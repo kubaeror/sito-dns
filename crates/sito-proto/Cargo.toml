@@ -8,6 +8,8 @@ description = "Wire format decoding, encoding, and domain name normalization for
 
 [dependencies]
 sito-core.workspace = true
-
+hickory-proto.workspace = true
+idna.workspace = true
+thiserror.workspace = true
 [lints]
 workspace = true

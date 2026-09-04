@@ -1,13 +1,18 @@
 //! `sito-proto`
 //!
-//! Wire format encoding and decoding wrapping `hickory-proto`, DNS message
-//! parsing, domain name normalization (FQDN canonicalization, Punycode, case-folding),
-//! and wire protocol conversion utilities.
+//! Wire format decoding, encoding, domain name normalization, and synthesized responses for sito.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_proto_initialization() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod error;
+pub mod normalize;
+pub mod wire;
+
+pub use error::ProtoError;
+pub use normalize::normalize_domain;
+pub use wire::{
+    client_edns_payload_size, decode_message, encode_message, extract_query_info,
+    set_edns_payload_size, synthesize_blocked_response,
+};
+
+// Re-export core hickory types so other sito crates don't need direct hickory-proto dependency
+pub use hickory_proto::op::{Edns, Header, Message, MessageType, Metadata, OpCode, ResponseCode};
+pub use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};

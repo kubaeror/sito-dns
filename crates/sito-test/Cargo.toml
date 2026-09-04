@@ -1,0 +1,15 @@
+[package]
+name = "sito-test"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Integration test harness and mock servers for sito"
+
+[dependencies]
+sito-core.workspace = true
+sito-proto.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

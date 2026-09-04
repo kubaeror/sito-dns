@@ -1,0 +1,688 @@
+//! Configuration structures, deserialization, and validation.
+
+use crate::error::ConfigError;
+use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
+use std::path::PathBuf;
+use std::str::FromStr;
+
+/// Top-level configuration container for sito.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default = "default_config_version")]
+    pub config_version: u32,
+    #[serde(default)]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub dns: DnsConfig,
+    #[serde(default)]
+    pub upstream: UpstreamConfig,
+    #[serde(default)]
+    pub filtering: FilteringConfig,
+
+    // Additional forward-compatible sections that might be present in full configs
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clients: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrites: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ha: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrations: Option<toml::Value>,
+}
+
+fn default_config_version() -> u32 {
+    1
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            config_version: 1,
+            server: ServerConfig::default(),
+            dns: DnsConfig::default(),
+            upstream: UpstreamConfig::default(),
+            filtering: FilteringConfig::default(),
+            clients: None,
+            rewrites: None,
+            web: None,
+            auth: None,
+            stats: None,
+            ha: None,
+            integrations: None,
+        }
+    }
+}
+
+impl Config {
+    /// Parse configuration from a TOML string.
+    pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
+        let config: Self = toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate configuration fields and logic constraints.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.config_version != 1 {
+            return Err(ConfigError::validation(
+                "config_version",
+                format!(
+                    "unsupported config_version {}, expected 1",
+                    self.config_version
+                ),
+            ));
+        }
+
+        self.server.validate()?;
+        self.dns.validate()?;
+        self.upstream.validate()?;
+        self.filtering.validate()?;
+
+        Ok(())
+    }
+}
+
+/// Server operational parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_server_role")]
+    pub role: String,
+    #[serde(default = "default_server_instance_name")]
+    pub instance_name: String,
+    #[serde(default = "default_server_data_dir")]
+    pub data_dir: PathBuf,
+    #[serde(default = "default_server_log_level")]
+    pub log_level: String,
+    #[serde(default = "default_server_log_format")]
+    pub log_format: String,
+}
+
+fn default_server_role() -> String {
+    "master".to_string()
+}
+fn default_server_instance_name() -> String {
+    "sito-main".to_string()
+}
+fn default_server_data_dir() -> PathBuf {
+    PathBuf::from("/var/lib/sito")
+}
+fn default_server_log_level() -> String {
+    "info".to_string()
+}
+fn default_server_log_format() -> String {
+    "json".to_string()
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            role: default_server_role(),
+            instance_name: default_server_instance_name(),
+            data_dir: default_server_data_dir(),
+            log_level: default_server_log_level(),
+            log_format: default_server_log_format(),
+        }
+    }
+}
+
+impl ServerConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        match self.role.as_str() {
+            "master" | "slave" => {}
+            other => {
+                return Err(ConfigError::validation(
+                    "server.role",
+                    format!("invalid server role '{other}', expected 'master' or 'slave'"),
+                ));
+            }
+        }
+
+        match self.log_level.to_lowercase().as_str() {
+            "trace" | "debug" | "info" | "warn" | "error" => {}
+            other => {
+                return Err(ConfigError::validation(
+                    "server.log_level",
+                    format!(
+                        "invalid log level '{other}', expected trace, debug, info, warn, or error"
+                    ),
+                ));
+            }
+        }
+
+        match self.log_format.to_lowercase().as_str() {
+            "json" | "pretty" => {}
+            other => {
+                return Err(ConfigError::validation(
+                    "server.log_format",
+                    format!("invalid log format '{other}', expected 'json' or 'pretty'"),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// DNS server listening and protocol parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsConfig {
+    #[serde(default = "default_dns_bind")]
+    pub bind: Vec<IpAddr>,
+    #[serde(default = "default_dns_port")]
+    pub port: u16,
+    #[serde(default = "default_dns_dot_port")]
+    pub dot_port: u16,
+    #[serde(default = "default_dns_doh_port")]
+    pub doh_port: u16,
+    #[serde(default = "default_dns_doq_port")]
+    pub doq_port: u16,
+    #[serde(default)]
+    pub doh_dedicated_hostname: String,
+    #[serde(default = "default_dns_edns_udp_size")]
+    pub edns_udp_size: u16,
+    #[serde(default = "default_dns_rate_limit_per_ip")]
+    pub rate_limit_per_ip: u32,
+    #[serde(default = "default_dns_max_tcp_connections")]
+    pub max_tcp_connections: usize,
+    #[serde(default)]
+    pub cache: CacheConfig,
+    #[serde(default)]
+    pub dnssec: DnssecConfig,
+}
+
+fn default_dns_bind() -> Vec<IpAddr> {
+    vec![
+        IpAddr::from_str("0.0.0.0").expect("valid 0.0.0.0"),
+        IpAddr::from_str("::").expect("valid ::"),
+    ]
+}
+fn default_dns_port() -> u16 {
+    53
+}
+fn default_dns_dot_port() -> u16 {
+    853
+}
+fn default_dns_doh_port() -> u16 {
+    443
+}
+fn default_dns_doq_port() -> u16 {
+    853
+}
+fn default_dns_edns_udp_size() -> u16 {
+    1232
+}
+fn default_dns_rate_limit_per_ip() -> u32 {
+    20
+}
+fn default_dns_max_tcp_connections() -> usize {
+    256
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_dns_bind(),
+            port: default_dns_port(),
+            dot_port: default_dns_dot_port(),
+            doh_port: default_dns_doh_port(),
+            doq_port: default_dns_doq_port(),
+            doh_dedicated_hostname: String::new(),
+            edns_udp_size: default_dns_edns_udp_size(),
+            rate_limit_per_ip: default_dns_rate_limit_per_ip(),
+            max_tcp_connections: default_dns_max_tcp_connections(),
+            cache: CacheConfig::default(),
+            dnssec: DnssecConfig::default(),
+        }
+    }
+}
+
+impl DnsConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.port == 0 {
+            return Err(ConfigError::validation(
+                "dns.port",
+                "port must be greater than 0",
+            ));
+        }
+        if self.bind.is_empty() {
+            return Err(ConfigError::validation(
+                "dns.bind",
+                "bind address list cannot be empty",
+            ));
+        }
+        if self.edns_udp_size < 512 || self.edns_udp_size > 4096 {
+            return Err(ConfigError::validation(
+                "dns.edns_udp_size",
+                format!(
+                    "edns_udp_size must be between 512 and 4096 bytes (got {})",
+                    self.edns_udp_size
+                ),
+            ));
+        }
+        if self.max_tcp_connections == 0 {
+            return Err(ConfigError::validation(
+                "dns.max_tcp_connections",
+                "max_tcp_connections must be greater than 0",
+            ));
+        }
+        self.cache.validate()?;
+        self.dnssec.validate()?;
+        Ok(())
+    }
+}
+
+/// Cache settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_cache_size_mb")]
+    pub size_mb: usize,
+    #[serde(default = "default_cache_min_ttl")]
+    pub min_ttl: u32,
+    #[serde(default = "default_cache_max_ttl")]
+    pub max_ttl: u32,
+    #[serde(default = "default_cache_negative_ttl_max")]
+    pub negative_ttl_max: u32,
+    #[serde(default = "default_true")]
+    pub prefetch: bool,
+    #[serde(default = "default_cache_serve_stale_hours")]
+    pub serve_stale_hours: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_cache_size_mb() -> usize {
+    64
+}
+fn default_cache_min_ttl() -> u32 {
+    60
+}
+fn default_cache_max_ttl() -> u32 {
+    86400
+}
+fn default_cache_negative_ttl_max() -> u32 {
+    3600
+}
+fn default_cache_serve_stale_hours() -> u32 {
+    12
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            size_mb: default_cache_size_mb(),
+            min_ttl: default_cache_min_ttl(),
+            max_ttl: default_cache_max_ttl(),
+            negative_ttl_max: default_cache_negative_ttl_max(),
+            prefetch: true,
+            serve_stale_hours: default_cache_serve_stale_hours(),
+        }
+    }
+}
+
+impl CacheConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.size_mb == 0 {
+            return Err(ConfigError::validation(
+                "dns.cache.size_mb",
+                "cache size_mb must be greater than 0",
+            ));
+        }
+        if self.min_ttl > self.max_ttl {
+            return Err(ConfigError::validation(
+                "dns.cache.min_ttl",
+                format!(
+                    "min_ttl ({}) cannot be greater than max_ttl ({})",
+                    self.min_ttl, self.max_ttl
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// DNSSEC settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnssecConfig {
+    #[serde(default = "default_true")]
+    pub validate: bool,
+    #[serde(default)]
+    pub ntp: Vec<String>,
+}
+
+impl Default for DnssecConfig {
+    fn default() -> Self {
+        Self {
+            validate: true,
+            ntp: Vec::new(),
+        }
+    }
+}
+
+impl DnssecConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        Ok(())
+    }
+}
+
+/// Upstream resolver strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamStrategy {
+    Parallel,
+    #[default]
+    Failover,
+    LoadBalance,
+}
+
+/// Per-domain upstream forwarder routing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerDomainUpstream {
+    pub domains: Vec<String>,
+    pub servers: Vec<String>,
+}
+
+/// Upstream resolvers and forwarding configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamConfig {
+    #[serde(default = "default_upstream_servers")]
+    pub servers: Vec<String>,
+    #[serde(default = "default_upstream_bootstrap")]
+    pub bootstrap: Vec<IpAddr>,
+    #[serde(default)]
+    pub strategy: UpstreamStrategy,
+    #[serde(default = "default_upstream_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_upstream_probe_domain")]
+    pub probe_domain: String,
+    #[serde(default = "default_upstream_pool_size")]
+    pub pool_size: usize,
+    #[serde(default)]
+    pub per_domain: Vec<PerDomainUpstream>,
+}
+
+fn default_upstream_servers() -> Vec<String> {
+    vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()]
+}
+fn default_upstream_bootstrap() -> Vec<IpAddr> {
+    vec![
+        IpAddr::from_str("9.9.9.9").expect("valid 9.9.9.9"),
+        IpAddr::from_str("149.112.112.112").expect("valid 149.112.112.112"),
+    ]
+}
+fn default_upstream_timeout_ms() -> u64 {
+    5000
+}
+fn default_upstream_probe_domain() -> String {
+    "example.com".to_string()
+}
+fn default_upstream_pool_size() -> usize {
+    4
+}
+
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        Self {
+            servers: default_upstream_servers(),
+            bootstrap: default_upstream_bootstrap(),
+            strategy: UpstreamStrategy::default(),
+            timeout_ms: default_upstream_timeout_ms(),
+            probe_domain: default_upstream_probe_domain(),
+            pool_size: default_upstream_pool_size(),
+            per_domain: Vec::new(),
+        }
+    }
+}
+
+impl UpstreamConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.servers.is_empty() {
+            return Err(ConfigError::validation(
+                "upstream.servers",
+                "servers list cannot be empty",
+            ));
+        }
+        if self.timeout_ms == 0 {
+            return Err(ConfigError::validation(
+                "upstream.timeout_ms",
+                "timeout_ms must be greater than 0",
+            ));
+        }
+        if self.pool_size == 0 {
+            return Err(ConfigError::validation(
+                "upstream.pool_size",
+                "pool_size must be greater than 0",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Filter blocking response modes per ADR-0005.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockingMode {
+    #[default]
+    ZeroIp,
+    Nxdomain,
+    Refused,
+    CustomIp(IpAddr),
+}
+
+/// A filter list definition to download and compile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterListConfig {
+    pub name: String,
+    pub url: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub refresh_hours: Option<u64>,
+}
+
+/// Filtering and blocklist configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilteringConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_filtering_refresh_interval_hours")]
+    pub refresh_interval_hours: u64,
+    #[serde(default)]
+    pub blocking_mode: BlockingMode,
+    #[serde(default = "default_filtering_blocking_ttl")]
+    pub blocking_ttl: u32,
+    #[serde(default = "default_true")]
+    pub cname_cloaking: bool,
+    #[serde(default = "default_filtering_anti_doh_bypass")]
+    pub anti_doh_bypass: String,
+    #[serde(default)]
+    pub lists: Vec<FilterListConfig>,
+    #[serde(default)]
+    pub custom_rules: Vec<String>,
+}
+
+fn default_filtering_refresh_interval_hours() -> u64 {
+    24
+}
+fn default_filtering_blocking_ttl() -> u32 {
+    10
+}
+fn default_filtering_anti_doh_bypass() -> String {
+    "off".to_string()
+}
+
+impl Default for FilteringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            refresh_interval_hours: default_filtering_refresh_interval_hours(),
+            blocking_mode: BlockingMode::default(),
+            blocking_ttl: default_filtering_blocking_ttl(),
+            cname_cloaking: true,
+            anti_doh_bypass: default_filtering_anti_doh_bypass(),
+            lists: Vec::new(),
+            custom_rules: Vec::new(),
+        }
+    }
+}
+
+impl FilteringConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.refresh_interval_hours == 0 {
+            return Err(ConfigError::validation(
+                "filtering.refresh_interval_hours",
+                "refresh_interval_hours must be greater than 0",
+            ));
+        }
+        for (i, list) in self.lists.iter().enumerate() {
+            if list.name.trim().is_empty() {
+                return Err(ConfigError::validation(
+                    format!("filtering.lists[{i}].name"),
+                    "filter list name cannot be empty",
+                ));
+            }
+            if list.url.trim().is_empty() {
+                return Err(ConfigError::validation(
+                    format!("filtering.lists[{i}].url"),
+                    "filter list URL cannot be empty",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_section_15_example() {
+        let toml_str = r#"
+config_version = 1
+
+[server]
+role = "master"
+instance_name = "sito-main"
+data_dir = "/var/lib/sito"
+log_level = "info"
+log_format = "json"
+
+[dns]
+bind = ["0.0.0.0", "::"]
+port = 53
+dot_port = 853
+doh_port = 443
+doq_port = 853
+doh_dedicated_hostname = ""
+edns_udp_size = 1232
+rate_limit_per_ip = 20
+max_tcp_connections = 256
+
+[dns.cache]
+enabled = true
+size_mb = 64
+min_ttl = 60
+max_ttl = 86400
+negative_ttl_max = 3600
+prefetch = true
+serve_stale_hours = 12
+
+[dns.dnssec]
+validate = true
+ntp = []
+
+[upstream]
+servers = ["tls://dns1.example", "https://dns2.example/dns-query"]
+bootstrap = ["9.9.9.9", "149.112.112.112"]
+strategy = "parallel"
+timeout_ms = 5000
+probe_domain = "example.com"
+pool_size = 4
+
+[[upstream.per_domain]]
+domains = ["*.lan", "168.192.in-addr.arpa"]
+servers = ["192.168.1.1"]
+
+[filtering]
+enabled = true
+refresh_interval_hours = 24
+blocking_mode = "zero_ip"
+blocking_ttl = 10
+cname_cloaking = true
+anti_doh_bypass = "off"
+lists = [ { name = "OISD", url = "https://example.com/hosts.txt", enabled = true, refresh_hours = 24 } ]
+custom_rules = []
+
+[clients]
+entries = []
+
+[rewrites]
+auto_ptr = true
+entries = []
+
+[web]
+port = 8080
+bind = ["0.0.0.0"]
+
+[auth]
+session_ttl_hours = 24
+
+[stats]
+query_log_enabled = true
+
+[ha]
+replication_port = 8953
+
+[integrations.mikrotik]
+enabled = false
+"#;
+        let config =
+            Config::from_toml_str(toml_str).expect("section 15 config should parse cleanly");
+        assert_eq!(config.config_version, 1);
+        assert_eq!(config.server.role, "master");
+        assert_eq!(config.dns.port, 53);
+        assert_eq!(config.dns.cache.size_mb, 64);
+        assert_eq!(config.upstream.strategy, UpstreamStrategy::Parallel);
+        assert_eq!(config.filtering.blocking_mode, BlockingMode::ZeroIp);
+        assert_eq!(config.filtering.lists.len(), 1);
+        assert_eq!(config.filtering.lists[0].name, "OISD");
+    }
+
+    #[test]
+    fn test_reject_invalid_config() {
+        // Bad config version
+        let bad_ver = "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]";
+        let err = Config::from_toml_str(bad_ver).unwrap_err();
+        match err {
+            ConfigError::Validation { field, .. } => assert_eq!(field, "config_version"),
+            other => panic!("expected validation error on config_version, got: {other:?}"),
+        }
+
+        // Empty upstream servers
+        let empty_up = "config_version = 1\n[upstream]\nservers = []";
+        let err = Config::from_toml_str(empty_up).unwrap_err();
+        match err {
+            ConfigError::Validation { field, .. } => assert_eq!(field, "upstream.servers"),
+            other => panic!("expected validation error on upstream.servers, got: {other:?}"),
+        }
+
+        // Bad min/max ttl
+        let bad_ttl = "config_version = 1\n[dns.cache]\nmin_ttl = 500\nmax_ttl = 100\n[upstream]\nservers = [\"1.1.1.1\"]";
+        let err = Config::from_toml_str(bad_ttl).unwrap_err();
+        match err {
+            ConfigError::Validation { field, .. } => assert_eq!(field, "dns.cache.min_ttl"),
+            other => panic!("expected validation error on dns.cache.min_ttl, got: {other:?}"),
+        }
+    }
+}
