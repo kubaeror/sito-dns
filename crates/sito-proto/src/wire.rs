@@ -111,6 +111,10 @@ pub fn synthesize_blocked_response(
                 }
             }
         }
+        BlockingMode::NullRdata => {
+            response.metadata.response_code = ResponseCode::NoError;
+            // Empty answer section for all query types (NODATA)
+        }
     }
 
     response
@@ -180,5 +184,42 @@ mod tests {
         let resp = synthesize_blocked_response(&query, &BlockingMode::Nxdomain, 60);
         assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
         assert!(resp.answers.is_empty());
+    }
+
+    #[test]
+    fn test_synthesize_blocked_refused() {
+        let mut query = Message::new(43, MessageType::Query, OpCode::Query);
+        let qname = Name::from_str("ads.example.com.").unwrap();
+        query.queries.push(Query::query(qname, RecordType::A));
+
+        let resp = synthesize_blocked_response(&query, &BlockingMode::Refused, 60);
+        assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
+    }
+
+    #[test]
+    fn test_synthesize_blocked_null_rdata() {
+        let mut query = Message::new(44, MessageType::Query, OpCode::Query);
+        let qname = Name::from_str("ads.example.com.").unwrap();
+        query.queries.push(Query::query(qname, RecordType::A));
+
+        let resp = synthesize_blocked_response(&query, &BlockingMode::NullRdata, 60);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert!(resp.answers.is_empty());
+    }
+
+    #[test]
+    fn test_synthesize_blocked_custom_ip() {
+        let mut query = Message::new(45, MessageType::Query, OpCode::Query);
+        let qname = Name::from_str("ads.example.com.").unwrap();
+        query.queries.push(Query::query(qname, RecordType::A));
+
+        let ip = "192.168.1.10".parse().unwrap();
+        let resp = synthesize_blocked_response(&query, &BlockingMode::CustomIp(ip), 60);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(
+            resp.answers[0].data,
+            RData::A(A(Ipv4Addr::new(192, 168, 1, 10)))
+        );
     }
 }

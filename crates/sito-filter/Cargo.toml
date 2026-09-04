@@ -16,6 +16,14 @@ arc-swap.workspace = true
 fnv.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+aho-corasick.workspace = true
+regex-automata.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
 
 [lints]
 workspace = true
+

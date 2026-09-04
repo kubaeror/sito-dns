@@ -50,6 +50,9 @@ tokio-rustls = "0.26"
 rand = "0.8"
 idna = "1.0"
 async-trait = "0.1"
+aho-corasick = "1.1"
+regex-automata = { version = "0.4", features = ["dfa-build", "syntax", "hybrid"] }
+criterion = "0.5"
 
 # Internal workspace dependencies
 sito = { path = "crates/sito", version = "0.1.0" }

@@ -468,15 +468,101 @@ impl UpstreamConfig {
     }
 }
 
-/// Filter blocking response modes per ADR-0005.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+/// Filter blocking response modes per ADR-0005 and Section 4.5.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BlockingMode {
     #[default]
     ZeroIp,
     Nxdomain,
     Refused,
     CustomIp(IpAddr),
+    NullRdata,
+}
+
+impl Serialize for BlockingMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::ZeroIp => serializer.serialize_str("zero_ip"),
+            Self::Nxdomain => serializer.serialize_str("nxdomain"),
+            Self::Refused => serializer.serialize_str("refused"),
+            Self::NullRdata => serializer.serialize_str("null_rdata"),
+            Self::CustomIp(ip) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("custom_ip", &ip.to_string())?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BlockingMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BlockingModeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BlockingModeVisitor {
+            type Value = BlockingMode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str(
+                    "a blocking mode string ('zero_ip', 'nxdomain', 'refused', 'null_rdata', 'custom_ip:<ip>', '<ip>') or map with 'custom_ip'",
+                )
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<BlockingMode, E>
+            where
+                E: serde::de::Error,
+            {
+                match v {
+                    "zero_ip" => Ok(BlockingMode::ZeroIp),
+                    "nxdomain" => Ok(BlockingMode::Nxdomain),
+                    "refused" => Ok(BlockingMode::Refused),
+                    "null_rdata" => Ok(BlockingMode::NullRdata),
+                    s if s.starts_with("custom_ip:") => {
+                        let ip_str = &s["custom_ip:".len()..];
+                        ip_str
+                            .parse::<IpAddr>()
+                            .map(BlockingMode::CustomIp)
+                            .map_err(|e| {
+                                E::custom(format!("invalid custom IP in blocking_mode: {e}"))
+                            })
+                    }
+                    s => {
+                        if let Ok(ip) = s.parse::<IpAddr>() {
+                            Ok(BlockingMode::CustomIp(ip))
+                        } else {
+                            Err(E::unknown_variant(
+                                v,
+                                &["zero_ip", "nxdomain", "refused", "null_rdata", "custom_ip"],
+                            ))
+                        }
+                    }
+                }
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<BlockingMode, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "custom_ip" {
+                        let ip_val: IpAddr = map.next_value()?;
+                        return Ok(BlockingMode::CustomIp(ip_val));
+                    }
+                    let _: serde::de::IgnoredAny = map.next_value()?;
+                }
+                Err(serde::de::Error::custom("missing 'custom_ip' field in map"))
+            }
+        }
+
+        deserializer.deserialize_any(BlockingModeVisitor)
+    }
 }
 
 /// A filter list definition to download and compile.
@@ -684,5 +770,27 @@ enabled = false
             ConfigError::Validation { field, .. } => assert_eq!(field, "dns.cache.min_ttl"),
             other => panic!("expected validation error on dns.cache.min_ttl, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_blocking_mode_deserialization() {
+        let toml_null = "config_version = 1\n[filtering]\nblocking_mode = \"null_rdata\"\n[upstream]\nservers = [\"1.1.1.1\"]";
+        let cfg = Config::from_toml_str(toml_null).unwrap();
+        assert_eq!(cfg.filtering.blocking_mode, BlockingMode::NullRdata);
+
+        let toml_custom = "config_version = 1\n[filtering]\nblocking_mode = \"custom_ip:192.168.1.50\"\n[upstream]\nservers = [\"1.1.1.1\"]";
+        let cfg = Config::from_toml_str(toml_custom).unwrap();
+        assert_eq!(
+            cfg.filtering.blocking_mode,
+            BlockingMode::CustomIp("192.168.1.50".parse().unwrap())
+        );
+
+        let toml_refused = "config_version = 1\n[filtering]\nblocking_mode = \"refused\"\n[upstream]\nservers = [\"1.1.1.1\"]";
+        let cfg = Config::from_toml_str(toml_refused).unwrap();
+        assert_eq!(cfg.filtering.blocking_mode, BlockingMode::Refused);
+
+        let toml_nxdomain = "config_version = 1\n[filtering]\nblocking_mode = \"nxdomain\"\n[upstream]\nservers = [\"1.1.1.1\"]";
+        let cfg = Config::from_toml_str(toml_nxdomain).unwrap();
+        assert_eq!(cfg.filtering.blocking_mode, BlockingMode::Nxdomain);
     }
 }
