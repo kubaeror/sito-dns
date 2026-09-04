@@ -19,6 +19,8 @@ pub struct Config {
     pub upstream: UpstreamConfig,
     #[serde(default)]
     pub filtering: FilteringConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
 
     // Additional forward-compatible sections that might be present in full configs
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,6 +51,7 @@ impl Default for Config {
             dns: DnsConfig::default(),
             upstream: UpstreamConfig::default(),
             filtering: FilteringConfig::default(),
+            tls: None,
             clients: None,
             rewrites: None,
             web: None,
@@ -84,8 +87,22 @@ impl Config {
         self.dns.validate()?;
         self.upstream.validate()?;
         self.filtering.validate()?;
+        if let Some(ref tls) = self.tls {
+            tls.validate()?;
+        }
 
         Ok(())
+    }
+
+    /// Resolves the effective TLS configuration (checking `dns.tls` first, then top-level `tls`).
+    pub fn get_tls_config(&self) -> Option<&TlsConfig> {
+        if let Some(ref tls) = self.dns.tls {
+            return Some(tls);
+        }
+        if let Some(ref tls) = self.tls {
+            return Some(tls);
+        }
+        None
     }
 }
 
@@ -185,6 +202,10 @@ pub struct DnsConfig {
     pub doq_port: u16,
     #[serde(default)]
     pub doh_dedicated_hostname: String,
+    #[serde(default)]
+    pub dot_padding: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
     #[serde(default = "default_dns_edns_udp_size")]
     pub edns_udp_size: u16,
     #[serde(default = "default_dns_rate_limit_per_ip")]
@@ -234,6 +255,8 @@ impl Default for DnsConfig {
             doh_port: default_dns_doh_port(),
             doq_port: default_dns_doq_port(),
             doh_dedicated_hostname: String::new(),
+            dot_padding: false,
+            tls: None,
             edns_udp_size: default_dns_edns_udp_size(),
             rate_limit_per_ip: default_dns_rate_limit_per_ip(),
             max_tcp_connections: default_dns_max_tcp_connections(),
@@ -271,6 +294,9 @@ impl DnsConfig {
                 "dns.max_tcp_connections",
                 "max_tcp_connections must be greater than 0",
             ));
+        }
+        if let Some(ref tls) = self.tls {
+            tls.validate()?;
         }
         self.cache.validate()?;
         self.dnssec.validate()?;
@@ -351,26 +377,134 @@ impl CacheConfig {
     }
 }
 
+fn default_dnssec_mode() -> String {
+    "validate".to_string()
+}
+
 /// DNSSEC settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnssecConfig {
+    #[serde(default = "default_dnssec_mode")]
+    pub mode: String,
     #[serde(default = "default_true")]
     pub validate: bool,
     #[serde(default)]
     pub ntp: Vec<String>,
+    #[serde(default)]
+    pub nta: Vec<String>,
+    #[serde(default)]
+    pub trust_anchors: Vec<String>,
 }
 
 impl Default for DnssecConfig {
     fn default() -> Self {
         Self {
+            mode: default_dnssec_mode(),
             validate: true,
             ntp: Vec::new(),
+            nta: Vec::new(),
+            trust_anchors: Vec::new(),
         }
     }
 }
 
 impl DnssecConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        Ok(())
+    }
+
+    /// Check if a domain matches any configured Negative Trust Anchor (NTA/NTP).
+    pub fn is_nta(&self, domain: &str) -> bool {
+        let d = domain.trim_end_matches('.').to_lowercase();
+        for anchor in self.ntp.iter().chain(self.nta.iter()) {
+            let a = anchor.trim_end_matches('.').to_lowercase();
+            if d == a || d.ends_with(&format!(".{a}")) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// TLS configuration for DoT, DoH, and encrypted listeners.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TlsConfig {
+    #[serde(default)]
+    pub cert: Option<PathBuf>,
+    #[serde(default)]
+    pub key: Option<PathBuf>,
+    #[serde(default)]
+    pub sni_certs: Vec<SniCertConfig>,
+}
+
+/// SNI-to-certificate mapping configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SniCertConfig {
+    pub domain: String,
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
+impl TlsConfig {
+    pub fn sni_tuples(&self) -> Vec<(String, PathBuf, PathBuf)> {
+        self.sni_certs
+            .iter()
+            .map(|s| (s.domain.clone(), s.cert.clone(), s.key.clone()))
+            .collect()
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        match (&self.cert, &self.key) {
+            (Some(_), None) => {
+                return Err(ConfigError::validation(
+                    "tls.key",
+                    "tls.key must be specified when tls.cert is configured",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ConfigError::validation(
+                    "tls.cert",
+                    "tls.cert must be specified when tls.key is configured",
+                ));
+            }
+            (Some(cert), Some(key)) => {
+                if cert.as_os_str().is_empty() {
+                    return Err(ConfigError::validation(
+                        "tls.cert",
+                        "tls.cert path cannot be empty",
+                    ));
+                }
+                if key.as_os_str().is_empty() {
+                    return Err(ConfigError::validation(
+                        "tls.key",
+                        "tls.key path cannot be empty",
+                    ));
+                }
+            }
+            (None, None) => {}
+        }
+
+        for (idx, sni) in self.sni_certs.iter().enumerate() {
+            if sni.domain.trim().is_empty() {
+                return Err(ConfigError::validation(
+                    format!("tls.sni_certs[{idx}].domain"),
+                    "SNI domain cannot be empty",
+                ));
+            }
+            if sni.cert.as_os_str().is_empty() {
+                return Err(ConfigError::validation(
+                    format!("tls.sni_certs[{idx}].cert"),
+                    "SNI cert path cannot be empty",
+                ));
+            }
+            if sni.key.as_os_str().is_empty() {
+                return Err(ConfigError::validation(
+                    format!("tls.sni_certs[{idx}].key"),
+                    "SNI key path cannot be empty",
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -792,5 +926,50 @@ enabled = false
         let toml_nxdomain = "config_version = 1\n[filtering]\nblocking_mode = \"nxdomain\"\n[upstream]\nservers = [\"1.1.1.1\"]";
         let cfg = Config::from_toml_str(toml_nxdomain).unwrap();
         assert_eq!(cfg.filtering.blocking_mode, BlockingMode::Nxdomain);
+    }
+
+    #[test]
+    fn test_dnssec_nta_matching() {
+        let mut dnssec = DnssecConfig::default();
+        dnssec.ntp.push("known-broken.example".to_string());
+        dnssec.nta.push("corp.internal.".to_string());
+
+        assert!(dnssec.is_nta("known-broken.example"));
+        assert!(dnssec.is_nta("sub.known-broken.example"));
+        assert!(dnssec.is_nta("sub.known-broken.example."));
+        assert!(dnssec.is_nta("corp.internal"));
+        assert!(dnssec.is_nta("host.corp.internal."));
+        assert!(!dnssec.is_nta("example.com"));
+    }
+
+    #[test]
+    fn test_tls_config_validation() {
+        let toml_missing_key = r#"
+config_version = 1
+[upstream]
+servers = ["1.1.1.1"]
+[tls]
+cert = "/path/to/cert.pem"
+"#;
+        let err = Config::from_toml_str(toml_missing_key).unwrap_err();
+        match err {
+            ConfigError::Validation { field, .. } => assert_eq!(field, "tls.key"),
+            other => panic!("expected tls.key error, got {other:?}"),
+        }
+
+        let toml_valid_tls = r#"
+config_version = 1
+[upstream]
+servers = ["1.1.1.1"]
+[dns.tls]
+cert = "/path/to/cert.pem"
+key = "/path/to/key.pem"
+"#;
+        let cfg = Config::from_toml_str(toml_valid_tls).unwrap();
+        assert!(cfg.get_tls_config().is_some());
+        assert_eq!(
+            cfg.get_tls_config().unwrap().cert.as_deref(),
+            Some(std::path::Path::new("/path/to/cert.pem"))
+        );
     }
 }

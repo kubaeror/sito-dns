@@ -62,6 +62,43 @@ pub fn run_check_config(path: &Path) -> Result<(), anyhow::Error> {
         )
     })?;
 
+    if let Some(tls) = config.get_tls_config() {
+        if let (Some(cert_path), Some(key_path)) = (&tls.cert, &tls.key) {
+            sito_transport::load_certificates(cert_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "TLS certificate verification failed for '{}': {}",
+                    cert_path.display(),
+                    e
+                )
+            })?;
+            sito_transport::load_private_key(key_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "TLS private key verification failed for '{}': {}",
+                    key_path.display(),
+                    e
+                )
+            })?;
+        }
+        for sni in &tls.sni_certs {
+            sito_transport::load_certificates(&sni.cert).map_err(|e| {
+                anyhow::anyhow!(
+                    "SNI TLS certificate verification failed for '{}' (domain '{}'): {}",
+                    sni.cert.display(),
+                    sni.domain,
+                    e
+                )
+            })?;
+            sito_transport::load_private_key(&sni.key).map_err(|e| {
+                anyhow::anyhow!(
+                    "SNI TLS private key verification failed for '{}' (domain '{}'): {}",
+                    sni.key.display(),
+                    sni.domain,
+                    e
+                )
+            })?;
+        }
+    }
+
     println!(
         "Configuration file '{}' is valid (listening on port {}, {} upstreams, {} blocklists configured).",
         path.display(),

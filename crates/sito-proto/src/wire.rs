@@ -42,6 +42,43 @@ pub fn set_edns_payload_size(msg: &mut Message, max_payload: u16) {
     msg.set_edns(edns);
 }
 
+/// Default block size for RFC 8467 DNS-over-TLS response padding.
+pub const DOT_PADDING_BLOCK_SIZE: usize = 468;
+
+/// Apply RFC 8467 block-length padding to a DNS message using EDNS(0) option 12.
+pub fn apply_dot_padding(msg: &mut Message, block_size: usize) -> Result<(), ProtoError> {
+    use hickory_proto::rr::rdata::opt::EdnsOption;
+
+    if block_size == 0 {
+        return Ok(());
+    }
+
+    if msg.edns.is_none() {
+        msg.set_edns(Edns::new());
+    }
+
+    let wire = encode_message(msg)?;
+    let current_len = wire.len();
+
+    let mut target_len = if current_len % block_size == 0 {
+        current_len
+    } else {
+        ((current_len / block_size) + 1) * block_size
+    };
+
+    if target_len < current_len + 4 {
+        target_len += block_size;
+    }
+
+    let padding_len = target_len - (current_len + 4);
+    if let Some(edns) = msg.edns.as_mut() {
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(12, vec![0u8; padding_len]));
+    }
+
+    Ok(())
+}
+
 /// Synthesize a response for a blocked domain according to the configured BlockingMode.
 pub fn synthesize_blocked_response(
     query: &Message,
@@ -125,6 +162,23 @@ mod tests {
     use super::*;
     use hickory_proto::op::{MessageType, OpCode, Query};
     use std::str::FromStr;
+
+    #[test]
+    fn test_apply_dot_padding() {
+        let mut msg = Message::new(1234, MessageType::Response, OpCode::Query);
+        let qname = Name::from_str("example.com.").unwrap();
+        msg.queries.push(Query::query(qname, RecordType::A));
+
+        apply_dot_padding(&mut msg, DOT_PADDING_BLOCK_SIZE).unwrap();
+
+        let encoded = encode_message(&msg).unwrap();
+        assert_eq!(encoded.len() % DOT_PADDING_BLOCK_SIZE, 0);
+        assert_eq!(encoded.len(), 468);
+
+        // Decode and verify EDNS option exists
+        let decoded = decode_message(&encoded).unwrap();
+        assert!(decoded.edns.is_some());
+    }
 
     #[test]
     fn test_synthesize_blocked_zero_ip_a_record() {

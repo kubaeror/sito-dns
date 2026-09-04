@@ -28,17 +28,32 @@ impl std::fmt::Display for ClientId {
 pub struct ClientContext {
     pub ip: IpAddr,
     pub id: Option<ClientId>,
+    pub sni: Option<String>,
 }
 
 impl ClientContext {
     pub fn new(ip: IpAddr) -> Self {
-        Self { ip, id: None }
+        Self {
+            ip,
+            id: None,
+            sni: None,
+        }
     }
 
     pub fn with_id(ip: IpAddr, id: impl Into<String>) -> Self {
         Self {
             ip,
             id: Some(ClientId::new(id)),
+            sni: None,
+        }
+    }
+
+    pub fn with_sni(ip: IpAddr, sni: impl Into<String>) -> Self {
+        let s = sni.into();
+        Self {
+            ip,
+            id: Some(ClientId::new(s.clone())),
+            sni: Some(s),
         }
     }
 }

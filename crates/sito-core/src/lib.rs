@@ -13,7 +13,7 @@ pub mod verdict;
 pub use client::{ClientContext, ClientId};
 pub use config::{
     BlockingMode, CacheConfig, Config, DnsConfig, DnssecConfig, FilterListConfig, FilteringConfig,
-    PerDomainUpstream, ServerConfig, UpstreamConfig, UpstreamStrategy,
+    PerDomainUpstream, ServerConfig, SniCertConfig, TlsConfig, UpstreamConfig, UpstreamStrategy,
 };
 pub use engine::FilterEngine;
 pub use error::{ConfigError, UpstreamError};

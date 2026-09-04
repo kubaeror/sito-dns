@@ -9,6 +9,12 @@ description = "DNSSEC cryptographic validation and trust anchor management for s
 [dependencies]
 sito-core.workspace = true
 sito-proto.workspace = true
+hickory-proto = { workspace = true, features = ["dnssec-ring"] }
+dashmap.workspace = true
+arc-swap.workspace = true
+tracing.workspace = true
+time.workspace = true
+base64.workspace = true
 
 [lints]
 workspace = true

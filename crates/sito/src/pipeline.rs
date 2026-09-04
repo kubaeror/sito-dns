@@ -3,9 +3,10 @@
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::RData;
 use sito_cache::DnsCache;
+use sito_core::FilterEngine;
 use sito_core::client::ClientContext;
 use sito_core::config::Config;
-use sito_core::engine::FilterEngine;
+use sito_dnssec::DnssecValidator;
 use sito_filter::HostsFilterEngine;
 use sito_proto::synthesize_blocked_response;
 use sito_transport::QueryHandler;
@@ -29,6 +30,7 @@ pub struct DnsPipeline {
     filter: Arc<HostsFilterEngine>,
     cache: Arc<DnsCache>,
     upstream: Arc<UpstreamManager>,
+    dnssec: Arc<DnssecValidator>,
     in_flight: Arc<AtomicUsize>,
 }
 
@@ -38,6 +40,7 @@ impl DnsPipeline {
         filter: Arc<HostsFilterEngine>,
         cache: Arc<DnsCache>,
         upstream: Arc<UpstreamManager>,
+        dnssec: Arc<DnssecValidator>,
         in_flight: Arc<AtomicUsize>,
     ) -> Self {
         Self {
@@ -45,6 +48,7 @@ impl DnsPipeline {
             filter,
             cache,
             upstream,
+            dnssec,
             in_flight,
         }
     }
@@ -137,7 +141,16 @@ impl QueryHandler for DnsPipeline {
                         }
                     }
 
-                    if self.config.dns.cache.enabled {
+                    // 5. DNSSEC validation
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as u32;
+                    let _outcome = self.dnssec.validate_response(&mut upstream_resp, None, now);
+
+                    if self.config.dns.cache.enabled
+                        && upstream_resp.metadata.response_code == ResponseCode::NoError
+                    {
                         self.cache.insert(&query, &upstream_resp).await;
                     }
                     Some(upstream_resp)

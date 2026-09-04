@@ -4,8 +4,8 @@ pub mod client;
 pub mod harness;
 pub mod mock;
 
-pub use client::TestDnsClient;
-pub use harness::TestServerInstance;
+pub use client::{DotConnection, TestDnsClient};
+pub use harness::{TestServerInstance, generate_expired_test_cert, generate_test_cert};
 pub use mock::MockDnsServer;
 
 #[cfg(test)]
@@ -300,5 +300,462 @@ mod tests {
 
         server.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// 8. Acceptance test: DoT query (kdig equivalent) -> NOERROR
+    #[tokio::test]
+    async fn test_acceptance_dot_query_noerror() {
+        let (cert_pem, key_pem) = generate_test_cert(&["sito-test.local", "127.0.0.1"]);
+        let temp_dir = std::env::temp_dir().join(format!("sito_dot_test_{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        tokio::fs::write(&cert_file, cert_pem).await.unwrap();
+        tokio::fs::write(&key_file, key_pem).await.unwrap();
+
+        let mock_upstream = MockDnsServer::spawn().await.unwrap();
+        mock_upstream.add_a_record("secure.example.com", Ipv4Addr::new(93, 184, 216, 34), 300);
+
+        let mut config = Config::default();
+        config.upstream.servers = vec![mock_upstream.addr().to_string()];
+        config.dns.dot_port = 0;
+        config.tls = Some(sito_core::config::TlsConfig {
+            cert: Some(cert_file),
+            key: Some(key_file),
+            sni_certs: Vec::new(),
+        });
+
+        let server = TestServerInstance::spawn(config).await.unwrap();
+        let client = server.client();
+
+        let resp = client
+            .query_dot(
+                server.dot_addr(),
+                "sito-test.local",
+                "secure.example.com",
+                RecordType::A,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.metadata.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(
+            resp.answers[0].data,
+            RData::A(A(Ipv4Addr::new(93, 184, 216, 34)))
+        );
+
+        server.shutdown().await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// 9. Acceptance test: DoH queries (curl --doh-url equivalent) via POST and GET, asserting no-store header
+    #[tokio::test]
+    async fn test_acceptance_doh_queries_and_no_store() {
+        let (cert_pem, key_pem) = generate_test_cert(&["sito-test.local", "127.0.0.1"]);
+        let temp_dir = std::env::temp_dir().join(format!("sito_doh_test_{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        tokio::fs::write(&cert_file, cert_pem).await.unwrap();
+        tokio::fs::write(&key_file, key_pem).await.unwrap();
+
+        let mock_upstream = MockDnsServer::spawn().await.unwrap();
+        mock_upstream.add_a_record("doh.example.com", Ipv4Addr::new(192, 0, 2, 1), 300);
+
+        let mut config = Config::default();
+        config.upstream.servers = vec![mock_upstream.addr().to_string()];
+        config.dns.doh_port = 0;
+        config.tls = Some(sito_core::config::TlsConfig {
+            cert: Some(cert_file),
+            key: Some(key_file),
+            sni_certs: Vec::new(),
+        });
+
+        let server = TestServerInstance::spawn(config).await.unwrap();
+        let client = server.client();
+
+        // Check POST query
+        let doh_url = server.doh_url("/dns-query");
+        let resp_post = client
+            .query_doh_post(&doh_url, "doh.example.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_post.metadata.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+        assert_eq!(resp_post.answers.len(), 1);
+        assert_eq!(
+            resp_post.answers[0].data,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 1)))
+        );
+
+        // Check GET query
+        let resp_get = client
+            .query_doh_get(&doh_url, "doh.example.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_get.metadata.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+        assert_eq!(resp_get.answers.len(), 1);
+        assert_eq!(
+            resp_get.answers[0].data,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 1)))
+        );
+
+        // Check Cache-Control: no-store header on raw HTTP response
+        let http_client = client.doh_http_client().unwrap();
+        let query_wire = sito_proto::encode_message(&resp_post).unwrap();
+        let http_resp = http_client
+            .post(&doh_url)
+            .header("Content-Type", "application/dns-message")
+            .header("Accept", "application/dns-message")
+            .body(query_wire)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(http_resp.status(), 200);
+        let cache_control = http_resp
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cache_control.contains("no-store"));
+
+        // Check DoH query with ClientID in path
+        let client_url = server.doh_url("/dns-query/alice-phone");
+        let resp_client = client
+            .query_doh_post(&client_url, "doh.example.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_client.metadata.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+
+        server.shutdown().await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// 10. Acceptance test: DNSSEC validation (Secure -> AD=1, Bogus -> SERVFAIL, NTA -> Bypass)
+    #[tokio::test]
+    async fn test_acceptance_dnssec_validation_secure_bogus_and_nta() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use hickory_proto::dnssec::PublicKey;
+        use hickory_proto::dnssec::rdata::DNSSECRData;
+        use hickory_proto::rr::{RData, Record};
+        use sito_dnssec::test_util::create_test_signed_domain;
+
+        let mock_upstream = MockDnsServer::spawn().await.unwrap();
+
+        // 1. Setup Secure domain
+        let (origin_secure, dnskey, a_record, rrsig_record, _) =
+            create_test_signed_domain("sigok.example.com.");
+        let pubkey_b64 = BASE64_STANDARD.encode(dnskey.public_key().public_bytes());
+
+        mock_upstream.add_custom_response(
+            "sigok.example.com",
+            RecordType::A,
+            vec![a_record.clone(), rrsig_record.clone()],
+            vec![Record::from_rdata(
+                origin_secure.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+            )],
+        );
+
+        // 2. Setup Bogus domain (tampered data)
+        let (origin_bogus, dnskey_bogus, _a_orig, rrsig_bogus, _) =
+            create_test_signed_domain("sigfail.example.com.");
+        let bogus_tampered_record = Record::from_rdata(
+            origin_bogus.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(6, 6, 6, 6))),
+        );
+        let pubkey_bogus_b64 = BASE64_STANDARD.encode(dnskey_bogus.public_key().public_bytes());
+
+        mock_upstream.add_custom_response(
+            "sigfail.example.com",
+            RecordType::A,
+            vec![bogus_tampered_record, rrsig_bogus],
+            vec![Record::from_rdata(
+                origin_bogus,
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey_bogus)),
+            )],
+        );
+
+        // 3. Setup NTA domain (tampered data, but domain in NTA list)
+        let (origin_nta, dnskey_nta, _a_orig_nta, rrsig_nta, _) =
+            create_test_signed_domain("bypass.example.com.");
+        let nta_tampered_record = Record::from_rdata(
+            origin_nta.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(7, 7, 7, 7))),
+        );
+        let pubkey_nta_b64 = BASE64_STANDARD.encode(dnskey_nta.public_key().public_bytes());
+
+        mock_upstream.add_custom_response(
+            "bypass.example.com",
+            RecordType::A,
+            vec![nta_tampered_record, rrsig_nta],
+            vec![Record::from_rdata(
+                origin_nta,
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey_nta)),
+            )],
+        );
+
+        let mut config = Config::default();
+        config.upstream.servers = vec![mock_upstream.addr().to_string()];
+        config.dns.dnssec.validate = true;
+        config.dns.dnssec.mode = "validate".to_string();
+        config.dns.dnssec.nta = vec!["bypass.example.com".to_string()];
+        config.dns.dnssec.trust_anchors = vec![
+            format!("sigok.example.com.:13:{pubkey_b64}"),
+            format!("sigfail.example.com.:13:{pubkey_bogus_b64}"),
+            format!("bypass.example.com.:13:{pubkey_nta_b64}"),
+        ];
+
+        let server = TestServerInstance::spawn(config).await.unwrap();
+        let client = server.client();
+
+        // Query 1: sigok -> NOERROR with AD=1
+        let resp_ok = client
+            .query_udp("sigok.example.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_ok.metadata.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+        assert!(
+            resp_ok.metadata.authentic_data,
+            "AD bit must be set for verified DNSSEC zone"
+        );
+
+        // Query 2: sigfail -> SERVFAIL (Bogus signature)
+        let resp_fail = client
+            .query_udp("sigfail.example.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_fail.metadata.response_code,
+            hickory_proto::op::ResponseCode::ServFail
+        );
+
+        // Query 3: bypass -> NOERROR, AD=0 (NTA bypass)
+        let resp_nta = client
+            .query_udp("bypass.example.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_nta.metadata.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+        assert!(
+            !resp_nta.metadata.authentic_data,
+            "AD bit must not be set for NTA bypassed zone"
+        );
+
+        server.shutdown().await.unwrap();
+    }
+
+    /// 11. Acceptance test: Cert reload without restart and without dropping persistent DoT connections
+    #[tokio::test]
+    async fn test_acceptance_cert_reload_without_disconnecting_persistent_dot() {
+        let (cert1_pem, key1_pem) = generate_test_cert(&["cert1.sito.local", "127.0.0.1"]);
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_reload_test_{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        tokio::fs::write(&cert_file, cert1_pem).await.unwrap();
+        tokio::fs::write(&key_file, key1_pem).await.unwrap();
+
+        let mock_upstream = MockDnsServer::spawn().await.unwrap();
+        mock_upstream.add_a_record("reload.test", Ipv4Addr::new(10, 1, 1, 1), 300);
+
+        let mut config = Config::default();
+        config.upstream.servers = vec![mock_upstream.addr().to_string()];
+        config.dns.dot_port = 0;
+        config.tls = Some(sito_core::config::TlsConfig {
+            cert: Some(cert_file.clone()),
+            key: Some(key_file.clone()),
+            sni_certs: Vec::new(),
+        });
+
+        let server = TestServerInstance::spawn(config).await.unwrap();
+        let client = server.client();
+
+        // 1. Establish persistent DoT connection on cert1
+        let mut conn = client
+            .connect_dot(server.dot_addr(), "cert1.sito.local", None)
+            .await
+            .unwrap();
+
+        let resp1 = conn.query("reload.test", RecordType::A).await.unwrap();
+        assert_eq!(
+            resp1.metadata.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+
+        // 2. Overwrite certificate and key with cert2 (new SAN)
+        let (cert2_pem, key2_pem) = generate_test_cert(&["cert2.sito.local", "127.0.0.1"]);
+        tokio::fs::write(&cert_file, cert2_pem).await.unwrap();
+        tokio::fs::write(&key_file, key2_pem).await.unwrap();
+
+        // Allow cert watcher debouncer / fs event to process
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // 3. Existing persistent connection STILL works and serves queries!
+        let resp2 = conn.query("reload.test", RecordType::A).await.unwrap();
+        assert_eq!(
+            resp2.metadata.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+
+        // 4. New connection connects using the new cert2 SNI
+        let mut conn2 = client
+            .connect_dot(server.dot_addr(), "cert2.sito.local", None)
+            .await
+            .unwrap();
+        let resp3 = conn2.query("reload.test", RecordType::A).await.unwrap();
+        assert_eq!(
+            resp3.metadata.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+
+        server.shutdown().await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// 12. Acceptance test: Blocking and cache behave identically across all 4 transports (UDP, TCP, DoT, DoH)
+    #[tokio::test]
+    async fn test_acceptance_all_four_transports_matrix() {
+        let (cert_pem, key_pem) = generate_test_cert(&["sito-test.local", "127.0.0.1"]);
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_matrix_test_{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        tokio::fs::write(&cert_file, cert_pem).await.unwrap();
+        tokio::fs::write(&key_file, key_pem).await.unwrap();
+
+        let mock_upstream = MockDnsServer::spawn().await.unwrap();
+        mock_upstream.add_a_record("allowed-domain.org", Ipv4Addr::new(9, 9, 9, 9), 300);
+
+        let mut config = Config::default();
+        config.upstream.servers = vec![mock_upstream.addr().to_string()];
+        config.dns.dot_port = 0;
+        config.dns.doh_port = 0;
+        config.filtering.custom_rules = vec!["||blocked-matrix.com^".to_string()];
+        config.tls = Some(sito_core::config::TlsConfig {
+            cert: Some(cert_file),
+            key: Some(key_file),
+            sni_certs: Vec::new(),
+        });
+
+        let server = TestServerInstance::spawn(config).await.unwrap();
+        let client = server.client();
+        let doh_url = server.doh_url("/dns-query");
+
+        // --- Verify Blocking across all 4 transports ---
+        // 1. UDP
+        let udp_block = client
+            .query_udp("blocked-matrix.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            udp_block.answers[0].data,
+            RData::A(A(Ipv4Addr::UNSPECIFIED))
+        );
+
+        // 2. TCP
+        let tcp_block = client
+            .query_tcp("blocked-matrix.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            tcp_block.answers[0].data,
+            RData::A(A(Ipv4Addr::UNSPECIFIED))
+        );
+
+        // 3. DoT
+        let dot_block = client
+            .query_dot(
+                server.dot_addr(),
+                "sito-test.local",
+                "blocked-matrix.com",
+                RecordType::A,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dot_block.answers[0].data,
+            RData::A(A(Ipv4Addr::UNSPECIFIED))
+        );
+
+        // 4. DoH
+        let doh_block = client
+            .query_doh_post(&doh_url, "blocked-matrix.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            doh_block.answers[0].data,
+            RData::A(A(Ipv4Addr::UNSPECIFIED))
+        );
+
+        // --- Verify Caching across all 4 transports ---
+        // First query via UDP populates cache
+        let r_udp = client
+            .query_udp("allowed-domain.org", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(mock_upstream.query_count(), 1);
+        let orig_ttl = r_udp.answers[0].ttl;
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        // Query via TCP hits cache with decremented TTL
+        let r_tcp = client
+            .query_tcp("allowed-domain.org", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(mock_upstream.query_count(), 1);
+        assert!(r_tcp.answers[0].ttl < orig_ttl);
+
+        // Query via DoT hits cache
+        let r_dot = client
+            .query_dot(
+                server.dot_addr(),
+                "sito-test.local",
+                "allowed-domain.org",
+                RecordType::A,
+            )
+            .await
+            .unwrap();
+        assert_eq!(mock_upstream.query_count(), 1);
+        assert!(r_dot.answers[0].ttl < orig_ttl);
+
+        // Query via DoH hits cache
+        let r_doh = client
+            .query_doh_get(&doh_url, "allowed-domain.org", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(mock_upstream.query_count(), 1);
+        assert!(r_doh.answers[0].ttl < orig_ttl);
+
+        server.shutdown().await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

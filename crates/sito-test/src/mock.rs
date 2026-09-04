@@ -13,12 +13,18 @@ use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tracing::trace;
 
+#[derive(Debug, Default, Clone)]
+pub struct MockRecordResponse {
+    pub answers: Vec<Record>,
+    pub additionals: Vec<Record>,
+}
+
 /// Lightweight in-process mock upstream DNS server.
 pub struct MockDnsServer {
     addr: SocketAddr,
     alive: Arc<AtomicBool>,
     query_count: Arc<AtomicUsize>,
-    records: Arc<DashMap<(String, RecordType), Vec<Record>>>,
+    records: Arc<DashMap<(String, RecordType), MockRecordResponse>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -30,7 +36,8 @@ impl MockDnsServer {
 
         let alive = Arc::new(AtomicBool::new(true));
         let query_count = Arc::new(AtomicUsize::new(0));
-        let records: Arc<DashMap<(String, RecordType), Vec<Record>>> = Arc::new(DashMap::new());
+        let records: Arc<DashMap<(String, RecordType), MockRecordResponse>> =
+            Arc::new(DashMap::new());
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
         let alive_clone = Arc::clone(&alive);
@@ -66,8 +73,11 @@ impl MockDnsServer {
 
                             if let Some(entry) = records_clone.get(&(norm, qtype)) {
                                 resp.metadata.response_code = ResponseCode::NoError;
-                                for r in entry.value() {
+                                for r in &entry.answers {
                                     resp.answers.push(r.clone());
+                                }
+                                for r in &entry.additionals {
+                                    resp.additionals.push(r.clone());
                                 }
                             } else {
                                 resp.metadata.response_code = ResponseCode::NXDomain;
@@ -106,6 +116,7 @@ impl MockDnsServer {
         self.records
             .entry((norm, RecordType::A))
             .or_default()
+            .answers
             .push(record);
     }
 
@@ -118,7 +129,26 @@ impl MockDnsServer {
         self.records
             .entry((norm, RecordType::AAAA))
             .or_default()
+            .answers
             .push(record);
+    }
+
+    /// Adds custom answers and additionals for a given domain and qtype.
+    pub fn add_custom_response(
+        &self,
+        domain: &str,
+        qtype: RecordType,
+        answers: Vec<Record>,
+        additionals: Vec<Record>,
+    ) {
+        let norm = normalize_domain(domain).unwrap_or_else(|_| domain.to_string());
+        self.records.insert(
+            (norm, qtype),
+            MockRecordResponse {
+                answers,
+                additionals,
+            },
+        );
     }
 
     /// Toggles mock server availability (if false, drops all incoming UDP queries).

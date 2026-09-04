@@ -100,12 +100,16 @@ mod tests {
             HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
         );
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let dnssec = Arc::new(sito_dnssec::DnssecValidator::from_config(
+            &config.dns.dnssec,
+        ));
 
         let pipeline = DnsPipeline::new(
             Arc::new(config.clone()),
             filter,
             cache.clone(),
             upstream,
+            dnssec,
             in_flight,
         );
 
@@ -224,9 +228,18 @@ mod tests {
             HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
         );
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let dnssec = Arc::new(sito_dnssec::DnssecValidator::from_config(
+            &config.dns.dnssec,
+        ));
 
-        let pipeline =
-            DnsPipeline::new(Arc::new(config.clone()), filter, cache, upstream, in_flight);
+        let pipeline = DnsPipeline::new(
+            Arc::new(config.clone()),
+            filter,
+            cache,
+            upstream,
+            dnssec,
+            in_flight,
+        );
 
         let client = ClientContext::new("127.0.0.1".parse().unwrap());
 

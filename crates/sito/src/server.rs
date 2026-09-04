@@ -9,8 +9,13 @@ use tracing::{info, warn};
 
 use sito_cache::DnsCache;
 use sito_core::config::Config;
+use sito_dnssec::DnssecValidator;
 use sito_filter::HostsFilterEngine;
-use sito_transport::{TcpConfig, UdpConfig, start_tcp_listener, start_udp_listener};
+use sito_transport::{
+    CertWatcher, DohConfig, DotConfig, TcpConfig, TlsAcceptorManager, UdpConfig,
+    load_server_config, start_doh_listener, start_dot_listener, start_tcp_listener,
+    start_udp_listener,
+};
 use sito_upstream::{BootstrapResolver, UpstreamManager};
 
 use crate::pipeline::DnsPipeline;
@@ -49,14 +54,66 @@ pub async fn run_server_with_shutdown(
     );
     let _refresh_handle = filter_engine.clone().spawn_refresh_task();
 
+    // Initialize DNSSEC validator
+    let dnssec = Arc::new(DnssecValidator::from_config(&config.dns.dnssec));
+
     // Construct pipeline
     let pipeline = Arc::new(DnsPipeline::new(
         Arc::new(config.clone()),
         filter_engine,
         cache,
         upstream_manager,
+        dnssec,
         in_flight.clone(),
     ));
+
+    // Load TLS configuration if configured
+    let (dot_acceptor_mgr, doh_acceptor_mgr) = if let Some(tls_cfg) = config.get_tls_config() {
+        if let (Some(cert), Some(key)) = (&tls_cfg.cert, &tls_cfg.key) {
+            let sni_tuples = tls_cfg.sni_tuples();
+            let dot_mgr = match load_server_config(cert, key, &sni_tuples, vec![b"dot".to_vec()]) {
+                Ok(cfg) => {
+                    let mgr = TlsAcceptorManager::new(cfg);
+                    let _ =
+                        CertWatcher::start(cert, key, &sni_tuples, &[b"dot".to_vec()], mgr.clone());
+                    Some(mgr)
+                }
+                Err(e) => {
+                    warn!("Failed to initialize DoT TLS configuration: {}", e);
+                    None
+                }
+            };
+
+            let doh_mgr = match load_server_config(
+                cert,
+                key,
+                &sni_tuples,
+                vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            ) {
+                Ok(cfg) => {
+                    let mgr = TlsAcceptorManager::new(cfg);
+                    let _ = CertWatcher::start(
+                        cert,
+                        key,
+                        &sni_tuples,
+                        &[b"h2".to_vec(), b"http/1.1".to_vec()],
+                        mgr.clone(),
+                    );
+                    Some(mgr)
+                }
+                Err(e) => {
+                    warn!("Failed to initialize DoH TLS configuration: {}", e);
+                    None
+                }
+            };
+
+            (dot_mgr, doh_mgr)
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
 
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
 
@@ -86,6 +143,31 @@ pub async fn run_server_with_shutdown(
         let tcp_handle =
             start_tcp_listener(tcp_config, pipeline.clone(), shutdown_rx.clone()).await?;
         all_handles.push(tcp_handle);
+
+        // Start DoT listener if dot_port > 0 and TLS is configured
+        if config.dns.dot_port > 0 {
+            if let Some(ref dot_mgr) = dot_acceptor_mgr {
+                let dot_addr = SocketAddr::new(*bind_ip, config.dns.dot_port);
+                let mut dot_config = DotConfig::new(dot_addr, dot_mgr.clone());
+                dot_config.dot_padding = config.dns.dot_padding;
+                dot_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+                dot_config.max_connections = config.dns.max_tcp_connections;
+                let dot_handle =
+                    start_dot_listener(dot_config, pipeline.clone(), shutdown_rx.clone()).await?;
+                all_handles.push(dot_handle);
+            }
+        }
+
+        // Start DoH listener if doh_port > 0 and (TLS configured or non-default port)
+        if config.dns.doh_port > 0 && (doh_acceptor_mgr.is_some() || config.dns.doh_port != 443) {
+            let doh_addr = SocketAddr::new(*bind_ip, config.dns.doh_port);
+            let mut doh_config = DohConfig::new(doh_addr, doh_acceptor_mgr.clone());
+            doh_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            doh_config.max_connections = config.dns.max_tcp_connections;
+            let doh_handle =
+                start_doh_listener(doh_config, pipeline.clone(), shutdown_rx.clone()).await?;
+            all_handles.push(doh_handle);
+        }
     }
 
     let _ = all_handles;
