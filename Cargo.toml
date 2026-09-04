@@ -49,6 +49,7 @@ webpki-roots = "0.26"
 tokio-rustls = "0.26"
 rand = "0.8"
 idna = "1.0"
+async-trait = "0.1"
 
 # Internal workspace dependencies
 sito-core = { path = "crates/sito-core", version = "0.1.0" }
