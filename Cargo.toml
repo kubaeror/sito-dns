@@ -52,6 +52,7 @@ idna = "1.0"
 async-trait = "0.1"
 
 # Internal workspace dependencies
+sito = { path = "crates/sito", version = "0.1.0" }
 sito-core = { path = "crates/sito-core", version = "0.1.0" }
 sito-proto = { path = "crates/sito-proto", version = "0.1.0" }
 sito-transport = { path = "crates/sito-transport", version = "0.1.0" }

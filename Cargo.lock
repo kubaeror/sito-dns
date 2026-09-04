@@ -1497,9 +1497,19 @@ dependencies = [
 name = "sito-test"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "dashmap",
+ "hickory-proto",
+ "rand 0.8.8",
+ "sito",
+ "sito-cache",
  "sito-core",
+ "sito-filter",
  "sito-proto",
+ "sito-transport",
+ "sito-upstream",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

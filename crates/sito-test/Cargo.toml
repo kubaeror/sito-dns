@@ -7,9 +7,19 @@ license.workspace = true
 description = "Integration test harness and mock servers for sito"
 
 [dependencies]
+sito.workspace = true
 sito-core.workspace = true
 sito-proto.workspace = true
+sito-transport.workspace = true
+sito-upstream.workspace = true
+sito-cache.workspace = true
+sito-filter.workspace = true
+hickory-proto.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+dashmap.workspace = true
+rand.workspace = true
 
 [lints]
 workspace = true
