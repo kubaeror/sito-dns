@@ -8,8 +8,10 @@ pub mod engine;
 pub mod error;
 pub mod parser;
 pub mod structures;
+pub mod subscription;
 
 pub use downloader::ListDownloader;
 pub use engine::{FilterSnapshot, HostsFilterEngine};
 pub use error::FilterError;
-pub use parser::parse_hosts;
+pub use parser::{Pattern, Rule, RuleKind, RuleModifiers, parse_hosts, parse_rules};
+pub use subscription::{ListMetadata, SubscriptionFetcher};

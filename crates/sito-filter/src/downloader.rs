@@ -3,7 +3,6 @@
 use crate::error::FilterError;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tracing::{debug, info, warn};
 
 pub const DEFAULT_MAX_LIST_BYTES: usize = 64 * 1024 * 1024; // 64 MB
 pub const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -34,62 +33,20 @@ impl ListDownloader {
     }
 
     /// Fetches a list from URL or file:// URI, falling back to disk cache if download fails.
+    /// Honors HTTP ETag and If-Modified-Since caching headers and retries with backoff.
     pub async fn fetch_or_cached(
         &self,
         list_name: &str,
         url: &str,
         data_dir: &Path,
     ) -> Result<String, FilterError> {
-        let cache_path = cache_path_for_list(data_dir, list_name);
-
-        // Handle file:// scheme directly
-        if let Some(file_path) = url.strip_prefix("file://") {
-            debug!(list = %list_name, path = %file_path, "Reading blocklist from local file");
-            return tokio::fs::read_to_string(file_path)
-                .await
-                .map_err(|e| FilterError::Io {
-                    path: PathBuf::from(file_path),
-                    source: e,
-                });
-        }
-
-        // Attempt HTTP/HTTPS download
-        match self.download(list_name, url).await {
-            Ok(content) => {
-                info!(list = %list_name, bytes = content.len(), "Successfully downloaded blocklist");
-                if let Err(e) = save_to_cache(&cache_path, &content).await {
-                    warn!(list = %list_name, path = %cache_path.display(), error = %e, "Failed to save blocklist to disk cache");
-                }
-                Ok(content)
-            }
-            Err(e) => {
-                warn!(
-                    list = %list_name,
-                    url = %url,
-                    error = %e,
-                    "Failed to download blocklist; attempting disk cache fallback"
-                );
-                match read_from_cache(&cache_path).await {
-                    Ok(cached) => {
-                        info!(
-                            list = %list_name,
-                            path = %cache_path.display(),
-                            bytes = cached.len(),
-                            "Loaded blocklist from disk cache fallback"
-                        );
-                        Ok(cached)
-                    }
-                    Err(cache_err) => {
-                        warn!(
-                            list = %list_name,
-                            cache_error = %cache_err,
-                            "Disk cache unavailable for blocklist"
-                        );
-                        Err(e)
-                    }
-                }
-            }
-        }
+        let fetcher = crate::subscription::SubscriptionFetcher::new(
+            Duration::from_secs(60),
+            self.max_bytes,
+            3,
+            Duration::from_millis(50),
+        );
+        fetcher.fetch_or_cached(list_name, url, data_dir).await
     }
 
     /// Downloads a blocklist over HTTP/HTTPS with size checking.
