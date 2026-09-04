@@ -2116,6 +2116,7 @@ dependencies = [
  "serde_json",
  "sito-core",
  "thiserror",
+ "tokio",
  "toml",
  "tracing",
 ]
