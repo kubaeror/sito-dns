@@ -1,0 +1,52 @@
+config_version = 1
+
+[server]
+role = "master"
+instance_name = "sito-main"
+data_dir = "/var/lib/sito"
+log_level = "info"
+log_format = "pretty"
+
+[dns]
+bind = ["0.0.0.0", "::"]
+port = 53
+dot_port = 853
+doh_port = 443
+doq_port = 853
+edns_udp_size = 1232
+rate_limit_per_ip = 20
+max_tcp_connections = 256
+
+[dns.cache]
+enabled = true
+size_mb = 64
+min_ttl = 60
+max_ttl = 86400
+negative_ttl_max = 3600
+prefetch = false
+serve_stale_hours = 0
+
+[dns.dnssec]
+validate = false
+ntp = []
+
+[upstream]
+servers = ["1.1.1.1:53", "1.0.0.1:53"]
+bootstrap = ["9.9.9.9", "149.112.112.112"]
+strategy = "failover"
+timeout_ms = 5000
+probe_domain = "example.com"
+pool_size = 4
+
+[filtering]
+enabled = true
+refresh_interval_hours = 24
+blocking_mode = "zero_ip"
+blocking_ttl = 10
+cname_cloaking = true
+anti_doh_bypass = "off"
+lists = []
+custom_rules = [
+    "0.0.0.0 ads.example.com",
+    "127.0.0.1 tracker.bad.net"
+]

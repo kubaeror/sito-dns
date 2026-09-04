@@ -8,7 +8,18 @@ description = "Self-hosted, high-performance, filtering DNS server"
 
 [dependencies]
 clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+hickory-proto.workspace = true
 sito-core.workspace = true
+sito-proto.workspace = true
+sito-transport.workspace = true
+sito-upstream.workspace = true
+sito-cache.workspace = true
+rand.workspace = true
+sito-filter.workspace = true
 
 [lints]
 workspace = true

@@ -1,12 +1,90 @@
 //! Binary entry point for the `sito` DNS server CLI.
 
 use clap::Parser;
+use sito::cli::{Cli, Commands, run_check_config, run_healthcheck};
+use sito::server::run_server;
+use sito_core::config::Config;
+use std::net::SocketAddr;
 
-#[derive(Parser, Debug)]
-#[command(name = "sito")]
-#[command(author, version, about = "High-performance, self-hosted, filtering DNS server", long_about = None)]
-struct Cli {}
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
 
-fn main() {
-    let _args = Cli::parse();
+    // Handle subcommands
+    if let Some(cmd) = cli.command {
+        match cmd {
+            Commands::CheckConfig { config } => {
+                let config_path = config.unwrap_or(cli.config);
+                if let Err(e) = run_check_config(&config_path) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            Commands::Healthcheck {
+                address,
+                timeout_ms,
+            } => {
+                let target_addr = if let Some(addr) = address {
+                    addr
+                } else if let Ok(content) = std::fs::read_to_string(&cli.config) {
+                    if let Ok(cfg) = Config::from_toml_str(&content) {
+                        SocketAddr::new("127.0.0.1".parse().unwrap(), cfg.dns.port)
+                    } else {
+                        "127.0.0.1:53".parse().unwrap()
+                    }
+                } else {
+                    "127.0.0.1:53".parse().unwrap()
+                };
+
+                if let Err(e) = run_healthcheck(target_addr, timeout_ms).await {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    // Server execution path
+    let config_path = cli.config;
+    let content = std::fs::read_to_string(&config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to open configuration file '{}': {}",
+            config_path.display(),
+            e
+        )
+    })?;
+
+    let config = Config::from_toml_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "Invalid configuration in '{}': {}",
+            config_path.display(),
+            e
+        )
+    })?;
+
+    // Initialize tracing subscriber per configuration
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.server.log_level));
+
+    if config.server.log_format == "pretty" {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .pretty()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .init();
+    }
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        config = %config_path.display(),
+        "Starting sito DNS server"
+    );
+
+    run_server(config).await
 }
