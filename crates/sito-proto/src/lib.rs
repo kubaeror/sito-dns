@@ -14,5 +14,7 @@ pub use wire::{
 };
 
 // Re-export core hickory types so other sito crates don't need direct hickory-proto dependency
-pub use hickory_proto::op::{Edns, Header, Message, MessageType, Metadata, OpCode, ResponseCode};
-pub use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+pub use hickory_proto::op::{
+    Edns, Header, Message, MessageType, Metadata, OpCode, Query, ResponseCode,
+};
+pub use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType, rdata};
