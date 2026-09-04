@@ -186,13 +186,11 @@ mod tests {
         // Total time should be upstream 1 timeout (~400ms) + small overhead (<100ms)
         assert!(
             elapsed >= Duration::from_millis(350),
-            "Elapsed was suspiciously fast: {:?}",
-            elapsed
+            "Elapsed was suspiciously fast: {elapsed:?}"
         );
         assert!(
             elapsed < Duration::from_millis(700),
-            "Failover took too long: {:?}",
-            elapsed
+            "Failover took too long: {elapsed:?}"
         );
 
         server.shutdown().await.unwrap();
@@ -255,11 +253,10 @@ mod tests {
         let shutdown_res = server.shutdown().await;
         let elapsed = start.elapsed();
 
-        assert!(shutdown_res.is_ok(), "Shutdown failed: {:?}", shutdown_res);
+        assert!(shutdown_res.is_ok(), "Shutdown failed: {shutdown_res:?}");
         assert!(
             elapsed <= Duration::from_secs(6),
-            "Shutdown took longer than 6s: {:?}",
-            elapsed
+            "Shutdown took longer than 6s: {elapsed:?}"
         );
     }
 

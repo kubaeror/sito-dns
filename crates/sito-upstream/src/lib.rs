@@ -144,10 +144,8 @@ mod tests {
         // Bind UDP and TCP on the same ephemeral port
         let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = tcp_listener.local_addr().unwrap().port();
-        let udp_socket = UdpSocket::bind(format!("127.0.0.1:{}", port))
-            .await
-            .unwrap();
-        let server_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let udp_socket = UdpSocket::bind(format!("127.0.0.1:{port}")).await.unwrap();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
         // UDP handler returns TC=1 (truncation)
         tokio::spawn(async move {

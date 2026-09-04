@@ -390,11 +390,13 @@ mod tests {
     async fn test_hosts_filter_blocking() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_engine_test_{}", std::process::id()));
-        let mut config = FilteringConfig::default();
-        config.custom_rules = vec![
-            "0.0.0.0 ads.example.com".to_string(),
-            "127.0.0.1 tracker.bad.net".to_string(),
-        ];
+        let config = FilteringConfig {
+            custom_rules: vec![
+                "0.0.0.0 ads.example.com".to_string(),
+                "127.0.0.1 tracker.bad.net".to_string(),
+            ],
+            ..Default::default()
+        };
 
         let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
         let client = ClientContext::new("127.0.0.1".parse().unwrap());
@@ -416,17 +418,19 @@ mod tests {
     async fn test_abp_rules_and_precedence() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_precedence_test_{}", std::process::id()));
-        let mut config = FilteringConfig::default();
-        config.custom_rules = vec![
-            // Standard block
-            "||blocked.example^".to_string(),
-            // Allowlist beats standard block
-            "@@||sub.blocked.example^".to_string(),
-            // Important block beats standard allowlist
-            "||important.sub.blocked.example^$important".to_string(),
-            // Important allowlist beats important block
-            "@@||special.important.sub.blocked.example^$important".to_string(),
-        ];
+        let config = FilteringConfig {
+            custom_rules: vec![
+                // Standard block
+                "||blocked.example^".to_string(),
+                // Allowlist beats standard block
+                "@@||sub.blocked.example^".to_string(),
+                // Important block beats standard allowlist
+                "||important.sub.blocked.example^$important".to_string(),
+                // Important allowlist beats important block
+                "@@||special.important.sub.blocked.example^$important".to_string(),
+            ],
+            ..Default::default()
+        };
 
         let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
         let client = ClientContext::new("127.0.0.1".parse().unwrap());
@@ -454,20 +458,22 @@ mod tests {
     async fn test_modifiers_evaluation() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_modifiers_test_{}", std::process::id()));
-        let mut config = FilteringConfig::default();
-        config.custom_rules = vec![
-            // $client
-            "||client-only.com^$client=192.168.1.100|laptop".to_string(),
-            // $dnstype
-            "||type-only.com^$dnstype=HTTPS|65".to_string(),
-            // $denyallow
-            "||denyallow.com^$denyallow=allowed.denyallow.com".to_string(),
-            // $dnsrewrite
-            "||rewrite.com^$dnsrewrite=1.2.3.4".to_string(),
-            // $badfilter deactivates a rule
-            "||deactivated.com^".to_string(),
-            "||deactivated.com^$badfilter".to_string(),
-        ];
+        let config = FilteringConfig {
+            custom_rules: vec![
+                // $client
+                "||client-only.com^$client=192.168.1.100|laptop".to_string(),
+                // $dnstype
+                "||type-only.com^$dnstype=HTTPS|65".to_string(),
+                // $denyallow
+                "||denyallow.com^$denyallow=allowed.denyallow.com".to_string(),
+                // $dnsrewrite
+                "||rewrite.com^$dnsrewrite=1.2.3.4".to_string(),
+                // $badfilter deactivates a rule
+                "||deactivated.com^".to_string(),
+                "||deactivated.com^$badfilter".to_string(),
+            ],
+            ..Default::default()
+        };
 
         let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
 
@@ -560,13 +566,15 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = FilteringConfig::default();
-        config.lists = vec![FilterListConfig {
-            name: "offline_list".to_string(),
-            url: "http://127.0.0.1:1".to_string(),
-            enabled: true,
-            refresh_hours: None,
-        }];
+        let config = FilteringConfig {
+            lists: vec![FilterListConfig {
+                name: "offline_list".to_string(),
+                url: "http://127.0.0.1:1".to_string(),
+                enabled: true,
+                refresh_hours: None,
+            }],
+            ..Default::default()
+        };
 
         let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
         assert_eq!(engine.rule_count(), 1);
@@ -581,10 +589,12 @@ mod tests {
     #[tokio::test]
     async fn test_protection_against_drastic_rule_drop() {
         let temp_dir = std::env::temp_dir().join(format!("sito_drop_test_{}", std::process::id()));
-        let mut config = FilteringConfig::default();
-        config.custom_rules = vec![
-            "0.0.0.0 ad1.com\n0.0.0.0 ad2.com\n0.0.0.0 ad3.com\n0.0.0.0 ad4.com\n0.0.0.0 ad5.com\n0.0.0.0 ad6.com".to_string(),
-        ];
+        let config = FilteringConfig {
+            custom_rules: vec![
+                "0.0.0.0 ad1.com\n0.0.0.0 ad2.com\n0.0.0.0 ad3.com\n0.0.0.0 ad4.com\n0.0.0.0 ad5.com\n0.0.0.0 ad6.com".to_string(),
+            ],
+            ..Default::default()
+        };
 
         let mut engine = HostsFilterEngine::init(config.clone(), temp_dir.clone()).await;
         assert_eq!(engine.rule_count(), 6);

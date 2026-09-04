@@ -304,7 +304,7 @@ mod tests {
         let meta = ListMetadata {
             etag: Some("\"abc123etag\"".to_string()),
             last_modified: Some("Fri, 05 Sep 2026 00:00:00 GMT".to_string()),
-            updated_at_secs: 123456789,
+            updated_at_secs: 123_456_789,
         };
 
         save_metadata(&meta_file, &meta).await.unwrap();

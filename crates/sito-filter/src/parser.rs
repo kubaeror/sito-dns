@@ -797,7 +797,7 @@ mod tests {
 
     #[test]
     fn test_parse_hosts_basic() {
-        let content = r#"
+        let content = r"
 # Standard hosts file comment
 127.0.0.1 localhost
 ::1 localhost ip6-localhost
@@ -805,7 +805,7 @@ mod tests {
 127.0.0.1 tracking.example.org bad.domain.net # inline comment
 ! ABP style comment
 plain-ad.com
-"#;
+";
         let mut set = FnvHashSet::default();
         let count = parse_hosts(content, &mut set);
 
@@ -941,12 +941,12 @@ plain-ad.com
 
     #[test]
     fn test_unknown_modifier_skips_rule_without_aborting() {
-        let content = r#"
+        let content = r"
 ||blocked.com^
 ||skipped.com^$image
 ||another-blocked.com^
 ||skipped2.com^$third-party,script
-"#;
+";
         let (rules, skipped) = parse_rules(content, "test");
         assert_eq!(rules.len(), 2);
         assert_eq!(skipped, 2);
@@ -959,11 +959,11 @@ plain-ad.com
 
     #[test]
     fn test_regex_rule_parsing() {
-        let line = r#"/^ad[0-9]+\.example\.com$/$important"#;
+        let line = r"/^ad[0-9]+\.example\.com$/$important";
         let rule = parse_line(line, "test", 1).unwrap();
         assert_eq!(
             rule.pattern,
-            Pattern::Regex(r#"^ad[0-9]+\.example\.com$"#.to_string())
+            Pattern::Regex(r"^ad[0-9]+\.example\.com$".to_string())
         );
         assert!(rule.modifiers.important);
     }

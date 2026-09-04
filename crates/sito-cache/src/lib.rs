@@ -65,7 +65,7 @@ mod tests {
             .expect("should hit cache");
         assert_eq!(cached.answers.len(), 1);
         let ttl_first = cached.answers[0].ttl;
-        assert!(ttl_first <= 100 && ttl_first >= 99);
+        assert!((99..=100).contains(&ttl_first));
 
         // Sleep 1 second and retrieve again
         tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -77,9 +77,7 @@ mod tests {
         let ttl_second = cached2.answers[0].ttl;
         assert!(
             ttl_second < ttl_first,
-            "TTL must decrease as time elapses (first: {}, second: {})",
-            ttl_first,
-            ttl_second
+            "TTL must decrease as time elapses (first: {ttl_first}, second: {ttl_second})"
         );
     }
 
@@ -157,10 +155,10 @@ mod tests {
             RData::SOA(SOA::new(
                 Name::from_str("ns1.example.").unwrap(),
                 Name::from_str("hostmaster.example.").unwrap(),
-                2026090401,
+                2_026_090_401,
                 7200,
                 3600,
-                1209600,
+                1_209_600,
                 120, // SOA minimum TTL = 120s
             )),
         ));
