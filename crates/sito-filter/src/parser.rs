@@ -76,10 +76,26 @@ impl ClientMatcher {
             Self::Cidr { ip, prefix } => cidr_matches(*ip, *prefix, ctx.ip),
             Self::Name(name) => {
                 if let Some(id) = &ctx.id {
-                    id.as_str().eq_ignore_ascii_case(name)
-                } else {
-                    false
+                    if id.as_str().eq_ignore_ascii_case(name) {
+                        return true;
+                    }
                 }
+                if let Some(client_name) = &ctx.client_name {
+                    if client_name.eq_ignore_ascii_case(name) {
+                        return true;
+                    }
+                }
+                if let Some(group) = &ctx.group {
+                    if group.eq_ignore_ascii_case(name) {
+                        return true;
+                    }
+                }
+                if let Some(mac) = &ctx.mac {
+                    if mac.eq_ignore_ascii_case(name) {
+                        return true;
+                    }
+                }
+                false
             }
         }
     }

@@ -2111,10 +2111,12 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "croner",
+ "reqwest",
  "serde",
  "serde_json",
  "sito-core",
  "thiserror",
+ "toml",
  "tracing",
 ]
 

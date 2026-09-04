@@ -11,6 +11,8 @@ croner = "4.0.0"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
+reqwest = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sito-core.workspace = true

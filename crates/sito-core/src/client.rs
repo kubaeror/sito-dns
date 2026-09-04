@@ -27,8 +27,16 @@ impl std::fmt::Display for ClientId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientContext {
     pub ip: IpAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<ClientId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 impl ClientContext {
@@ -37,6 +45,9 @@ impl ClientContext {
             ip,
             id: None,
             sni: None,
+            mac: None,
+            client_name: None,
+            group: None,
         }
     }
 
@@ -45,6 +56,9 @@ impl ClientContext {
             ip,
             id: Some(ClientId::new(id)),
             sni: None,
+            mac: None,
+            client_name: None,
+            group: None,
         }
     }
 
@@ -54,6 +68,27 @@ impl ClientContext {
             ip,
             id: Some(ClientId::new(s.clone())),
             sni: Some(s),
+            mac: None,
+            client_name: None,
+            group: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_mac(mut self, mac: impl Into<String>) -> Self {
+        self.mac = Some(mac.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_client_name(mut self, name: impl Into<String>) -> Self {
+        self.client_name = Some(name.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = Some(group.into());
+        self
     }
 }
