@@ -9,6 +9,9 @@ description = "High-performance in-memory DNS cache for sito"
 [dependencies]
 sito-core.workspace = true
 sito-proto.workspace = true
+moka.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true
