@@ -1,0 +1,14 @@
+[package]
+name = "sito-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Multi-protocol DNS transport listeners for sito"
+
+[dependencies]
+sito-core.workspace = true
+sito-proto.workspace = true
+
+[lints]
+workspace = true

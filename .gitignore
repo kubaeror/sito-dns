@@ -1,0 +1,21 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Node / Frontend
+node_modules/
+dist/
+.dist/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS and IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp

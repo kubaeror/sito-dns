@@ -1,0 +1,13 @@
+[package]
+name = "sito-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "REST API, OpenAPI documentation, and administration server for sito"
+
+[dependencies]
+sito-core.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,68 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sito",
+    "crates/sito-core",
+    "crates/sito-proto",
+    "crates/sito-transport",
+    "crates/sito-upstream",
+    "crates/sito-cache",
+    "crates/sito-filter",
+    "crates/sito-dnssec",
+    "crates/sito-clients",
+    "crates/sito-rewrites",
+    "crates/sito-api",
+    "crates/sito-stats",
+    "crates/sito-ha",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "GPL-3.0-only"
+authors = ["sito contributors"]
+repository = "https://github.com/kubaeror/sito-dns"
+homepage = "https://github.com/kubaeror/sito-dns"
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+
+# Internal workspace dependencies
+sito-core = { path = "crates/sito-core", version = "0.1.0" }
+sito-proto = { path = "crates/sito-proto", version = "0.1.0" }
+sito-transport = { path = "crates/sito-transport", version = "0.1.0" }
+sito-upstream = { path = "crates/sito-upstream", version = "0.1.0" }
+sito-cache = { path = "crates/sito-cache", version = "0.1.0" }
+sito-filter = { path = "crates/sito-filter", version = "0.1.0" }
+sito-dnssec = { path = "crates/sito-dnssec", version = "0.1.0" }
+sito-clients = { path = "crates/sito-clients", version = "0.1.0" }
+sito-rewrites = { path = "crates/sito-rewrites", version = "0.1.0" }
+sito-api = { path = "crates/sito-api", version = "0.1.0" }
+sito-stats = { path = "crates/sito-stats", version = "0.1.0" }
+sito-ha = { path = "crates/sito-ha", version = "0.1.0" }
+
+[workspace.lints.rust]
+# Future Rust lints can be specified here
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Allowlist of pedantic lints that are too noisy or unidiomatic for DNS systems
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+struct_excessive_bools = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+default_trait_access = "allow"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = true

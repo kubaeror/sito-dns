@@ -1,0 +1,13 @@
+[package]
+name = "sito-stats"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Query logging, persistent SQLite storage, and Prometheus metrics for sito"
+
+[dependencies]
+sito-core.workspace = true
+
+[lints]
+workspace = true

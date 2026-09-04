@@ -1,0 +1,13 @@
+[package]
+name = "sito-clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Client registry, identification, and group policy management for sito"
+
+[dependencies]
+sito-core.workspace = true
+
+[lints]
+workspace = true
