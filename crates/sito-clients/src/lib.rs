@@ -6,10 +6,6 @@
 //! - Scheduled access policies and category-based blocking
 //! - Router integration (e.g. MikroTik RouterOS DHCP lease synchronization)
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_clients_initialization() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod schedule;
+
+pub use schedule::{Schedule, ScheduleError};
