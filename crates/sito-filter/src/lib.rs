@@ -1,16 +1,14 @@
 //! `sito-filter`
 //!
-//! High-throughput DNS filtering engine supporting AdGuard/ABP rule syntax:
-//! - `SuffixTrie` with label interning for exact and wildcard domain rules
-//! - Aho-Corasick multi-pattern search for fast substring matching
-//! - Backtracking-free regex DFA execution using `regex-automata`
-//! - Rule modifiers, exception rules (`@@`), and CNAME uncloaking inspection
-//! - Subscription scheduler with ETag validation and atomic snapshot swapping
+//! High-throughput DNS filtering engine supporting hosts-format blocklists,
+//! asynchronous downloading with disk caching, and atomic snapshot updates.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_filter_initialization() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod downloader;
+pub mod engine;
+pub mod error;
+pub mod parser;
+
+pub use downloader::ListDownloader;
+pub use engine::{FilterSnapshot, HostsFilterEngine};
+pub use error::FilterError;
+pub use parser::parse_hosts;
