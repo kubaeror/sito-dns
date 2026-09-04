@@ -11,10 +11,11 @@ pub use mock::MockDnsServer;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::rr::{RData, RecordType};
+    use hickory_proto::rr::{Name, RData, RecordType};
     use sito_core::config::{Config, FilterListConfig};
-    use sito_proto::rdata::{A, AAAA};
+    use sito_proto::rdata::{A, AAAA, CNAME, PTR};
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::str::FromStr;
     use std::time::Duration;
 
     /// 1. Acceptance test: dig @127.0.0.1 example.com -> NOERROR via fake upstream
@@ -757,5 +758,458 @@ mod tests {
 
         server.shutdown().await.unwrap();
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// 13. Acceptance test: Policy Matrix across multiple clients and groups (M4.6)
+    /// Devices: kid-device (kids), adult-device (adults), guest-device (bypass), unknown (default)
+    /// Tests: ad domain, adult domain, tiktok, safe search on Google
+    #[tokio::test]
+    async fn test_acceptance_m4_policy_matrix_devices_and_groups() {
+        let (cert_pem, key_pem) = generate_test_cert(&["sito-test.local", "127.0.0.1"]);
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_matrix_p_test_{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        tokio::fs::write(&cert_file, cert_pem).await.unwrap();
+        tokio::fs::write(&key_file, key_pem).await.unwrap();
+
+        let mock_upstream = MockDnsServer::spawn().await.unwrap();
+        mock_upstream.add_a_record("ad-tracker.com", Ipv4Addr::new(1, 2, 3, 4), 300);
+        mock_upstream.add_a_record("pornhub.com", Ipv4Addr::new(1, 2, 3, 4), 300);
+        mock_upstream.add_a_record("tiktok.com", Ipv4Addr::new(1, 2, 3, 4), 300);
+        mock_upstream.add_a_record("www.google.com", Ipv4Addr::new(1, 2, 3, 4), 300);
+        mock_upstream.add_a_record("allowed-clean.com", Ipv4Addr::new(1, 2, 3, 4), 300);
+
+        let clients_val: toml::Value = toml::from_str(
+            r#"
+            [[entries]]
+            name = "kid-device"
+            ids = ["kid-client"]
+            group = "kids"
+
+            [[entries]]
+            name = "adult-device"
+            ids = ["adult-client"]
+            group = "adults"
+
+            [[entries]]
+            name = "guest-device"
+            ids = ["guest-client"]
+            group = "bypass"
+
+            [groups.kids]
+            filtering = true
+            safe_search = true
+            parental = true
+            parental_categories = ["adult"]
+            [[groups.kids.blocked_services]]
+            service = "tiktok"
+
+            [groups.adults]
+            filtering = true
+            safe_search = false
+            parental = false
+
+            [groups.bypass]
+            filtering = false
+        "#,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.upstream.servers = vec![mock_upstream.addr().to_string()];
+        config.filtering.custom_rules = vec!["||ad-tracker.com^".to_string()];
+        config.clients = Some(clients_val);
+        config.dns.doh_port = 0;
+        config.tls = Some(sito_core::config::TlsConfig {
+            cert: Some(cert_file),
+            key: Some(key_file),
+            sni_certs: Vec::new(),
+        });
+
+        let server = TestServerInstance::spawn(config).await.unwrap();
+        let client = server.client();
+
+        let doh_kid = server.doh_url("/dns-query/kid-client");
+        let doh_adult = server.doh_url("/dns-query/adult-client");
+        let doh_bypass = server.doh_url("/dns-query/guest-client");
+        let doh_default = server.doh_url("/dns-query");
+
+        // --- 1. General Ad Domain (ad-tracker.com) ---
+        // Kid: blocked
+        let r = client
+            .query_doh_post(&doh_kid, "ad-tracker.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].data, RData::A(A(Ipv4Addr::UNSPECIFIED)));
+        // Adult: blocked
+        let r = client
+            .query_doh_post(&doh_adult, "ad-tracker.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].data, RData::A(A(Ipv4Addr::UNSPECIFIED)));
+        // Bypass: allowed (1.2.3.4)
+        let r = client
+            .query_doh_post(&doh_bypass, "ad-tracker.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].data, RData::A(A(Ipv4Addr::new(1, 2, 3, 4))));
+        // Default unknown: blocked
+        let r = client
+            .query_doh_post(&doh_default, "ad-tracker.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].data, RData::A(A(Ipv4Addr::UNSPECIFIED)));
+
+        // --- 2. Parental Control Domain (pornhub.com) ---
+        // Kid: blocked by parental
+        let r = client
+            .query_doh_post(&doh_kid, "pornhub.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].data, RData::A(A(Ipv4Addr::UNSPECIFIED)));
+        // Adult: allowed
+        let r = client
+            .query_doh_post(&doh_adult, "pornhub.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].data, RData::A(A(Ipv4Addr::new(1, 2, 3, 4))));
+        // Bypass: allowed
+        let r = client
+            .query_doh_post(&doh_bypass, "pornhub.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].data, RData::A(A(Ipv4Addr::new(1, 2, 3, 4))));
+        // Default unknown: allowed (parental is false on default)
+        let r = client
+            .query_doh_post(&doh_default, "pornhub.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].data, RData::A(A(Ipv4Addr::new(1, 2, 3, 4))));
+
+        // --- 3. Blocked Service (tiktok.com) ---
+        // Kid: blocked by service
+        let r = client
+            .query_doh_post(&doh_kid, "tiktok.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].data, RData::A(A(Ipv4Addr::UNSPECIFIED)));
+        // Adult: allowed
+        let r = client
+            .query_doh_post(&doh_adult, "tiktok.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].data, RData::A(A(Ipv4Addr::new(1, 2, 3, 4))));
+        // Bypass: allowed
+        let r = client
+            .query_doh_post(&doh_bypass, "tiktok.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].data, RData::A(A(Ipv4Addr::new(1, 2, 3, 4))));
+
+        // --- 4. Safe Search Domain (www.google.com) ---
+        // Kid: CNAME forcesafesearch.google.com.
+        let r = client
+            .query_doh_post(&doh_kid, "www.google.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].record_type(), RecordType::CNAME);
+        assert_eq!(
+            r.answers[0].data,
+            RData::CNAME(CNAME(
+                Name::from_str("forcesafesearch.google.com.").unwrap()
+            ))
+        );
+        // Adult: allowed upstream
+        let r = client
+            .query_doh_post(&doh_adult, "www.google.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].record_type(), RecordType::A);
+        assert_eq!(r.answers[0].data, RData::A(A(Ipv4Addr::new(1, 2, 3, 4))));
+        // Bypass: allowed upstream
+        let r = client
+            .query_doh_post(&doh_bypass, "www.google.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(r.answers[0].record_type(), RecordType::A);
+
+        server.shutdown().await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// 14. Acceptance test: Local DNS rewrites with wildcards, auto-PTR, CNAME chaining, and exception_clients
+    #[tokio::test]
+    async fn test_acceptance_m4_local_rewrites_wildcard_and_auto_ptr() {
+        let (cert_pem, key_pem) = generate_test_cert(&["sito-test.local", "127.0.0.1"]);
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_rewrites_test_{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        tokio::fs::write(&cert_file, cert_pem).await.unwrap();
+        tokio::fs::write(&key_file, key_pem).await.unwrap();
+
+        let mock_upstream = MockDnsServer::spawn().await.unwrap();
+        mock_upstream.add_a_record("nas.lan", Ipv4Addr::new(100, 100, 100, 100), 300);
+
+        let rewrites_val: toml::Value = toml::from_str(r#"
+            auto_ptr = true
+            entries = [
+                { domain = "*.home.arpa", type = "A", answer = "192.168.1.10" },
+                { domain = "printer.lan", type = "A", answer = "192.168.1.50" },
+                { domain = "app.lan", type = "CNAME", answer = "web.lan" },
+                { domain = "web.lan", type = "A", answer = "192.168.1.80" },
+                { domain = "nas.lan", type = "A", answer = "192.168.1.90", exception_clients = ["admin-laptop"] }
+            ]
+        "#).unwrap();
+
+        let clients_val: toml::Value = toml::from_str(
+            r#"
+            [[entries]]
+            name = "admin-laptop"
+            ids = ["admin-laptop"]
+            group = "default"
+        "#,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.upstream.servers = vec![mock_upstream.addr().to_string()];
+        config.rewrites = Some(rewrites_val);
+        config.clients = Some(clients_val);
+        config.dns.doh_port = 0;
+        config.tls = Some(sito_core::config::TlsConfig {
+            cert: Some(cert_file),
+            key: Some(key_file),
+            sni_certs: Vec::new(),
+        });
+
+        let server = TestServerInstance::spawn(config).await.unwrap();
+        let client = server.client();
+
+        // 1. Wildcard *.home.arpa matches nas.home.arpa
+        let r = client
+            .query_udp("nas.home.arpa", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.answers[0].data,
+            RData::A(A(Ipv4Addr::new(192, 168, 1, 10)))
+        );
+
+        // Multi-level subdomain also matches wildcard *.home.arpa
+        let r = client
+            .query_udp("sub.device.home.arpa", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.answers[0].data,
+            RData::A(A(Ipv4Addr::new(192, 168, 1, 10)))
+        );
+
+        // 2. Exact A record for printer.lan
+        let r = client
+            .query_udp("printer.lan", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.answers[0].data,
+            RData::A(A(Ipv4Addr::new(192, 168, 1, 50)))
+        );
+
+        // 3. Auto-PTR reverse query for printer.lan (192.168.1.50 -> 50.1.168.192.in-addr.arpa)
+        let r_ptr = client
+            .query_udp("50.1.168.192.in-addr.arpa", RecordType::PTR)
+            .await
+            .unwrap();
+        assert_eq!(r_ptr.answers.len(), 1);
+        assert_eq!(r_ptr.answers[0].record_type(), RecordType::PTR);
+        assert_eq!(
+            r_ptr.answers[0].data,
+            RData::PTR(PTR(Name::from_str("printer.lan.").unwrap()))
+        );
+
+        // 4. CNAME local chain: app.lan -> web.lan -> 192.168.1.80
+        let r_cname = client.query_udp("app.lan", RecordType::A).await.unwrap();
+        assert_eq!(r_cname.answers.len(), 2);
+        assert_eq!(
+            r_cname.answers[0].data,
+            RData::CNAME(CNAME(Name::from_str("web.lan.").unwrap()))
+        );
+        assert_eq!(
+            r_cname.answers[1].data,
+            RData::A(A(Ipv4Addr::new(192, 168, 1, 80)))
+        );
+
+        // 5. Exception clients: standard query gets local rewrite 192.168.1.90
+        let r_nas = client.query_udp("nas.lan", RecordType::A).await.unwrap();
+        assert_eq!(
+            r_nas.answers[0].data,
+            RData::A(A(Ipv4Addr::new(192, 168, 1, 90)))
+        );
+
+        // Excepted client (admin-laptop) bypasses rewrite and gets upstream response (100.100.100.100)
+        let doh_admin = server.doh_url("/dns-query/admin-laptop");
+        let r_admin = client
+            .query_doh_post(&doh_admin, "nas.lan", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            r_admin.answers[0].data,
+            RData::A(A(Ipv4Addr::new(100, 100, 100, 100)))
+        );
+
+        server.shutdown().await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// 15. Acceptance test: ADR-0007 Precedence ($important beats rewrite; rewrite beats standard block)
+    #[tokio::test]
+    async fn test_acceptance_m4_adr007_precedence_important_vs_rewrite() {
+        let mock_upstream = MockDnsServer::spawn().await.unwrap();
+
+        let rewrites_val: toml::Value = toml::from_str(
+            r#"
+            entries = [
+                { domain = "printer.lan", type = "A", answer = "192.168.1.50" },
+                { domain = "tracker.lan", type = "A", answer = "192.168.1.99" }
+            ]
+        "#,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.upstream.servers = vec![mock_upstream.addr().to_string()];
+        config.filtering.custom_rules = vec![
+            "||printer.lan^".to_string(),           // standard block
+            "||tracker.lan^$important".to_string(), // important block
+        ];
+        config.rewrites = Some(rewrites_val);
+
+        let server = TestServerInstance::spawn(config).await.unwrap();
+        let client = server.client();
+
+        // 1. Local rewrite beats standard block:
+        // printer.lan has a local rewrite and standard block ||printer.lan^
+        // Local rewrite MUST win over standard block
+        let r_printer = client
+            .query_udp("printer.lan", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            r_printer.answers[0].data,
+            RData::A(A(Ipv4Addr::new(192, 168, 1, 50)))
+        );
+
+        // 2. $important block beats local rewrite:
+        // tracker.lan has a local rewrite and ||tracker.lan^$important
+        // $important block MUST win over local rewrite per ADR-0007
+        let r_tracker = client
+            .query_udp("tracker.lan", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            r_tracker.answers[0].data,
+            RData::A(A(Ipv4Addr::UNSPECIFIED))
+        );
+
+        server.shutdown().await.unwrap();
+    }
+
+    /// 16. Acceptance test: Client identification by DoT SNI subdomain
+    #[tokio::test]
+    async fn test_acceptance_m4_dot_sni_client_identification() {
+        let (cert_pem, key_pem) =
+            generate_test_cert(&["sito-test.local", "127.0.0.1", "phone.dns.sito-test.local"]);
+        let temp_dir = std::env::temp_dir().join(format!("sito_sni_test_{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        tokio::fs::write(&cert_file, cert_pem).await.unwrap();
+        tokio::fs::write(&key_file, key_pem).await.unwrap();
+
+        let mock_upstream = MockDnsServer::spawn().await.unwrap();
+        mock_upstream.add_a_record("www.google.com", Ipv4Addr::new(1, 2, 3, 4), 300);
+
+        let clients_val: toml::Value = toml::from_str(
+            r#"
+            [[entries]]
+            name = "phone"
+            ids = ["phone"]
+            group = "kids"
+
+            [groups.kids]
+            safe_search = true
+        "#,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.upstream.servers = vec![mock_upstream.addr().to_string()];
+        config.clients = Some(clients_val);
+        config.dns.dot_port = 0;
+        config.tls = Some(sito_core::config::TlsConfig {
+            cert: Some(cert_file),
+            key: Some(key_file),
+            sni_certs: Vec::new(),
+        });
+
+        let server = TestServerInstance::spawn(config).await.unwrap();
+        let client = server.client();
+
+        // Connect via DoT with SNI "phone.dns.sito-test.local"
+        // Client identification resolves "phone" -> group "kids" -> safe search enabled!
+        let r = client
+            .query_dot(
+                server.dot_addr(),
+                "phone.dns.sito-test.local",
+                "www.google.com",
+                RecordType::A,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(r.answers[0].record_type(), RecordType::CNAME);
+        assert_eq!(
+            r.answers[0].data,
+            RData::CNAME(CNAME(
+                Name::from_str("forcesafesearch.google.com.").unwrap()
+            ))
+        );
+
+        server.shutdown().await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// 17. Acceptance test: Check-config rejects invalid cron expression in TOML
+    #[test]
+    fn test_acceptance_check_config_rejects_bad_cron() {
+        let temp_dir = std::env::temp_dir().join(format!("sito_check_cron_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let bad_cron_path = temp_dir.join("bad_cron.toml");
+        let toml_content = r#"
+config_version = 1
+[server]
+role = "master"
+
+[clients]
+[clients.groups.kids]
+schedule_enabled = true
+schedule = "99 99 99 99 99 99"
+"#;
+        std::fs::write(&bad_cron_path, toml_content).unwrap();
+        let err = sito::cli::run_check_config(&bad_cron_path)
+            .expect_err("Should fail due to invalid cron");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Clients configuration validation failed")
+                || err_msg.contains("schedule"),
+            "Error should mention clients validation failure: {err_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

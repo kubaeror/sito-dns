@@ -62,6 +62,26 @@ pub fn run_check_config(path: &Path) -> Result<(), anyhow::Error> {
         )
     })?;
 
+    if let Some(ref clients_val) = config.clients {
+        let _: sito_clients::ClientsConfig = clients_val.clone().try_into().map_err(|e| {
+            anyhow::anyhow!(
+                "Clients configuration validation failed for '{}': {}",
+                path.display(),
+                e
+            )
+        })?;
+    }
+
+    if let Some(ref rewrites_val) = config.rewrites {
+        let _: sito_rewrites::RewritesConfig = rewrites_val.clone().try_into().map_err(|e| {
+            anyhow::anyhow!(
+                "Rewrites configuration validation failed for '{}': {}",
+                path.display(),
+                e
+            )
+        })?;
+    }
+
     if let Some(tls) = config.get_tls_config() {
         if let (Some(cert_path), Some(key_path)) = (&tls.cert, &tls.key) {
             sito_transport::load_certificates(cert_path).map_err(|e| {

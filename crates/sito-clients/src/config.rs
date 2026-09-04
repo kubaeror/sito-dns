@@ -44,8 +44,10 @@ pub struct ClientEntryConfig {
 }
 
 /// A policy group configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientGroupConfig {
+    #[serde(default = "default_true")]
+    pub filtering: bool,
     #[serde(default)]
     pub lists: Vec<String>,
     #[serde(default)]
@@ -64,6 +66,23 @@ pub struct ClientGroupConfig {
     pub schedule: Option<Schedule>,
     #[serde(default)]
     pub blocked_services: Vec<BlockedServiceConfig>,
+}
+
+impl Default for ClientGroupConfig {
+    fn default() -> Self {
+        Self {
+            filtering: true,
+            lists: Vec::new(),
+            custom_rules: Vec::new(),
+            safe_search: false,
+            safe_search_youtube: None,
+            parental: false,
+            parental_categories: Vec::new(),
+            schedule_enabled: false,
+            schedule: None,
+            blocked_services: Vec::new(),
+        }
+    }
 }
 
 /// Blocked service specification with optional cron schedule.

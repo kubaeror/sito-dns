@@ -15,6 +15,10 @@ sito-upstream.workspace = true
 sito-cache.workspace = true
 sito-filter.workspace = true
 sito-dnssec.workspace = true
+sito-clients.workspace = true
+sito-rewrites.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+toml.workspace = true
 hickory-proto.workspace = true
 tokio.workspace = true
 tracing.workspace = true

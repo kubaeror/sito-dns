@@ -65,13 +65,13 @@ M4.6 matrix       → integration tests: 3 devices × 3 groups × {block, allowl
 
 ## Tests and acceptance criteria
 
-- [ ] Two devices in different groups get different verdicts for the same domain
-- [ ] ClientID from DoH and SNI from DoT identify without IP
-- [ ] `dig -x 192.168.1.10` returns the PTR from the rewrite
-- [ ] Schedule toggles a service block at the boundary (mocked clock)
-- [ ] YouTube in a safe-search group → CNAME `restrict.youtube.com`
-- [ ] Policy matrix (M4.6) green in CI
-- [ ] Client TOML change + reload (manual in this phase) without restart
+- [x] Two devices in different groups get different verdicts for the same domain
+- [x] ClientID from DoH and SNI from DoT identify without IP
+- [x] `dig -x 192.168.1.10` returns the PTR from the rewrite
+- [x] Schedule toggles a service block at the boundary (mocked clock)
+- [x] YouTube in a safe-search group → CNAME `restrict.youtube.com`
+- [x] Policy matrix (M4.6) green in CI
+- [x] Client TOML change + reload (manual in this phase) without restart
 
 ## Risks
 
@@ -84,3 +84,15 @@ M4.6 matrix       → integration tests: 3 devices × 3 groups × {block, allowl
 ## Deliverables
 
 Full client/group configuration via TOML, policy matrix in `docs/policy-matrix.md`, closed ADR-007.
+
+---
+
+## Completion Report
+
+All subphases of Phase M4 (Clients, Policies and Local Records) are implemented, verified, and passing all tests:
+1. **M4.1 Client Registry & Identification:** Multi-tier client identification chain (DoH path, DoT SNI subdomain, static IP/CIDR, local MAC via ARP cache, MikroTik RouterOS lease matching, unknown fallback).
+2. **M4.2 Schedules:** Lazy query-time cron schedule evaluation via `croner` with 5- and 6-field cron support, minute and hour window intervals, and field-number validation.
+3. **M4.3 Safe Search, Parental Control & Service Blocking:** Table 9.3 rewrites for Google, Bing, YouTube (strict/moderate), DuckDuckGo; bundled `services.json` (23 AdGuard-compatible services); bundled adult and gambling blocklists.
+4. **M4.4 Local DNS Rewrites & ADR-0007 Precedence:** Exact A/AAAA/CNAME/PTR, wildcard `*.home.arpa`, local CNAME chaining, auto-PTR for RFC1918/ULA, `exception_clients` bypass. ADR-0007 ratified: `$important` blocks beat local rewrites; local rewrites beat standard filters and cache.
+5. **M4.5 MikroTik RouterOS Integration:** REST API client (`GET /rest/ip/dhcp-server/lease`) with token and basic auth, automatic lease synchronization, and graceful error degradation.
+6. **M4.6 Integration Test Matrix:** Complete test suite in `crates/sito-test` verifying all 3 devices × 3 groups combinations across transports and rules; formal policy matrix documented in `docs/policy-matrix.md`.

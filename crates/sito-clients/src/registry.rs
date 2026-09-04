@@ -282,36 +282,39 @@ impl ClientRegistry {
         if let Some(grp) = group {
             policy.lists.clone_from(&grp.lists);
             policy.custom_rules.clone_from(&grp.custom_rules);
-            policy.safe_search = grp.safe_search;
-            policy.safe_search_youtube = grp
-                .safe_search_youtube
-                .unwrap_or(YouTubeSafeSearchMode::Strict);
-            policy.parental = grp.parental;
-            policy.parental_categories = grp.parental_categories.iter().cloned().collect();
-
-            // Evaluate group schedule
-            if grp.schedule_enabled {
+            let group_active = if grp.schedule_enabled {
                 if let Some(ref sched) = grp.schedule {
-                    policy.is_filtering_enabled = sched.is_active(&now);
-                } else {
-                    policy.is_filtering_enabled = true;
-                }
-            } else {
-                policy.is_filtering_enabled = true;
-            }
-
-            // Evaluate blocked services
-            for svc_cfg in &grp.blocked_services {
-                let is_active = if let Some(ref sched) = svc_cfg.schedule {
                     sched.is_active(&now)
                 } else {
                     true
-                };
+                }
+            } else {
+                true
+            };
 
-                if is_active {
-                    policy
-                        .active_blocked_services
-                        .insert(svc_cfg.service.to_ascii_lowercase());
+            let filtering_on = grp.filtering && group_active;
+            policy.is_filtering_enabled = filtering_on;
+            policy.safe_search = filtering_on && grp.safe_search;
+            policy.safe_search_youtube = grp
+                .safe_search_youtube
+                .unwrap_or(YouTubeSafeSearchMode::Strict);
+            policy.parental = filtering_on && grp.parental;
+            policy.parental_categories = grp.parental_categories.iter().cloned().collect();
+
+            // Evaluate blocked services
+            if filtering_on {
+                for svc_cfg in &grp.blocked_services {
+                    let is_active = if let Some(ref sched) = svc_cfg.schedule {
+                        sched.is_active(&now)
+                    } else {
+                        true
+                    };
+
+                    if is_active {
+                        policy
+                            .active_blocked_services
+                            .insert(svc_cfg.service.to_ascii_lowercase());
+                    }
                 }
             }
         }

@@ -20,6 +20,11 @@ use sito_upstream::{BootstrapResolver, UpstreamManager};
 
 use crate::pipeline::DnsPipeline;
 
+#[derive(serde::Deserialize, Default)]
+struct IntegrationsConfig {
+    mikrotik: Option<sito_clients::RouterOsConfig>,
+}
+
 /// Runs the complete sito DNS server with graceful shutdown handling.
 pub async fn run_server(config: Config) -> anyhow::Result<()> {
     run_server_with_shutdown(config, None).await
@@ -57,6 +62,41 @@ pub async fn run_server_with_shutdown(
     // Initialize DNSSEC validator
     let dnssec = Arc::new(DnssecValidator::from_config(&config.dns.dnssec));
 
+    // Initialize client registry
+    let clients_config: sito_clients::ClientsConfig = config
+        .clients
+        .as_ref()
+        .and_then(|v| v.clone().try_into().ok())
+        .unwrap_or_default();
+    let client_registry = Arc::new(sito_clients::ClientRegistry::new(clients_config));
+
+    // Initialize parental and service registries
+    let parental_registry = Arc::new(sito_clients::ParentalRegistry::bundled());
+    let service_registry = Arc::new(sito_clients::ServiceRegistry::bundled());
+
+    // Initialize local rewrites table
+    let rewrites_config: sito_rewrites::RewritesConfig = config
+        .rewrites
+        .as_ref()
+        .and_then(|v| v.clone().try_into().ok())
+        .unwrap_or_default();
+    let rewrite_table = Arc::new(sito_rewrites::RewriteTable::new(rewrites_config));
+
+    // Initialize MikroTik RouterOS integration if configured
+    if let Some(ref int_val) = config.integrations {
+        if let Ok(integrations) = int_val.clone().try_into::<IntegrationsConfig>() {
+            if let Some(mikrotik_cfg) = integrations.mikrotik {
+                if mikrotik_cfg.enabled {
+                    let _routeros_handle = sito_clients::spawn_routeros_sync(
+                        mikrotik_cfg,
+                        client_registry.clone(),
+                        shutdown_rx.clone(),
+                    );
+                }
+            }
+        }
+    }
+
     // Construct pipeline
     let pipeline = Arc::new(DnsPipeline::new(
         Arc::new(config.clone()),
@@ -64,6 +104,10 @@ pub async fn run_server_with_shutdown(
         cache,
         upstream_manager,
         dnssec,
+        client_registry,
+        parental_registry,
+        service_registry,
+        rewrite_table,
         in_flight.clone(),
     ));
 

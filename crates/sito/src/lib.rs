@@ -16,10 +16,12 @@ mod tests {
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
     use sito_cache::DnsCache;
+    use sito_clients::{ClientRegistry, ClientsConfig, ParentalRegistry, ServiceRegistry};
     use sito_core::client::ClientContext;
     use sito_core::config::Config;
     use sito_filter::HostsFilterEngine;
     use sito_proto::rdata::A;
+    use sito_rewrites::{RewriteTable, RewritesConfig};
     use sito_transport::QueryHandler;
     use sito_upstream::{BootstrapResolver, UpstreamManager};
     use std::net::{Ipv4Addr, SocketAddr};
@@ -104,12 +106,21 @@ mod tests {
             &config.dns.dnssec,
         ));
 
+        let clients = Arc::new(ClientRegistry::new(ClientsConfig::default()));
+        let parental = Arc::new(ParentalRegistry::bundled());
+        let services = Arc::new(ServiceRegistry::bundled());
+        let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
+
         let pipeline = DnsPipeline::new(
             Arc::new(config.clone()),
             filter,
             cache.clone(),
             upstream,
             dnssec,
+            clients,
+            parental,
+            services,
+            rewrites,
             in_flight,
         );
 
@@ -232,12 +243,21 @@ mod tests {
             &config.dns.dnssec,
         ));
 
+        let clients = Arc::new(ClientRegistry::new(ClientsConfig::default()));
+        let parental = Arc::new(ParentalRegistry::bundled());
+        let services = Arc::new(ServiceRegistry::bundled());
+        let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
+
         let pipeline = DnsPipeline::new(
             Arc::new(config.clone()),
             filter,
             cache,
             upstream,
             dnssec,
+            clients,
+            parental,
+            services,
+            rewrites,
             in_flight,
         );
 
