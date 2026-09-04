@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Running pre-commit checks..."
+
+echo "==> Checking code formatting (cargo fmt --check)..."
+cargo fmt --check
+
+echo "==> Running clippy (cargo clippy --workspace -- -D warnings)..."
+cargo clippy --workspace -- -D warnings
+
+echo "==> Running tests (cargo test --workspace)..."
+cargo test --workspace
+
+echo "==> Checking cargo deny (cargo deny check)..."
+cargo deny check
+
+echo "All pre-commit checks passed successfully!"
