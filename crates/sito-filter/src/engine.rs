@@ -126,8 +126,14 @@ impl FilterSnapshot {
         }
     }
 
-    /// Evaluates a domain against the compiled snapshot following section 4.3 precedence.
-    pub fn evaluate(&self, domain: &str, qtype: RecordType, client: &ClientContext) -> Verdict {
+    /// Evaluates a domain against only `$important` rules (Stages 1 and 2).
+    /// Returns `Some(verdict)` if an `$important` rule matched, or `None` if no `$important` rule applied.
+    pub fn evaluate_important(
+        &self,
+        domain: &str,
+        qtype: RecordType,
+        client: &ClientContext,
+    ) -> Option<Verdict> {
         let mut allow_candidates = Vec::new();
         self.allowlist
             .collect_candidates(domain, &self.interner, &mut allow_candidates);
@@ -153,7 +159,7 @@ impl FilterSnapshot {
                 }
             }
             let rule_ref = RuleRef::new(&rule.raw).with_source(&rule.source, rule.line as usize);
-            return Verdict::Allow(Some(rule_ref));
+            return Some(Verdict::Allow(Some(rule_ref)));
         }
 
         // Stage 2: Important Blocklist (...$important)
@@ -176,15 +182,33 @@ impl FilterSnapshot {
                 }
             }
             if let Some(rewrite) = &rule.modifiers.dnsrewrite {
-                return Verdict::Rewrite(RewriteAction::DnsRewrite {
+                return Some(Verdict::Rewrite(RewriteAction::DnsRewrite {
                     rcode: rewrite.rcode.clone(),
                     rtype: rewrite.rtype.clone(),
                     value: rewrite.value.clone(),
-                });
+                }));
             }
             let rule_ref = RuleRef::new(&rule.raw).with_source(&rule.source, rule.line as usize);
-            return Verdict::Block(BlockReason::Rule(rule_ref));
+            return Some(Verdict::Block(BlockReason::Rule(rule_ref)));
         }
+
+        None
+    }
+
+    /// Evaluates a domain against standard filter rules (Stages 3 and 4).
+    pub fn evaluate_standard(
+        &self,
+        domain: &str,
+        qtype: RecordType,
+        client: &ClientContext,
+    ) -> Verdict {
+        let mut allow_candidates = Vec::new();
+        self.allowlist
+            .collect_candidates(domain, &self.interner, &mut allow_candidates);
+
+        let mut block_candidates = Vec::new();
+        self.blocklist
+            .collect_candidates(domain, &self.interner, &mut block_candidates);
 
         // Stage 3: Standard Allowlist (@@...)
         for &rule_id in &allow_candidates {
@@ -237,6 +261,14 @@ impl FilterSnapshot {
         }
 
         Verdict::Allow(None)
+    }
+
+    /// Evaluates a domain against the compiled snapshot following section 4.3 precedence.
+    pub fn evaluate(&self, domain: &str, qtype: RecordType, client: &ClientContext) -> Verdict {
+        if let Some(verdict) = self.evaluate_important(domain, qtype, client) {
+            return verdict;
+        }
+        self.evaluate_standard(domain, qtype, client)
     }
 }
 
@@ -361,6 +393,46 @@ impl HostsFilterEngine {
                 }
             }
         })
+    }
+
+    /// Evaluates a domain query against only `$important` rules.
+    pub fn evaluate_important(
+        &self,
+        qname: &Name,
+        qtype: RecordType,
+        client: &ClientContext,
+    ) -> Option<Verdict> {
+        if !self.config.enabled {
+            return None;
+        }
+
+        let raw_domain = qname.to_utf8();
+        let Ok(normalized) = normalize_domain(&raw_domain) else {
+            return None;
+        };
+
+        let snapshot = self.snapshot.load();
+        snapshot.evaluate_important(&normalized, qtype, client)
+    }
+
+    /// Evaluates a domain query against standard filter rules.
+    pub fn evaluate_standard(
+        &self,
+        qname: &Name,
+        qtype: RecordType,
+        client: &ClientContext,
+    ) -> Verdict {
+        if !self.config.enabled {
+            return Verdict::Allow(None);
+        }
+
+        let raw_domain = qname.to_utf8();
+        let Ok(normalized) = normalize_domain(&raw_domain) else {
+            return Verdict::Allow(None);
+        };
+
+        let snapshot = self.snapshot.load();
+        snapshot.evaluate_standard(&normalized, qtype, client)
     }
 }
 

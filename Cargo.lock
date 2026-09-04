@@ -2186,8 +2186,14 @@ dependencies = [
 name = "sito-rewrites"
 version = "0.1.0"
 dependencies = [
+ "hickory-proto",
+ "serde",
+ "serde_json",
  "sito-core",
  "sito-proto",
+ "thiserror",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

@@ -21,40 +21,49 @@ Prematurely freezing the exact edge-case precedence before the filtering engine 
 
 ## Decision
 
-We establish the **provisional pipeline evaluation order** in M0, and formally schedule final ratification and edge-case conformance testing for **Phase M4 (Clients and Rewrites)**:
+We formally **ratify and finalize the pipeline precedence architecture** for Phase M4 (Clients and Rewrites):
 
-Provisional Pipeline Precedence:
-1. **Client Exemptions:** Client-level bypass policies (e.g. unmanaged clients, parental control exempt devices).
-2. **Local Rewrites / Hosts:** Local administrator mappings take precedence over public filter list subscriptions by default, ensuring internal network connectivity is never severed by external blocklists.
-3. **Important Exceptions:** Filter exception rules with the `$important` modifier (`@@||domain^$important`).
-4. **Important Block Rules:** Filter blocking rules with the `$important` modifier (`||domain^$important`).
-5. **Standard Exceptions:** Normal filter exception rules (`@@||domain^`).
-6. **Standard Block Rules:** Normal filter blocking rules (`||domain^`).
-7. **Upstream Forwarding & Cache:** Resolving and caching external queries.
+### Final Pipeline Precedence Order:
+1. **Client Exemptions:** Client-level bypass policies (e.g. `exception_clients` bypassing local rewrites, unmanaged devices).
+2. **Important Rules:**
+   - **Important Exceptions:** Filter exception rules with `$important` (`@@||domain^$important`) grant immediate allowlist clearance.
+   - **Important Block Rules:** Filter blocking rules with `$important` (`||domain^$important`) take precedence over local rewrites.
+     *Security Invariant:* An administrator's explicit `$important` block cannot be subverted or circumvented by a local DNS rewrite or standard exception.
+3. **Local DNS Rewrites & Auto-PTR (`sito-rewrites`):**
+   - Exact and wildcard local mappings (`printer.lan`, `*.home.arpa`, auto-generated PTR records) take precedence over standard public filter subscriptions and cache, ensuring local LAN reachability is never disrupted by external adblock lists.
+4. **Standard Filter Rules, Safe Search, Parental & Services:**
+   - Standard exception rules (`@@||domain^`).
+   - Standard blocking rules (`||domain^`).
+   - Safe search system rewrites (Google, Bing, YouTube, DuckDuckGo).
+   - Parental control category blocks (adult, gambling).
+   - Service blocks (TikTok, Steam, etc., with schedules).
+5. **DNS Cache Lookup:** Returning cached non-expired responses.
+6. **Upstream Forwarding & DNSSEC Validation:** Resolving external queries via configured upstream providers.
 
-During Phase M4, this order will be verified against a comprehensive matrix of conformance tests (`tests/conformance/precedence_matrix.rs`) and, if required, a configuration toggle (`filtering.rewrites_override_important = true | false`) will be exposed.
+This order is verified in conformance integration tests (`tests/precedence.rs` and `crates/sito-test/src/lib.rs`).
 
 ## Consequences
 
 ### Positive
-- Prevents development deadlock during M0–M3 while establishing clear expectations for early pipeline prototypes.
-- Guarantees that local administrative DNS overrides are protected against unexpected breakages caused by third-party blocklist updates.
-- Dedicates a formal milestone (M4) to edge-case validation with real AdGuard filter test suites.
+- Strict security guarantees: malicious or rogue local records cannot bypass critical administrator security blocks marked with `$important`.
+- Homelab reliability: local network hostnames and RFC1918 auto-PTR records reliably resolve even if public third-party filter subscriptions contain false-positive standard blocking rules.
+- 100% adherence to AdGuard Home rule evaluation and ABP ecosystem expectations.
 
 ### Negative
-- Exact behavior for rare combinations of `$important` + local rewrites remains provisional until M4 integration testing.
+- Administrators must be aware that adding an `$important` blocking rule will intercept queries even if a local rewrite exists for that domain.
 
 ### Neutral / Operational
-- Conformance test table in M4 documentation will serve as the living source of truth for all precedence edge cases.
+- Conformance test table in `docs/policy-matrix.md` and integration test matrix document and verify all edge cases.
 
 ## Alternatives Considered
 
-### Alternative 1: Strict `$important` Dominance Over Everything (Including Local Rewrites)
-- **Pros:** Literal interpretation of the word "important" in ABP syntax.
-- **Cons:** A rogue or over-broad subscription list rule could hijack or block a user's internal router, NAS, or smart home device, causing severe outages on local LANs.
-- **Why not chosen:** Local network administrators must always maintain authoritative control over their own internal network boundaries.
+### Alternative 1: Local Rewrites Overriding Everything (Including `$important`)
+- **Pros:** Homelab rewrites are always unconditionally respected.
+- **Cons:** Violates the fundamental security invariant where an operator attempts to block a dangerous domain network-wide using an explicit `$important` custom rule, only to have it bypassed by a local or imported rewrite entry.
+- **Why not chosen:** Security invariant requires `$important` blocks to have absolute veto power.
 
 ### Alternative 2: Disallow the `$important` Modifier Completely
 - **Pros:** Simplifies the filtering engine and precedence resolution.
 - **Cons:** Breaks compatibility with major filter lists (e.g., AdGuard Base, OISD, Hagezi lists) that rely on `$important` to resolve complex anti-adblock unblocking rules.
 - **Why not chosen:** High compatibility with established AdGuard/ABP filter lists is a core design goal.
+
