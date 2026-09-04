@@ -167,6 +167,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pipeline_cname_uncloaking() {
+        use hickory_proto::rr::rdata::CNAME;
+
+        let temp_dir = std::env::temp_dir().join(format!("sito_cname_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Start mock upstream that returns a CNAME chain
+        let mock_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_socket.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while let Ok((len, src)) = mock_socket.recv_from(&mut buf).await {
+                if let Ok(query) = sito_proto::decode_message(&buf[..len]) {
+                    let mut resp =
+                        Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                    resp.metadata.response_code = ResponseCode::NoError;
+                    resp.queries = query.queries.clone();
+                    if let Some(q) = query.queries.first() {
+                        let cname_target = Name::from_str("cloaked.adnetwork.com.").unwrap();
+                        let cname_record = Record::from_rdata(
+                            q.name().clone(),
+                            300,
+                            RData::CNAME(CNAME(cname_target.clone())),
+                        );
+                        let a_record = Record::from_rdata(
+                            cname_target,
+                            300,
+                            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+                        );
+                        resp.answers.push(cname_record);
+                        resp.answers.push(a_record);
+                    }
+                    let encoded = sito_proto::encode_message(&resp).unwrap();
+                    let _ = mock_socket.send_to(&encoded, src).await;
+                }
+            }
+        });
+
+        // 2. Setup config with blocked domain matching CNAME target
+        let mut config = Config::default();
+        config.server.data_dir = temp_dir.clone();
+        config.upstream.servers = vec![mock_addr.to_string()];
+        config.filtering.cname_cloaking = true;
+        config.filtering.custom_rules = vec!["||adnetwork.com^".to_string()];
+
+        let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
+        let upstream = Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let cache = Arc::new(DnsCache::new(config.dns.cache.clone()));
+        let filter = Arc::new(
+            HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
+        );
+        let in_flight = Arc::new(AtomicUsize::new(0));
+
+        let pipeline =
+            DnsPipeline::new(Arc::new(config.clone()), filter, cache, upstream, in_flight);
+
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+        // 3. Query track.company.com (not directly blocked, but points via CNAME to adnetwork.com)
+        let mut query = Message::new(555, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("track.company.com.").unwrap(),
+            RecordType::A,
+        ));
+
+        let resp = pipeline.handle(query, client).await.unwrap();
+        assert_eq!(resp.metadata.id, 555);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1);
+        // Answer was replaced with blocked 0.0.0.0 response via CNAME uncloaking!
+        assert_eq!(resp.answers[0].data, RData::A(A(Ipv4Addr::UNSPECIFIED)));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
     async fn test_server_run_and_graceful_shutdown() {
         let temp_dir = std::env::temp_dir().join(format!("sito_srv_test_{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).unwrap();

@@ -1,6 +1,7 @@
 //! DNS query execution pipeline.
 
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::rr::RData;
 use sito_cache::DnsCache;
 use sito_core::client::ClientContext;
 use sito_core::config::Config;
@@ -109,6 +110,33 @@ impl QueryHandler for DnsPipeline {
             match self.upstream.resolve(&query).await {
                 Ok(mut upstream_resp) => {
                     upstream_resp.metadata.id = query_id;
+
+                    // 4. CNAME uncloaking: inspect any CNAME targets against FilterEngine
+                    if self.config.filtering.enabled && self.config.filtering.cname_cloaking {
+                        for record in &upstream_resp.answers {
+                            if let RData::CNAME(cname) = &record.data {
+                                let cname_target = &cname.0;
+                                let verdict = self.filter.evaluate(cname_target, qtype, &client);
+                                if verdict.is_blocked() {
+                                    info!(
+                                        qname = %qname,
+                                        cname_target = %cname_target,
+                                        verdict = ?verdict,
+                                        via_cname = true,
+                                        "Query blocked via CNAME uncloaking"
+                                    );
+                                    let mut blocked_resp = synthesize_blocked_response(
+                                        &query,
+                                        &self.config.filtering.blocking_mode,
+                                        self.config.filtering.blocking_ttl,
+                                    );
+                                    blocked_resp.metadata.id = query_id;
+                                    return Some(blocked_resp);
+                                }
+                            }
+                        }
+                    }
+
                     if self.config.dns.cache.enabled {
                         self.cache.insert(&query, &upstream_resp).await;
                     }
