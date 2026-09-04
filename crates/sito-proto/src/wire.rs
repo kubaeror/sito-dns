@@ -157,6 +157,50 @@ pub fn synthesize_blocked_response(
     response
 }
 
+/// Synthesize a response containing a CNAME record.
+pub fn synthesize_cname_response(query: &Message, cname_target: &Name, ttl: u32) -> Message {
+    let mut response = Message::response(query.metadata.id, query.metadata.op_code);
+    response.metadata.recursion_desired = query.metadata.recursion_desired;
+    response.metadata.recursion_available = true;
+    response.metadata.response_code = ResponseCode::NoError;
+    response.queries.clone_from(&query.queries);
+
+    if let Some(client_edns) = &query.edns {
+        let mut resp_edns = Edns::new();
+        resp_edns.set_max_payload(client_edns.max_payload());
+        response.set_edns(resp_edns);
+    }
+
+    if let Some(q) = query.queries.first() {
+        let record = Record::from_rdata(
+            q.name().clone(),
+            ttl,
+            RData::CNAME(hickory_proto::rr::rdata::CNAME(cname_target.clone())),
+        );
+        response.answers.push(record);
+    }
+
+    response
+}
+
+/// Synthesize a response containing custom answer records.
+pub fn synthesize_records_response(query: &Message, answers: Vec<Record>) -> Message {
+    let mut response = Message::response(query.metadata.id, query.metadata.op_code);
+    response.metadata.recursion_desired = query.metadata.recursion_desired;
+    response.metadata.recursion_available = true;
+    response.metadata.response_code = ResponseCode::NoError;
+    response.queries.clone_from(&query.queries);
+
+    if let Some(client_edns) = &query.edns {
+        let mut resp_edns = Edns::new();
+        resp_edns.set_max_payload(client_edns.max_payload());
+        response.set_edns(resp_edns);
+    }
+
+    response.answers = answers;
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

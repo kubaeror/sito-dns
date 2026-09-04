@@ -11,6 +11,7 @@ pub use normalize::normalize_domain;
 pub use wire::{
     DOT_PADDING_BLOCK_SIZE, apply_dot_padding, client_edns_payload_size, decode_message,
     encode_message, extract_query_info, set_edns_payload_size, synthesize_blocked_response,
+    synthesize_cname_response, synthesize_records_response,
 };
 
 // Re-export core hickory types so other sito crates don't need direct hickory-proto dependency

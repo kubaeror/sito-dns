@@ -1,0 +1,120 @@
+{
+  "tiktok": [
+    "tiktok.com",
+    "tiktokcdn.com",
+    "tiktokv.com",
+    "byteoversea.com",
+    "ibytedtos.com",
+    "musical.ly"
+  ],
+  "youtube": [
+    "youtube.com",
+    "youtu.be",
+    "ytimg.com",
+    "googlevideo.com",
+    "youtubei.googleapis.com"
+  ],
+  "facebook": [
+    "facebook.com",
+    "fb.com",
+    "fbcdn.net",
+    "fbsbx.com"
+  ],
+  "instagram": [
+    "instagram.com",
+    "cdninstagram.com"
+  ],
+  "steam": [
+    "steampowered.com",
+    "steamcommunity.com",
+    "steamgames.com",
+    "steamstatic.com",
+    "steamcontent.com"
+  ],
+  "netflix": [
+    "netflix.com",
+    "netflix.net",
+    "nflximg.net",
+    "nflxvideo.net",
+    "nflxext.com"
+  ],
+  "discord": [
+    "discord.com",
+    "discord.gg",
+    "discordapp.com",
+    "discordapp.net"
+  ],
+  "roblox": [
+    "roblox.com",
+    "rbxcdn.com"
+  ],
+  "spotify": [
+    "spotify.com",
+    "scdn.co",
+    "spoti.fi"
+  ],
+  "reddit": [
+    "reddit.com",
+    "redd.it",
+    "redditstatic.com",
+    "redditmedia.com"
+  ],
+  "twitch": [
+    "twitch.tv",
+    "ttvnw.net",
+    "jtvnw.net"
+  ],
+  "twitter": [
+    "twitter.com",
+    "x.com",
+    "twimg.com",
+    "t.co"
+  ],
+  "telegram": [
+    "telegram.org",
+    "t.me",
+    "telegra.ph"
+  ],
+  "amazon": [
+    "amazon.com",
+    "media-amazon.com",
+    "ssl-images-amazon.com"
+  ],
+  "ebay": [
+    "ebay.com",
+    "ebayimg.com",
+    "ebaystatic.com"
+  ],
+  "epic_games": [
+    "epicgames.com",
+    "unrealengine.com"
+  ],
+  "origin": [
+    "origin.com",
+    "ea.com"
+  ],
+  "whatsapp": [
+    "whatsapp.com",
+    "whatsapp.net"
+  ],
+  "snapchat": [
+    "snapchat.com",
+    "sc-cdn.net"
+  ],
+  "pinterest": [
+    "pinterest.com",
+    "pinimg.com"
+  ],
+  "vk": [
+    "vk.com",
+    "userapi.com"
+  ],
+  "disneyplus": [
+    "disneyplus.com",
+    "bamgrid.com"
+  ],
+  "hulu": [
+    "hulu.com",
+    "hulustream.com"
+  ]
+}
