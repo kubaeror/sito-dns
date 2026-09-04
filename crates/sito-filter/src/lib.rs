@@ -7,6 +7,7 @@ pub mod downloader;
 pub mod engine;
 pub mod error;
 pub mod parser;
+pub mod structures;
 
 pub use downloader::ListDownloader;
 pub use engine::{FilterSnapshot, HostsFilterEngine};
