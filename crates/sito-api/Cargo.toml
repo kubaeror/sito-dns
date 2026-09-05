@@ -8,7 +8,7 @@ description = "REST API, OpenAPI documentation, and administration server for si
 
 [dependencies]
 anyhow.workspace = true
-argon2 = "0.5"
+argon2 = "0.6"
 arc-swap.workspace = true
 axum.workspace = true
 blake3.workspace = true
