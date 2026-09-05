@@ -3066,7 +3066,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sito"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3100,7 +3100,7 @@ dependencies = [
 
 [[package]]
 name = "sito-api"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3138,7 +3138,7 @@ dependencies = [
 
 [[package]]
 name = "sito-cache"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "moka",
  "sito-core",
@@ -3149,7 +3149,7 @@ dependencies = [
 
 [[package]]
 name = "sito-clients"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "chrono",
  "croner",
@@ -3165,7 +3165,7 @@ dependencies = [
 
 [[package]]
 name = "sito-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arc-swap",
  "hickory-proto",
@@ -3176,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "sito-dnssec"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arc-swap",
  "base64",
@@ -3190,7 +3190,7 @@ dependencies = [
 
 [[package]]
 name = "sito-filter"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -3210,7 +3210,7 @@ dependencies = [
 
 [[package]]
 name = "sito-ha"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3241,7 +3241,7 @@ dependencies = [
 
 [[package]]
 name = "sito-proto"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hickory-proto",
  "idna",
@@ -3251,7 +3251,7 @@ dependencies = [
 
 [[package]]
 name = "sito-rewrites"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hickory-proto",
  "serde",
@@ -3265,7 +3265,7 @@ dependencies = [
 
 [[package]]
 name = "sito-stats"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "chrono",
  "serde",
@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "sito-test"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3330,7 +3330,7 @@ dependencies = [
 
 [[package]]
 name = "sito-transport"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3365,7 +3365,7 @@ dependencies = [
 
 [[package]]
 name = "sito-upstream"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "rand 0.8.8",
