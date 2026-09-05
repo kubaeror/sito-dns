@@ -4,7 +4,7 @@
 //! Rotated upon login.
 
 use crate::auth::token::Role;
-use rand::RngCore;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 pub const SESSION_COOKIE_NAME: &str = "sito_session";
@@ -23,7 +23,7 @@ pub struct Session {
 impl Session {
     pub fn new(username: &str, role: Role, ttl_secs: i64) -> Self {
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill(&mut bytes);
         let id = hex::encode(bytes);
         let now = chrono::Utc::now().timestamp();
 

@@ -5,7 +5,7 @@ use crate::auth::password::{hash_password, verify_password};
 use crate::auth::session::{DEFAULT_SESSION_TTL_SECS, Session};
 use crate::auth::token::{ApiTokenMeta, CreateTokenResponse, Role, generate_token, hash_token};
 use crate::auth::totp::{TotpConfig, TotpSetupResponse};
-use rand::RngCore;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -163,7 +163,7 @@ impl AuthManager {
             && totp.enabled
         {
             let mut bytes = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut bytes);
+            rand::rng().fill(&mut bytes);
             let partial_token = hex::encode(bytes);
 
             let mut partials = self.partial_tokens.lock().unwrap();

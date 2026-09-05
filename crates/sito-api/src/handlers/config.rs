@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use rand::RngCore;
+use rand::RngExt;
 use sito_core::config::Config;
 use std::io::Read;
 use std::sync::Arc;
@@ -312,7 +312,7 @@ pub async fn prepare_restore(
         extract_backup_archive(&body).map_err(|e| ProblemDetails::bad_request(e.to_string()))?;
 
     let mut token_bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut token_bytes);
+    rand::rng().fill(&mut token_bytes);
     let token = hex::encode(token_bytes);
 
     // Save token with 5-minute expiry
