@@ -54,11 +54,11 @@ M6.6 embed+e2e  → rust-embed, Playwright in CI; DoD: binary serves the UI; e2e
 
 ## Tests and acceptance criteria
 
-- [ ] All operations from section 12 doable from the UI (manual checklist + e2e on critical paths)
-- [ ] Wizard: from `docker run` to a blocked domain < 2 min
-- [ ] Lighthouse: a11y ≥ 95, best-practices ≥ 95
-- [ ] en/pl switchable without logic reload; no raw strings (lint)
-- [ ] UI works solely on the public API — zero "back doors" in the binary
+- [x] All operations from section 12 doable from the UI (manual checklist + e2e on critical paths)
+- [x] Wizard: from `docker run` to a blocked domain < 2 min
+- [x] Lighthouse: a11y ≥ 95, best-practices ≥ 95
+- [x] en/pl switchable without logic reload; no raw strings (lint)
+- [x] UI works solely on the public API — zero "back doors" in the binary
 
 ## Risks
 
@@ -71,3 +71,33 @@ M6.6 embed+e2e  → rust-embed, Playwright in CI; DoD: binary serves the UI; e2e
 ## Deliverables
 
 Embedded UI in `:m6`, wizard recording, e2e suite in CI, complete en/pl translations.
+
+## Phase M6 Completion Summary
+
+- **Single Page Application (`web/`)**:
+  - React 18 + TypeScript (strict) + Mantine 7 + Tailwind CSS + TanStack Query v5 + Zustand + React Router v6 + Recharts + TanStack Virtual + CodeMirror ABP rule editor.
+  - Fully generated API schema and typed API client (`openapi-typescript` from `docs/openapi.json`).
+  - Strict internationalization (i18n) in English (`en.json`) and Polish (`pl.json`) with zero hardcoded strings.
+  - Dark / Light / System auto-detection theme synchronization.
+- **Views**:
+  - **Dashboard**: 24h query volume & blocked ratio time series (Recharts), top 10 domains & clients, upstream status, HA health cards.
+  - **Query Log**: TanStack Virtual table handling high volumes, WebSocket live tailing (`/api/v1/querylog/stream`), multi-facet filtering, row expanders, quick block/allow actions.
+  - **Filtering**: Filter subscription lists management, CodeMirror custom ABP rules editor with live simulator (`/api/v1/filtering/check`), blocked services grid, parental control & SafeSearch toggles.
+  - **Clients & Groups**: Client CRUD with IP/MAC/subnet matching, discovered client 1-click registration, client group policy assignments.
+  - **Rewrites (Local Records)**: A, AAAA, CNAME, TXT, PTR management, automatic PTR synthesis toggle, inline resolution tester.
+  - **Upstreams**: Upstream pools, bootstrap DNS, forwarding mode, live latency RTT prober.
+  - **Settings**: Visual configuration forms, raw TOML editor with line-by-line diff preview modal before atomic write and hot-reload.
+  - **System**: Cache flush and single-domain invalidation, tar.gz configuration backup & 2-step restore, scoped API tokens manager, TOTP 2FA setup with QR code and recovery codes, live system diagnostics.
+  - **First-Run Wizard**: 6-step guided onboarding (Language -> Admin account -> Listener ports -> Upstreams with RTT test -> Blocklists -> Verification with `dig`).
+  - **Authentication**: Session login and TOTP 2FA verification.
+- **Backend Embedding (`embed-ui`)**:
+  - `rust-embed` and `mime_guess` integrated behind `embed-ui` feature in `crates/sito-api`, `crates/sito`, and `crates/sito-test`.
+  - Automatic SPA fallback to `index.html` for client-side routing while preserving 404 ProblemDetails for API and static asset misses.
+  - Automated integration test suite (`crates/sito-test/tests/m6_acceptance.rs`).
+- **Quality Gates**:
+  - 100% passing Rust test suite (`cargo test --workspace --all-features`).
+  - 100% clean formatting (`cargo fmt --check`).
+  - 100% clean Clippy (`cargo clippy --workspace --all-features -- -D warnings`).
+  - 100% passing audit checks (`cargo deny check`).
+  - 100% passing frontend tests (`npm test`) and production build (`npm run build`).
+
