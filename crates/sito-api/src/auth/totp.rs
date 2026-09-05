@@ -5,6 +5,7 @@
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use totp_rs::{Algorithm, Secret, TOTP};
 
 /// TOTP configuration and state for a user.
@@ -101,13 +102,18 @@ impl TotpConfig {
             }
         }
 
-        // 2. Try one-time backup codes
+        // 2. Try one-time backup codes using constant-time comparison
         let entered_hash = hash_backup_code(&clean_code);
-        if let Some(pos) = self
-            .backup_code_hashes
-            .iter()
-            .position(|h| h == &entered_hash)
-        {
+        let entered_bytes = entered_hash.as_bytes();
+        let mut matched_idx = None;
+        for (idx, h) in self.backup_code_hashes.iter().enumerate() {
+            let h_bytes = h.as_bytes();
+            if h_bytes.len() == entered_bytes.len() && bool::from(h_bytes.ct_eq(entered_bytes)) {
+                matched_idx = Some(idx);
+            }
+        }
+
+        if let Some(pos) = matched_idx {
             self.backup_code_hashes.remove(pos);
             return true;
         }

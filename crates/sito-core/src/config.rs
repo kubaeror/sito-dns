@@ -837,6 +837,16 @@ impl FilteringConfig {
                     "filter list URL cannot be empty",
                 ));
             }
+            let url_lower = list.url.trim().to_ascii_lowercase();
+            if !url_lower.starts_with("http://")
+                && !url_lower.starts_with("https://")
+                && !url_lower.starts_with("file://")
+            {
+                return Err(ConfigError::validation(
+                    format!("filtering.lists[{i}].url"),
+                    "filter list URL must use http://, https://, or file:// scheme",
+                ));
+            }
         }
         match self.anti_doh_bypass.as_str() {
             "off" | "block_all" | "block_except_trusted" => {}

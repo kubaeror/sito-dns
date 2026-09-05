@@ -196,7 +196,12 @@ impl RuleSetBuilder {
                 pat_to_rules.push(rules);
             }
 
-            match Regex::new_many(&pat_strings) {
+            let mut builder = regex_automata::dfa::regex::Builder::new();
+            builder.dense(
+                regex_automata::dfa::dense::Config::new().dfa_size_limit(Some(10 * 1024 * 1024)), // 10 MB strict DFA memory ceiling
+            );
+
+            match builder.build_many(&pat_strings) {
                 Ok(re) => (Some(re), pat_to_rules),
                 Err(e) => {
                     warn!(error = %e, "Failed to compile regex DFA; skipping regex matcher");

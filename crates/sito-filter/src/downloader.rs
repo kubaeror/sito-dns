@@ -51,6 +51,16 @@ impl ListDownloader {
 
     /// Downloads a blocklist over HTTP/HTTPS with size checking.
     pub async fn download(&self, list_name: &str, url: &str) -> Result<String, FilterError> {
+        let url_lower = url.trim().to_ascii_lowercase();
+        if !url_lower.starts_with("http://") && !url_lower.starts_with("https://") {
+            return Err(FilterError::InvalidUrl {
+                url: url.to_string(),
+                reason:
+                    "unsupported scheme: only http and https are permitted for network downloads"
+                        .to_string(),
+            });
+        }
+
         let resp = self
             .client
             .get(url)

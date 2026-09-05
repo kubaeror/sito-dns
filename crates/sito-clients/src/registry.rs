@@ -324,7 +324,7 @@ impl ClientRegistry {
 }
 
 /// Extract {id} from {id}.dns.domain.
-fn extract_id_from_sni(sni: &str) -> Option<&str> {
+pub fn extract_id_from_sni(sni: &str) -> Option<&str> {
     let parts: Vec<&str> = sni.split('.').collect();
     if parts.len() >= 3 && parts[1] == "dns" {
         return Some(parts[0]);
@@ -333,6 +333,24 @@ fn extract_id_from_sni(sni: &str) -> Option<&str> {
         return Some(parts[0]);
     }
     None
+}
+
+/// Extract and sanitize ClientID from URL path (e.g. `/dns-query/{client_id}`).
+pub fn extract_id_from_url_path(path: &str) -> Option<&str> {
+    let clean = path.trim_matches('/');
+    let segment = if let Some(stripped) = clean.strip_prefix("dns-query/") {
+        stripped
+    } else {
+        clean
+    };
+    if segment.is_empty()
+        || segment.contains('/')
+        || segment.contains('\\')
+        || segment.contains("..")
+    {
+        return None;
+    }
+    Some(segment)
 }
 
 /// Check if target_ip is contained within a CIDR subnet block.

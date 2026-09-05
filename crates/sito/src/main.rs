@@ -6,6 +6,10 @@ use sito::server::run_server_full;
 use sito_core::config::Config;
 use std::net::SocketAddr;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();

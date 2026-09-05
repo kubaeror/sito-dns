@@ -129,6 +129,16 @@ impl SubscriptionFetcher {
                 });
         }
 
+        // Restrict HTTP list download schemes to http and https (SSRF protection)
+        let url_lower = url.trim().to_ascii_lowercase();
+        if !url_lower.starts_with("http://") && !url_lower.starts_with("https://") {
+            return Err(FilterError::InvalidUrl {
+                url: url.to_string(),
+                reason: "unsupported scheme: only http, https, and file schemes are permitted"
+                    .to_string(),
+            });
+        }
+
         let existing_meta = read_metadata(&meta_path).await;
         let mut last_error = None;
         let mut backoff = self.initial_backoff;

@@ -49,10 +49,18 @@ sito-stats.workspace = true
 tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
 utoipa = "5.3"
+subtle.workspace = true
 
 [features]
 default = []
 embed-ui = ["sito-api/embed-ui", "sito/embed-ui"]
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "pipeline_bench"
+harness = false
 
 [lints]
 workspace = true

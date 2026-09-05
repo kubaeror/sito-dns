@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 
 /// Outcome of the first login phase (`POST /auth/login`).
 #[derive(Debug, Clone)]
@@ -298,16 +299,28 @@ impl AuthManager {
         }
     }
 
-    /// Validates a bearer API token string against stored Blake3 hashes.
+    /// Validates a bearer API token string against stored Blake3 hashes using constant-time comparison.
     pub fn validate_token(&self, token: &str) -> Option<ApiTokenMeta> {
         let hash = hash_token(token);
+        let hash_bytes = hash.as_bytes();
         let mut tokens = self.tokens.lock().unwrap();
-        if let Some(meta) = tokens.get_mut(&hash) {
-            meta.last_used = Some(chrono::Utc::now().timestamp_millis());
-            Some(meta.clone())
-        } else {
-            None
+
+        let mut matched_key: Option<String> = None;
+        for stored_hash in tokens.keys() {
+            let stored_bytes = stored_hash.as_bytes();
+            if stored_bytes.len() == hash_bytes.len() && bool::from(stored_bytes.ct_eq(hash_bytes))
+            {
+                matched_key = Some(stored_hash.clone());
+            }
         }
+
+        if let Some(key) = matched_key {
+            if let Some(meta) = tokens.get_mut(&key) {
+                meta.last_used = Some(chrono::Utc::now().timestamp_millis());
+                return Some(meta.clone());
+            }
+        }
+        None
     }
 }
 
