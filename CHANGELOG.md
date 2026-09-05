@@ -20,6 +20,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - `toml`: Upgraded from `0.8` to `1.1` (using `toml-write` engine).
   - `base64`: Upgraded from `0.22` to `0.23`.
   - `criterion`: Upgraded from `0.5` to `0.8` (benchmarks modernized with `std::hint::black_box`).
+  - `argon2`: Upgraded from `0.5` to `0.6` (migrated to `password-hash 0.6`, `phc::PasswordHash`, and automatic secure salt generation).
+  - `rand`: Upgraded from `0.8` to `0.10` (unified RNG engine across entire workspace, migrated to `rand::rng()` and `rand::RngExt`).
 - **Workspace Version**: Bumped workspace and crate versions to `1.1.1`.
 
 ---
