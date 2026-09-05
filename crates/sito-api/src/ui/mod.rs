@@ -79,7 +79,7 @@ mod tests {
             username: "admin",
             user_role: "",
             active_tab: "login",
-            version: "1.1.1",
+            version: "1.2.0",
             error_message: "Invalid credentials test",
         };
         let html = tmpl.render().expect("render login template");
@@ -101,7 +101,7 @@ mod tests {
             top_clients: vec![("192.168.1.10".to_string(), 100)],
         };
         let status = StatusResponse {
-            version: "1.1.1".to_string(),
+            version: "1.2.0".to_string(),
             uptime_seconds: 3661,
             role: "master".to_string(),
             listeners: vec!["0.0.0.0:53 (UDP/TCP)".to_string()],
@@ -126,7 +126,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "dashboard",
-            version: "1.1.1",
+            version: "1.2.0",
             stats: &stats,
             status: &status,
             uptime_str: "1h 1m 1s".to_string(),
@@ -175,7 +175,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "querylog",
-            version: "1.1.1",
+            version: "1.2.0",
             entries: &rows,
         };
         let full_html = full.render().expect("render querylog page");
@@ -190,7 +190,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "filtering",
-            version: "1.1.1",
+            version: "1.2.0",
             lists: &[],
             custom_rules: "||ad.com^",
         };
@@ -201,7 +201,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "rewrites",
-            version: "1.1.1",
+            version: "1.2.0",
             rewrites: vec![RewriteViewItem {
                 domain: "nas.lan".to_string(),
                 record_type: "A".to_string(),
@@ -215,7 +215,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "clients",
-            version: "1.1.1",
+            version: "1.2.0",
             clients: vec![ClientViewItem {
                 name: "Work PC".to_string(),
                 ids: vec!["192.168.1.100".to_string()],
@@ -229,7 +229,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "upstreams",
-            version: "1.1.1",
+            version: "1.2.0",
             upstreams: vec![],
         };
         assert!(upstreams_tmpl.render().is_ok());
@@ -239,7 +239,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "settings",
-            version: "1.1.1",
+            version: "1.2.0",
             cache_size_mb: 64,
             min_ttl: 60,
             dnssec_enabled: true,
@@ -248,7 +248,7 @@ mod tests {
         assert!(settings_tmpl.render().is_ok());
 
         let status = StatusResponse {
-            version: "1.1.1".to_string(),
+            version: "1.2.0".to_string(),
             uptime_seconds: 120,
             role: "master".to_string(),
             listeners: vec![],
@@ -258,7 +258,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "system",
-            version: "1.1.1",
+            version: "1.2.0",
             status: &status,
             uptime_str: "2m 0s".to_string(),
         };
@@ -274,7 +274,7 @@ mod tests {
             username: "admin",
             user_role: "",
             active_tab: "wizard",
-            version: "1.1.1",
+            version: "1.2.0",
         };
         assert!(wiz_tmpl.render().unwrap().contains("Welcome to sito DNS"));
     }
