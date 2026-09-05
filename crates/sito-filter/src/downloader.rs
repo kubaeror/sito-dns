@@ -82,14 +82,14 @@ impl ListDownloader {
             });
         }
 
-        if let Some(content_length) = resp.content_length() {
-            if content_length as usize > self.max_bytes {
-                return Err(FilterError::ListTooLarge {
-                    list: list_name.to_string(),
-                    size: content_length as usize,
-                    limit: self.max_bytes,
-                });
-            }
+        if let Some(content_length) = resp.content_length()
+            && content_length as usize > self.max_bytes
+        {
+            return Err(FilterError::ListTooLarge {
+                list: list_name.to_string(),
+                size: content_length as usize,
+                limit: self.max_bytes,
+            });
         }
 
         let bytes = resp

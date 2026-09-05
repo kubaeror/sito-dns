@@ -153,10 +153,10 @@ impl ClientRegistry {
                     if id.eq_ignore_ascii_case(&sni_lower) {
                         return Some(entry.clone());
                     }
-                    if let Some(cand) = candidate_id {
-                        if id.eq_ignore_ascii_case(cand) {
-                            return Some(entry.clone());
-                        }
+                    if let Some(cand) = candidate_id
+                        && id.eq_ignore_ascii_case(cand)
+                    {
+                        return Some(entry.clone());
                     }
                 }
             }
@@ -169,10 +169,10 @@ impl ClientRegistry {
         for entry in &self.config.entries {
             for id in &entry.ids {
                 // Exact IP
-                if let Ok(ip) = id.parse::<IpAddr>() {
-                    if ip == client_ip {
-                        return Some(entry.clone());
-                    }
+                if let Ok(ip) = id.parse::<IpAddr>()
+                    && ip == client_ip
+                {
+                    return Some(entry.clone());
                 }
                 // CIDR subnet
                 if id.contains('/') && cidr_matches(id, client_ip) {
@@ -186,10 +186,10 @@ impl ClientRegistry {
     fn match_by_mac(&self, mac: &str) -> Option<ClientEntryConfig> {
         for entry in &self.config.entries {
             for id in &entry.ids {
-                if let Some(entry_mac) = normalize_mac(id) {
-                    if entry_mac.eq_ignore_ascii_case(mac) {
-                        return Some(entry.clone());
-                    }
+                if let Some(entry_mac) = normalize_mac(id)
+                    && entry_mac.eq_ignore_ascii_case(mac)
+                {
+                    return Some(entry.clone());
                 }
             }
         }
@@ -213,24 +213,24 @@ impl ClientRegistry {
 
                 // Check if this lease matches any client entry
                 for entry in &self.config.entries {
-                    if let Some(ref h) = lease.hostname {
-                        if entry.name.eq_ignore_ascii_case(h) {
-                            return Some(entry.clone());
-                        }
+                    if let Some(ref h) = lease.hostname
+                        && entry.name.eq_ignore_ascii_case(h)
+                    {
+                        return Some(entry.clone());
                     }
                     for id in &entry.ids {
                         if normalize_mac(id).is_some_and(|m| m.eq_ignore_ascii_case(&lease.mac)) {
                             return Some(entry.clone());
                         }
-                        if let Some(ref h) = lease.hostname {
-                            if id.eq_ignore_ascii_case(h) {
-                                return Some(entry.clone());
-                            }
+                        if let Some(ref h) = lease.hostname
+                            && id.eq_ignore_ascii_case(h)
+                        {
+                            return Some(entry.clone());
                         }
-                        if let Some(ref c) = lease.comment {
-                            if id.eq_ignore_ascii_case(c) {
-                                return Some(entry.clone());
-                            }
+                        if let Some(ref c) = lease.comment
+                            && id.eq_ignore_ascii_case(c)
+                        {
+                            return Some(entry.clone());
                         }
                     }
                 }

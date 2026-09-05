@@ -200,28 +200,26 @@ impl DynamicCertResolver {
 impl ResolvesServerCert for DynamicCertResolver {
     fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
         // Check for ACME TLS-ALPN-01 challenge first (ALPN = "acme-tls/1")
-        if let Some(mut alpn) = client_hello.alpn() {
-            if alpn.any(|proto| proto == b"acme-tls/1") {
-                if let Some(sni) = client_hello.server_name() {
-                    let sni_lower = sni.to_ascii_lowercase();
-                    if let Some(key) = self.challenge_keys.get(&sni_lower) {
-                        return Some(Arc::clone(&*key));
-                    }
-                }
+        if let Some(mut alpn) = client_hello.alpn()
+            && alpn.any(|proto| proto == b"acme-tls/1")
+            && let Some(sni) = client_hello.server_name()
+        {
+            let sni_lower = sni.to_ascii_lowercase();
+            if let Some(key) = self.challenge_keys.get(&sni_lower) {
+                return Some(Arc::clone(&*key));
             }
         }
 
         // Enforce ALPN if configured and client provided ALPN offers
-        if !self.allowed_alpn.is_empty() {
-            if let Some(mut alpn) = client_hello.alpn() {
-                if !alpn.any(|client_proto| {
-                    self.allowed_alpn
-                        .iter()
-                        .any(|p| p.as_slice() == client_proto)
-                }) {
-                    return None;
-                }
-            }
+        if !self.allowed_alpn.is_empty()
+            && let Some(mut alpn) = client_hello.alpn()
+            && !alpn.any(|client_proto| {
+                self.allowed_alpn
+                    .iter()
+                    .any(|p| p.as_slice() == client_proto)
+            })
+        {
+            return None;
         }
 
         if let Some(sni) = client_hello.server_name() {
@@ -389,10 +387,10 @@ impl CertWatcher {
 
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| {
-                if let Ok(event) = res {
-                    if event.kind.is_modify() || event.kind.is_create() {
-                        let _ = tx.blocking_send(());
-                    }
+                if let Ok(event) = res
+                    && (event.kind.is_modify() || event.kind.is_create())
+                {
+                    let _ = tx.blocking_send(());
                 }
             },
             notify::Config::default(),

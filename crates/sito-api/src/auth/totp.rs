@@ -80,25 +80,25 @@ impl TotpConfig {
         let clean_code = code.trim().replace(' ', "");
 
         // 1. Try dynamic 6-digit TOTP code
-        if clean_code.len() == 6 && clean_code.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(secret) = Secret::Encoded(self.secret.clone()).to_bytes() {
-                if let Ok(totp) = TOTP::new(
-                    Algorithm::SHA1,
-                    6,
-                    1, // ±1 step window
-                    30,
-                    secret,
-                    Some(issuer.to_string()),
-                    username.to_string(),
-                ) {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if totp.check(&clean_code, now) {
-                        return true;
-                    }
-                }
+        if clean_code.len() == 6
+            && clean_code.chars().all(|c| c.is_ascii_digit())
+            && let Ok(secret) = Secret::Encoded(self.secret.clone()).to_bytes()
+            && let Ok(totp) = TOTP::new(
+                Algorithm::SHA1,
+                6,
+                1, // ±1 step window
+                30,
+                secret,
+                Some(issuer.to_string()),
+                username.to_string(),
+            )
+        {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if totp.check(&clean_code, now) {
+                return true;
             }
         }
 

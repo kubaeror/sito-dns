@@ -29,17 +29,16 @@ pub fn mask_sensitive_toml(toml_str: &str) -> String {
     let mut out = Vec::new();
     for line in toml_str.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("key =")
+        if (trimmed.starts_with("key =")
             || trimmed.starts_with("password =")
             || trimmed.starts_with("secret =")
             || trimmed.starts_with("token =")
-            || trimmed.starts_with("password_hash =")
+            || trimmed.starts_with("password_hash ="))
+            && let Some(idx) = line.find('=')
         {
-            if let Some(idx) = line.find('=') {
-                let (prefix, _) = line.split_at(idx + 1);
-                out.push(format!("{prefix} \"***\""));
-                continue;
-            }
+            let (prefix, _) = line.split_at(idx + 1);
+            out.push(format!("{prefix} \"***\""));
+            continue;
         }
         out.push(line.to_string());
     }

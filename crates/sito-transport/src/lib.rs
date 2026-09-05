@@ -591,19 +591,19 @@ mod tests {
         let config = DohConfig::new(actual_addr, None);
 
         let handler = Arc::new(|query: Message, client: ClientContext| async move {
-            if let Some(ref id) = client.id {
-                if id.as_str() == "alice" {
-                    let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
-                    resp.queries = query.queries.clone();
-                    resp.metadata.response_code = ResponseCode::NoError;
-                    let qname = query.queries[0].name().clone();
-                    resp.answers.push(Record::from_rdata(
-                        qname,
-                        300,
-                        RData::A(A(std::net::Ipv4Addr::new(1, 1, 1, 1))),
-                    ));
-                    return Some(resp);
-                }
+            if let Some(ref id) = client.id
+                && id.as_str() == "alice"
+            {
+                let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                resp.queries = query.queries.clone();
+                resp.metadata.response_code = ResponseCode::NoError;
+                let qname = query.queries[0].name().clone();
+                resp.answers.push(Record::from_rdata(
+                    qname,
+                    300,
+                    RData::A(A(std::net::Ipv4Addr::new(1, 1, 1, 1))),
+                ));
+                return Some(resp);
             }
 
             let mut resp = Message::response(query.metadata.id, query.metadata.op_code);

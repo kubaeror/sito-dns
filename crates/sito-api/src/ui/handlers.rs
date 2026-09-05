@@ -63,29 +63,26 @@ fn escape_html(s: &str) -> String {
 }
 
 pub fn get_session_user(ctx: &ServerContext, headers: &HeaderMap) -> Option<AuthUser> {
-    if let Some(cookie_hdr) = headers.get("cookie") {
-        if let Ok(cookie_str) = cookie_hdr.to_str() {
-            if let Some(session_id) = extract_session_cookie(cookie_str) {
-                if let Some(session) = ctx.auth_mgr.validate_session(&session_id) {
-                    return Some(AuthUser {
-                        username: session.username,
-                        role: session.role,
-                        token_id: None,
-                    });
-                }
-            }
-        }
+    if let Some(cookie_hdr) = headers.get("cookie")
+        && let Ok(cookie_str) = cookie_hdr.to_str()
+        && let Some(session_id) = extract_session_cookie(cookie_str)
+        && let Some(session) = ctx.auth_mgr.validate_session(&session_id)
+    {
+        return Some(AuthUser {
+            username: session.username,
+            role: session.role,
+            token_id: None,
+        });
     }
     None
 }
 
 fn parse_client_ip(headers: &HeaderMap) -> String {
-    if let Some(fwd) = headers.get("x-forwarded-for") {
-        if let Ok(s) = fwd.to_str() {
-            if let Some(first) = s.split(',').next() {
-                return first.trim().to_string();
-            }
-        }
+    if let Some(fwd) = headers.get("x-forwarded-for")
+        && let Ok(s) = fwd.to_str()
+        && let Some(first) = s.split(',').next()
+    {
+        return first.trim().to_string();
     }
     "127.0.0.1".to_string()
 }
@@ -144,17 +141,16 @@ pub async fn login_submit(
             resp
         }
         LoginResult::TotpRequired { partial_token } => {
-            if let Some(ref code) = form.totp {
-                if !code.trim().is_empty() {
-                    if let Some(session) = ctx.auth_mgr.verify_totp(&partial_token, code.trim()) {
-                        let cookie_header = session.to_cookie_header();
-                        let mut resp = Redirect::to("/dashboard").into_response();
-                        if let Ok(val) = cookie_header.parse() {
-                            resp.headers_mut().insert(SET_COOKIE, val);
-                        }
-                        return resp;
-                    }
+            if let Some(ref code) = form.totp
+                && !code.trim().is_empty()
+                && let Some(session) = ctx.auth_mgr.verify_totp(&partial_token, code.trim())
+            {
+                let cookie_header = session.to_cookie_header();
+                let mut resp = Redirect::to("/dashboard").into_response();
+                if let Ok(val) = cookie_header.parse() {
+                    resp.headers_mut().insert(SET_COOKIE, val);
                 }
+                return resp;
             }
             HtmlTemplate(LoginTemplate {
                 is_authenticated: false,
@@ -197,12 +193,11 @@ pub async fn login_submit(
 }
 
 pub async fn logout_handler(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
-    if let Some(cookie_hdr) = headers.get("cookie") {
-        if let Ok(s) = cookie_hdr.to_str() {
-            if let Some(session_id) = extract_session_cookie(s) {
-                ctx.auth_mgr.logout(&session_id);
-            }
-        }
+    if let Some(cookie_hdr) = headers.get("cookie")
+        && let Ok(s) = cookie_hdr.to_str()
+        && let Some(session_id) = extract_session_cookie(s)
+    {
+        ctx.auth_mgr.logout(&session_id);
     }
     let clear_cookie = build_clear_session_cookie();
     let mut resp = Redirect::to("/login").into_response();
@@ -997,10 +992,10 @@ pub async fn system_reload_handler(
         return Redirect::to("/login").into_response();
     }
 
-    if let Ok(toml_str) = tokio::fs::read_to_string(&ctx.config_path).await {
-        if let Ok(cfg) = sito_core::config::Config::from_toml_str(&toml_str) {
-            ctx.config.store(Arc::new(cfg));
-        }
+    if let Ok(toml_str) = tokio::fs::read_to_string(&ctx.config_path).await
+        && let Ok(cfg) = sito_core::config::Config::from_toml_str(&toml_str)
+    {
+        ctx.config.store(Arc::new(cfg));
     }
     Redirect::to("/system").into_response()
 }

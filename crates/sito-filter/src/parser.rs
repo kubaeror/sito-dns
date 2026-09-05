@@ -75,25 +75,25 @@ impl ClientMatcher {
             Self::Ip(ip) => ctx.ip == *ip,
             Self::Cidr { ip, prefix } => cidr_matches(*ip, *prefix, ctx.ip),
             Self::Name(name) => {
-                if let Some(id) = &ctx.id {
-                    if id.as_str().eq_ignore_ascii_case(name) {
-                        return true;
-                    }
+                if let Some(id) = &ctx.id
+                    && id.as_str().eq_ignore_ascii_case(name)
+                {
+                    return true;
                 }
-                if let Some(client_name) = &ctx.client_name {
-                    if client_name.eq_ignore_ascii_case(name) {
-                        return true;
-                    }
+                if let Some(client_name) = &ctx.client_name
+                    && client_name.eq_ignore_ascii_case(name)
+                {
+                    return true;
                 }
-                if let Some(group) = &ctx.group {
-                    if group.eq_ignore_ascii_case(name) {
-                        return true;
-                    }
+                if let Some(group) = &ctx.group
+                    && group.eq_ignore_ascii_case(name)
+                {
+                    return true;
                 }
-                if let Some(mac) = &ctx.mac {
-                    if mac.eq_ignore_ascii_case(name) {
-                        return true;
-                    }
+                if let Some(mac) = &ctx.mac
+                    && mac.eq_ignore_ascii_case(name)
+                {
+                    return true;
                 }
                 false
             }
@@ -795,10 +795,10 @@ pub fn parse_hosts<S: BuildHasher>(content: &str, set: &mut HashSet<String, S>) 
                 continue;
             }
 
-            if let Ok(normalized) = normalize_domain(raw_domain) {
-                if set.insert(normalized) {
-                    added += 1;
-                }
+            if let Ok(normalized) = normalize_domain(raw_domain)
+                && set.insert(normalized)
+            {
+                added += 1;
             }
         }
     }

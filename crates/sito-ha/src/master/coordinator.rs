@@ -205,16 +205,16 @@ impl MasterCoordinator {
 
         // If slave is behind current version, immediately enqueue push
         let cur_v = self.get_current_version();
-        if have_version < cur_v {
-            if let Some(ref push) = *self.active_push.lock().unwrap() {
-                info!(
-                    instance = %slave_instance,
-                    have_version,
-                    cur_v,
-                    "Slave is behind master version; pushing latest bundle immediately"
-                );
-                let _ = tx.try_send(push.clone());
-            }
+        if have_version < cur_v
+            && let Some(ref push) = *self.active_push.lock().unwrap()
+        {
+            info!(
+                instance = %slave_instance,
+                have_version,
+                cur_v,
+                "Slave is behind master version; pushing latest bundle immediately"
+            );
+            let _ = tx.try_send(push.clone());
         }
 
         // Heartbeat ping interval
@@ -226,11 +226,10 @@ impl MasterCoordinator {
             tokio::select! {
                 // Outgoing messages queued for this slave
                 Some(msg) = rx.recv() => {
-                    if let Ok(json) = msg.to_json() {
-                        if ws_stream.send(WsMessage::Text(json.into())).await.is_err() {
+                    if let Ok(json) = msg.to_json()
+                        && ws_stream.send(WsMessage::Text(json.into())).await.is_err() {
                             break;
                         }
-                    }
                 }
 
                 // Periodic ping
@@ -238,11 +237,10 @@ impl MasterCoordinator {
                     #[allow(clippy::cast_sign_loss)]
                     let ts = Utc::now().timestamp_millis() as u64;
                     let ping = HaMessage::Ping { ts };
-                    if let Ok(json) = ping.to_json() {
-                        if ws_stream.send(WsMessage::Text(json.into())).await.is_err() {
+                    if let Ok(json) = ping.to_json()
+                        && ws_stream.send(WsMessage::Text(json.into())).await.is_err() {
                             break;
                         }
-                    }
                 }
 
                 // Incoming messages from slave
@@ -254,11 +252,10 @@ impl MasterCoordinator {
                             }
                         }
                         Some(Ok(WsMessage::Binary(bin))) => {
-                            if let Ok(txt) = std::str::from_utf8(&bin) {
-                                if !self.process_slave_msg(&slave_instance, txt) {
+                            if let Ok(txt) = std::str::from_utf8(&bin)
+                                && !self.process_slave_msg(&slave_instance, txt) {
                                     break;
                                 }
-                            }
                         }
                         Some(Ok(WsMessage::Pong(_))) => {
                             let mut slaves = self.slaves.lock().unwrap();
@@ -353,12 +350,12 @@ impl MasterCoordinator {
             HaMessage::Hello { have_version, .. } => {
                 // Resync requested
                 let cur_v = self.get_current_version();
-                if have_version < cur_v {
-                    if let Some(ref push) = *self.active_push.lock().unwrap() {
-                        let slaves = self.slaves.lock().unwrap();
-                        if let Some(s) = slaves.get(slave_instance) {
-                            let _ = s.sender.try_send(push.clone());
-                        }
+                if have_version < cur_v
+                    && let Some(ref push) = *self.active_push.lock().unwrap()
+                {
+                    let slaves = self.slaves.lock().unwrap();
+                    if let Some(s) = slaves.get(slave_instance) {
+                        let _ = s.sender.try_send(push.clone());
                     }
                 }
             }

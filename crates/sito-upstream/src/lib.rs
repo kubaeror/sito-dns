@@ -107,20 +107,20 @@ mod tests {
 
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            if let Ok((len, peer)) = mock_socket.recv_from(&mut buf).await {
-                if let Ok(query) = decode_message(&buf[..len]) {
-                    let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
-                    resp.queries = query.queries.clone();
-                    resp.metadata.response_code = ResponseCode::NoError;
-                    // Return 1.2.3.4 for any query
-                    resp.answers.push(Record::from_rdata(
-                        query.queries[0].name().clone(),
-                        300,
-                        RData::A(A(std::net::Ipv4Addr::new(1, 2, 3, 4))),
-                    ));
-                    if let Ok(encoded) = encode_message(&resp) {
-                        let _ = mock_socket.send_to(&encoded, peer).await;
-                    }
+            if let Ok((len, peer)) = mock_socket.recv_from(&mut buf).await
+                && let Ok(query) = decode_message(&buf[..len])
+            {
+                let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                resp.queries = query.queries.clone();
+                resp.metadata.response_code = ResponseCode::NoError;
+                // Return 1.2.3.4 for any query
+                resp.answers.push(Record::from_rdata(
+                    query.queries[0].name().clone(),
+                    300,
+                    RData::A(A(std::net::Ipv4Addr::new(1, 2, 3, 4))),
+                ));
+                if let Ok(encoded) = encode_message(&resp) {
+                    let _ = mock_socket.send_to(&encoded, peer).await;
                 }
             }
         });
@@ -150,14 +150,14 @@ mod tests {
         // UDP handler returns TC=1 (truncation)
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            if let Ok((len, peer)) = udp_socket.recv_from(&mut buf).await {
-                if let Ok(query) = decode_message(&buf[..len]) {
-                    let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
-                    resp.queries = query.queries.clone();
-                    resp.metadata.truncation = true; // Set TC=1
-                    if let Ok(encoded) = encode_message(&resp) {
-                        let _ = udp_socket.send_to(&encoded, peer).await;
-                    }
+            if let Ok((len, peer)) = udp_socket.recv_from(&mut buf).await
+                && let Ok(query) = decode_message(&buf[..len])
+            {
+                let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                resp.queries = query.queries.clone();
+                resp.metadata.truncation = true; // Set TC=1
+                if let Ok(encoded) = encode_message(&resp) {
+                    let _ = udp_socket.send_to(&encoded, peer).await;
                 }
             }
         });
@@ -170,23 +170,22 @@ mod tests {
                 if stream.read_exact(&mut len_buf).await.is_ok() {
                     let req_len = u16::from_be_bytes(len_buf) as usize;
                     let mut req_buf = vec![0u8; req_len];
-                    if stream.read_exact(&mut req_buf).await.is_ok() {
-                        if let Ok(query) = decode_message(&req_buf) {
-                            let mut resp =
-                                Message::response(query.metadata.id, query.metadata.op_code);
-                            resp.queries = query.queries.clone();
-                            resp.metadata.response_code = ResponseCode::NoError;
-                            resp.answers.push(Record::from_rdata(
-                                query.queries[0].name().clone(),
-                                300,
-                                RData::A(A(std::net::Ipv4Addr::new(7, 7, 7, 7))),
-                            ));
-                            if let Ok(encoded) = encode_message(&resp) {
-                                let resp_len = encoded.len() as u16;
-                                let _ = stream.write_all(&resp_len.to_be_bytes()).await;
-                                let _ = stream.write_all(&encoded).await;
-                                let _ = stream.flush().await;
-                            }
+                    if stream.read_exact(&mut req_buf).await.is_ok()
+                        && let Ok(query) = decode_message(&req_buf)
+                    {
+                        let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                        resp.queries = query.queries.clone();
+                        resp.metadata.response_code = ResponseCode::NoError;
+                        resp.answers.push(Record::from_rdata(
+                            query.queries[0].name().clone(),
+                            300,
+                            RData::A(A(std::net::Ipv4Addr::new(7, 7, 7, 7))),
+                        ));
+                        if let Ok(encoded) = encode_message(&resp) {
+                            let resp_len = encoded.len() as u16;
+                            let _ = stream.write_all(&resp_len.to_be_bytes()).await;
+                            let _ = stream.write_all(&encoded).await;
+                            let _ = stream.flush().await;
                         }
                     }
                 }

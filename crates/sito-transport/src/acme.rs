@@ -433,7 +433,7 @@ pub fn start_acme_manager(
         }
 
         // Periodic renewal loop (check every 12 hours)
-        let check_interval = Duration::from_secs(12 * 3600);
+        let check_interval = Duration::from_hours(12);
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {

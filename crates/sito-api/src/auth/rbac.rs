@@ -59,38 +59,36 @@ pub fn authenticate_request(
     auth_mgr: &AuthManager,
 ) -> Result<AuthUser, ProblemDetails> {
     // 1. Try Bearer token in Authorization header
-    if let Some(auth_header) = parts.headers.get(AUTHORIZATION) {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                let clean_token = token.trim();
-                if let Some(meta) = auth_mgr.validate_token(clean_token) {
-                    return Ok(AuthUser {
-                        username: meta.name,
-                        role: meta.scope,
-                        token_id: Some(meta.id),
-                    });
-                }
-                return Err(ProblemDetails::unauthorized("Invalid or expired API token"));
-            }
+    if let Some(auth_header) = parts.headers.get(AUTHORIZATION)
+        && let Ok(auth_str) = auth_header.to_str()
+        && let Some(token) = auth_str.strip_prefix("Bearer ")
+    {
+        let clean_token = token.trim();
+        if let Some(meta) = auth_mgr.validate_token(clean_token) {
+            return Ok(AuthUser {
+                username: meta.name,
+                role: meta.scope,
+                token_id: Some(meta.id),
+            });
         }
+        return Err(ProblemDetails::unauthorized("Invalid or expired API token"));
     }
 
     // 2. Try session cookie
-    if let Some(cookie_header) = parts.headers.get(COOKIE) {
-        if let Ok(cookie_str) = cookie_header.to_str() {
-            if let Some(session_id) = extract_session_cookie(cookie_str) {
-                if let Some(session) = auth_mgr.validate_session(&session_id) {
-                    return Ok(AuthUser {
-                        username: session.username,
-                        role: session.role,
-                        token_id: None,
-                    });
-                }
-                return Err(ProblemDetails::unauthorized(
-                    "Invalid or expired session cookie",
-                ));
-            }
+    if let Some(cookie_header) = parts.headers.get(COOKIE)
+        && let Ok(cookie_str) = cookie_header.to_str()
+        && let Some(session_id) = extract_session_cookie(cookie_str)
+    {
+        if let Some(session) = auth_mgr.validate_session(&session_id) {
+            return Ok(AuthUser {
+                username: session.username,
+                role: session.role,
+                token_id: None,
+            });
         }
+        return Err(ProblemDetails::unauthorized(
+            "Invalid or expired session cookie",
+        ));
     }
 
     // 3. Try query parameter `token` (supported for WebSocket stream connections)

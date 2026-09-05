@@ -110,15 +110,14 @@ impl HaConfig {
             if let Some(ref pubkey_str) = self.master_pubkey {
                 parse_public_key(pubkey_str)?;
             }
-            if let Some(ref url) = self.master_url {
-                if !url.starts_with("ws://") && !url.starts_with("wss://") {
-                    return Err(HaError::Validation {
-                        field: "master_url".to_string(),
-                        reason: format!(
-                            "Invalid master_url '{url}': must start with ws:// or wss://"
-                        ),
-                    });
-                }
+            if let Some(ref url) = self.master_url
+                && !url.starts_with("ws://")
+                && !url.starts_with("wss://")
+            {
+                return Err(HaError::Validation {
+                    field: "master_url".to_string(),
+                    reason: format!("Invalid master_url '{url}': must start with ws:// or wss://"),
+                });
             }
         }
 

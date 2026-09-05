@@ -88,7 +88,7 @@ mod tests {
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains(&session.id));
 
-        let extracted = extract_session_cookie(&format!("theme=dark; {}; lang=en", cookie));
+        let extracted = extract_session_cookie(&format!("theme=dark; {cookie}; lang=en"));
         assert_eq!(extracted, Some(session.id));
 
         let clear = build_clear_session_cookie();

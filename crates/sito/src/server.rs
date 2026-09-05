@@ -112,18 +112,16 @@ pub async fn run_server_full(
     let rewrite_table = Arc::new(sito_rewrites::RewriteTable::new(rewrites_config));
 
     // Initialize MikroTik RouterOS integration if configured
-    if let Some(ref int_val) = config.integrations {
-        if let Ok(integrations) = int_val.clone().try_into::<IntegrationsConfig>() {
-            if let Some(mikrotik_cfg) = integrations.mikrotik {
-                if mikrotik_cfg.enabled {
-                    let _routeros_handle = sito_clients::spawn_routeros_sync(
-                        mikrotik_cfg,
-                        client_registry.clone(),
-                        shutdown_rx.clone(),
-                    );
-                }
-            }
-        }
+    if let Some(ref int_val) = config.integrations
+        && let Ok(integrations) = int_val.clone().try_into::<IntegrationsConfig>()
+        && let Some(mikrotik_cfg) = integrations.mikrotik
+        && mikrotik_cfg.enabled
+    {
+        let _routeros_handle = sito_clients::spawn_routeros_sync(
+            mikrotik_cfg,
+            client_registry.clone(),
+            shutdown_rx.clone(),
+        );
     }
 
     // Construct pipeline with query logging and Prometheus metrics
@@ -284,10 +282,10 @@ pub async fn run_server_full(
         use notify::{Event, RecursiveMode, Watcher};
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut watcher = match notify::recommended_watcher(move |res: Result<Event, _>| {
-            if let Ok(event) = res {
-                if event.kind.is_modify() || event.kind.is_create() {
-                    let _ = tx.send(());
-                }
+            if let Ok(event) = res
+                && (event.kind.is_modify() || event.kind.is_create())
+            {
+                let _ = tx.send(());
             }
         }) {
             Ok(w) => w,
@@ -297,14 +295,14 @@ pub async fn run_server_full(
             }
         };
 
-        if watcher_config_path.exists() {
-            if let Err(e) = watcher.watch(&watcher_config_path, RecursiveMode::NonRecursive) {
-                warn!(
-                    "Failed to watch config file {}: {e}",
-                    watcher_config_path.display()
-                );
-                return;
-            }
+        if watcher_config_path.exists()
+            && let Err(e) = watcher.watch(&watcher_config_path, RecursiveMode::NonRecursive)
+        {
+            warn!(
+                "Failed to watch config file {}: {e}",
+                watcher_config_path.display()
+            );
+            return;
         }
 
         loop {
@@ -487,27 +485,28 @@ pub async fn run_server_full(
         };
 
     // If ACME is enabled, start ACME renewal background manager
-    if let Some(acme) = acme_cfg {
-        if acme.enabled && !acme.domains.is_empty() {
-            let email = acme
-                .email
-                .clone()
-                .unwrap_or_else(|| "admin@example.com".to_string());
-            let storage_dir = acme
-                .cache_dir
-                .clone()
-                .unwrap_or_else(|| config.server.data_dir.join("acme"));
-            let doh_alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()];
-            let service_cfg =
-                AcmeServiceConfig::new(email, acme.domains, storage_dir).with_staging(acme.staging);
-            let _acme_handle = start_acme_manager(
-                service_cfg,
-                doh_acceptor_mgr.clone(),
-                Some(http01_challenges.clone()),
-                doh_alpn,
-                shutdown_rx.clone(),
-            );
-        }
+    if let Some(acme) = acme_cfg
+        && acme.enabled
+        && !acme.domains.is_empty()
+    {
+        let email = acme
+            .email
+            .clone()
+            .unwrap_or_else(|| "admin@example.com".to_string());
+        let storage_dir = acme
+            .cache_dir
+            .clone()
+            .unwrap_or_else(|| config.server.data_dir.join("acme"));
+        let doh_alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()];
+        let service_cfg =
+            AcmeServiceConfig::new(email, acme.domains, storage_dir).with_staging(acme.staging);
+        let _acme_handle = start_acme_manager(
+            service_cfg,
+            doh_acceptor_mgr.clone(),
+            Some(http01_challenges.clone()),
+            doh_alpn,
+            shutdown_rx.clone(),
+        );
     }
 
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
@@ -540,17 +539,17 @@ pub async fn run_server_full(
         all_handles.push(tcp_handle);
 
         // Start DoT listener if dot_port > 0 and TLS is configured
-        if config.dns.dot_port > 0 {
-            if let Some(ref dot_mgr) = dot_acceptor_mgr {
-                let dot_addr = SocketAddr::new(*bind_ip, config.dns.dot_port);
-                let mut dot_config = DotConfig::new(dot_addr, dot_mgr.clone());
-                dot_config.dot_padding = config.dns.dot_padding;
-                dot_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-                dot_config.max_connections = config.dns.max_tcp_connections;
-                let dot_handle =
-                    start_dot_listener(dot_config, pipeline.clone(), shutdown_rx.clone()).await?;
-                all_handles.push(dot_handle);
-            }
+        if config.dns.dot_port > 0
+            && let Some(ref dot_mgr) = dot_acceptor_mgr
+        {
+            let dot_addr = SocketAddr::new(*bind_ip, config.dns.dot_port);
+            let mut dot_config = DotConfig::new(dot_addr, dot_mgr.clone());
+            dot_config.dot_padding = config.dns.dot_padding;
+            dot_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            dot_config.max_connections = config.dns.max_tcp_connections;
+            let dot_handle =
+                start_dot_listener(dot_config, pipeline.clone(), shutdown_rx.clone()).await?;
+            all_handles.push(dot_handle);
         }
 
         // Start DoH listener if doh_port > 0 and (TLS configured or non-default port)
@@ -571,31 +570,30 @@ pub async fn run_server_full(
         }
 
         // Start DoQ listener if doq_port > 0 and TLS is configured
-        if config.dns.doq_port > 0 {
-            if let Some(ref doq_mgr) = doq_acceptor_mgr {
-                let doq_addr = SocketAddr::new(*bind_ip, config.dns.doq_port);
-                let mut doq_config = DoqConfig::new(doq_addr, Some(doq_mgr.clone()));
-                doq_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-                doq_config.max_connections = config.dns.max_tcp_connections;
-                match start_doq_listener(doq_config, pipeline.clone(), shutdown_rx.clone()).await {
-                    Ok(doq_handle) => all_handles.push(doq_handle),
-                    Err(e) => warn!("Failed to start DoQ listener on {doq_addr}: {e}"),
-                }
+        if config.dns.doq_port > 0
+            && let Some(ref doq_mgr) = doq_acceptor_mgr
+        {
+            let doq_addr = SocketAddr::new(*bind_ip, config.dns.doq_port);
+            let mut doq_config = DoqConfig::new(doq_addr, Some(doq_mgr.clone()));
+            doq_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            doq_config.max_connections = config.dns.max_tcp_connections;
+            match start_doq_listener(doq_config, pipeline.clone(), shutdown_rx.clone()).await {
+                Ok(doq_handle) => all_handles.push(doq_handle),
+                Err(e) => warn!("Failed to start DoQ listener on {doq_addr}: {e}"),
             }
         }
 
         // Start DoH3 listener if doh3_port > 0 and TLS is configured
-        if config.dns.doh3_port > 0 {
-            if let Some(ref doh3_mgr) = doh3_acceptor_mgr {
-                let doh3_addr = SocketAddr::new(*bind_ip, config.dns.doh3_port);
-                let mut doh3_config = Doh3Config::new(doh3_addr, Some(doh3_mgr.clone()));
-                doh3_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-                doh3_config.max_connections = config.dns.max_tcp_connections;
-                match start_doh3_listener(doh3_config, pipeline.clone(), shutdown_rx.clone()).await
-                {
-                    Ok(doh3_handle) => all_handles.push(doh3_handle),
-                    Err(e) => warn!("Failed to start DoH3 listener on {doh3_addr}: {e}"),
-                }
+        if config.dns.doh3_port > 0
+            && let Some(ref doh3_mgr) = doh3_acceptor_mgr
+        {
+            let doh3_addr = SocketAddr::new(*bind_ip, config.dns.doh3_port);
+            let mut doh3_config = Doh3Config::new(doh3_addr, Some(doh3_mgr.clone()));
+            doh3_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            doh3_config.max_connections = config.dns.max_tcp_connections;
+            match start_doh3_listener(doh3_config, pipeline.clone(), shutdown_rx.clone()).await {
+                Ok(doh3_handle) => all_handles.push(doh3_handle),
+                Err(e) => warn!("Failed to start DoH3 listener on {doh3_addr}: {e}"),
             }
         }
     }

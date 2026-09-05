@@ -600,17 +600,17 @@ async fn test_acceptance_m5_prometheus_table_14_2() {
 fn test_acceptance_m5_ip_anonymization() {
     // IPv4 masking to /24 (last octet zeroed)
     let ipv4: std::net::IpAddr = "192.168.1.123".parse().unwrap();
-    assert_eq!(anonymize_ip(ipv4).to_string(), "192.168.1.0");
+    assert_eq!(anonymize_ip(ipv4).clone(), "192.168.1.0");
 
     let ipv4_public: std::net::IpAddr = "8.8.4.4".parse().unwrap();
-    assert_eq!(anonymize_ip(ipv4_public).to_string(), "8.8.4.0");
+    assert_eq!(anonymize_ip(ipv4_public).clone(), "8.8.4.0");
 
     // IPv6 masking to /56 (host and subnets beyond 56 bits zeroed)
     let ipv6: std::net::IpAddr = "2001:0db8:85a3:0000:0000:8a2e:0370:7334".parse().unwrap();
-    assert_eq!(anonymize_ip(ipv6).to_string(), "2001:db8:85a3::");
+    assert_eq!(anonymize_ip(ipv6).clone(), "2001:db8:85a3::");
 
     let ipv6_sub: std::net::IpAddr = "2606:4700:4700::1111".parse().unwrap();
-    assert_eq!(anonymize_ip(ipv6_sub).to_string(), "2606:4700:4700::");
+    assert_eq!(anonymize_ip(ipv6_sub).clone(), "2606:4700:4700::");
 }
 
 /// 7. Acceptance test: Backup and restore roundtrip and invalid archive rejection

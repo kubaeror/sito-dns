@@ -299,17 +299,17 @@ impl DnssecValidator {
         }
 
         // Check NTA bypass
-        if let Some(query) = response.queries.first() {
-            if self.is_nta(query.name()) {
-                debug!(
-                    "Bypassing DNSSEC validation for NTA domain {}",
-                    query.name()
-                );
-                response.metadata.authentic_data = false;
-                let outcome = ValidationOutcome::NtaBypass;
-                self.metrics.record_validation(&outcome);
-                return outcome;
-            }
+        if let Some(query) = response.queries.first()
+            && self.is_nta(query.name())
+        {
+            debug!(
+                "Bypassing DNSSEC validation for NTA domain {}",
+                query.name()
+            );
+            response.metadata.authentic_data = false;
+            let outcome = ValidationOutcome::NtaBypass;
+            self.metrics.record_validation(&outcome);
+            return outcome;
         }
 
         // Collect DNSKEY records from response
@@ -382,20 +382,19 @@ impl DnssecValidator {
 
             if matching_key.is_none() {
                 for (key_owner, dnskey) in &response_dnskeys {
-                    if key_owner == signer_name {
-                        if let Ok(tag) = dnskey.calculate_key_tag() {
-                            if tag == key_tag {
-                                matching_key = Some(dnskey.clone());
-                                // Cache for remaining duration up to expiration
-                                self.key_cache.insert(
-                                    lower_signer.clone(),
-                                    key_tag,
-                                    dnskey.clone(),
-                                    expiration,
-                                );
-                                break;
-                            }
-                        }
+                    if key_owner == signer_name
+                        && let Ok(tag) = dnskey.calculate_key_tag()
+                        && tag == key_tag
+                    {
+                        matching_key = Some(dnskey.clone());
+                        // Cache for remaining duration up to expiration
+                        self.key_cache.insert(
+                            lower_signer.clone(),
+                            key_tag,
+                            dnskey.clone(),
+                            expiration,
+                        );
+                        break;
                     }
                 }
             }
@@ -679,8 +678,8 @@ mod tests {
         ));
 
         // Validate at a future time past expiration (10 days in future)
-        let future = (time::OffsetDateTime::now_utc() + Duration::from_secs(86400 * 10))
-            .unix_timestamp() as u32;
+        let future =
+            (time::OffsetDateTime::now_utc() + Duration::from_hours(240)).unix_timestamp() as u32;
         let outcome = validator.validate_response(&mut msg, Some("1.1.1.1"), future);
 
         assert_eq!(

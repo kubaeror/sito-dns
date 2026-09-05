@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn test_matches_any_service() {
         let reg = ServiceRegistry::bundled();
-        let blocked = vec!["tiktok", "steam"];
+        let blocked = ["tiktok", "steam"];
 
         assert_eq!(
             reg.matches_any_service(blocked.iter().copied(), "api.tiktokv.com"),

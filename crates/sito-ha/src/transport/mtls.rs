@@ -147,12 +147,12 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
             .to_string()
             .to_lowercase();
 
-        if let Some(ref expected_fp) = self.pinned_fingerprint {
-            if &cert_fp != expected_fp {
-                return Err(RustlsError::InvalidCertificate(
-                    rustls::CertificateError::ApplicationVerificationFailure,
-                ));
-            }
+        if let Some(ref expected_fp) = self.pinned_fingerprint
+            && &cert_fp != expected_fp
+        {
+            return Err(RustlsError::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
         }
 
         Ok(ServerCertVerified::assertion())

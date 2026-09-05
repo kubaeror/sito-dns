@@ -19,12 +19,11 @@ use crate::models::{
 use crate::state::ServerContext;
 
 fn parse_client_ip(headers: &HeaderMap) -> String {
-    if let Some(forwarded) = headers.get("x-forwarded-for") {
-        if let Ok(val) = forwarded.to_str() {
-            if let Some(first) = val.split(',').next() {
-                return first.trim().to_string();
-            }
-        }
+    if let Some(forwarded) = headers.get("x-forwarded-for")
+        && let Ok(val) = forwarded.to_str()
+        && let Some(first) = val.split(',').next()
+    {
+        return first.trim().to_string();
     }
     "127.0.0.1".to_string()
 }
@@ -135,15 +134,15 @@ pub async fn verify_totp(
     )
 )]
 pub async fn logout(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
-    if let Some(cookie_header) = headers.get("cookie") {
-        if let Ok(cookie_str) = cookie_header.to_str() {
-            for pair in cookie_str.split(';') {
-                let mut parts = pair.splitn(2, '=');
-                if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                    if k.trim() == SESSION_COOKIE_NAME {
-                        ctx.auth_mgr.logout(v.trim());
-                    }
-                }
+    if let Some(cookie_header) = headers.get("cookie")
+        && let Ok(cookie_str) = cookie_header.to_str()
+    {
+        for pair in cookie_str.split(';') {
+            let mut parts = pair.splitn(2, '=');
+            if let (Some(k), Some(v)) = (parts.next(), parts.next())
+                && k.trim() == SESSION_COOKIE_NAME
+            {
+                ctx.auth_mgr.logout(v.trim());
             }
         }
     }

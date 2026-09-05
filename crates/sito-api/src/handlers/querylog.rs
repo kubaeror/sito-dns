@@ -99,11 +99,10 @@ async fn handle_live_tail(mut socket: WebSocket, ctx: ServerContext) {
             entry = rx.recv() => {
                 match entry {
                     Ok(entry) => {
-                        if let Ok(json) = serde_json::to_string(&entry) {
-                            if socket.send(Message::Text(json.into())).await.is_err() {
+                        if let Ok(json) = serde_json::to_string(&entry)
+                            && socket.send(Message::Text(json.into())).await.is_err() {
                                 break;
                             }
-                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(_) => break,

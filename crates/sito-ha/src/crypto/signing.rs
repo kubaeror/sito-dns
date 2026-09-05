@@ -109,12 +109,12 @@ pub fn parse_public_key(input: &str) -> Result<[u8; 32], HaError> {
         return Ok(out);
     }
 
-    if let Ok(decoded) = BASE64_STANDARD.decode(trimmed) {
-        if decoded.len() == 32 {
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&decoded);
-            return Ok(out);
-        }
+    if let Ok(decoded) = BASE64_STANDARD.decode(trimmed)
+        && decoded.len() == 32
+    {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&decoded);
+        return Ok(out);
     }
 
     Err(HaError::Crypto(format!(

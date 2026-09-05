@@ -91,10 +91,10 @@ pub struct RawRouterOsLease {
 impl RawRouterOsLease {
     pub fn into_lease(self) -> Option<RouterOsLease> {
         // Filter out explicitly disabled leases
-        if let Some(ref d) = self.disabled {
-            if d.as_bool() == Some(true) || d.as_str() == Some("true") {
-                return None;
-            }
+        if let Some(ref d) = self.disabled
+            && (d.as_bool() == Some(true) || d.as_str() == Some("true"))
+        {
+            return None;
         }
 
         let mac_raw = self.mac_address?;
@@ -131,10 +131,10 @@ pub async fn fetch_routeros_leases(
 
     // Authentication: check token_env first, then username/password
     if let Some(ref token_key) = config.token_env {
-        if let Ok(token) = std::env::var(token_key) {
-            if !token.trim().is_empty() {
-                req = req.bearer_auth(token.trim());
-            }
+        if let Ok(token) = std::env::var(token_key)
+            && !token.trim().is_empty()
+        {
+            req = req.bearer_auth(token.trim());
         }
     } else if let Some(ref username) = config.username {
         let password = if let Some(ref pwd_env) = config.password_env {
@@ -314,7 +314,7 @@ mod tests {
             .expect_err("Should fail with 500");
         match err {
             RouterOsError::BadStatus(status, _) => {
-                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR)
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
             }
             other => panic!("Unexpected error: {other:?}"),
         }

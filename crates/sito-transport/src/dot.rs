@@ -128,11 +128,11 @@ async fn handle_dot_connection<H: QueryHandler>(
 
     // ALPN verification: if ALPN protocol negotiated, ensure it's "dot"
     let negotiated_alpn = tls_stream.get_ref().1.alpn_protocol();
-    if let Some(alpn) = negotiated_alpn {
-        if alpn != b"dot" {
-            debug!("DoT invalid ALPN protocol negotiated: {:?}", alpn);
-            return Ok(());
-        }
+    if let Some(alpn) = negotiated_alpn
+        && alpn != b"dot"
+    {
+        debug!("DoT invalid ALPN protocol negotiated: {:?}", alpn);
+        return Ok(());
     }
 
     // SNI extraction

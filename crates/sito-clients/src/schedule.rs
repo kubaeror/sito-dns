@@ -100,12 +100,11 @@ impl Schedule {
 
     /// Check if the schedule is active at the specified timestamp.
     pub fn is_active(&self, timestamp: &DateTime<Utc>) -> bool {
-        if let Some(ref window) = self.window_cron {
-            if let Ok(matching) = window.is_time_matching(timestamp) {
-                if matching {
-                    return true;
-                }
-            }
+        if let Some(ref window) = self.window_cron
+            && let Ok(matching) = window.is_time_matching(timestamp)
+            && matching
+        {
+            return true;
         }
 
         self.cron.is_time_matching(timestamp).unwrap_or(false)
@@ -203,15 +202,15 @@ fn validate_numeric_field(
         // Handle step: e.g. */10 or 5-20/2
         let (range_part, _step) = match clean.split_once('/') {
             Some((l, r)) => {
-                if let Ok(step_val) = r.parse::<u32>() {
-                    if step_val == 0 {
-                        return Err(ScheduleError::field_error(
-                            full_expr,
-                            field_num,
-                            field_name,
-                            "step value cannot be zero",
-                        ));
-                    }
+                if let Ok(step_val) = r.parse::<u32>()
+                    && step_val == 0
+                {
+                    return Err(ScheduleError::field_error(
+                        full_expr,
+                        field_num,
+                        field_name,
+                        "step value cannot be zero",
+                    ));
                 }
                 (l, Some(r))
             }
@@ -224,39 +223,39 @@ fn validate_numeric_field(
 
         // Handle range: e.g. 15-21
         if let Some((start_str, end_str)) = range_part.split_once('-') {
-            if let Ok(start) = start_str.parse::<u32>() {
-                if start < min || start > max {
-                    return Err(ScheduleError::field_error(
-                        full_expr,
-                        field_num,
-                        field_name,
-                        format!("value {start} is out of bounds ({min}-{max})"),
-                    ));
-                }
+            if let Ok(start) = start_str.parse::<u32>()
+                && (start < min || start > max)
+            {
+                return Err(ScheduleError::field_error(
+                    full_expr,
+                    field_num,
+                    field_name,
+                    format!("value {start} is out of bounds ({min}-{max})"),
+                ));
             }
-            if let Ok(end) = end_str.parse::<u32>() {
-                if end < min || end > max {
-                    return Err(ScheduleError::field_error(
-                        full_expr,
-                        field_num,
-                        field_name,
-                        format!("value {end} is out of bounds ({min}-{max})"),
-                    ));
-                }
+            if let Ok(end) = end_str.parse::<u32>()
+                && (end < min || end > max)
+            {
+                return Err(ScheduleError::field_error(
+                    full_expr,
+                    field_num,
+                    field_name,
+                    format!("value {end} is out of bounds ({min}-{max})"),
+                ));
             }
             continue;
         }
 
         // Single number
-        if let Ok(val) = range_part.parse::<u32>() {
-            if val < min || val > max {
-                return Err(ScheduleError::field_error(
-                    full_expr,
-                    field_num,
-                    field_name,
-                    format!("value {val} is out of bounds ({min}-{max})"),
-                ));
-            }
+        if let Ok(val) = range_part.parse::<u32>()
+            && (val < min || val > max)
+        {
+            return Err(ScheduleError::field_error(
+                full_expr,
+                field_num,
+                field_name,
+                format!("value {val} is out of bounds ({min}-{max})"),
+            ));
         }
     }
 

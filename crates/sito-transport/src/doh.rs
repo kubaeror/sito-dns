@@ -215,15 +215,15 @@ async fn acme_http01_route<H: QueryHandler>(
     State(state): State<Arc<DohState<H>>>,
     Path(token): Path<String>,
 ) -> Response {
-    if let Some(ref store) = state.http01_challenges {
-        if let Some(key_auth) = store.get(&token) {
-            return (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "text/plain")],
-                key_auth.clone(),
-            )
-                .into_response();
-        }
+    if let Some(ref store) = state.http01_challenges
+        && let Some(key_auth) = store.get(&token)
+    {
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain")],
+            key_auth.clone(),
+        )
+            .into_response();
     }
     StatusCode::NOT_FOUND.into_response()
 }
