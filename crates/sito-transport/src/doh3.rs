@@ -110,6 +110,7 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
         config.rate_limit_per_ip,
         config.rate_limit_per_ip * 2,
     ));
+    rate_limiter.spawn_pruner(shutdown_rx.clone());
     let semaphore = Arc::new(Semaphore::new(config.max_connections));
     let acceptor_mgr = config.acceptor_mgr.clone();
 

@@ -6,7 +6,7 @@
     "license": {
       "name": "GPL-3.0-only"
     },
-    "version": "1.1.1"
+    "version": "1.2.0"
   },
   "paths": {
     "/api/v1/auth/login": {
@@ -2094,6 +2094,108 @@
         }
       }
     },
+    "/api/v1/system/update/apply": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Download and apply software update.",
+        "operationId": "apply_update",
+        "requestBody": {
+          "description": "Optional update configuration",
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ApplyUpdatePayload"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Update applied successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyUpdateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or running in Docker",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Update process failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/system/update/check": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Check for software updates via GitHub Releases.",
+        "operationId": "check_update",
+        "parameters": [
+          {
+            "name": "repo",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Update information retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateInfo"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to query release info",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/upstream": {
       "get": {
         "tags": [
@@ -2354,6 +2456,35 @@
           },
           "scope": {
             "$ref": "#/components/schemas/Role"
+          }
+        }
+      },
+      "ApplyUpdatePayload": {
+        "type": "object",
+        "properties": {
+          "force": {
+            "type": "boolean"
+          },
+          "repo": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ApplyUpdateResponse": {
+        "type": "object",
+        "required": [
+          "message",
+          "status"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
           }
         }
       },
@@ -3420,6 +3551,58 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "UpdateInfo": {
+        "type": "object",
+        "description": "Information about version and available updates.",
+        "required": [
+          "current_version",
+          "latest_version",
+          "update_available",
+          "release_url",
+          "release_notes",
+          "is_docker"
+        ],
+        "properties": {
+          "current_version": {
+            "type": "string",
+            "description": "Currently running version of sito."
+          },
+          "instructions": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Environment-specific upgrade instructions (e.g. docker compose command)."
+          },
+          "is_docker": {
+            "type": "boolean",
+            "description": "Whether the server is running inside a Docker/OCI container."
+          },
+          "latest_version": {
+            "type": "string",
+            "description": "Latest version available upstream."
+          },
+          "published_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Release publication timestamp."
+          },
+          "release_notes": {
+            "type": "string",
+            "description": "Markdown release notes for the latest version."
+          },
+          "release_url": {
+            "type": "string",
+            "description": "HTML URL to the release page on GitHub."
+          },
+          "update_available": {
+            "type": "boolean",
+            "description": "Whether an update is available."
           }
         }
       },

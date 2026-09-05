@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::auth::manager::LoginResult;
 use crate::auth::rbac::AuthUser;
+use crate::auth::resolve_client_ip;
 use crate::auth::session::{build_clear_session_cookie, extract_session_cookie};
 use crate::config_writer::save_config_atomic;
 use crate::models::{FilterListDto, StatusResponse};
@@ -77,16 +78,6 @@ pub fn get_session_user(ctx: &ServerContext, headers: &HeaderMap) -> Option<Auth
     None
 }
 
-fn parse_client_ip(headers: &HeaderMap) -> String {
-    if let Some(fwd) = headers.get("x-forwarded-for")
-        && let Ok(s) = fwd.to_str()
-        && let Some(first) = s.split(',').next()
-    {
-        return first.trim().to_string();
-    }
-    "127.0.0.1".to_string()
-}
-
 // ---------------------------------------------------------------------------
 // Root, Login & Logout
 // ---------------------------------------------------------------------------
@@ -123,10 +114,12 @@ pub struct LoginForm {
 
 pub async fn login_submit(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let client_ip = parse_client_ip(&headers);
+    let trusted_proxies = ctx.config.load().get_web_config().trusted_proxies;
+    let client_ip = resolve_client_ip(peer_addr, &headers, &trusted_proxies);
     let result = ctx
         .auth_mgr
         .login(&form.username, &form.password, &client_ip);
@@ -232,8 +225,15 @@ fn get_status_response(ctx: &ServerContext) -> StatusResponse {
     }
 }
 
-fn get_upstreams_list(ctx: &ServerContext) -> Vec<UpstreamViewItem> {
+async fn get_upstreams_list(ctx: &ServerContext) -> Vec<UpstreamViewItem> {
     let cfg = ctx.config.load();
+    let statuses = ctx.upstream.statuses().await;
+    let stats = ctx
+        .stats_db
+        .get_upstream_stats(86_400_000)
+        .await
+        .unwrap_or_default();
+
     let mut res = Vec::new();
     for addr_str in &cfg.upstream.servers {
         let proto = if addr_str.starts_with("tls://") {
@@ -247,13 +247,26 @@ fn get_upstreams_list(ctx: &ServerContext) -> Vec<UpstreamViewItem> {
         } else {
             "DNS"
         };
+
+        let is_healthy = statuses
+            .iter()
+            .find(|(name, _)| name == addr_str)
+            .is_none_or(|(_, status)| *status != sito_upstream::HealthStatus::Down);
+
+        let (total_queries, avg_latency_ms) = stats
+            .iter()
+            .find(|s| &s.upstream == addr_str || addr_str.contains(&s.upstream))
+            .map_or((0, 0.0), |s| {
+                (s.total_queries, (s.avg_elapsed_us as f64) / 1000.0)
+            });
+
         res.push(UpstreamViewItem {
             address: addr_str.clone(),
             protocol: proto.to_string(),
-            is_healthy: true,
+            is_healthy,
             weight: 100,
-            total_queries: 0,
-            avg_latency_ms: 12.5,
+            total_queries: total_queries.max(0) as u64,
+            avg_latency_ms,
         });
     }
     res
@@ -272,7 +285,20 @@ pub async fn dashboard_page(State(ctx): State<ServerContext>, headers: HeaderMap
     let status = get_status_response(&ctx);
     let uptime_str = format_duration(status.uptime_seconds);
     let blocked_pct_str = format!("{:.1}", stats.blocked_percentage);
-    let upstreams = get_upstreams_list(&ctx);
+    let upstreams = get_upstreams_list(&ctx).await;
+
+    let hourly = ctx
+        .stats_db
+        .get_hourly_activity(24)
+        .await
+        .unwrap_or_default();
+    let times: Vec<i64> = hourly.iter().map(|h| h.timestamp_sec).collect();
+    let totals: Vec<i64> = hourly.iter().map(|h| h.total_queries).collect();
+    let blocked: Vec<i64> = hourly.iter().map(|h| h.blocked_queries).collect();
+
+    let hourly_times_json = serde_json::to_string(&times).unwrap_or_else(|_| "[]".to_string());
+    let hourly_totals_json = serde_json::to_string(&totals).unwrap_or_else(|_| "[]".to_string());
+    let hourly_blocked_json = serde_json::to_string(&blocked).unwrap_or_else(|_| "[]".to_string());
 
     HtmlTemplate(DashboardTemplate {
         is_authenticated: true,
@@ -285,6 +311,9 @@ pub async fn dashboard_page(State(ctx): State<ServerContext>, headers: HeaderMap
         uptime_str,
         blocked_pct_str,
         upstreams,
+        hourly_times_json,
+        hourly_totals_json,
+        hourly_blocked_json,
     })
     .into_response()
 }
@@ -431,19 +460,31 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
     };
 
     let cfg = ctx.config.load();
+    let snapshot = ctx.filter.snapshot();
     let lists: Vec<FilterListDto> = cfg
         .filtering
         .lists
         .iter()
         .enumerate()
-        .map(|(idx, list)| FilterListDto {
-            id: idx,
-            name: list.name.clone(),
-            url: list.url.clone(),
-            enabled: list.enabled,
-            refresh_hours: list.refresh_hours.unwrap_or(24) as u32,
-            rule_count: 0,
-            last_updated: None,
+        .map(|(idx, list)| {
+            let count = if list.enabled {
+                snapshot
+                    .rules
+                    .iter()
+                    .filter(|r| r.source == list.name)
+                    .count()
+            } else {
+                0
+            };
+            FilterListDto {
+                id: idx,
+                name: list.name.clone(),
+                url: list.url.clone(),
+                enabled: list.enabled,
+                refresh_hours: list.refresh_hours.unwrap_or(24) as u32,
+                rule_count: count,
+                last_updated: None,
+            }
         })
         .collect();
 
@@ -474,7 +515,8 @@ pub async fn filtering_toggle_handler(
     if let Some(item) = new_cfg.filtering.lists.get_mut(id) {
         item.enabled = !item.enabled;
         let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
-        ctx.config.store(Arc::new(new_cfg));
+        ctx.config.store(Arc::new(new_cfg.clone()));
+        let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     }
     Redirect::to("/filtering").into_response()
 }
@@ -503,7 +545,8 @@ pub async fn filtering_add_handler(
         refresh_hours: Some(u64::from(form.refresh_hours)),
     });
     let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
-    ctx.config.store(Arc::new(new_cfg));
+    ctx.config.store(Arc::new(new_cfg.clone()));
+    let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
 
     Redirect::to("/filtering").into_response()
 }
@@ -521,7 +564,8 @@ pub async fn filtering_delete_handler(
     if id < new_cfg.filtering.lists.len() {
         new_cfg.filtering.lists.remove(id);
         let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
-        ctx.config.store(Arc::new(new_cfg));
+        ctx.config.store(Arc::new(new_cfg.clone()));
+        let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     }
     Redirect::to("/filtering").into_response()
 }
@@ -550,7 +594,8 @@ pub async fn filtering_custom_rules_handler(
         .collect();
 
     let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
-    ctx.config.store(Arc::new(new_cfg));
+    ctx.config.store(Arc::new(new_cfg.clone()));
+    let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
 
     Redirect::to("/filtering").into_response()
 }
@@ -610,9 +655,14 @@ pub async fn filtering_simulate_handler(
 }
 
 pub async fn filtering_update_all_handler(
-    State(_ctx): State<ServerContext>,
-    _headers: HeaderMap,
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
 ) -> Response {
+    if get_session_user(&ctx, &headers).is_none() {
+        return Redirect::to("/login").into_response();
+    }
+    let cfg = ctx.config.load();
+    let _ = ctx.filter.reload_with_config(&cfg.filtering).await;
     Redirect::to("/filtering").into_response()
 }
 
@@ -698,6 +748,8 @@ pub async fn rewrites_add_handler(
 #[derive(Deserialize)]
 pub struct DeleteRewriteForm {
     pub domain: String,
+    pub record_type: Option<String>,
+    pub answer: Option<String>,
 }
 
 pub async fn rewrites_delete_handler(
@@ -710,7 +762,22 @@ pub async fn rewrites_delete_handler(
     }
 
     let mut rewrites_cfg = load_rewrites_config(&ctx);
-    rewrites_cfg.entries.retain(|e| e.domain != form.domain);
+    rewrites_cfg.entries.retain(|e| {
+        if e.domain != form.domain {
+            return true;
+        }
+        if let Some(ref rt) = form.record_type
+            && &e.r#type != rt
+        {
+            return true;
+        }
+        if let Some(ref ans) = form.answer
+            && &e.answer != ans
+        {
+            return true;
+        }
+        false
+    });
 
     let mut new_cfg = (**ctx.config.load()).clone();
     if let Ok(val) = toml::Value::try_from(&rewrites_cfg) {
@@ -854,7 +921,7 @@ pub async fn upstreams_page(State(ctx): State<ServerContext>, headers: HeaderMap
         return Redirect::to("/login").into_response();
     };
 
-    let upstreams = get_upstreams_list(&ctx);
+    let upstreams = get_upstreams_list(&ctx).await;
 
     HtmlTemplate(UpstreamsTemplate {
         is_authenticated: true,
@@ -898,12 +965,147 @@ pub struct TestUpstreamForm {
     pub address: String,
 }
 
-pub async fn upstreams_test_handler(Form(form): Form<TestUpstreamForm>) -> Response {
-    axum::response::Html(format!(
-        "<div class='badge badge-success' style='font-size:0.9rem; padding: 6px 12px;'>Resolver {} is reachable (RTT: 14.2 ms)</div>",
-        escape_html(&form.address)
-    ))
-    .into_response()
+async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result<f64, String> {
+    let start = std::time::Instant::now();
+    let qname = sito_proto::Name::from_str(probe_domain)
+        .unwrap_or_else(|_| sito_proto::Name::from_str("example.com").unwrap());
+
+    if let Some(target) = addr_str.strip_prefix("tls://") {
+        let parts: Vec<&str> = target.split(':').collect();
+        let host = parts[0];
+        let port: u16 = if parts.len() > 1 {
+            parts[1].parse().unwrap_or(853)
+        } else {
+            853
+        };
+        let mut addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("DNS resolution of {host} failed: {e}"))?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| format!("Could not resolve {host}"))?;
+
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| "Connection timed out".to_string())?
+        .map_err(|e| format!("TCP connection failed: {e}"))?;
+        drop(stream);
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        return Ok(elapsed);
+    }
+
+    if let Some(target) = addr_str.strip_prefix("https://") {
+        let host_port = target.split('/').next().unwrap_or(target);
+        let parts: Vec<&str> = host_port.split(':').collect();
+        let host = parts[0];
+        let port: u16 = if parts.len() > 1 {
+            parts[1].parse().unwrap_or(443)
+        } else {
+            443
+        };
+        let mut addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("DNS resolution of {host} failed: {e}"))?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| format!("Could not resolve {host}"))?;
+
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| "Connection timed out".to_string())?
+        .map_err(|e| format!("HTTPS connection failed: {e}"))?;
+        drop(stream);
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        return Ok(elapsed);
+    }
+
+    // Standard UDP probe
+    let target = addr_str.strip_prefix("udp://").unwrap_or(addr_str);
+    let target_addr: std::net::SocketAddr = if let Ok(sa) = target.parse() {
+        sa
+    } else {
+        let parts: Vec<&str> = target.split(':').collect();
+        let host = parts[0];
+        let port: u16 = if parts.len() > 1 {
+            parts[1].parse().unwrap_or(53)
+        } else {
+            53
+        };
+        let mut addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("Lookup of {host} failed: {e}"))?;
+        addrs
+            .next()
+            .ok_or_else(|| format!("Could not resolve {host}"))?
+    };
+
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| format!("Failed to bind local UDP socket: {e}"))?;
+
+    let mut query_msg = sito_proto::Message::new(
+        rand::random(),
+        sito_proto::MessageType::Query,
+        sito_proto::OpCode::Query,
+    );
+    query_msg.metadata.recursion_desired = true;
+    query_msg
+        .queries
+        .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
+    let wire = sito_proto::encode_message(&query_msg)
+        .map_err(|e| format!("Failed to encode DNS probe message: {e}"))?;
+
+    socket
+        .send_to(&wire, target_addr)
+        .await
+        .map_err(|e| format!("UDP send failed: {e}"))?;
+
+    let mut buf = [0u8; 512];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    .map_err(|_| "Probe query timed out after 2s".to_string())?
+    .map_err(|e| format!("UDP recv failed: {e}"))?;
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    Ok(elapsed)
+}
+
+pub async fn upstreams_test_handler(
+    State(ctx): State<ServerContext>,
+    Form(form): Form<TestUpstreamForm>,
+) -> Response {
+    let clean = form.address.trim();
+    if clean.is_empty() {
+        return axum::response::Html(
+            "<div class='badge badge-danger' style='font-size:0.9rem; padding: 6px 12px;'>Invalid upstream address</div>",
+        )
+        .into_response();
+    }
+
+    let probe_domain = ctx.config.load().upstream.probe_domain.clone();
+    match probe_upstream_target(clean, &probe_domain).await {
+        Ok(elapsed) => axum::response::Html(format!(
+            "<div class='badge badge-success' style='font-size:0.9rem; padding: 6px 12px;'>Resolver {} is reachable (RTT: {:.1} ms)</div>",
+            escape_html(clean),
+            elapsed
+        ))
+        .into_response(),
+        Err(e) => axum::response::Html(format!(
+            "<div class='badge badge-danger' style='font-size:0.9rem; padding: 6px 12px;'>Resolver {} error: {}</div>",
+            escape_html(clean),
+            escape_html(&e)
+        ))
+        .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,6 +1202,132 @@ pub async fn system_reload_handler(
     Redirect::to("/system").into_response()
 }
 
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+pub async fn system_update_check_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+) -> Response {
+    if get_session_user(&ctx, &headers).is_none() {
+        return Redirect::to("/login").into_response();
+    }
+
+    match crate::updater::check_for_update(None).await {
+        Ok(info) => {
+            if info.update_available {
+                let install_or_docker = if info.is_docker {
+                    r#"<div style="margin-top: 14px; padding: 12px; background: rgba(56, 189, 248, 0.1); border: 1px solid var(--accent); border-radius: 6px;">
+                            <div style="font-weight: 600; color: var(--accent); margin-bottom: 4px;">Docker Environment Detected</div>
+                            <div style="font-size: 0.85rem; color: var(--text-secondary);">
+                                In-app binary updates are disabled in containers. Upgrade by running:
+                                <pre style="margin-top: 6px; padding: 6px 10px; background: var(--bg-surface); border-radius: 4px;"><code>docker compose pull && docker compose up -d</code></pre>
+                            </div>
+                        </div>"#.to_string()
+                } else {
+                    format!(
+                        r##"<form hx-post="/ui/system/update/apply" hx-target="#update-container" hx-swap="innerHTML" style="margin-top: 14px;">
+                            <button type="submit" class="btn btn-primary" onclick="this.disabled=true; this.innerText=&quot;Updating...&quot;; this.form.submit();">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+                                Download & Install v{}
+                            </button>
+                        </form>"##,
+                        info.latest_version
+                    )
+                };
+
+                axum::response::Html(format!(
+                    r#"<div>
+                        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+                            <div>
+                                <span class="badge badge-warning" style="font-size: 0.85rem;">New version available: v{}</span>
+                                <span style="font-size: 0.85rem; color: var(--text-secondary); margin-left: 8px;">(Current: v{})</span>
+                            </div>
+                            <a href="{}" target="_blank" rel="noopener" class="btn btn-outline" style="font-size: 0.8rem; padding: 4px 10px;">View on GitHub</a>
+                        </div>
+                        <div style="background: var(--bg-base); padding: 12px; border-radius: 6px; font-size: 0.85rem; max-height: 150px; overflow-y: auto; white-space: pre-wrap; font-family: monospace;">{}</div>
+                        {}
+                    </div>"#,
+                    info.latest_version,
+                    info.current_version,
+                    info.release_url,
+                    html_escape(&info.release_notes),
+                    install_or_docker
+                )).into_response()
+            } else {
+                axum::response::Html(format!(
+                    r##"<div>
+                        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
+                            <span class="badge badge-success" style="font-size: 0.85rem;">Up to date</span>
+                            <span style="font-size: 0.875rem; color: var(--text-secondary);">sito is running the latest release (v{})</span>
+                        </div>
+                        <button hx-get="/ui/system/update/check" hx-target="#update-container" hx-swap="innerHTML" class="btn btn-outline" style="font-size: 0.8rem; padding: 4px 10px;">
+                            Check Again
+                        </button>
+                    </div>"##,
+                    info.current_version
+                )).into_response()
+            }
+        }
+        Err(e) => {
+            axum::response::Html(format!(
+                r##"<div>
+                    <div style="padding: 10px 14px; background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); border-radius: 6px; color: var(--danger); font-size: 0.875rem; margin-bottom: 12px;">
+                        Failed to check for updates: {}
+                    </div>
+                    <button hx-get="/ui/system/update/check" hx-target="#update-container" hx-swap="innerHTML" class="btn btn-outline" style="font-size: 0.8rem; padding: 4px 10px;">
+                        Retry
+                    </button>
+                </div>"##,
+                html_escape(&e.to_string())
+            )).into_response()
+        }
+    }
+}
+
+pub async fn system_update_apply_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(user) = get_session_user(&ctx, &headers) else {
+        return Redirect::to("/login").into_response();
+    };
+
+    if user.role != crate::auth::token::Role::Admin {
+        return axum::response::Html(
+            r#"<div style="padding: 12px; background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); border-radius: 6px; color: var(--danger); font-size: 0.875rem;">
+                Permission denied: Only administrators can install updates.
+            </div>"#,
+        ).into_response();
+    }
+
+    match crate::updater::apply_update(None, false).await {
+        Ok(msg) => axum::response::Html(format!(
+            r#"<div style="padding: 14px; background: rgba(34, 197, 94, 0.1); border: 1px solid var(--success); border-radius: 6px;">
+                <div style="font-weight: 600; color: var(--success); margin-bottom: 4px;">Update Successful!</div>
+                <div style="font-size: 0.875rem; color: var(--text-primary);">{}</div>
+            </div>"#,
+            html_escape(&msg)
+        )).into_response(),
+        Err(e) => axum::response::Html(format!(
+            r##"<div>
+                <div style="padding: 14px; background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); border-radius: 6px; color: var(--danger); font-size: 0.875rem; margin-bottom: 12px;">
+                    <strong>Update Failed:</strong> {}
+                </div>
+                <button hx-get="/ui/system/update/check" hx-target="#update-container" hx-swap="innerHTML" class="btn btn-outline" style="font-size: 0.8rem; padding: 4px 10px;">
+                    Back to Update Status
+                </button>
+            </div>"##,
+            html_escape(&e.to_string())
+        )).into_response(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Setup Wizard
 // ---------------------------------------------------------------------------
@@ -1030,5 +1358,16 @@ pub async fn wizard_complete_handler(
     let _ = ctx
         .auth_mgr
         .update_user_password(&form.admin_user, &form.admin_password);
+
+    let mut new_cfg = (**ctx.config.load()).clone();
+    if !form.upstream.trim().is_empty() {
+        new_cfg.upstream.servers = vec![form.upstream.trim().to_string()];
+    }
+    new_cfg.filtering.enabled = form.enable_adblock.is_some();
+
+    let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+    ctx.config.store(Arc::new(new_cfg.clone()));
+    let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+
     Redirect::to("/login").into_response()
 }

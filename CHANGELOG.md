@@ -5,6 +5,37 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.2.0] - 2026-09-05
+
+### Added
+- **In-App Self-Updater**:
+  - Direct software updates from web console and CLI (`sito update`).
+  - Automatic query of GitHub Releases API, parsing semantic versions and release notes.
+  - SHA256 checksum verification against published `SHA256SUMS`.
+  - Docker/OCI container detection with non-destructive container upgrade guidance.
+  - Safe, atomic self-replacement of the running executable on Linux (x86_64, aarch64, armv7).
+  - Admin REST API endpoints: `GET /api/v1/system/update/check` and `POST /api/v1/system/update/apply`.
+  - OpenAPI 3.0 specification updated in `docs/openapi.json`.
+- **Advanced Upstream Strategies & Caching**:
+  - `Parallel` upstream racing: concurrent query dispatch to all healthy upstreams; fastest valid answer wins.
+  - `LoadBalance` round-robin: distributed query forwarding across upstream resolvers.
+  - `[[upstream.per_domain]]`: domain-based routing for split-horizon or internal DNS zones.
+  - RFC 8767 `serve_stale`: stale cache entry fallback during upstream network outages.
+
+### Fixed
+- **RouterOS Auth Fallback**: Automatically fall back to native RouterOS API (port 8728) if REST login fails.
+- **SafeSearch Normalization**: Fixed domain matching bypasses with consistent trailing-dot FQDN normalization.
+- **HA Redaction Loop**: Guarded against recursive cycle traversal in High Availability secret sanitization.
+- **Auth IP Resolution**: Secured peer IP extraction against reverse proxy spoofing when proxies are untrusted.
+- **Web Port Configuration**: Fixed web server listener to respect `config.web.port` (default `8080`).
+- **Telemetry Retention Cleanup**: Added 24-hour background task to prune old query logs and keep SQLite storage bounded.
+- **Test Harness Reliability**: Eliminated ephemeral port probe races in parallel acceptance test execution with automated retry.
+
+### Changed
+- **Workspace Version**: Bumped workspace package and all internal crates to `1.2.0`.
+
+---
+
 ## [1.1.1] - 2026-09-05
 
 ### Maintenance & Rust 1.98.1 Toolchain Modernization

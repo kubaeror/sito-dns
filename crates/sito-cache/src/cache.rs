@@ -42,12 +42,24 @@ impl DnsCache {
         let entry = self.cache.get(&key).await?;
 
         let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
-        if elapsed_secs >= entry.max_lifespan_secs {
+        let max_stale_secs = entry
+            .max_lifespan_secs
+            .saturating_add(self.config.serve_stale_hours * 3600);
+
+        if elapsed_secs >= max_stale_secs {
             trace!(
-                "Cache entry for {} expired (elapsed: {}s, lifespan: {}s)",
-                key.qname, elapsed_secs, entry.max_lifespan_secs
+                "Cache entry for {} completely expired (elapsed: {}s, max_stale: {}s)",
+                key.qname, elapsed_secs, max_stale_secs
             );
             self.cache.invalidate(&key).await;
+            return None;
+        }
+
+        if elapsed_secs >= entry.max_lifespan_secs {
+            trace!(
+                "Cache entry for {} expired for normal queries (elapsed: {}s, lifespan: {}s)",
+                key.qname, elapsed_secs, entry.max_lifespan_secs
+            );
             return None;
         }
 
@@ -81,6 +93,72 @@ impl DnsCache {
             entry.max_lifespan_secs.saturating_sub(elapsed_secs)
         );
         Some(response)
+    }
+
+    /// Retrieve a stale cached response according to RFC 8767 when upstreams fail.
+    /// TTLs are clamped to 30 seconds as recommended by RFC 8767 section 5.
+    pub async fn get_stale(
+        &self,
+        name: &Name,
+        qtype: RecordType,
+        qclass: DNSClass,
+    ) -> Option<Message> {
+        const STALE_SERVE_TTL: u32 = 30;
+
+        if !self.config.enabled || self.config.serve_stale_hours == 0 {
+            return None;
+        }
+
+        let key = CacheKey::new(name, qtype, qclass);
+        let entry = self.cache.get(&key).await?;
+
+        let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
+        let max_stale_secs = entry
+            .max_lifespan_secs
+            .saturating_add(self.config.serve_stale_hours * 3600);
+
+        if elapsed_secs >= max_stale_secs {
+            self.cache.invalidate(&key).await;
+            return None;
+        }
+
+        entry.hits.fetch_add(1, Ordering::Relaxed);
+        let mut response = entry.message.clone();
+
+        for record in &mut response.answers {
+            record.ttl = STALE_SERVE_TTL;
+        }
+        for record in &mut response.authorities {
+            record.ttl = STALE_SERVE_TTL;
+        }
+        for record in &mut response.additionals {
+            record.ttl = STALE_SERVE_TTL;
+        }
+
+        debug!(
+            "Cache serving stale entry for {} (elapsed: {}s, original lifespan: {}s)",
+            key.qname, elapsed_secs, entry.max_lifespan_secs
+        );
+        Some(response)
+    }
+
+    /// Check whether a cached entry is eligible for background prefetch
+    /// (prefetch enabled, hits >= 2, and remaining TTL <= 10% of lifespan or <= 10 seconds).
+    pub async fn should_prefetch(&self, name: &Name, qtype: RecordType, qclass: DNSClass) -> bool {
+        if !self.config.enabled || !self.config.prefetch {
+            return false;
+        }
+
+        let key = CacheKey::new(name, qtype, qclass);
+        if let Some(entry) = self.cache.get(&key).await {
+            let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
+            if elapsed_secs < entry.max_lifespan_secs {
+                let remaining = entry.max_lifespan_secs - elapsed_secs;
+                let hits = entry.hits.load(Ordering::Relaxed);
+                return hits >= 2 && (remaining <= 10 || remaining <= entry.max_lifespan_secs / 10);
+            }
+        }
+        false
     }
 
     /// Insert a response into the cache, calculating clamped TTLs and entry weight.

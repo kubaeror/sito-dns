@@ -15,6 +15,7 @@ pub mod models;
 pub mod openapi;
 pub mod router;
 pub mod state;
+pub mod updater;
 
 #[cfg(feature = "embed-ui")]
 pub mod ui;

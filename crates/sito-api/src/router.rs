@@ -12,7 +12,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::error::ProblemDetails;
 use crate::handlers::{
     auth_handlers, cache, clients, config, filtering, ha, metrics, querylog, rewrites, stats,
-    status, upstream,
+    status, update, upstream,
 };
 use crate::openapi::ApiDoc;
 use crate::state::ServerContext;
@@ -83,6 +83,7 @@ pub fn create_router(ctx: ServerContext) -> Router {
             "/querylog",
             get(querylog::get_querylog).delete(querylog::delete_querylog),
         )
+        .route("/querylog/clear", post(querylog::delete_querylog))
         .route("/querylog/stream", get(querylog::stream_querylog))
         // Filtering
         .route(
@@ -160,6 +161,9 @@ pub fn create_router(ctx: ServerContext) -> Router {
         .route("/config/backup", get(config::download_backup))
         .route("/config/restore", post(config::prepare_restore))
         .route("/config/restore/confirm", post(config::confirm_restore))
+        // Software Update
+        .route("/system/update/check", get(update::check_update))
+        .route("/system/update/apply", post(update::apply_update))
         .layer(axum::middleware::from_fn_with_state(
             ctx.clone(),
             slave_read_only_middleware,

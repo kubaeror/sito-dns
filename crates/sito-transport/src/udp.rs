@@ -76,6 +76,7 @@ pub fn start_udp_listener<H: QueryHandler>(
         config.rate_limit_per_ip * 2,
     ));
     let mut tasks = Vec::new();
+    tasks.push(rate_limiter.spawn_pruner(shutdown_rx.clone()));
 
     for worker_id in 0..config.worker_count {
         let std_socket = create_reuseport_udp_socket(&config.bind_addr)?;

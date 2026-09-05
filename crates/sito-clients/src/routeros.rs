@@ -129,14 +129,18 @@ pub async fn fetch_routeros_leases(
 
     let mut req = client.get(&endpoint);
 
-    // Authentication: check token_env first, then username/password
-    if let Some(ref token_key) = config.token_env {
-        if let Ok(token) = std::env::var(token_key)
-            && !token.trim().is_empty()
-        {
-            req = req.bearer_auth(token.trim());
-        }
-    } else if let Some(ref username) = config.username {
+    // Authentication: check token_env first; if present in env, use bearer auth,
+    // otherwise fall through to username/password basic auth.
+    let mut authenticated = false;
+    if let Some(ref token_key) = config.token_env
+        && let Ok(token) = std::env::var(token_key)
+        && !token.trim().is_empty()
+    {
+        req = req.bearer_auth(token.trim());
+        authenticated = true;
+    }
+
+    if !authenticated && let Some(ref username) = config.username {
         let password = if let Some(ref pwd_env) = config.password_env {
             std::env::var(pwd_env).unwrap_or_default()
         } else {

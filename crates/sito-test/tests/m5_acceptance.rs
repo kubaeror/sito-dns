@@ -132,6 +132,31 @@ async fn test_acceptance_m5_openapi_contract() {
     }
 }
 
+async fn call_route(
+    app: axum::Router,
+    method: &'static str,
+    uri: &'static str,
+    token: Option<&str>,
+    body: &'static str,
+) -> (StatusCode, String) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+
+    if let Some(t) = token {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
+    }
+
+    let req = builder.body(Body::from(body)).unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    let status = res.status();
+    let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&body_bytes).to_string())
+}
+
 /// 2. Acceptance test: RBAC Role x Endpoint Matrix (Admin, Operator, Viewer, Unauthenticated)
 #[tokio::test]
 async fn test_acceptance_m5_rbac_matrix() {
@@ -150,32 +175,6 @@ async fn test_acceptance_m5_rbac_matrix() {
     let view_tok = ctx.auth_mgr.create_token("viw-test", Role::Viewer).1.token;
 
     let app = sito_api::create_router(ctx);
-
-    // Helper macro to run a request through the app
-    async fn call_route(
-        app: axum::Router,
-        method: &'static str,
-        uri: &'static str,
-        token: Option<&str>,
-        body: &'static str,
-    ) -> (StatusCode, String) {
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header(header::CONTENT_TYPE, "application/json");
-
-        if let Some(t) = token {
-            builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
-        }
-
-        let req = builder.body(Body::from(body)).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        let status = res.status();
-        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        (status, String::from_utf8_lossy(&body_bytes).to_string())
-    }
 
     // 1. Unauthenticated requests to protected endpoints -> 401 with RFC 7807 problem+json
     let (status, body) = call_route(app.clone(), "GET", "/api/v1/status", None, "").await;
@@ -315,6 +314,21 @@ async fn test_acceptance_m5_rbac_matrix() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+async fn get_json(app: axum::Router, uri: &str, token: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    let status = res.status();
+    let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    (status, json)
+}
+
 /// 3. Acceptance test: Query log filters and cursor pagination
 #[tokio::test]
 async fn test_acceptance_m5_querylog_filters_and_pagination() {
@@ -380,26 +394,6 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
     ctx.stats_db.insert_batch(&entries).await.unwrap();
 
     let app = sito_api::create_router(ctx.clone());
-
-    // Helper request caller
-    async fn get_json(
-        app: axum::Router,
-        uri: &str,
-        token: &str,
-    ) -> (StatusCode, serde_json::Value) {
-        let req = Request::builder()
-            .uri(uri)
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .body(Body::empty())
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        let status = res.status();
-        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        (status, json)
-    }
 
     // Filter by domain
     let (status, json) =

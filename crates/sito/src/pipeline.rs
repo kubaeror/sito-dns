@@ -320,7 +320,7 @@ impl QueryHandler for DnsPipeline {
             // ADR-0007 Stage 4: Safe Search CNAME rewrites (Google, Bing, YouTube, DuckDuckGo)
             if policy.safe_search
                 && let Some(target) = match_safe_search(&domain_str, policy.safe_search_youtube)
-                    && let Ok(cname_target) = Name::from_str(target) {
+                && let Ok(cname_target) = Name::from_str(&format!("{}.", target.trim_end_matches('.'))) {
                         info!(
                             qname = %qname,
                             target = %target,
@@ -374,6 +374,18 @@ impl QueryHandler for DnsPipeline {
                     }
 
                     info!(qname = %qname, qtype = ?qtype, "Cache hit");
+                    if self.cache.should_prefetch(qname, qtype, qclass).await {
+                        let bg_upstream = Arc::clone(&self.upstream);
+                        let bg_cache = Arc::clone(&self.cache);
+                        let bg_query = query.clone();
+                        tokio::spawn(async move {
+                            if let Ok(resp) = bg_upstream.resolve(&bg_query).await
+                                && resp.metadata.response_code == ResponseCode::NoError
+                            {
+                                bg_cache.insert(&bg_query, &resp).await;
+                            }
+                        });
+                    }
                     cached_resp.metadata.id = query_id;
                     return (
                         Some(cached_resp),
@@ -499,6 +511,29 @@ impl QueryHandler for DnsPipeline {
                         error = %e,
                         "Upstream resolution failed"
                     );
+
+                    if self.config.dns.cache.enabled
+                        && self.config.dns.cache.serve_stale_hours > 0
+                        && let Some(mut stale_resp) =
+                            self.cache.get_stale(qname, qtype, qclass).await
+                    {
+                        info!(
+                            qname = %qname,
+                            "Upstream failed, serving stale cached response (RFC 8767)"
+                        );
+                        stale_resp.metadata.id = query_id;
+                        return (
+                            Some(stale_resp),
+                            "allowed",
+                            Some("stale_cache".to_string()),
+                            None,
+                            None,
+                            true,
+                            domain_str,
+                            qtype,
+                        );
+                    }
+
                     let mut err_resp = Message::new(query_id, MessageType::Response, OpCode::Query);
                     err_resp.metadata.response_code = ResponseCode::ServFail;
                     err_resp.metadata.recursion_desired = query.metadata.recursion_desired;

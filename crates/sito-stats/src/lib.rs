@@ -16,7 +16,8 @@ pub mod writer;
 
 pub use anonymize::anonymize_ip;
 pub use db::{
-    ClientStats, GlobalStats, QueryLogFilter, QueryLogPage, RetentionReport, StatsDb, UpstreamStats,
+    ClientStats, GlobalStats, HourlyActivity, QueryLogFilter, QueryLogPage, RetentionReport,
+    StatsDb, UpstreamStats,
 };
 pub use entry::QueryLogEntry;
 pub use error::StatsError;
@@ -100,7 +101,7 @@ mod tests {
         let stats = db.get_global_stats(86_400_000 * 365).await.unwrap();
         assert_eq!(stats.total_queries, 50);
         assert_eq!(stats.blocked_queries, 25);
-        assert_eq!(stats.blocked_percentage, 50.0);
+        assert!((stats.blocked_percentage - 50.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -270,7 +271,7 @@ mod tests {
         for i in 0..count {
             entries.push(QueryLogEntry {
                 id: None,
-                ts: base_ts + i as i64,
+                ts: base_ts + i64::try_from(i).unwrap_or(0),
                 client_ip: "10.0.0.5".into(),
                 client_name: None,
                 qname: "speedtest.example".into(),
@@ -299,5 +300,54 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_get_hourly_activity() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let entries = vec![
+            QueryLogEntry {
+                id: None,
+                ts: now - 1800 * 1000,
+                client_ip: "192.168.1.1".into(),
+                client_name: None,
+                qname: "test1.com".into(),
+                qtype: 1,
+                rcode: Some(0),
+                verdict: "allowed".into(),
+                rule: None,
+                list_source: None,
+                upstream: None,
+                elapsed_us: Some(100),
+                dnssec: None,
+                proto: "udp".into(),
+            },
+            QueryLogEntry {
+                id: None,
+                ts: now - 1800 * 1000 + 10,
+                client_ip: "192.168.1.2".into(),
+                client_name: None,
+                qname: "ad.tracker.com".into(),
+                qtype: 1,
+                rcode: Some(0),
+                verdict: "blocked".into(),
+                rule: Some("ad.tracker.com".into()),
+                list_source: None,
+                upstream: None,
+                elapsed_us: Some(50),
+                dnssec: None,
+                proto: "udp".into(),
+            },
+        ];
+
+        db.insert_batch(&entries).await.unwrap();
+        let activity = db.get_hourly_activity(24).await.unwrap();
+        assert_eq!(activity.len(), 24);
+        let total_queries: i64 = activity.iter().map(|a| a.total_queries).sum();
+        let blocked_queries: i64 = activity.iter().map(|a| a.blocked_queries).sum();
+        assert_eq!(total_queries, 2);
+        assert_eq!(blocked_queries, 1);
     }
 }

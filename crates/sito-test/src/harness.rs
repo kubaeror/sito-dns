@@ -14,6 +14,7 @@ pub struct TestServerInstance {
     port: u16,
     dot_port: u16,
     doh_port: u16,
+    web_port: u16,
     addr: SocketAddr,
     has_tls: bool,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -22,12 +23,30 @@ pub struct TestServerInstance {
 }
 
 impl TestServerInstance {
-    /// Spawns a new server instance with the given configuration modifications.
-    pub async fn spawn(mut config: Config) -> Result<Self, anyhow::Error> {
-        // Allocate an ephemeral port for standard DNS (UDP/TCP)
-        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = probe.local_addr()?.port();
-        drop(probe);
+    /// Spawns a new server instance with the given configuration modifications,
+    /// retrying up to 5 times if an ephemeral port collision occurs during parallel test execution.
+    pub async fn spawn(config: Config) -> Result<Self, anyhow::Error> {
+        let mut last_err = anyhow::anyhow!("Failed to spawn test server instance");
+        for attempt in 0..5 {
+            match Self::try_spawn(config.clone()).await {
+                Ok(instance) => return Ok(instance),
+                Err(e) => {
+                    tracing::warn!(
+                        "Test server spawn attempt {} failed: {e}; retrying",
+                        attempt + 1
+                    );
+                    last_err = e;
+                    tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    async fn try_spawn(mut config: Config) -> Result<Self, anyhow::Error> {
+        // Allocate ephemeral ports ensuring no collisions between listeners
+        let probe_dns = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = probe_dns.local_addr()?.port();
 
         let mut dot_port = config.dns.dot_port;
         let mut doh_port = config.dns.doh_port;
@@ -35,35 +54,64 @@ impl TestServerInstance {
         let mut doh3_port = config.dns.doh3_port;
         let has_tls = config.get_tls_config().is_some();
 
+        let mut probe_dot = None;
+        let mut probe_doh = None;
+        let mut probe_doq = None;
+        let mut probe_doh3 = None;
+
         if has_tls {
             if dot_port == 853 || dot_port == 0 {
                 let p = std::net::TcpListener::bind("127.0.0.1:0")?;
                 dot_port = p.local_addr()?.port();
-                drop(p);
                 config.dns.dot_port = dot_port;
+                probe_dot = Some(p);
             }
             if doh_port == 443 || doh_port == 0 {
                 let p = std::net::TcpListener::bind("127.0.0.1:0")?;
                 doh_port = p.local_addr()?.port();
-                drop(p);
                 config.dns.doh_port = doh_port;
+                probe_doh = Some(p);
             }
             if doq_port == 853 || doq_port == 0 {
                 let p = std::net::UdpSocket::bind("127.0.0.1:0")?;
                 doq_port = p.local_addr()?.port();
-                drop(p);
                 config.dns.doq_port = doq_port;
+                probe_doq = Some(p);
             }
             if doh3_port == 443 || doh3_port == 0 {
                 let p = std::net::UdpSocket::bind("127.0.0.1:0")?;
                 doh3_port = p.local_addr()?.port();
-                drop(p);
                 config.dns.doh3_port = doh3_port;
+                probe_doh3 = Some(p);
             }
         }
 
-        let temp_dir =
-            std::env::temp_dir().join(format!("sito_test_inst_{}_{}", std::process::id(), port));
+        let mut probe_web = None;
+        let mut web_port = config.get_web_config().port;
+        if web_port == 8080 || web_port == 0 {
+            let p = std::net::TcpListener::bind("127.0.0.1:0")?;
+            web_port = p.local_addr()?.port();
+            let mut web_cfg = config.get_web_config();
+            web_cfg.bind = "127.0.0.1".parse().unwrap();
+            web_cfg.port = web_port;
+            config.set_web_config(web_cfg);
+            probe_web = Some(p);
+        }
+
+        // Release all probes simultaneously right before starting the server
+        drop(probe_dns);
+        drop(probe_dot);
+        drop(probe_doh);
+        drop(probe_doq);
+        drop(probe_doh3);
+        drop(probe_web);
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_test_inst_{}_{}_{}",
+            std::process::id(),
+            port,
+            rand::random::<u32>()
+        ));
         tokio::fs::create_dir_all(&temp_dir).await?;
 
         config.server.data_dir = temp_dir.clone();
@@ -73,52 +121,102 @@ impl TestServerInstance {
         let addr = SocketAddr::new("127.0.0.1".parse().unwrap(), port);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let server_task =
+        let mut server_task =
             tokio::spawn(async move { run_server_with_shutdown(config, Some(shutdown_rx)).await });
 
         // Wait until standard server listener is ready (up to 3s for busy CI runners)
         let mut ready = false;
         for _ in 0..150 {
             tokio::time::sleep(Duration::from_millis(20)).await;
+            if server_task.is_finished() {
+                break;
+            }
             if tokio::net::TcpStream::connect(addr).await.is_ok() {
                 ready = true;
                 break;
             }
         }
 
+        if server_task.is_finished() {
+            (&mut server_task).await??;
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+            anyhow::bail!("Server task exited unexpectedly during startup");
+        }
+
         if !ready {
+            let _ = shutdown_tx.send(());
+            let _ = server_task.await;
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
             anyhow::bail!("Server failed to bind to {addr} within timeout");
         }
 
         // Wait until DoT listener is ready if configured
         if has_tls && dot_port > 0 {
             let dot_addr = SocketAddr::new(addr.ip(), dot_port);
+            let mut dot_ready = false;
             for _ in 0..150 {
+                if server_task.is_finished() {
+                    break;
+                }
                 if tokio::net::TcpStream::connect(dot_addr).await.is_ok() {
+                    dot_ready = true;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if server_task.is_finished() {
+                (&mut server_task).await??;
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                anyhow::bail!("Server task exited unexpectedly during DoT startup");
+            }
+            if !dot_ready {
+                let _ = shutdown_tx.send(());
+                let _ = server_task.await;
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                anyhow::bail!("DoT listener failed to bind to {dot_addr} within timeout");
             }
         }
 
         // Wait until DoH listener is ready if configured
         if has_tls && doh_port > 0 {
             let doh_addr = SocketAddr::new(addr.ip(), doh_port);
+            let mut doh_ready = false;
             for _ in 0..150 {
+                if server_task.is_finished() {
+                    break;
+                }
                 if tokio::net::TcpStream::connect(doh_addr).await.is_ok() {
+                    doh_ready = true;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if server_task.is_finished() {
+                (&mut server_task).await??;
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                anyhow::bail!("Server task exited unexpectedly during DoH startup");
+            }
+            if !doh_ready {
+                let _ = shutdown_tx.send(());
+                let _ = server_task.await;
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                anyhow::bail!("DoH listener failed to bind to {doh_addr} within timeout");
             }
         }
 
         // Brief grace period for UDP and listener tasks to enter event loop
         tokio::time::sleep(Duration::from_millis(50)).await;
+        if server_task.is_finished() {
+            (&mut server_task).await??;
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+            anyhow::bail!("Server task exited unexpectedly during initialization grace period");
+        }
 
         Ok(Self {
             port,
             dot_port,
             doh_port,
+            web_port,
             addr,
             has_tls,
             shutdown_tx: Some(shutdown_tx),
@@ -145,6 +243,11 @@ impl TestServerInstance {
     /// Bound port of the DoH listener.
     pub fn doh_port(&self) -> u16 {
         self.doh_port
+    }
+
+    /// Bound port of the web admin interface.
+    pub fn web_port(&self) -> u16 {
+        self.web_port
     }
 
     /// Bound address of the DoT listener.

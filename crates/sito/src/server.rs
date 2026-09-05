@@ -255,10 +255,17 @@ pub async fn run_server_full(
     };
 
     let api_router = sito_api::create_router(server_ctx);
-    if let Ok(listener) = tokio::net::TcpListener::bind("0.0.0.0:3000").await {
+    let web_cfg = config_arc.load().get_web_config();
+    if web_cfg.enabled {
+        let web_addr = SocketAddr::new(web_cfg.bind, web_cfg.port);
+        let listener = tokio::net::TcpListener::bind(web_addr).await.map_err(|e| {
+            anyhow::anyhow!("Failed to bind web admin interface to {web_addr}: {e}")
+        })?;
+        let bound_addr = listener.local_addr()?;
         let mut api_shutdown_rx = shutdown_rx.clone();
+        let make_svc = api_router.into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, api_router)
+            let _ = axum::serve(listener, make_svc)
                 .with_graceful_shutdown(async move {
                     while !*api_shutdown_rx.borrow_and_update() {
                         if api_shutdown_rx.changed().await.is_err() {
@@ -268,8 +275,31 @@ pub async fn run_server_full(
                 })
                 .await;
         });
-        info!("sito admin REST API listening on http://0.0.0.0:3000");
+        info!("sito admin REST API listening on http://{bound_addr}");
     }
+
+    // Periodic stats retention cleanup task (every 24h)
+    let retention_db = stats_db.clone();
+    let retention_days = config_arc.load().get_stats_config().retention_days;
+    let mut retention_shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_hours(24));
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = retention_shutdown_rx.changed() => {
+                    if *retention_shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Err(e) = retention_db.cleanup_retention(retention_days).await {
+                        warn!("Error during stats retention cleanup: {e}");
+                    }
+                }
+            }
+        }
+    });
 
     // Spawn config file watcher for hot-reload
     let watcher_config_path = config_path_buf.clone();

@@ -54,9 +54,14 @@ use utoipa::OpenApi;
         crate::handlers::config::download_backup,
         crate::handlers::config::prepare_restore,
         crate::handlers::config::confirm_restore,
+        crate::handlers::update::check_update,
+        crate::handlers::update::apply_update,
     ),
     components(
         schemas(
+            crate::updater::UpdateInfo,
+            crate::handlers::update::ApplyUpdateResponse,
+            crate::handlers::update::ApplyUpdatePayload,
             crate::models::StatusResponse,
             crate::models::StatsQuery,
             crate::models::FilterListDto,
@@ -118,7 +123,7 @@ use utoipa::OpenApi;
     ),
     info(
         title = "sito DNS Administrative API",
-        version = "1.1.1",
+        version = "1.2.0",
         description = "Administrative REST API and OpenAPI 3.0 specification for the sito DNS server",
         license(name = "GPL-3.0-only")
     )

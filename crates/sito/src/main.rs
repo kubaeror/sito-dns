@@ -76,6 +76,13 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
             },
+            Commands::Update { check, force, repo } => {
+                if let Err(e) = sito::cli::run_update(check, force, repo.as_deref()).await {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
         }
     }
 

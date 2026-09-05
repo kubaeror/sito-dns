@@ -1,8 +1,9 @@
-//! Upstream manager coordinating failover, health checking, and server pooling.
+//! Upstream manager coordinating failover, load balancing, parallel racing, health checking, and server pooling.
 
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
@@ -18,18 +19,75 @@ use crate::health::{HealthStatus, UpstreamHealth};
 use crate::plain::PlainUpstream;
 use crate::upstream::Upstream;
 
+pub type NamedUpstream = (String, Arc<dyn Upstream>);
+pub type PerDomainRule = (Vec<String>, Vec<NamedUpstream>);
+
 struct ManagedEntry {
     name: String,
     upstream: Arc<dyn Upstream>,
     health: Arc<RwLock<UpstreamHealth>>,
 }
 
-/// Central manager for upstream DNS servers, handling failover and health tracking.
+/// Central manager for upstream DNS servers, handling failover, load balancing,
+/// parallel queries, per-domain routing, and health tracking.
 pub struct UpstreamManager {
     entries: Vec<ManagedEntry>,
+    per_domain_rules: Vec<(Vec<String>, Vec<ManagedEntry>)>,
     strategy: UpstreamStrategy,
     timeout_duration: Duration,
     probe_domain: String,
+    rr_counter: AtomicUsize,
+}
+
+async fn create_managed_entry(
+    server_str: &str,
+    bootstrap: &BootstrapResolver,
+    timeout_duration: Duration,
+    pool_size: usize,
+) -> Result<ManagedEntry, UpstreamError> {
+    let (name, upstream): (String, Arc<dyn Upstream>) =
+        if let Some(tls_target) = server_str.strip_prefix("tls://") {
+            let parts: Vec<&str> = tls_target.split(':').collect();
+            let host = parts[0];
+            let port: u16 = if parts.len() > 1 {
+                parts[1].parse().unwrap_or(853)
+            } else {
+                853
+            };
+
+            // Resolve hostname via bootstrap
+            let resolved_ips = bootstrap.resolve_hostname(host).await?;
+            let target_ip = resolved_ips[0];
+            let socket_addr = SocketAddr::new(target_ip, port);
+
+            let dot = DotUpstream::new(socket_addr, host.to_string(), timeout_duration, pool_size)?;
+            (server_str.to_string(), Arc::new(dot))
+        } else {
+            let target_str = server_str.strip_prefix("udp://").unwrap_or(server_str);
+            let socket_addr = if let Ok(addr) = SocketAddr::from_str(target_str) {
+                addr
+            } else {
+                let parts: Vec<&str> = target_str.split(':').collect();
+                let host = parts[0];
+                let port: u16 = if parts.len() > 1 {
+                    parts[1].parse().unwrap_or(53)
+                } else {
+                    53
+                };
+
+                let resolved_ips = bootstrap.resolve_hostname(host).await?;
+                SocketAddr::new(resolved_ips[0], port)
+            };
+
+            let plain = PlainUpstream::new(socket_addr, timeout_duration);
+            (server_str.to_string(), Arc::new(plain))
+        };
+
+    Ok(ManagedEntry {
+        name,
+        upstream,
+        health: Arc::new(RwLock::new(UpstreamHealth::new())),
+    })
 }
 
 impl UpstreamManager {
@@ -42,61 +100,31 @@ impl UpstreamManager {
         let mut entries = Vec::new();
 
         for server_str in &config.servers {
-            let (name, upstream): (String, Arc<dyn Upstream>) =
-                if let Some(tls_target) = server_str.strip_prefix("tls://") {
-                    let parts: Vec<&str> = tls_target.split(':').collect();
-                    let host = parts[0];
-                    let port: u16 = if parts.len() > 1 {
-                        parts[1].parse().unwrap_or(853)
-                    } else {
-                        853
-                    };
+            entries.push(
+                create_managed_entry(server_str, bootstrap, timeout_duration, config.pool_size)
+                    .await?,
+            );
+        }
 
-                    // Resolve hostname via bootstrap
-                    let resolved_ips = bootstrap.resolve_hostname(host).await?;
-                    let target_ip = resolved_ips[0];
-                    let socket_addr = SocketAddr::new(target_ip, port);
-
-                    let dot = DotUpstream::new(
-                        socket_addr,
-                        host.to_string(),
-                        timeout_duration,
-                        config.pool_size,
-                    )?;
-                    (server_str.clone(), Arc::new(dot))
-                } else {
-                    let target_str = server_str.strip_prefix("udp://").unwrap_or(server_str);
-                    let socket_addr = if let Ok(addr) = SocketAddr::from_str(target_str) {
-                        addr
-                    } else {
-                        let parts: Vec<&str> = target_str.split(':').collect();
-                        let host = parts[0];
-                        let port: u16 = if parts.len() > 1 {
-                            parts[1].parse().unwrap_or(53)
-                        } else {
-                            53
-                        };
-
-                        let resolved_ips = bootstrap.resolve_hostname(host).await?;
-                        SocketAddr::new(resolved_ips[0], port)
-                    };
-
-                    let plain = PlainUpstream::new(socket_addr, timeout_duration);
-                    (server_str.clone(), Arc::new(plain))
-                };
-
-            entries.push(ManagedEntry {
-                name,
-                upstream,
-                health: Arc::new(RwLock::new(UpstreamHealth::new())),
-            });
+        let mut per_domain_rules = Vec::new();
+        for pd in &config.per_domain {
+            let mut pd_entries = Vec::new();
+            for server_str in &pd.servers {
+                pd_entries.push(
+                    create_managed_entry(server_str, bootstrap, timeout_duration, config.pool_size)
+                        .await?,
+                );
+            }
+            per_domain_rules.push((pd.domains.clone(), pd_entries));
         }
 
         Ok(Self {
             entries,
+            per_domain_rules,
             strategy: config.strategy,
             timeout_duration,
             probe_domain: config.probe_domain.clone(),
+            rr_counter: AtomicUsize::new(0),
         })
     }
 
@@ -117,10 +145,32 @@ impl UpstreamManager {
 
         Self {
             entries,
+            per_domain_rules: Vec::new(),
             strategy,
             timeout_duration,
             probe_domain: "example.com".to_string(),
+            rr_counter: AtomicUsize::new(0),
         }
+    }
+
+    /// Create an UpstreamManager with per-domain rules (for testing).
+    #[must_use]
+    pub fn with_per_domain_upstreams(mut self, rules: Vec<PerDomainRule>) -> Self {
+        self.per_domain_rules = rules
+            .into_iter()
+            .map(|(domains, upstreams)| {
+                let entries = upstreams
+                    .into_iter()
+                    .map(|(name, upstream)| ManagedEntry {
+                        name,
+                        upstream,
+                        health: Arc::new(RwLock::new(UpstreamHealth::new())),
+                    })
+                    .collect();
+                (domains, entries)
+            })
+            .collect();
+        self
     }
 
     pub fn strategy(&self) -> UpstreamStrategy {
@@ -138,18 +188,52 @@ impl UpstreamManager {
             let status = entry.health.read().await.status();
             res.push((entry.name.clone(), status));
         }
+        for (_, group) in &self.per_domain_rules {
+            for entry in group {
+                let status = entry.health.read().await.status();
+                res.push((entry.name.clone(), status));
+            }
+        }
         res
     }
 
-    /// Resolve a DNS query according to the configured strategy (e.g. failover).
+    /// Resolve a DNS query according to domain rules and configured strategy (parallel, load balance, failover).
     pub async fn resolve(&self, msg: &Message) -> Result<Message, UpstreamError> {
-        if self.entries.is_empty() {
+        if let Some(query) = msg.queries.first() {
+            let qname_str = query.name.to_utf8().to_lowercase();
+            let qname_clean = qname_str.trim_end_matches('.');
+            for (domains, group) in &self.per_domain_rules {
+                for d in domains {
+                    let d_clean = d.trim().to_lowercase();
+                    let d_clean = d_clean.trim_end_matches('.');
+                    if !d_clean.is_empty()
+                        && (qname_clean == d_clean || qname_clean.ends_with(&format!(".{d_clean}")))
+                    {
+                        debug!(
+                            "Routing query for {} to per-domain upstreams {:?}",
+                            qname_str, domains
+                        );
+                        return self.resolve_entries(group, msg).await;
+                    }
+                }
+            }
+        }
+
+        self.resolve_entries(&self.entries, msg).await
+    }
+
+    async fn resolve_entries(
+        &self,
+        entries: &[ManagedEntry],
+        msg: &Message,
+    ) -> Result<Message, UpstreamError> {
+        if entries.is_empty() {
             return Err(UpstreamError::AllDown);
         }
 
         // Collect available upstreams
         let mut candidates = Vec::new();
-        for entry in &self.entries {
+        for entry in entries {
             let health = entry.health.read().await;
             if health.is_available() {
                 candidates.push(entry);
@@ -159,27 +243,75 @@ impl UpstreamManager {
         // If all are marked down, fall back to trying all candidates
         if candidates.is_empty() {
             warn!("All upstreams marked down, attempting emergency query to all upstreams");
-            candidates.extend(self.entries.iter());
+            candidates.extend(entries.iter());
         }
 
-        // Failover execution: try first healthy, fallback to next on error
-        let mut last_error = None;
-        for entry in candidates {
-            trace!("Querying upstream {}", entry.name);
-            match entry.upstream.resolve(msg).await {
-                Ok(response) => {
-                    entry.health.write().await.record_success();
-                    return Ok(response);
+        match self.strategy {
+            UpstreamStrategy::Parallel => {
+                let mut futs = Vec::with_capacity(candidates.len());
+                for entry in candidates {
+                    let u = Arc::clone(&entry.upstream);
+                    let h = Arc::clone(&entry.health);
+                    let m = msg.clone();
+                    let name = entry.name.clone();
+                    futs.push(Box::pin(async move {
+                        match u.resolve(&m).await {
+                            Ok(resp) => {
+                                h.write().await.record_success();
+                                Ok(resp)
+                            }
+                            Err(e) => {
+                                warn!("Upstream {} failed parallel query: {}", name, e);
+                                h.write().await.record_error(&e);
+                                Err(e)
+                            }
+                        }
+                    }));
                 }
-                Err(e) => {
-                    warn!("Upstream {} failed query: {}", entry.name, e);
-                    entry.health.write().await.record_error(&e);
-                    last_error = Some(e);
+                match futures_util::future::select_ok(futs).await {
+                    Ok((resp, _)) => Ok(resp),
+                    Err(e) => Err(e),
                 }
             }
+            UpstreamStrategy::LoadBalance => {
+                let start_idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % candidates.len();
+                let mut last_error = None;
+                for i in 0..candidates.len() {
+                    let entry = candidates[(start_idx + i) % candidates.len()];
+                    trace!("Querying upstream (load_balance) {}", entry.name);
+                    match entry.upstream.resolve(msg).await {
+                        Ok(response) => {
+                            entry.health.write().await.record_success();
+                            return Ok(response);
+                        }
+                        Err(e) => {
+                            warn!("Upstream {} failed query: {}", entry.name, e);
+                            entry.health.write().await.record_error(&e);
+                            last_error = Some(e);
+                        }
+                    }
+                }
+                Err(last_error.unwrap_or(UpstreamError::AllDown))
+            }
+            UpstreamStrategy::Failover => {
+                let mut last_error = None;
+                for entry in candidates {
+                    trace!("Querying upstream (failover) {}", entry.name);
+                    match entry.upstream.resolve(msg).await {
+                        Ok(response) => {
+                            entry.health.write().await.record_success();
+                            return Ok(response);
+                        }
+                        Err(e) => {
+                            warn!("Upstream {} failed query: {}", entry.name, e);
+                            entry.health.write().await.record_error(&e);
+                            last_error = Some(e);
+                        }
+                    }
+                }
+                Err(last_error.unwrap_or(UpstreamError::AllDown))
+            }
         }
-
-        Err(last_error.unwrap_or(UpstreamError::AllDown))
     }
 
     /// Spawn background health probing loop (probes every 10 seconds).
@@ -203,7 +335,17 @@ impl UpstreamManager {
                         }
                     }
                     () = sleep(Duration::from_secs(10)) => {
+                        let mut all_entries = Vec::new();
                         for entry in &this.entries {
+                            all_entries.push(entry);
+                        }
+                        for (_, group) in &this.per_domain_rules {
+                            for entry in group {
+                                all_entries.push(entry);
+                            }
+                        }
+
+                        for entry in all_entries {
                             let status = entry.health.read().await.status();
                             // Only probe if Suspect or Down
                             if status != HealthStatus::Healthy {
@@ -227,5 +369,185 @@ impl UpstreamManager {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sito_proto::rdata::A;
+    use sito_proto::{RData, Record, ResponseCode};
+    use std::sync::atomic::AtomicU32;
+
+    struct ConfigurableMockUpstream {
+        succeed: bool,
+        delay: Duration,
+        result_ip: std::net::Ipv4Addr,
+        call_count: Arc<AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl Upstream for ConfigurableMockUpstream {
+        async fn resolve(&self, msg: &Message) -> Result<Message, UpstreamError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            if self.delay > Duration::ZERO {
+                tokio::time::sleep(self.delay).await;
+            }
+            if self.succeed {
+                let mut resp = Message::response(msg.metadata.id, msg.metadata.op_code);
+                resp.queries = msg.queries.clone();
+                resp.metadata.response_code = ResponseCode::NoError;
+                resp.answers.push(Record::from_rdata(
+                    msg.queries[0].name().clone(),
+                    300,
+                    RData::A(A(self.result_ip)),
+                ));
+                Ok(resp)
+            } else {
+                Err(UpstreamError::Timeout)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_strategy_fastest_wins() {
+        let calls_fast = Arc::new(AtomicU32::new(0));
+        let calls_slow = Arc::new(AtomicU32::new(0));
+
+        let fast_upstream = Arc::new(ConfigurableMockUpstream {
+            succeed: true,
+            delay: Duration::from_millis(10),
+            result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+            call_count: Arc::clone(&calls_fast),
+        });
+
+        let slow_upstream = Arc::new(ConfigurableMockUpstream {
+            succeed: true,
+            delay: Duration::from_millis(200),
+            result_ip: std::net::Ipv4Addr::new(2, 2, 2, 2),
+            call_count: Arc::clone(&calls_slow),
+        });
+
+        let manager = UpstreamManager::with_upstreams(
+            vec![
+                ("slow".to_string(), slow_upstream),
+                ("fast".to_string(), fast_upstream),
+            ],
+            UpstreamStrategy::Parallel,
+            Duration::from_secs(1),
+        );
+
+        let mut query = Message::new(1, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("test.com.").unwrap(),
+            RecordType::A,
+        ));
+
+        let resp = manager.resolve(&query).await.unwrap();
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(
+            resp.answers[0].data,
+            RData::A(A(std::net::Ipv4Addr::new(1, 1, 1, 1)))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_balance_strategy_round_robin() {
+        let calls_a = Arc::new(AtomicU32::new(0));
+        let calls_b = Arc::new(AtomicU32::new(0));
+
+        let upstream_a = Arc::new(ConfigurableMockUpstream {
+            succeed: true,
+            delay: Duration::ZERO,
+            result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+            call_count: Arc::clone(&calls_a),
+        });
+
+        let upstream_b = Arc::new(ConfigurableMockUpstream {
+            succeed: true,
+            delay: Duration::ZERO,
+            result_ip: std::net::Ipv4Addr::new(2, 2, 2, 2),
+            call_count: Arc::clone(&calls_b),
+        });
+
+        let manager = UpstreamManager::with_upstreams(
+            vec![("a".to_string(), upstream_a), ("b".to_string(), upstream_b)],
+            UpstreamStrategy::LoadBalance,
+            Duration::from_secs(1),
+        );
+
+        let mut query = Message::new(1, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("test.com.").unwrap(),
+            RecordType::A,
+        ));
+
+        let resp1 = manager.resolve(&query).await.unwrap();
+        let resp2 = manager.resolve(&query).await.unwrap();
+
+        // Round robin should give answers from both servers
+        assert_ne!(resp1.answers[0].data, resp2.answers[0].data);
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_per_domain_routing() {
+        let calls_default = Arc::new(AtomicU32::new(0));
+        let calls_corp = Arc::new(AtomicU32::new(0));
+
+        let default_upstream = Arc::new(ConfigurableMockUpstream {
+            succeed: true,
+            delay: Duration::ZERO,
+            result_ip: std::net::Ipv4Addr::new(8, 8, 8, 8),
+            call_count: Arc::clone(&calls_default),
+        });
+
+        let corp_upstream = Arc::new(ConfigurableMockUpstream {
+            succeed: true,
+            delay: Duration::ZERO,
+            result_ip: std::net::Ipv4Addr::new(10, 0, 0, 1),
+            call_count: Arc::clone(&calls_corp),
+        });
+
+        let manager = UpstreamManager::with_upstreams(
+            vec![("default".to_string(), default_upstream)],
+            UpstreamStrategy::Failover,
+            Duration::from_secs(1),
+        )
+        .with_per_domain_upstreams(vec![(
+            vec!["corp".to_string(), "internal.lan".to_string()],
+            vec![("corp".to_string(), corp_upstream)],
+        )]);
+
+        // 1. Query for corp domain
+        let mut query_corp = Message::new(1, MessageType::Query, OpCode::Query);
+        query_corp.queries.push(Query::query(
+            Name::from_str("server.corp.").unwrap(),
+            RecordType::A,
+        ));
+
+        let resp_corp = manager.resolve(&query_corp).await.unwrap();
+        assert_eq!(
+            resp_corp.answers[0].data,
+            RData::A(A(std::net::Ipv4Addr::new(10, 0, 0, 1)))
+        );
+        assert_eq!(calls_corp.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_default.load(Ordering::SeqCst), 0);
+
+        // 2. Query for public domain
+        let mut query_pub = Message::new(2, MessageType::Query, OpCode::Query);
+        query_pub.queries.push(Query::query(
+            Name::from_str("google.com.").unwrap(),
+            RecordType::A,
+        ));
+
+        let resp_pub = manager.resolve(&query_pub).await.unwrap();
+        assert_eq!(
+            resp_pub.answers[0].data,
+            RData::A(A(std::net::Ipv4Addr::new(8, 8, 8, 8)))
+        );
+        assert_eq!(calls_corp.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_default.load(Ordering::SeqCst), 1);
     }
 }

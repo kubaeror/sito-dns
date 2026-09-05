@@ -140,7 +140,9 @@ fn test_m9_security_constant_time_comparison() {
 fn test_m9_fuzz_parser_sanity_runners() {
     let mut rng_seed: u64 = 0x1234_5678_9ABC_DEF0;
     let mut next_rand = || {
-        rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        rng_seed = rng_seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         rng_seed
     };
 
@@ -300,7 +302,8 @@ fn test_m9_release_configuration_and_systemd() {
 
     // Verify workspace version is at least 1.0.0
     assert!(
-        cargo_content.contains("version = \"1.1.1\"")
+        cargo_content.contains("version = \"1.2.0\"")
+            || cargo_content.contains("version = \"1.1.1\"")
             || cargo_content.contains("version = \"1.1.0\"")
             || cargo_content.contains("version = \"1.0.1\"")
             || cargo_content.contains("version = \"1.0.0\""),

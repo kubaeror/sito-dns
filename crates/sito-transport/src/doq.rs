@@ -102,6 +102,7 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
         config.rate_limit_per_ip,
         config.rate_limit_per_ip * 2,
     ));
+    rate_limiter.spawn_pruner(shutdown_rx.clone());
     let semaphore = Arc::new(Semaphore::new(config.max_connections));
     let acceptor_mgr = config.acceptor_mgr.clone();
 
@@ -259,6 +260,7 @@ mod tests {
     use super::*;
     use crate::tls::generate_test_cert;
     use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
     use sito_proto::rdata::A;
     use sito_proto::{
         Message, MessageType, Name, OpCode, Query, RData, Record, RecordType, ResponseCode,
@@ -310,7 +312,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Build Quinn client
-        use rustls::pki_types::pem::PemObject;
         let mut root_store = rustls::RootCertStore::empty();
         let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
         root_store.add(cert_der).unwrap();

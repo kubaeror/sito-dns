@@ -42,6 +42,8 @@ pub fn ui_router() -> Router<ServerContext> {
         .route("/ui/upstreams/test", post(handlers::upstreams_test_handler))
         .route("/ui/settings/save", post(handlers::settings_save_handler))
         .route("/ui/system/reload", post(handlers::system_reload_handler))
+        .route("/ui/system/update/check", get(handlers::system_update_check_handler))
+        .route("/ui/system/update/apply", post(handlers::system_update_apply_handler))
         .route("/ui/wizard/complete", post(handlers::wizard_complete_handler))
 }
 
@@ -77,7 +79,7 @@ mod tests {
             username: "admin",
             user_role: "",
             active_tab: "login",
-            version: "1.1.1",
+            version: "1.2.0",
             error_message: "Invalid credentials test",
         };
         let html = tmpl.render().expect("render login template");
@@ -99,7 +101,7 @@ mod tests {
             top_clients: vec![("192.168.1.10".to_string(), 100)],
         };
         let status = StatusResponse {
-            version: "1.1.1".to_string(),
+            version: "1.2.0".to_string(),
             uptime_seconds: 3661,
             role: "master".to_string(),
             listeners: vec!["0.0.0.0:53 (UDP/TCP)".to_string()],
@@ -124,7 +126,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "dashboard",
-            version: "1.1.1",
+            version: "1.2.0",
             stats: &stats,
             status: &status,
             uptime_str: "1h 1m 1s".to_string(),
@@ -137,6 +139,9 @@ mod tests {
                 total_queries: 500,
                 avg_latency_ms: 15.2,
             }],
+            hourly_times_json: "[0, 1, 2]".to_string(),
+            hourly_totals_json: "[10, 20, 30]".to_string(),
+            hourly_blocked_json: "[1, 2, 3]".to_string(),
         };
         let dash_html = dash.render().expect("render dashboard template");
         assert!(dash_html.contains("Operational Dashboard"));
@@ -147,7 +152,7 @@ mod tests {
     #[test]
     fn test_render_querylog_and_rows() {
         let rows = vec![QueryLogRowItem {
-            ts: 1700000000000,
+            ts: 1_700_000_000_000,
             time_str: "12:34:56".to_string(),
             client_ip: "192.168.1.5".to_string(),
             client_name: Some("Laptop".to_string()),
@@ -170,7 +175,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "querylog",
-            version: "1.1.1",
+            version: "1.2.0",
             entries: &rows,
         };
         let full_html = full.render().expect("render querylog page");
@@ -185,7 +190,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "filtering",
-            version: "1.1.1",
+            version: "1.2.0",
             lists: &[],
             custom_rules: "||ad.com^",
         };
@@ -196,7 +201,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "rewrites",
-            version: "1.1.1",
+            version: "1.2.0",
             rewrites: vec![RewriteViewItem {
                 domain: "nas.lan".to_string(),
                 record_type: "A".to_string(),
@@ -210,7 +215,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "clients",
-            version: "1.1.1",
+            version: "1.2.0",
             clients: vec![ClientViewItem {
                 name: "Work PC".to_string(),
                 ids: vec!["192.168.1.100".to_string()],
@@ -224,7 +229,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "upstreams",
-            version: "1.1.1",
+            version: "1.2.0",
             upstreams: vec![],
         };
         assert!(upstreams_tmpl.render().is_ok());
@@ -234,7 +239,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "settings",
-            version: "1.1.1",
+            version: "1.2.0",
             cache_size_mb: 64,
             min_ttl: 60,
             dnssec_enabled: true,
@@ -243,7 +248,7 @@ mod tests {
         assert!(settings_tmpl.render().is_ok());
 
         let status = StatusResponse {
-            version: "1.1.1".to_string(),
+            version: "1.2.0".to_string(),
             uptime_seconds: 120,
             role: "master".to_string(),
             listeners: vec![],
@@ -253,7 +258,7 @@ mod tests {
             username: "admin",
             user_role: "admin",
             active_tab: "system",
-            version: "1.1.1",
+            version: "1.2.0",
             status: &status,
             uptime_str: "2m 0s".to_string(),
         };
@@ -269,7 +274,7 @@ mod tests {
             username: "admin",
             user_role: "",
             active_tab: "wizard",
-            version: "1.1.1",
+            version: "1.2.0",
         };
         assert!(wiz_tmpl.render().unwrap().contains("Welcome to sito DNS"));
     }

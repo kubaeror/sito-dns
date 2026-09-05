@@ -68,6 +68,18 @@ pub enum Commands {
         #[command(subcommand)]
         command: HaCommands,
     },
+    /// Check for and install software updates
+    Update {
+        /// Only check for available updates without installing
+        #[arg(short, long)]
+        check: bool,
+        /// Force update even if already running the latest version
+        #[arg(short, long)]
+        force: bool,
+        /// Optional custom GitHub repository (e.g. kubaeror/sito-dns)
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -290,5 +302,46 @@ pub fn run_ha_gen_certs(dir: &Path, master: bool, slave: bool) -> Result<(), any
     let certs = sito_ha::generate_ha_certs(dir, master, slave)
         .map_err(|e| anyhow::anyhow!("Failed to generate HA certificates: {e}"))?;
     print!("{}", certs.summary());
+    Ok(())
+}
+
+/// Executes the `update` subcommand.
+pub async fn run_update(check: bool, force: bool, repo: Option<&str>) -> Result<(), anyhow::Error> {
+    println!("Checking for updates...");
+    let info = sito_api::updater::check_for_update(repo)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to check for updates: {e}"))?;
+
+    println!("Current version : v{}", info.current_version);
+    println!("Latest version  : v{}", info.latest_version);
+
+    if info.is_docker {
+        println!("\nNotice: Running inside a Docker container.");
+        if let Some(instructions) = &info.instructions {
+            println!("{instructions}");
+        }
+        return Ok(());
+    }
+
+    if !info.update_available && !force {
+        println!("\nsito is up to date.");
+        return Ok(());
+    }
+
+    if check {
+        if info.update_available {
+            println!("\nA new version is available! Run 'sito update' to install.");
+            println!("Release URL: {}", info.release_url);
+            println!("\nRelease Notes:\n{}", info.release_notes);
+        }
+        return Ok(());
+    }
+
+    println!("\nApplying update to v{}...", info.latest_version);
+    let msg = sito_api::updater::apply_update(repo, force)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to apply update: {e}"))?;
+
+    println!("{msg}");
     Ok(())
 }

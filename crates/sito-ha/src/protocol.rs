@@ -138,8 +138,8 @@ mod tests {
         assert!(stats_json.contains("\"type\":\"stats_report\""));
         assert_eq!(stats, HaMessage::from_json(&stats_json).unwrap());
 
-        let ping = HaMessage::Ping { ts: 1690000000 };
-        let pong = HaMessage::Pong { ts: 1690000000 };
+        let ping = HaMessage::Ping { ts: 1_690_000_000 };
+        let pong = HaMessage::Pong { ts: 1_690_000_000 };
         assert_eq!(
             ping,
             HaMessage::from_json(&ping.to_json().unwrap()).unwrap()

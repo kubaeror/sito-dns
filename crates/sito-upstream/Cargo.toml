@@ -17,6 +17,7 @@ tokio-rustls.workspace = true
 webpki-roots.workspace = true
 async-trait.workspace = true
 rand.workspace = true
+futures-util.workspace = true
 
 [lints]
 workspace = true
