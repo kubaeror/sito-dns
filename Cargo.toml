@@ -57,7 +57,7 @@ regex-automata = { version = "0.4", features = ["dfa-build", "syntax", "hybrid"]
 criterion = "0.5"
 rustls-pki-types = { version = "1.15", features = ["std"] }
 rcgen = "0.14"
-base64 = "0.22"
+base64 = "0.23"
 notify = "8.2"
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "matched-path", "query", "ws", "form"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
