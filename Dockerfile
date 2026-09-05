@@ -2,7 +2,7 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p sito
+RUN cargo build --release --locked -p sito --features "embed-ui"
 
 # Runtime stage
 FROM gcr.io/distroless/cc-debian12:nonroot

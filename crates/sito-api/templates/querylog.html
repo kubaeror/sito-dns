@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+
+{% block title %}Query Log - sito DNS{% endblock %}
+{% block page_title %}Real-time DNS Query Log{% endblock %}
+
+{% block content %}
+<div class="card" style="margin-bottom: 20px;" x-data="{ autoRefresh: true }">
+  <div style="display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end;">
+    <div style="flex: 2; min-width: 200px;">
+      <label class="form-label" for="domain-search">Search Domain</label>
+      <input type="text" id="domain-search" name="domain" class="form-input" placeholder="e.g. google.com or tracker"
+             hx-get="/ui/partials/querylog-rows" hx-trigger="keyup changed delay:300ms"
+             hx-target="#query-table-body" hx-include="#filter-form">
+    </div>
+
+    <form id="filter-form" style="display: flex; flex-wrap: wrap; gap: 14px; flex: 3;" hx-boost="false">
+      <div style="flex: 1; min-width: 140px;">
+        <label class="form-label" for="client-filter">Client IP / Name</label>
+        <input type="text" id="client-filter" name="client" class="form-input" placeholder="192.168.1.X"
+               hx-get="/ui/partials/querylog-rows" hx-trigger="keyup changed delay:300ms"
+               hx-target="#query-table-body" hx-include="#filter-form, #domain-search">
+      </div>
+
+      <div style="width: 140px;">
+        <label class="form-label" for="status-filter">Verdict</label>
+        <select id="status-filter" name="status" class="form-select"
+                hx-get="/ui/partials/querylog-rows" hx-trigger="change"
+                hx-target="#query-table-body" hx-include="#filter-form, #domain-search">
+          <option value="all">All Verdicts</option>
+          <option value="allowed">Allowed</option>
+          <option value="blocked">Blocked</option>
+          <option value="cached">Cached</option>
+        </select>
+      </div>
+
+      <div style="width: 120px;">
+        <label class="form-label" for="qtype-filter">Type</label>
+        <select id="qtype-filter" name="qtype" class="form-select"
+                hx-get="/ui/partials/querylog-rows" hx-trigger="change"
+                hx-target="#query-table-body" hx-include="#filter-form, #domain-search">
+          <option value="all">All Types</option>
+          <option value="1">A (1)</option>
+          <option value="28">AAAA (28)</option>
+          <option value="65">HTTPS (65)</option>
+          <option value="5">CNAME (5)</option>
+          <option value="16">TXT (16)</option>
+          <option value="15">MX (15)</option>
+          <option value="12">PTR (12)</option>
+        </select>
+      </div>
+    </form>
+
+    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 2px;">
+      <button type="button" class="btn btn-secondary btn-sm"
+              hx-get="/ui/partials/querylog-rows"
+              hx-target="#query-table-body"
+              hx-include="#filter-form, #domain-search"
+              title="Refresh queries list">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 21h5v-5"/></svg>
+        Refresh
+      </button>
+
+      <form action="/api/v1/querylog/clear" method="POST" hx-post="/api/v1/querylog/clear" hx-confirm="Are you sure you want to clear all query logs?" hx-target="#query-table-body" hx-swap="innerHTML" style="margin:0;">
+        <button type="submit" class="btn btn-outline btn-sm" style="color: var(--accent-danger);" title="Clear query history">
+          Clear Logs
+        </button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <div class="card-title">Queries Log Stream</div>
+    <div style="display: flex; align-items: center; gap: 8px;">
+      <span class="badge badge-success">Live Polling (3s)</span>
+    </div>
+  </div>
+
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Client</th>
+          <th>Requested Domain</th>
+          <th>Type</th>
+          <th>Verdict</th>
+          <th>Latency</th>
+          <th>Upstream / Matched Rule</th>
+        </tr>
+      </thead>
+      <tbody id="query-table-body"
+             hx-get="/ui/partials/querylog-rows"
+             hx-trigger="every 3s"
+             hx-include="#filter-form, #domain-search"
+             hx-swap="innerHTML">
+        {% include "partials/querylog_rows.html" %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

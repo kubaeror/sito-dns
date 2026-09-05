@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+
+{% block title %}Clients - sito DNS{% endblock %}
+{% block page_title %}Client Identification & Per-Device Rules{% endblock %}
+
+{% block content %}
+<div class="card" x-data="{ showModal: false }">
+  <div class="card-header">
+    <div class="card-title">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      Identified Clients & Device Policies
+    </div>
+    <button @click="showModal = true" class="btn btn-primary btn-sm">
+      + Add Client
+    </button>
+  </div>
+
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Client Name</th>
+          <th>Identifiers (IP / Subnet / MAC)</th>
+          <th>Assigned Group</th>
+          <th style="text-align: center;">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in clients %}
+        <tr>
+          <td class="td-strong">{{ c.name }}</td>
+          <td class="mono" style="color: var(--text-secondary);">
+            {% for id in c.ids %}
+            <div>{{ id }}</div>
+            {% else %}
+            <div>-</div>
+            {% endfor %}
+          </td>
+          <td>
+            <span class="badge badge-info">{{ c.group }}</span>
+          </td>
+          <td style="text-align: center;">
+            <form action="/ui/clients/delete" method="POST" style="display:inline;" onsubmit="return confirm('Remove client {{ c.name }}?');">
+              <input type="hidden" name="name" value="{{ c.name }}">
+              <button type="submit" class="btn-icon" style="color: var(--accent-danger);" title="Delete client">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+              </button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="4" style="text-align: center; color: var(--text-muted); padding: 24px;">No custom clients registered yet</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Add Client Modal -->
+  <div class="modal-backdrop" x-show="showModal" style="display: none;">
+    <div class="modal-dialog" @click.away="showModal = false">
+      <div class="modal-header">
+        <h3>Add Device / Client Rule</h3>
+        <button class="btn-icon" @click="showModal = false">&times;</button>
+      </div>
+      <form action="/ui/clients/add" method="POST">
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="form-label" for="client-name">Device / Client Name</label>
+            <input type="text" id="client-name" name="name" class="form-input" required placeholder="Work Laptop">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="client-ids">Identifiers (IPs, MAC, or CIDRs comma separated)</label>
+            <input type="text" id="client-ids" name="ids" class="form-input mono" placeholder="192.168.1.105, 10.0.0.0/24">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="client-group">Group Name</label>
+            <input type="text" id="client-group" name="group" class="form-input" value="default" placeholder="default, kids, guests">
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" @click="showModal = false">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Client</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

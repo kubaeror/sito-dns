@@ -101,6 +101,18 @@ impl AuthManager {
             .insert(username.to_string(), user);
     }
 
+    /// Updates password for an existing user.
+    pub fn update_user_password(&self, username: &str, password: &str) -> bool {
+        if let Ok(hash) = hash_password(password) {
+            let mut users = self.users.lock().unwrap();
+            if let Some(user) = users.get_mut(username) {
+                user.password_hash = hash;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Primary login flow (`POST /auth/login`).
     pub fn login(&self, username: &str, password: &str, client_ip: &str) -> LoginResult {
         // 1. IP rate limiting

@@ -1,0 +1,101 @@
+<div id="stats-container" hx-get="/ui/partials/dashboard-stats" hx-trigger="every 5s" hx-swap="outerHTML">
+  <div class="grid-4">
+    <div class="card stat-card">
+      <div class="stat-title">Total DNS Queries (24h)</div>
+      <div class="stat-value">{{ stats.total_queries }}</div>
+      <div class="stat-subtext">
+        <span class="badge badge-info">Active</span>
+        <span>Processed by resolver</span>
+      </div>
+    </div>
+
+    <div class="card stat-card">
+      <div class="stat-title">Blocked Queries</div>
+      <div class="stat-value" style="color: var(--accent-danger);">{{ stats.blocked_queries }}</div>
+      <div class="stat-subtext">
+        <span class="badge badge-danger">{{ blocked_pct_str }}%</span>
+        <span>Filtered threats & ads</span>
+      </div>
+    </div>
+
+    <div class="card stat-card">
+      <div class="stat-title">Cached Queries</div>
+      <div class="stat-value" style="color: var(--accent-secondary);">{{ stats.cached_queries }}</div>
+      <div class="stat-subtext">
+        <span class="badge badge-success">Cache Hit</span>
+        <span>Sub-millisecond latency</span>
+      </div>
+    </div>
+
+    <div class="card stat-card">
+      <div class="stat-title">System Status</div>
+      <div class="stat-value" style="font-size: 1.35rem; color: var(--accent-primary);">{{ status.role|upper }}</div>
+      <div class="stat-subtext">
+        <span class="badge badge-neutral">Uptime</span>
+        <span>{{ uptime_str }}</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <!-- Top Domains -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Top Requested Domains</div>
+        <span class="badge badge-neutral">Top 5</span>
+      </div>
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Domain</th>
+              <th style="text-align: right;">Queries</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for (domain, count) in stats.top_domains %}
+            <tr>
+              <td class="td-strong mono">{{ domain }}</td>
+              <td style="text-align: right; font-weight: 600;">{{ count }}</td>
+            </tr>
+            {% else %}
+            <tr>
+              <td colspan="2" style="text-align: center; color: var(--text-muted); padding: 24px;">No query data recorded yet</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Top Blocked Domains -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Top Blocked Domains</div>
+        <span class="badge badge-danger">Blocked</span>
+      </div>
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Domain</th>
+              <th style="text-align: right;">Count</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for (domain, count) in stats.top_blocked_domains %}
+            <tr>
+              <td class="td-strong mono" style="color: var(--accent-danger);">{{ domain }}</td>
+              <td style="text-align: right; font-weight: 600;">{{ count }}</td>
+            </tr>
+            {% else %}
+            <tr>
+              <td colspan="2" style="text-align: center; color: var(--text-muted); padding: 24px;">No blocked domains in current window</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>

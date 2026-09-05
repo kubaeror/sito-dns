@@ -36,7 +36,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Run clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-features -- -D warnings
 
   test:
     name: test
@@ -46,7 +46,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
 
   deny:
     name: deny
@@ -84,9 +84,9 @@ jobs:
       - name: Build binary for ${{ matrix.target }}
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --workspace --target ${{ matrix.target }}
+            cross build --workspace --features embed-ui --target ${{ matrix.target }}
           else
-            cargo build --workspace --target ${{ matrix.target }}
+            cargo build --workspace --all-features --target ${{ matrix.target }}
           fi
       - name: Verify binary output
         if: matrix.target == 'x86_64-unknown-linux-gnu'

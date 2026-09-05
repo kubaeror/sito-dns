@@ -16,6 +16,9 @@ pub mod openapi;
 pub mod router;
 pub mod state;
 
+#[cfg(feature = "embed-ui")]
+pub mod ui;
+
 pub use auth::*;
 pub use error::ProblemDetails;
 pub use openapi::ApiDoc;
