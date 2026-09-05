@@ -217,7 +217,9 @@ impl StatsDb {
 
         let _ = write!(query_builder, " ORDER BY id DESC LIMIT {fetch_limit}");
 
-        let rows = sqlx::query(&query_builder).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(query_builder.as_str()))
+            .fetch_all(&self.pool)
+            .await?;
 
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
