@@ -3,7 +3,7 @@
 //! Format: `sito_<random-256-bit>`, only Blake3 hashes stored persistently.
 //! Scopes: `admin`, `operator`, `viewer`.
 
-use rand::RngCore;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use utoipa::ToSchema;
@@ -69,7 +69,7 @@ pub fn hash_token(token: &str) -> String {
 /// Generates a new cryptographically secure API token formatted as `sito_<256-bit hex>`.
 pub fn generate_token(name: &str, scope: Role) -> (ApiTokenMeta, CreateTokenResponse) {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill(&mut bytes);
     let token = format!("sito_{}", hex::encode(bytes));
     let hash = hash_token(&token);
     let id = format!("tok_{}", &hash[..12]);

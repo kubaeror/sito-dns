@@ -175,9 +175,9 @@ impl QueryHandler for DnsPipeline {
             }
 
             // ADR-0007 Stage 1: $important filter rules (takes precedence over local rewrites)
-            if policy.is_filtering_enabled {
-                if let Some(verdict) = self.filter.evaluate_important(qname, qtype, &client) {
-                    if verdict.is_blocked() {
+            if policy.is_filtering_enabled
+                && let Some(verdict) = self.filter.evaluate_important(qname, qtype, &client)
+                    && verdict.is_blocked() {
                         info!(
                             qname = %qname,
                             qtype = ?qtype,
@@ -201,8 +201,6 @@ impl QueryHandler for DnsPipeline {
                             qtype,
                         );
                     }
-                }
-            }
 
             // ADR-0007 Stage 2: Local DNS rewrites and auto-PTR
             if let Some(records) = self.rewrites.lookup(qname, qtype, &client) {
@@ -320,9 +318,9 @@ impl QueryHandler for DnsPipeline {
             }
 
             // ADR-0007 Stage 4: Safe Search CNAME rewrites (Google, Bing, YouTube, DuckDuckGo)
-            if policy.safe_search {
-                if let Some(target) = match_safe_search(&domain_str, policy.safe_search_youtube) {
-                    if let Ok(cname_target) = Name::from_str(target) {
+            if policy.safe_search
+                && let Some(target) = match_safe_search(&domain_str, policy.safe_search_youtube)
+                    && let Ok(cname_target) = Name::from_str(target) {
                         info!(
                             qname = %qname,
                             target = %target,
@@ -341,8 +339,6 @@ impl QueryHandler for DnsPipeline {
                             qtype,
                         );
                     }
-                }
-            }
 
             // 5. Cache lookup
             if self.config.dns.cache.enabled {
@@ -540,29 +536,30 @@ impl QueryHandler for DnsPipeline {
             }
         }
 
-        if !policy.ignore_query_log && !domain_str.is_empty() {
-            if let Some(ref ql) = self.querylog {
-                let rcode = resp
-                    .as_ref()
-                    .map(|r| u16::from(r.metadata.response_code) as u8);
-                let entry = sito_stats::QueryLogEntry {
-                    id: None,
-                    ts: chrono::Utc::now().timestamp_millis(),
-                    client_ip: client.ip.to_string(),
-                    client_name: client.client_name.clone(),
-                    qname: domain_str.trim_end_matches('.').to_string(),
-                    qtype: qtype_num,
-                    rcode,
-                    verdict: verdict_str.to_string(),
-                    rule: rule_opt,
-                    list_source: source_opt,
-                    upstream: upstream_opt,
-                    elapsed_us: Some(elapsed_us),
-                    dnssec: None,
-                    proto: client.proto.clone(),
-                };
-                let _ = ql.try_send(entry);
-            }
+        if !policy.ignore_query_log
+            && !domain_str.is_empty()
+            && let Some(ref ql) = self.querylog
+        {
+            let rcode = resp
+                .as_ref()
+                .map(|r| u16::from(r.metadata.response_code) as u8);
+            let entry = sito_stats::QueryLogEntry {
+                id: None,
+                ts: chrono::Utc::now().timestamp_millis(),
+                client_ip: client.ip.to_string(),
+                client_name: client.client_name.clone(),
+                qname: domain_str.trim_end_matches('.').to_string(),
+                qtype: qtype_num,
+                rcode,
+                verdict: verdict_str.to_string(),
+                rule: rule_opt,
+                list_source: source_opt,
+                upstream: upstream_opt,
+                elapsed_us: Some(elapsed_us),
+                dnssec: None,
+                proto: client.proto.clone(),
+            };
+            let _ = ql.try_send(entry);
         }
 
         resp

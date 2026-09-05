@@ -18,26 +18,26 @@ members = [
 ]
 
 [workspace.package]
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.98.1"
 license = "GPL-3.0-only"
 authors = ["sito contributors"]
 repository = "https://github.com/kubaeror/sito-dns"
 homepage = "https://github.com/kubaeror/sito-dns"
 
 [workspace.dependencies]
-askama = { version = "0.12", default-features = false }
+askama = "0.16"
 clap = { version = "4.6", features = ["derive"] }
 tokio = { version = "1.53", features = ["full"] }
 hickory-proto = { version = "0.26.2", default-features = false, features = ["std"] }
 arc-swap = "1.9"
 dashmap = "6.2"
 moka = { version = "0.12", features = ["future"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "1.1"
 thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
@@ -49,15 +49,15 @@ rustls = { version = "0.23", features = ["ring"] }
 time = "0.3"
 webpki-roots = "1.0"
 tokio-rustls = "0.26"
-rand = "0.8"
+rand = "0.10"
 idna = "1.1"
 async-trait = "0.1"
 aho-corasick = "1.1"
 regex-automata = { version = "0.4", features = ["dfa-build", "syntax", "hybrid"] }
-criterion = "0.5"
+criterion = "0.8"
 rustls-pki-types = { version = "1.15", features = ["std"] }
 rcgen = "0.14"
-base64 = "0.22"
+base64 = "0.23"
 notify = "8.2"
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "matched-path", "query", "ws", "form"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
@@ -65,7 +65,7 @@ hex = "0.4"
 hyper = { version = "1.11", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "http1", "http2", "service"] }
 x509-parser = "0.18"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 rust-embed = "8.12"
 mime_guess = "2.0"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -76,7 +76,7 @@ http = "1.5"
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
 ring = "0.17"
 blake3 = "1.8"
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
 subtle = "2.6"
 mimalloc = { version = "0.1", default-features = false }
@@ -85,20 +85,20 @@ tar = "0.4"
 utoipa = { version = "5.5", features = ["axum_extras"] }
 
 # Internal workspace dependencies
-sito = { path = "crates/sito", version = "1.1.0" }
-sito-core = { path = "crates/sito-core", version = "1.1.0" }
-sito-proto = { path = "crates/sito-proto", version = "1.1.0" }
-sito-transport = { path = "crates/sito-transport", version = "1.1.0" }
-sito-upstream = { path = "crates/sito-upstream", version = "1.1.0" }
-sito-cache = { path = "crates/sito-cache", version = "1.1.0" }
-sito-filter = { path = "crates/sito-filter", version = "1.1.0" }
-sito-dnssec = { path = "crates/sito-dnssec", version = "1.1.0" }
-sito-clients = { path = "crates/sito-clients", version = "1.1.0" }
-sito-rewrites = { path = "crates/sito-rewrites", version = "1.1.0" }
-sito-api = { path = "crates/sito-api", version = "1.1.0" }
-sito-stats = { path = "crates/sito-stats", version = "1.1.0" }
-sito-ha = { path = "crates/sito-ha", version = "1.1.0" }
-sito-test = { path = "crates/sito-test", version = "1.1.0" }
+sito = { path = "crates/sito", version = "1.1.1" }
+sito-core = { path = "crates/sito-core", version = "1.1.1" }
+sito-proto = { path = "crates/sito-proto", version = "1.1.1" }
+sito-transport = { path = "crates/sito-transport", version = "1.1.1" }
+sito-upstream = { path = "crates/sito-upstream", version = "1.1.1" }
+sito-cache = { path = "crates/sito-cache", version = "1.1.1" }
+sito-filter = { path = "crates/sito-filter", version = "1.1.1" }
+sito-dnssec = { path = "crates/sito-dnssec", version = "1.1.1" }
+sito-clients = { path = "crates/sito-clients", version = "1.1.1" }
+sito-rewrites = { path = "crates/sito-rewrites", version = "1.1.1" }
+sito-api = { path = "crates/sito-api", version = "1.1.1" }
+sito-stats = { path = "crates/sito-stats", version = "1.1.1" }
+sito-ha = { path = "crates/sito-ha", version = "1.1.1" }
+sito-test = { path = "crates/sito-test", version = "1.1.1" }
 
 [workspace.lints.rust]
 # Future Rust lints can be specified here

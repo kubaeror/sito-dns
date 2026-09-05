@@ -189,14 +189,14 @@ impl SubscriptionFetcher {
                         break;
                     }
 
-                    if let Some(len) = resp.content_length() {
-                        if len as usize > self.max_bytes {
-                            return Err(FilterError::ListTooLarge {
-                                list: list_name.to_string(),
-                                size: len as usize,
-                                limit: self.max_bytes,
-                            });
-                        }
+                    if let Some(len) = resp.content_length()
+                        && len as usize > self.max_bytes
+                    {
+                        return Err(FilterError::ListTooLarge {
+                            list: list_name.to_string(),
+                            size: len as usize,
+                            limit: self.max_bytes,
+                        });
                     }
 
                     // Extract ETag and Last-Modified headers before consuming body

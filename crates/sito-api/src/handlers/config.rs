@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use rand::RngCore;
+use rand::RngExt;
 use sito_core::config::Config;
 use std::io::Read;
 use std::sync::Arc;
@@ -29,17 +29,16 @@ pub fn mask_sensitive_toml(toml_str: &str) -> String {
     let mut out = Vec::new();
     for line in toml_str.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("key =")
+        if (trimmed.starts_with("key =")
             || trimmed.starts_with("password =")
             || trimmed.starts_with("secret =")
             || trimmed.starts_with("token =")
-            || trimmed.starts_with("password_hash =")
+            || trimmed.starts_with("password_hash ="))
+            && let Some(idx) = line.find('=')
         {
-            if let Some(idx) = line.find('=') {
-                let (prefix, _) = line.split_at(idx + 1);
-                out.push(format!("{prefix} \"***\""));
-                continue;
-            }
+            let (prefix, _) = line.split_at(idx + 1);
+            out.push(format!("{prefix} \"***\""));
+            continue;
         }
         out.push(line.to_string());
     }
@@ -313,7 +312,7 @@ pub async fn prepare_restore(
         extract_backup_archive(&body).map_err(|e| ProblemDetails::bad_request(e.to_string()))?;
 
     let mut token_bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut token_bytes);
+    rand::rng().fill(&mut token_bytes);
     let token = hex::encode(token_bytes);
 
     // Save token with 5-minute expiry

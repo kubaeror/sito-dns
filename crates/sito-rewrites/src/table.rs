@@ -89,20 +89,20 @@ impl RewriteTable {
                                 ));
                             }
                         }
-                    } else if let LocalRecordData::AAAA(ipv6) = rdata {
-                        if is_ula(&ipv6) {
-                            let ptr_name = ipv6_to_ip6_arpa(&ipv6);
-                            if let Ok(target_name) = Name::from_str(&format!("{norm_domain}.")) {
-                                auto_ptr_candidates.push((
-                                    ptr_name,
-                                    StoredRule {
-                                        wildcard_suffix: None,
-                                        record_type: RecordType::PTR,
-                                        data: LocalRecordData::Ptr(target_name),
-                                        exception_clients: entry.exception_clients.clone(),
-                                    },
-                                ));
-                            }
+                    } else if let LocalRecordData::AAAA(ipv6) = rdata
+                        && is_ula(&ipv6)
+                    {
+                        let ptr_name = ipv6_to_ip6_arpa(&ipv6);
+                        if let Ok(target_name) = Name::from_str(&format!("{norm_domain}.")) {
+                            auto_ptr_candidates.push((
+                                ptr_name,
+                                StoredRule {
+                                    wildcard_suffix: None,
+                                    record_type: RecordType::PTR,
+                                    data: LocalRecordData::Ptr(target_name),
+                                    exception_clients: entry.exception_clients.clone(),
+                                },
+                            ));
                         }
                     }
                 }
@@ -143,30 +143,29 @@ impl RewriteTable {
         }
 
         // 2. Check exact CNAME if requested qtype is A or AAAA
-        if qtype == RecordType::A || qtype == RecordType::AAAA {
-            if let Some(rules) = self.exact.get(&(qname_str.clone(), RecordType::CNAME)) {
-                for rule in rules {
-                    if !is_client_excepted(client, &rule.exception_clients) {
-                        if let LocalRecordData::Cname(ref target) = rule.data {
-                            let mut answers = vec![build_record(qname, &rule.data)];
-                            // Chain resolution: check if target is also in our rewrite table
-                            if let Some(target_answers) = self.lookup(target, qtype, client) {
-                                answers.extend(target_answers);
-                            }
-                            return Some(answers);
-                        }
+        if (qtype == RecordType::A || qtype == RecordType::AAAA)
+            && let Some(rules) = self.exact.get(&(qname_str.clone(), RecordType::CNAME))
+        {
+            for rule in rules {
+                if !is_client_excepted(client, &rule.exception_clients)
+                    && let LocalRecordData::Cname(ref target) = rule.data
+                {
+                    let mut answers = vec![build_record(qname, &rule.data)];
+                    // Chain resolution: check if target is also in our rewrite table
+                    if let Some(target_answers) = self.lookup(target, qtype, client) {
+                        answers.extend(target_answers);
                     }
+                    return Some(answers);
                 }
             }
         }
 
         // 3. Check auto-PTR table (for PTR queries)
-        if qtype == RecordType::PTR {
-            if let Some(rule) = self.auto_ptr.get(&qname_str) {
-                if !is_client_excepted(client, &rule.exception_clients) {
-                    return Some(vec![build_record(qname, &rule.data)]);
-                }
-            }
+        if qtype == RecordType::PTR
+            && let Some(rule) = self.auto_ptr.get(&qname_str)
+            && !is_client_excepted(client, &rule.exception_clients)
+        {
+            return Some(vec![build_record(qname, &rule.data)]);
         }
 
         // 4. Check wildcard rules
@@ -179,19 +178,19 @@ impl RewriteTable {
                 continue;
             }
 
-            if let Some(ref suffix) = rule.wildcard_suffix {
-                if matches_wildcard(&qname_str, suffix) {
-                    if rule.record_type == RecordType::CNAME {
-                        if let LocalRecordData::Cname(ref target) = rule.data {
-                            let mut answers = vec![build_record(qname, &rule.data)];
-                            if let Some(target_answers) = self.lookup(target, qtype, client) {
-                                answers.extend(target_answers);
-                            }
-                            return Some(answers);
-                        }
+            if let Some(ref suffix) = rule.wildcard_suffix
+                && matches_wildcard(&qname_str, suffix)
+            {
+                if rule.record_type == RecordType::CNAME
+                    && let LocalRecordData::Cname(ref target) = rule.data
+                {
+                    let mut answers = vec![build_record(qname, &rule.data)];
+                    if let Some(target_answers) = self.lookup(target, qtype, client) {
+                        answers.extend(target_answers);
                     }
-                    return Some(vec![build_record(qname, &rule.data)]);
+                    return Some(answers);
                 }
+                return Some(vec![build_record(qname, &rule.data)]);
             }
         }
 
@@ -210,25 +209,25 @@ fn is_client_excepted(client: &ClientContext, exceptions: &[String]) -> bool {
         if exc.eq_ignore_ascii_case(&client_ip_str) {
             return true;
         }
-        if let Some(ref name) = client.client_name {
-            if exc.eq_ignore_ascii_case(name) {
-                return true;
-            }
+        if let Some(ref name) = client.client_name
+            && exc.eq_ignore_ascii_case(name)
+        {
+            return true;
         }
-        if let Some(ref id) = client.id {
-            if exc.eq_ignore_ascii_case(id.as_str()) {
-                return true;
-            }
+        if let Some(ref id) = client.id
+            && exc.eq_ignore_ascii_case(id.as_str())
+        {
+            return true;
         }
-        if let Some(ref group) = client.group {
-            if exc.eq_ignore_ascii_case(group) {
-                return true;
-            }
+        if let Some(ref group) = client.group
+            && exc.eq_ignore_ascii_case(group)
+        {
+            return true;
         }
-        if let Some(ref mac) = client.mac {
-            if exc.eq_ignore_ascii_case(mac) {
-                return true;
-            }
+        if let Some(ref mac) = client.mac
+            && exc.eq_ignore_ascii_case(mac)
+        {
+            return true;
         }
     }
 

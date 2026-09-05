@@ -116,44 +116,44 @@ impl Config {
         if let Some(ref acme) = self.acme {
             return Some(acme.clone());
         }
-        if let Some(ref web_val) = self.web {
-            if let Ok(web_table) = web_val.clone().try_into::<toml::Table>() {
-                let enabled = web_table
-                    .get("acme_enabled")
-                    .and_then(toml::Value::as_bool)
-                    .unwrap_or(false);
-                let email = web_table
-                    .get("acme_email")
-                    .and_then(toml::Value::as_str)
-                    .map(std::string::ToString::to_string);
-                let domains: Vec<String> = web_table
-                    .get("acme_domains")
-                    .and_then(toml::Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let staging = web_table
-                    .get("acme_staging")
-                    .and_then(toml::Value::as_bool)
-                    .unwrap_or(false);
-                let cache_dir = web_table
-                    .get("acme_cache_dir")
-                    .and_then(toml::Value::as_str)
-                    .map(PathBuf::from);
+        if let Some(ref web_val) = self.web
+            && let Ok(web_table) = web_val.clone().try_into::<toml::Table>()
+        {
+            let enabled = web_table
+                .get("acme_enabled")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+            let email = web_table
+                .get("acme_email")
+                .and_then(toml::Value::as_str)
+                .map(std::string::ToString::to_string);
+            let domains: Vec<String> = web_table
+                .get("acme_domains")
+                .and_then(toml::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let staging = web_table
+                .get("acme_staging")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+            let cache_dir = web_table
+                .get("acme_cache_dir")
+                .and_then(toml::Value::as_str)
+                .map(PathBuf::from);
 
-                if enabled || !domains.is_empty() || email.is_some() {
-                    return Some(AcmeConfig {
-                        enabled,
-                        email,
-                        domains,
-                        staging,
-                        cache_dir,
-                        http_port: default_acme_http_port(),
-                    });
-                }
+            if enabled || !domains.is_empty() || email.is_some() {
+                return Some(AcmeConfig {
+                    enabled,
+                    email,
+                    domains,
+                    staging,
+                    cache_dir,
+                    http_port: default_acme_http_port(),
+                });
             }
         }
         None

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_FAILED_ATTEMPTS: u32 = 5;
-const LOCKOUT_DURATION: Duration = Duration::from_secs(15 * 60); // 15 minutes
+const LOCKOUT_DURATION: Duration = Duration::from_mins(15); // 15 minutes
 
 #[derive(Debug, Clone)]
 struct AttemptRecord {
@@ -41,16 +41,16 @@ impl LockoutTracker {
     /// Returns remaining lockout duration in seconds if locked.
     pub fn check_lockout(&self, key: &str) -> Option<u64> {
         let mut map = self.attempts.lock().unwrap();
-        if let Some(record) = map.get_mut(key) {
-            if let Some(until) = record.locked_until {
-                let now = Instant::now();
-                if now < until {
-                    return Some((until - now).as_secs());
-                }
-                // Lockout expired, reset
-                record.count = 0;
-                record.locked_until = None;
+        if let Some(record) = map.get_mut(key)
+            && let Some(until) = record.locked_until
+        {
+            let now = Instant::now();
+            if now < until {
+                return Some((until - now).as_secs());
             }
+            // Lockout expired, reset
+            record.count = 0;
+            record.locked_until = None;
         }
         None
     }

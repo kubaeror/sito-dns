@@ -75,13 +75,13 @@ pub fn sanitize_config_for_bundle(master_toml: &str) -> Result<String, HaError> 
     }
 
     // 3. Mask TLS keys if present
-    if let Some(toml::Value::Table(tls_table)) = table.get_mut("tls") {
-        if tls_table.contains_key("key") {
-            tls_table.insert(
-                "key".to_string(),
-                toml::Value::String("${SECRET:tls_key}".to_string()),
-            );
-        }
+    if let Some(toml::Value::Table(tls_table)) = table.get_mut("tls")
+        && tls_table.contains_key("key")
+    {
+        tls_table.insert(
+            "key".to_string(),
+            toml::Value::String("${SECRET:tls_key}".to_string()),
+        );
     }
 
     // 4. Mask web secrets if present
@@ -117,15 +117,14 @@ pub fn sanitize_config_for_bundle(master_toml: &str) -> Result<String, HaError> 
     }
 
     // 6. Mask integrations secrets if present
-    if let Some(toml::Value::Table(integrations_table)) = table.get_mut("integrations") {
-        if let Some(toml::Value::Table(mikrotik)) = integrations_table.get_mut("mikrotik") {
-            if mikrotik.contains_key("token") {
-                mikrotik.insert(
-                    "token".to_string(),
-                    toml::Value::String("${SECRET:mikrotik_token}".to_string()),
-                );
-            }
-        }
+    if let Some(toml::Value::Table(integrations_table)) = table.get_mut("integrations")
+        && let Some(toml::Value::Table(mikrotik)) = integrations_table.get_mut("mikrotik")
+        && mikrotik.contains_key("token")
+    {
+        mikrotik.insert(
+            "token".to_string(),
+            toml::Value::String("${SECRET:mikrotik_token}".to_string()),
+        );
     }
 
     toml::to_string_pretty(&table).map_err(|e| HaError::Serialization(e.to_string()))

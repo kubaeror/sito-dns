@@ -5,7 +5,7 @@ use crate::auth::password::{hash_password, verify_password};
 use crate::auth::session::{DEFAULT_SESSION_TTL_SECS, Session};
 use crate::auth::token::{ApiTokenMeta, CreateTokenResponse, Role, generate_token, hash_token};
 use crate::auth::totp::{TotpConfig, TotpSetupResponse};
-use rand::RngCore;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -159,23 +159,23 @@ impl AuthManager {
         }
 
         // Password valid: check if TOTP is enabled
-        if let Some(ref totp) = user.totp {
-            if totp.enabled {
-                let mut bytes = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut bytes);
-                let partial_token = hex::encode(bytes);
+        if let Some(ref totp) = user.totp
+            && totp.enabled
+        {
+            let mut bytes = [0u8; 32];
+            rand::rng().fill(&mut bytes);
+            let partial_token = hex::encode(bytes);
 
-                let mut partials = self.partial_tokens.lock().unwrap();
-                partials.insert(
-                    partial_token.clone(),
-                    PartialAuth {
-                        username: username.to_string(),
-                        expires_at: Instant::now() + Duration::from_secs(300), // 5 minutes
-                    },
-                );
+            let mut partials = self.partial_tokens.lock().unwrap();
+            partials.insert(
+                partial_token.clone(),
+                PartialAuth {
+                    username: username.to_string(),
+                    expires_at: Instant::now() + Duration::from_secs(300), // 5 minutes
+                },
+            );
 
-                return LoginResult::TotpRequired { partial_token };
-            }
+            return LoginResult::TotpRequired { partial_token };
         }
 
         // Authentication successful
@@ -326,11 +326,11 @@ impl AuthManager {
             }
         }
 
-        if let Some(key) = matched_key {
-            if let Some(meta) = tokens.get_mut(&key) {
-                meta.last_used = Some(chrono::Utc::now().timestamp_millis());
-                return Some(meta.clone());
-            }
+        if let Some(key) = matched_key
+            && let Some(meta) = tokens.get_mut(&key)
+        {
+            meta.last_used = Some(chrono::Utc::now().timestamp_millis());
+            return Some(meta.clone());
         }
         None
     }

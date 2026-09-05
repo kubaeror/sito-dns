@@ -1,6 +1,6 @@
 //! Exponential backoff with random jitter for resilient reconnection.
 
-use rand::Rng;
+use rand::RngExt;
 use std::time::Duration;
 
 /// Exponential backoff generator with jitter.
@@ -37,9 +37,9 @@ impl ExponentialBackoff {
     /// Computes the next delay with random jitter, then increments the backoff interval.
     pub fn next_delay(&mut self) -> Duration {
         let base_ms = self.current.as_millis() as f64;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         // Add +/- 20% random jitter
-        let jitter_factor = rng.gen_range(0.8..=1.2);
+        let jitter_factor = rng.random_range(0.8..=1.2);
         let jittered_ms = (base_ms * jitter_factor).max(self.min.as_millis() as f64);
         let delay = Duration::from_millis(jittered_ms as u64).min(self.max);
 

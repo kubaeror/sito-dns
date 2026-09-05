@@ -6,7 +6,7 @@ use blake3::Hash;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
-use totp_rs::{Algorithm, Secret, TOTP};
+use totp_rs::{Builder, Secret};
 
 /// TOTP configuration and state for a user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,22 +29,18 @@ pub struct TotpSetupResponse {
 impl TotpConfig {
     /// Generates a new TOTP setup with secret, URL, QR code, and 10 plaintext backup codes.
     pub fn generate(issuer: &str, username: &str) -> (Self, TotpSetupResponse) {
-        let secret = Secret::generate_secret();
-        let secret_str = secret.to_encoded().to_string();
+        let secret = Secret::generate();
+        let secret_str = secret.to_base32();
 
-        let totp = TOTP::new(
-            Algorithm::SHA1,
-            6,
-            1, // ±1 step tolerance
-            30,
-            secret.to_bytes().unwrap_or_default(),
-            Some(issuer.to_string()),
-            username.to_string(),
-        )
-        .expect("Valid TOTP parameters");
+        let totp = Builder::new()
+            .with_secret(secret)
+            .with_issuer(Some(issuer))
+            .with_account_name(username)
+            .build()
+            .expect("Valid TOTP parameters");
 
-        let otpauth_url = totp.get_url();
-        let qr_code = totp.get_qr_base64().unwrap_or_default();
+        let otpauth_url = totp.to_url().unwrap_or_default();
+        let qr_code = totp.to_qr_base64().unwrap_or_default();
 
         // Generate 10 one-time 8-character backup codes
         let mut plaintext_backup_codes = Vec::with_capacity(10);
@@ -80,25 +76,21 @@ impl TotpConfig {
         let clean_code = code.trim().replace(' ', "");
 
         // 1. Try dynamic 6-digit TOTP code
-        if clean_code.len() == 6 && clean_code.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(secret) = Secret::Encoded(self.secret.clone()).to_bytes() {
-                if let Ok(totp) = TOTP::new(
-                    Algorithm::SHA1,
-                    6,
-                    1, // ±1 step window
-                    30,
-                    secret,
-                    Some(issuer.to_string()),
-                    username.to_string(),
-                ) {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if totp.check(&clean_code, now) {
-                        return true;
-                    }
-                }
+        if clean_code.len() == 6
+            && clean_code.chars().all(|c| c.is_ascii_digit())
+            && let Ok(secret) = Secret::try_from_base32(&self.secret)
+            && let Ok(totp) = Builder::new()
+                .with_secret(secret)
+                .with_issuer(Some(issuer))
+                .with_account_name(username)
+                .build()
+        {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if totp.check(&clean_code, now).is_some() {
+                return true;
             }
         }
 
@@ -140,23 +132,19 @@ mod tests {
         assert!(setup.otpauth_url.contains("sito"));
 
         // Generate valid 6-digit code
-        let secret = Secret::Encoded(config.secret.clone()).to_bytes().unwrap();
-        let totp = TOTP::new(
-            Algorithm::SHA1,
-            6,
-            1,
-            30,
-            secret,
-            Some("sito".to_string()),
-            "admin".to_string(),
-        )
-        .unwrap();
+        let secret = Secret::try_from_base32(&config.secret).unwrap();
+        let totp = Builder::new()
+            .with_secret(secret)
+            .with_issuer(Some("sito"))
+            .with_account_name("admin")
+            .build()
+            .unwrap();
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let valid_code = totp.generate(now);
+        let valid_code = totp.generate(now).to_string();
 
         assert!(config.verify(&valid_code, "admin", "sito"));
         assert!(!config.verify("999999", "admin", "sito"));

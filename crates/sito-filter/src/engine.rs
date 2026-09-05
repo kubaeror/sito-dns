@@ -148,15 +148,15 @@ impl FilterSnapshot {
             if !rule.modifiers.important {
                 continue;
             }
-            if let Some(client_filter) = &rule.modifiers.client {
-                if !client_filter.matches(client) {
-                    continue;
-                }
+            if let Some(client_filter) = &rule.modifiers.client
+                && !client_filter.matches(client)
+            {
+                continue;
             }
-            if let Some(dnstype_filter) = &rule.modifiers.dnstype {
-                if !dnstype_filter.matches(qtype) {
-                    continue;
-                }
+            if let Some(dnstype_filter) = &rule.modifiers.dnstype
+                && !dnstype_filter.matches(qtype)
+            {
+                continue;
             }
             let rule_ref = RuleRef::new(&rule.raw).with_source(&rule.source, rule.line as usize);
             return Some(Verdict::Allow(Some(rule_ref)));
@@ -171,15 +171,15 @@ impl FilterSnapshot {
             if rule.modifiers.denyallow_matches(domain) {
                 continue;
             }
-            if let Some(client_filter) = &rule.modifiers.client {
-                if !client_filter.matches(client) {
-                    continue;
-                }
+            if let Some(client_filter) = &rule.modifiers.client
+                && !client_filter.matches(client)
+            {
+                continue;
             }
-            if let Some(dnstype_filter) = &rule.modifiers.dnstype {
-                if !dnstype_filter.matches(qtype) {
-                    continue;
-                }
+            if let Some(dnstype_filter) = &rule.modifiers.dnstype
+                && !dnstype_filter.matches(qtype)
+            {
+                continue;
             }
             if let Some(rewrite) = &rule.modifiers.dnsrewrite {
                 return Some(Verdict::Rewrite(RewriteAction::DnsRewrite {
@@ -216,15 +216,15 @@ impl FilterSnapshot {
             if rule.modifiers.important {
                 continue;
             }
-            if let Some(client_filter) = &rule.modifiers.client {
-                if !client_filter.matches(client) {
-                    continue;
-                }
+            if let Some(client_filter) = &rule.modifiers.client
+                && !client_filter.matches(client)
+            {
+                continue;
             }
-            if let Some(dnstype_filter) = &rule.modifiers.dnstype {
-                if !dnstype_filter.matches(qtype) {
-                    continue;
-                }
+            if let Some(dnstype_filter) = &rule.modifiers.dnstype
+                && !dnstype_filter.matches(qtype)
+            {
+                continue;
             }
             let rule_ref = RuleRef::new(&rule.raw).with_source(&rule.source, rule.line as usize);
             return Verdict::Allow(Some(rule_ref));
@@ -239,15 +239,15 @@ impl FilterSnapshot {
             if rule.modifiers.denyallow_matches(domain) {
                 continue;
             }
-            if let Some(client_filter) = &rule.modifiers.client {
-                if !client_filter.matches(client) {
-                    continue;
-                }
+            if let Some(client_filter) = &rule.modifiers.client
+                && !client_filter.matches(client)
+            {
+                continue;
             }
-            if let Some(dnstype_filter) = &rule.modifiers.dnstype {
-                if !dnstype_filter.matches(qtype) {
-                    continue;
-                }
+            if let Some(dnstype_filter) = &rule.modifiers.dnstype
+                && !dnstype_filter.matches(qtype)
+            {
+                continue;
             }
             if let Some(rewrite) = &rule.modifiers.dnsrewrite {
                 return Verdict::Rewrite(RewriteAction::DnsRewrite {

@@ -91,7 +91,7 @@ fn test_m9_security_ssrf_url_scheme_allowlist() {
 #[test]
 fn test_m9_security_redos_adversarial_patterns() {
     // Test adversarial regex patterns that cause catastrophic backtracking in backtracking engines
-    let adversarial_patterns = vec![
+    let adversarial_patterns = [
         r"^((a+)+)$",
         r"^((a|a)+)+$",
         r"^(a+)+b$",
@@ -120,8 +120,7 @@ fn test_m9_security_redos_adversarial_patterns() {
 
     assert!(
         elapsed < std::time::Duration::from_millis(50),
-        "DFA matching took {:?}, must execute in strictly linear time < 50ms without catastrophic backtracking",
-        elapsed
+        "DFA matching took {elapsed:?}, must execute in strictly linear time < 50ms without catastrophic backtracking"
     );
 }
 
@@ -209,8 +208,7 @@ fn test_m9_migration_script_sanity() {
 
     assert!(
         full_path.exists(),
-        "Migration script must exist at {:?}",
-        full_path
+        "Migration script must exist at {full_path:?}"
     );
 
     // Create a mock AdGuardHome.yaml
@@ -302,7 +300,8 @@ fn test_m9_release_configuration_and_systemd() {
 
     // Verify workspace version is at least 1.0.0
     assert!(
-        cargo_content.contains("version = \"1.1.0\"")
+        cargo_content.contains("version = \"1.1.1\"")
+            || cargo_content.contains("version = \"1.1.0\"")
             || cargo_content.contains("version = \"1.0.1\"")
             || cargo_content.contains("version = \"1.0.0\""),
         "Workspace package version must be at least 1.0.0"

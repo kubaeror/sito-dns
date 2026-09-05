@@ -39,17 +39,16 @@ pub struct ServerContext {
 impl ServerContext {
     /// Resolves the URL of the master node for redirect headers (`X-Dnsd-Master`).
     pub fn resolve_master_url(&self) -> String {
-        if let Some(ref tracker) = self.slave_tracker {
-            if let Some(ref url) = tracker.master_url {
-                return url.clone();
-            }
+        if let Some(ref tracker) = self.slave_tracker
+            && let Some(ref url) = tracker.master_url
+        {
+            return url.clone();
         }
-        if let Some(ref ha_val) = self.config.load().ha {
-            if let Ok(ha_cfg) = sito_ha::HaConfig::from_toml_value(ha_val) {
-                if let Some(ref url) = ha_cfg.master_url {
-                    return url.clone();
-                }
-            }
+        if let Some(ref ha_val) = self.config.load().ha
+            && let Ok(ha_cfg) = sito_ha::HaConfig::from_toml_value(ha_val)
+            && let Some(ref url) = ha_cfg.master_url
+        {
+            return url.clone();
         }
         "wss://master.local:8953".to_string()
     }

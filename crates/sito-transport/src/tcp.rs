@@ -176,10 +176,9 @@ async fn handle_tcp_connection<H: QueryHandler>(
             if let Some(response) = handler
                 .handle(query, ClientContext::new(client_ip).with_proto("tcp"))
                 .await
+                && let Ok(encoded) = encode_message(&response)
             {
-                if let Ok(encoded) = encode_message(&response) {
-                    let _ = tx.send(encoded).await;
-                }
+                let _ = tx.send(encoded).await;
             }
         });
     }

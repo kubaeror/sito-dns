@@ -70,10 +70,10 @@ impl MacResolver {
         // 1. Check cache
         {
             let cache = self.cache.read().unwrap();
-            if let Some(entry) = cache.get(&ip) {
-                if entry.expires_at > now {
-                    return Some(entry.mac.clone());
-                }
+            if let Some(entry) = cache.get(&ip)
+                && entry.expires_at > now
+            {
+                return Some(entry.mac.clone());
             }
         }
 
@@ -119,14 +119,12 @@ fn read_system_arp() -> HashMap<IpAddr, String> {
     // 192.168.1.1      0x1         0x2         00:11:22:33:44:55     *        eth0
     for line in content.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() >= 4 {
-            if let Ok(ip) = fields[0].parse::<IpAddr>() {
-                if let Some(norm) = normalize_mac(fields[3]) {
-                    if norm != "00:00:00:00:00:00" {
-                        map.insert(ip, norm);
-                    }
-                }
-            }
+        if fields.len() >= 4
+            && let Ok(ip) = fields[0].parse::<IpAddr>()
+            && let Some(norm) = normalize_mac(fields[3])
+            && norm != "00:00:00:00:00:00"
+        {
+            map.insert(ip, norm);
         }
     }
 

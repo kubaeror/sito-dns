@@ -265,12 +265,11 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                         let query_str = req.uri().query().unwrap_or("");
                                         let mut dns_param = None;
                                         for pair in query_str.split('&') {
-                                            if let Some((k, v)) = pair.split_once('=') {
-                                                if k == "dns" {
+                                            if let Some((k, v)) = pair.split_once('=')
+                                                && k == "dns" {
                                                     dns_param = Some(v);
                                                     break;
                                                 }
-                                            }
                                         }
 
                                         let Some(param) = dns_param else {
@@ -333,8 +332,8 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
 
                                 let response = handler.handle(query, client_ctx).await;
 
-                                if let Some(resp) = response {
-                                    if let Ok(encoded) = encode_message(&resp) {
+                                if let Some(resp) = response
+                                    && let Ok(encoded) = encode_message(&resp) {
                                         let http_resp = http::Response::builder()
                                             .status(http::StatusCode::OK)
                                             .header(http::header::CONTENT_TYPE, "application/dns-message")
@@ -348,7 +347,6 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                         }
                                         return;
                                     }
-                                }
 
                                 let no_content = http::Response::builder()
                                     .status(http::StatusCode::NO_CONTENT)

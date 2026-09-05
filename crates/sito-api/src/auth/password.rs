@@ -2,9 +2,9 @@
 //!
 //! Parameters: m = 64 MiB (65536 KiB), t = 3 iterations, p = 4 lanes.
 
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::{Argon2, Params, Version};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
+use argon2::{Algorithm, Argon2, Params, Version};
 
 /// Memory cost in KiB (64 MiB).
 pub const ARGON2_M_COST: u32 = 65536;
@@ -17,11 +17,10 @@ pub const ARGON2_P_COST: u32 = 4;
 pub fn hash_password(password: &str) -> Result<String, String> {
     let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, None)
         .map_err(|e| format!("Invalid Argon2 parameters: {e}"))?;
-    let argon2 = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
-    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     argon2
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|hash| hash.to_string())
         .map_err(|e| format!("Failed to hash password: {e}"))
 }

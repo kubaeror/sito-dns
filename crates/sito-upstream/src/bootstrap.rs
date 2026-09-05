@@ -58,11 +58,11 @@ impl BootstrapResolver {
         // Check in-memory cache
         {
             let cache = self.cache.read().await;
-            if let Some(entry) = cache.get(trimmed) {
-                if Instant::now() < entry.expires_at {
-                    debug!("Bootstrap cache hit for '{}': {:?}", trimmed, entry.ips);
-                    return Ok(entry.ips.clone());
-                }
+            if let Some(entry) = cache.get(trimmed)
+                && Instant::now() < entry.expires_at
+            {
+                debug!("Bootstrap cache hit for '{}': {:?}", trimmed, entry.ips);
+                return Ok(entry.ips.clone());
             }
         }
 

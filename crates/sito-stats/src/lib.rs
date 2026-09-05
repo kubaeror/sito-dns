@@ -292,11 +292,10 @@ mod tests {
             db.insert_batch(chunk).await.unwrap();
         }
         let elapsed = start.elapsed();
-        println!("50,000 entries inserted in {:?}", elapsed);
+        println!("50,000 entries inserted in {elapsed:?}");
         assert!(
             elapsed < Duration::from_secs(10),
-            "Insertion took {:?}, expected < 10s",
-            elapsed
+            "Insertion took {elapsed:?}, expected < 10s"
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;

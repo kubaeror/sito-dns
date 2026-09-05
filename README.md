@@ -4,7 +4,7 @@
 [![Nightly Fuzzing](https://github.com/kubaeror/sito-dns/actions/workflows/nightly-fuzz.yml/badge.svg)](https://github.com/kubaeror/sito-dns/actions/workflows/nightly-fuzz.yml)
 [![Release](https://img.shields.io/github/v/release/kubaeror/sito-dns?include_prereleases&color=brightgreen)](https://github.com/kubaeror/sito-dns/releases)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
-[![MSRV: 1.85.0](https://img.shields.io/badge/MSRV-1.85.0-orange.svg)](rust-toolchain.toml)
+[![MSRV: 1.98.1](https://img.shields.io/badge/MSRV-1.98.1-orange.svg)](rust-toolchain.toml)
 [![Rust Edition 2024](https://img.shields.io/badge/Edition-2024-purple.svg)](Cargo.toml)
 
 > **sito** (noun, Polish for *sieve* / *strainer*) — A high-performance, memory-safe, self-hosted filtering DNS server written in Rust.
