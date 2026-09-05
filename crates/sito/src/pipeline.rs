@@ -320,7 +320,7 @@ impl QueryHandler for DnsPipeline {
             // ADR-0007 Stage 4: Safe Search CNAME rewrites (Google, Bing, YouTube, DuckDuckGo)
             if policy.safe_search
                 && let Some(target) = match_safe_search(&domain_str, policy.safe_search_youtube)
-                    && let Ok(cname_target) = Name::from_str(target) {
+                && let Ok(cname_target) = Name::from_str(&format!("{}.", target.trim_end_matches('.'))) {
                         info!(
                             qname = %qname,
                             target = %target,

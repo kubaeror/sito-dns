@@ -24,10 +24,9 @@ pub struct TestServerInstance {
 impl TestServerInstance {
     /// Spawns a new server instance with the given configuration modifications.
     pub async fn spawn(mut config: Config) -> Result<Self, anyhow::Error> {
-        // Allocate an ephemeral port for standard DNS (UDP/TCP)
-        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = probe.local_addr()?.port();
-        drop(probe);
+        // Allocate ephemeral ports ensuring no collisions between listeners
+        let probe_dns = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = probe_dns.local_addr()?.port();
 
         let mut dot_port = config.dns.dot_port;
         let mut doh_port = config.dns.doh_port;
@@ -35,32 +34,44 @@ impl TestServerInstance {
         let mut doh3_port = config.dns.doh3_port;
         let has_tls = config.get_tls_config().is_some();
 
+        let mut probe_dot = None;
+        let mut probe_doh = None;
+        let mut probe_doq = None;
+        let mut probe_doh3 = None;
+
         if has_tls {
             if dot_port == 853 || dot_port == 0 {
                 let p = std::net::TcpListener::bind("127.0.0.1:0")?;
                 dot_port = p.local_addr()?.port();
-                drop(p);
                 config.dns.dot_port = dot_port;
+                probe_dot = Some(p);
             }
             if doh_port == 443 || doh_port == 0 {
                 let p = std::net::TcpListener::bind("127.0.0.1:0")?;
                 doh_port = p.local_addr()?.port();
-                drop(p);
                 config.dns.doh_port = doh_port;
+                probe_doh = Some(p);
             }
             if doq_port == 853 || doq_port == 0 {
                 let p = std::net::UdpSocket::bind("127.0.0.1:0")?;
                 doq_port = p.local_addr()?.port();
-                drop(p);
                 config.dns.doq_port = doq_port;
+                probe_doq = Some(p);
             }
             if doh3_port == 443 || doh3_port == 0 {
                 let p = std::net::UdpSocket::bind("127.0.0.1:0")?;
                 doh3_port = p.local_addr()?.port();
-                drop(p);
                 config.dns.doh3_port = doh3_port;
+                probe_doh3 = Some(p);
             }
         }
+
+        // Release all probes simultaneously right before starting the server
+        drop(probe_dns);
+        drop(probe_dot);
+        drop(probe_doh);
+        drop(probe_doq);
+        drop(probe_doh3);
 
         let temp_dir =
             std::env::temp_dir().join(format!("sito_test_inst_{}_{}", std::process::id(), port));
@@ -93,22 +104,32 @@ impl TestServerInstance {
         // Wait until DoT listener is ready if configured
         if has_tls && dot_port > 0 {
             let dot_addr = SocketAddr::new(addr.ip(), dot_port);
+            let mut dot_ready = false;
             for _ in 0..150 {
                 if tokio::net::TcpStream::connect(dot_addr).await.is_ok() {
+                    dot_ready = true;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if !dot_ready {
+                anyhow::bail!("DoT listener failed to bind to {dot_addr} within timeout");
             }
         }
 
         // Wait until DoH listener is ready if configured
         if has_tls && doh_port > 0 {
             let doh_addr = SocketAddr::new(addr.ip(), doh_port);
+            let mut doh_ready = false;
             for _ in 0..150 {
                 if tokio::net::TcpStream::connect(doh_addr).await.is_ok() {
+                    doh_ready = true;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if !doh_ready {
+                anyhow::bail!("DoH listener failed to bind to {doh_addr} within timeout");
             }
         }
 

@@ -172,12 +172,14 @@ pub fn substitute_secrets<S: ::std::hash::BuildHasher>(
     let mut result = template.to_string();
     let prefix = "${SECRET:";
     let suffix = "}";
+    let mut search_from = 0;
 
-    while let Some(start) = result.find(prefix) {
+    while let Some(rel_start) = result[search_from..].find(prefix) {
+        let start = search_from + rel_start;
         let after_prefix = &result[start + prefix.len()..];
         if let Some(end) = after_prefix.find(suffix) {
             let secret_name = &after_prefix[..end];
-            let full_placeholder = &result[start..start + prefix.len() + end + suffix.len()];
+            let full_placeholder_len = prefix.len() + end + suffix.len();
 
             let replacement = if let Some(val) = local_secrets.get(secret_name) {
                 Some(val.clone())
@@ -189,12 +191,15 @@ pub fn substitute_secrets<S: ::std::hash::BuildHasher>(
 
             match replacement {
                 Some(val) => {
-                    result = result.replace(full_placeholder, &val);
+                    let val_len = val.len();
+                    result.replace_range(start..start + full_placeholder_len, &val);
+                    search_from = start + val_len;
                 }
                 None => {
                     if allow_missing {
-                        // Replace with empty or marker to allow parse attempt
-                        result = result.replace(full_placeholder, "");
+                        // Replace with empty to allow parse attempt
+                        result.replace_range(start..start + full_placeholder_len, "");
+                        search_from = start;
                     } else {
                         return Err(HaError::Validation {
                             field: secret_name.to_string(),
@@ -402,5 +407,18 @@ token = "mikrotik_secret_token_12345"
         let wrong_key = Ed25519SigningKey::generate().unwrap();
         let sig_err = verify_and_unpack_push(&push_msg, 9, &wrong_key.public_key());
         assert!(sig_err.is_err());
+    }
+
+    #[test]
+    fn test_substitute_secrets_recursive_safety() {
+        let mut secrets = HashMap::new();
+        // Secret value itself contains placeholder syntax
+        secrets.insert(
+            "nested".to_string(),
+            "val_${SECRET:nested}_safe".to_string(),
+        );
+        let template = "key = \"${SECRET:nested}\"";
+        let res = substitute_secrets(template, &secrets, false).unwrap();
+        assert_eq!(res, "key = \"val_${SECRET:nested}_safe\"");
     }
 }
