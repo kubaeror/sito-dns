@@ -76,7 +76,7 @@ http = "1.5"
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
 ring = "0.17"
 blake3 = "1.8"
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
 subtle = "2.6"
 mimalloc = { version = "0.1", default-features = false }
