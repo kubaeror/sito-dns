@@ -2911,11 +2911,28 @@ name = "sito-api"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "axum",
  "blake3",
+ "chrono",
  "flate2",
+ "hex",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sito-cache",
+ "sito-clients",
  "sito-core",
+ "sito-filter",
+ "sito-proto",
+ "sito-rewrites",
+ "sito-stats",
+ "sito-upstream",
  "tar",
+ "thiserror",
+ "tokio",
  "totp-rs",
+ "tower-http",
+ "tracing",
  "utoipa",
  "utoipa-swagger-ui",
 ]
@@ -3718,6 +3735,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
 ]
 

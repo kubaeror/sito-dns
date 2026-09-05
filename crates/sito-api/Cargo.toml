@@ -7,7 +7,31 @@ license.workspace = true
 description = "REST API, OpenAPI documentation, and administration server for sito"
 
 [dependencies]
+argon2 = "0.5"
+axum.workspace = true
+blake3 = "1.5"
+chrono.workspace = true
+flate2 = "1.0"
+hex.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sito-cache.workspace = true
+sito-clients.workspace = true
 sito-core.workspace = true
+sito-filter.workspace = true
+sito-proto.workspace = true
+sito-rewrites.workspace = true
+sito-stats.workspace = true
+sito-upstream.workspace = true
+tar = "0.4"
+thiserror.workspace = true
+tokio.workspace = true
+totp-rs = { version = "5.6", features = ["gen_secret", "qr", "otpauth"] }
+tower-http.workspace = true
+tracing.workspace = true
+utoipa = { version = "5.3", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 
 [lints]
 workspace = true
