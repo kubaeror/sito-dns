@@ -1,10 +1,11 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use fnv::FnvHashSet;
 use hickory_proto::rr::RecordType;
 use sito_core::client::ClientContext;
 use sito_filter::engine::FilterSnapshot;
 use sito_filter::parser::parse_rules;
 use sito_filter::structures::{LabelInterner, SuffixTrie};
+use std::hint::black_box;
 
 fn bench_exact_hashset(c: &mut Criterion) {
     let mut set = FnvHashSet::default();

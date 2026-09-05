@@ -1,4 +1,4 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use sito_cache::DnsCache;
@@ -10,6 +10,7 @@ use sito_core::engine::FilterEngine;
 use sito_proto::{decode_message, encode_message};
 use sito_rewrites::config::{RewriteEntryConfig, RewritesConfig};
 use sito_rewrites::table::RewriteTable;
+use std::hint::black_box;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 

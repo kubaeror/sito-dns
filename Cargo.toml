@@ -54,7 +54,7 @@ idna = "1.1"
 async-trait = "0.1"
 aho-corasick = "1.1"
 regex-automata = { version = "0.4", features = ["dfa-build", "syntax", "hybrid"] }
-criterion = "0.5"
+criterion = "0.8"
 rustls-pki-types = { version = "1.15", features = ["std"] }
 rcgen = "0.14"
 base64 = "0.23"
