@@ -7,7 +7,8 @@ use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::response::Response;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use sito_stats::{QueryLogFilter, QueryLogPage};
 use utoipa::IntoParams;
@@ -71,16 +72,26 @@ pub async fn get_querylog(
 )]
 pub async fn delete_querylog(
     _operator: RequireOperator,
+    headers: HeaderMap,
     State(ctx): State<ServerContext>,
-) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
+) -> Result<Response, ProblemDetails> {
     let affected = ctx
         .stats_db
         .delete_query_logs()
         .await
         .map_err(|e| ProblemDetails::internal_error(e.to_string()))?;
+
+    if headers.contains_key("hx-request") {
+        return Ok(axum::response::Html(
+            "<tr><td colspan='6' class='text-muted text-center py-4'>No queries recorded yet</td></tr>",
+        )
+        .into_response());
+    }
+
     Ok(Json(GenericMessageResponse {
         message: format!("Successfully deleted {affected} query log entries"),
-    }))
+    })
+    .into_response())
 }
 
 /// WebSocket live tail endpoint streaming query log entries in real-time.

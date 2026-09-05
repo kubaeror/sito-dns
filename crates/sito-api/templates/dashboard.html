@@ -71,20 +71,9 @@
     if (!el) return;
 
     const width = el.clientWidth || 800;
-    const now = Math.floor(Date.now() / 1000);
-    const times = [];
-    const totals = [];
-    const blocked = [];
-
-    // 24 data points representing the last 24 hours
-    for (let i = 23; i >= 0; i--) {
-      times.push(now - i * 3600);
-      const base = Math.max(10, Math.floor({{ stats.total_queries }} / 24));
-      const jitter = Math.floor(Math.random() * (base * 0.4)) - (base * 0.2);
-      const t = Math.max(0, Math.round(base + jitter));
-      totals.push(t);
-      blocked.push(Math.round(t * ({{ stats.blocked_percentage }} / 100)));
-    }
+    const times = {{ hourly_times_json|safe }};
+    const totals = {{ hourly_totals_json|safe }};
+    const blocked = {{ hourly_blocked_json|safe }};
 
     const data = [times, totals, blocked];
 

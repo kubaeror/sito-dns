@@ -87,6 +87,9 @@ pub struct DashboardTemplate<'a> {
     pub uptime_str: String,
     pub blocked_pct_str: String,
     pub upstreams: Vec<UpstreamViewItem>,
+    pub hourly_times_json: String,
+    pub hourly_totals_json: String,
+    pub hourly_blocked_json: String,
 }
 
 #[derive(Template)]

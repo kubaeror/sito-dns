@@ -569,4 +569,80 @@ impl StatsDb {
             Ok(0)
         }
     }
+
+    /// Returns aggregated activity for the last N hours bucketed by hour.
+    pub async fn get_hourly_activity(&self, hours: u32) -> Result<Vec<HourlyActivity>, StatsError> {
+        let now_sec = chrono::Utc::now().timestamp();
+        let current_hour_sec = (now_sec / 3600) * 3600;
+        let hours_i64 = i64::from(hours.max(1));
+        let start_hour_sec = current_hour_sec - (hours_i64 - 1) * 3600;
+        let start_ms = start_hour_sec * 1000;
+
+        let rows = sqlx::query(
+            r"
+            SELECT
+                (ts / 3600000) * 3600 as hour_sec,
+                COUNT(*) as total,
+                SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) as blocked
+            FROM query_log
+            WHERE ts >= ?
+            GROUP BY hour_sec
+            ",
+        )
+        .bind(start_ms)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut map = std::collections::HashMap::new();
+        for r in rows {
+            let hour_sec: i64 = r.get("hour_sec");
+            let total: i64 = r.get::<Option<i64>, _>("total").unwrap_or(0);
+            let blocked: i64 = r.get::<Option<i64>, _>("blocked").unwrap_or(0);
+            map.insert(hour_sec, (total, blocked));
+        }
+
+        // Also check stats_hourly in case older logs were pruned by retention
+        let archived_rows = sqlx::query(
+            r"
+            SELECT
+                (hour / 3600000) * 3600 as hour_sec,
+                queries as total,
+                blocked
+            FROM stats_hourly
+            WHERE hour >= ?
+            ",
+        )
+        .bind(start_ms)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        for r in archived_rows {
+            let hour_sec: i64 = r.get("hour_sec");
+            let total: i64 = r.get::<Option<i64>, _>("total").unwrap_or(0);
+            let blocked: i64 = r.get::<Option<i64>, _>("blocked").unwrap_or(0);
+            map.entry(hour_sec).or_insert((total, blocked));
+        }
+
+        let mut result = Vec::with_capacity(hours as usize);
+        for h in 0..hours_i64 {
+            let h_sec = start_hour_sec + h * 3600;
+            let (total, blocked) = map.get(&h_sec).copied().unwrap_or((0, 0));
+            result.push(HourlyActivity {
+                timestamp_sec: h_sec,
+                total_queries: total,
+                blocked_queries: blocked,
+            });
+        }
+
+        Ok(result)
+    }
+}
+
+/// Hourly activity bucket for dashboard time-series charts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct HourlyActivity {
+    pub timestamp_sec: i64,
+    pub total_queries: i64,
+    pub blocked_queries: i64,
 }

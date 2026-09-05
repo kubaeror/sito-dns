@@ -225,8 +225,15 @@ fn get_status_response(ctx: &ServerContext) -> StatusResponse {
     }
 }
 
-fn get_upstreams_list(ctx: &ServerContext) -> Vec<UpstreamViewItem> {
+async fn get_upstreams_list(ctx: &ServerContext) -> Vec<UpstreamViewItem> {
     let cfg = ctx.config.load();
+    let statuses = ctx.upstream.statuses().await;
+    let stats = ctx
+        .stats_db
+        .get_upstream_stats(86_400_000)
+        .await
+        .unwrap_or_default();
+
     let mut res = Vec::new();
     for addr_str in &cfg.upstream.servers {
         let proto = if addr_str.starts_with("tls://") {
@@ -240,13 +247,26 @@ fn get_upstreams_list(ctx: &ServerContext) -> Vec<UpstreamViewItem> {
         } else {
             "DNS"
         };
+
+        let is_healthy = statuses
+            .iter()
+            .find(|(name, _)| name == addr_str)
+            .map(|(_, status)| *status != sito_upstream::HealthStatus::Down)
+            .unwrap_or(true);
+
+        let (total_queries, avg_latency_ms) = stats
+            .iter()
+            .find(|s| &s.upstream == addr_str || addr_str.contains(&s.upstream))
+            .map(|s| (s.total_queries, (s.avg_elapsed_us as f64) / 1000.0))
+            .unwrap_or((0, 0.0));
+
         res.push(UpstreamViewItem {
             address: addr_str.clone(),
             protocol: proto.to_string(),
-            is_healthy: true,
+            is_healthy,
             weight: 100,
-            total_queries: 0,
-            avg_latency_ms: 12.5,
+            total_queries,
+            avg_latency_ms,
         });
     }
     res
@@ -265,7 +285,20 @@ pub async fn dashboard_page(State(ctx): State<ServerContext>, headers: HeaderMap
     let status = get_status_response(&ctx);
     let uptime_str = format_duration(status.uptime_seconds);
     let blocked_pct_str = format!("{:.1}", stats.blocked_percentage);
-    let upstreams = get_upstreams_list(&ctx);
+    let upstreams = get_upstreams_list(&ctx).await;
+
+    let hourly = ctx
+        .stats_db
+        .get_hourly_activity(24)
+        .await
+        .unwrap_or_default();
+    let times: Vec<i64> = hourly.iter().map(|h| h.timestamp_sec).collect();
+    let totals: Vec<i64> = hourly.iter().map(|h| h.total_queries).collect();
+    let blocked: Vec<i64> = hourly.iter().map(|h| h.blocked_queries).collect();
+
+    let hourly_times_json = serde_json::to_string(&times).unwrap_or_else(|_| "[]".to_string());
+    let hourly_totals_json = serde_json::to_string(&totals).unwrap_or_else(|_| "[]".to_string());
+    let hourly_blocked_json = serde_json::to_string(&blocked).unwrap_or_else(|_| "[]".to_string());
 
     HtmlTemplate(DashboardTemplate {
         is_authenticated: true,
@@ -278,6 +311,9 @@ pub async fn dashboard_page(State(ctx): State<ServerContext>, headers: HeaderMap
         uptime_str,
         blocked_pct_str,
         upstreams,
+        hourly_times_json,
+        hourly_totals_json,
+        hourly_blocked_json,
     })
     .into_response()
 }
@@ -424,19 +460,31 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
     };
 
     let cfg = ctx.config.load();
+    let snapshot = ctx.filter.snapshot();
     let lists: Vec<FilterListDto> = cfg
         .filtering
         .lists
         .iter()
         .enumerate()
-        .map(|(idx, list)| FilterListDto {
-            id: idx,
-            name: list.name.clone(),
-            url: list.url.clone(),
-            enabled: list.enabled,
-            refresh_hours: list.refresh_hours.unwrap_or(24) as u32,
-            rule_count: 0,
-            last_updated: None,
+        .map(|(idx, list)| {
+            let count = if list.enabled {
+                snapshot
+                    .rules
+                    .iter()
+                    .filter(|r| r.source == list.name)
+                    .count() as u32
+            } else {
+                0
+            };
+            FilterListDto {
+                id: idx,
+                name: list.name.clone(),
+                url: list.url.clone(),
+                enabled: list.enabled,
+                refresh_hours: list.refresh_hours.unwrap_or(24) as u32,
+                rule_count: count,
+                last_updated: None,
+            }
         })
         .collect();
 
@@ -467,7 +515,8 @@ pub async fn filtering_toggle_handler(
     if let Some(item) = new_cfg.filtering.lists.get_mut(id) {
         item.enabled = !item.enabled;
         let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
-        ctx.config.store(Arc::new(new_cfg));
+        ctx.config.store(Arc::new(new_cfg.clone()));
+        let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     }
     Redirect::to("/filtering").into_response()
 }
@@ -496,7 +545,8 @@ pub async fn filtering_add_handler(
         refresh_hours: Some(u64::from(form.refresh_hours)),
     });
     let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
-    ctx.config.store(Arc::new(new_cfg));
+    ctx.config.store(Arc::new(new_cfg.clone()));
+    let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
 
     Redirect::to("/filtering").into_response()
 }
@@ -514,7 +564,8 @@ pub async fn filtering_delete_handler(
     if id < new_cfg.filtering.lists.len() {
         new_cfg.filtering.lists.remove(id);
         let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
-        ctx.config.store(Arc::new(new_cfg));
+        ctx.config.store(Arc::new(new_cfg.clone()));
+        let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     }
     Redirect::to("/filtering").into_response()
 }
@@ -543,7 +594,8 @@ pub async fn filtering_custom_rules_handler(
         .collect();
 
     let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
-    ctx.config.store(Arc::new(new_cfg));
+    ctx.config.store(Arc::new(new_cfg.clone()));
+    let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
 
     Redirect::to("/filtering").into_response()
 }
@@ -603,9 +655,14 @@ pub async fn filtering_simulate_handler(
 }
 
 pub async fn filtering_update_all_handler(
-    State(_ctx): State<ServerContext>,
-    _headers: HeaderMap,
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
 ) -> Response {
+    if get_session_user(&ctx, &headers).is_none() {
+        return Redirect::to("/login").into_response();
+    }
+    let cfg = ctx.config.load();
+    let _ = ctx.filter.reload_with_config(&cfg.filtering).await;
     Redirect::to("/filtering").into_response()
 }
 
@@ -691,6 +748,8 @@ pub async fn rewrites_add_handler(
 #[derive(Deserialize)]
 pub struct DeleteRewriteForm {
     pub domain: String,
+    pub record_type: Option<String>,
+    pub answer: Option<String>,
 }
 
 pub async fn rewrites_delete_handler(
@@ -703,7 +762,22 @@ pub async fn rewrites_delete_handler(
     }
 
     let mut rewrites_cfg = load_rewrites_config(&ctx);
-    rewrites_cfg.entries.retain(|e| e.domain != form.domain);
+    rewrites_cfg.entries.retain(|e| {
+        if e.domain != form.domain {
+            return true;
+        }
+        if let Some(ref rt) = form.record_type
+            && &e.r#type != rt
+        {
+            return true;
+        }
+        if let Some(ref ans) = form.answer
+            && &e.answer != ans
+        {
+            return true;
+        }
+        false
+    });
 
     let mut new_cfg = (**ctx.config.load()).clone();
     if let Ok(val) = toml::Value::try_from(&rewrites_cfg) {
@@ -847,7 +921,7 @@ pub async fn upstreams_page(State(ctx): State<ServerContext>, headers: HeaderMap
         return Redirect::to("/login").into_response();
     };
 
-    let upstreams = get_upstreams_list(&ctx);
+    let upstreams = get_upstreams_list(&ctx).await;
 
     HtmlTemplate(UpstreamsTemplate {
         is_authenticated: true,
@@ -891,12 +965,145 @@ pub struct TestUpstreamForm {
     pub address: String,
 }
 
-pub async fn upstreams_test_handler(Form(form): Form<TestUpstreamForm>) -> Response {
-    axum::response::Html(format!(
-        "<div class='badge badge-success' style='font-size:0.9rem; padding: 6px 12px;'>Resolver {} is reachable (RTT: 14.2 ms)</div>",
-        escape_html(&form.address)
-    ))
-    .into_response()
+async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result<f64, String> {
+    let start = std::time::Instant::now();
+    let qname = sito_proto::Name::from_str(probe_domain)
+        .unwrap_or_else(|_| sito_proto::Name::from_str("example.com").unwrap());
+
+    if let Some(target) = addr_str.strip_prefix("tls://") {
+        let parts: Vec<&str> = target.split(':').collect();
+        let host = parts[0];
+        let port: u16 = if parts.len() > 1 {
+            parts[1].parse().unwrap_or(853)
+        } else {
+            853
+        };
+        let mut addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("DNS resolution of {host} failed: {e}"))?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| format!("Could not resolve {host}"))?;
+
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| "Connection timed out".to_string())?
+        .map_err(|e| format!("TCP connection failed: {e}"))?;
+        drop(stream);
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        return Ok(elapsed);
+    }
+
+    if let Some(target) = addr_str.strip_prefix("https://") {
+        let host_port = target.split('/').next().unwrap_or(target);
+        let parts: Vec<&str> = host_port.split(':').collect();
+        let host = parts[0];
+        let port: u16 = if parts.len() > 1 {
+            parts[1].parse().unwrap_or(443)
+        } else {
+            443
+        };
+        let mut addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("DNS resolution of {host} failed: {e}"))?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| format!("Could not resolve {host}"))?;
+
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| "Connection timed out".to_string())?
+        .map_err(|e| format!("HTTPS connection failed: {e}"))?;
+        drop(stream);
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        return Ok(elapsed);
+    }
+
+    // Standard UDP probe
+    let target = addr_str.strip_prefix("udp://").unwrap_or(addr_str);
+    let target_addr: std::net::SocketAddr = if let Ok(sa) = target.parse() {
+        sa
+    } else {
+        let parts: Vec<&str> = target.split(':').collect();
+        let host = parts[0];
+        let port: u16 = if parts.len() > 1 {
+            parts[1].parse().unwrap_or(53)
+        } else {
+            53
+        };
+        let mut addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("Lookup of {host} failed: {e}"))?;
+        addrs
+            .next()
+            .ok_or_else(|| format!("Could not resolve {host}"))?
+    };
+
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| format!("Failed to bind local UDP socket: {e}"))?;
+
+    let mut query_msg = sito_proto::Message::new();
+    query_msg
+        .header_mut()
+        .set_message_type(sito_proto::MessageType::Query);
+    query_msg.header_mut().set_recursion_desired(true);
+    query_msg.header_mut().set_id(rand::random());
+    query_msg.add_query(sito_proto::Query::new(qname, sito_proto::RecordType::A));
+    let wire = sito_proto::encode_message(&query_msg)
+        .map_err(|e| format!("Failed to encode DNS probe message: {e}"))?;
+
+    socket
+        .send_to(&wire, target_addr)
+        .await
+        .map_err(|e| format!("UDP send failed: {e}"))?;
+
+    let mut buf = [0u8; 512];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    .map_err(|_| "Probe query timed out after 2s".to_string())?
+    .map_err(|e| format!("UDP recv failed: {e}"))?;
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    Ok(elapsed)
+}
+
+pub async fn upstreams_test_handler(
+    State(ctx): State<ServerContext>,
+    Form(form): Form<TestUpstreamForm>,
+) -> Response {
+    let clean = form.address.trim();
+    if clean.is_empty() {
+        return axum::response::Html(
+            "<div class='badge badge-danger' style='font-size:0.9rem; padding: 6px 12px;'>Invalid upstream address</div>",
+        )
+        .into_response();
+    }
+
+    let probe_domain = ctx.config.load().upstream.probe_domain.clone();
+    match probe_upstream_target(clean, &probe_domain).await {
+        Ok(elapsed) => axum::response::Html(format!(
+            "<div class='badge badge-success' style='font-size:0.9rem; padding: 6px 12px;'>Resolver {} is reachable (RTT: {:.1} ms)</div>",
+            escape_html(clean),
+            elapsed
+        ))
+        .into_response(),
+        Err(e) => axum::response::Html(format!(
+            "<div class='badge badge-danger' style='font-size:0.9rem; padding: 6px 12px;'>Resolver {} error: {}</div>",
+            escape_html(clean),
+            escape_html(&e)
+        ))
+        .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,5 +1230,16 @@ pub async fn wizard_complete_handler(
     let _ = ctx
         .auth_mgr
         .update_user_password(&form.admin_user, &form.admin_password);
+
+    let mut new_cfg = (**ctx.config.load()).clone();
+    if !form.upstream.trim().is_empty() {
+        new_cfg.upstream.servers = vec![form.upstream.trim().to_string()];
+    }
+    new_cfg.filtering.enabled = form.enable_adblock.is_some();
+
+    let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+    ctx.config.store(Arc::new(new_cfg.clone()));
+    let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+
     Redirect::to("/login").into_response()
 }

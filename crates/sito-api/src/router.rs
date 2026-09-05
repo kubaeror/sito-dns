@@ -83,6 +83,7 @@ pub fn create_router(ctx: ServerContext) -> Router {
             "/querylog",
             get(querylog::get_querylog).delete(querylog::delete_querylog),
         )
+        .route("/querylog/clear", post(querylog::delete_querylog))
         .route("/querylog/stream", get(querylog::stream_querylog))
         // Filtering
         .route(
