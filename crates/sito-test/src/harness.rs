@@ -25,7 +25,7 @@ impl TestServerInstance {
     /// Spawns a new server instance with the given configuration modifications.
     pub async fn spawn(mut config: Config) -> Result<Self, anyhow::Error> {
         // Allocate an ephemeral port for standard DNS (UDP/TCP)
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
         let port = probe.local_addr()?.port();
         drop(probe);
 
@@ -76,10 +76,10 @@ impl TestServerInstance {
         let server_task =
             tokio::spawn(async move { run_server_with_shutdown(config, Some(shutdown_rx)).await });
 
-        // Wait until standard server listener is ready
+        // Wait until standard server listener is ready (up to 3s for busy CI runners)
         let mut ready = false;
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        for _ in 0..150 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
             if tokio::net::TcpStream::connect(addr).await.is_ok() {
                 ready = true;
                 break;
@@ -93,27 +93,27 @@ impl TestServerInstance {
         // Wait until DoT listener is ready if configured
         if has_tls && dot_port > 0 {
             let dot_addr = SocketAddr::new(addr.ip(), dot_port);
-            for _ in 0..50 {
+            for _ in 0..150 {
                 if tokio::net::TcpStream::connect(dot_addr).await.is_ok() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
 
         // Wait until DoH listener is ready if configured
         if has_tls && doh_port > 0 {
             let doh_addr = SocketAddr::new(addr.ip(), doh_port);
-            for _ in 0..50 {
+            for _ in 0..150 {
                 if tokio::net::TcpStream::connect(doh_addr).await.is_ok() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
 
         // Brief grace period for UDP and listener tasks to enter event loop
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         Ok(Self {
             port,

@@ -11,9 +11,9 @@ anyhow.workspace = true
 argon2 = "0.5"
 arc-swap.workspace = true
 axum.workspace = true
-blake3 = "1.5"
+blake3.workspace = true
 chrono.workspace = true
-flate2 = "1.0"
+flate2.workspace = true
 hex.workspace = true
 rand.workspace = true
 serde.workspace = true
@@ -27,15 +27,15 @@ sito-proto.workspace = true
 sito-rewrites.workspace = true
 sito-stats.workspace = true
 sito-upstream.workspace = true
-tar = "0.4"
+tar.workspace = true
 thiserror.workspace = true
 subtle.workspace = true
 tokio.workspace = true
 toml.workspace = true
-totp-rs = { version = "5.6", features = ["gen_secret", "qr", "otpauth"] }
+totp-rs = { version = "5.7", features = ["gen_secret", "qr", "otpauth"] }
 tower-http.workspace = true
 tracing.workspace = true
-utoipa = { version = "5.3", features = ["axum_extras"] }
+utoipa.workspace = true
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 rust-embed = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }

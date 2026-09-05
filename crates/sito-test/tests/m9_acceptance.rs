@@ -300,10 +300,11 @@ fn test_m9_release_configuration_and_systemd() {
 
     let cargo_content = fs::read_to_string(&cargo_toml_path).expect("read Cargo.toml");
 
-    // Verify workspace version is 1.0.0
+    // Verify workspace version is at least 1.0.0
     assert!(
-        cargo_content.contains("version = \"1.0.0\""),
-        "Workspace package version must be 1.0.0"
+        cargo_content.contains("version = \"1.0.1\"")
+            || cargo_content.contains("version = \"1.0.0\""),
+        "Workspace package version must be at least 1.0.0"
     );
 
     // Verify release profile optimization

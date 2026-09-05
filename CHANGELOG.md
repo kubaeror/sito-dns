@@ -5,6 +5,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.0.1] - 2026-09-05
+
+### Maintenance & Dependency Upgrades
+- Upgraded workspace dependencies: `socket2` unified on `0.6.5` (eliminating duplicate versions in dependency graph), `tokio` to `1.53.1`, `clap` to `4.6.6`, `arc-swap` to `1.9.2`, `dashmap` to `6.2.1`, `bytes` to `1.12.1`, `http` to `1.5.0`, `hyper` to `1.11.1`, `idna` to `1.1.0`, `notify` to `8.2.0`, and `rust-embed` to `8.12.0`.
+- Unified workspace dependencies (`flate2`, `tar`, `utoipa`, `blake3`) in `sito-api`.
+- Upgraded frontend API client `openapi-fetch` to `^0.17.0` with strict tuple type conversions in dashboard top domains and clients.
+- Bumped application and crate versions across the workspace to `1.0.1`.
+
+---
+
 ## [1.0.0] - 2026-09-05
 
 ### Production Release — Hardened, Measured, Documented, and Packaged
