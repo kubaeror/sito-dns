@@ -60,13 +60,13 @@ M5.6 reload       → task 4 (hot-reload + write-through); DoD: list change via 
 
 ## Tests and acceptance criteria
 
-- [ ] Swagger complete; every endpoint has a contract test
-- [ ] RBAC: role × endpoint matrix (3 roles × ~30 endpoints) green
-- [ ] Query log: filters (client/domain/status/time) + cursor work on 1M rows < 200 ms
-- [ ] Live tail WS delivers an entry < 500 ms after the query
-- [ ] Prometheus scrape contains the whole table 14.2
-- [ ] IP anonymization (masks /24, /56) applies before storage
-- [ ] Backup/restore: an instance restored from the archive gives identical verdicts
+- [x] Swagger complete; every endpoint has a contract test
+- [x] RBAC: role × endpoint matrix (3 roles × ~30 endpoints) green
+- [x] Query log: filters (client/domain/status/time) + cursor work on 1M rows < 200 ms
+- [x] Live tail WS delivers an entry < 500 ms after the query
+- [x] Prometheus scrape contains the whole table 14.2
+- [x] IP anonymization (masks /24, /56) applies before storage
+- [x] Backup/restore: an instance restored from the archive gives identical verdicts
 
 ## Risks
 

@@ -93,6 +93,23 @@ pub fn authenticate_request(
         }
     }
 
+    // 3. Try query parameter `token` (supported for WebSocket stream connections)
+    if let Some(query) = parts.uri.query() {
+        for param in query.split('&') {
+            if let Some(token) = param.strip_prefix("token=") {
+                let clean_token = token.trim();
+                if let Some(meta) = auth_mgr.validate_token(clean_token) {
+                    return Ok(AuthUser {
+                        username: meta.name,
+                        role: meta.scope,
+                        token_id: Some(meta.id),
+                    });
+                }
+                return Err(ProblemDetails::unauthorized("Invalid or expired API token"));
+            }
+        }
+    }
+
     Err(ProblemDetails::unauthorized(
         "Authentication required (Bearer token or session cookie)",
     ))

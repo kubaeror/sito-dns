@@ -2091,7 +2091,7 @@
         }
       }
     },
-    "/api/v1/upstream/config": {
+    "/api/v1/upstream": {
       "get": {
         "tags": [
           "crate::handlers::upstream"

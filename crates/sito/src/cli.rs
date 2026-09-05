@@ -42,6 +42,27 @@ pub enum Commands {
         #[arg(short, long, default_value = "2000")]
         timeout_ms: u64,
     },
+    /// Create a tar.gz backup archive of configuration and metadata
+    Backup {
+        /// Optional path to configuration file to back up (defaults to main --config)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Destination archive file path (.tar.gz)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Restore configuration from a backup archive (.tar.gz)
+    Restore {
+        /// Path to backup archive (.tar.gz) to restore
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Destination configuration file path (defaults to main --config)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Overwrite destination configuration file if it already exists
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 /// Executes the `check-config` subcommand.
@@ -163,5 +184,82 @@ pub async fn run_healthcheck(addr: SocketAddr, timeout_ms: u64) -> Result<(), an
         resp.metadata.id, resp.metadata.response_code, elapsed
     );
 
+    Ok(())
+}
+
+/// Executes the `backup` subcommand.
+pub fn run_backup(config_path: &Path, output: Option<&Path>) -> Result<PathBuf, anyhow::Error> {
+    let content = std::fs::read_to_string(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read configuration file '{}': {}",
+            config_path.display(),
+            e
+        )
+    })?;
+
+    // Pre-validate before backing up
+    Config::from_toml_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "Configuration validation failed for '{}': {}",
+            config_path.display(),
+            e
+        )
+    })?;
+
+    let archive_bytes = sito_api::handlers::config::create_backup_archive(&content)?;
+
+    let out_path = if let Some(p) = output {
+        p.to_path_buf()
+    } else {
+        PathBuf::from(format!(
+            "sito-backup-{}.tar.gz",
+            chrono::Utc::now().format("%Y%m%d%H%M%S")
+        ))
+    };
+
+    std::fs::write(&out_path, archive_bytes)?;
+    println!(
+        "Backup successfully created at '{}' from '{}'",
+        out_path.display(),
+        config_path.display()
+    );
+    Ok(out_path)
+}
+
+/// Executes the `restore` subcommand.
+pub fn run_restore(
+    archive_path: &Path,
+    target_config_path: &Path,
+    force: bool,
+) -> Result<(), anyhow::Error> {
+    if target_config_path.exists() && !force {
+        anyhow::bail!(
+            "Target config file '{}' already exists. Use --force to overwrite.",
+            target_config_path.display()
+        );
+    }
+
+    let archive_bytes = std::fs::read(archive_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read backup archive '{}': {}",
+            archive_path.display(),
+            e
+        )
+    })?;
+
+    let (config_toml, metadata) =
+        sito_api::handlers::config::extract_backup_archive(&archive_bytes)?;
+
+    // Atomic write to destination
+    let tmp_path = target_config_path.with_extension("tmp");
+    std::fs::write(&tmp_path, &config_toml)?;
+    std::fs::rename(&tmp_path, target_config_path)?;
+
+    println!(
+        "Successfully restored configuration (sito version: {}, backup timestamp: {}) to '{}'",
+        metadata.sito_version,
+        metadata.timestamp,
+        target_config_path.display()
+    );
     Ok(())
 }

@@ -79,6 +79,10 @@ pub fn create_router(ctx: ServerContext) -> Router {
         .route("/rewrites/{id}", delete(rewrites::delete_rewrite))
         // Upstream
         .route(
+            "/upstream",
+            get(upstream::get_upstream_config).put(upstream::update_upstream_config),
+        )
+        .route(
             "/upstream/config",
             get(upstream::get_upstream_config).put(upstream::update_upstream_config),
         )

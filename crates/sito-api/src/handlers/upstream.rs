@@ -21,7 +21,7 @@ use crate::state::ServerContext;
 /// Get current upstream DNS configuration.
 #[utoipa::path(
     get,
-    path = "/api/v1/upstream/config",
+    path = "/api/v1/upstream",
     responses(
         (status = 200, description = "Current upstream DNS configuration", body = UpstreamConfigDto),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -61,7 +61,7 @@ pub async fn get_upstream_config(
 /// Update upstream DNS configuration.
 #[utoipa::path(
     put,
-    path = "/api/v1/upstream/config",
+    path = "/api/v1/upstream",
     request_body = UpstreamConfigDto,
     responses(
         (status = 200, description = "Updated upstream DNS configuration", body = UpstreamConfigDto),

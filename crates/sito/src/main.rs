@@ -1,8 +1,8 @@
 //! Binary entry point for the `sito` DNS server CLI.
 
 use clap::Parser;
-use sito::cli::{Cli, Commands, run_check_config, run_healthcheck};
-use sito::server::run_server;
+use sito::cli::{Cli, Commands, run_backup, run_check_config, run_healthcheck, run_restore};
+use sito::server::run_server_full;
 use sito_core::config::Config;
 use std::net::SocketAddr;
 
@@ -38,6 +38,26 @@ async fn main() -> anyhow::Result<()> {
                 };
 
                 if let Err(e) = run_healthcheck(target_addr, timeout_ms).await {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            Commands::Backup { config, output } => {
+                let config_path = config.unwrap_or(cli.config);
+                if let Err(e) = run_backup(&config_path, output.as_deref()) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            Commands::Restore {
+                input,
+                config,
+                force,
+            } => {
+                let config_path = config.unwrap_or(cli.config);
+                if let Err(e) = run_restore(&input, &config_path, force) {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }
@@ -86,5 +106,5 @@ async fn main() -> anyhow::Result<()> {
         "Starting sito DNS server"
     );
 
-    run_server(config).await
+    run_server_full(config, config_path, None).await
 }

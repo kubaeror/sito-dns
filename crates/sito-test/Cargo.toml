@@ -17,6 +17,7 @@ sito-filter.workspace = true
 sito-dnssec.workspace = true
 sito-clients.workspace = true
 sito-rewrites.workspace = true
+arc-swap.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 toml.workspace = true
 hickory-proto.workspace = true
@@ -33,6 +34,14 @@ tokio-rustls.workspace = true
 webpki-roots.workspace = true
 base64.workspace = true
 time.workspace = true
+axum.workspace = true
+futures-util = "0.3"
+serde_json.workspace = true
+sito-api.workspace = true
+sito-stats.workspace = true
+tokio-tungstenite = "0.29"
+tower = { version = "0.5", features = ["util"] }
+utoipa = "5.3"
 
 [lints]
 workspace = true

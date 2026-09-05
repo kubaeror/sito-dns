@@ -1,16 +1,20 @@
 //! Server lifecycle and runner implementation.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+use arc_swap::ArcSwap;
 use sito_cache::DnsCache;
 use sito_core::config::Config;
 use sito_dnssec::DnssecValidator;
 use sito_filter::HostsFilterEngine;
+use sito_stats::{MetricsRegistry, QueryLogWriter, StatsDb};
 use sito_transport::{
     CertWatcher, DohConfig, DotConfig, TcpConfig, TlsAcceptorManager, UdpConfig,
     load_server_config, start_doh_listener, start_dot_listener, start_tcp_listener,
@@ -27,7 +31,8 @@ struct IntegrationsConfig {
 
 /// Runs the complete sito DNS server with graceful shutdown handling.
 pub async fn run_server(config: Config) -> anyhow::Result<()> {
-    run_server_with_shutdown(config, None).await
+    let config_path = config.server.data_dir.join("config.toml");
+    run_server_full(config, config_path, None).await
 }
 
 /// Runs the DNS server with an optional custom shutdown receiver (useful for testing).
@@ -35,11 +40,33 @@ pub async fn run_server_with_shutdown(
     config: Config,
     custom_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> anyhow::Result<()> {
+    let config_path = config.server.data_dir.join("config.toml");
+    run_server_full(config, config_path, custom_shutdown).await
+}
+
+/// Runs the DNS server with custom config path and shutdown receiver.
+pub async fn run_server_full(
+    config: Config,
+    config_path: impl AsRef<Path>,
+    custom_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> anyhow::Result<()> {
+    let config_path_buf = config_path.as_ref().to_path_buf();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let in_flight = Arc::new(AtomicUsize::new(0));
 
     // Ensure data directory exists
     tokio::fs::create_dir_all(&config.server.data_dir).await?;
+
+    // Initialize Stats SQLite DB
+    let db_path = config.server.data_dir.join("stats.db");
+    let stats_db = StatsDb::open(&db_path).await?;
+
+    // Initialize QueryLogWriter (10k buffer per M5.1)
+    let querylog_writer = QueryLogWriter::spawn(stats_db.clone(), 10_000);
+    let querylog_sender = querylog_writer.sender();
+
+    // Initialize Prometheus metrics registry with 18 metrics per Table 14.2
+    let metrics = MetricsRegistry::new(env!("CARGO_PKG_VERSION"), "git");
 
     // Initialize upstream manager with bootstrap resolver
     let bootstrap = BootstrapResolver::new(
@@ -97,19 +124,126 @@ pub async fn run_server_with_shutdown(
         }
     }
 
-    // Construct pipeline
-    let pipeline = Arc::new(DnsPipeline::new(
-        Arc::new(config.clone()),
-        filter_engine,
-        cache,
-        upstream_manager,
-        dnssec,
-        client_registry,
-        parental_registry,
-        service_registry,
-        rewrite_table,
-        in_flight.clone(),
-    ));
+    // Construct pipeline with query logging and Prometheus metrics
+    let pipeline = Arc::new(
+        DnsPipeline::new(
+            Arc::new(config.clone()),
+            filter_engine.clone(),
+            cache.clone(),
+            upstream_manager.clone(),
+            dnssec,
+            client_registry.clone(),
+            parental_registry,
+            service_registry,
+            rewrite_table.clone(),
+            in_flight.clone(),
+        )
+        .with_stats(querylog_sender.clone(), metrics.clone()),
+    );
+
+    // Setup ArcSwaps for hot-reloadable components
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(config.clone())));
+    let clients_arc = Arc::new(ArcSwap::new(client_registry.clone()));
+    let rewrites_arc = Arc::new(ArcSwap::new(rewrite_table.clone()));
+
+    // Administrative REST API server
+    let server_ctx = sito_api::ServerContext {
+        config: config_arc.clone(),
+        config_path: config_path_buf.clone(),
+        auth_mgr: Arc::new(sito_api::AuthManager::new()),
+        stats_db: stats_db.clone(),
+        querylog_sender: querylog_sender.clone(),
+        metrics: metrics.clone(),
+        filter: filter_engine.clone(),
+        cache: cache.clone(),
+        upstream: upstream_manager.clone(),
+        clients: clients_arc.clone(),
+        rewrites: rewrites_arc.clone(),
+        start_time: Instant::now(),
+        restore_tokens: Arc::new(Mutex::new(HashMap::new())),
+    };
+
+    let api_router = sito_api::create_router(server_ctx);
+    if let Ok(listener) = tokio::net::TcpListener::bind("0.0.0.0:3000").await {
+        let mut api_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, api_router)
+                .with_graceful_shutdown(async move {
+                    while !*api_shutdown_rx.borrow_and_update() {
+                        if api_shutdown_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await;
+        });
+        info!("sito admin REST API listening on http://0.0.0.0:3000");
+    }
+
+    // Spawn config file watcher for hot-reload
+    let watcher_config_path = config_path_buf.clone();
+    let watcher_config_arc = config_arc.clone();
+    let watcher_filter = filter_engine.clone();
+    let mut watcher_shutdown_rx = shutdown_rx.clone();
+
+    tokio::spawn(async move {
+        use notify::{Event, RecursiveMode, Watcher};
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut watcher = match notify::recommended_watcher(move |res: Result<Event, _>| {
+            if let Ok(event) = res {
+                if event.kind.is_modify() || event.kind.is_create() {
+                    let _ = tx.send(());
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!("Failed to initialize config file watcher: {e}");
+                return;
+            }
+        };
+
+        if watcher_config_path.exists() {
+            if let Err(e) = watcher.watch(&watcher_config_path, RecursiveMode::NonRecursive) {
+                warn!(
+                    "Failed to watch config file {}: {e}",
+                    watcher_config_path.display()
+                );
+                return;
+            }
+        }
+
+        loop {
+            tokio::select! {
+                _ = watcher_shutdown_rx.changed() => {
+                    if *watcher_shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                Some(()) = rx.recv() => {
+                    // Debounce brief bursts of file writes
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    while rx.try_recv().is_ok() {}
+
+                    match tokio::fs::read_to_string(&watcher_config_path).await {
+                        Ok(content) => match Config::from_toml_str(&content) {
+                            Ok(new_cfg) => {
+                                info!("Detected configuration file change, hot-reloading");
+                                let _ = watcher_filter.reload_with_config(&new_cfg.filtering).await;
+                                watcher_config_arc.store(Arc::new(new_cfg));
+                            }
+                            Err(e) => {
+                                warn!("Ignoring invalid hot-reloaded configuration: {e}");
+                            }
+                        },
+                        Err(e) => {
+                            warn!("Failed to read modified configuration file: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     // Load TLS configuration if configured
     let (dot_acceptor_mgr, doh_acceptor_mgr) = if let Some(tls_cfg) = config.get_tls_config() {

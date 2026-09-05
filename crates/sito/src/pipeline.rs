@@ -1,7 +1,7 @@
 //! DNS query execution pipeline.
 
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
-use hickory_proto::rr::{Name, RData};
+use hickory_proto::rr::{Name, RData, RecordType};
 use sito_cache::DnsCache;
 use sito_clients::{ClientRegistry, ParentalRegistry, ServiceRegistry, match_safe_search};
 use sito_core::FilterEngine;
@@ -40,6 +40,8 @@ pub struct DnsPipeline {
     services: Arc<ServiceRegistry>,
     rewrites: Arc<RewriteTable>,
     in_flight: Arc<AtomicUsize>,
+    querylog: Option<sito_stats::QueryLogSender>,
+    metrics: Option<sito_stats::MetricsRegistry>,
 }
 
 impl DnsPipeline {
@@ -67,7 +69,20 @@ impl DnsPipeline {
             services,
             rewrites,
             in_flight,
+            querylog: None,
+            metrics: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_stats(
+        mut self,
+        querylog: sito_stats::QueryLogSender,
+        metrics: sito_stats::MetricsRegistry,
+    ) -> Self {
+        self.querylog = Some(querylog);
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -92,16 +107,28 @@ impl QueryHandler for DnsPipeline {
             query_id = query_id
         );
 
-        async {
+        let start = std::time::Instant::now();
+
+        let outcome = async {
             let Some(first_query) = query.queries.first() else {
                 let mut err_resp = Message::new(query_id, MessageType::Response, OpCode::Query);
                 err_resp.metadata.response_code = ResponseCode::FormErr;
-                return Some(err_resp);
+                return (
+                    Some(err_resp),
+                    "formerr",
+                    None,
+                    None,
+                    None,
+                    false,
+                    String::new(),
+                    RecordType::A,
+                );
             };
 
             let qname = first_query.name();
             let qtype = first_query.query_type();
             let qclass = first_query.query_class();
+            let domain_str = qname.to_utf8();
 
             trace!(qname = %qname, qtype = ?qtype, "Processing DNS query");
 
@@ -121,7 +148,16 @@ impl QueryHandler for DnsPipeline {
                             self.config.filtering.blocking_ttl,
                         );
                         blocked_resp.metadata.id = query_id;
-                        return Some(blocked_resp);
+                        return (
+                            Some(blocked_resp),
+                            "blocked",
+                            None,
+                            None,
+                            None,
+                            false,
+                            domain_str,
+                            qtype,
+                        );
                     }
                 }
             }
@@ -136,10 +172,17 @@ impl QueryHandler for DnsPipeline {
                 );
                 let mut rewrite_resp = synthesize_records_response(&query, records);
                 rewrite_resp.metadata.id = query_id;
-                return Some(rewrite_resp);
+                return (
+                    Some(rewrite_resp),
+                    "rewritten",
+                    None,
+                    None,
+                    None,
+                    false,
+                    domain_str,
+                    qtype,
+                );
             }
-
-            let domain_str = qname.to_utf8();
 
             // ADR-0007 Stage 3: Standard filtering, Parental Control, and Service Blocking
             if policy.is_filtering_enabled {
@@ -161,7 +204,16 @@ impl QueryHandler for DnsPipeline {
                         self.config.filtering.blocking_ttl,
                     );
                     blocked_resp.metadata.id = query_id;
-                    return Some(blocked_resp);
+                    return (
+                        Some(blocked_resp),
+                        "blocked",
+                        Some("parental".to_string()),
+                        None,
+                        None,
+                        false,
+                        domain_str,
+                        qtype,
+                    );
                 }
 
                 // 3b. Blocked services (e.g. TikTok, YouTube, etc.)
@@ -185,7 +237,16 @@ impl QueryHandler for DnsPipeline {
                         self.config.filtering.blocking_ttl,
                     );
                     blocked_resp.metadata.id = query_id;
-                    return Some(blocked_resp);
+                    return (
+                        Some(blocked_resp),
+                        "blocked",
+                        Some("service".to_string()),
+                        None,
+                        None,
+                        false,
+                        domain_str,
+                        qtype,
+                    );
                 }
 
                 // 3c. Standard filter rules
@@ -203,7 +264,16 @@ impl QueryHandler for DnsPipeline {
                         self.config.filtering.blocking_ttl,
                     );
                     blocked_resp.metadata.id = query_id;
-                    return Some(blocked_resp);
+                    return (
+                        Some(blocked_resp),
+                        "blocked",
+                        None,
+                        None,
+                        None,
+                        false,
+                        domain_str,
+                        qtype,
+                    );
                 }
             }
 
@@ -218,7 +288,16 @@ impl QueryHandler for DnsPipeline {
                         );
                         let mut ss_resp = synthesize_cname_response(&query, &cname_target, 300);
                         ss_resp.metadata.id = query_id;
-                        return Some(ss_resp);
+                        return (
+                            Some(ss_resp),
+                            "rewritten",
+                            None,
+                            None,
+                            None,
+                            false,
+                            domain_str,
+                            qtype,
+                        );
                     }
                 }
             }
@@ -228,9 +307,21 @@ impl QueryHandler for DnsPipeline {
                 if let Some(mut cached_resp) = self.cache.get(qname, qtype, qclass).await {
                     info!(qname = %qname, qtype = ?qtype, "Cache hit");
                     cached_resp.metadata.id = query_id;
-                    return Some(cached_resp);
+                    return (
+                        Some(cached_resp),
+                        "allowed",
+                        Some("cache".to_string()),
+                        None,
+                        None,
+                        true,
+                        domain_str,
+                        qtype,
+                    );
                 }
                 debug!(qname = %qname, qtype = ?qtype, "Cache miss");
+                if let Some(ref m) = self.metrics {
+                    m.inc_cache_misses();
+                }
             }
 
             // 6. Upstream resolution
@@ -261,7 +352,16 @@ impl QueryHandler for DnsPipeline {
                                         self.config.filtering.blocking_ttl,
                                     );
                                     blocked_resp.metadata.id = query_id;
-                                    return Some(blocked_resp);
+                                    return (
+                                        Some(blocked_resp),
+                                        "blocked",
+                                        Some("cname_uncloaking".to_string()),
+                                        None,
+                                        None,
+                                        false,
+                                        domain_str,
+                                        qtype,
+                                    );
                                 }
                             }
                         }
@@ -279,7 +379,16 @@ impl QueryHandler for DnsPipeline {
                     {
                         self.cache.insert(&query, &upstream_resp).await;
                     }
-                    Some(upstream_resp)
+                    (
+                        Some(upstream_resp),
+                        "allowed",
+                        None,
+                        None,
+                        Some("upstream".to_string()),
+                        false,
+                        domain_str,
+                        qtype,
+                    )
                 }
                 Err(e) => {
                     warn!(
@@ -293,11 +402,63 @@ impl QueryHandler for DnsPipeline {
                     err_resp.metadata.recursion_desired = query.metadata.recursion_desired;
                     err_resp.metadata.recursion_available = true;
                     err_resp.queries.clone_from(&query.queries);
-                    Some(err_resp)
+                    (
+                        Some(err_resp),
+                        "servfail",
+                        None,
+                        None,
+                        None,
+                        false,
+                        domain_str,
+                        qtype,
+                    )
                 }
             }
         }
         .instrument(span)
-        .await
+        .await;
+
+        let (resp, verdict_str, rule_opt, source_opt, upstream_opt, from_cache, domain_str, qtype) =
+            outcome;
+
+        let elapsed = start.elapsed();
+        let elapsed_us = elapsed.as_micros() as i64;
+        let elapsed_secs = elapsed.as_secs_f64();
+        let qtype_num = u16::from(qtype);
+
+        if let Some(ref m) = self.metrics {
+            m.inc_queries("udp", qtype_num, verdict_str);
+            m.observe_query_duration(verdict_str, elapsed_secs);
+            if from_cache {
+                m.inc_cache_hits();
+            }
+        }
+
+        if !policy.ignore_query_log && !domain_str.is_empty() {
+            if let Some(ref ql) = self.querylog {
+                let rcode = resp
+                    .as_ref()
+                    .map(|r| u16::from(r.metadata.response_code) as u8);
+                let entry = sito_stats::QueryLogEntry {
+                    id: None,
+                    ts: chrono::Utc::now().timestamp_millis(),
+                    client_ip: client.ip.to_string(),
+                    client_name: client.client_name.clone(),
+                    qname: domain_str.trim_end_matches('.').to_string(),
+                    qtype: qtype_num,
+                    rcode,
+                    verdict: verdict_str.to_string(),
+                    rule: rule_opt,
+                    list_source: source_opt,
+                    upstream: upstream_opt,
+                    elapsed_us: Some(elapsed_us),
+                    dnssec: None,
+                    proto: "udp".to_string(),
+                };
+                let _ = ql.try_send(entry);
+            }
+        }
+
+        resp
     }
 }

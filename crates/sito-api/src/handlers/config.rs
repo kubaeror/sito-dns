@@ -178,49 +178,100 @@ pub async fn reload_config(
     ),
     security(("bearer_auth" = []), ("cookie_auth" = []))
 )]
-pub async fn download_backup(
-    _admin: RequireAdmin,
-    State(ctx): State<ServerContext>,
-) -> Result<Response, ProblemDetails> {
-    let config_content = tokio::fs::read(&ctx.config_path).await.unwrap_or_else(|_| {
-        toml::to_string_pretty(&*ctx.config.load())
-            .unwrap_or_default()
-            .into_bytes()
-    });
-
+/// Create a compressed .tar.gz archive containing config.toml and metadata.json
+pub fn create_backup_archive(config_toml: &str) -> anyhow::Result<Vec<u8>> {
     let metadata = BackupMetadata {
         version: "1.0".to_string(),
         timestamp: chrono::Utc::now().timestamp(),
         sito_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    let meta_json = serde_json::to_vec_pretty(&metadata)
-        .map_err(|e| ProblemDetails::internal_error(format!("JSON serialization failed: {e}")))?;
+    let meta_json = serde_json::to_vec_pretty(&metadata)?;
 
     let enc = GzEncoder::new(Vec::new(), Compression::default());
     let mut tar = Builder::new(enc);
 
     // Add config.toml
     let mut cfg_header = Header::new_gnu();
-    cfg_header.set_size(config_content.len() as u64);
+    cfg_header.set_size(config_toml.len() as u64);
     cfg_header.set_mode(0o644);
     cfg_header.set_cksum();
-    tar.append_data(&mut cfg_header, "config.toml", &config_content[..])
-        .map_err(|e| ProblemDetails::internal_error(format!("Tar packing failed: {e}")))?;
+    tar.append_data(&mut cfg_header, "config.toml", config_toml.as_bytes())?;
 
     // Add metadata.json
     let mut meta_header = Header::new_gnu();
     meta_header.set_size(meta_json.len() as u64);
     meta_header.set_mode(0o644);
     meta_header.set_cksum();
-    tar.append_data(&mut meta_header, "metadata.json", &meta_json[..])
-        .map_err(|e| ProblemDetails::internal_error(format!("Tar packing failed: {e}")))?;
+    tar.append_data(&mut meta_header, "metadata.json", &meta_json[..])?;
 
-    let enc = tar
-        .into_inner()
-        .map_err(|e| ProblemDetails::internal_error(format!("Tar finalizing failed: {e}")))?;
-    let compressed = enc
-        .finish()
-        .map_err(|e| ProblemDetails::internal_error(format!("Gzip compression failed: {e}")))?;
+    let enc = tar.into_inner()?;
+    let compressed = enc.finish()?;
+    Ok(compressed)
+}
+
+/// Extract and validate a compressed .tar.gz archive containing config.toml and metadata.json
+pub fn extract_backup_archive(archive_bytes: &[u8]) -> anyhow::Result<(String, BackupMetadata)> {
+    if archive_bytes.is_empty() {
+        anyhow::bail!("Archive body is empty");
+    }
+
+    let gz = GzDecoder::new(archive_bytes);
+    let mut archive = Archive::new(gz);
+
+    let mut restored_config_toml = None;
+    let mut restored_metadata = None;
+
+    let entries = archive.entries()?;
+    for entry_res in entries {
+        let mut entry = entry_res?;
+        let path = entry.path()?.to_string_lossy().to_string();
+
+        if path == "config.toml" || path.ends_with("/config.toml") {
+            let mut s = String::new();
+            entry.read_to_string(&mut s)?;
+            restored_config_toml = Some(s);
+        } else if path == "metadata.json" || path.ends_with("/metadata.json") {
+            let mut s = String::new();
+            entry.read_to_string(&mut s)?;
+            if let Ok(meta) = serde_json::from_str::<BackupMetadata>(&s) {
+                restored_metadata = Some(meta);
+            }
+        }
+    }
+
+    let meta =
+        restored_metadata.ok_or_else(|| anyhow::anyhow!("Archive is missing metadata.json"))?;
+    let config_toml = restored_config_toml
+        .ok_or_else(|| anyhow::anyhow!("Archive does not contain a valid config.toml"))?;
+
+    // Pre-validation of restored configuration
+    Config::from_toml_str(&config_toml)
+        .map_err(|e| anyhow::anyhow!("Restored configuration validation failed: {e}"))?;
+
+    Ok((config_toml, meta))
+}
+
+/// Download a complete configuration backup archive (.tar.gz).
+#[utoipa::path(
+    get,
+    path = "/api/v1/config/backup",
+    responses(
+        (status = 200, description = "Gzipped tar archive containing config and metadata", content_type = "application/gzip"),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []), ("cookie_auth" = []))
+)]
+pub async fn download_backup(
+    _admin: RequireAdmin,
+    State(ctx): State<ServerContext>,
+) -> Result<Response, ProblemDetails> {
+    let config_content = tokio::fs::read_to_string(&ctx.config_path)
+        .await
+        .unwrap_or_else(|_| toml::to_string_pretty(&*ctx.config.load()).unwrap_or_default());
+
+    let compressed = create_backup_archive(&config_content)
+        .map_err(|e| ProblemDetails::internal_error(format!("Backup archiving failed: {e}")))?;
 
     let filename = format!(
         "sito-backup-{}.tar.gz",
@@ -258,54 +309,8 @@ pub async fn prepare_restore(
     State(ctx): State<ServerContext>,
     body: Bytes,
 ) -> Result<Json<RestorePreparedResponse>, ProblemDetails> {
-    if body.is_empty() {
-        return Err(ProblemDetails::bad_request("Archive body is empty"));
-    }
-
-    let gz = GzDecoder::new(&body[..]);
-    let mut archive = Archive::new(gz);
-
-    let mut restored_config_toml = None;
-    let mut found_metadata = false;
-
-    let entries = archive
-        .entries()
-        .map_err(|e| ProblemDetails::bad_request(format!("Invalid tar.gz archive: {e}")))?;
-
-    for entry_res in entries {
-        let mut entry =
-            entry_res.map_err(|e| ProblemDetails::bad_request(format!("Corrupted entry: {e}")))?;
-        let path = entry
-            .path()
-            .map_err(|e| ProblemDetails::bad_request(format!("Invalid path: {e}")))?
-            .to_string_lossy()
-            .to_string();
-
-        if path == "config.toml" || path.ends_with("/config.toml") {
-            let mut s = String::new();
-            entry
-                .read_to_string(&mut s)
-                .map_err(|e| ProblemDetails::bad_request(format!("Read config error: {e}")))?;
-            restored_config_toml = Some(s);
-        } else if path == "metadata.json" || path.ends_with("/metadata.json") {
-            found_metadata = true;
-        }
-    }
-
-    if !found_metadata {
-        return Err(ProblemDetails::bad_request(
-            "Archive is missing metadata.json",
-        ));
-    }
-
-    let config_toml = restored_config_toml.ok_or_else(|| {
-        ProblemDetails::bad_request("Archive does not contain a valid config.toml")
-    })?;
-
-    // Pre-validation of restored configuration
-    let _parsed = Config::from_toml_str(&config_toml).map_err(|e| {
-        ProblemDetails::bad_request(format!("Restored configuration validation failed: {e}"))
-    })?;
+    let (config_toml, _meta) =
+        extract_backup_archive(&body).map_err(|e| ProblemDetails::bad_request(e.to_string()))?;
 
     let mut token_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut token_bytes);
