@@ -18,7 +18,12 @@ sito-dnssec.workspace = true
 sito-clients.workspace = true
 sito-rewrites.workspace = true
 arc-swap.workspace = true
+bytes.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+h3.workspace = true
+h3-quinn.workspace = true
+http.workspace = true
+quinn.workspace = true
 toml.workspace = true
 hickory-proto.workspace = true
 tokio.workspace = true

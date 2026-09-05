@@ -16,8 +16,10 @@ use sito_dnssec::DnssecValidator;
 use sito_filter::HostsFilterEngine;
 use sito_stats::{MetricsRegistry, QueryLogWriter, StatsDb};
 use sito_transport::{
-    CertWatcher, DohConfig, DotConfig, TcpConfig, TlsAcceptorManager, UdpConfig,
-    load_server_config, start_doh_listener, start_dot_listener, start_tcp_listener,
+    AcmeServiceConfig, CertWatcher, Doh3Config, DohConfig, DoqConfig, DotConfig, TcpConfig,
+    TlsAcceptorManager, UdpConfig, generate_self_signed_cert, load_server_config,
+    load_server_config_with_challenges, start_acme_manager, start_doh_listener,
+    start_doh3_listener, start_doq_listener, start_dot_listener, start_tcp_listener,
     start_udp_listener,
 };
 use sito_upstream::{BootstrapResolver, UpstreamManager};
@@ -245,53 +247,150 @@ pub async fn run_server_full(
         }
     });
 
-    // Load TLS configuration if configured
-    let (dot_acceptor_mgr, doh_acceptor_mgr) = if let Some(tls_cfg) = config.get_tls_config() {
-        if let (Some(cert), Some(key)) = (&tls_cfg.cert, &tls_cfg.key) {
-            let sni_tuples = tls_cfg.sni_tuples();
-            let dot_mgr = match load_server_config(cert, key, &sni_tuples, vec![b"dot".to_vec()]) {
-                Ok(cfg) => {
-                    let mgr = TlsAcceptorManager::new(cfg);
-                    let _ =
-                        CertWatcher::start(cert, key, &sni_tuples, &[b"dot".to_vec()], mgr.clone());
-                    Some(mgr)
-                }
-                Err(e) => {
-                    warn!("Failed to initialize DoT TLS configuration: {}", e);
-                    None
-                }
-            };
+    // ACME and TLS setup
+    let acme_cfg = config.get_acme_config();
+    let is_acme_enabled = acme_cfg
+        .as_ref()
+        .is_some_and(|a| a.enabled && !a.domains.is_empty());
 
-            let doh_mgr = match load_server_config(
+    let (cert_file, key_file, sni_tuples) = if let Some(tls_cfg) = config.get_tls_config() {
+        if let (Some(cert), Some(key)) = (&tls_cfg.cert, &tls_cfg.key) {
+            (Some(cert.clone()), Some(key.clone()), tls_cfg.sni_tuples())
+        } else {
+            (None, None, Vec::new())
+        }
+    } else {
+        (None, None, Vec::new())
+    };
+
+    // If static cert/key not provided, but ACME is enabled, establish ACME storage directory and bootstrap cert
+    let (effective_cert, effective_key) = match (cert_file, key_file) {
+        (Some(c), Some(k)) => (Some(c), Some(k)),
+        _ if is_acme_enabled => {
+            let acme = acme_cfg.as_ref().unwrap();
+            let storage_dir = acme
+                .cache_dir
+                .clone()
+                .unwrap_or_else(|| config.server.data_dir.join("acme"));
+            let cert_path = storage_dir.join("cert.pem");
+            let key_path = storage_dir.join("key.pem");
+
+            if !cert_path.exists() || !key_path.exists() {
+                let _ = tokio::fs::create_dir_all(&storage_dir).await;
+                match generate_self_signed_cert(&acme.domains) {
+                    Ok((cert_pem, key_pem)) => {
+                        let _ = tokio::fs::write(&cert_path, cert_pem).await;
+                        let _ = tokio::fs::write(&key_path, key_pem).await;
+                        info!(
+                            "Generated bootstrap self-signed certificate in {:?}",
+                            storage_dir
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to generate bootstrap self-signed certificate: {e}");
+                    }
+                }
+            }
+            if cert_path.exists() && key_path.exists() {
+                (Some(cert_path), Some(key_path))
+            } else {
+                (None, None)
+            }
+        }
+        _ => (None, None),
+    };
+
+    let http01_challenges = Arc::new(dashmap::DashMap::<String, String>::new());
+    let challenge_keys = Arc::new(dashmap::DashMap::new());
+
+    let (dot_acceptor_mgr, doh_acceptor_mgr, doq_acceptor_mgr, doh3_acceptor_mgr) =
+        if let (Some(cert), Some(key)) = (&effective_cert, &effective_key) {
+            let doh_alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()];
+            let doh_mgr = match load_server_config_with_challenges(
                 cert,
                 key,
                 &sni_tuples,
-                vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+                doh_alpn.clone(),
+                challenge_keys.clone(),
             ) {
                 Ok(cfg) => {
-                    let mgr = TlsAcceptorManager::new(cfg);
-                    let _ = CertWatcher::start(
-                        cert,
-                        key,
-                        &sni_tuples,
-                        &[b"h2".to_vec(), b"http/1.1".to_vec()],
-                        mgr.clone(),
-                    );
+                    let mgr = TlsAcceptorManager::with_challenge_keys(cfg, challenge_keys.clone());
+                    let _ = CertWatcher::start(cert, key, &sni_tuples, &doh_alpn, mgr.clone());
                     Some(mgr)
                 }
                 Err(e) => {
-                    warn!("Failed to initialize DoH TLS configuration: {}", e);
+                    warn!("Failed to initialize DoH TLS configuration: {e}");
                     None
                 }
             };
 
-            (dot_mgr, doh_mgr)
+            let dot_alpn = vec![b"dot".to_vec()];
+            let dot_mgr = match load_server_config(cert, key, &sni_tuples, dot_alpn.clone()) {
+                Ok(cfg) => {
+                    let mgr = TlsAcceptorManager::new(cfg);
+                    let _ = CertWatcher::start(cert, key, &sni_tuples, &dot_alpn, mgr.clone());
+                    Some(mgr)
+                }
+                Err(e) => {
+                    warn!("Failed to initialize DoT TLS configuration: {e}");
+                    None
+                }
+            };
+
+            let doq_alpn = vec![b"doq".to_vec()];
+            let doq_mgr = match load_server_config(cert, key, &sni_tuples, doq_alpn.clone()) {
+                Ok(cfg) => {
+                    let mgr = TlsAcceptorManager::new(cfg);
+                    let _ = CertWatcher::start(cert, key, &sni_tuples, &doq_alpn, mgr.clone());
+                    Some(mgr)
+                }
+                Err(e) => {
+                    warn!("Failed to initialize DoQ TLS configuration: {e}");
+                    None
+                }
+            };
+
+            let doh3_alpn = vec![b"h3".to_vec()];
+            let doh3_mgr = match load_server_config(cert, key, &sni_tuples, doh3_alpn.clone()) {
+                Ok(cfg) => {
+                    let mgr = TlsAcceptorManager::new(cfg);
+                    let _ = CertWatcher::start(cert, key, &sni_tuples, &doh3_alpn, mgr.clone());
+                    Some(mgr)
+                }
+                Err(e) => {
+                    warn!("Failed to initialize DoH3 TLS configuration: {e}");
+                    None
+                }
+            };
+
+            (dot_mgr, doh_mgr, doq_mgr, doh3_mgr)
         } else {
-            (None, None)
+            (None, None, None, None)
+        };
+
+    // If ACME is enabled, start ACME renewal background manager
+    if let Some(acme) = acme_cfg {
+        if acme.enabled && !acme.domains.is_empty() {
+            let email = acme
+                .email
+                .clone()
+                .unwrap_or_else(|| "admin@example.com".to_string());
+            let storage_dir = acme
+                .cache_dir
+                .clone()
+                .unwrap_or_else(|| config.server.data_dir.join("acme"));
+            let doh_alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()];
+            let service_cfg =
+                AcmeServiceConfig::new(email, acme.domains, storage_dir).with_staging(acme.staging);
+            let _acme_handle = start_acme_manager(
+                service_cfg,
+                doh_acceptor_mgr.clone(),
+                Some(http01_challenges.clone()),
+                doh_alpn,
+                shutdown_rx.clone(),
+            );
         }
-    } else {
-        (None, None)
-    };
+    }
 
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
 
@@ -339,12 +438,47 @@ pub async fn run_server_full(
         // Start DoH listener if doh_port > 0 and (TLS configured or non-default port)
         if config.dns.doh_port > 0 && (doh_acceptor_mgr.is_some() || config.dns.doh_port != 443) {
             let doh_addr = SocketAddr::new(*bind_ip, config.dns.doh_port);
-            let mut doh_config = DohConfig::new(doh_addr, doh_acceptor_mgr.clone());
+            let mut doh_config = DohConfig::new(doh_addr, doh_acceptor_mgr.clone())
+                .with_http01_challenges(http01_challenges.clone())
+                .with_alt_svc_port(if config.dns.doh3_port > 0 {
+                    Some(config.dns.doh3_port)
+                } else {
+                    None
+                });
             doh_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
             doh_config.max_connections = config.dns.max_tcp_connections;
             let doh_handle =
                 start_doh_listener(doh_config, pipeline.clone(), shutdown_rx.clone()).await?;
             all_handles.push(doh_handle);
+        }
+
+        // Start DoQ listener if doq_port > 0 and TLS is configured
+        if config.dns.doq_port > 0 {
+            if let Some(ref doq_mgr) = doq_acceptor_mgr {
+                let doq_addr = SocketAddr::new(*bind_ip, config.dns.doq_port);
+                let mut doq_config = DoqConfig::new(doq_addr, Some(doq_mgr.clone()));
+                doq_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+                doq_config.max_connections = config.dns.max_tcp_connections;
+                match start_doq_listener(doq_config, pipeline.clone(), shutdown_rx.clone()).await {
+                    Ok(doq_handle) => all_handles.push(doq_handle),
+                    Err(e) => warn!("Failed to start DoQ listener on {doq_addr}: {e}"),
+                }
+            }
+        }
+
+        // Start DoH3 listener if doh3_port > 0 and TLS is configured
+        if config.dns.doh3_port > 0 {
+            if let Some(ref doh3_mgr) = doh3_acceptor_mgr {
+                let doh3_addr = SocketAddr::new(*bind_ip, config.dns.doh3_port);
+                let mut doh3_config = Doh3Config::new(doh3_addr, Some(doh3_mgr.clone()));
+                doh3_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+                doh3_config.max_connections = config.dns.max_tcp_connections;
+                match start_doh3_listener(doh3_config, pipeline.clone(), shutdown_rx.clone()).await
+                {
+                    Ok(doh3_handle) => all_handles.push(doh3_handle),
+                    Err(e) => warn!("Failed to start DoH3 listener on {doh3_addr}: {e}"),
+                }
+            }
         }
     }
 

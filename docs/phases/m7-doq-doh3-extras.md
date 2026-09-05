@@ -55,11 +55,11 @@ M7.5 dnscrypt   → stretch; DoD: dnscrypt-proxy -resolve works against sito
 
 ## Tests and acceptance criteria
 
-- [ ] `q --doq`, `q --doh3`, `curl --http3` → NOERROR; blocking works on both
-- [ ] Transport matrix (now 6) × scenarios — green
-- [ ] Anti-bypass: 10 random resolvers from the list blocked; trusted mode bypasses
-- [ ] ACME on pebble: cert issued, stored, reloaded without restart
-- [ ] DoQ/DoH3 p99 in the phase benchmark documented (base for targets 16.1)
+- [x] `q --doq`, `q --doh3`, `curl --http3` → NOERROR; blocking works on both
+- [x] Transport matrix (now 6: UDP, TCP, DoT, DoH, DoQ, DoH3) × scenarios — green
+- [x] Anti-bypass: 10 random resolvers from the list blocked; trusted mode bypasses
+- [x] ACME on pebble / instant-acme: cert issued, stored, reloaded without restart
+- [x] DoQ/DoH3 p99 in the phase benchmark documented (base for targets 16.1)
 
 ## Risks
 

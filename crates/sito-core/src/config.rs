@@ -21,6 +21,8 @@ pub struct Config {
     pub filtering: FilteringConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme: Option<AcmeConfig>,
 
     // Additional forward-compatible sections that might be present in full configs
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,6 +54,7 @@ impl Default for Config {
             upstream: UpstreamConfig::default(),
             filtering: FilteringConfig::default(),
             tls: None,
+            acme: None,
             clients: None,
             rewrites: None,
             web: None,
@@ -90,6 +93,9 @@ impl Config {
         if let Some(ref tls) = self.tls {
             tls.validate()?;
         }
+        if let Some(ref acme) = self.get_acme_config() {
+            acme.validate()?;
+        }
 
         Ok(())
     }
@@ -101,6 +107,54 @@ impl Config {
         }
         if let Some(ref tls) = self.tls {
             return Some(tls);
+        }
+        None
+    }
+
+    /// Resolves the effective ACME configuration (checking `acme` first, then `web.acme_*`).
+    pub fn get_acme_config(&self) -> Option<AcmeConfig> {
+        if let Some(ref acme) = self.acme {
+            return Some(acme.clone());
+        }
+        if let Some(ref web_val) = self.web {
+            if let Ok(web_table) = web_val.clone().try_into::<toml::Table>() {
+                let enabled = web_table
+                    .get("acme_enabled")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false);
+                let email = web_table
+                    .get("acme_email")
+                    .and_then(toml::Value::as_str)
+                    .map(std::string::ToString::to_string);
+                let domains: Vec<String> = web_table
+                    .get("acme_domains")
+                    .and_then(toml::Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let staging = web_table
+                    .get("acme_staging")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false);
+                let cache_dir = web_table
+                    .get("acme_cache_dir")
+                    .and_then(toml::Value::as_str)
+                    .map(PathBuf::from);
+
+                if enabled || !domains.is_empty() || email.is_some() {
+                    return Some(AcmeConfig {
+                        enabled,
+                        email,
+                        domains,
+                        staging,
+                        cache_dir,
+                        http_port: default_acme_http_port(),
+                    });
+                }
+            }
         }
         None
     }
@@ -200,6 +254,8 @@ pub struct DnsConfig {
     pub doh_port: u16,
     #[serde(default = "default_dns_doq_port")]
     pub doq_port: u16,
+    #[serde(default = "default_dns_doh3_port")]
+    pub doh3_port: u16,
     #[serde(default)]
     pub doh_dedicated_hostname: String,
     #[serde(default)]
@@ -236,6 +292,9 @@ fn default_dns_doh_port() -> u16 {
 fn default_dns_doq_port() -> u16 {
     853
 }
+fn default_dns_doh3_port() -> u16 {
+    443
+}
 fn default_dns_edns_udp_size() -> u16 {
     1232
 }
@@ -254,6 +313,7 @@ impl Default for DnsConfig {
             dot_port: default_dns_dot_port(),
             doh_port: default_dns_doh_port(),
             doq_port: default_dns_doq_port(),
+            doh3_port: default_dns_doh3_port(),
             doh_dedicated_hostname: String::new(),
             dot_padding: false,
             tls: None,
@@ -776,6 +836,61 @@ impl FilteringConfig {
                     format!("filtering.lists[{i}].url"),
                     "filter list URL cannot be empty",
                 ));
+            }
+        }
+        match self.anti_doh_bypass.as_str() {
+            "off" | "block_all" | "block_except_trusted" => {}
+            other => {
+                return Err(ConfigError::validation(
+                    "filtering.anti_doh_bypass",
+                    format!(
+                        "invalid anti_doh_bypass mode '{other}', expected 'off', 'block_all', or 'block_except_trusted'"
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// ACME automated certificate configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AcmeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub staging: bool,
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    #[serde(default = "default_acme_http_port")]
+    pub http_port: u16,
+}
+
+fn default_acme_http_port() -> u16 {
+    80
+}
+
+impl AcmeConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.enabled {
+            if self.domains.is_empty() {
+                return Err(ConfigError::validation(
+                    "acme.domains",
+                    "acme.domains cannot be empty when ACME is enabled",
+                ));
+            }
+            for (idx, domain) in self.domains.iter().enumerate() {
+                if domain.trim().is_empty() {
+                    return Err(ConfigError::validation(
+                        format!("acme.domains[{idx}]"),
+                        "ACME domain cannot be empty",
+                    ));
+                }
             }
         }
         Ok(())

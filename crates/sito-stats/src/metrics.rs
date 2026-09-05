@@ -65,6 +65,7 @@ pub struct MetricsRegistry {
     dnssec_bogus: Arc<Mutex<BTreeMap<String, u64>>>,
     clients_identified: Arc<Mutex<BTreeMap<String, u64>>>,
     doh_bypass_blocked: Arc<AtomicU64>,
+    transport_queries_total: Arc<Mutex<BTreeMap<String, u64>>>,
     ha_slaves_connected: Arc<AtomicI64>,
     ha_config_version: Arc<Mutex<BTreeMap<String, f64>>>,
     querylog_dropped: Arc<AtomicU64>,
@@ -95,6 +96,7 @@ impl MetricsRegistry {
             dnssec_bogus: Arc::new(Mutex::new(BTreeMap::new())),
             clients_identified: Arc::new(Mutex::new(BTreeMap::new())),
             doh_bypass_blocked: Arc::new(AtomicU64::new(0)),
+            transport_queries_total: Arc::new(Mutex::new(BTreeMap::new())),
             ha_slaves_connected: Arc::new(AtomicI64::new(0)),
             ha_config_version: Arc::new(Mutex::new(BTreeMap::new())),
             querylog_dropped: Arc::new(AtomicU64::new(0)),
@@ -107,6 +109,13 @@ impl MetricsRegistry {
         let mut map = self.queries_total.lock().unwrap();
         let key = (proto.to_string(), qtype.to_string(), verdict.to_string());
         *map.entry(key).or_insert(0) += 1;
+        let mut t_map = self.transport_queries_total.lock().unwrap();
+        *t_map.entry(proto.to_string()).or_insert(0) += 1;
+    }
+
+    pub fn inc_transport_query(&self, proto: &str) {
+        let mut map = self.transport_queries_total.lock().unwrap();
+        *map.entry(proto.to_string()).or_insert(0) += 1;
     }
 
     pub fn observe_query_duration(&self, verdict: &str, duration_secs: f64) {
@@ -209,6 +218,23 @@ impl MetricsRegistry {
                     let _ = writeln!(
                         out,
                         "sito_queries_total{{proto=\"{proto}\",qtype=\"{qtype}\",verdict=\"{verdict}\"}} {count}"
+                    );
+                }
+            }
+        }
+
+        // 1b. sito_transport_queries_total
+        out.push_str("# HELP sito_transport_queries_total Total DNS queries by transport\n");
+        out.push_str("# TYPE sito_transport_queries_total counter\n");
+        {
+            let map = self.transport_queries_total.lock().unwrap();
+            if map.is_empty() {
+                out.push_str("sito_transport_queries_total{proto=\"udp\"} 0\n");
+            } else {
+                for (proto, count) in map.iter() {
+                    let _ = writeln!(
+                        out,
+                        "sito_transport_queries_total{{proto=\"{proto}\"}} {count}"
                     );
                 }
             }

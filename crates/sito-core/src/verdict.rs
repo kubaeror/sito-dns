@@ -51,6 +51,7 @@ pub enum BlockReason {
     Rule(RuleRef),
     Parental,
     Service(String),
+    AntiDohBypass,
 }
 
 /// Action to perform when rewriting a DNS query or response.

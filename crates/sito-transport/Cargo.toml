@@ -26,6 +26,15 @@ base64.workspace = true
 notify.workspace = true
 x509-parser.workspace = true
 time.workspace = true
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+bytes.workspace = true
+http.workspace = true
+instant-acme.workspace = true
+rcgen.workspace = true
+ring.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

@@ -3,7 +3,10 @@
 //! Multi-protocol DNS transport listeners (UDP, TCP) with SO_REUSEPORT,
 //! IP_PKTINFO, EDNS(0), RFC 7766 pipelining, and per-IP rate limiting.
 
+pub mod acme;
 pub mod doh;
+pub mod doh3;
+pub mod doq;
 pub mod dot;
 pub mod handler;
 pub mod limiter;
@@ -12,14 +15,21 @@ pub mod tcp;
 pub mod tls;
 pub mod udp;
 
+pub use acme::{
+    AcmeServiceConfig, days_until_expiration, generate_tls_alpn_01_cert,
+    obtain_or_renew_certificate, start_acme_manager,
+};
 pub use doh::{DohConfig, start_doh_listener};
+pub use doh3::{Doh3Config, build_quinn_h3_server_config, start_doh3_listener};
+pub use doq::{DoqConfig, build_quinn_server_config, start_doq_listener};
 pub use dot::{DotConfig, start_dot_listener};
 pub use handler::QueryHandler;
 pub use limiter::RateLimiter;
 pub use tcp::{TcpConfig, start_tcp_listener};
 pub use tls::{
     CertWatcher, DynamicCertResolver, TlsAcceptorManager, TlsError, build_server_config,
-    load_certificates, load_private_key, load_server_config, validate_certificate_validity,
+    generate_self_signed_cert, load_certificates, load_private_key, load_server_config,
+    load_server_config_with_challenges, validate_certificate_validity,
 };
 pub use udp::{UdpConfig, create_reuseport_udp_socket, start_udp_listener};
 

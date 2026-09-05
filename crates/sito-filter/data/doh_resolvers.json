@@ -1,0 +1,179 @@
+[
+  {
+    "name": "Cloudflare",
+    "domains": [
+      "cloudflare-dns.com",
+      "one.one.one.one",
+      "1dot1dot1dot1.cloudflare-dns.com",
+      "dns.cloudflare.com",
+      "security.cloudflare-dns.com",
+      "family.cloudflare-dns.com"
+    ],
+    "ips": [
+      "1.1.1.1",
+      "1.0.0.1",
+      "1.1.1.2",
+      "1.0.0.2",
+      "1.1.1.3",
+      "1.0.0.3",
+      "162.159.36.1",
+      "162.159.46.1",
+      "2606:4700:4700::1111",
+      "2606:4700:4700::1001",
+      "2606:4700:4700::1112",
+      "2606:4700:4700::1002",
+      "2606:4700:4700::1113",
+      "2606:4700:4700::1003"
+    ]
+  },
+  {
+    "name": "Google",
+    "domains": [
+      "dns.google",
+      "dns.google.com"
+    ],
+    "ips": [
+      "8.8.8.8",
+      "8.8.4.4",
+      "2001:4860:4860::8888",
+      "2001:4860:4860::8844"
+    ]
+  },
+  {
+    "name": "Quad9",
+    "domains": [
+      "dns.quad9.net",
+      "dns9.quad9.net",
+      "dns10.quad9.net",
+      "dns11.quad9.net"
+    ],
+    "ips": [
+      "9.9.9.9",
+      "149.112.112.112",
+      "9.9.9.10",
+      "149.112.112.10",
+      "9.9.9.11",
+      "149.112.112.11",
+      "2620:fe::fe",
+      "2620:fe::9",
+      "2620:fe::10",
+      "2620:fe::11"
+    ]
+  },
+  {
+    "name": "AdGuard",
+    "domains": [
+      "dns.adguard-dns.com",
+      "dns-family.adguard-dns.com",
+      "dns-unfiltered.adguard-dns.com"
+    ],
+    "ips": [
+      "94.140.14.14",
+      "94.140.15.15",
+      "94.140.14.15",
+      "94.140.15.16",
+      "94.140.14.140",
+      "94.140.14.141",
+      "2a10:50c0::ad1:ff",
+      "2a10:50c0::ad2:ff"
+    ]
+  },
+  {
+    "name": "NextDNS",
+    "domains": [
+      "dns.nextdns.io",
+      "*.dns.nextdns.io",
+      "nextdns.io"
+    ],
+    "ips": [
+      "45.90.28.0",
+      "45.90.30.0",
+      "45.90.28.1",
+      "45.90.30.1",
+      "2a07:a8c0::",
+      "2a07:a8c1::"
+    ]
+  },
+  {
+    "name": "ControlD",
+    "domains": [
+      "dns.controld.com",
+      "freedns.controld.com",
+      "p0.freedns.controld.com"
+    ],
+    "ips": [
+      "76.76.2.0",
+      "76.76.10.0",
+      "76.76.2.1",
+      "76.76.10.1",
+      "2606:1a40::",
+      "2606:1a40:1::"
+    ]
+  },
+  {
+    "name": "Mullvad",
+    "domains": [
+      "dns.mullvad.net",
+      "adblock.dns.mullvad.net"
+    ],
+    "ips": [
+      "194.242.2.2",
+      "194.242.2.3",
+      "194.242.2.4",
+      "194.242.2.5",
+      "194.242.2.9",
+      "2a07:e340::2"
+    ]
+  },
+  {
+    "name": "OpenDNS",
+    "domains": [
+      "dns.opendns.com",
+      "doh.opendns.com",
+      "doh.familyshield.opendns.com"
+    ],
+    "ips": [
+      "208.67.222.222",
+      "208.67.220.220",
+      "208.67.222.123",
+      "208.67.220.123",
+      "2620:119:35::35",
+      "2620:119:53::53"
+    ]
+  },
+  {
+    "name": "CleanBrowsing",
+    "domains": [
+      "doh.cleanbrowsing.org"
+    ],
+    "ips": [
+      "185.228.168.9",
+      "185.228.169.9",
+      "185.228.168.168",
+      "185.228.169.168"
+    ]
+  },
+  {
+    "name": "AliDNS",
+    "domains": [
+      "dns.alidns.com"
+    ],
+    "ips": [
+      "223.5.5.5",
+      "223.6.6.6",
+      "2400:3200::1",
+      "2400:3200:baba::1"
+    ]
+  },
+  {
+    "name": "DNSPod",
+    "domains": [
+      "doh.pub",
+      "dot.pub"
+    ],
+    "ips": [
+      "1.12.12.12",
+      "120.53.53.53"
+    ]
+  }
+]

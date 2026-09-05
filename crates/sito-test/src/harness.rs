@@ -31,6 +31,8 @@ impl TestServerInstance {
 
         let mut dot_port = config.dns.dot_port;
         let mut doh_port = config.dns.doh_port;
+        let mut doq_port = config.dns.doq_port;
+        let mut doh3_port = config.dns.doh3_port;
         let has_tls = config.get_tls_config().is_some();
 
         if has_tls {
@@ -45,6 +47,18 @@ impl TestServerInstance {
                 doh_port = p.local_addr()?.port();
                 drop(p);
                 config.dns.doh_port = doh_port;
+            }
+            if doq_port == 853 || doq_port == 0 {
+                let p = std::net::UdpSocket::bind("127.0.0.1:0")?;
+                doq_port = p.local_addr()?.port();
+                drop(p);
+                config.dns.doq_port = doq_port;
+            }
+            if doh3_port == 443 || doh3_port == 0 {
+                let p = std::net::UdpSocket::bind("127.0.0.1:0")?;
+                doh3_port = p.local_addr()?.port();
+                drop(p);
+                config.dns.doh3_port = doh3_port;
             }
         }
 

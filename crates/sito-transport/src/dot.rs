@@ -142,8 +142,8 @@ async fn handle_dot_connection<H: QueryHandler>(
         .server_name()
         .map(ToString::to_string);
     let client_ctx = match server_name {
-        Some(ref sni) => ClientContext::with_sni(peer_addr.ip(), sni),
-        None => ClientContext::new(peer_addr.ip()),
+        Some(ref sni) => ClientContext::with_sni(peer_addr.ip(), sni).with_proto("dot"),
+        None => ClientContext::new(peer_addr.ip()).with_proto("dot"),
     };
 
     let (mut reader, mut writer) = tokio::io::split(tls_stream);

@@ -319,6 +319,12 @@ pub async fn check_filtering(
                 None,
                 Some(format!("service:{svc}")),
             ),
+            sito_core::verdict::BlockReason::AntiDohBypass => (
+                "blocked".to_string(),
+                Some("anti_doh_bypass".to_string()),
+                Some("anti_doh_bypass".to_string()),
+                Some("anti_doh_bypass".to_string()),
+            ),
         },
         sito_core::verdict::Verdict::Rewrite(_) => ("rewritten".to_string(), None, None, None),
     };

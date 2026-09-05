@@ -8,12 +8,13 @@ use sito_core::FilterEngine;
 use sito_core::client::ClientContext;
 use sito_core::config::Config;
 use sito_dnssec::DnssecValidator;
-use sito_filter::HostsFilterEngine;
+use sito_filter::{AntiBypassRegistry, HostsFilterEngine};
 use sito_proto::synthesize_blocked_response;
 use sito_proto::wire::{synthesize_cname_response, synthesize_records_response};
 use sito_rewrites::RewriteTable;
 use sito_transport::QueryHandler;
 use sito_upstream::UpstreamManager;
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,6 +33,7 @@ impl Drop for InFlightGuard {
 pub struct DnsPipeline {
     config: Arc<Config>,
     filter: Arc<HostsFilterEngine>,
+    anti_bypass: Arc<AntiBypassRegistry>,
     cache: Arc<DnsCache>,
     upstream: Arc<UpstreamManager>,
     dnssec: Arc<DnssecValidator>,
@@ -61,6 +63,7 @@ impl DnsPipeline {
         Self {
             config,
             filter,
+            anti_bypass: Arc::new(AntiBypassRegistry::bundled()),
             cache,
             upstream,
             dnssec,
@@ -72,6 +75,12 @@ impl DnsPipeline {
             querylog: None,
             metrics: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_anti_bypass(mut self, anti_bypass: Arc<AntiBypassRegistry>) -> Self {
+        self.anti_bypass = anti_bypass;
+        self
     }
 
     #[must_use]
@@ -131,6 +140,39 @@ impl QueryHandler for DnsPipeline {
             let domain_str = qname.to_utf8();
 
             trace!(qname = %qname, qtype = ?qtype, "Processing DNS query");
+
+            let bypass_check_needed = match self.config.filtering.anti_doh_bypass.as_str() {
+                "block_all" => true,
+                "block_except_trusted" => !policy.trusted,
+                _ => false,
+            };
+
+            // Anti-DoH bypass: check if domain matches known public resolver
+            if bypass_check_needed && self.anti_bypass.matches_domain(&domain_str) {
+                info!(
+                    qname = %qname,
+                    "Query blocked by Anti-DoH bypass rule (resolver domain)"
+                );
+                if let Some(ref m) = self.metrics {
+                    m.inc_doh_bypass_blocked();
+                }
+                let mut blocked_resp = synthesize_blocked_response(
+                    &query,
+                    &self.config.filtering.blocking_mode,
+                    self.config.filtering.blocking_ttl,
+                );
+                blocked_resp.metadata.id = query_id;
+                return (
+                    Some(blocked_resp),
+                    "blocked",
+                    Some("anti_doh_bypass".to_string()),
+                    Some("anti_doh_bypass".to_string()),
+                    None,
+                    false,
+                    domain_str,
+                    qtype,
+                );
+            }
 
             // ADR-0007 Stage 1: $important filter rules (takes precedence over local rewrites)
             if policy.is_filtering_enabled {
@@ -305,6 +347,36 @@ impl QueryHandler for DnsPipeline {
             // 5. Cache lookup
             if self.config.dns.cache.enabled {
                 if let Some(mut cached_resp) = self.cache.get(qname, qtype, qclass).await {
+                    if bypass_check_needed {
+                        let has_bypass_ip = cached_resp.answers.iter().any(|rec| match &rec.data {
+                            RData::A(a) => self.anti_bypass.matches_ip(&IpAddr::V4(a.0)),
+                            RData::AAAA(aaaa) => self.anti_bypass.matches_ip(&IpAddr::V6(aaaa.0)),
+                            _ => false,
+                        });
+                        if has_bypass_ip {
+                            info!(qname = %qname, "Cached query blocked by Anti-DoH bypass (resolved IP)");
+                            if let Some(ref m) = self.metrics {
+                                m.inc_doh_bypass_blocked();
+                            }
+                            let mut blocked_resp = synthesize_blocked_response(
+                                &query,
+                                &self.config.filtering.blocking_mode,
+                                self.config.filtering.blocking_ttl,
+                            );
+                            blocked_resp.metadata.id = query_id;
+                            return (
+                                Some(blocked_resp),
+                                "blocked",
+                                Some("anti_doh_bypass".to_string()),
+                                Some("anti_doh_bypass".to_string()),
+                                None,
+                                false,
+                                domain_str,
+                                qtype,
+                            );
+                        }
+                    }
+
                     info!(qname = %qname, qtype = ?qtype, "Cache hit");
                     cached_resp.metadata.id = query_id;
                     return (
@@ -328,6 +400,40 @@ impl QueryHandler for DnsPipeline {
             match self.upstream.resolve(&query).await {
                 Ok(mut upstream_resp) => {
                     upstream_resp.metadata.id = query_id;
+
+                    // Anti-DoH bypass: inspect resolved A and AAAA records for known resolver IPs
+                    if bypass_check_needed {
+                        let has_bypass_ip = upstream_resp.answers.iter().any(|rec| match &rec.data {
+                            RData::A(a) => self.anti_bypass.matches_ip(&IpAddr::V4(a.0)),
+                            RData::AAAA(aaaa) => self.anti_bypass.matches_ip(&IpAddr::V6(aaaa.0)),
+                            _ => false,
+                        });
+                        if has_bypass_ip {
+                            info!(
+                                qname = %qname,
+                                "Upstream query blocked by Anti-DoH bypass (resolved IP)"
+                            );
+                            if let Some(ref m) = self.metrics {
+                                m.inc_doh_bypass_blocked();
+                            }
+                            let mut blocked_resp = synthesize_blocked_response(
+                                &query,
+                                &self.config.filtering.blocking_mode,
+                                self.config.filtering.blocking_ttl,
+                            );
+                            blocked_resp.metadata.id = query_id;
+                            return (
+                                Some(blocked_resp),
+                                "blocked",
+                                Some("anti_doh_bypass".to_string()),
+                                Some("anti_doh_bypass".to_string()),
+                                None,
+                                false,
+                                domain_str,
+                                qtype,
+                            );
+                        }
+                    }
 
                     // 7. CNAME uncloaking: inspect any CNAME targets against FilterEngine
                     if self.config.filtering.enabled
@@ -427,7 +533,7 @@ impl QueryHandler for DnsPipeline {
         let qtype_num = u16::from(qtype);
 
         if let Some(ref m) = self.metrics {
-            m.inc_queries("udp", qtype_num, verdict_str);
+            m.inc_queries(&client.proto, qtype_num, verdict_str);
             m.observe_query_duration(verdict_str, elapsed_secs);
             if from_cache {
                 m.inc_cache_hits();
@@ -453,7 +559,7 @@ impl QueryHandler for DnsPipeline {
                     upstream: upstream_opt,
                     elapsed_us: Some(elapsed_us),
                     dnssec: None,
-                    proto: "udp".to_string(),
+                    proto: client.proto.clone(),
                 };
                 let _ = ql.try_send(entry);
             }

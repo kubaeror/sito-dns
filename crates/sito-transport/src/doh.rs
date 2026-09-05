@@ -11,7 +11,7 @@ use tracing::{debug, info, trace, warn};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use base64::Engine;
@@ -33,6 +33,8 @@ pub struct DohConfig {
     pub acceptor_mgr: Option<TlsAcceptorManager>,
     pub max_connections: usize,
     pub rate_limit_per_ip: u32,
+    pub http01_challenges: Option<Arc<dashmap::DashMap<String, String>>>,
+    pub alt_svc_port: Option<u16>,
 }
 
 impl DohConfig {
@@ -42,13 +44,32 @@ impl DohConfig {
             acceptor_mgr,
             max_connections: 256,
             rate_limit_per_ip: 20,
+            http01_challenges: None,
+            alt_svc_port: Some(443),
         }
+    }
+
+    #[must_use]
+    pub fn with_http01_challenges(
+        mut self,
+        challenges: Arc<dashmap::DashMap<String, String>>,
+    ) -> Self {
+        self.http01_challenges = Some(challenges);
+        self
+    }
+
+    #[must_use]
+    pub fn with_alt_svc_port(mut self, port: Option<u16>) -> Self {
+        self.alt_svc_port = port;
+        self
     }
 }
 
 struct DohState<H: QueryHandler> {
     handler: Arc<H>,
     rate_limiter: Arc<RateLimiter>,
+    http01_challenges: Option<Arc<dashmap::DashMap<String, String>>>,
+    alt_svc_header: Option<HeaderValue>,
 }
 
 fn decode_base64url(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
@@ -125,23 +146,26 @@ async fn handle_doh_request<H: QueryHandler>(
     };
 
     let client_ctx = match client_id {
-        Some(cid) => ClientContext::with_id(client_ip, cid),
-        None => ClientContext::new(client_ip),
+        Some(cid) => ClientContext::with_id(client_ip, cid).with_proto("doh"),
+        None => ClientContext::new(client_ip).with_proto("doh"),
     };
 
     let response = state.handler.handle(query, client_ctx).await;
 
     match response {
         Some(resp) => match encode_message(&resp) {
-            Ok(encoded) => (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, "application/dns-message"),
-                    (header::CACHE_CONTROL, "no-store"),
-                ],
-                encoded,
-            )
-                .into_response(),
+            Ok(encoded) => {
+                let mut resp_builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/dns-message")
+                    .header(header::CACHE_CONTROL, "no-store");
+                if let Some(ref alt_svc) = state.alt_svc_header {
+                    resp_builder = resp_builder.header(header::ALT_SVC, alt_svc);
+                }
+                resp_builder
+                    .body(axum::body::Body::from(encoded))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            }
             Err(e) => {
                 warn!("DoH failed to encode DNS response: {}", e);
                 (
@@ -187,6 +211,23 @@ async fn doh_route_with_client<H: QueryHandler>(
     .await
 }
 
+async fn acme_http01_route<H: QueryHandler>(
+    State(state): State<Arc<DohState<H>>>,
+    Path(token): Path<String>,
+) -> Response {
+    if let Some(ref store) = state.http01_challenges {
+        if let Some(key_auth) = store.get(&token) {
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/plain")],
+                key_auth.clone(),
+            )
+                .into_response();
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
 /// Start the DNS over HTTPS listener.
 pub async fn start_doh_listener<H: QueryHandler + 'static>(
     config: DohConfig,
@@ -197,17 +238,28 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
     let local_addr = listener.local_addr()?;
     info!("DoH listener started on {}", local_addr);
 
+    let alt_svc_header = config.alt_svc_port.map(|p| {
+        let val = format!("h3=\":{p}\"; ma=86400");
+        HeaderValue::from_str(&val).expect("valid alt-svc header value")
+    });
+
     let state = Arc::new(DohState {
         handler,
         rate_limiter: Arc::new(RateLimiter::new(
             config.rate_limit_per_ip,
             config.rate_limit_per_ip * 2,
         )),
+        http01_challenges: config.http01_challenges,
+        alt_svc_header,
     });
 
     let app = Router::new()
         .route("/dns-query", any(doh_route::<H>))
         .route("/dns-query/{client_id}", any(doh_route_with_client::<H>))
+        .route(
+            "/.well-known/acme-challenge/{token}",
+            axum::routing::get(acme_http01_route::<H>),
+        )
         .with_state(state);
 
     let semaphore = Arc::new(Semaphore::new(config.max_connections));

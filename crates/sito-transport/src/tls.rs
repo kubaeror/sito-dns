@@ -124,12 +124,36 @@ pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError>
     })
 }
 
-/// Dynamic SNI certificate resolver supporting a default fallback and virtual host mapping.
-#[derive(Debug)]
+/// Generates a self-signed certificate and private key pair for the given domain names.
+pub fn generate_self_signed_cert(domains: &[String]) -> Result<(String, String), TlsError> {
+    let params = rcgen::CertificateParams::new(domains.to_vec())
+        .map_err(|e| TlsError::Config(format!("Failed to build certificate params: {e}")))?;
+    let key_pair = rcgen::KeyPair::generate()
+        .map_err(|e| TlsError::Config(format!("Failed to generate key pair: {e}")))?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| TlsError::Config(format!("Failed to sign certificate: {e}")))?;
+    Ok((cert.pem(), key_pair.serialize_pem()))
+}
+
+/// Dynamic SNI certificate resolver supporting a default fallback, virtual host mapping,
+/// and in-memory ACME challenge keys (RFC 8737 TLS-ALPN-01).
 pub struct DynamicCertResolver {
     default_key: Arc<CertifiedKey>,
     sni_keys: HashMap<String, Arc<CertifiedKey>>,
     allowed_alpn: Vec<Vec<u8>>,
+    challenge_keys: Arc<dashmap::DashMap<String, Arc<CertifiedKey>>>,
+}
+
+impl std::fmt::Debug for DynamicCertResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicCertResolver")
+            .field("default_key", &self.default_key)
+            .field("sni_keys", &self.sni_keys)
+            .field("allowed_alpn", &self.allowed_alpn)
+            .field("challenge_count", &self.challenge_keys.len())
+            .finish()
+    }
 }
 
 impl DynamicCertResolver {
@@ -141,7 +165,29 @@ impl DynamicCertResolver {
             default_key,
             sni_keys,
             allowed_alpn: Vec::new(),
+            challenge_keys: Arc::new(dashmap::DashMap::new()),
         }
+    }
+
+    #[must_use]
+    pub fn with_challenge_keys(
+        mut self,
+        challenge_keys: Arc<dashmap::DashMap<String, Arc<CertifiedKey>>>,
+    ) -> Self {
+        self.challenge_keys = challenge_keys;
+        self
+    }
+
+    pub fn challenge_keys(&self) -> Arc<dashmap::DashMap<String, Arc<CertifiedKey>>> {
+        Arc::clone(&self.challenge_keys)
+    }
+
+    pub fn register_challenge(&self, domain: &str, key: Arc<CertifiedKey>) {
+        self.challenge_keys.insert(domain.to_ascii_lowercase(), key);
+    }
+
+    pub fn unregister_challenge(&self, domain: &str) {
+        self.challenge_keys.remove(&domain.to_ascii_lowercase());
     }
 
     #[must_use]
@@ -153,6 +199,18 @@ impl DynamicCertResolver {
 
 impl ResolvesServerCert for DynamicCertResolver {
     fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        // Check for ACME TLS-ALPN-01 challenge first (ALPN = "acme-tls/1")
+        if let Some(mut alpn) = client_hello.alpn() {
+            if alpn.any(|proto| proto == b"acme-tls/1") {
+                if let Some(sni) = client_hello.server_name() {
+                    let sni_lower = sni.to_ascii_lowercase();
+                    if let Some(key) = self.challenge_keys.get(&sni_lower) {
+                        return Some(Arc::clone(&*key));
+                    }
+                }
+            }
+        }
+
         // Enforce ALPN if configured and client provided ALPN offers
         if !self.allowed_alpn.is_empty() {
             if let Some(mut alpn) = client_hello.alpn() {
@@ -217,6 +275,23 @@ pub fn load_server_config(
     sni_certs: &[(String, PathBuf, PathBuf)],
     alpn_protocols: Vec<Vec<u8>>,
 ) -> Result<ServerConfig, TlsError> {
+    load_server_config_with_challenges(
+        cert_path,
+        key_path,
+        sni_certs,
+        alpn_protocols,
+        Arc::new(dashmap::DashMap::new()),
+    )
+}
+
+/// Build `ServerConfig` from primary cert/key paths, optional SNI pairs, and shared challenge keys.
+pub fn load_server_config_with_challenges(
+    cert_path: &Path,
+    key_path: &Path,
+    sni_certs: &[(String, PathBuf, PathBuf)],
+    alpn_protocols: Vec<Vec<u8>>,
+    challenge_keys: Arc<dashmap::DashMap<String, Arc<CertifiedKey>>>,
+) -> Result<ServerConfig, TlsError> {
     let default_certs = load_certificates(cert_path)?;
     let default_key = load_private_key(key_path)?;
     let default_certified = create_certified_key(default_certs, &default_key)?;
@@ -231,6 +306,7 @@ pub fn load_server_config(
 
     let resolver = Arc::new(
         DynamicCertResolver::new(default_certified, sni_keys)
+            .with_challenge_keys(challenge_keys)
             .with_allowed_alpn(alpn_protocols.clone()),
     );
     build_server_config(resolver, alpn_protocols)
@@ -240,6 +316,7 @@ pub fn load_server_config(
 #[derive(Clone)]
 pub struct TlsAcceptorManager {
     server_config: Arc<ArcSwap<ServerConfig>>,
+    challenge_keys: Arc<dashmap::DashMap<String, Arc<CertifiedKey>>>,
 }
 
 impl TlsAcceptorManager {
@@ -247,7 +324,34 @@ impl TlsAcceptorManager {
     pub fn new(config: ServerConfig) -> Self {
         Self {
             server_config: Arc::new(ArcSwap::from_pointee(config)),
+            challenge_keys: Arc::new(dashmap::DashMap::new()),
         }
+    }
+
+    /// Create a new manager with shared challenge keys.
+    pub fn with_challenge_keys(
+        config: ServerConfig,
+        challenge_keys: Arc<dashmap::DashMap<String, Arc<CertifiedKey>>>,
+    ) -> Self {
+        Self {
+            server_config: Arc::new(ArcSwap::from_pointee(config)),
+            challenge_keys,
+        }
+    }
+
+    /// Access the shared challenge keys map.
+    pub fn challenge_keys(&self) -> Arc<dashmap::DashMap<String, Arc<CertifiedKey>>> {
+        Arc::clone(&self.challenge_keys)
+    }
+
+    /// Register a challenge certificate for TLS-ALPN-01 validation.
+    pub fn register_challenge(&self, domain: &str, key: Arc<CertifiedKey>) {
+        self.challenge_keys.insert(domain.to_ascii_lowercase(), key);
+    }
+
+    /// Unregister a challenge certificate.
+    pub fn unregister_challenge(&self, domain: &str) {
+        self.challenge_keys.remove(&domain.to_ascii_lowercase());
     }
 
     /// Load the current active `ServerConfig`.

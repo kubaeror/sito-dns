@@ -173,7 +173,10 @@ async fn handle_tcp_connection<H: QueryHandler>(
 
         // Pipelining: process queries asynchronously on the connection
         tokio::spawn(async move {
-            if let Some(response) = handler.handle(query, ClientContext::new(client_ip)).await {
+            if let Some(response) = handler
+                .handle(query, ClientContext::new(client_ip).with_proto("tcp"))
+                .await
+            {
                 if let Ok(encoded) = encode_message(&response) {
                     let _ = tx.send(encoded).await;
                 }

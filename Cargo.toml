@@ -67,6 +67,13 @@ x509-parser = "0.18"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rust-embed = "8.5"
 mime_guess = "2.0"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+bytes = "1.0"
+http = "1.0"
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
+ring = "0.17"
 
 # Internal workspace dependencies
 sito = { path = "crates/sito", version = "0.1.0" }
