@@ -17,6 +17,8 @@ sito-filter.workspace = true
 sito-dnssec.workspace = true
 sito-clients.workspace = true
 sito-rewrites.workspace = true
+sito-ha.workspace = true
+blake3.workspace = true
 arc-swap.workspace = true
 bytes.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

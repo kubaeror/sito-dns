@@ -74,6 +74,9 @@ async fn create_test_context(temp_dir: &Path) -> (ServerContext, PathBuf, QueryL
         rewrites,
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
+        master_coordinator: None,
+        slave_tracker: None,
+        resync_sender: None,
     };
 
     (ctx, config_path, querylog_writer)
@@ -297,7 +300,7 @@ async fn test_acceptance_m5_rbac_matrix() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // 5. HA stubs: returns 501 Not Implemented per M5 specification
+    // 5. HA status: returns 200 OK for Admin per M8 implementation
     let (status, body) = call_route(
         app.clone(),
         "GET",
@@ -306,8 +309,8 @@ async fn test_acceptance_m5_rbac_matrix() {
         "",
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert!(body.contains("HA replication will be delivered in Phase M8"));
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"role\""));
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

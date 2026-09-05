@@ -63,6 +63,15 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
+            Commands::Ha { command } => match command {
+                sito::cli::HaCommands::GenCerts { dir, master, slave } => {
+                    if let Err(e) = sito::cli::run_ha_gen_certs(&dir, master, slave) {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
+            },
         }
     }
 

@@ -31,6 +31,28 @@ pub struct ServerContext {
     pub start_time: Instant,
     /// Pending backup restorations awaiting confirmation token: token -> (toml_content, expires_at).
     pub restore_tokens: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+    pub master_coordinator: Option<sito_ha::MasterCoordinator>,
+    pub slave_tracker: Option<sito_ha::SlaveStatusTracker>,
+    pub resync_sender: Option<tokio::sync::mpsc::Sender<()>>,
+}
+
+impl ServerContext {
+    /// Resolves the URL of the master node for redirect headers (`X-Dnsd-Master`).
+    pub fn resolve_master_url(&self) -> String {
+        if let Some(ref tracker) = self.slave_tracker {
+            if let Some(ref url) = tracker.master_url {
+                return url.clone();
+            }
+        }
+        if let Some(ref ha_val) = self.config.load().ha {
+            if let Ok(ha_cfg) = sito_ha::HaConfig::from_toml_value(ha_val) {
+                if let Some(ref url) = ha_cfg.master_url {
+                    return url.clone();
+                }
+            }
+        }
+        "wss://master.local:8953".to_string()
+    }
 }
 
 // Axum FromRef implementations for modular extractors

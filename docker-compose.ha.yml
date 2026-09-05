@@ -1,0 +1,152 @@
+# =============================================================================
+# sito DNS - High Availability (HA) Cluster Deployment
+# =============================================================================
+# Architecture: Master / Slave State Machine Replication over WebSocket + mTLS
+# Authoritative Plan: docs/dns-server-plan-detailed.md (Section 11 & 17.3)
+# Phase Specification: docs/phases/m8-ha.md
+#
+# QUICK START:
+# 1. Generate mTLS certificate suite and BLAKE3 pinned fingerprints:
+#    sito ha gen-certs \
+#      --out-dir ./ha/certs \
+#      --master-ip 192.168.1.10 \
+#      --slave-ip 192.168.1.11 \
+#      --master-san 192.168.1.10,sito-master \
+#      --slave-san 192.168.1.11,sito-slave
+#
+# 2. Copy certificates to node directories:
+#    mkdir -p ha/master/certs ha/slave/certs
+#    cp ha/certs/ca.crt ha/master/certs/ && cp ha/certs/ca.crt ha/slave/certs/
+#    cp ha/certs/master.crt ha/certs/master.key ha/master/certs/
+#    cp ha/certs/slave.crt ha/certs/slave.key ha/slave/certs/
+#
+# 3. Update 'parent: eth0' below to match your host's physical network interface.
+# 4. Start the HA cluster:
+#    docker compose -f docker-compose.ha.yml up -d
+#
+# DHCP CONFIGURATION (MikroTik RouterOS Option 6):
+# Configure RouterOS DHCP server to hand out both redundant DNS IPs:
+#   /ip dhcp-server network set [find] dns-server=192.168.1.10,192.168.1.11
+# Or using raw DHCP Option 6:
+#   /ip dhcp-server option add name=ha-dns code=6 value="0xc0a8010a0c0a8010b"
+#   /ip dhcp-server network set [find] dhcp-option=ha-dns
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Master Node: Authoritative configuration, Web UI read/write, pushes state
+  # ---------------------------------------------------------------------------
+  sito-master:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sito:m8
+    container_name: sito-master
+    cap_add:
+      - NET_BIND_SERVICE
+    networks:
+      lan:
+        ipv4_address: 192.168.1.10
+    volumes:
+      - "./ha/master/config:/etc/sito"
+      - "./ha/master/certs:/etc/sito/certs:ro"
+      - "sito-master-data:/var/lib/sito"
+    environment:
+      - DNSD__SERVER__ROLE=master
+      - DNSD__SERVER__INSTANCE_NAME=sito-master
+      - DNSD__HA__REPLICATION_PORT=8953
+      - DNSD__HA__CERT_PATH=/etc/sito/certs/master.crt
+      - DNSD__HA__KEY_PATH=/etc/sito/certs/master.key
+      - DNSD__HA__CA_PATH=/etc/sito/certs/ca.crt
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/bin/sito", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Slave Node 1: Read-only Web UI, replicated state, continuous DNS resolution
+  # ---------------------------------------------------------------------------
+  sito-slave:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sito:m8
+    container_name: sito-slave
+    cap_add:
+      - NET_BIND_SERVICE
+    networks:
+      lan:
+        ipv4_address: 192.168.1.11
+    volumes:
+      - "./ha/slave/config:/etc/sito"
+      - "./ha/slave/certs:/etc/sito/certs:ro"
+      - "sito-slave-data:/var/lib/sito"
+    environment:
+      - DNSD__SERVER__ROLE=slave
+      - DNSD__SERVER__INSTANCE_NAME=sito-slave-1
+      - DNSD__HA__MASTER_URL=wss://192.168.1.10:8953
+      - DNSD__HA__CERT_PATH=/etc/sito/certs/slave.crt
+      - DNSD__HA__KEY_PATH=/etc/sito/certs/slave.key
+      - DNSD__HA__CA_PATH=/etc/sito/certs/ca.crt
+    restart: unless-stopped
+    depends_on:
+      - sito-master
+    healthcheck:
+      test: ["CMD", "/usr/bin/sito", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # (Optional) Remote / Offsite Slave Node 2
+  # Uncomment to deploy a secondary backup slave on another IP or subnet
+  # ---------------------------------------------------------------------------
+  # sito-slave-2:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   image: sito:m8
+  #   container_name: sito-slave-2
+  #   cap_add:
+  #     - NET_BIND_SERVICE
+  #   networks:
+  #     lan:
+  #       ipv4_address: 192.168.1.12
+  #   volumes:
+  #     - "./ha/slave2/config:/etc/sito"
+  #     - "./ha/slave2/certs:/etc/sito/certs:ro"
+  #     - "sito-slave2-data:/var/lib/sito"
+  #   environment:
+  #     - DNSD__SERVER__ROLE=slave
+  #     - DNSD__SERVER__INSTANCE_NAME=sito-slave-2
+  #     - DNSD__HA__MASTER_URL=wss://192.168.1.10:8953
+  #     - DNSD__HA__CERT_PATH=/etc/sito/certs/slave2.crt
+  #     - DNSD__HA__KEY_PATH=/etc/sito/certs/slave2.key
+  #     - DNSD__HA__CA_PATH=/etc/sito/certs/ca.crt
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - sito-master
+
+# =============================================================================
+# Networking: Macvlan driver gives each container its own dedicated LAN IP
+# NOTE: If running on a host/cloud VPS without macvlan support (e.g. Docker
+# Desktop), replace with standard bridge network and port mappings:
+# Master: 53:53, 3000:3000, 8953:8953
+# Slave:  5353:53, 3001:3000
+# =============================================================================
+networks:
+  lan:
+    driver: macvlan
+    driver_opts:
+      parent: eth0 # Set to physical interface name (e.g. eth0, enp3s0, bond0)
+    ipam:
+      config:
+        - subnet: 192.168.1.0/24
+          gateway: 192.168.1.1
+
+volumes:
+  sito-master-data: {}
+  sito-slave-data: {}
+  # sito-slave2-data: {}

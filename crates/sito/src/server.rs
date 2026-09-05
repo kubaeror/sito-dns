@@ -148,6 +148,94 @@ pub async fn run_server_full(
     let clients_arc = Arc::new(ArcSwap::new(client_registry.clone()));
     let rewrites_arc = Arc::new(ArcSwap::new(rewrite_table.clone()));
 
+    // Initialize High Availability (HA) clustering subsystem per role
+    let ha_config: sito_ha::HaConfig = config
+        .ha
+        .as_ref()
+        .and_then(|v| v.clone().try_into().ok())
+        .unwrap_or_default();
+
+    let (master_coordinator, slave_tracker, resync_sender) = if config.server.role == "master" {
+        // Load or create master Ed25519 signing key (0600 on Unix)
+        let signing_key_path = config.server.data_dir.join("ha_signing.key");
+        let signing_key = Arc::new(sito_ha::Ed25519SigningKey::load_or_create(
+            &signing_key_path,
+        )?);
+
+        let coordinator = sito_ha::MasterCoordinator::new(
+            config.server.instance_name.clone(),
+            1,
+            signing_key.clone(),
+            metrics.clone(),
+        );
+
+        let initial_toml = std::fs::read_to_string(&config_path_buf)
+            .unwrap_or_else(|_| toml::to_string_pretty(&config).unwrap_or_default());
+        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&initial_toml).unwrap_or_default();
+        let list_metadata = config
+            .filtering
+            .lists
+            .iter()
+            .map(|l| sito_ha::FilterListMetadata {
+                name: l.name.clone(),
+                url: l.url.clone(),
+                enabled: l.enabled,
+                refresh_hours: l.refresh_hours,
+            })
+            .collect();
+
+        #[allow(clippy::cast_sign_loss)]
+        let initial_bundle = sito_ha::ConfigBundle {
+            version: 1,
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+            config_toml: sanitized_toml,
+            custom_rules: config.filtering.custom_rules.clone(),
+            rewrites: config.rewrites.clone(),
+            clients: config.clients.clone(),
+            lists: list_metadata,
+        };
+        let _ = coordinator.update_bundle(initial_bundle);
+
+        // Spawn master replication listener if replication_port > 0
+        let _master_server_handle = sito_ha::spawn_master_server(
+            ha_config.clone(),
+            coordinator.clone(),
+            shutdown_rx.clone(),
+        );
+
+        (Some(coordinator), None, None)
+    } else {
+        // Slave role
+        let tracker = sito_ha::SlaveStatusTracker::new(
+            config.server.instance_name.clone(),
+            0,
+            ha_config.master_url.clone(),
+        );
+
+        let slave_handles = sito_ha::SlaveAppHandles {
+            config: config_arc.clone(),
+            filter: filter_engine.clone(),
+            rewrites: rewrites_arc.clone(),
+            clients: clients_arc.clone(),
+            metrics: metrics.clone(),
+            config_path: Some(config_path_buf.clone()),
+        };
+
+        let (resync_tx, resync_rx) = tokio::sync::mpsc::channel(4);
+
+        if ha_config.master_url.is_some() {
+            let _slave_worker_handle = sito_ha::spawn_slave_worker(
+                ha_config.clone(),
+                tracker.clone(),
+                slave_handles,
+                resync_rx,
+                shutdown_rx.clone(),
+            );
+        }
+
+        (None, Some(tracker), Some(resync_tx))
+    };
+
     // Administrative REST API server
     let server_ctx = sito_api::ServerContext {
         config: config_arc.clone(),
@@ -163,6 +251,9 @@ pub async fn run_server_full(
         rewrites: rewrites_arc.clone(),
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
+        master_coordinator: master_coordinator.clone(),
+        slave_tracker: slave_tracker.clone(),
+        resync_sender,
     };
 
     let api_router = sito_api::create_router(server_ctx);
@@ -186,6 +277,7 @@ pub async fn run_server_full(
     let watcher_config_path = config_path_buf.clone();
     let watcher_config_arc = config_arc.clone();
     let watcher_filter = filter_engine.clone();
+    let watcher_coordinator = master_coordinator.clone();
     let mut watcher_shutdown_rx = shutdown_rx.clone();
 
     tokio::spawn(async move {
@@ -232,7 +324,33 @@ pub async fn run_server_full(
                             Ok(new_cfg) => {
                                 info!("Detected configuration file change, hot-reloading");
                                 let _ = watcher_filter.reload_with_config(&new_cfg.filtering).await;
-                                watcher_config_arc.store(Arc::new(new_cfg));
+                                watcher_config_arc.store(Arc::new(new_cfg.clone()));
+
+                                if let Some(ref coord) = watcher_coordinator {
+                                    let next_version = coord.get_current_version() + 1;
+                                    let sanitized_toml = sito_ha::sanitize_config_for_bundle(&content).unwrap_or_default();
+                                    let list_metadata = new_cfg.filtering.lists.iter().map(|l| sito_ha::FilterListMetadata {
+                                        name: l.name.clone(),
+                                        url: l.url.clone(),
+                                        enabled: l.enabled,
+                                        refresh_hours: l.refresh_hours,
+                                    }).collect();
+
+                                    #[allow(clippy::cast_sign_loss)]
+                                    let new_bundle = sito_ha::ConfigBundle {
+                                        version: next_version,
+                                        timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                                        config_toml: sanitized_toml,
+                                        custom_rules: new_cfg.filtering.custom_rules.clone(),
+                                        rewrites: new_cfg.rewrites.clone(),
+                                        clients: new_cfg.clients.clone(),
+                                        lists: list_metadata,
+                                    };
+
+                                    if let Err(e) = coord.update_bundle(new_bundle) {
+                                        warn!("Failed to broadcast updated bundle to slaves: {e}");
+                                    }
+                                }
                             }
                             Err(e) => {
                                 warn!("Ignoring invalid hot-reloaded configuration: {e}");

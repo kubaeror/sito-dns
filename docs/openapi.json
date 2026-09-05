@@ -1545,9 +1545,19 @@
         "tags": [
           "crate::handlers::ha"
         ],
-        "summary": "Trigger manual HA resynchronization (Deferred to Phase M8).",
+        "summary": "Trigger manual HA resynchronization.",
         "operationId": "trigger_ha_resync",
         "responses": {
+          "200": {
+            "description": "Triggered HA synchronization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HaResyncResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized",
             "content": {
@@ -1560,16 +1570,6 @@
           },
           "403": {
             "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            }
-          },
-          "501": {
-            "description": "HA replication will be delivered in Phase M8",
             "content": {
               "application/json": {
                 "schema": {
@@ -1594,9 +1594,22 @@
         "tags": [
           "crate::handlers::ha"
         ],
-        "summary": "List connected HA secondary nodes (Deferred to Phase M8).",
+        "summary": "List connected HA replica secondary nodes.",
         "operationId": "get_ha_slaves",
         "responses": {
+          "200": {
+            "description": "List connected replica slaves",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/HaSlaveSummary"
+                  }
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized",
             "content": {
@@ -1609,16 +1622,6 @@
           },
           "403": {
             "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            }
-          },
-          "501": {
-            "description": "HA replication will be delivered in Phase M8",
             "content": {
               "application/json": {
                 "schema": {
@@ -1643,9 +1646,19 @@
         "tags": [
           "crate::handlers::ha"
         ],
-        "summary": "Get HA cluster status (Deferred to Phase M8).",
+        "summary": "Get HA cluster status.",
         "operationId": "get_ha_status",
         "responses": {
+          "200": {
+            "description": "HA cluster status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HaStatusResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized",
             "content": {
@@ -1658,16 +1671,6 @@
           },
           "403": {
             "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            }
-          },
-          "501": {
-            "description": "HA replication will be delivered in Phase M8",
             "content": {
               "application/json": {
                 "schema": {
@@ -2757,6 +2760,156 @@
           "total_queries": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "HaResyncResponse": {
+        "type": "object",
+        "description": "Response for `POST /api/v1/ha/resync`.",
+        "required": [
+          "status",
+          "role",
+          "version"
+        ],
+        "properties": {
+          "role": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "HaSlaveStatsSummary": {
+        "type": "object",
+        "description": "Statistics reported by a replica slave.",
+        "required": [
+          "window_s",
+          "queries",
+          "blocked",
+          "upstreams_count"
+        ],
+        "properties": {
+          "blocked": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "queries": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "upstreams_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "window_s": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "HaSlaveSummary": {
+        "type": "object",
+        "description": "Summary of a connected replica slave node for `GET /api/v1/ha/slaves`.",
+        "required": [
+          "instance",
+          "remote_addr",
+          "synced_version",
+          "lag",
+          "last_ping_secs_ago",
+          "connected_at"
+        ],
+        "properties": {
+          "connected_at": {
+            "type": "string"
+          },
+          "instance": {
+            "type": "string"
+          },
+          "lag": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_ping_secs_ago": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_stats": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HaSlaveStatsSummary"
+              }
+            ]
+          },
+          "remote_addr": {
+            "type": "string"
+          },
+          "synced_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "HaStatusResponse": {
+        "type": "object",
+        "description": "HA cluster status response for `GET /api/v1/ha/status`.",
+        "required": [
+          "role",
+          "instance_name",
+          "version",
+          "state",
+          "slaves_connected"
+        ],
+        "properties": {
+          "degraded_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instance_name": {
+            "type": "string"
+          },
+          "last_synced_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "master_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "type": "string"
+          },
+          "slaves_connected": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },

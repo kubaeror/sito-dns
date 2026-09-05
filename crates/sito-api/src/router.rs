@@ -1,7 +1,9 @@
 //! Axum router configuration binding handlers, middleware, and documentation.
 
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::extract::Request;
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use utoipa::OpenApi;
@@ -15,10 +17,51 @@ use crate::handlers::{
 use crate::openapi::ApiDoc;
 use crate::state::ServerContext;
 
+/// Middleware that enforces read-only access on replica slave nodes.
+/// Mutating methods (POST, PUT, DELETE, PATCH) outside auth and resync return 409 Conflict with X-Dnsd-Master header.
+pub async fn slave_read_only_middleware(
+    axum::extract::State(ctx): axum::extract::State<ServerContext>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method();
+    let is_mutating = matches!(
+        *method,
+        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
+    );
+
+    let is_slave = ctx.config.load().server.role == "slave";
+
+    if is_slave && is_mutating {
+        let path = request.uri().path();
+        let is_allowed = path.starts_with("/api/v1/auth")
+            || path == "/api/v1/ha/resync"
+            || path == "/ha/resync"
+            || path.starts_with("/auth");
+
+        if !is_allowed {
+            let master_url = ctx.resolve_master_url();
+            let mut problem = ProblemDetails::conflict(
+                "Modifications are disabled on HA replica slaves. Submit configuration changes directly to the master node.",
+            );
+            problem.error_type = "urn:sito:ha:read-only".to_string();
+            problem.title = "Read-Only Replica".to_string();
+            problem.instance = Some(path.to_string());
+
+            let mut resp = (StatusCode::CONFLICT, Json(problem)).into_response();
+            if let Ok(val) = HeaderValue::from_str(&master_url) {
+                resp.headers_mut()
+                    .insert(HeaderName::from_static("x-dnsd-master"), val);
+            }
+            return resp;
+        }
+    }
+
+    next.run(request).await
+}
+
 #[cfg(feature = "embed-ui")]
 use axum::http::header::CONTENT_TYPE;
-#[cfg(feature = "embed-ui")]
-use axum::response::Response;
 
 #[cfg(not(feature = "embed-ui"))]
 async fn not_found_handler() -> impl IntoResponse {
@@ -174,7 +217,11 @@ pub fn create_router(ctx: ServerContext) -> Router {
         .route("/config/reload", post(config::reload_config))
         .route("/config/backup", get(config::download_backup))
         .route("/config/restore", post(config::prepare_restore))
-        .route("/config/restore/confirm", post(config::confirm_restore));
+        .route("/config/restore/confirm", post(config::confirm_restore))
+        .layer(axum::middleware::from_fn_with_state(
+            ctx.clone(),
+            slave_read_only_middleware,
+        ));
 
     #[cfg(feature = "embed-ui")]
     let app = Router::new()

@@ -1,0 +1,148 @@
+//! Configuration structures and validation for High Availability clustering.
+
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+use crate::crypto::parse_public_key;
+use crate::error::HaError;
+
+fn default_replication_port() -> u16 {
+    8953
+}
+
+fn default_listen_addr() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_stats_interval_secs() -> u64 {
+    30
+}
+
+fn default_ping_interval_secs() -> u64 {
+    15
+}
+
+/// High Availability clustering configuration section `[ha]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HaConfig {
+    /// Port on which the master node listens for WebSocket replication connections (default: 8953).
+    #[serde(default = "default_replication_port")]
+    pub replication_port: u16,
+
+    /// Listening IP address for the replication listener (default: "0.0.0.0").
+    #[serde(default = "default_listen_addr")]
+    pub listen_addr: String,
+
+    /// WebSocket URL to connect to the master (required on slave nodes, e.g. "wss://192.168.1.10:8953").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_url: Option<String>,
+
+    /// Expected BLAKE3 certificate fingerprint of the master node for pinning (e.g. "blake3:...").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_fingerprint: Option<String>,
+
+    /// Ed25519 public key (in hex or base64) of the master node used to verify signed state bundles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_pubkey: Option<String>,
+
+    /// Path to mTLS certificate file (PEM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert: Option<PathBuf>,
+
+    /// Path to mTLS private key file (PEM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<PathBuf>,
+
+    /// Path to CA certificate file (PEM) for mTLS verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<PathBuf>,
+
+    /// Pinned slave certificate BLAKE3 fingerprints accepted by the master.
+    #[serde(default)]
+    pub pinned_slave_fingerprints: Vec<String>,
+
+    /// Interval in seconds for sending periodic statistics reports from slave to master (default: 30s).
+    #[serde(default = "default_stats_interval_secs")]
+    pub stats_interval_secs: u64,
+
+    /// Interval in seconds for WebSocket heartbeat pings (default: 15s).
+    #[serde(default = "default_ping_interval_secs")]
+    pub ping_interval_secs: u64,
+}
+
+impl Default for HaConfig {
+    fn default() -> Self {
+        Self {
+            replication_port: default_replication_port(),
+            listen_addr: default_listen_addr(),
+            master_url: None,
+            master_fingerprint: None,
+            master_pubkey: None,
+            cert: None,
+            key: None,
+            ca: None,
+            pinned_slave_fingerprints: Vec::new(),
+            stats_interval_secs: default_stats_interval_secs(),
+            ping_interval_secs: default_ping_interval_secs(),
+        }
+    }
+}
+
+impl HaConfig {
+    /// Deserializes `HaConfig` from a `toml::Value`.
+    pub fn from_toml_value(val: &toml::Value) -> Result<Self, HaError> {
+        val.clone().try_into().map_err(|e| HaError::Validation {
+            field: "ha".to_string(),
+            reason: format!("Failed to parse [ha] configuration: {e}"),
+        })
+    }
+
+    /// Validates fields based on the assigned node role ("master" or "slave").
+    pub fn validate(&self, role: &str) -> Result<(), HaError> {
+        if self.replication_port == 0 {
+            return Err(HaError::Validation {
+                field: "replication_port".to_string(),
+                reason: "Replication port must be greater than 0".to_string(),
+            });
+        }
+
+        if role == "slave" {
+            if let Some(ref pubkey_str) = self.master_pubkey {
+                parse_public_key(pubkey_str)?;
+            }
+            if let Some(ref url) = self.master_url {
+                if !url.starts_with("ws://") && !url.starts_with("wss://") {
+                    return Err(HaError::Validation {
+                        field: "master_url".to_string(),
+                        reason: format!(
+                            "Invalid master_url '{url}': must start with ws:// or wss://"
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ha_config_defaults_and_parsing() {
+        let toml_str = r#"
+replication_port = 8953
+master_url = "wss://127.0.0.1:8953"
+master_fingerprint = "blake3:abcdef0123456789"
+pinned_slave_fingerprints = ["blake3:11223344"]
+"#;
+        let val: toml::Value = toml::from_str(toml_str).unwrap();
+        let cfg = HaConfig::from_toml_value(&val).unwrap();
+        assert_eq!(cfg.replication_port, 8953);
+        assert_eq!(cfg.master_url.as_deref(), Some("wss://127.0.0.1:8953"));
+        assert_eq!(cfg.pinned_slave_fingerprints.len(), 1);
+        assert!(cfg.validate("slave").is_ok());
+    }
+}

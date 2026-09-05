@@ -22,6 +22,7 @@ sito-cache.workspace = true
 sito-clients.workspace = true
 sito-core.workspace = true
 sito-filter.workspace = true
+sito-ha.workspace = true
 sito-proto.workspace = true
 sito-rewrites.workspace = true
 sito-stats.workspace = true

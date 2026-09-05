@@ -63,6 +63,27 @@ pub enum Commands {
         #[arg(short, long)]
         force: bool,
     },
+    /// High Availability clustering management
+    Ha {
+        #[command(subcommand)]
+        command: HaCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HaCommands {
+    /// Generate self-signed CA and mTLS certificate/key pairs with BLAKE3 fingerprint pinning
+    GenCerts {
+        /// Destination directory to save generated certificates and private keys
+        #[arg(short, long, default_value = "certs")]
+        dir: PathBuf,
+        /// Generate master server certificate
+        #[arg(long)]
+        master: bool,
+        /// Generate slave client certificate
+        #[arg(long)]
+        slave: bool,
+    },
 }
 
 /// Executes the `check-config` subcommand.
@@ -261,5 +282,13 @@ pub fn run_restore(
         metadata.timestamp,
         target_config_path.display()
     );
+    Ok(())
+}
+
+/// Executes the `ha gen-certs` subcommand.
+pub fn run_ha_gen_certs(dir: &Path, master: bool, slave: bool) -> Result<(), anyhow::Error> {
+    let certs = sito_ha::generate_ha_certs(dir, master, slave)
+        .map_err(|e| anyhow::anyhow!("Failed to generate HA certificates: {e}"))?;
+    print!("{}", certs.summary());
     Ok(())
 }

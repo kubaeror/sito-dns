@@ -280,3 +280,68 @@ pub struct CreateTokenRequest {
 pub struct HaStubResponse {
     pub message: String,
 }
+
+/// HA cluster status response for `GET /api/v1/ha/status`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HaStatusResponse {
+    pub role: String,
+    pub instance_name: String,
+    pub version: u64,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_url: Option<String>,
+    pub slaves_connected: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_synced_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+}
+
+/// Statistics reported by a replica slave.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HaSlaveStatsSummary {
+    pub window_s: u64,
+    pub queries: u64,
+    pub blocked: u64,
+    pub upstreams_count: usize,
+}
+
+/// Summary of a connected replica slave node for `GET /api/v1/ha/slaves`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HaSlaveSummary {
+    pub instance: String,
+    pub remote_addr: String,
+    pub synced_version: u64,
+    pub lag: u64,
+    pub last_ping_secs_ago: u64,
+    pub connected_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_stats: Option<HaSlaveStatsSummary>,
+}
+
+impl From<sito_ha::SlaveSummary> for HaSlaveSummary {
+    fn from(s: sito_ha::SlaveSummary) -> Self {
+        Self {
+            instance: s.instance,
+            remote_addr: s.remote_addr,
+            synced_version: s.synced_version,
+            lag: s.lag,
+            last_ping_secs_ago: s.last_ping_secs_ago,
+            connected_at: s.connected_at,
+            last_stats: s.last_stats.map(|st| HaSlaveStatsSummary {
+                window_s: st.window_s,
+                queries: st.queries,
+                blocked: st.blocked,
+                upstreams_count: st.upstreams_count,
+            }),
+        }
+    }
+}
+
+/// Response for `POST /api/v1/ha/resync`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HaResyncResponse {
+    pub status: String,
+    pub role: String,
+    pub version: u64,
+}

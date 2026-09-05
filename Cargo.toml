@@ -74,6 +74,9 @@ bytes = "1.0"
 http = "1.0"
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
 ring = "0.17"
+blake3 = "1.8"
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
 
 # Internal workspace dependencies
 sito = { path = "crates/sito", version = "0.1.0" }
