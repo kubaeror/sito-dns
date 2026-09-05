@@ -270,20 +270,22 @@ export const DashboardView: React.FC = () => {
             {stats && stats.top_domains && stats.top_domains.length > 0 ? (
               stats.top_domains.slice(0, 10).map(([domain, count], idx) => {
                 const total = stats.total_queries || 1;
-                const pct = ((count / total) * 100).toFixed(1);
+                const countNum = Number(count);
+                const domainStr = String(domain);
+                const pct = ((countNum / total) * 100).toFixed(1);
                 return (
-                  <div key={domain} className="py-2 flex items-center justify-between text-xs">
+                  <div key={domainStr} className="py-2 flex items-center justify-between text-xs">
                     <div className="flex items-center space-x-2 truncate pr-2">
                       <span className="text-zinc-600 dark:text-zinc-300 font-mono w-4 shrink-0">
                         {idx + 1}.
                       </span>
-                      <span className="font-medium text-zinc-800 dark:text-zinc-200 truncate" title={domain}>
-                        {domain}
+                      <span className="font-medium text-zinc-800 dark:text-zinc-200 truncate" title={domainStr}>
+                        {domainStr}
                       </span>
                     </div>
                     <div className="flex items-center space-x-2 shrink-0">
                       <span className="font-semibold text-zinc-900 dark:text-zinc-100">
-                        {count.toLocaleString()}
+                        {countNum.toLocaleString()}
                       </span>
                       <span className="text-zinc-600 dark:text-zinc-300 w-10 text-right">
                         {pct}%
@@ -306,20 +308,22 @@ export const DashboardView: React.FC = () => {
             {stats && stats.top_blocked_domains && stats.top_blocked_domains.length > 0 ? (
               stats.top_blocked_domains.slice(0, 10).map(([domain, count], idx) => {
                 const totalBlocked = stats.blocked_queries || 1;
-                const pct = ((count / totalBlocked) * 100).toFixed(1);
+                const countNum = Number(count);
+                const domainStr = String(domain);
+                const pct = ((countNum / totalBlocked) * 100).toFixed(1);
                 return (
-                  <div key={domain} className="py-2 flex items-center justify-between text-xs">
+                  <div key={domainStr} className="py-2 flex items-center justify-between text-xs">
                     <div className="flex items-center space-x-2 truncate pr-2">
                       <span className="text-zinc-600 dark:text-zinc-300 font-mono w-4 shrink-0">
                         {idx + 1}.
                       </span>
-                      <span className="font-medium text-rose-700 dark:text-rose-300 truncate" title={domain}>
-                        {domain}
+                      <span className="font-medium text-rose-700 dark:text-rose-300 truncate" title={domainStr}>
+                        {domainStr}
                       </span>
                     </div>
                     <div className="flex items-center space-x-2 shrink-0">
                       <span className="font-semibold text-zinc-900 dark:text-zinc-100">
-                        {count.toLocaleString()}
+                        {countNum.toLocaleString()}
                       </span>
                       <span className="text-zinc-600 dark:text-zinc-300 w-10 text-right">
                         {pct}%
@@ -342,20 +346,22 @@ export const DashboardView: React.FC = () => {
             {stats && stats.top_clients && stats.top_clients.length > 0 ? (
               stats.top_clients.slice(0, 10).map(([client, count], idx) => {
                 const total = stats.total_queries || 1;
-                const pct = ((count / total) * 100).toFixed(1);
+                const countNum = Number(count);
+                const clientStr = String(client);
+                const pct = ((countNum / total) * 100).toFixed(1);
                 return (
-                  <div key={client} className="py-2 flex items-center justify-between text-xs">
+                  <div key={clientStr} className="py-2 flex items-center justify-between text-xs">
                     <div className="flex items-center space-x-2 truncate pr-2">
                       <span className="text-zinc-600 dark:text-zinc-300 font-mono w-4 shrink-0">
                         {idx + 1}.
                       </span>
-                      <span className="font-mono text-zinc-800 dark:text-zinc-200 truncate" title={client}>
-                        {client}
+                      <span className="font-mono text-zinc-800 dark:text-zinc-200 truncate" title={clientStr}>
+                        {clientStr}
                       </span>
                     </div>
                     <div className="flex items-center space-x-2 shrink-0">
                       <span className="font-semibold text-zinc-900 dark:text-zinc-100">
-                        {count.toLocaleString()}
+                        {countNum.toLocaleString()}
                       </span>
                       <span className="text-zinc-600 dark:text-zinc-300 w-10 text-right">
                         {pct}%

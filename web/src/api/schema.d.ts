@@ -414,7 +414,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Trigger manual HA resynchronization (Deferred to Phase M8). */
+        /** Trigger manual HA resynchronization. */
         post: operations["trigger_ha_resync"];
         delete?: never;
         options?: never;
@@ -429,7 +429,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List connected HA secondary nodes (Deferred to Phase M8). */
+        /** List connected HA replica secondary nodes. */
         get: operations["get_ha_slaves"];
         put?: never;
         post?: never;
@@ -446,7 +446,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get HA cluster status (Deferred to Phase M8). */
+        /** Get HA cluster status. */
         get: operations["get_ha_status"];
         put?: never;
         post?: never;
@@ -747,6 +747,48 @@ export interface components {
             ][];
             /** Format: int64 */
             total_queries: number;
+        };
+        /** @description Response for `POST /api/v1/ha/resync`. */
+        HaResyncResponse: {
+            role: string;
+            status: string;
+            /** Format: int64 */
+            version: number;
+        };
+        /** @description Statistics reported by a replica slave. */
+        HaSlaveStatsSummary: {
+            /** Format: int64 */
+            blocked: number;
+            /** Format: int64 */
+            queries: number;
+            upstreams_count: number;
+            /** Format: int64 */
+            window_s: number;
+        };
+        /** @description Summary of a connected replica slave node for `GET /api/v1/ha/slaves`. */
+        HaSlaveSummary: {
+            connected_at: string;
+            instance: string;
+            /** Format: int64 */
+            lag: number;
+            /** Format: int64 */
+            last_ping_secs_ago: number;
+            last_stats?: null | components["schemas"]["HaSlaveStatsSummary"];
+            remote_addr: string;
+            /** Format: int64 */
+            synced_version: number;
+        };
+        /** @description HA cluster status response for `GET /api/v1/ha/status`. */
+        HaStatusResponse: {
+            degraded_reason?: string | null;
+            instance_name: string;
+            last_synced_at?: string | null;
+            master_url?: string | null;
+            role: string;
+            slaves_connected: number;
+            state: string;
+            /** Format: int64 */
+            version: number;
         };
         /** @description Stub response for HA endpoints returning 501 Not Implemented. */
         HaStubResponse: {
@@ -2351,6 +2393,15 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description Triggered HA synchronization */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HaResyncResponse"];
+                };
+            };
             /** @description Unauthorized */
             401: {
                 headers: {
@@ -2362,15 +2413,6 @@ export interface operations {
             };
             /** @description Forbidden */
             403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ProblemDetails"];
-                };
-            };
-            /** @description HA replication will be delivered in Phase M8 */
-            501: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2389,6 +2431,15 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description List connected replica slaves */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HaSlaveSummary"][];
+                };
+            };
             /** @description Unauthorized */
             401: {
                 headers: {
@@ -2400,15 +2451,6 @@ export interface operations {
             };
             /** @description Forbidden */
             403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ProblemDetails"];
-                };
-            };
-            /** @description HA replication will be delivered in Phase M8 */
-            501: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2427,6 +2469,15 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description HA cluster status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HaStatusResponse"];
+                };
+            };
             /** @description Unauthorized */
             401: {
                 headers: {
@@ -2438,15 +2489,6 @@ export interface operations {
             };
             /** @description Forbidden */
             403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ProblemDetails"];
-                };
-            };
-            /** @description HA replication will be delivered in Phase M8 */
-            501: {
                 headers: {
                     [name: string]: unknown;
                 };
