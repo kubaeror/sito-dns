@@ -4,8 +4,7 @@ target/
 
 # Node / Frontend
 node_modules/
-dist/
-.dist/
+*.tsbuildinfo
 
 # Environment and secrets
 .env
