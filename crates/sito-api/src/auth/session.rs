@@ -7,6 +7,7 @@ use crate::auth::token::Role;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
+pub const SESSION_COOKIE_NAME: &str = "sito_session";
 pub const DEFAULT_SESSION_TTL_SECS: i64 = 86400; // 24 hours
 
 /// Active user session.
@@ -37,6 +38,11 @@ impl Session {
 
     pub fn is_expired(&self) -> bool {
         chrono::Utc::now().timestamp() >= self.expires_at
+    }
+
+    pub fn to_cookie_header(&self) -> String {
+        let max_age = self.expires_at - chrono::Utc::now().timestamp();
+        build_session_cookie(&self.id, max_age.max(0))
     }
 }
 

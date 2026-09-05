@@ -2910,6 +2910,7 @@ dependencies = [
 name = "sito-api"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "argon2",
  "axum",
  "blake3",
@@ -2930,6 +2931,7 @@ dependencies = [
  "tar",
  "thiserror",
  "tokio",
+ "toml",
  "totp-rs",
  "tower-http",
  "tracing",
@@ -3052,6 +3054,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "utoipa",
 ]
 
 [[package]]

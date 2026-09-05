@@ -237,6 +237,17 @@ impl AuthManager {
         false
     }
 
+    /// Disables TOTP 2FA for a user.
+    pub fn disable_totp(&self, username: &str) -> bool {
+        let mut users = self.users.lock().unwrap();
+        if let Some(user) = users.get_mut(username) {
+            user.totp = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Validates an active session from a cookie.
     pub fn validate_session(&self, session_id: &str) -> Option<Session> {
         let mut sessions = self.sessions.lock().unwrap();

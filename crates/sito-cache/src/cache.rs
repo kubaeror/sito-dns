@@ -175,4 +175,14 @@ impl DnsCache {
     pub fn flush(&self) {
         self.cache.invalidate_all();
     }
+
+    /// Invalidate entries matching the specified domain.
+    pub fn invalidate_domain(&self, domain: &str) {
+        let normalized =
+            sito_proto::normalize_domain(domain).unwrap_or_else(|_| domain.to_ascii_lowercase());
+        let norm_clone = normalized.clone();
+        let _ = self.cache.invalidate_entries_if(move |k, _v| {
+            k.qname == norm_clone || k.qname.ends_with(&format!(".{norm_clone}"))
+        });
+    }
 }

@@ -17,7 +17,7 @@ pub struct TotpConfig {
 }
 
 /// Returned during TOTP setup.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TotpSetupResponse {
     pub secret: String,
     pub otpauth_url: String,

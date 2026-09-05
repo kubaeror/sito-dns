@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
+use utoipa::ToSchema;
+
 /// Query log filter parameters for pagination and search.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct QueryLogFilter {
     pub client: Option<String>,
     pub domain: Option<String>,
@@ -24,7 +26,7 @@ pub struct QueryLogFilter {
 }
 
 /// Paginated page of query logs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueryLogPage {
     pub entries: Vec<QueryLogEntry>,
     pub next_cursor: Option<String>,
@@ -32,7 +34,7 @@ pub struct QueryLogPage {
 }
 
 /// Aggregated global statistics.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct GlobalStats {
     pub total_queries: i64,
     pub blocked_queries: i64,
@@ -44,7 +46,7 @@ pub struct GlobalStats {
 }
 
 /// Aggregated statistics per client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClientStats {
     pub client_ip: String,
     pub client_name: Option<String>,
@@ -54,7 +56,7 @@ pub struct ClientStats {
 }
 
 /// Aggregated statistics per upstream resolver.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpstreamStats {
     pub upstream: String,
     pub total_queries: i64,
@@ -64,7 +66,7 @@ pub struct UpstreamStats {
 }
 
 /// Retention pruning report.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct RetentionReport {
     pub aggregated_hours: usize,
     pub deleted_records: u64,

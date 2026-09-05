@@ -310,14 +310,19 @@ impl HostsFilterEngine {
 
     /// Reloads all configured blocklists and custom rules, updating snapshot atomically.
     pub async fn reload(&self) -> Result<usize, FilterError> {
-        if !self.config.enabled {
+        self.reload_with_config(&self.config).await
+    }
+
+    /// Reloads blocklists and custom rules using an updated filtering configuration.
+    pub async fn reload_with_config(&self, config: &FilteringConfig) -> Result<usize, FilterError> {
+        if !config.enabled {
             self.snapshot.store(Arc::new(FilterSnapshot::default()));
             return Ok(0);
         }
 
         let mut list_contents = Vec::new();
 
-        for list in &self.config.lists {
+        for list in &config.lists {
             if !list.enabled {
                 continue;
             }
@@ -341,7 +346,7 @@ impl HostsFilterEngine {
             }
         }
 
-        let custom_rules = self.config.custom_rules.clone();
+        let custom_rules = config.custom_rules.clone();
 
         // Compile rules in blocking task to avoid stalling the tokio async runtime
         let (new_snapshot, count) = tokio::task::spawn_blocking(move || {

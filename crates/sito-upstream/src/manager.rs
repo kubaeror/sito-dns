@@ -131,6 +131,16 @@ impl UpstreamManager {
         self.timeout_duration
     }
 
+    /// Retrieve the current health status of all configured upstreams.
+    pub async fn statuses(&self) -> Vec<(String, HealthStatus)> {
+        let mut res = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            let status = entry.health.read().await.status();
+            res.push((entry.name.clone(), status));
+        }
+        res
+    }
+
     /// Resolve a DNS query according to the configured strategy (e.g. failover).
     pub async fn resolve(&self, msg: &Message) -> Result<Message, UpstreamError> {
         if self.entries.is_empty() {

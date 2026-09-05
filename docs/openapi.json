@@ -1,0 +1,3454 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "sito DNS Administrative API",
+    "description": "Administrative REST API and OpenAPI 3.0 specification for the sito DNS server",
+    "license": {
+      "name": "GPL-3.0-only"
+    },
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/api/v1/auth/login": {
+      "post": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "User login endpoint.",
+        "operationId": "login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Login successful or TOTP required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Locked out or rate limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "Logout endpoint invalidating current session cookie.",
+        "operationId": "logout",
+        "responses": {
+          "200": {
+            "description": "Logged out successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/tokens": {
+      "get": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "List all API tokens.",
+        "operationId": "list_tokens",
+        "responses": {
+          "200": {
+            "description": "List of API tokens",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ApiTokenMeta"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "Create a new API token.",
+        "operationId": "create_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "API token created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateTokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/auth/tokens/{id}": {
+      "delete": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "Revoke an API token by ID.",
+        "operationId": "delete_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Token revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Token not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/auth/totp/disable": {
+      "post": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "Disable TOTP 2FA.",
+        "operationId": "disable_totp",
+        "responses": {
+          "200": {
+            "description": "TOTP disabled successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/auth/totp/enable": {
+      "post": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "Enable TOTP 2FA by verifying setup code.",
+        "operationId": "enable_totp",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TotpConfirmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "TOTP enabled successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/auth/totp/setup": {
+      "get": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "Initiate TOTP 2FA setup.",
+        "operationId": "get_totp_setup",
+        "responses": {
+          "200": {
+            "description": "TOTP setup credentials generated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TotpSetupResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/auth/totp/verify": {
+      "post": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "Second login phase: verify TOTP code.",
+        "operationId": "verify_totp",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TotpVerifyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "TOTP verified, session established",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or expired code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/cache/flush": {
+      "post": {
+        "tags": [
+          "crate::handlers::cache"
+        ],
+        "summary": "Flush entire DNS response cache.",
+        "operationId": "flush_cache",
+        "responses": {
+          "200": {
+            "description": "Cache flushed successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/cache/invalidate": {
+      "post": {
+        "tags": [
+          "crate::handlers::cache"
+        ],
+        "summary": "Invalidate cache entries matching a domain.",
+        "operationId": "invalidate_cache",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cache entries invalidated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/clients": {
+      "get": {
+        "tags": [
+          "Clients"
+        ],
+        "operationId": "get_clients",
+        "responses": {
+          "200": {
+            "description": "Clients list retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ClientDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Clients"
+        ],
+        "operationId": "create_client",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClientDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Client created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/clients/groups": {
+      "get": {
+        "tags": [
+          "Clients"
+        ],
+        "operationId": "get_client_groups",
+        "responses": {
+          "200": {
+            "description": "Client groups retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ClientGroupDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Clients"
+        ],
+        "operationId": "add_client_group",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClientGroupDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Client group added",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientGroupDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Group already exists"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/clients/groups/{name}": {
+      "put": {
+        "tags": [
+          "Clients"
+        ],
+        "operationId": "update_client_group",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Group name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClientGroupDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Client group updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientGroupDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Clients"
+        ],
+        "operationId": "delete_client_group",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Group name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Client group deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Group not found"
+          }
+        }
+      }
+    },
+    "/api/v1/clients/{name}": {
+      "put": {
+        "tags": [
+          "Clients"
+        ],
+        "operationId": "update_client",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Client name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClientDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Client updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not Found"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Clients"
+        ],
+        "operationId": "delete_client",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Client name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Client deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not Found"
+          }
+        }
+      }
+    },
+    "/api/v1/config": {
+      "get": {
+        "tags": [
+          "crate::handlers::config"
+        ],
+        "summary": "Get current full configuration with secrets masked.",
+        "operationId": "get_config",
+        "responses": {
+          "200": {
+            "description": "Full configuration with masked secrets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "crate::handlers::config"
+        ],
+        "summary": "Update full configuration atomically after pre-commit validation.",
+        "operationId": "update_config",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateConfigRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Configuration updated successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/config/backup": {
+      "get": {
+        "tags": [
+          "crate::handlers::config"
+        ],
+        "summary": "Download a complete configuration backup archive (.tar.gz).",
+        "operationId": "download_backup",
+        "responses": {
+          "200": {
+            "description": "Gzipped tar archive containing config and metadata",
+            "content": {
+              "application/gzip": {}
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/config/reload": {
+      "post": {
+        "tags": [
+          "crate::handlers::config"
+        ],
+        "summary": "Reload configuration from disk without server restart.",
+        "operationId": "reload_config",
+        "responses": {
+          "200": {
+            "description": "Configuration reloaded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration on disk",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/config/restore": {
+      "post": {
+        "tags": [
+          "crate::handlers::config"
+        ],
+        "summary": "Upload and validate a backup archive (.tar.gz), generating a confirmation token.",
+        "operationId": "prepare_restore",
+        "requestBody": {
+          "description": "Gzipped tar archive",
+          "content": {
+            "application/gzip": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Backup validated and confirmation token issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestorePreparedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Corrupted or invalid backup",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/config/restore/confirm": {
+      "post": {
+        "tags": [
+          "crate::handlers::config"
+        ],
+        "summary": "Confirm and apply configuration restoration using confirmation token.",
+        "operationId": "confirm_restore",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RestoreConfirmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Restoration completed successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or expired confirmation token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/filtering/check": {
+      "post": {
+        "tags": [
+          "Filtering"
+        ],
+        "operationId": "check_filtering",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FilterCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Filtering check result simulated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FilterCheckResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/filtering/lists": {
+      "get": {
+        "tags": [
+          "Filtering"
+        ],
+        "operationId": "get_filter_lists",
+        "responses": {
+          "200": {
+            "description": "Subscription lists retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FilterListDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Filtering"
+        ],
+        "operationId": "add_filter_list",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddFilterListRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Filter list added",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FilterListDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/filtering/lists/{id}": {
+      "put": {
+        "tags": [
+          "Filtering"
+        ],
+        "operationId": "update_filter_list",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Filter list index ID",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateFilterListRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Filter list updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FilterListDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not Found"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Filtering"
+        ],
+        "operationId": "delete_filter_list",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Filter list index ID",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Filter list deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not Found"
+          }
+        }
+      }
+    },
+    "/api/v1/filtering/refresh": {
+      "post": {
+        "tags": [
+          "Filtering"
+        ],
+        "operationId": "refresh_filtering",
+        "responses": {
+          "200": {
+            "description": "Filter lists refreshed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/filtering/rules": {
+      "get": {
+        "tags": [
+          "Filtering"
+        ],
+        "operationId": "get_filtering_rules",
+        "responses": {
+          "200": {
+            "description": "Custom rules retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomRulesDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Filtering"
+        ],
+        "operationId": "set_filtering_rules",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomRulesDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Custom rules updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomRulesDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/ha/resync": {
+      "post": {
+        "tags": [
+          "crate::handlers::ha"
+        ],
+        "summary": "Trigger manual HA resynchronization (Deferred to Phase M8).",
+        "operationId": "trigger_ha_resync",
+        "responses": {
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "HA replication will be delivered in Phase M8",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/ha/slaves": {
+      "get": {
+        "tags": [
+          "crate::handlers::ha"
+        ],
+        "summary": "List connected HA secondary nodes (Deferred to Phase M8).",
+        "operationId": "get_ha_slaves",
+        "responses": {
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "HA replication will be delivered in Phase M8",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/ha/status": {
+      "get": {
+        "tags": [
+          "crate::handlers::ha"
+        ],
+        "summary": "Get HA cluster status (Deferred to Phase M8).",
+        "operationId": "get_ha_status",
+        "responses": {
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "HA replication will be delivered in Phase M8",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/querylog": {
+      "get": {
+        "tags": [
+          "QueryLog"
+        ],
+        "operationId": "get_querylog",
+        "parameters": [
+          {
+            "name": "client",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "domain",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "qtype",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Query logs retrieved with cursor pagination",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueryLogPage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "QueryLog"
+        ],
+        "operationId": "delete_querylog",
+        "responses": {
+          "200": {
+            "description": "Query log cleared successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/rewrites": {
+      "get": {
+        "tags": [
+          "Rewrites"
+        ],
+        "operationId": "get_rewrites",
+        "responses": {
+          "200": {
+            "description": "DNS rewrites retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RewriteDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Rewrites"
+        ],
+        "operationId": "add_rewrite",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddRewriteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "DNS rewrite created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RewriteDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/rewrites/{id}": {
+      "delete": {
+        "tags": [
+          "Rewrites"
+        ],
+        "operationId": "delete_rewrite",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Rewrite index ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "DNS rewrite deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not Found"
+          }
+        }
+      }
+    },
+    "/api/v1/stats": {
+      "get": {
+        "tags": [
+          "Stats"
+        ],
+        "operationId": "get_stats",
+        "parameters": [
+          {
+            "name": "window",
+            "in": "query",
+            "description": "Time window: \"1h\", \"24h\", \"7d\", \"30d\" (default: \"24h\").",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Global statistics retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalStats"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/stats/clients": {
+      "get": {
+        "tags": [
+          "Stats"
+        ],
+        "operationId": "get_client_stats",
+        "parameters": [
+          {
+            "name": "window",
+            "in": "query",
+            "description": "Time window: \"1h\", \"24h\", \"7d\", \"30d\" (default: \"24h\").",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-client statistics retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ClientStats"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/stats/upstreams": {
+      "get": {
+        "tags": [
+          "Stats"
+        ],
+        "operationId": "get_upstream_stats",
+        "parameters": [
+          {
+            "name": "window",
+            "in": "query",
+            "description": "Time window: \"1h\", \"24h\", \"7d\", \"30d\" (default: \"24h\").",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-upstream statistics retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UpstreamStats"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/status": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "get_status",
+        "responses": {
+          "200": {
+            "description": "Server status retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/upstream/config": {
+      "get": {
+        "tags": [
+          "crate::handlers::upstream"
+        ],
+        "summary": "Get current upstream DNS configuration.",
+        "operationId": "get_upstream_config",
+        "responses": {
+          "200": {
+            "description": "Current upstream DNS configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamConfigDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "crate::handlers::upstream"
+        ],
+        "summary": "Update upstream DNS configuration.",
+        "operationId": "update_upstream_config",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpstreamConfigDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated upstream DNS configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamConfigDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/upstream/test": {
+      "post": {
+        "tags": [
+          "crate::handlers::upstream"
+        ],
+        "summary": "Test upstream server latency and availability.",
+        "operationId": "test_upstream_servers",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpstreamTestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Latency test results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamTestResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AddFilterListRequest": {
+        "type": "object",
+        "description": "Request to create a new filter list.",
+        "required": [
+          "name",
+          "url"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "refresh_hours": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "AddRewriteRequest": {
+        "type": "object",
+        "description": "Request to create a new DNS rewrite.",
+        "required": [
+          "domain",
+          "answer"
+        ],
+        "properties": {
+          "answer": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "exception_clients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "record_type": {
+            "type": "string"
+          }
+        }
+      },
+      "ApiTokenMeta": {
+        "type": "object",
+        "description": "Stored metadata for an API token (the plaintext token is never stored).",
+        "required": [
+          "id",
+          "name",
+          "hash",
+          "scope",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "hash": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_used": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/Role"
+          }
+        }
+      },
+      "BackupMetadata": {
+        "type": "object",
+        "description": "Backup creation metadata.",
+        "required": [
+          "version",
+          "timestamp",
+          "sito_version"
+        ],
+        "properties": {
+          "sito_version": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "ClientDto": {
+        "type": "object",
+        "description": "Client configuration record.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "doh_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dot_sni": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group": {
+            "type": "string"
+          },
+          "ignore_query_log": {
+            "type": "boolean"
+          },
+          "ignore_stats": {
+            "type": "boolean"
+          },
+          "ip": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "mac": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "subnet": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ClientGroupDto": {
+        "type": "object",
+        "description": "Client policy group.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "blocked_services": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "filtering_enabled": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parental_categories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "parental_control": {
+            "type": "boolean"
+          },
+          "safe_search": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ClientStats": {
+        "type": "object",
+        "description": "Aggregated statistics per client.",
+        "required": [
+          "client_ip",
+          "total_queries",
+          "blocked_queries",
+          "last_seen"
+        ],
+        "properties": {
+          "blocked_queries": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "client_ip": {
+            "type": "string"
+          },
+          "client_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_seen": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total_queries": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "ConfigResponse": {
+        "type": "object",
+        "description": "Full configuration response with secrets masked.",
+        "required": [
+          "config_toml"
+        ],
+        "properties": {
+          "config_toml": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateTokenRequest": {
+        "type": "object",
+        "description": "Request to create an API token.",
+        "required": [
+          "name",
+          "scope"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateTokenResponse": {
+        "type": "object",
+        "description": "Response returned when creating an API token.",
+        "required": [
+          "id",
+          "name",
+          "scope",
+          "token"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "token": {
+            "type": "string",
+            "description": "The plaintext token. Only displayed once upon creation."
+          }
+        }
+      },
+      "CustomRulesDto": {
+        "type": "object",
+        "description": "Custom rules collection.",
+        "required": [
+          "rules"
+        ],
+        "properties": {
+          "rules": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "FilterCheckRequest": {
+        "type": "object",
+        "description": "Request to test/simulate a filtering verdict without contacting upstreams.",
+        "required": [
+          "domain"
+        ],
+        "properties": {
+          "client": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain": {
+            "type": "string"
+          },
+          "qtype": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "FilterCheckResponse": {
+        "type": "object",
+        "description": "Simulated filtering verdict response.",
+        "required": [
+          "domain",
+          "verdict"
+        ],
+        "properties": {
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain": {
+            "type": "string"
+          },
+          "list_source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rule": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verdict": {
+            "type": "string"
+          }
+        }
+      },
+      "FilterListDto": {
+        "type": "object",
+        "description": "Filter list subscription details.",
+        "required": [
+          "id",
+          "name",
+          "url",
+          "enabled",
+          "refresh_hours",
+          "rule_count"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "last_updated": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "refresh_hours": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "rule_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "GenericMessageResponse": {
+        "type": "object",
+        "description": "Generic success message response.",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "GlobalStats": {
+        "type": "object",
+        "description": "Aggregated global statistics.",
+        "required": [
+          "total_queries",
+          "blocked_queries",
+          "cached_queries",
+          "blocked_percentage",
+          "top_domains",
+          "top_blocked_domains",
+          "top_clients"
+        ],
+        "properties": {
+          "blocked_percentage": {
+            "type": "number",
+            "format": "double"
+          },
+          "blocked_queries": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "cached_queries": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "top_blocked_domains": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": false,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              ]
+            }
+          },
+          "top_clients": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": false,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              ]
+            }
+          },
+          "top_domains": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": false,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              ]
+            }
+          },
+          "total_queries": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "HaStubResponse": {
+        "type": "object",
+        "description": "Stub response for HA endpoints returning 501 Not Implemented.",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "InvalidateCacheQuery": {
+        "type": "object",
+        "description": "Query parameters for cache invalidation.",
+        "required": [
+          "domain"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string"
+          }
+        }
+      },
+      "LoginRequest": {
+        "type": "object",
+        "description": "Login request.",
+        "required": [
+          "user",
+          "pass"
+        ],
+        "properties": {
+          "pass": {
+            "type": "string"
+          },
+          "user": {
+            "type": "string"
+          }
+        }
+      },
+      "LoginResponse": {
+        "type": "object",
+        "description": "Login response.",
+        "properties": {
+          "partial_token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "totp_required": {
+            "type": "boolean"
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ProblemDetails": {
+        "type": "object",
+        "description": "RFC 7807 Problem Details response object.",
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Detailed explanation specific to this occurrence."
+          },
+          "instance": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional URI reference identifying the specific occurrence of the problem."
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "HTTP status code.",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string",
+            "description": "Short human-readable summary of the problem."
+          },
+          "type": {
+            "type": "string",
+            "description": "URI reference identifying the problem type."
+          }
+        }
+      },
+      "QueryLogEntry": {
+        "type": "object",
+        "description": "A single DNS query log record stored in SQLite or streamed over WebSockets.",
+        "required": [
+          "ts",
+          "client_ip",
+          "qname",
+          "qtype",
+          "verdict",
+          "proto"
+        ],
+        "properties": {
+          "client_ip": {
+            "type": "string",
+            "description": "Client IP address (or masked if anonymization is enabled)."
+          },
+          "client_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional human-readable client name."
+          },
+          "dnssec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "DNSSEC outcome: \"secure\" | \"insecure\" | \"bogus\"."
+          },
+          "elapsed_us": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Total elapsed processing duration in microseconds."
+          },
+          "id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "list_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Source list name that produced the rule match."
+          },
+          "proto": {
+            "type": "string",
+            "description": "Incoming protocol: \"udp\" | \"tcp\" | \"dot\" | \"doh\" | \"doq\" | \"doh3\"."
+          },
+          "qname": {
+            "type": "string",
+            "description": "Fully-qualified domain name queried (lowercased without trailing dot)."
+          },
+          "qtype": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Query record type (A=1, AAAA=28, HTTPS=65, etc.).",
+            "minimum": 0
+          },
+          "rcode": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Response code (0=NoError, 3=NXDomain, 2=ServFail, etc.).",
+            "minimum": 0
+          },
+          "rule": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Matched filter rule text if any."
+          },
+          "ts": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Timestamp in unix milliseconds."
+          },
+          "upstream": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Upstream resolver name or address that answered."
+          },
+          "verdict": {
+            "type": "string",
+            "description": "Filtering verdict: \"allowed\" | \"blocked\" | \"whitelisted\" | \"rewritten\" | \"stale\"."
+          }
+        }
+      },
+      "QueryLogFilter": {
+        "type": "object",
+        "description": "Query log filter parameters for pagination and search.",
+        "properties": {
+          "client": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cursor": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "qtype": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
+      "QueryLogPage": {
+        "type": "object",
+        "description": "Paginated page of query logs.",
+        "required": [
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryLogEntry"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "total_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
+      "RestoreConfirmRequest": {
+        "type": "object",
+        "description": "Request to confirm restoration.",
+        "required": [
+          "confirmation_token"
+        ],
+        "properties": {
+          "confirmation_token": {
+            "type": "string"
+          }
+        }
+      },
+      "RestorePreparedResponse": {
+        "type": "object",
+        "description": "Restore preparation response with confirmation token.",
+        "required": [
+          "confirmation_token",
+          "message",
+          "config_preview"
+        ],
+        "properties": {
+          "config_preview": {
+            "type": "string"
+          },
+          "confirmation_token": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "RewriteDto": {
+        "type": "object",
+        "description": "Local DNS rewrite record.",
+        "required": [
+          "id",
+          "domain",
+          "record_type",
+          "answer"
+        ],
+        "properties": {
+          "answer": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "exception_clients": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "id": {
+            "type": "string"
+          },
+          "record_type": {
+            "type": "string"
+          }
+        }
+      },
+      "Role": {
+        "type": "string",
+        "description": "RBAC role hierarchy: Admin > Operator > Viewer.",
+        "enum": [
+          "viewer",
+          "operator",
+          "admin"
+        ]
+      },
+      "StatsQuery": {
+        "type": "object",
+        "description": "Query parameters for statistics window.",
+        "properties": {
+          "window": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Time window: \"1h\", \"24h\", \"7d\", \"30d\" (default: \"24h\")."
+          }
+        }
+      },
+      "StatusResponse": {
+        "type": "object",
+        "description": "System status response.",
+        "required": [
+          "version",
+          "uptime_seconds",
+          "role",
+          "listeners"
+        ],
+        "properties": {
+          "listeners": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "role": {
+            "type": "string"
+          },
+          "uptime_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "TotpConfirmRequest": {
+        "type": "object",
+        "description": "Request to confirm and enable TOTP.",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          }
+        }
+      },
+      "TotpSetupResponse": {
+        "type": "object",
+        "description": "Returned during TOTP setup.",
+        "required": [
+          "secret",
+          "otpauth_url",
+          "qr_code",
+          "backup_codes"
+        ],
+        "properties": {
+          "backup_codes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "otpauth_url": {
+            "type": "string"
+          },
+          "qr_code": {
+            "type": "string"
+          },
+          "secret": {
+            "type": "string"
+          }
+        }
+      },
+      "TotpVerifyRequest": {
+        "type": "object",
+        "description": "TOTP verification request.",
+        "required": [
+          "partial_token",
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "partial_token": {
+            "type": "string"
+          }
+        }
+      },
+      "UpdateConfigRequest": {
+        "type": "object",
+        "description": "Request to replace full configuration.",
+        "required": [
+          "config_toml"
+        ],
+        "properties": {
+          "config_toml": {
+            "type": "string"
+          }
+        }
+      },
+      "UpdateFilterListRequest": {
+        "type": "object",
+        "description": "Request to update an existing filter list.",
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "refresh_hours": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "UpstreamConfigDto": {
+        "type": "object",
+        "description": "Upstream DNS configuration.",
+        "required": [
+          "servers",
+          "bootstrap",
+          "strategy",
+          "timeout_ms",
+          "probe_domain",
+          "pool_size"
+        ],
+        "properties": {
+          "bootstrap": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "pool_size": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "probe_domain": {
+            "type": "string"
+          },
+          "servers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "strategy": {
+            "type": "string"
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "UpstreamStats": {
+        "type": "object",
+        "description": "Aggregated statistics per upstream resolver.",
+        "required": [
+          "upstream",
+          "total_queries",
+          "error_queries",
+          "avg_elapsed_us",
+          "share_percentage"
+        ],
+        "properties": {
+          "avg_elapsed_us": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "error_queries": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "share_percentage": {
+            "type": "number",
+            "format": "double"
+          },
+          "total_queries": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "upstream": {
+            "type": "string"
+          }
+        }
+      },
+      "UpstreamTestItem": {
+        "type": "object",
+        "description": "Upstream latency test individual result.",
+        "required": [
+          "server",
+          "healthy"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "healthy": {
+            "type": "boolean"
+          },
+          "rtt_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "server": {
+            "type": "string"
+          }
+        }
+      },
+      "UpstreamTestRequest": {
+        "type": "object",
+        "description": "Upstream latency test request.",
+        "required": [
+          "servers"
+        ],
+        "properties": {
+          "servers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "UpstreamTestResponse": {
+        "type": "object",
+        "description": "Upstream latency test result response.",
+        "required": [
+          "results"
+        ],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UpstreamTestItem"
+            }
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "System",
+      "description": "System status and health"
+    },
+    {
+      "name": "Stats",
+      "description": "Query statistics and metrics"
+    },
+    {
+      "name": "QueryLog",
+      "description": "Historical query logs and live streaming"
+    },
+    {
+      "name": "Filtering",
+      "description": "Blocklists, allowlists, and custom rules"
+    },
+    {
+      "name": "Clients",
+      "description": "Client mapping and policy groups"
+    },
+    {
+      "name": "Rewrites",
+      "description": "Custom DNS rewrites"
+    },
+    {
+      "name": "Upstream",
+      "description": "Upstream DNS resolvers and latency probing"
+    },
+    {
+      "name": "Cache",
+      "description": "Response cache operations"
+    },
+    {
+      "name": "Config",
+      "description": "Configuration persistence, hot-reload, backup and restore"
+    },
+    {
+      "name": "Auth",
+      "description": "Authentication, sessions, TOTP 2FA, and API tokens"
+    },
+    {
+      "name": "HA",
+      "description": "High Availability replication (Phase M8)"
+    }
+  ]
+}

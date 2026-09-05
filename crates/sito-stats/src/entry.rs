@@ -1,9 +1,10 @@
 //! Query log entry representation per section 14.1.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// A single DNS query log record stored in SQLite or streamed over WebSockets.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct QueryLogEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<i64>,
