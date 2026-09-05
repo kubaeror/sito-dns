@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::auth::manager::LoginResult;
 use crate::auth::rbac::AuthUser;
+use crate::auth::resolve_client_ip;
 use crate::auth::session::{build_clear_session_cookie, extract_session_cookie};
 use crate::config_writer::save_config_atomic;
 use crate::models::{FilterListDto, StatusResponse};
@@ -77,16 +78,6 @@ pub fn get_session_user(ctx: &ServerContext, headers: &HeaderMap) -> Option<Auth
     None
 }
 
-fn parse_client_ip(headers: &HeaderMap) -> String {
-    if let Some(fwd) = headers.get("x-forwarded-for")
-        && let Ok(s) = fwd.to_str()
-        && let Some(first) = s.split(',').next()
-    {
-        return first.trim().to_string();
-    }
-    "127.0.0.1".to_string()
-}
-
 // ---------------------------------------------------------------------------
 // Root, Login & Logout
 // ---------------------------------------------------------------------------
@@ -123,10 +114,12 @@ pub struct LoginForm {
 
 pub async fn login_submit(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let client_ip = parse_client_ip(&headers);
+    let trusted_proxies = ctx.config.load().get_web_config().trusted_proxies;
+    let client_ip = resolve_client_ip(peer_addr, &headers, &trusted_proxies);
     let result = ctx
         .auth_mgr
         .login(&form.username, &form.password, &client_ip);

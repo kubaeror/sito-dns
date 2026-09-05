@@ -11,22 +11,13 @@ use crate::auth::rbac::RequireAdmin;
 use crate::auth::session::SESSION_COOKIE_NAME;
 use crate::auth::token::{ApiTokenMeta, CreateTokenResponse, Role};
 use crate::auth::totp::TotpSetupResponse;
+use crate::auth::{MaybeConnectInfo, resolve_client_ip};
 use crate::error::ProblemDetails;
 use crate::models::{
     CreateTokenRequest, GenericMessageResponse, LoginRequest, LoginResponse, TotpConfirmRequest,
     TotpVerifyRequest,
 };
 use crate::state::ServerContext;
-
-fn parse_client_ip(headers: &HeaderMap) -> String {
-    if let Some(forwarded) = headers.get("x-forwarded-for")
-        && let Ok(val) = forwarded.to_str()
-        && let Some(first) = val.split(',').next()
-    {
-        return first.trim().to_string();
-    }
-    "127.0.0.1".to_string()
-}
 
 /// User login endpoint.
 #[utoipa::path(
@@ -41,10 +32,12 @@ fn parse_client_ip(headers: &HeaderMap) -> String {
 )]
 pub async fn login(
     State(ctx): State<ServerContext>,
+    MaybeConnectInfo(peer_addr): MaybeConnectInfo,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ProblemDetails> {
-    let client_ip = parse_client_ip(&headers);
+    let trusted_proxies = ctx.config.load().get_web_config().trusted_proxies;
+    let client_ip = resolve_client_ip(peer_addr, &headers, &trusted_proxies);
     let result = ctx.auth_mgr.login(&req.user, &req.pass, &client_ip);
 
     match result {

@@ -100,7 +100,7 @@ mod tests {
         let stats = db.get_global_stats(86_400_000 * 365).await.unwrap();
         assert_eq!(stats.total_queries, 50);
         assert_eq!(stats.blocked_queries, 25);
-        assert_eq!(stats.blocked_percentage, 50.0);
+        assert!((stats.blocked_percentage - 50.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -270,7 +270,7 @@ mod tests {
         for i in 0..count {
             entries.push(QueryLogEntry {
                 id: None,
-                ts: base_ts + i as i64,
+                ts: base_ts + i64::try_from(i).unwrap_or(0),
                 client_ip: "10.0.0.5".into(),
                 client_name: None,
                 qname: "speedtest.example".into(),

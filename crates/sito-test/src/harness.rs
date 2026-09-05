@@ -14,6 +14,7 @@ pub struct TestServerInstance {
     port: u16,
     dot_port: u16,
     doh_port: u16,
+    web_port: u16,
     addr: SocketAddr,
     has_tls: bool,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -66,12 +67,25 @@ impl TestServerInstance {
             }
         }
 
+        let mut probe_web = None;
+        let mut web_port = config.get_web_config().port;
+        if web_port == 8080 || web_port == 0 {
+            let p = std::net::TcpListener::bind("127.0.0.1:0")?;
+            web_port = p.local_addr()?.port();
+            let mut web_cfg = config.get_web_config();
+            web_cfg.bind = "127.0.0.1".parse().unwrap();
+            web_cfg.port = web_port;
+            config.set_web_config(web_cfg);
+            probe_web = Some(p);
+        }
+
         // Release all probes simultaneously right before starting the server
         drop(probe_dns);
         drop(probe_dot);
         drop(probe_doh);
         drop(probe_doq);
         drop(probe_doh3);
+        drop(probe_web);
 
         let temp_dir =
             std::env::temp_dir().join(format!("sito_test_inst_{}_{}", std::process::id(), port));
@@ -140,6 +154,7 @@ impl TestServerInstance {
             port,
             dot_port,
             doh_port,
+            web_port,
             addr,
             has_tls,
             shutdown_tx: Some(shutdown_tx),
@@ -166,6 +181,11 @@ impl TestServerInstance {
     /// Bound port of the DoH listener.
     pub fn doh_port(&self) -> u16 {
         self.doh_port
+    }
+
+    /// Bound port of the web admin interface.
+    pub fn web_port(&self) -> u16 {
+        self.web_port
     }
 
     /// Bound address of the DoT listener.

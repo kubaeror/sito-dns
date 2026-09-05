@@ -158,6 +158,88 @@ impl Config {
         }
         None
     }
+
+    /// Resolves the effective web configuration.
+    pub fn get_web_config(&self) -> WebConfig {
+        if let Some(ref val) = self.web
+            && let Ok(cfg) = val.clone().try_into::<WebConfig>()
+        {
+            return cfg;
+        }
+        WebConfig::default()
+    }
+
+    /// Sets or overrides the web configuration.
+    pub fn set_web_config(&mut self, web: WebConfig) {
+        if let Ok(val) = toml::Value::try_from(web) {
+            self.web = Some(val);
+        }
+    }
+
+    /// Resolves the effective stats configuration.
+    pub fn get_stats_config(&self) -> StatsConfig {
+        if let Some(ref val) = self.stats
+            && let Ok(cfg) = val.clone().try_into::<StatsConfig>()
+        {
+            return cfg;
+        }
+        StatsConfig::default()
+    }
+}
+
+/// Web administrative server parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebConfig {
+    #[serde(default = "default_web_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_web_bind")]
+    pub bind: IpAddr,
+    #[serde(default = "default_web_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub trusted_proxies: Vec<IpAddr>,
+}
+
+fn default_web_enabled() -> bool {
+    true
+}
+
+fn default_web_bind() -> IpAddr {
+    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+}
+
+fn default_web_port() -> u16 {
+    8080
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_web_enabled(),
+            bind: default_web_bind(),
+            port: default_web_port(),
+            trusted_proxies: Vec::new(),
+        }
+    }
+}
+
+/// Query statistics and retention parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatsConfig {
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+}
+
+fn default_retention_days() -> u32 {
+    90
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_retention_days(),
+        }
+    }
 }
 
 /// Server operational parameters.

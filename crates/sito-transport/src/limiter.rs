@@ -61,6 +61,30 @@ impl RateLimiter {
         self.buckets
             .retain(|_, bucket| now.duration_since(bucket.last_replenished).as_secs() < 60);
     }
+
+    /// Spawn a background task to periodically prune inactive rate limit buckets every 60 seconds until shutdown.
+    pub fn spawn_pruner(
+        self: &std::sync::Arc<Self>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let limiter = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        limiter.prune();
+                    }
+                }
+            }
+        })
+    }
 }
 
 #[cfg(test)]

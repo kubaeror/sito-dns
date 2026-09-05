@@ -50,6 +50,7 @@ pub async fn start_tcp_listener<H: QueryHandler>(
         config.rate_limit_per_ip,
         config.rate_limit_per_ip * 2,
     ));
+    rate_limiter.spawn_pruner(shutdown_rx.clone());
 
     let handle = tokio::spawn(async move {
         loop {

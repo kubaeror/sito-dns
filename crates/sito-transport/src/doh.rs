@@ -252,6 +252,7 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
         http01_challenges: config.http01_challenges,
         alt_svc_header,
     });
+    state.rate_limiter.spawn_pruner(shutdown_rx.clone());
 
     let app = Router::new()
         .route("/dns-query", any(doh_route::<H>))
