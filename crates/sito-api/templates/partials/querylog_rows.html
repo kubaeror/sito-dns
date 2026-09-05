@@ -1,0 +1,42 @@
+{% for entry in entries %}
+<tr id="query-{{ entry.ts }}">
+  <td class="mono" style="font-size: 0.75rem; white-space: nowrap;">{{ entry.time_str }}</td>
+  <td class="mono td-strong">
+    <div>{{ entry.client_ip }}</div>
+    {% if let Some(name) = entry.client_name %}
+    <div style="font-size: 0.7rem; color: var(--text-muted);">{{ name }}</div>
+    {% endif %}
+  </td>
+  <td class="mono td-strong" style="max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+    {{ entry.qname }}
+  </td>
+  <td><span class="badge badge-neutral mono">{{ entry.qtype_str }}</span></td>
+  <td>
+    {% if entry.verdict == "blocked" %}
+      <span class="badge badge-danger">Blocked</span>
+    {% else if entry.verdict == "cached" %}
+      <span class="badge badge-info">Cached</span>
+    {% else %}
+      <span class="badge badge-success">Allowed</span>
+    {% endif %}
+  </td>
+  <td class="mono" style="font-size: 0.8rem;">
+    {{ entry.latency_str }}
+  </td>
+  <td style="font-size: 0.8rem; color: var(--text-secondary);">
+    {% if let Some(rule) = entry.rule %}
+      <span style="color: var(--accent-danger);">{{ rule }}</span>
+    {% else if let Some(up) = entry.upstream %}
+      <span class="mono">{{ up }}</span>
+    {% else %}
+      -
+    {% endif %}
+  </td>
+</tr>
+{% else %}
+<tr>
+  <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 32px;">
+    No matching queries found in logs.
+  </td>
+</tr>
+{% endfor %}

@@ -15,9 +15,9 @@
 
 ## 📊 Feature Comparison: sito vs. AdGuard Home vs. Pi-hole
 
-| Feature / Capability | **sito** (v1.0) | **AdGuard Home** | **Pi-hole (FTL)** |
+| Feature / Capability | **sito** (v1.1) | **AdGuard Home** | **Pi-hole (FTL)** |
 |---|---|---|---|
-| **Language & Runtime** | **Rust (edition 2024, zero GC)** | Go (GC overhead under load) | C (FTL) + PHP Web UI |
+| **Language & Runtime** | **Rust (edition 2024, zero GC, zero Node.js)** | Go (GC overhead under load) | C (FTL) + PHP Web UI |
 | **Max Cache Throughput** | **≥ 500,000 QPS** (measured 584k) | ~100,000 QPS | ~50,000 QPS |
 | **Cache Hit Latency (p99)** | **< 1.0 ms** (measured 0.34 ms) | 2 – 5 ms | 2 – 5 ms |
 | **Memory @ 1M Rules** | **~ 285 MB RSS** (Trie + Interning) | 400 – 800 MB RSS | ~ 350 MB RSS |
@@ -27,7 +27,7 @@
 | **ReDoS Defense** | **Pure Dense DFA (no backtracking)** | RE2 linear time | POSIX regex (risk of backtrack) |
 | **ACME Certificates** | **Native TLS-ALPN-01 & HTTP-01** | Built-in ACME | External (Certbot) |
 | **RouterOS Integration** | **Native DHCP Lease Sync** | None | None |
-| **Distribution** | **Single standalone binary (UI embedded)** | Single standalone binary | Multiple packages / lighttpd |
+| **Distribution** | **Single standalone binary (HTMX + Askama UI embedded)** | Single standalone binary | Multiple packages / lighttpd |
 | **Config Format** | **Single TOML (`config.toml`)** | Single YAML | Multiple conf files + SQLite |
 
 ---
@@ -35,6 +35,7 @@
 ## ⚡ Key Highlights
 
 - **Blazing Fast Hot Path:** Zero garbage collection pauses, multi-socket `SO_REUSEPORT` listeners, and concurrent `moka` caching delivering **> 580k QPS** with **0.34 ms p99 latency** on reference hardware ([ADR-008](docs/adr/0008-performance-budget.md)).
+- **Zero-Node.js Embedded Web Console:** Lightweight, reactive admin panel powered by Axum, Askama compile-time templates, HTMX, and Alpine.js embedded directly into the standalone binary via `rust-embed` (zero npm/Node.js build or runtime dependencies, <1 MB footprint).
 - **AdGuard / ABP Syntax Compatibility:** High-throughput `SuffixTrie` with string interning, Aho-Corasick substring matching, and backtracking-free regex DFAs.
 - **Modern Encryption:** Native support for plain UDP/TCP, DNS-over-TLS (DoT/853), DNS-over-HTTPS (DoH/443, H2), DNS-over-QUIC (DoQ/853), and DNS-over-HTTP/3 (DoH3/443).
 - **Zero-Consensus High Availability:** Real-time master/slave push replication over mTLS WebSockets with Ed25519 cryptographic signatures and atomic snapshot updates ([ADR-002](docs/adr/0002-ha-master-slave-push.md)).
@@ -120,7 +121,7 @@ cargo build --release --locked --features "embed-ui,mimalloc"
 ./target/release/sito --config /etc/sito/config.toml
 ```
 
-Once started, navigate to `http://localhost:8080` to access the administration web panel. Initial credentials: `admin` / `adminadmin`.
+Once started, navigate to `http://localhost:8080` to access the reactive HTMX administration web panel (Dashboard, Query Log, Filter Subscriptions, Custom Rules Editor, Local Rewrites, Clients, Upstream Latency Tester, System Settings). Initial credentials: `admin` / `adminadmin`.
 
 Swagger UI / OpenAPI documentation is available at `http://localhost:8080/swagger-ui`.
 

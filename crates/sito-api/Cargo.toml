@@ -39,10 +39,11 @@ utoipa.workspace = true
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 rust-embed = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
+askama = { workspace = true, optional = true }
 
 [features]
 default = []
-embed-ui = ["dep:rust-embed", "dep:mime_guess"]
+embed-ui = ["dep:rust-embed", "dep:mime_guess", "dep:askama"]
 
 [lints]
 workspace = true

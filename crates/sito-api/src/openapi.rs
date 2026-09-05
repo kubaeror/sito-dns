@@ -118,7 +118,7 @@ use utoipa::OpenApi;
     ),
     info(
         title = "sito DNS Administrative API",
-        version = "1.0.1",
+        version = "1.1.0",
         description = "Administrative REST API and OpenAPI 3.0 specification for the sito DNS server",
         license(name = "GPL-3.0-only")
     )

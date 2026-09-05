@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+
+{% block title %}DNS Rewrites - sito DNS{% endblock %}
+{% block page_title %}Local DNS Records & Rewrites{% endblock %}
+
+{% block content %}
+<div class="card" x-data="{ showModal: false }">
+  <div class="card-header">
+    <div class="card-title">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+      Custom DNS Records & Local Hostnames
+    </div>
+    <button @click="showModal = true" class="btn btn-primary btn-sm">
+      + Add DNS Rewrite
+    </button>
+  </div>
+
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Domain / Hostname</th>
+          <th>Type</th>
+          <th>IP / Target Address</th>
+          <th style="text-align: center;">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rewrites %}
+        <tr>
+          <td class="td-strong mono">{{ r.domain }}</td>
+          <td><span class="badge badge-neutral mono">{{ r.record_type }}</span></td>
+          <td class="mono" style="color: var(--accent-secondary);">{{ r.answer }}</td>
+          <td style="text-align: center;">
+            <form action="/ui/rewrites/delete" method="POST" style="display:inline;" onsubmit="return confirm('Delete rewrite for {{ r.domain }}?');">
+              <input type="hidden" name="domain" value="{{ r.domain }}">
+              <button type="submit" class="btn-icon" style="color: var(--accent-danger);" title="Delete rewrite">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+              </button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="4" style="text-align: center; color: var(--text-muted); padding: 24px;">No local DNS rewrites defined</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Add Modal -->
+  <div class="modal-backdrop" x-show="showModal" style="display: none;">
+    <div class="modal-dialog" @click.away="showModal = false">
+      <div class="modal-header">
+        <h3>Add Local DNS Rewrite</h3>
+        <button class="btn-icon" @click="showModal = false">&times;</button>
+      </div>
+      <form action="/ui/rewrites/add" method="POST">
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="form-label" for="rw-domain">Domain Name</label>
+            <input type="text" id="rw-domain" name="domain" class="form-input mono" required placeholder="nas.lan or router.home">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="rw-type">Record Type</label>
+            <select id="rw-type" name="record_type" class="form-select">
+              <option value="A">A (IPv4 Address)</option>
+              <option value="AAAA">AAAA (IPv6 Address)</option>
+              <option value="CNAME">CNAME (Canonical Name Alias)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="rw-answer">Destination Value / IP</label>
+            <input type="text" id="rw-answer" name="answer" class="form-input mono" required placeholder="192.168.1.50">
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" @click="showModal = false">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Rewrite</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

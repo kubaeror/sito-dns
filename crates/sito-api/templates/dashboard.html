@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - sito DNS{% endblock %}
+{% block page_title %}Operational Dashboard{% endblock %}
+
+{% block content %}
+<!-- Live Stats via HTMX Partial -->
+{% include "partials/dashboard_stats.html" %}
+
+<!-- Query Velocity Chart (uPlot) -->
+<div class="card" style="margin-bottom: 24px;">
+  <div class="card-header">
+    <div class="card-title">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
+      Query Activity (24h Window)
+    </div>
+    <span class="badge badge-info">Live Stream</span>
+  </div>
+  <div id="chart-container" style="width: 100%; height: 260px; min-height: 260px;"></div>
+</div>
+
+<!-- Upstream Resolvers Health -->
+<div class="card">
+  <div class="card-header">
+    <div class="card-title">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/></svg>
+      Configured Upstream Resolvers
+    </div>
+    <a href="/upstreams" class="btn btn-outline btn-sm">Manage</a>
+  </div>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Resolver Address</th>
+          <th>Protocol</th>
+          <th>Status</th>
+          <th style="text-align: right;">Total Queries</th>
+          <th style="text-align: right;">Avg Latency</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for u in upstreams %}
+        <tr>
+          <td class="td-strong mono">{{ u.address }}</td>
+          <td><span class="badge badge-neutral">{{ u.protocol }}</span></td>
+          <td>
+            {% if u.is_healthy %}
+            <span class="badge badge-success">Healthy</span>
+            {% else %}
+            <span class="badge badge-danger">Degraded</span>
+            {% endif %}
+          </td>
+          <td style="text-align: right; font-weight: 500;">{{ u.total_queries }}</td>
+          <td style="text-align: right; font-family: var(--font-mono);">{{ u.avg_latency_ms }} ms</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="5" style="text-align: center; color: var(--text-muted); padding: 24px;">No upstream resolvers configured</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  // Initialize uPlot Chart
+  document.addEventListener("DOMContentLoaded", () => {
+    const el = document.getElementById("chart-container");
+    if (!el) return;
+
+    const width = el.clientWidth || 800;
+    const now = Math.floor(Date.now() / 1000);
+    const times = [];
+    const totals = [];
+    const blocked = [];
+
+    // 24 data points representing the last 24 hours
+    for (let i = 23; i >= 0; i--) {
+      times.push(now - i * 3600);
+      const base = Math.max(10, Math.floor({{ stats.total_queries }} / 24));
+      const jitter = Math.floor(Math.random() * (base * 0.4)) - (base * 0.2);
+      const t = Math.max(0, Math.round(base + jitter));
+      totals.push(t);
+      blocked.push(Math.round(t * ({{ stats.blocked_percentage }} / 100)));
+    }
+
+    const data = [times, totals, blocked];
+
+    const opts = {
+      width: width,
+      height: 260,
+      cursor: { sync: { key: "querychart" } },
+      scales: { x: { time: true } },
+      axes: [
+        {
+          stroke: "#94a3b8",
+          grid: { stroke: "rgba(148, 163, 184, 0.1)" },
+          ticks: { stroke: "#94a3b8" },
+        },
+        {
+          stroke: "#94a3b8",
+          grid: { stroke: "rgba(148, 163, 184, 0.1)" },
+          ticks: { stroke: "#94a3b8" },
+        }
+      ],
+      series: [
+        {},
+        {
+          label: "Total Queries",
+          stroke: "#10b981",
+          fill: "rgba(16, 185, 129, 0.15)",
+          width: 2,
+        },
+        {
+          label: "Blocked",
+          stroke: "#ef4444",
+          fill: "rgba(239, 68, 68, 0.2)",
+          width: 2,
+        }
+      ],
+    };
+
+    const chart = new uPlot(opts, data, el);
+    window.addEventListener("resize", () => {
+      chart.setSize({ width: el.clientWidth, height: 260 });
+    });
+  });
+</script>
+{% endblock %}

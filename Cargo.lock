@@ -131,6 +131,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "askama"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b79091df18a97caea757e28cd2d5fda49c6cd4bd01ddffd7ff01ace0c0ad2c28"
+dependencies = [
+ "askama_derive",
+ "askama_escape",
+]
+
+[[package]]
+name = "askama_derive"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19fe8d6cb13c4714962c072ea496f3392015f0989b1a2847bb4b2d9effd71d83"
+dependencies = [
+ "askama_parser",
+ "mime",
+ "mime_guess",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "askama_escape"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "619743e34b5ba4e9703bba34deac3427c72507c7159f5fd030aea8cac0cfe341"
+
+[[package]]
+name = "askama_parser"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acb1161c6b64d1c3d83108213c2a2533a342ac225aabd0bda218278c2ddb00c0"
+dependencies = [
+ "nom",
+]
+
+[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3066,7 +3105,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sito"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3100,11 +3139,12 @@ dependencies = [
 
 [[package]]
 name = "sito-api"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
  "argon2",
+ "askama",
  "axum",
  "blake3",
  "chrono",
@@ -3138,7 +3178,7 @@ dependencies = [
 
 [[package]]
 name = "sito-cache"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "moka",
  "sito-core",
@@ -3149,7 +3189,7 @@ dependencies = [
 
 [[package]]
 name = "sito-clients"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "croner",
@@ -3165,7 +3205,7 @@ dependencies = [
 
 [[package]]
 name = "sito-core"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "arc-swap",
  "hickory-proto",
@@ -3176,7 +3216,7 @@ dependencies = [
 
 [[package]]
 name = "sito-dnssec"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "arc-swap",
  "base64",
@@ -3190,7 +3230,7 @@ dependencies = [
 
 [[package]]
 name = "sito-filter"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -3210,7 +3250,7 @@ dependencies = [
 
 [[package]]
 name = "sito-ha"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3241,7 +3281,7 @@ dependencies = [
 
 [[package]]
 name = "sito-proto"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "hickory-proto",
  "idna",
@@ -3251,7 +3291,7 @@ dependencies = [
 
 [[package]]
 name = "sito-rewrites"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "hickory-proto",
  "serde",
@@ -3265,7 +3305,7 @@ dependencies = [
 
 [[package]]
 name = "sito-stats"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "serde",
@@ -3280,7 +3320,7 @@ dependencies = [
 
 [[package]]
 name = "sito-test"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3330,7 +3370,7 @@ dependencies = [
 
 [[package]]
 name = "sito-transport"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3365,7 +3405,7 @@ dependencies = [
 
 [[package]]
 name = "sito-upstream"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "rand 0.8.8",

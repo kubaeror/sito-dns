@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block title %}Login - sito DNS{% endblock %}
+
+{% block standalone_content %}
+<div class="login-container">
+  <div class="login-card">
+    <div style="text-align: center; margin-bottom: 24px;">
+      <img src="/static/logo.svg" alt="sito logo" style="width: 48px; height: 48px; margin-bottom: 12px; border-radius: 10px;">
+      <h1 style="font-size: 1.5rem; font-weight: 700; margin-bottom: 4px;">sito DNS</h1>
+      <p style="font-size: 0.875rem; color: var(--text-secondary);">Administration & Management Console</p>
+    </div>
+
+    {% if !error_message.is_empty() %}
+    <div style="background-color: rgba(239, 68, 68, 0.15); border: 1px solid var(--accent-danger); color: var(--accent-danger); padding: 10px 14px; border-radius: var(--radius-md); font-size: 0.85rem; margin-bottom: 18px;">
+      {{ error_message }}
+    </div>
+    {% endif %}
+
+    <form method="POST" action="/ui/login" hx-boost="false">
+      <div class="form-group">
+        <label class="form-label" for="username">Username</label>
+        <input class="form-input" type="text" id="username" name="username" value="{{ username }}" required autofocus autocomplete="username" placeholder="admin">
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="password">Password</label>
+        <input class="form-input" type="password" id="password" name="password" required autocomplete="current-password" placeholder="••••••••">
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="totp">TOTP 2FA Code <span style="font-weight: 400; color: var(--text-muted);">(if enabled)</span></label>
+        <input class="form-input" type="text" id="totp" name="totp" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" placeholder="123456">
+      </div>
+
+      <button type="submit" class="btn btn-primary" style="width: 100%; margin-top: 8px; padding: 10px;">
+        Sign In
+      </button>
+    </form>
+  </div>
+</div>
+{% endblock %}

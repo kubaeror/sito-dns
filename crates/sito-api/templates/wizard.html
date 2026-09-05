@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+
+{% block title %}Initial Setup Wizard - sito DNS{% endblock %}
+
+{% block standalone_content %}
+<div class="login-container">
+  <div class="card" style="max-width: 600px; width: 100%; padding: 32px;">
+    <div style="text-align: center; margin-bottom: 24px;">
+      <img src="/static/logo.svg" alt="sito logo" style="width: 48px; height: 48px; margin-bottom: 12px; border-radius: 10px;">
+      <h1 style="font-size: 1.5rem; font-weight: 700;">Welcome to sito DNS</h1>
+      <p style="font-size: 0.875rem; color: var(--text-secondary);">First-Time Setup Configuration</p>
+    </div>
+
+    <form action="/ui/wizard/complete" method="POST">
+      <div class="form-group">
+        <label class="form-label" for="wiz-user">Admin Username</label>
+        <input type="text" id="wiz-user" name="admin_user" class="form-input" value="admin" required>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="wiz-pass">Admin Password</label>
+        <input type="password" id="wiz-pass" name="admin_password" class="form-input" required placeholder="Strong password">
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="wiz-upstream">Primary Upstream DNS</label>
+        <select id="wiz-upstream" name="upstream" class="form-select">
+          <option value="tls://1.1.1.1:853">Cloudflare DNS (DNS-over-TLS)</option>
+          <option value="https://dns.quad9.net/dns-query">Quad9 (DNS-over-HTTPS, Malware blocking)</option>
+          <option value="tls://dns.google:853">Google Public DNS (DNS-over-TLS)</option>
+          <option value="1.1.1.1:53">Standard UDP/TCP 1.1.1.1</option>
+        </select>
+      </div>
+
+      <div class="form-group" style="margin-top: 20px;">
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+          <input type="checkbox" name="enable_adblock" checked style="width: 16px; height: 16px;">
+          <span style="font-size: 0.875rem;">Enable default Adblock and anti-tracking lists</span>
+        </label>
+      </div>
+
+      <button type="submit" class="btn btn-primary" style="width: 100%; margin-top: 16px; padding: 10px;">
+        Complete Setup & Go to Dashboard
+      </button>
+    </form>
+  </div>
+</div>
+{% endblock %}

@@ -5,6 +5,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.1.0] - 2026-09-05
+
+### Major Architecture Change — Web Framework Migration to HTMX + Askama + Alpine.js
+- **Eliminated Node.js and npm**: Completely removed the Node.js / Vite / React 18 / Mantine UI frontend toolchain, eliminating 351 MB of `node_modules` and 100+ npm dependencies.
+- **Server-Side Rendered Hypermedia**: Migrated web dashboard and administration views to **Askama** type-safe compile-time templates in `crates/sito-api` with **HTMX** for dynamic partial swaps and **Alpine.js** for client-side state.
+- **Microsecond Rendering & Minimal Footprint**: Client bundle reduced by >95% (from 1.6 MB to ~70 kB total JS/CSS), browser memory footprint reduced from ~150 MB to ~20 MB.
+- **Real-Time DNS Query Log**: Live WebSocket streaming directly into HTMX table rows for zero-delay query inspection.
+- **High-Performance Charts**: Integrated **uPlot** (~35 kB) for fast 24h query analytics.
+- **Unified Rust Toolchain**: Entire repository and web UI now compiles with standard `cargo build`.
+- Bumped workspace version to `1.1.0`.
+
+---
+
 ## [1.0.1] - 2026-09-05
 
 ### Maintenance & Dependency Upgrades

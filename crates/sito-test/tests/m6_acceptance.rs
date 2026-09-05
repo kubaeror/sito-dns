@@ -82,13 +82,30 @@ async fn create_test_context() -> (ServerContext, PathBuf) {
 #[tokio::test]
 async fn test_embedded_ui_serves_root_and_index() {
     let (ctx, temp_dir) = create_test_context().await;
-    let app = create_router(ctx);
+    let app = create_router(ctx.clone());
 
+    // Unauthenticated GET / redirects to /login with 303 See Other
     let req = Request::builder().uri("/").body(Body::empty()).unwrap();
-
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let ct = resp
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "/login"
+    );
+
+    // GET /login returns 200 OK HTML
+    let app2 = create_router(ctx);
+    let req2 = Request::builder()
+        .uri("/login")
+        .body(Body::empty())
+        .unwrap();
+    let resp2 = app2.oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let ct = resp2
         .headers()
         .get(header::CONTENT_TYPE)
         .unwrap()
@@ -96,11 +113,11 @@ async fn test_embedded_ui_serves_root_and_index() {
         .unwrap();
     assert!(ct.contains("text/html"));
 
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    let body = axum::body::to_bytes(resp2.into_body(), usize::MAX)
         .await
         .unwrap();
     let body_str = String::from_utf8_lossy(&body);
-    assert!(body_str.contains("sito"));
+    assert!(body_str.contains("sito DNS"));
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
@@ -110,28 +127,41 @@ async fn test_embedded_ui_serves_root_and_index() {
 async fn test_embedded_ui_spa_routing_fallback() {
     let (ctx, temp_dir) = create_test_context().await;
 
-    for spa_path in ["/dashboard", "/querylog", "/filtering", "/wizard", "/login"] {
+    // Login with default admin credentials to obtain real session cookie
+    let login_res = ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1");
+    let cookie_val = match login_res {
+        sito_api::auth::LoginResult::Success(session) => session.to_cookie_header(),
+        other => panic!("expected login success, got {other:?}"),
+    };
+
+    for ui_path in ["/dashboard", "/querylog", "/filtering", "/wizard", "/login"] {
         let app = create_router(ctx.clone());
         let req = Request::builder()
-            .uri(spa_path)
+            .uri(ui_path)
+            .header(header::COOKIE, &cookie_val)
             .body(Body::empty())
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "Failed for {spa_path}");
-        let ct = resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(ct.contains("text/html"));
+        // /login when authenticated redirects to /dashboard, other pages return 200 OK
+        if ui_path == "/login" {
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER, "Failed for {ui_path}");
+        } else {
+            assert_eq!(resp.status(), StatusCode::OK, "Failed for {ui_path}");
+            let ct = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(ct.contains("text/html"));
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_str = String::from_utf8_lossy(&body);
-        assert!(body_str.contains("sito"));
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body_str = String::from_utf8_lossy(&body);
+            assert!(body_str.contains("sito"));
+        }
     }
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;

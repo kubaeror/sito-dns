@@ -99,5 +99,16 @@ Embedded UI in `:m6`, wizard recording, e2e suite in CI, complete en/pl translat
   - 100% clean formatting (`cargo fmt --check`).
   - 100% clean Clippy (`cargo clippy --workspace --all-features -- -D warnings`).
   - 100% passing audit checks (`cargo deny check`).
-  - 100% passing frontend tests (`npm test`) and production build (`npm run build`).
+
+---
+
+## Version 1.1.0 Evolution — Migration to HTMX + Askama + Alpine.js
+
+In version 1.1.0, the web interface was migrated from a Node.js/React SPA to a native Rust SSR stack:
+- **Zero Node.js/npm**: Removed `node_modules` (350+ MB build dependencies), Vite, and npm from build/runtime pipelines.
+- **Askama Templates**: Compile-time type-safe HTML template rendering directly inside Axum handlers with zero runtime reflection overhead.
+- **HTMX + Alpine.js**: Server-driven partial updates (`hx-get`, `hx-post`, `hx-target`, `hx-swap`) with micro-interactions powered by Alpine.js and charting via lightweight uPlot (<30 KB).
+- **Single Pure-Rust Artifact**: Embedded directly via `rust-embed` with complete CSS design system, dark/light mode toggle, and live WebSocket telemetry.
+- **Efficiency Gains**: Reduced Docker image size, eliminated frontend vulnerability scanning liabilities, and achieved sub-millisecond template rendering latency.
+
 

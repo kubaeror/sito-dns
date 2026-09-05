@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+
+{% block title %}System - sito DNS{% endblock %}
+{% block page_title %}System Diagnostics & Health{% endblock %}
+
+{% block content %}
+<div class="grid-2">
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">Instance Information</div>
+      <span class="badge badge-success">Running</span>
+    </div>
+    <div class="table-container">
+      <table>
+        <tbody>
+          <tr>
+            <td class="td-strong">Binary Version</td>
+            <td class="mono">{{ status.version }}</td>
+          </tr>
+          <tr>
+            <td class="td-strong">Server Role</td>
+            <td><span class="badge badge-info">{{ status.role|upper }}</span></td>
+          </tr>
+          <tr>
+            <td class="td-strong">Uptime</td>
+            <td class="mono">{{ uptime_str }}</td>
+          </tr>
+          <tr>
+            <td class="td-strong">Web Architecture</td>
+            <td><span class="badge badge-success">HTMX + Askama + Alpine.js (100% Rust)</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">Network Listeners</div>
+      <span class="badge badge-neutral">{{ status.listeners.len() }} Active</span>
+    </div>
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th>Bind Address</th>
+            <th>Protocol</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for l in status.listeners %}
+          <tr>
+            <td class="mono td-strong">{{ l }}</td>
+            <td><span class="badge badge-neutral">ACTIVE</span></td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="2" style="text-align:center; color: var(--text-muted); padding: 16px;">Standard bindings (0.0.0.0:53 UDP/TCP)</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="card" style="margin-top: 24px;">
+  <div class="card-header">
+    <div class="card-title">Administrative Operations</div>
+  </div>
+  <div style="display: flex; gap: 14px; flex-wrap: wrap;">
+    <form action="/ui/system/reload" method="POST" style="margin:0;">
+      <button type="submit" class="btn btn-secondary">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 21h5v-5"/></svg>
+        Reload Configuration from Disk
+      </button>
+    </form>
+    <a href="/api/v1/ha/bundle" class="btn btn-outline" download="sito-backup.tar.gz">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
+      Download Backup Bundle (.tar.gz)
+    </a>
+  </div>
+</div>
+{% endblock %}
