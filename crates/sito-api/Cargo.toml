@@ -35,6 +35,12 @@ tower-http.workspace = true
 tracing.workspace = true
 utoipa = { version = "5.3", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+rust-embed = { workspace = true, optional = true }
+mime_guess = { workspace = true, optional = true }
+
+[features]
+default = []
+embed-ui = ["dep:rust-embed", "dep:mime_guess"]
 
 [lints]
 workspace = true

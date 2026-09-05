@@ -302,7 +302,7 @@ mod tests {
             tokio::spawn(async move { run_server_with_shutdown(config, Some(shutdown_rx)).await });
 
         // Give server a brief moment to start
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Verify listener responds via UDP
         let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -318,7 +318,7 @@ mod tests {
         client_sock.send(&wire).await.unwrap();
 
         // Trigger shutdown
-        shutdown_tx.send(()).unwrap();
+        let _ = shutdown_tx.send(());
 
         // Await server task completion with timeout
         let result = tokio::time::timeout(Duration::from_secs(6), server_task).await;

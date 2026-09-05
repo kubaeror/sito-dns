@@ -15,6 +15,12 @@ use crate::handlers::{
 use crate::openapi::ApiDoc;
 use crate::state::ServerContext;
 
+#[cfg(feature = "embed-ui")]
+use axum::http::header::CONTENT_TYPE;
+#[cfg(feature = "embed-ui")]
+use axum::response::Response;
+
+#[cfg(not(feature = "embed-ui"))]
 async fn not_found_handler() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
@@ -22,6 +28,60 @@ async fn not_found_handler() -> impl IntoResponse {
             "The requested endpoint does not exist",
         )),
     )
+}
+
+#[cfg(feature = "embed-ui")]
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../../web/dist"]
+struct WebDist;
+
+#[cfg(feature = "embed-ui")]
+async fn ui_handler(uri: axum::http::Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+
+    if path.starts_with("api/") || path == "api" || path == "metrics" {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ProblemDetails::not_found(
+                "The requested endpoint does not exist",
+            )),
+        )
+            .into_response();
+    }
+
+    let file_path = if path.is_empty() { "index.html" } else { path };
+
+    if let Some(file) = WebDist::get(file_path) {
+        let mime = mime_guess::from_path(file_path).first_or_octet_stream();
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, mime.as_ref())
+            .body(axum::body::Body::from(file.data))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    } else {
+        // SPA fallback: non-file paths serve index.html for client-side routing
+        if file_path.contains('.') {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ProblemDetails::not_found("Asset not found")),
+            )
+                .into_response();
+        }
+
+        if let Some(index) = WebDist::get("index.html") {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(axum::body::Body::from(index.data))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ProblemDetails::not_found("UI index.html not found")),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Constructs the complete administrative HTTP router.
@@ -116,10 +176,21 @@ pub fn create_router(ctx: ServerContext) -> Router {
         .route("/config/restore", post(config::prepare_restore))
         .route("/config/restore/confirm", post(config::confirm_restore));
 
-    Router::new()
+    #[cfg(feature = "embed-ui")]
+    let app = Router::new()
+        .nest("/api/v1", api_v1)
+        .route("/metrics", get(metrics::get_metrics))
+        .merge(SwaggerUi::new("/api/docs").url("/api/docs/openapi.json", ApiDoc::openapi()))
+        .fallback(ui_handler)
+        .with_state(ctx);
+
+    #[cfg(not(feature = "embed-ui"))]
+    let app = Router::new()
         .nest("/api/v1", api_v1)
         .route("/metrics", get(metrics::get_metrics))
         .merge(SwaggerUi::new("/api/docs").url("/api/docs/openapi.json", ApiDoc::openapi()))
         .fallback(not_found_handler)
-        .with_state(ctx)
+        .with_state(ctx);
+
+    app
 }

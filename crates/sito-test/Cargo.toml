@@ -43,5 +43,9 @@ tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
 utoipa = "5.3"
 
+[features]
+default = []
+embed-ui = ["sito-api/embed-ui", "sito/embed-ui"]
+
 [lints]
 workspace = true
