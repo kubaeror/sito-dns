@@ -11,4 +11,5 @@ pub mod querylog;
 pub mod rewrites;
 pub mod stats;
 pub mod status;
+pub mod update;
 pub mod upstream;

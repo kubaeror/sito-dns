@@ -3042,6 +3042,8 @@ dependencies = [
  "hex",
  "mime_guess",
  "rand 0.10.2",
+ "reqwest",
+ "ring",
  "rust-embed",
  "serde",
  "serde_json",

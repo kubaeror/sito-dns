@@ -380,7 +380,7 @@ token = "mikrotik_secret_token_12345"
 
         let bundle = ConfigBundle {
             version: 10,
-            timestamp: 123456789,
+            timestamp: 123_456_789,
             config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec!["||example.org^".to_string()],
             rewrites: None,

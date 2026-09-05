@@ -66,6 +66,21 @@
 
 <div class="card" style="margin-top: 24px;">
   <div class="card-header">
+    <div class="card-title">Version & Software Updates</div>
+  </div>
+  <div id="update-container">
+    <p style="font-size: 0.875rem; color: var(--text-secondary); margin-bottom: 12px;">
+      Current installed version is <strong>v{{ status.version }}</strong>. Check for newer stable releases from GitHub.
+    </p>
+    <button hx-get="/ui/system/update/check" hx-target="#update-container" hx-swap="innerHTML" class="btn btn-outline">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+      Check for Updates
+    </button>
+  </div>
+</div>
+
+<div class="card" style="margin-top: 24px;">
+  <div class="card-header">
     <div class="card-title">Administrative Operations</div>
   </div>
   <div style="display: flex; gap: 14px; flex-wrap: wrap;">

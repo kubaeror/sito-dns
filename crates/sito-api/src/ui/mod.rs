@@ -42,6 +42,8 @@ pub fn ui_router() -> Router<ServerContext> {
         .route("/ui/upstreams/test", post(handlers::upstreams_test_handler))
         .route("/ui/settings/save", post(handlers::settings_save_handler))
         .route("/ui/system/reload", post(handlers::system_reload_handler))
+        .route("/ui/system/update/check", get(handlers::system_update_check_handler))
+        .route("/ui/system/update/apply", post(handlers::system_update_apply_handler))
         .route("/ui/wizard/complete", post(handlers::wizard_complete_handler))
 }
 
@@ -137,6 +139,9 @@ mod tests {
                 total_queries: 500,
                 avg_latency_ms: 15.2,
             }],
+            hourly_times_json: "[0, 1, 2]".to_string(),
+            hourly_totals_json: "[10, 20, 30]".to_string(),
+            hourly_blocked_json: "[1, 2, 3]".to_string(),
         };
         let dash_html = dash.render().expect("render dashboard template");
         assert!(dash_html.contains("Operational Dashboard"));
@@ -147,7 +152,7 @@ mod tests {
     #[test]
     fn test_render_querylog_and_rows() {
         let rows = vec![QueryLogRowItem {
-            ts: 1700000000000,
+            ts: 1_700_000_000_000,
             time_str: "12:34:56".to_string(),
             client_ip: "192.168.1.5".to_string(),
             client_name: Some("Laptop".to_string()),
