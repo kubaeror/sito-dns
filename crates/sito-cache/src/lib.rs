@@ -171,4 +171,51 @@ mod tests {
             .expect("negative response should be cached");
         assert_eq!(cached.metadata.response_code, ResponseCode::NXDomain);
     }
+
+    #[tokio::test]
+    async fn test_serve_stale_fallback() {
+        let mut config = make_test_config(1, 1, 300);
+        config.serve_stale_hours = 1;
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("stale.example.").unwrap();
+        let mut query = Message::new(5, MessageType::Query, OpCode::Query);
+        query
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+
+        let mut response = Message::response(5, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.metadata.response_code = ResponseCode::NoError;
+        response.answers.push(Record::from_rdata(
+            qname.clone(),
+            1,
+            RData::A(A(std::net::Ipv4Addr::new(1, 2, 3, 4))),
+        ));
+
+        cache.insert(&query, &response).await;
+
+        // Fresh hit
+        let fresh = cache.get(&qname, RecordType::A, DNSClass::IN).await;
+        assert!(fresh.is_some());
+
+        // Wait for TTL 1s to expire
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        // Fresh lookup should now return None
+        let expired = cache.get(&qname, RecordType::A, DNSClass::IN).await;
+        assert!(expired.is_none());
+
+        // Stale lookup should return the cached message with STALE_SERVE_TTL (30s)
+        let stale = cache
+            .get_stale(&qname, RecordType::A, DNSClass::IN)
+            .await
+            .expect("stale response should be available");
+        assert_eq!(stale.answers.len(), 1);
+        assert_eq!(stale.answers[0].ttl, 30);
+        assert_eq!(
+            stale.answers[0].data,
+            RData::A(A(std::net::Ipv4Addr::new(1, 2, 3, 4)))
+        );
+    }
 }
