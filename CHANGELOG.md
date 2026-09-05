@@ -5,6 +5,25 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.1.1] - 2026-09-05
+
+### Maintenance & Rust 1.98.1 Toolchain Modernization
+- **Rust Toolchain Bump**: Bumped toolchain and MSRV to `1.98.1` (`rust-toolchain.toml` and `Cargo.toml`). Adopted Rust 2024 let-chain idioms across codebase.
+- **Transitive Dependency Refresh**: Updated 31 SemVer-compatible crates via `cargo update` previously blocked by older MSRV.
+- **Major Dependency Upgrades**:
+  - `totp-rs`: Upgraded from `5.6` to `6.0` (migrated to `TOTP::builder()` API, `try_from_base32`, and URL generation).
+  - `sqlx`: Upgraded from `0.8` to `0.9` (adopted `sqlx::AssertSqlSafe` for dynamic batch telemetry queries).
+  - `reqwest`: Upgraded from `0.12` to `0.13` (migrated TLS configuration to `rustls` feature).
+  - `tower-http`: Upgraded from `0.6` to `0.7`.
+  - `tokio-tungstenite`: Upgraded from `0.26` to `0.30`.
+  - `askama`: Upgraded from `0.14` to `0.16`.
+  - `toml`: Upgraded from `0.8` to `1.1` (using `toml-write` engine).
+  - `base64`: Upgraded from `0.22` to `0.23`.
+  - `criterion`: Upgraded from `0.5` to `0.8` (benchmarks modernized with `std::hint::black_box`).
+- **Workspace Version**: Bumped workspace and crate versions to `1.1.1`.
+
+---
+
 ## [1.1.0] - 2026-09-05
 
 ### Major Architecture Change — Web Framework Migration to HTMX + Askama + Alpine.js
