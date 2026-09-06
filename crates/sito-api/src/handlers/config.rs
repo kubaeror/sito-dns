@@ -130,6 +130,7 @@ pub async fn update_config(
     // Atomic write
     save_config_atomic(&ctx.config_path, &parsed).await?;
     ctx.config.store(Arc::new(parsed));
+    crate::publish_bundle(&ctx);
 
     Ok(Json(GenericMessageResponse {
         message: "Configuration successfully updated".to_string(),
@@ -160,6 +161,7 @@ pub async fn reload_config(
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid configuration on disk: {e}")))?;
 
     ctx.config.store(Arc::new(parsed));
+    crate::publish_bundle(&ctx);
 
     Ok(Json(GenericMessageResponse {
         message: "Configuration reloaded successfully from disk".to_string(),
@@ -368,6 +370,7 @@ pub async fn confirm_restore(
 
     save_config_atomic(&ctx.config_path, &parsed).await?;
     ctx.config.store(Arc::new(parsed));
+    crate::publish_bundle(&ctx);
 
     Ok(Json(GenericMessageResponse {
         message: "Configuration successfully restored from backup".to_string(),

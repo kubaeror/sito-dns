@@ -897,3 +897,38 @@ async fn test_m8_slave_to_master_promotion_procedure() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+// ----------------------------------------------------------------------------
+// Test 11: Master publishes bundle to coordinator on mutating API operation
+// ----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_m8_master_api_mutation_publishes_bundle() {
+    let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+    let metrics = MetricsRegistry::new("0.1.0", "master-coord-test");
+    let coordinator = MasterCoordinator::new("master-pub".to_string(), 1, signing_key, metrics);
+
+    let (ctx, token, temp_dir) =
+        create_test_context("master", Some(coordinator.clone()), None, None).await;
+    let app = create_router(ctx);
+
+    assert_eq!(coordinator.get_current_version(), 1);
+
+    // Perform mutating request: POST /api/v1/rewrites
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/rewrites")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"domain":"test.local","record_type":"A","answer":"1.2.3.4","exception_clients":[]}"#,
+        ))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Coordinator bundle version must have incremented to 2
+    assert_eq!(coordinator.get_current_version(), 2);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

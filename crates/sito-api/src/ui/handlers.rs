@@ -535,6 +535,7 @@ pub async fn filtering_toggle_handler(
         let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
         ctx.config.store(Arc::new(new_cfg.clone()));
         let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+        crate::publish_bundle(&ctx);
     }
     Redirect::to("/filtering").into_response()
 }
@@ -569,6 +570,7 @@ pub async fn filtering_add_handler(
     let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
     ctx.config.store(Arc::new(new_cfg.clone()));
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+    crate::publish_bundle(&ctx);
 
     Redirect::to("/filtering").into_response()
 }
@@ -591,6 +593,7 @@ pub async fn filtering_delete_handler(
         let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
         ctx.config.store(Arc::new(new_cfg.clone()));
         let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+        crate::publish_bundle(&ctx);
     }
     Redirect::to("/filtering").into_response()
 }
@@ -624,6 +627,7 @@ pub async fn filtering_custom_rules_handler(
     let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
     ctx.config.store(Arc::new(new_cfg.clone()));
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+    crate::publish_bundle(&ctx);
 
     Redirect::to("/filtering").into_response()
 }
@@ -779,6 +783,7 @@ pub async fn rewrites_add_handler(
         ctx.config.store(Arc::new(new_cfg));
         let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg);
         ctx.rewrites.store(Arc::new(new_table));
+        crate::publish_bundle(&ctx);
     }
 
     Redirect::to("/rewrites").into_response()
@@ -828,6 +833,7 @@ pub async fn rewrites_delete_handler(
         ctx.config.store(Arc::new(new_cfg));
         let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg);
         ctx.rewrites.store(Arc::new(new_table));
+        crate::publish_bundle(&ctx);
     }
 
     Redirect::to("/rewrites").into_response()
@@ -923,6 +929,7 @@ pub async fn clients_add_handler(
         ctx.config.store(Arc::new(new_cfg));
         let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
         ctx.clients.store(Arc::new(new_reg));
+        crate::publish_bundle(&ctx);
     }
 
     Redirect::to("/clients").into_response()
@@ -955,6 +962,7 @@ pub async fn clients_delete_handler(
         ctx.config.store(Arc::new(new_cfg));
         let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
         ctx.clients.store(Arc::new(new_reg));
+        crate::publish_bundle(&ctx);
     }
 
     Redirect::to("/clients").into_response()
@@ -1013,6 +1021,7 @@ pub async fn upstreams_add_handler(
         new_cfg.upstream.servers.push(clean);
         let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
         ctx.config.store(Arc::new(new_cfg));
+        crate::publish_bundle(&ctx);
     }
 
     Redirect::to("/upstreams").into_response()
@@ -1201,6 +1210,7 @@ pub async fn settings_save_handler(
 
     let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
     ctx.config.store(Arc::new(new_cfg));
+    crate::publish_bundle(&ctx);
 
     Redirect::to("/settings").into_response()
 }
@@ -1244,6 +1254,7 @@ pub async fn system_reload_handler(
         && let Ok(cfg) = sito_core::config::Config::from_toml_str(&toml_str)
     {
         ctx.config.store(Arc::new(cfg));
+        crate::publish_bundle(&ctx);
     }
     Redirect::to("/system").into_response()
 }
@@ -1488,6 +1499,7 @@ pub async fn wizard_complete_handler(
 
     ctx.config.store(Arc::new(new_cfg.clone()));
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+    crate::publish_bundle(&ctx);
 
     Redirect::to("/login").into_response()
 }
@@ -1659,7 +1671,7 @@ mod tests {
 
         // 1. Wrong username (empty) -> 400 Bad Request, first_run stays true
         let empty_user_form = WizardCompleteForm {
-            admin_user: "".to_string(),
+            admin_user: String::new(),
             admin_password: "ValidPassword123!".to_string(),
             upstream: "1.1.1.1:53".to_string(),
             enable_adblock: None,

@@ -109,6 +109,7 @@ pub async fn update_upstream_config(
     // Pre-commit validation and atomic write
     save_config_atomic(&ctx.config_path, &new_config).await?;
     ctx.config.store(Arc::new(new_config));
+    crate::publish_bundle(&ctx);
 
     Ok(Json(dto))
 }
