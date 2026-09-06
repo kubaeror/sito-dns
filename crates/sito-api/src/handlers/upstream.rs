@@ -106,9 +106,32 @@ pub async fn update_upstream_config(
         per_domain: new_config.upstream.per_domain,
     };
 
+    let bootstrap = BootstrapResolver::new(
+        new_config.upstream.bootstrap.clone(),
+        Duration::from_millis(new_config.upstream.timeout_ms),
+    );
+
+    // Reload upstream manager with new configuration (also validates upstreams)
+    ctx.upstream
+        .reload(&new_config.upstream, &bootstrap)
+        .await
+        .map_err(|e| ProblemDetails::bad_request(format!("Invalid upstream configuration: {e}")))?;
+
     // Pre-commit validation and atomic write
-    save_config_atomic(&ctx.config_path, &new_config).await?;
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_config).await {
+        let prev_cfg = ctx.config.load();
+        let prev_bootstrap = BootstrapResolver::new(
+            prev_cfg.upstream.bootstrap.clone(),
+            Duration::from_millis(prev_cfg.upstream.timeout_ms),
+        );
+        let _ = ctx
+            .upstream
+            .reload(&prev_cfg.upstream, &prev_bootstrap)
+            .await;
+        return Err(e);
+    }
     ctx.config.store(Arc::new(new_config));
+    crate::publish_bundle(&ctx);
 
     Ok(Json(dto))
 }
@@ -228,4 +251,110 @@ pub async fn test_upstream_servers(
     }
 
     Json(UpstreamTestResponse { results })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::rbac::AuthUser;
+    use crate::auth::token::Role;
+    use arc_swap::ArcSwap;
+    use sito_core::config::Config;
+    use std::sync::Mutex;
+
+    async fn mock_context(temp_dir: &std::path::Path) -> ServerContext {
+        let db_path = temp_dir.join("test.db");
+        let stats_db = sito_stats::StatsDb::open(&db_path).await.unwrap();
+        let querylog_writer = sito_stats::QueryLogWriter::spawn(stats_db.clone(), 100);
+        let querylog_sender = querylog_writer.sender();
+        let metrics = sito_stats::MetricsRegistry::new("1.2.1", "test");
+        let auth_mgr = Arc::new(crate::auth::AuthManager::new());
+        let config = Config::default();
+        let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+        let filter = Arc::new(
+            sito_filter::HostsFilterEngine::init(Default::default(), temp_dir.to_path_buf()).await,
+        );
+        let cache = Arc::new(sito_cache::DnsCache::new(Default::default()));
+        let bootstrap = sito_upstream::BootstrapResolver::new(
+            vec!["127.0.0.1".parse().unwrap()],
+            std::time::Duration::from_secs(1),
+        );
+        let upstream = Arc::new(
+            sito_upstream::UpstreamManager::from_config(&Default::default(), &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let clients = Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
+            Default::default(),
+        ))));
+        let rewrites = Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
+            Default::default(),
+        ))));
+
+        ServerContext {
+            config: config_arc,
+            config_path: temp_dir.join("config.toml"),
+            auth_mgr,
+            stats_db,
+            querylog_sender,
+            metrics,
+            filter,
+            cache,
+            upstream,
+            clients,
+            rewrites,
+            start_time: Instant::now(),
+            restore_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            master_coordinator: None,
+            slave_tracker: None,
+            resync_sender: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_upstream_config_hot_reloads() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_upstream_test_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let operator = RequireOperator(AuthUser {
+            username: "operator".to_string(),
+            role: Role::Operator,
+            token_id: None,
+        });
+
+        let dto = UpstreamConfigDto {
+            servers: vec!["1.1.1.1:53".to_string()],
+            bootstrap: vec!["1.0.0.1".to_string()],
+            strategy: "load_balance".to_string(),
+            timeout_ms: 3000,
+            probe_domain: "cloudflare.com".to_string(),
+            pool_size: 4,
+        };
+
+        let res = update_upstream_config(operator.clone(), State(ctx.clone()), Json(dto)).await;
+        assert!(res.is_ok());
+
+        assert_eq!(ctx.upstream.strategy(), UpstreamStrategy::LoadBalance);
+        assert_eq!(ctx.upstream.timeout(), Duration::from_millis(3000));
+        let statuses = ctx.upstream.statuses().await;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].0, "1.1.1.1:53");
+
+        // Test invalid upstream server fails and does not change config
+        let bad_dto = UpstreamConfigDto {
+            servers: vec!["invalid-ip-without-port".to_string()],
+            bootstrap: vec!["1.0.0.1".to_string()],
+            strategy: "failover".to_string(),
+            timeout_ms: 1000,
+            probe_domain: "example.com".to_string(),
+            pool_size: 2,
+        };
+
+        let bad_res = update_upstream_config(operator, State(ctx.clone()), Json(bad_dto)).await;
+        assert!(bad_res.is_err());
+        // Strategy remains LoadBalance
+        assert_eq!(ctx.upstream.strategy(), UpstreamStrategy::LoadBalance);
+    }
 }

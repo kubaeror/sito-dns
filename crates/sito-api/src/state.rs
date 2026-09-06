@@ -52,6 +52,59 @@ impl ServerContext {
         }
         "wss://master.local:8953".to_string()
     }
+
+    /// Publishes an updated HA configuration bundle to all connected replica slaves,
+    /// incrementing the configuration version monotonic counter.
+    pub fn publish_bundle(&self) {
+        let Some(ref coordinator) = self.master_coordinator else {
+            return;
+        };
+
+        let config = self.config.load();
+        let raw_toml = std::fs::read_to_string(&self.config_path)
+            .unwrap_or_else(|_| toml::to_string_pretty(&**config).unwrap_or_default());
+        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&raw_toml).unwrap_or_default();
+        let list_metadata = config
+            .filtering
+            .lists
+            .iter()
+            .map(|l| sito_ha::FilterListMetadata {
+                name: l.name.clone(),
+                url: l.url.clone(),
+                enabled: l.enabled,
+                refresh_hours: l.refresh_hours,
+            })
+            .collect();
+
+        let new_version = coordinator.get_current_version().saturating_add(1);
+        #[allow(clippy::cast_sign_loss)]
+        let bundle = sito_ha::ConfigBundle {
+            version: new_version,
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+            config_toml: sanitized_toml,
+            custom_rules: config.filtering.custom_rules.clone(),
+            rewrites: config.rewrites.clone(),
+            clients: config.clients.clone(),
+            lists: list_metadata,
+        };
+
+        if let Err(e) = coordinator.update_bundle(bundle) {
+            tracing::error!(
+                version = new_version,
+                "Failed to update HA bundle and broadcast to slaves: {e}"
+            );
+        } else {
+            tracing::info!(
+                version = new_version,
+                "Updated HA bundle and broadcasted to slaves"
+            );
+        }
+    }
+}
+
+/// Helper function to publish an updated configuration bundle to replica slaves.
+pub fn publish_bundle(ctx: &ServerContext) {
+    ctx.publish_bundle();
 }
 
 // Axum FromRef implementations for modular extractors

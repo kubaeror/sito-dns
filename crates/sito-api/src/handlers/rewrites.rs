@@ -35,6 +35,7 @@ async fn save_rewrites_config(
     // Update active rewrite table
     let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg.clone());
     ctx.rewrites.store(Arc::new(new_table));
+    crate::publish_bundle(ctx);
     Ok(())
 }
 

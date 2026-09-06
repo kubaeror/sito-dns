@@ -532,9 +532,13 @@ pub async fn filtering_toggle_handler(
     let mut new_cfg = (**ctx.config.load()).clone();
     if let Some(item) = new_cfg.filtering.lists.get_mut(id) {
         item.enabled = !item.enabled;
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         ctx.config.store(Arc::new(new_cfg.clone()));
         let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+        crate::publish_bundle(&ctx);
     }
     Redirect::to("/filtering").into_response()
 }
@@ -566,9 +570,13 @@ pub async fn filtering_add_handler(
         enabled: true,
         refresh_hours: form.refresh_hours.map(u64::from),
     });
-    let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to persist configuration to disk: {e:?}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     ctx.config.store(Arc::new(new_cfg.clone()));
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+    crate::publish_bundle(&ctx);
 
     Redirect::to("/filtering").into_response()
 }
@@ -588,9 +596,13 @@ pub async fn filtering_delete_handler(
     let mut new_cfg = (**ctx.config.load()).clone();
     if id < new_cfg.filtering.lists.len() {
         new_cfg.filtering.lists.remove(id);
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         ctx.config.store(Arc::new(new_cfg.clone()));
         let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+        crate::publish_bundle(&ctx);
     }
     Redirect::to("/filtering").into_response()
 }
@@ -621,9 +633,13 @@ pub async fn filtering_custom_rules_handler(
         .map(String::from)
         .collect();
 
-    let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to persist configuration to disk: {e:?}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     ctx.config.store(Arc::new(new_cfg.clone()));
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+    crate::publish_bundle(&ctx);
 
     Redirect::to("/filtering").into_response()
 }
@@ -775,10 +791,14 @@ pub async fn rewrites_add_handler(
     let mut new_cfg = (**ctx.config.load()).clone();
     if let Ok(val) = toml::Value::try_from(&rewrites_cfg) {
         new_cfg.rewrites = Some(val);
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         ctx.config.store(Arc::new(new_cfg));
         let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg);
         ctx.rewrites.store(Arc::new(new_table));
+        crate::publish_bundle(&ctx);
     }
 
     Redirect::to("/rewrites").into_response()
@@ -824,10 +844,14 @@ pub async fn rewrites_delete_handler(
     let mut new_cfg = (**ctx.config.load()).clone();
     if let Ok(val) = toml::Value::try_from(&rewrites_cfg) {
         new_cfg.rewrites = Some(val);
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         ctx.config.store(Arc::new(new_cfg));
         let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg);
         ctx.rewrites.store(Arc::new(new_table));
+        crate::publish_bundle(&ctx);
     }
 
     Redirect::to("/rewrites").into_response()
@@ -919,10 +943,14 @@ pub async fn clients_add_handler(
     let mut new_cfg = (**ctx.config.load()).clone();
     if let Ok(val) = toml::Value::try_from(&clients_cfg) {
         new_cfg.clients = Some(val);
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         ctx.config.store(Arc::new(new_cfg));
         let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
         ctx.clients.store(Arc::new(new_reg));
+        crate::publish_bundle(&ctx);
     }
 
     Redirect::to("/clients").into_response()
@@ -951,10 +979,14 @@ pub async fn clients_delete_handler(
     let mut new_cfg = (**ctx.config.load()).clone();
     if let Ok(val) = toml::Value::try_from(&clients_cfg) {
         new_cfg.clients = Some(val);
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         ctx.config.store(Arc::new(new_cfg));
         let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
         ctx.clients.store(Arc::new(new_reg));
+        crate::publish_bundle(&ctx);
     }
 
     Redirect::to("/clients").into_response()
@@ -1011,8 +1043,19 @@ pub async fn upstreams_add_handler(
     }
     if !clean.is_empty() && !new_cfg.upstream.servers.contains(&clean) {
         new_cfg.upstream.servers.push(clean);
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
-        ctx.config.store(Arc::new(new_cfg));
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        ctx.config.store(Arc::new(new_cfg.clone()));
+        let bootstrap = sito_upstream::BootstrapResolver::new(
+            new_cfg.upstream.bootstrap.clone(),
+            std::time::Duration::from_millis(new_cfg.upstream.timeout_ms),
+        );
+        if let Err(e) = ctx.upstream.reload(&new_cfg.upstream, &bootstrap).await {
+            tracing::error!("Failed to reload upstream manager: {e:?}");
+        }
+        crate::publish_bundle(&ctx);
     }
 
     Redirect::to("/upstreams").into_response()
@@ -1199,8 +1242,12 @@ pub async fn settings_save_handler(
     new_cfg.dns.dnssec.validate = form.dnssec.is_some();
     new_cfg.dns.rate_limit_per_ip = form.rate_limit;
 
-    let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to persist configuration to disk: {e:?}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     ctx.config.store(Arc::new(new_cfg));
+    crate::publish_bundle(&ctx);
 
     Redirect::to("/settings").into_response()
 }
@@ -1244,6 +1291,7 @@ pub async fn system_reload_handler(
         && let Ok(cfg) = sito_core::config::Config::from_toml_str(&toml_str)
     {
         ctx.config.store(Arc::new(cfg));
+        crate::publish_bundle(&ctx);
     }
     Redirect::to("/system").into_response()
 }
@@ -1413,10 +1461,63 @@ pub async fn wizard_complete_handler(
             .into_response();
     }
 
-    let _ = ctx
-        .auth_mgr
-        .update_user_password(&form.admin_user, &form.admin_password);
-    ctx.auth_mgr.mark_setup_complete();
+    let admin_user = form.admin_user.trim();
+    let admin_password = form.admin_password.trim();
+
+    if admin_user.is_empty() || admin_password.is_empty() || admin_password.len() < 8 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid username or password: password must be at least 8 characters long.",
+        )
+            .into_response();
+    }
+
+    if admin_user.contains(|c: char| c.is_whitespace() || c.is_control()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid username: cannot contain whitespace or control characters.",
+        )
+            .into_response();
+    }
+
+    if is_first_run {
+        if ctx.auth_mgr.has_user(admin_user) {
+            if !ctx
+                .auth_mgr
+                .update_user_password(admin_user, admin_password)
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Failed to update administrator password.",
+                )
+                    .into_response();
+            }
+        } else {
+            // Nonexistent user: create as admin
+            ctx.auth_mgr
+                .create_user(admin_user, admin_password, Role::Admin);
+            // If custom admin username chosen, remove default 'admin' account if still on bootstrap password
+            if admin_user != "admin" && ctx.auth_mgr.is_default_admin_active() {
+                ctx.auth_mgr.delete_user("admin");
+            }
+        }
+        ctx.auth_mgr.mark_setup_complete();
+    } else {
+        // Not first run: must be authenticated admin updating existing admin credentials
+        if !ctx.auth_mgr.has_user(admin_user) {
+            return (StatusCode::BAD_REQUEST, "Username does not exist.").into_response();
+        }
+        if !ctx
+            .auth_mgr
+            .update_user_password(admin_user, admin_password)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Failed to update administrator password.",
+            )
+                .into_response();
+        }
+    }
 
     let mut new_cfg = (**ctx.config.load()).clone();
     if !form.upstream.trim().is_empty() {
@@ -1424,9 +1525,23 @@ pub async fn wizard_complete_handler(
     }
     new_cfg.filtering.enabled = form.enable_adblock.is_some();
 
-    let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to save config in wizard: {e:?}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to save configuration",
+        )
+            .into_response();
+    }
+
     ctx.config.store(Arc::new(new_cfg.clone()));
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+    let bootstrap = sito_upstream::BootstrapResolver::new(
+        new_cfg.upstream.bootstrap.clone(),
+        std::time::Duration::from_millis(new_cfg.upstream.timeout_ms),
+    );
+    let _ = ctx.upstream.reload(&new_cfg.upstream, &bootstrap).await;
+    crate::publish_bundle(&ctx);
 
     Redirect::to("/login").into_response()
 }
@@ -1583,6 +1698,148 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_wizard_validation_and_user_creation() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_test_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        assert!(ctx.auth_mgr.is_first_run());
+
+        // 1. Wrong username (empty) -> 400 Bad Request, first_run stays true
+        let empty_user_form = WizardCompleteForm {
+            admin_user: String::new(),
+            admin_password: "ValidPassword123!".to_string(),
+            upstream: "1.1.1.1:53".to_string(),
+            enable_adblock: None,
+        };
+        let resp =
+            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(empty_user_form))
+                .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(ctx.auth_mgr.is_first_run());
+
+        // 2. Wrong username (whitespace) -> 400 Bad Request, first_run stays true
+        let space_user_form = WizardCompleteForm {
+            admin_user: "admin user".to_string(),
+            admin_password: "ValidPassword123!".to_string(),
+            upstream: "1.1.1.1:53".to_string(),
+            enable_adblock: None,
+        };
+        let resp =
+            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(space_user_form))
+                .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(ctx.auth_mgr.is_first_run());
+
+        // 3. Short password -> 400 Bad Request, first_run stays true
+        let short_pass_form = WizardCompleteForm {
+            admin_user: "admin".to_string(),
+            admin_password: "short".to_string(),
+            upstream: "1.1.1.1:53".to_string(),
+            enable_adblock: None,
+        };
+        let resp =
+            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(short_pass_form))
+                .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(ctx.auth_mgr.is_first_run());
+
+        // 4. Nonexistent user -> created as admin, first_run becomes false, default admin purged
+        let nonexistent_user_form = WizardCompleteForm {
+            admin_user: "superadmin".to_string(),
+            admin_password: "SuperSecretPassword123!".to_string(),
+            upstream: "1.1.1.1:53".to_string(),
+            enable_adblock: Some("on".to_string()),
+        };
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Form(nonexistent_user_form),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(!ctx.auth_mgr.is_first_run());
+        assert!(ctx.auth_mgr.has_user("superadmin"));
+        assert!(!ctx.auth_mgr.has_user("admin"));
+
+        // Login as new admin succeeds
+        let login_res = ctx
+            .auth_mgr
+            .login("superadmin", "SuperSecretPassword123!", "127.0.0.1");
+        assert!(matches!(login_res, crate::auth::LoginResult::Success(_)));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ui_handlers_persist_failure_returns_500_and_preserves_in_memory_state() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_persist_err_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let mut ctx = mock_context(&temp_dir).await;
+
+        let login_res = ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1");
+        let crate::auth::LoginResult::Success(session) = login_res else {
+            panic!("admin login failed");
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            format!("sito_session={}", session.id).parse().unwrap(),
+        );
+
+        // Break config_path to point to a non-writable/non-existent directory to simulate disk write failure
+        ctx.config_path = std::path::PathBuf::from("/proc/forbidden_ui_test/config.toml");
+
+        let orig_cache_size = ctx.config.load().dns.cache.size_mb;
+        let settings_resp = settings_save_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(SaveSettingsForm {
+                cache_size_mb: 9999,
+                min_ttl: 100,
+                dnssec: None,
+                rate_limit: 50,
+            }),
+        )
+        .await;
+        assert_eq!(settings_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Verify in-memory config was NOT mutated
+        assert_eq!(ctx.config.load().dns.cache.size_mb, orig_cache_size);
+
+        let filter_resp = filtering_add_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(AddFilterListForm {
+                name: "blocked-list".to_string(),
+                url: "http://example.com/hosts".to_string(),
+                refresh_hours: None,
+            }),
+        )
+        .await;
+        assert_eq!(filter_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Verify in-memory filter lists was NOT mutated
+        assert!(ctx.config.load().filtering.lists.is_empty());
+
+        let rewrite_resp = rewrites_add_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(AddRewriteForm {
+                domain: "bad.internal".to_string(),
+                record_type: "A".to_string(),
+                answer: "1.2.3.4".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(rewrite_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Verify in-memory rewrites table was NOT mutated
+        assert!(load_rewrites_config(&ctx).entries.is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

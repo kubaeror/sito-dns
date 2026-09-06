@@ -1,5 +1,8 @@
 //! High-performance multi-socket UDP listener with SO_REUSEPORT, PKTINFO, and EDNS0/TC support.
 
+#[cfg(not(unix))]
+compile_error!("sito-transport UDP listener requires a Unix-based operating system (Linux/macOS)");
+
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;

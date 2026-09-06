@@ -247,7 +247,7 @@ impl QueryHandler for DnsPipeline {
         let query_id = query.metadata.id;
         let request_id = rand::random::<u64>();
 
-        let span = tracing::info_span!(
+        let span = tracing::debug_span!(
             "query",
             request_id = request_id,
             client_ip = %client.ip,
@@ -411,7 +411,7 @@ impl QueryHandler for DnsPipeline {
                 && let Ok(cname_target) =
                     Name::from_str(&format!("{}.", target.trim_end_matches('.')))
             {
-                info!(
+                debug!(
                     qname = %qname,
                     target = %target,
                     "Enforcing safe search CNAME rewrite"
@@ -443,7 +443,7 @@ impl QueryHandler for DnsPipeline {
                         return QueryOutcome::anti_doh_blocked(resp, domain_str, qtype);
                     }
 
-                    info!(qname = %qname, qtype = ?qtype, "Cache hit");
+                    debug!(qname = %qname, qtype = ?qtype, "Cache hit");
                     if self.cache.should_prefetch(qname, qtype, qclass).await
                         && let Ok(permit) = Arc::clone(&self.prefetch_semaphore).try_acquire_owned()
                     {
@@ -453,7 +453,8 @@ impl QueryHandler for DnsPipeline {
                         tokio::spawn(async move {
                             let _permit = permit;
                             if let Ok(resp) = bg_upstream.resolve(&bg_query).await
-                                && resp.metadata.response_code == ResponseCode::NoError
+                                && (resp.metadata.response_code == ResponseCode::NoError
+                                    || resp.metadata.response_code == ResponseCode::NXDomain)
                             {
                                 bg_cache.insert(&bg_query, &resp).await;
                             }
@@ -486,8 +487,8 @@ impl QueryHandler for DnsPipeline {
             }
 
             // 6. Upstream resolution
-            match self.upstream.resolve(&query).await {
-                Ok(mut upstream_resp) => {
+            match self.upstream.resolve_with_upstream(&query).await {
+                Ok((mut upstream_resp, upstream_name)) => {
                     upstream_resp.metadata.id = query_id;
 
                     // Anti-DoH bypass: inspect resolved A and AAAA records for known resolver IPs
@@ -559,7 +560,8 @@ impl QueryHandler for DnsPipeline {
                     };
 
                     if config.dns.cache.enabled
-                        && upstream_resp.metadata.response_code == ResponseCode::NoError
+                        && (upstream_resp.metadata.response_code == ResponseCode::NoError
+                            || upstream_resp.metadata.response_code == ResponseCode::NXDomain)
                     {
                         self.cache.insert(&query, &upstream_resp).await;
                         if let Some(ref m) = self.metrics {
@@ -573,7 +575,7 @@ impl QueryHandler for DnsPipeline {
                         verdict: "allowed",
                         rule: None,
                         source: None,
-                        upstream: Some("upstream".to_string()),
+                        upstream: Some(upstream_name),
                         from_cache: false,
                         domain_str,
                         qtype,
@@ -593,7 +595,7 @@ impl QueryHandler for DnsPipeline {
                         && let Some(mut stale_resp) =
                             self.cache.get_stale(qname, qtype, qclass).await
                     {
-                        info!(
+                        debug!(
                             qname = %qname,
                             "Upstream failed, serving stale cached response (RFC 8767)"
                         );

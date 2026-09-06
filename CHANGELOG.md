@@ -5,6 +5,36 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.3.0] - 2026-09-06
+
+### Security, Performance & Operational Audit Remediation (Audit 2)
+Comprehensive remediation of all findings identified in `/docs/audit2.md`:
+
+#### Phase 1: Critical Security (P1)
+- **HA Master Replication Hardening (P1-1)**: Enforced strict TLS certificate pinning (`expected_slave_pins`), rejected plaintext WebSocket replication by default, and required non-empty authentication tokens (`auth_token`) on the replication listener, preventing unauthorized configuration extraction and eavesdropping.
+- **Setup Wizard Credential Validation (P1-2)**: Validated existing admin credentials if an admin user already exists, auto-created the admin account if missing, and surfaced configuration persistence errors to prevent runtime/disk drift.
+- **Default Metrics Authentication (P1-3 - Breaking Change)**: Changed `metrics_auth` default from `false` to `true`, requiring authentication for `/metrics` by default.
+
+#### Phase 2: Resilience & Integrity (P2)
+- **Immediate HA Replication on Mutations (P2-1)**: Wired automatic bundle publishing to connected slave nodes immediately upon mutating API and UI configuration changes.
+- **Negative Caching for NXDOMAIN Responses (P2-2)**: Enabled caching of NXDOMAIN responses using the minimum TTL from the SOA record and RFC 2308 compliance.
+- **Upstream ID & Query Log Anonymization (P2-3)**: Propagated real upstream names into SQLite query log entries and wired querylog IP anonymization per configuration.
+- **Filter Reload Join Error Handling (P2-4)**: Gracefully handled Tokio join errors during filter engine reloads without clearing or wiping existing filter rules.
+- **HA Slave Telemetry (P2-5)**: Transmitted real query counts, block rates, and upstream performance in slave heartbeat reports to the HA master coordinator.
+- **User Account File Corruption Protection (P2-6)**: Created automatic timestamped backups (`users.toml.corrupt.<ts>`) on unparseable user files and aborted startup rather than silently overwriting credentials with defaults.
+- **Trusted Reverse Proxy Client IP Protection (P2-7)**: Used rightmost client IP from `X-Forwarded-For` when behind trusted reverse proxies to eliminate header spoofing.
+- **Atomic UI Configuration Persistence (P2-8)**: Enforced atomic file persistence (`save_config_atomic`) before updating in-memory state across all UI handlers, returning HTTP 500 on disk failures.
+
+#### Phase 3: Performance, Infrastructure & Polish (P3)
+- **Single-Pass Filter Candidate Collection (P3-1)**: Refactored `evaluate()` in `sito-filter` to collect rule candidates once and pass them through `evaluate_important` and `evaluate_standard`, eliminating double traversal on the hot path.
+- **Live Upstream Hot-Reloading (P3-2)**: Dynamically reloaded `UpstreamManager` servers, strategies, and per-domain rules on `PUT /api/v1/upstream` and UI upstream edits without requiring daemon restart.
+- **Reduced Pipeline Log Level (P3-3)**: Lowered routine cache hits, safe search rewrites, and stale cache serves to `debug` level, keeping `info` exclusively for block verdicts.
+- **Docker Port Exposures & Documentation (P3-4)**: Added DoT (853), DoH (443), and Web (8080) ports to Dockerfile and compose, documented `NET_BIND_SERVICE` capability requirements, and added workflow dispatch tags to container image metadata.
+- **CI Release Smoke Build (P3-5)**: Added an x86_64 `--release` smoke build step to the continuous integration workflow.
+- **Unix Compile Guard & Platform Support (P3-6)**: Added `#[cfg(not(unix))]` compile error guard to `sito-transport` and documented Unix/Linux platform requirements in documentation.
+
+---
+
 ## [1.2.1] - 2026-09-06
 
 ### Security & Robustness Audit Remediation

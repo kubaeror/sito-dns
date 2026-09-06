@@ -33,8 +33,9 @@ async fn save_clients_config(
     ctx.config.store(Arc::new(new_cfg));
 
     // Update active registry
-    let new_registry = sito_clients::ClientRegistry::new(clients_cfg.clone());
-    ctx.clients.store(Arc::new(new_registry));
+    let new_reg = sito_clients::ClientRegistry::new(clients_cfg.clone());
+    ctx.clients.store(Arc::new(new_reg));
+    crate::publish_bundle(ctx);
     Ok(())
 }
 

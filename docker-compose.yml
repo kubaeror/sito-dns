@@ -9,6 +9,10 @@ services:
     ports:
       - "53:53/udp"
       - "53:53/tcp"
+      - "853:853/tcp"
+      - "853:853/udp"
+      - "443:443/tcp"
+      - "8080:8080/tcp"
     volumes:
       - "./config:/etc/sito"
       - "sito-data:/var/lib/sito"

@@ -44,11 +44,21 @@ pub fn resolve_client_ip(
         if trusted_proxies.contains(&peer_ip)
             && let Some(forwarded) = headers.get("x-forwarded-for")
             && let Ok(val) = forwarded.to_str()
-            && let Some(first) = val.split(',').next()
         {
-            let candidate = first.trim();
-            if candidate.parse::<IpAddr>().is_ok() {
-                return candidate.to_string();
+            // Reverse proxies append client IP to X-Forwarded-For (RFC 7239 / standard practice).
+            // To prevent client-side spoofing, take the last entry added by the trusted proxy,
+            // falling back to leftmost if the last entry is not a valid IP.
+            if let Some(last) = val.rsplit(',').next() {
+                let candidate = last.trim();
+                if candidate.parse::<IpAddr>().is_ok() {
+                    return candidate.to_string();
+                }
+            }
+            if let Some(first) = val.split(',').next() {
+                let candidate = first.trim();
+                if candidate.parse::<IpAddr>().is_ok() {
+                    return candidate.to_string();
+                }
             }
         }
         // Direct client or untrusted proxy
@@ -58,11 +68,18 @@ pub fn resolve_client_ip(
     // Direct unit test / test harness without socket
     if let Some(forwarded) = headers.get("x-forwarded-for")
         && let Ok(val) = forwarded.to_str()
-        && let Some(first) = val.split(',').next()
     {
-        let candidate = first.trim();
-        if candidate.parse::<IpAddr>().is_ok() {
-            return candidate.to_string();
+        if let Some(last) = val.rsplit(',').next() {
+            let candidate = last.trim();
+            if candidate.parse::<IpAddr>().is_ok() {
+                return candidate.to_string();
+            }
+        }
+        if let Some(first) = val.split(',').next() {
+            let candidate = first.trim();
+            if candidate.parse::<IpAddr>().is_ok() {
+                return candidate.to_string();
+            }
         }
     }
 
@@ -120,16 +137,44 @@ mod tests {
     #[test]
     fn test_trusted_proxy_uses_forwarded_for() {
         let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.1"));
+        let proxy_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let peer = SocketAddr::new(proxy_ip, 12345);
+        let trusted = vec![proxy_ip];
+
+        let ip = resolve_client_ip(Some(peer), &headers, &trusted);
+        assert_eq!(ip, "192.0.2.1");
+    }
+
+    #[test]
+    fn test_trusted_proxy_prevents_client_spoofing_via_last_entry() {
+        let mut headers = HeaderMap::new();
+        // Client attempted to spoof 1.1.1.1, but trusted proxy appended real client IP 203.0.113.55
         headers.insert(
             "x-forwarded-for",
-            HeaderValue::from_static("1.2.3.4, 10.0.0.1"),
+            HeaderValue::from_static("1.1.1.1, 203.0.113.55"),
         );
         let proxy_ip: IpAddr = "10.0.0.1".parse().unwrap();
         let peer = SocketAddr::new(proxy_ip, 12345);
         let trusted = vec![proxy_ip];
 
         let ip = resolve_client_ip(Some(peer), &headers, &trusted);
-        assert_eq!(ip, "1.2.3.4");
+        assert_eq!(ip, "203.0.113.55");
+    }
+
+    #[test]
+    fn test_trusted_proxy_fallback_to_leftmost_if_last_entry_invalid() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.42, not-an-ip"),
+        );
+        let proxy_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let peer = SocketAddr::new(proxy_ip, 12345);
+        let trusted = vec![proxy_ip];
+
+        let ip = resolve_client_ip(Some(peer), &headers, &trusted);
+        assert_eq!(ip, "198.51.100.42");
     }
 
     #[test]

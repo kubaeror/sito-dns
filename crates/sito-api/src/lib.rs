@@ -24,7 +24,7 @@ pub use auth::*;
 pub use error::ProblemDetails;
 pub use openapi::ApiDoc;
 pub use router::create_router;
-pub use state::ServerContext;
+pub use state::{ServerContext, publish_bundle};
 
 #[cfg(test)]
 mod tests {

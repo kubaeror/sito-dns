@@ -23,7 +23,7 @@ use crate::bundle::{substitute_secrets, verify_and_unpack_push};
 use crate::config::HaConfig;
 use crate::crypto::parse_public_key;
 use crate::error::HaError;
-use crate::protocol::HaMessage;
+use crate::protocol::{HaMessage, UpstreamReport};
 use crate::slave::state::{SlaveState, SlaveStatusTracker};
 use crate::transport::{ExponentialBackoff, build_client_tls_config};
 
@@ -388,8 +388,12 @@ where
     );
 
     let stats_interval_secs = ha_config.stats_interval_secs.max(1);
-    let mut stats_ticker = tokio::time::interval(Duration::from_secs(stats_interval_secs));
+    let mut stats_ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(stats_interval_secs),
+        Duration::from_secs(stats_interval_secs),
+    );
     stats_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let (mut last_queries, mut last_blocked) = handles.metrics.get_queries_and_blocked();
 
     loop {
         tokio::select! {
@@ -413,11 +417,23 @@ where
 
             _ = stats_ticker.tick() => {
                 // Collect stats from handles and emit periodic StatsReport
+                let (total_q, total_b) = handles.metrics.get_queries_and_blocked();
+                let queries = total_q.saturating_sub(last_queries);
+                let blocked = total_b.saturating_sub(last_blocked);
+                last_queries = total_q;
+                last_blocked = total_b;
+
+                let upstream_reports = handles.metrics.get_upstream_reports();
+                let mut upstreams = HashMap::new();
+                for (name, (rtt_ms, errors)) in upstream_reports {
+                    upstreams.insert(name, UpstreamReport { rtt_ms, errors });
+                }
+
                 let stats = HaMessage::StatsReport {
                     window_s: stats_interval_secs,
-                    queries: 0,
-                    blocked: 0,
-                    upstreams: HashMap::new(),
+                    queries,
+                    blocked,
+                    upstreams,
                 };
                 if let Ok(json) = stats.to_json() {
                     let _ = ws_stream.send(WsMessage::Text(json.into())).await;

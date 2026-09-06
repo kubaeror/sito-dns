@@ -98,12 +98,13 @@ mod tests {
             sito_clients::ClientRegistry::new(Default::default()),
         )));
 
+        let slave_metrics = sito_stats::MetricsRegistry::new("0.1.0", "slave");
         let handles = SlaveAppHandles {
             config: config_arc.clone(),
             filter: filter_engine.clone(),
             rewrites: rewrites_arc.clone(),
             clients: clients_arc.clone(),
-            metrics: metrics.clone(),
+            metrics: slave_metrics.clone(),
             config_path: None,
         };
 
@@ -113,6 +114,7 @@ mod tests {
             master_pubkey: Some(signing_key.public_key_hex()),
             cert: certs.slave_cert_path.clone(),
             key: certs.slave_key_path.clone(),
+            stats_interval_secs: 1,
             ..Default::default()
         };
 
@@ -155,6 +157,27 @@ mod tests {
         assert_eq!(slaves[0].instance, "slave-1");
         assert_eq!(slaves[0].synced_version, 2);
         assert_eq!(slaves[0].lag, 0);
+
+        slave_metrics.inc_queries("udp", 1, "blocked");
+        slave_metrics.observe_upstream_rtt("1.1.1.1:53", 0.025);
+
+        // Wait up to 3 seconds for stats ticker to report
+        let mut stats_received = false;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Some(stats) = &coordinator.list_slaves()[0].last_stats
+                && stats.queries >= 1
+            {
+                assert!(stats.blocked >= 1);
+                assert_eq!(stats.upstreams_count, 1);
+                stats_received = true;
+                break;
+            }
+        }
+        assert!(
+            stats_received,
+            "Slave stats report should be received by coordinator"
+        );
 
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&temp_dir);

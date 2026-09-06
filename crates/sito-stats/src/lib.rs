@@ -152,6 +152,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_writer_anonymize_ip_toggle() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let writer = QueryLogWriter::spawn_with_anonymize(db.clone(), 100, true);
+        let sender = writer.sender();
+
+        let mut live_tail = sender.subscribe();
+
+        let entry = QueryLogEntry {
+            id: None,
+            ts: chrono::Utc::now().timestamp_millis(),
+            client_ip: "192.168.1.100".into(),
+            client_name: None,
+            qname: "privacy.test".into(),
+            qtype: 1,
+            rcode: Some(0),
+            verdict: "allowed".into(),
+            rule: None,
+            list_source: None,
+            upstream: Some("1.1.1.1:53".into()),
+            elapsed_us: Some(500),
+            dnssec: None,
+            proto: "udp".into(),
+        };
+
+        assert!(sender.try_send(entry));
+        let live = live_tail.recv().await.unwrap();
+        assert_eq!(live.client_ip, "192.168.1.0");
+
+        sender.flush().await;
+
+        let page = db.query_logs(&QueryLogFilter::default()).await.unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].client_ip, "192.168.1.0");
+        assert_eq!(page.entries[0].upstream, Some("1.1.1.1:53".into()));
+
+        // Toggle off
+        sender.set_anonymize(false);
+        let entry2 = QueryLogEntry {
+            id: None,
+            ts: chrono::Utc::now().timestamp_millis(),
+            client_ip: "10.45.99.123".into(),
+            client_name: None,
+            qname: "raw.test".into(),
+            qtype: 1,
+            rcode: Some(0),
+            verdict: "allowed".into(),
+            rule: None,
+            list_source: None,
+            upstream: Some("8.8.8.8:53".into()),
+            elapsed_us: Some(300),
+            dnssec: None,
+            proto: "udp".into(),
+        };
+
+        assert!(sender.try_send(entry2));
+        let live2 = live_tail.recv().await.unwrap();
+        assert_eq!(live2.client_ip, "10.45.99.123");
+
+        sender.flush().await;
+        let page2 = db.query_logs(&QueryLogFilter::default()).await.unwrap();
+        assert_eq!(page2.entries.len(), 2);
+        assert_eq!(page2.entries[0].client_ip, "10.45.99.123");
+        assert_eq!(page2.entries[0].upstream, Some("8.8.8.8:53".into()));
+
+        sender.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_retention_cleaner_and_aggregation() {
         let db = StatsDb::in_memory().await.unwrap();
 
@@ -531,5 +599,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res_status.entries.len(), 0);
+    }
+
+    #[test]
+    fn test_metrics_registry_queries_and_upstream_reports() {
+        let metrics = MetricsRegistry::new("1.0.0", "test");
+        metrics.inc_queries("udp", 1, "allowed");
+        metrics.inc_queries("udp", 28, "blocked");
+        metrics.inc_queries("tcp", 1, "allowed");
+
+        let (total, blocked) = metrics.get_queries_and_blocked();
+        assert_eq!(total, 3);
+        assert_eq!(blocked, 1);
+
+        metrics.observe_upstream_rtt("1.1.1.1:53", 0.025);
+        metrics.observe_upstream_rtt("1.1.1.1:53", 0.035);
+        metrics.inc_upstream_errors("1.1.1.1:53", "timeout");
+        metrics.inc_upstream_errors("8.8.8.8:53", "network");
+
+        let upstreams = metrics.get_upstream_reports();
+        assert_eq!(upstreams.len(), 2);
+        let u1 = upstreams.get("1.1.1.1:53").unwrap();
+        assert!((u1.0 - 30.0).abs() < 1e-3);
+        assert_eq!(u1.1, 1);
+
+        let u2 = upstreams.get("8.8.8.8:53").unwrap();
+        assert!(u2.0.abs() < 1e-6);
+        assert_eq!(u2.1, 1);
     }
 }

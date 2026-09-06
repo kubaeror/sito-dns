@@ -91,3 +91,8 @@ jobs:
       - name: Verify binary output
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: ./target/${{ matrix.target }}/debug/sito --version
+      - name: Smoke build release binary (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo build --release --locked -p sito --features "embed-ui,mimalloc" --target ${{ matrix.target }}
+          ./target/${{ matrix.target }}/release/sito --version

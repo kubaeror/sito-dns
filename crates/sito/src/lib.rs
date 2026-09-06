@@ -111,6 +111,10 @@ mod tests {
         let services = Arc::new(ServiceRegistry::bundled());
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
 
+        let stats_db = sito_stats::StatsDb::in_memory().await.unwrap();
+        let querylog_writer = sito_stats::QueryLogWriter::spawn(stats_db.clone(), 100);
+        let metrics = sito_stats::MetricsRegistry::new("1.2.1", "test");
+
         let pipeline = DnsPipeline::new(
             Arc::new(config.clone()),
             filter,
@@ -122,7 +126,8 @@ mod tests {
             services,
             rewrites,
             in_flight,
-        );
+        )
+        .with_stats(querylog_writer.sender(), metrics);
 
         let client = ClientContext::new("127.0.0.1".parse().unwrap());
 
@@ -163,6 +168,19 @@ mod tests {
             resp_allowed.answers[0].data,
             RData::A(A(Ipv4Addr::new(93, 184, 216, 34)))
         );
+
+        // Verify real upstream identifier was recorded in query log
+        querylog_writer.sender().flush().await;
+        let logs = stats_db
+            .query_logs(&sito_stats::QueryLogFilter::default())
+            .await
+            .unwrap();
+        let upstream_log = logs
+            .entries
+            .iter()
+            .find(|e| e.qname == "example.com")
+            .expect("should find example.com query log");
+        assert_eq!(upstream_log.upstream, Some(mock_addr.to_string()));
 
         // 5. Test second query -> cache hit
         let mut query_cached = Message::new(303, MessageType::Query, OpCode::Query);
@@ -455,6 +473,138 @@ mod tests {
         assert_eq!(
             resp2.answers[0].data,
             RData::A(A(Ipv4Addr::new(192, 168, 1, 1)))
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_negative_caching_nxdomain() {
+        use sito_proto::rdata::SOA;
+
+        let temp_dir = std::env::temp_dir().join(format!("sito_nx_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mock_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_socket.local_addr().unwrap();
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    res = mock_socket.recv_from(&mut buf) => {
+                        if let Ok((len, src)) = res
+                            && let Ok(query) = sito_proto::decode_message(&buf[..len])
+                        {
+                            let mut resp =
+                                Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                            resp.metadata.response_code = ResponseCode::NXDomain;
+                            resp.queries = query.queries.clone();
+                            resp.authorities.push(Record::from_rdata(
+                                Name::from_str("example.com.").unwrap(),
+                                300,
+                                RData::SOA(SOA::new(
+                                    Name::from_str("ns1.example.com.").unwrap(),
+                                    Name::from_str("admin.example.com.").unwrap(),
+                                    2_026_090_601,
+                                    7200,
+                                    3600,
+                                    1_209_600,
+                                    60, // minimum TTL = 60s
+                                )),
+                            ));
+                            let encoded = sito_proto::encode_message(&resp).unwrap();
+                            let _ = mock_socket.send_to(&encoded, src).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut config = Config::default();
+        config.server.data_dir = temp_dir.clone();
+        config.upstream.servers = vec![mock_addr.to_string()];
+        config.dns.cache.enabled = true;
+        config.dns.cache.min_ttl = 10;
+        config.dns.cache.negative_ttl_max = 300;
+
+        let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
+        let upstream = Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let cache = Arc::new(DnsCache::new(config.dns.cache.clone()));
+        let filter = Arc::new(
+            HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
+        );
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let dnssec = Arc::new(sito_dnssec::DnssecValidator::from_config(
+            &config.dns.dnssec,
+        ));
+        let clients = Arc::new(ClientRegistry::new(ClientsConfig::default()));
+        let parental = Arc::new(ParentalRegistry::bundled());
+        let services = Arc::new(ServiceRegistry::bundled());
+        let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
+
+        let pipeline = DnsPipeline::new(
+            Arc::new(config.clone()),
+            filter,
+            cache.clone(),
+            upstream,
+            dnssec,
+            clients,
+            parental,
+            services,
+            rewrites,
+            in_flight,
+        );
+
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let nx_name = Name::from_str("nxdomain.example.com.").unwrap();
+        let mut query1 = Message::new(1, MessageType::Query, OpCode::Query);
+        query1
+            .queries
+            .push(Query::query(nx_name.clone(), RecordType::A));
+
+        // First query: resolved via upstream -> NXDomain
+        let resp1 = pipeline.handle(query1, client.clone()).await.unwrap();
+        assert_eq!(resp1.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(resp1.authorities.len(), 1);
+        assert_eq!(resp1.authorities[0].ttl, 300);
+
+        // Shutdown upstream so any subsequent resolution would fail
+        let _ = shutdown_tx.send(());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Second query: served from cache!
+        let mut query2 = Message::new(2, MessageType::Query, OpCode::Query);
+        query2
+            .queries
+            .push(Query::query(nx_name.clone(), RecordType::A));
+        let resp2 = pipeline.handle(query2, client.clone()).await.unwrap();
+        assert_eq!(resp2.metadata.id, 2);
+        assert_eq!(resp2.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(resp2.authorities.len(), 1);
+        let ttl_first = resp2.authorities[0].ttl;
+        assert!(ttl_first <= 60);
+
+        // Sleep to verify decrementing TTL on negative cache hit
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        let mut query3 = Message::new(3, MessageType::Query, OpCode::Query);
+        query3.queries.push(Query::query(nx_name, RecordType::A));
+        let resp3 = pipeline.handle(query3, client).await.unwrap();
+        assert_eq!(resp3.metadata.id, 3);
+        assert_eq!(resp3.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(resp3.authorities.len(), 1);
+        let ttl_second = resp3.authorities[0].ttl;
+        assert!(
+            ttl_second < ttl_first,
+            "Negative TTL must decrement over time (first: {ttl_first}, second: {ttl_second})"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

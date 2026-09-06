@@ -80,12 +80,18 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, RustlsError> {
+        if self.pinned_fingerprints.is_empty() {
+            return Err(RustlsError::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+
         let cert_fp = blake3::hash(end_entity.as_ref())
             .to_hex()
             .to_string()
             .to_lowercase();
 
-        if !self.pinned_fingerprints.is_empty() && !self.pinned_fingerprints.contains(&cert_fp) {
+        if !self.pinned_fingerprints.contains(&cert_fp) {
             return Err(RustlsError::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
@@ -96,20 +102,30 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -166,20 +182,30 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -249,4 +275,37 @@ pub fn build_client_tls_config(
     };
 
     Ok(Arc::new(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pinned_client_cert_verifier_rejects_empty_pins() {
+        let verifier = PinnedClientCertVerifier::new(&[]);
+        let dummy_cert = CertificateDer::from(vec![1, 2, 3, 4]);
+        let now = rustls::pki_types::UnixTime::now();
+        let res = verifier.verify_client_cert(&dummy_cert, &[], now);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_pinned_client_cert_verifier_matching_and_mismatch() {
+        let dummy_cert = CertificateDer::from(vec![1, 2, 3, 4]);
+        let fp = blake3::hash(dummy_cert.as_ref()).to_hex().to_string();
+        let now = rustls::pki_types::UnixTime::now();
+
+        // Matching pin
+        let verifier = PinnedClientCertVerifier::new(&[fp]);
+        assert!(verifier.verify_client_cert(&dummy_cert, &[], now).is_ok());
+
+        // Mismatch pin
+        let verifier_mismatch = PinnedClientCertVerifier::new(&["blake3:99999999".to_string()]);
+        assert!(
+            verifier_mismatch
+                .verify_client_cert(&dummy_cert, &[], now)
+                .is_err()
+        );
+    }
 }

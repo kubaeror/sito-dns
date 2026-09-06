@@ -11,7 +11,7 @@ pub mod totp;
 
 pub use client_ip::{MaybeConnectInfo, is_https_request, resolve_client_ip};
 pub use lockout::LockoutTracker;
-pub use manager::{AuthManager, LoginResult};
+pub use manager::{AuthManager, AuthStorageError, LoginResult};
 pub use password::{hash_password, verify_password};
 pub use rbac::{AuthUser, RequireAdmin, RequireOperator, RequireViewer};
 pub use session::{Session, build_clear_session_cookie, build_session_cookie};

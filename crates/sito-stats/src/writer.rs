@@ -2,8 +2,9 @@
 
 use crate::db::StatsDb;
 use crate::entry::QueryLogEntry;
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::error;
@@ -27,14 +28,22 @@ pub struct QueryLogSender {
     tx: mpsc::Sender<WriterCommand>,
     dropped_total: Arc<AtomicU64>,
     live_tail_tx: broadcast::Sender<QueryLogEntry>,
+    anonymize: Arc<AtomicBool>,
 }
 
 impl QueryLogSender {
     /// Attempts to enqueue a query log entry.
     ///
+    /// If anonymization is enabled, masks the client IP address.
     /// If the channel is full, drops the entry without blocking the DNS hot path
     /// and increments `sito_querylog_dropped_total`.
-    pub fn try_send(&self, entry: QueryLogEntry) -> bool {
+    pub fn try_send(&self, mut entry: QueryLogEntry) -> bool {
+        if self.anonymize.load(Ordering::Relaxed)
+            && let Ok(ip) = entry.client_ip.parse::<IpAddr>()
+        {
+            entry.client_ip = crate::anonymize_ip(ip);
+        }
+
         // Broadcast immediately to live-tail listeners regardless of storage queue
         let _ = self.live_tail_tx.send(entry.clone());
 
@@ -48,6 +57,11 @@ impl QueryLogSender {
             self.dropped_total.fetch_add(1, Ordering::Relaxed);
             false
         }
+    }
+
+    /// Sets whether client IPs should be anonymized before logging.
+    pub fn set_anonymize(&self, enabled: bool) {
+        self.anonymize.store(enabled, Ordering::Relaxed);
     }
 
     /// Returns the total number of dropped query log events due to channel backpressure.
@@ -86,14 +100,21 @@ pub struct QueryLogWriter {
 impl QueryLogWriter {
     /// Spawns a dedicated single-writer task with the given database and channel capacity.
     pub fn spawn(db: StatsDb, capacity: usize) -> Self {
+        Self::spawn_with_anonymize(db, capacity, false)
+    }
+
+    /// Spawns a dedicated single-writer task with the given database, channel capacity, and anonymization toggle.
+    pub fn spawn_with_anonymize(db: StatsDb, capacity: usize, anonymize: bool) -> Self {
         let (tx, mut rx) = mpsc::channel(capacity);
         let dropped_total = Arc::new(AtomicU64::new(0));
         let (live_tail_tx, _) = broadcast::channel(1000);
+        let anonymize_arc = Arc::new(AtomicBool::new(anonymize));
 
         let sender = QueryLogSender {
             tx,
             dropped_total: Arc::clone(&dropped_total),
             live_tail_tx: live_tail_tx.clone(),
+            anonymize: Arc::clone(&anonymize_arc),
         };
 
         let join_handle = tokio::spawn(async move {
@@ -105,7 +126,12 @@ impl QueryLogWriter {
                 tokio::select! {
                     cmd = rx.recv() => {
                         match cmd {
-                            Some(WriterCommand::Entry(entry)) => {
+                            Some(WriterCommand::Entry(mut entry)) => {
+                                if anonymize_arc.load(Ordering::Relaxed)
+                                    && let Ok(ip) = entry.client_ip.parse::<IpAddr>()
+                                {
+                                    entry.client_ip = crate::anonymize_ip(ip);
+                                }
                                 batch.push(*entry);
                                 if batch.len() >= BATCH_SIZE_THRESHOLD {
                                     if let Err(e) = db.insert_batch(&batch).await {
@@ -165,6 +191,13 @@ impl QueryLogWriter {
     /// Returns a cloneable sender handle for enqueuing query logs.
     pub fn sender(&self) -> QueryLogSender {
         self.sender.clone()
+    }
+
+    /// Configure IP anonymization on the writer.
+    #[must_use]
+    pub fn with_anonymize(self, enabled: bool) -> Self {
+        self.sender.set_anonymize(enabled);
+        self
     }
 
     /// Shuts down the writer cleanly, flushing any remaining buffered logs, and waits for task exit.

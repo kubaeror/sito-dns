@@ -80,6 +80,15 @@ pub enum Commands {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Reset administrative credentials (re-bootstrap admin user)
+    ResetAdmin {
+        /// Optional path to configuration file (defaults to main --config)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Optional new admin password (defaults to adminadmin)
+        #[arg(short, long)]
+        password: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -343,5 +352,42 @@ pub async fn run_update(check: bool, force: bool, repo: Option<&str>) -> Result<
         .map_err(|e| anyhow::anyhow!("Failed to apply update: {e}"))?;
 
     println!("{msg}");
+    Ok(())
+}
+
+/// Executes the `reset-admin` subcommand.
+pub fn run_reset_admin(config_path: &Path, password: Option<&str>) -> Result<(), anyhow::Error> {
+    let content = std::fs::read_to_string(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read configuration file '{}': {}",
+            config_path.display(),
+            e
+        )
+    })?;
+
+    let config = Config::from_toml_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "Configuration validation failed for '{}': {}",
+            config_path.display(),
+            e
+        )
+    })?;
+
+    let pass = password.unwrap_or("adminadmin");
+    let users_path = sito_api::AuthManager::reset_admin_credentials(&config.server.data_dir, pass)
+        .map_err(|e| anyhow::anyhow!("Failed to reset admin credentials: {e}"))?;
+
+    println!(
+        "Administrative credentials successfully reset in '{}'.\nUsername: admin",
+        users_path.display()
+    );
+    if password.is_none() {
+        println!(
+            "Password: adminadmin (Warning: Please change this default password upon logging in!)"
+        );
+    } else {
+        println!("Password: (custom password set)");
+    }
+
     Ok(())
 }
