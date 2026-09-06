@@ -79,12 +79,29 @@ else
     fi
 
     if [ -f "${TMP_DIR}/${TARBALL_NAME}" ]; then
-        if [ -f "${TMP_DIR}/SHA256SUMS" ]; then
-            echo "Verifying SHA256 checksum..."
-            cd "${TMP_DIR}"
-            grep "${TARBALL_NAME}" SHA256SUMS | sha256sum -c -
-            cd - >/dev/null
+        if [ ! -f "${TMP_DIR}/SHA256SUMS" ]; then
+            echo "Error: SHA256SUMS file is missing from release v${SITO_VERSION}." >&2
+            echo "For security, sito refuses to install binaries without verified checksums." >&2
+            echo "Please check https://github.com/${REPO}/releases/tag/v${SITO_VERSION} or build from source." >&2
+            exit 1
         fi
+
+        echo "Verifying SHA256 checksum..."
+        cd "${TMP_DIR}"
+        if ! grep -F "${TARBALL_NAME}" SHA256SUMS >/dev/null 2>&1; then
+            echo "Error: Checksum entry for ${TARBALL_NAME} was not found in SHA256SUMS." >&2
+            echo "For security, sito refuses to install binaries without verified checksums." >&2
+            exit 1
+        fi
+
+        if ! grep -F "${TARBALL_NAME}" SHA256SUMS | sha256sum -c -; then
+            echo "Error: SHA256 checksum verification failed for ${TARBALL_NAME}!" >&2
+            echo "The downloaded archive does not match the published release checksum." >&2
+            echo "This could indicate a corrupted download or security tampering." >&2
+            exit 1
+        fi
+        cd - >/dev/null
+
         tar -xzf "${TMP_DIR}/${TARBALL_NAME}" -C "${TMP_DIR}"
         cp -f "${TMP_DIR}/sito" "${INSTALL_BIN}"
     else
