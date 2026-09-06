@@ -44,6 +44,17 @@ pub struct UserAccount {
     pub totp: Option<TotpConfig>,
 }
 
+pub const MAX_SESSIONS: usize = 10_000;
+pub const MAX_PENDING_TOTP: usize = 10_000;
+pub const MAX_PARTIAL_TOKENS: usize = 10_000;
+pub const PENDING_TOTP_TTL: Duration = Duration::from_secs(600); // 10 minutes
+
+#[derive(Debug, Clone)]
+struct PendingTotp {
+    config: TotpConfig,
+    created_at: Instant,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct UsersFile {
     #[serde(default)]
@@ -56,7 +67,7 @@ pub struct AuthManager {
     users: Arc<Mutex<HashMap<String, UserAccount>>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     tokens: Arc<Mutex<HashMap<String, ApiTokenMeta>>>, // Keyed by token hash
-    pending_totp_setups: Arc<Mutex<HashMap<String, TotpConfig>>>,
+    pending_totp_setups: Arc<Mutex<HashMap<String, PendingTotp>>>,
     partial_tokens: Arc<Mutex<HashMap<String, PartialAuth>>>,
     lockout: LockoutTracker,
     session_ttl_secs: i64,
@@ -257,6 +268,19 @@ impl AuthManager {
         false
     }
 
+    fn insert_session(&self, session: Session) {
+        let mut sessions = self.sessions.lock().unwrap();
+        if !sessions.contains_key(&session.id) && sessions.len() >= MAX_SESSIONS {
+            sessions.retain(|_, s| !s.is_expired());
+            if sessions.len() >= MAX_SESSIONS
+                && let Some(oldest_key) = sessions.keys().next().cloned()
+            {
+                sessions.remove(&oldest_key);
+            }
+        }
+        sessions.insert(session.id.clone(), session);
+    }
+
     /// Primary login flow (`POST /auth/login`).
     pub fn login(&self, username: &str, password: &str, client_ip: &str) -> LoginResult {
         // 1. IP rate limiting
@@ -311,11 +335,20 @@ impl AuthManager {
             let partial_token = hex::encode(bytes);
 
             let mut partials = self.partial_tokens.lock().unwrap();
+            let now = Instant::now();
+            if !partials.contains_key(&partial_token) && partials.len() >= MAX_PARTIAL_TOKENS {
+                partials.retain(|_, auth| now < auth.expires_at);
+                if partials.len() >= MAX_PARTIAL_TOKENS
+                    && let Some(oldest_key) = partials.keys().next().cloned()
+                {
+                    partials.remove(&oldest_key);
+                }
+            }
             partials.insert(
                 partial_token.clone(),
                 PartialAuth {
                     username: username.to_string(),
-                    expires_at: Instant::now() + Duration::from_secs(300), // 5 minutes
+                    expires_at: now + Duration::from_secs(300), // 5 minutes
                 },
             );
 
@@ -325,10 +358,7 @@ impl AuthManager {
         // Authentication successful
         self.lockout.record_success(username);
         let session = Session::new(username, user.role, self.session_ttl_secs);
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(session.id.clone(), session.clone());
+        self.insert_session(session.clone());
         LoginResult::Success(session)
     }
 
@@ -359,10 +389,7 @@ impl AuthManager {
             self.save_users();
 
             let session = Session::new(&username, role, self.session_ttl_secs);
-            self.sessions
-                .lock()
-                .unwrap()
-                .insert(session.id.clone(), session.clone());
+            self.insert_session(session.clone());
             Some(session)
         } else {
             self.lockout.record_failure(&username);
@@ -373,25 +400,42 @@ impl AuthManager {
     /// Initiates TOTP setup for a user (`GET /auth/totp/setup`).
     pub fn init_totp_setup(&self, username: &str) -> Option<TotpSetupResponse> {
         let (config, resp) = TotpConfig::generate("sito", username);
-        self.pending_totp_setups
-            .lock()
-            .unwrap()
-            .insert(username.to_string(), config);
+        let now = Instant::now();
+        let mut pending = self.pending_totp_setups.lock().unwrap();
+        if !pending.contains_key(username) && pending.len() >= MAX_PENDING_TOTP {
+            pending.retain(|_, p| now.duration_since(p.created_at) <= PENDING_TOTP_TTL);
+            if pending.len() >= MAX_PENDING_TOTP
+                && let Some(oldest_key) = pending.keys().next().cloned()
+            {
+                pending.remove(&oldest_key);
+            }
+        }
+        pending.insert(
+            username.to_string(),
+            PendingTotp {
+                config,
+                created_at: now,
+            },
+        );
         Some(resp)
     }
 
     /// Confirms and activates TOTP for a user using initial code verification.
     pub fn confirm_totp_setup(&self, username: &str, code: &str) -> bool {
         let mut pending = self.pending_totp_setups.lock().unwrap();
-        let Some(mut config) = pending.remove(username) else {
+        let Some(mut item) = pending.remove(username) else {
             return false;
         };
 
-        if config.verify(code, username, "sito") {
-            config.enabled = true;
+        if Instant::now().duration_since(item.created_at) > PENDING_TOTP_TTL {
+            return false;
+        }
+
+        if item.config.verify(code, username, "sito") {
+            item.config.enabled = true;
             let mut users = self.users.lock().unwrap();
             if let Some(user) = users.get_mut(username) {
-                user.totp = Some(config);
+                user.totp = Some(item.config);
                 drop(users);
                 self.save_users();
                 return true;
@@ -485,6 +529,88 @@ impl AuthManager {
             return Some(meta.clone());
         }
         None
+    }
+
+    /// Prunes expired sessions, partial tokens, pending TOTP setups, and lockout/rate limits.
+    pub fn prune(&self) {
+        self.lockout.prune();
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.retain(|_, s| !s.is_expired());
+        }
+        {
+            let now = Instant::now();
+            let mut pending = self.pending_totp_setups.lock().unwrap();
+            pending.retain(|_, p| now.duration_since(p.created_at) <= PENDING_TOTP_TTL);
+        }
+        {
+            let now = Instant::now();
+            let mut partials = self.partial_tokens.lock().unwrap();
+            partials.retain(|_, p| now < p.expires_at);
+        }
+    }
+
+    /// Spawns a background task to periodically prune expired sessions and entries until shutdown.
+    pub fn spawn_pruner(
+        self: &Arc<Self>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let mgr = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        mgr.prune();
+                    }
+                }
+            }
+        })
+    }
+
+    #[cfg(test)]
+    pub fn sessions_len(&self) -> usize {
+        self.sessions.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub fn partial_tokens_len(&self) -> usize {
+        self.partial_tokens.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub fn pending_totp_len(&self) -> usize {
+        self.pending_totp_setups.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub fn expire_session_for_test(&self, session_id: &str) {
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(s) = sessions.get_mut(session_id) {
+            s.expires_at = 0;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn expire_partial_tokens_for_test(&self) {
+        let mut partials = self.partial_tokens.lock().unwrap();
+        for auth in partials.values_mut() {
+            auth.expires_at = Instant::now() - Duration::from_secs(10);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn expire_pending_totp_for_test(&self) {
+        let mut pending = self.pending_totp_setups.lock().unwrap();
+        for p in pending.values_mut() {
+            p.created_at = Instant::now() - Duration::from_secs(1000);
+        }
     }
 }
 
@@ -605,5 +731,36 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_prune_expired_entries() {
+        let mgr = Arc::new(AuthManager::new());
+        // 1. Create a session and expire it
+        let session = match mgr.login("admin", "adminadmin", "127.0.0.1") {
+            LoginResult::Success(s) => s,
+            _ => panic!("login failed"),
+        };
+        assert_eq!(mgr.sessions_len(), 1);
+        mgr.expire_session_for_test(&session.id);
+
+        // 2. Create pending totp and expire it
+        mgr.init_totp_setup("admin");
+        assert_eq!(mgr.pending_totp_len(), 1);
+        mgr.expire_pending_totp_for_test();
+
+        // 3. Prune
+        mgr.prune();
+        assert_eq!(mgr.sessions_len(), 0);
+        assert_eq!(mgr.pending_totp_len(), 0);
+
+        // Test pruner task shutdown
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = mgr.spawn_pruner(shutdown_rx);
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("pruner should shutdown cleanly")
+            .unwrap();
     }
 }
