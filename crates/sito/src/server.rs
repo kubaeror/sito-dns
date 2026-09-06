@@ -150,8 +150,17 @@ pub async fn run_server_full(
     let ha_config: sito_ha::HaConfig = config
         .ha
         .as_ref()
-        .and_then(|v| v.clone().try_into().ok())
-        .unwrap_or_default();
+        .map(sito_ha::HaConfig::from_toml_value)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("Invalid HA configuration: {e}"))?
+        .unwrap_or_else(|| sito_ha::HaConfig {
+            replication_port: 0,
+            ..Default::default()
+        });
+
+    ha_config
+        .validate(&config.server.role)
+        .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
 
     let (master_coordinator, slave_tracker, resync_sender) = if config.server.role == "master" {
         // Load or create master Ed25519 signing key (0600 on Unix)
@@ -195,11 +204,15 @@ pub async fn run_server_full(
         let _ = coordinator.update_bundle(initial_bundle);
 
         // Spawn master replication listener if replication_port > 0
-        let _master_server_handle = sito_ha::spawn_master_server(
-            ha_config.clone(),
-            coordinator.clone(),
-            shutdown_rx.clone(),
-        );
+        let _master_server_handle = if ha_config.replication_port > 0 {
+            Some(sito_ha::spawn_master_server(
+                ha_config.clone(),
+                coordinator.clone(),
+                shutdown_rx.clone(),
+            ))
+        } else {
+            None
+        };
 
         (Some(coordinator), None, None)
     } else {

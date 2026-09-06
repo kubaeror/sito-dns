@@ -400,18 +400,12 @@ pub fn spawn_master_server(
         coordinator.slave_token.clone_from(&ha_config.slave_token);
     }
     tokio::spawn(async move {
-        let listen_addr = format!("{}:{}", ha_config.listen_addr, ha_config.replication_port);
-        let listener = match TcpListener::bind(&listen_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                error!("Failed to bind master HA replication listener on '{listen_addr}': {e}");
-                return;
-            }
-        };
+        if ha_config.replication_port == 0 {
+            info!("Master HA replication is disabled (replication_port is 0)");
+            return;
+        }
 
-        info!(addr = %listen_addr, "Master HA replication listener active");
-
-        // Optional mTLS setup
+        // mTLS setup or explicit insecure plaintext check
         let tls_acceptor = if let (Some(cert_path), Some(key_path)) =
             (&ha_config.cert, &ha_config.key)
         {
@@ -424,8 +418,25 @@ pub fn spawn_master_server(
                 }
             }
         } else {
+            if !ha_config.allow_insecure_ws {
+                error!(
+                    "Master HA replication requires TLS (cert and key configured) unless allow_insecure_ws is true. Refusing to serve plaintext replication."
+                );
+                return;
+            }
             None
         };
+
+        let listen_addr = format!("{}:{}", ha_config.listen_addr, ha_config.replication_port);
+        let listener = match TcpListener::bind(&listen_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!("Failed to bind master HA replication listener on '{listen_addr}': {e}");
+                return;
+            }
+        };
+
+        info!(addr = %listen_addr, "Master HA replication listener active");
 
         loop {
             tokio::select! {

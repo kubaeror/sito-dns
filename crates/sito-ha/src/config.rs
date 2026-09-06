@@ -114,14 +114,46 @@ impl HaConfig {
 
     /// Validates fields based on the assigned node role ("master" or "slave").
     pub fn validate(&self, role: &str) -> Result<(), HaError> {
-        if self.replication_port == 0 {
-            return Err(HaError::Validation {
-                field: "replication_port".to_string(),
-                reason: "Replication port must be greater than 0".to_string(),
-            });
-        }
+        if role == "master" {
+            if self.replication_port > 0 {
+                let has_token = self
+                    .slave_token
+                    .as_ref()
+                    .is_some_and(|t| !t.trim().is_empty());
+                let has_pins = !self.pinned_slave_fingerprints.is_empty();
 
-        if role == "slave" {
+                if !has_token && !has_pins {
+                    return Err(HaError::Validation {
+                        field: "slave_token".to_string(),
+                        reason: "Master replication requires authentication: either slave_token or pinned_slave_fingerprints must be configured".to_string(),
+                    });
+                }
+
+                let has_cert = self.cert.is_some();
+                let has_key = self.key.is_some();
+
+                if (has_cert && !has_key) || (!has_cert && has_key) {
+                    return Err(HaError::Validation {
+                        field: "key".to_string(),
+                        reason: "Both cert and key must be provided for TLS replication"
+                            .to_string(),
+                    });
+                }
+
+                if (!has_cert || !has_key) && !self.allow_insecure_ws {
+                    return Err(HaError::Validation {
+                        field: "cert".to_string(),
+                        reason: "Master replication requires TLS certificate and key unless allow_insecure_ws = true".to_string(),
+                    });
+                }
+            }
+        } else if role == "slave" {
+            if self.replication_port == 0 {
+                return Err(HaError::Validation {
+                    field: "replication_port".to_string(),
+                    reason: "Replication port must be greater than 0".to_string(),
+                });
+            }
             if let Some(ref pubkey_str) = self.master_pubkey {
                 parse_public_key(pubkey_str)?;
             }
@@ -174,5 +206,35 @@ pinned_slave_fingerprints = ["blake3:11223344"]
         assert_eq!(cfg.master_url.as_deref(), Some("wss://127.0.0.1:8953"));
         assert_eq!(cfg.pinned_slave_fingerprints.len(), 1);
         assert!(cfg.validate("slave").is_ok());
+    }
+
+    #[test]
+    fn test_master_validation_requires_auth_and_tls() {
+        // Default config with replication_port > 0 fails without auth
+        let mut cfg = HaConfig::default();
+        assert!(cfg.validate("master").is_err());
+
+        // Token provided, but no TLS and allow_insecure_ws is false -> fails
+        cfg.slave_token = Some("secret".to_string());
+        assert!(cfg.validate("master").is_err());
+
+        // Explicit allow_insecure_ws with token -> passes
+        cfg.allow_insecure_ws = true;
+        assert!(cfg.validate("master").is_ok());
+
+        // allow_insecure_ws true, but no auth -> fails
+        cfg.slave_token = None;
+        assert!(cfg.validate("master").is_err());
+
+        // Pinned slave fingerprints satisfies auth
+        cfg.pinned_slave_fingerprints = vec!["blake3:abc123".to_string()];
+        assert!(cfg.validate("master").is_ok());
+
+        // replication_port == 0 (disabled) always passes master validation
+        let disabled_cfg = HaConfig {
+            replication_port: 0,
+            ..Default::default()
+        };
+        assert!(disabled_cfg.validate("master").is_ok());
     }
 }
