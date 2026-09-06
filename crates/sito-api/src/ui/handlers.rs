@@ -1413,10 +1413,63 @@ pub async fn wizard_complete_handler(
             .into_response();
     }
 
-    let _ = ctx
-        .auth_mgr
-        .update_user_password(&form.admin_user, &form.admin_password);
-    ctx.auth_mgr.mark_setup_complete();
+    let admin_user = form.admin_user.trim();
+    let admin_password = form.admin_password.trim();
+
+    if admin_user.is_empty() || admin_password.is_empty() || admin_password.len() < 8 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid username or password: password must be at least 8 characters long.",
+        )
+            .into_response();
+    }
+
+    if admin_user.contains(|c: char| c.is_whitespace() || c.is_control()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid username: cannot contain whitespace or control characters.",
+        )
+            .into_response();
+    }
+
+    if is_first_run {
+        if ctx.auth_mgr.has_user(admin_user) {
+            if !ctx
+                .auth_mgr
+                .update_user_password(admin_user, admin_password)
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Failed to update administrator password.",
+                )
+                    .into_response();
+            }
+        } else {
+            // Nonexistent user: create as admin
+            ctx.auth_mgr
+                .create_user(admin_user, admin_password, Role::Admin);
+            // If custom admin username chosen, remove default 'admin' account if still on bootstrap password
+            if admin_user != "admin" && ctx.auth_mgr.is_default_admin_active() {
+                ctx.auth_mgr.delete_user("admin");
+            }
+        }
+        ctx.auth_mgr.mark_setup_complete();
+    } else {
+        // Not first run: must be authenticated admin updating existing admin credentials
+        if !ctx.auth_mgr.has_user(admin_user) {
+            return (StatusCode::BAD_REQUEST, "Username does not exist.").into_response();
+        }
+        if !ctx
+            .auth_mgr
+            .update_user_password(admin_user, admin_password)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Failed to update administrator password.",
+            )
+                .into_response();
+        }
+    }
 
     let mut new_cfg = (**ctx.config.load()).clone();
     if !form.upstream.trim().is_empty() {
@@ -1424,7 +1477,15 @@ pub async fn wizard_complete_handler(
     }
     new_cfg.filtering.enabled = form.enable_adblock.is_some();
 
-    let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to save config in wizard: {e:?}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to save configuration",
+        )
+            .into_response();
+    }
+
     ctx.config.store(Arc::new(new_cfg.clone()));
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
 
@@ -1583,6 +1644,81 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_wizard_validation_and_user_creation() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_test_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        assert!(ctx.auth_mgr.is_first_run());
+
+        // 1. Wrong username (empty) -> 400 Bad Request, first_run stays true
+        let empty_user_form = WizardCompleteForm {
+            admin_user: "".to_string(),
+            admin_password: "ValidPassword123!".to_string(),
+            upstream: "1.1.1.1:53".to_string(),
+            enable_adblock: None,
+        };
+        let resp =
+            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(empty_user_form))
+                .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(ctx.auth_mgr.is_first_run());
+
+        // 2. Wrong username (whitespace) -> 400 Bad Request, first_run stays true
+        let space_user_form = WizardCompleteForm {
+            admin_user: "admin user".to_string(),
+            admin_password: "ValidPassword123!".to_string(),
+            upstream: "1.1.1.1:53".to_string(),
+            enable_adblock: None,
+        };
+        let resp =
+            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(space_user_form))
+                .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(ctx.auth_mgr.is_first_run());
+
+        // 3. Short password -> 400 Bad Request, first_run stays true
+        let short_pass_form = WizardCompleteForm {
+            admin_user: "admin".to_string(),
+            admin_password: "short".to_string(),
+            upstream: "1.1.1.1:53".to_string(),
+            enable_adblock: None,
+        };
+        let resp =
+            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(short_pass_form))
+                .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(ctx.auth_mgr.is_first_run());
+
+        // 4. Nonexistent user -> created as admin, first_run becomes false, default admin purged
+        let nonexistent_user_form = WizardCompleteForm {
+            admin_user: "superadmin".to_string(),
+            admin_password: "SuperSecretPassword123!".to_string(),
+            upstream: "1.1.1.1:53".to_string(),
+            enable_adblock: Some("on".to_string()),
+        };
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Form(nonexistent_user_form),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(!ctx.auth_mgr.is_first_run());
+        assert!(ctx.auth_mgr.has_user("superadmin"));
+        assert!(!ctx.auth_mgr.has_user("admin"));
+
+        // Login as new admin succeeds
+        let login_res = ctx
+            .auth_mgr
+            .login("superadmin", "SuperSecretPassword123!", "127.0.0.1");
+        assert!(matches!(login_res, crate::auth::LoginResult::Success(_)));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

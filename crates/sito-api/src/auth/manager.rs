@@ -233,6 +233,30 @@ impl AuthManager {
         }
     }
 
+    /// Checks whether a user with the given username exists.
+    pub fn has_user(&self, username: &str) -> bool {
+        self.users.lock().unwrap().contains_key(username)
+    }
+
+    /// Deletes a user account by username. Returns true if the user existed and was removed.
+    pub fn delete_user(&self, username: &str) -> bool {
+        let removed = self.users.lock().unwrap().remove(username).is_some();
+        if removed {
+            self.save_users();
+        }
+        removed
+    }
+
+    /// Returns true if the default bootstrapped admin user is still active with default password.
+    pub fn is_default_admin_active(&self) -> bool {
+        let users = self.users.lock().unwrap();
+        if let Some(admin) = users.get("admin") {
+            verify_password("adminadmin", &admin.password_hash)
+        } else {
+            false
+        }
+    }
+
     /// Marks initial setup as completed.
     pub fn mark_setup_complete(&self) {
         self.setup_complete.store(true, Ordering::SeqCst);
