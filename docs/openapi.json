@@ -2183,6 +2183,16 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid repository parameter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Failed to query release info",
             "content": {

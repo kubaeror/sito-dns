@@ -5,7 +5,7 @@ use axum::extract::Query;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::rbac::RequireAdmin;
+use crate::auth::rbac::{RequireAdmin, RequireViewer};
 use crate::error::ProblemDetails;
 use crate::updater::{self, UpdateInfo};
 
@@ -35,12 +35,22 @@ pub struct ApplyUpdateResponse {
     params(CheckUpdateQuery),
     responses(
         (status = 200, description = "Update information retrieved successfully", body = UpdateInfo),
+        (status = 400, description = "Invalid repository parameter", body = ProblemDetails),
         (status = 500, description = "Failed to query release info", body = ProblemDetails)
     )
 )]
 pub async fn check_update(
+    _viewer: RequireViewer,
     Query(params): Query<CheckUpdateQuery>,
 ) -> Result<Json<UpdateInfo>, ProblemDetails> {
+    if let Some(ref repo) = params.repo
+        && !updater::is_allowed_repo(repo)
+    {
+        return Err(ProblemDetails::bad_request(format!(
+            "Repository '{repo}' is not in the allowed repositories list"
+        )));
+    }
+
     match updater::check_for_update(params.repo.as_deref()).await {
         Ok(info) => Ok(Json(info)),
         Err(e) => Err(ProblemDetails::new(
@@ -72,6 +82,14 @@ pub async fn apply_update(
     } else {
         (None, false)
     };
+
+    if let Some(ref r) = repo
+        && !updater::is_allowed_repo(r)
+    {
+        return Err(ProblemDetails::bad_request(format!(
+            "Repository '{r}' is not in the allowed repositories list"
+        )));
+    }
 
     match updater::apply_update(repo.as_deref(), force).await {
         Ok(message) => Ok(Json(ApplyUpdateResponse {
