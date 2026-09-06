@@ -22,20 +22,69 @@ use crate::upstream::Upstream;
 pub type NamedUpstream = (String, Arc<dyn Upstream>);
 pub type PerDomainRule = (Vec<String>, Vec<NamedUpstream>);
 
+#[derive(Clone)]
 struct ManagedEntry {
     name: String,
     upstream: Arc<dyn Upstream>,
     health: Arc<RwLock<UpstreamHealth>>,
 }
 
-/// Central manager for upstream DNS servers, handling failover, load balancing,
-/// parallel queries, per-domain routing, and health tracking.
-pub struct UpstreamManager {
+#[derive(Clone)]
+struct UpstreamInner {
     entries: Vec<ManagedEntry>,
     per_domain_rules: Vec<(Vec<String>, Vec<ManagedEntry>)>,
     strategy: UpstreamStrategy,
     timeout_duration: Duration,
     probe_domain: String,
+}
+
+impl UpstreamInner {
+    async fn from_config(
+        config: &UpstreamConfig,
+        bootstrap: &BootstrapResolver,
+    ) -> Result<Self, UpstreamError> {
+        let timeout_duration = Duration::from_millis(config.timeout_ms);
+        let mut entries = Vec::new();
+
+        for server_str in &config.servers {
+            entries.push(
+                create_managed_entry(server_str, bootstrap, timeout_duration, config.pool_size)
+                    .await?,
+            );
+        }
+
+        let mut per_domain_rules = Vec::new();
+        for pd in &config.per_domain {
+            let mut pd_entries = Vec::new();
+            for server_str in &pd.servers {
+                pd_entries.push(
+                    create_managed_entry(server_str, bootstrap, timeout_duration, config.pool_size)
+                        .await?,
+                );
+            }
+            let cleaned_domains = pd
+                .domains
+                .iter()
+                .map(|d| clean_rule_domain(d))
+                .filter(|d| !d.is_empty())
+                .collect();
+            per_domain_rules.push((cleaned_domains, pd_entries));
+        }
+
+        Ok(Self {
+            entries,
+            per_domain_rules,
+            strategy: config.strategy,
+            timeout_duration,
+            probe_domain: config.probe_domain.clone(),
+        })
+    }
+}
+
+/// Central manager for upstream DNS servers, handling failover, load balancing,
+/// parallel queries, per-domain routing, and health tracking.
+pub struct UpstreamManager {
+    inner: arc_swap::ArcSwap<UpstreamInner>,
     rr_counter: AtomicUsize,
 }
 
@@ -107,42 +156,27 @@ impl UpstreamManager {
         config: &UpstreamConfig,
         bootstrap: &BootstrapResolver,
     ) -> Result<Self, UpstreamError> {
-        let timeout_duration = Duration::from_millis(config.timeout_ms);
-        let mut entries = Vec::new();
-
-        for server_str in &config.servers {
-            entries.push(
-                create_managed_entry(server_str, bootstrap, timeout_duration, config.pool_size)
-                    .await?,
-            );
-        }
-
-        let mut per_domain_rules = Vec::new();
-        for pd in &config.per_domain {
-            let mut pd_entries = Vec::new();
-            for server_str in &pd.servers {
-                pd_entries.push(
-                    create_managed_entry(server_str, bootstrap, timeout_duration, config.pool_size)
-                        .await?,
-                );
-            }
-            let cleaned_domains = pd
-                .domains
-                .iter()
-                .map(|d| clean_rule_domain(d))
-                .filter(|d| !d.is_empty())
-                .collect();
-            per_domain_rules.push((cleaned_domains, pd_entries));
-        }
-
+        let inner = UpstreamInner::from_config(config, bootstrap).await?;
         Ok(Self {
-            entries,
-            per_domain_rules,
-            strategy: config.strategy,
-            timeout_duration,
-            probe_domain: config.probe_domain.clone(),
+            inner: arc_swap::ArcSwap::new(Arc::new(inner)),
             rr_counter: AtomicUsize::new(0),
         })
+    }
+
+    /// Hot-reloads upstream manager dynamically with updated servers, strategy, and domain rules.
+    pub async fn reload(
+        &self,
+        config: &UpstreamConfig,
+        bootstrap: &BootstrapResolver,
+    ) -> Result<(), UpstreamError> {
+        let new_inner = UpstreamInner::from_config(config, bootstrap).await?;
+        self.inner.store(Arc::new(new_inner));
+        info!(
+            servers = ?config.servers,
+            strategy = ?config.strategy,
+            "UpstreamManager successfully hot-reloaded"
+        );
+        Ok(())
     }
 
     /// Create an UpstreamManager with explicitly provided Upstream implementations (for testing).
@@ -160,20 +194,24 @@ impl UpstreamManager {
             })
             .collect();
 
-        Self {
+        let inner = UpstreamInner {
             entries,
             per_domain_rules: Vec::new(),
             strategy,
             timeout_duration,
             probe_domain: "example.com".to_string(),
+        };
+
+        Self {
+            inner: arc_swap::ArcSwap::new(Arc::new(inner)),
             rr_counter: AtomicUsize::new(0),
         }
     }
 
     /// Create an UpstreamManager with per-domain rules (for testing).
     #[must_use]
-    pub fn with_per_domain_upstreams(mut self, rules: Vec<PerDomainRule>) -> Self {
-        self.per_domain_rules = rules
+    pub fn with_per_domain_upstreams(self, rules: Vec<PerDomainRule>) -> Self {
+        let per_domain_rules = rules
             .into_iter()
             .map(|(domains, upstreams)| {
                 let cleaned_domains = domains
@@ -192,25 +230,36 @@ impl UpstreamManager {
                 (cleaned_domains, entries)
             })
             .collect();
+
+        let current = self.inner.load();
+        let new_inner = UpstreamInner {
+            entries: current.entries.clone(),
+            per_domain_rules,
+            strategy: current.strategy,
+            timeout_duration: current.timeout_duration,
+            probe_domain: current.probe_domain.clone(),
+        };
+        self.inner.store(Arc::new(new_inner));
         self
     }
 
     pub fn strategy(&self) -> UpstreamStrategy {
-        self.strategy
+        self.inner.load().strategy
     }
 
     pub fn timeout(&self) -> Duration {
-        self.timeout_duration
+        self.inner.load().timeout_duration
     }
 
     /// Retrieve the current health status of all configured upstreams.
     pub async fn statuses(&self) -> Vec<(String, HealthStatus)> {
-        let mut res = Vec::with_capacity(self.entries.len());
-        for entry in &self.entries {
+        let inner = self.inner.load();
+        let mut res = Vec::with_capacity(inner.entries.len());
+        for entry in &inner.entries {
             let status = entry.health.read().await.status();
             res.push((entry.name.clone(), status));
         }
-        for (_, group) in &self.per_domain_rules {
+        for (_, group) in &inner.per_domain_rules {
             for entry in group {
                 let status = entry.health.read().await.status();
                 res.push((entry.name.clone(), status));
@@ -229,10 +278,11 @@ impl UpstreamManager {
         &self,
         msg: &Message,
     ) -> Result<(Message, String), UpstreamError> {
+        let inner = self.inner.load();
         if let Some(query) = msg.queries.first() {
             let qname_str = query.name.to_utf8().to_lowercase();
             let qname_clean = qname_str.trim_end_matches('.');
-            for (domains, group) in &self.per_domain_rules {
+            for (domains, group) in &inner.per_domain_rules {
                 for d in domains {
                     if let Some(prefix) = qname_clean.strip_suffix(d.as_str())
                         && (prefix.is_empty() || prefix.ends_with('.'))
@@ -241,19 +291,21 @@ impl UpstreamManager {
                             "Routing query for {} to per-domain upstreams {:?}",
                             qname_str, domains
                         );
-                        return self.resolve_entries(group, msg).await;
+                        return self.resolve_entries(group, msg, inner.strategy).await;
                     }
                 }
             }
         }
 
-        self.resolve_entries(&self.entries, msg).await
+        self.resolve_entries(&inner.entries, msg, inner.strategy)
+            .await
     }
 
     async fn resolve_entries(
         &self,
         entries: &[ManagedEntry],
         msg: &Message,
+        strategy: UpstreamStrategy,
     ) -> Result<(Message, String), UpstreamError> {
         if entries.is_empty() {
             return Err(UpstreamError::AllDown);
@@ -274,7 +326,7 @@ impl UpstreamManager {
             candidates.extend(entries.iter());
         }
 
-        match self.strategy {
+        match strategy {
             UpstreamStrategy::Parallel => {
                 let mut futs = Vec::with_capacity(candidates.len());
                 for entry in candidates {
@@ -349,12 +401,6 @@ impl UpstreamManager {
     ) -> tokio::task::JoinHandle<()> {
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            let probe_qname =
-                match Name::from_str(&format!("{}.", this.probe_domain.trim_end_matches('.'))) {
-                    Ok(n) => n,
-                    Err(_) => Name::from_str("example.com.").unwrap(),
-                };
-
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
@@ -363,13 +409,20 @@ impl UpstreamManager {
                         }
                     }
                     () = sleep(Duration::from_secs(10)) => {
+                        let inner = this.inner.load();
+                        let probe_qname =
+                            match Name::from_str(&format!("{}.", inner.probe_domain.trim_end_matches('.'))) {
+                                Ok(n) => n,
+                                Err(_) => Name::from_str("example.com.").unwrap(),
+                            };
+
                         let mut all_entries = Vec::new();
-                        for entry in &this.entries {
-                            all_entries.push(entry);
+                        for entry in &inner.entries {
+                            all_entries.push(entry.clone());
                         }
-                        for (_, group) in &this.per_domain_rules {
+                        for (_, group) in &inner.per_domain_rules {
                             for entry in group {
-                                all_entries.push(entry);
+                                all_entries.push(entry.clone());
                             }
                         }
 
@@ -577,5 +630,48 @@ mod tests {
         );
         assert_eq!(calls_corp.load(Ordering::SeqCst), 1);
         assert_eq!(calls_default.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_upstream_manager_reload() {
+        let calls_default = Arc::new(AtomicU32::new(0));
+        let default_upstream = Arc::new(ConfigurableMockUpstream {
+            succeed: true,
+            delay: Duration::ZERO,
+            result_ip: std::net::Ipv4Addr::new(8, 8, 8, 8),
+            call_count: calls_default,
+        });
+
+        let manager = UpstreamManager::with_upstreams(
+            vec![("default".to_string(), default_upstream)],
+            UpstreamStrategy::Failover,
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(manager.strategy(), UpstreamStrategy::Failover);
+        assert_eq!(manager.timeout(), Duration::from_secs(1));
+
+        let bootstrap = BootstrapResolver::new(
+            vec!["127.0.0.1".parse().unwrap()],
+            Duration::from_millis(500),
+        );
+
+        let new_config = UpstreamConfig {
+            servers: vec!["1.1.1.1:53".to_string()],
+            bootstrap: vec![],
+            strategy: UpstreamStrategy::LoadBalance,
+            timeout_ms: 2500,
+            probe_domain: "cloudflare.com".to_string(),
+            pool_size: 2,
+            per_domain: vec![],
+        };
+
+        manager.reload(&new_config, &bootstrap).await.unwrap();
+
+        assert_eq!(manager.strategy(), UpstreamStrategy::LoadBalance);
+        assert_eq!(manager.timeout(), Duration::from_millis(2500));
+        let statuses = manager.statuses().await;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].0, "1.1.1.1:53");
     }
 }

@@ -3299,6 +3299,7 @@ dependencies = [
 name = "sito-upstream"
 version = "1.2.1"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "futures-util",
  "rand 0.10.2",

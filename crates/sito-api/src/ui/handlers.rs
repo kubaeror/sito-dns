@@ -1047,7 +1047,14 @@ pub async fn upstreams_add_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg));
+        ctx.config.store(Arc::new(new_cfg.clone()));
+        let bootstrap = sito_upstream::BootstrapResolver::new(
+            new_cfg.upstream.bootstrap.clone(),
+            std::time::Duration::from_millis(new_cfg.upstream.timeout_ms),
+        );
+        if let Err(e) = ctx.upstream.reload(&new_cfg.upstream, &bootstrap).await {
+            tracing::error!("Failed to reload upstream manager: {e:?}");
+        }
         crate::publish_bundle(&ctx);
     }
 
@@ -1529,6 +1536,11 @@ pub async fn wizard_complete_handler(
 
     ctx.config.store(Arc::new(new_cfg.clone()));
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+    let bootstrap = sito_upstream::BootstrapResolver::new(
+        new_cfg.upstream.bootstrap.clone(),
+        std::time::Duration::from_millis(new_cfg.upstream.timeout_ms),
+    );
+    let _ = ctx.upstream.reload(&new_cfg.upstream, &bootstrap).await;
     crate::publish_bundle(&ctx);
 
     Redirect::to("/login").into_response()
