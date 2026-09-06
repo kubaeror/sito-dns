@@ -265,6 +265,11 @@ pub async fn run_server_full(
     let web_cfg = config_arc.load().get_web_config();
     if web_cfg.enabled {
         let web_addr = SocketAddr::new(web_cfg.bind, web_cfg.port);
+        if !web_cfg.bind.is_loopback() && config_arc.load().get_tls_config().is_none() {
+            warn!(
+                "Web UI running over plain HTTP on {web_addr}; credentials transmitted in plaintext. Set up TLS or reverse proxy."
+            );
+        }
         let listener = tokio::net::TcpListener::bind(web_addr).await.map_err(|e| {
             anyhow::anyhow!("Failed to bind web admin interface to {web_addr}: {e}")
         })?;

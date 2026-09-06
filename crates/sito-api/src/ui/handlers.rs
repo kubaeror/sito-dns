@@ -119,7 +119,11 @@ pub async fn login_submit(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let trusted_proxies = ctx.config.load().get_web_config().trusted_proxies;
+    let config = ctx.config.load();
+    let trusted_proxies = config.get_web_config().trusted_proxies;
+    let tls_enabled = config.get_tls_config().is_some();
+    let is_secure =
+        crate::auth::is_https_request(peer_addr, &headers, &trusted_proxies, tls_enabled);
     let client_ip = resolve_client_ip(peer_addr, &headers, &trusted_proxies);
     let result = ctx
         .auth_mgr
@@ -127,7 +131,7 @@ pub async fn login_submit(
 
     match result {
         LoginResult::Success(session) => {
-            let cookie_header = session.to_cookie_header();
+            let cookie_header = session.to_cookie_header_secure(is_secure);
             let mut resp = Redirect::to("/dashboard").into_response();
             if let Ok(val) = cookie_header.parse() {
                 resp.headers_mut().insert(SET_COOKIE, val);
@@ -139,7 +143,7 @@ pub async fn login_submit(
                 && !code.trim().is_empty()
                 && let Some(session) = ctx.auth_mgr.verify_totp(&partial_token, code.trim())
             {
-                let cookie_header = session.to_cookie_header();
+                let cookie_header = session.to_cookie_header_secure(is_secure);
                 let mut resp = Redirect::to("/dashboard").into_response();
                 if let Ok(val) = cookie_header.parse() {
                     resp.headers_mut().insert(SET_COOKIE, val);
@@ -186,14 +190,23 @@ pub async fn login_submit(
     }
 }
 
-pub async fn logout_handler(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
+pub async fn logout_handler(
+    State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
     if let Some(cookie_hdr) = headers.get("cookie")
         && let Ok(s) = cookie_hdr.to_str()
         && let Some(session_id) = extract_session_cookie(s)
     {
         ctx.auth_mgr.logout(&session_id);
     }
-    let clear_cookie = build_clear_session_cookie();
+    let config = ctx.config.load();
+    let trusted_proxies = config.get_web_config().trusted_proxies;
+    let tls_enabled = config.get_tls_config().is_some();
+    let is_secure =
+        crate::auth::is_https_request(peer_addr, &headers, &trusted_proxies, tls_enabled);
+    let clear_cookie = build_clear_session_cookie(is_secure);
     let mut resp = Redirect::to("/login").into_response();
     if let Ok(val) = clear_cookie.parse() {
         resp.headers_mut().insert(SET_COOKIE, val);
