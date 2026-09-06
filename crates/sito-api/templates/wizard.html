@@ -1,46 +1,257 @@
 {% extends "base.html" %}
 
-{% block title %}Initial Setup Wizard - sito DNS{% endblock %}
+{% block title %}First-Time Setup Wizard - sito DNS{% endblock %}
 
 {% block standalone_content %}
-<div class="login-container">
-  <div class="card" style="max-width: 600px; width: 100%; padding: 32px;">
-    <div style="text-align: center; margin-bottom: 24px;">
-      <img src="/static/logo.svg" alt="sito logo" style="width: 48px; height: 48px; margin-bottom: 12px; border-radius: 10px;">
-      <h1 style="font-size: 1.5rem; font-weight: 700;">Welcome to sito DNS</h1>
-      <p style="font-size: 0.875rem; color: var(--text-secondary);">First-Time Setup Configuration</p>
+<div class="login-container" style="padding: 40px 20px; min-height: 100vh;">
+  <div class="card" style="max-width: 760px; width: 100%; padding: 36px; box-shadow: var(--modal-shadow);">
+    <div style="text-align: center; margin-bottom: 28px;">
+      <img src="/static/logo.svg" alt="sito logo" style="width: 52px; height: 52px; margin-bottom: 14px; border-radius: 12px;">
+      <h1 style="font-size: 1.6rem; font-weight: 700; letter-spacing: -0.02em;">Welcome to sito DNS</h1>
+      <p style="font-size: 0.9rem; color: var(--text-secondary); margin-top: 4px;">First-Time Configuration Wizard</p>
+      <div style="margin-top: 12px; font-size: 0.825rem; color: var(--text-muted); background: var(--bg-tertiary); padding: 8px 14px; border-radius: var(--radius-md); display: inline-block;">
+        All settings are pre-configured with secure defaults. You may fine-tune them below or change them anytime later.
+      </div>
     </div>
 
     <form action="/ui/wizard/complete" method="POST">
-      <div class="form-group">
-        <label class="form-label" for="wiz-user">Admin Username</label>
-        <input type="text" id="wiz-user" name="admin_user" class="form-input" value="admin" required>
+      <!-- Section 1: Administrator Account -->
+      <div style="margin-bottom: 24px;">
+        <h3 style="font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text-primary);">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          1. Administrator Account
+        </h3>
+        <div class="form-group">
+          <label class="form-label" for="wiz-user">Admin Username</label>
+          <input type="text" id="wiz-user" name="admin_user" class="form-input" value="admin" required placeholder="admin">
+          <div class="form-help">Username for logging into this web panel and REST API.</div>
+        </div>
+        <div class="grid-2" style="margin-bottom: 0;">
+          <div class="form-group">
+            <label class="form-label" for="wiz-pass">Admin Password</label>
+            <input type="password" id="wiz-pass" name="admin_password" class="form-input" minlength="8" placeholder="Default: adminadmin">
+            <div class="form-help">Minimum 8 characters (or leave empty for default: <code>adminadmin</code>).</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="wiz-pass-confirm">Confirm Password</label>
+            <input type="password" id="wiz-pass-confirm" name="confirm_password" class="form-input" placeholder="Confirm password">
+            <div class="form-help">Must match admin password if specified.</div>
+          </div>
+        </div>
       </div>
 
-      <div class="form-group">
-        <label class="form-label" for="wiz-pass">Admin Password</label>
-        <input type="password" id="wiz-pass" name="admin_password" class="form-input" required placeholder="Strong password">
+      <!-- Section 2: DNS Listeners -->
+      <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-color);">
+        <h3 style="font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text-primary);">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/></svg>
+          2. DNS Listeners & Protocols
+        </h3>
+        <div class="form-group">
+          <label class="form-label">Listen IP Bindings</label>
+          <div style="display: flex; gap: 24px; margin-top: 6px;">
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+              <input type="checkbox" name="bind_ipv4" checked style="width: 16px; height: 16px;">
+              <span style="font-size: 0.875rem;">IPv4 (<code>0.0.0.0</code>)</span>
+            </label>
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+              <input type="checkbox" name="bind_ipv6" checked style="width: 16px; height: 16px;">
+              <span style="font-size: 0.875rem;">IPv6 (<code>::</code>)</span>
+            </label>
+          </div>
+        </div>
+        <div class="grid-4" style="margin-bottom: 0;">
+          <div class="form-group">
+            <label class="form-label" for="wiz-port">DNS Port (UDP/TCP)</label>
+            <input type="number" id="wiz-port" name="port" class="form-input" value="53" min="1" max="65535">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="wiz-dot">DoT Port</label>
+            <input type="number" id="wiz-dot" name="dot_port" class="form-input" value="853" min="1" max="65535">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="wiz-doh">DoH Port</label>
+            <input type="number" id="wiz-doh" name="doh_port" class="form-input" value="443" min="1" max="65535">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="wiz-doq">DoQ Port</label>
+            <input type="number" id="wiz-doq" name="doq_port" class="form-input" value="0" min="0" max="65535">
+            <div class="form-help">0 to disable (avoid port 853 collision).</div>
+          </div>
+        </div>
       </div>
 
-      <div class="form-group">
-        <label class="form-label" for="wiz-upstream">Primary Upstream DNS</label>
-        <select id="wiz-upstream" name="upstream" class="form-select">
-          <option value="tls://1.1.1.1:853">Cloudflare DNS (DNS-over-TLS)</option>
-          <option value="https://dns.quad9.net/dns-query">Quad9 (DNS-over-HTTPS, Malware blocking)</option>
-          <option value="tls://dns.google:853">Google Public DNS (DNS-over-TLS)</option>
-          <option value="1.1.1.1:53">Standard UDP/TCP 1.1.1.1</option>
-        </select>
+      <!-- Section 3: Upstream Resolvers -->
+      <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-color);">
+        <h3 style="font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text-primary);">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" x2="22" y1="12" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+          3. Upstream DNS Resolvers
+        </h3>
+        <div class="form-group">
+          <label class="form-label" for="wiz-upstreams">Upstream Servers (one per line or comma-separated)</label>
+          <textarea id="wiz-upstreams" name="upstreams" class="form-textarea mono" rows="3" placeholder="1.1.1.1&#10;1.0.0.1">1.1.1.1&#10;1.0.0.1</textarea>
+          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center;">
+            <span style="font-size: 0.75rem; color: var(--text-muted); margin-right: 4px;">Presets:</span>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('wiz-upstreams').value = '1.1.1.1\n1.0.0.1';">Cloudflare</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('wiz-upstreams').value = '9.9.9.9\n149.112.112.112';">Quad9</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('wiz-upstreams').value = '8.8.8.8\n8.8.4.4';">Google</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('wiz-upstreams').value = 'tls://1.1.1.1:853\ntls://1.0.0.1:853';">Cloudflare DoT</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('wiz-upstreams').value = 'https://dns.quad9.net/dns-query';">Quad9 DoH</button>
+          </div>
+        </div>
+
+        <!-- Latency Tester -->
+        <div class="card" style="background: var(--bg-primary); padding: 12px 16px; margin-bottom: 16px; border: 1px dashed var(--border-color);">
+          <div style="font-size: 0.8rem; font-weight: 600; margin-bottom: 8px; color: var(--text-secondary);">Test Upstream Latency</div>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <input type="text" id="wiz-test-target" name="address" class="form-input mono" style="font-size: 0.85rem;" placeholder="e.g. 1.1.1.1 or 9.9.9.9" value="1.1.1.1">
+            <button type="button" class="btn btn-outline btn-sm" style="white-space: nowrap;"
+                    hx-post="/ui/upstreams/test"
+                    hx-include="#wiz-test-target"
+                    hx-target="#wiz-test-feedback"
+                    hx-swap="innerHTML">
+              Test Latency
+            </button>
+          </div>
+          <div id="wiz-test-feedback" style="margin-top: 8px;"></div>
+        </div>
+
+        <div class="grid-2" style="margin-bottom: 0;">
+          <div class="form-group">
+            <label class="form-label" for="wiz-strategy">Resolution Strategy</label>
+            <select id="wiz-strategy" name="upstream_strategy" class="form-select">
+              <option value="failover" selected>Failover (Sequential with primary fallback)</option>
+              <option value="parallel">Parallel (Query all, fastest answer wins)</option>
+              <option value="load_balance">Load Balance (Round-robin / weighted)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="wiz-timeout">Query Timeout (ms)</label>
+            <input type="number" id="wiz-timeout" name="timeout_ms" class="form-input" value="5000" min="50" max="60000">
+          </div>
+        </div>
+        <div class="form-group" style="margin-bottom: 0;">
+          <label class="form-label" for="wiz-bootstrap">Bootstrap Resolvers (IPs used to resolve DoT/DoH endpoints)</label>
+          <input type="text" id="wiz-bootstrap" name="bootstrap" class="form-input mono" value="9.9.9.9, 149.112.112.112">
+        </div>
       </div>
 
-      <div class="form-group" style="margin-top: 20px;">
-        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-          <input type="checkbox" name="enable_adblock" checked style="width: 16px; height: 16px;">
-          <span style="font-size: 0.875rem;">Enable default Adblock and anti-tracking lists</span>
-        </label>
+      <!-- Section 4: Cache & DNSSEC -->
+      <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-color);">
+        <h3 style="font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text-primary);">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          4. Cache & DNSSEC
+        </h3>
+        <div class="grid-2">
+          <div class="form-group">
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin-bottom: 6px;">
+              <input type="checkbox" name="cache_enabled" checked style="width: 16px; height: 16px;">
+              <span class="form-label" style="margin-bottom: 0;">Enable In-Memory DNS Cache</span>
+            </label>
+            <div class="form-help">Caches queries locally for ultra-low latency response times.</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="wiz-cache-size">Cache Size (MB)</label>
+            <input type="number" id="wiz-cache-size" name="cache_size_mb" class="form-input" value="64" min="4" max="8192">
+          </div>
+        </div>
+        <div class="grid-2" style="margin-bottom: 0;">
+          <div class="form-group">
+            <label class="form-label" for="wiz-dnssec-mode">DNSSEC Mode</label>
+            <select id="wiz-dnssec-mode" name="dnssec_mode" class="form-select">
+              <option value="validate" selected>Validate (Enforce cryptographic signatures)</option>
+              <option value="strict">Strict (Fail on all unauthenticated domains)</option>
+              <option value="log_only">Log Only (Permissive validation with audit logs)</option>
+              <option value="off">Off (Disable DNSSEC checks)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin-top: 24px;">
+              <input type="checkbox" name="dnssec_validate" checked style="width: 16px; height: 16px;">
+              <span style="font-size: 0.875rem;">Enable Cryptographic DNSSEC Validation</span>
+            </label>
+          </div>
+        </div>
       </div>
 
-      <button type="submit" class="btn btn-primary" style="width: 100%; margin-top: 16px; padding: 10px;">
-        Complete Setup & Go to Dashboard
+      <!-- Section 5: Filtering & Protection -->
+      <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-color);">
+        <h3 style="font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text-primary);">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><line x1="9.5" x2="14.5" y1="9" y2="14"/><line x1="14.5" x2="9.5" y1="9" y2="14"/></svg>
+          5. Filtering & Adblock Protection
+        </h3>
+        <div class="grid-2">
+          <div class="form-group">
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin-bottom: 6px;">
+              <input type="checkbox" name="filtering_enabled" checked style="width: 16px; height: 16px;">
+              <span class="form-label" style="margin-bottom: 0;">Enable DNS-Based Filtering</span>
+            </label>
+            <div class="form-help">Block advertisements, tracking, phishing, and malware domains.</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="wiz-block-mode">Blocking Response Mode</label>
+            <select id="wiz-block-mode" name="blocking_mode" class="form-select">
+              <option value="zero_ip" selected>Zero IP (Respond 0.0.0.0 / ::)</option>
+              <option value="nxdomain">NXDOMAIN (Domain does not exist)</option>
+              <option value="refused">REFUSED (Query refused)</option>
+              <option value="null_rdata">Null RDATA (Empty response)</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-group">
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+            <input type="checkbox" name="cname_cloaking" checked style="width: 16px; height: 16px;">
+            <span style="font-size: 0.875rem;">Enable CNAME Cloaking Defense (Uncloaks third-party tracking aliases)</span>
+          </label>
+        </div>
+        <div class="form-group" style="margin-bottom: 0;">
+          <label class="form-label">Subscribe to Popular Blocklists</label>
+          <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 8px;">
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+              <input type="checkbox" name="list_oisd_big" checked style="width: 16px; height: 16px;">
+              <span style="font-size: 0.875rem;"><strong>OISD Big</strong> — Comprehensive ad, tracker, and telemetry protection (Recommended)</span>
+            </label>
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+              <input type="checkbox" name="list_oisd_small" style="width: 16px; height: 16px;">
+              <span style="font-size: 0.875rem;"><strong>OISD Small</strong> — Lightweight adblock list for low-resource environments</span>
+            </label>
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+              <input type="checkbox" name="list_stevenblack" style="width: 16px; height: 16px;">
+              <span style="font-size: 0.875rem;"><strong>StevenBlack Unified</strong> — Popular amalgamated adware + malware hosts list</span>
+            </label>
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+              <input type="checkbox" name="list_hagezi" style="width: 16px; height: 16px;">
+              <span style="font-size: 0.875rem;"><strong>HaGeZi Multi Pro</strong> — Strict multi-threat protection against ads, trackers, and malicious domains</span>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Section 6: Web Panel & Statistics -->
+      <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-color);">
+        <h3 style="font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text-primary);">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/><path d="M6 6h10"/><path d="M6 10h10"/><path d="M6 14h6"/></svg>
+          6. Web Panel & Statistics
+        </h3>
+        <div class="grid-2">
+          <div class="form-group">
+            <label class="form-label" for="wiz-web-bind">Web Bind Address</label>
+            <input type="text" id="wiz-web-bind" name="web_bind" class="form-input mono" value="0.0.0.0" placeholder="0.0.0.0">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="wiz-web-port">Web Port</label>
+            <input type="number" id="wiz-web-port" name="web_port" class="form-input" value="8080" min="1" max="65535">
+          </div>
+        </div>
+        <div class="form-group" style="margin-bottom: 0;">
+          <label class="form-label" for="wiz-retention">Query Log Retention (Days)</label>
+          <input type="number" id="wiz-retention" name="retention_days" class="form-input" value="90" min="1" max="3650">
+          <div class="form-help">Number of days to preserve query logs and time-series statistics.</div>
+        </div>
+      </div>
+
+      <!-- Submit button -->
+      <button type="submit" class="btn btn-primary" style="width: 100%; margin-top: 32px; padding: 12px; font-size: 1rem; font-weight: 600; border-radius: var(--radius-md);">
+        Complete Setup & Start sito DNS
       </button>
     </form>
   </div>
