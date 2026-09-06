@@ -8,6 +8,7 @@ use crate::auth::totp::{TotpConfig, TotpSetupResponse};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
@@ -52,6 +53,7 @@ pub struct AuthManager {
     lockout: LockoutTracker,
     session_ttl_secs: i64,
     login_rate_limit: usize,
+    setup_complete: Arc<AtomicBool>,
 }
 
 impl Default for AuthManager {
@@ -71,6 +73,7 @@ impl AuthManager {
             lockout: LockoutTracker::new(),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
             login_rate_limit: 5,
+            setup_complete: Arc::new(AtomicBool::new(false)),
         };
 
         // Create default bootstrap admin account (admin / adminadmin)
@@ -84,6 +87,24 @@ impl AuthManager {
         mgr.session_ttl_secs = i64::try_from(secs).unwrap_or(DEFAULT_SESSION_TTL_SECS);
         mgr.login_rate_limit = login_rate_limit;
         mgr
+    }
+
+    /// Returns true if the server is in first-run state (setup has not been completed and default credentials are active).
+    pub fn is_first_run(&self) -> bool {
+        if self.setup_complete.load(Ordering::SeqCst) {
+            return false;
+        }
+        let users = self.users.lock().unwrap();
+        if let Some(admin) = users.get("admin") {
+            verify_password("adminadmin", &admin.password_hash)
+        } else {
+            false
+        }
+    }
+
+    /// Marks initial setup as completed.
+    pub fn mark_setup_complete(&self) {
+        self.setup_complete.store(true, Ordering::SeqCst);
     }
 
     /// Creates or updates a user account.

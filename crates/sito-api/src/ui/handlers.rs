@@ -14,6 +14,7 @@ use crate::auth::manager::LoginResult;
 use crate::auth::rbac::AuthUser;
 use crate::auth::resolve_client_ip;
 use crate::auth::session::{build_clear_session_cookie, extract_session_cookie};
+use crate::auth::token::Role;
 use crate::config_writer::save_config_atomic;
 use crate::models::{FilterListDto, StatusResponse};
 use crate::state::ServerContext;
@@ -1332,11 +1333,18 @@ pub async fn system_update_apply_handler(
 // Setup Wizard
 // ---------------------------------------------------------------------------
 
-pub async fn wizard_page(State(_ctx): State<ServerContext>) -> Response {
+pub async fn wizard_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
+    let auth_user = get_session_user(&ctx, &headers);
+    let is_admin = auth_user.as_ref().map_or(false, |u| u.role == Role::Admin);
+
+    if !ctx.auth_mgr.is_first_run() && !is_admin {
+        return Redirect::to("/login").into_response();
+    }
+
     HtmlTemplate(WizardTemplate {
-        is_authenticated: false,
-        username: "admin",
-        user_role: "",
+        is_authenticated: auth_user.is_some(),
+        username: auth_user.as_ref().map_or("admin", |u| &u.username),
+        user_role: auth_user.as_ref().map_or("", |u| u.role.as_str()),
         active_tab: "wizard",
         version: env!("CARGO_PKG_VERSION"),
     })
@@ -1353,11 +1361,25 @@ pub struct WizardCompleteForm {
 
 pub async fn wizard_complete_handler(
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
     Form(form): Form<WizardCompleteForm>,
 ) -> Response {
+    let is_first_run = ctx.auth_mgr.is_first_run();
+    let auth_user = get_session_user(&ctx, &headers);
+    let is_admin = auth_user.as_ref().map_or(false, |u| u.role == Role::Admin);
+
+    if !is_first_run && !is_admin {
+        return (
+            StatusCode::FORBIDDEN,
+            "Setup wizard is disabled. Admin session required.",
+        )
+            .into_response();
+    }
+
     let _ = ctx
         .auth_mgr
         .update_user_password(&form.admin_user, &form.admin_password);
+    ctx.auth_mgr.mark_setup_complete();
 
     let mut new_cfg = (**ctx.config.load()).clone();
     if !form.upstream.trim().is_empty() {
