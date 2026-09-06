@@ -316,6 +316,9 @@ mod tests {
         ));
         let wire = sito_proto::encode_message(&query).unwrap();
         client_sock.send(&wire).await.unwrap();
+        let mut resp_buf = [0u8; 512];
+        let _ = tokio::time::timeout(Duration::from_millis(1000), client_sock.recv(&mut resp_buf))
+            .await;
 
         // Trigger shutdown
         let _ = shutdown_tx.send(());
@@ -324,6 +327,20 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(6), server_task).await;
         assert!(result.is_ok(), "Server failed to shut down within timeout");
         assert!(result.unwrap().unwrap().is_ok());
+
+        // Verify that querylog writer flushed all buffered logs to disk before exiting
+        let stats_path = temp_dir.join("stats.db");
+        if stats_path.exists() {
+            let stats_db = sito_stats::StatsDb::open(&stats_path).await.unwrap();
+            let logs = stats_db
+                .query_logs(&sito_stats::QueryLogFilter::default())
+                .await
+                .unwrap();
+            assert!(
+                !logs.entries.is_empty(),
+                "Query log batch should be flushed on graceful shutdown"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

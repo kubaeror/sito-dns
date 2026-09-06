@@ -686,6 +686,9 @@ pub async fn run_server_full(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    info!("Flushing and shutting down query log writer...");
+    querylog_writer.shutdown().await;
+
     info!("Graceful shutdown complete, exiting");
     Ok(())
 }
