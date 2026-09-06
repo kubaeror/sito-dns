@@ -15,7 +15,7 @@
 
 ## 📊 Feature Comparison: sito vs. AdGuard Home vs. Pi-hole
 
-| Feature / Capability | **sito** (v1.2) | **AdGuard Home** | **Pi-hole (FTL)** |
+| Feature / Capability | **sito** (v1.3) | **AdGuard Home** | **Pi-hole (FTL)** |
 |---|---|---|---|
 | **Language & Runtime** | **Rust (edition 2024, zero GC, zero Node.js)** | Go (GC overhead under load) | C (FTL) + PHP Web UI |
 | **Max Cache Throughput** | **≥ 500,000 QPS** (measured 584k) | ~100,000 QPS | ~50,000 QPS |
@@ -34,14 +34,15 @@
 
 ## ⚡ Key Highlights
 
-- **Blazing Fast Hot Path:** Zero garbage collection pauses, multi-socket `SO_REUSEPORT` listeners, concurrent UDP query workers, and concurrent `moka` caching delivering **> 580k QPS** with **0.34 ms p99 latency** on reference hardware ([ADR-008](docs/adr/0008-performance-budget.md)).
-- **Zero-Downtime Hot Reloading:** ArcSwap-backed query pipeline picks up configuration, local rewrites, and client group changes immediately without dropping persistent transport connections or restarting the daemon.
+- **Blazing Fast Hot Path:** Zero garbage collection pauses, multi-socket `SO_REUSEPORT` listeners, concurrent UDP query workers, single-pass candidate filter evaluation, and concurrent `moka` caching delivering **> 580k QPS** with **0.34 ms p99 latency** on reference hardware ([ADR-008](docs/adr/0008-performance-budget.md)).
+- **Zero-Downtime Hot Reloading:** ArcSwap-backed query pipeline and live upstream reloading pick up configuration, upstream resolvers, local rewrites, and client group changes immediately without dropping persistent transport connections or restarting the daemon.
 - **Zero-Node.js Embedded Web Console:** Lightweight, reactive admin panel powered by Axum, Askama compile-time templates, HTMX, and Alpine.js embedded directly into the standalone binary via `rust-embed` (zero npm/Node.js build or runtime dependencies, <1 MB footprint).
 - **AdGuard / ABP Syntax Compatibility:** High-throughput `SuffixTrie` with string interning, Aho-Corasick substring matching, and backtracking-free regex DFAs.
 - **Modern Encryption:** Native support for plain UDP/TCP, DNS-over-TLS (DoT/853), DNS-over-HTTPS (DoH/443, H2), DNS-over-QUIC (DoQ/853), and DNS-over-HTTP/3 (DoH3/443).
-- **Zero-Consensus High Availability:** Real-time master/slave push replication over mTLS WebSockets with Ed25519 cryptographic signatures, certificate pinning, and atomic snapshot updates ([ADR-002](docs/adr/0002-ha-master-slave-push.md)).
-- **Hardened Security & RBAC:** Audited security posture including setup wizard access gating, Argon2id/TOTP bounded auth maps with active background pruners, strict SHA-256 self-updater verification, constant-time authentication via `subtle`, parameterized SQL query builders, SSRF protection, ReDoS protection via dense DFA compilation bounds, and systemd sandbox directives.
-- **Robust Telemetry:** Non-blocking query logging to SQLite in WAL mode with watermark aggregation protection, Prometheus metrics exposition ([ADR-003](docs/adr/0003-log-store-sqlite-wal.md)), and Grafana dashboard.
+- **Zero-Consensus High Availability:** Real-time master/slave push replication over mTLS WebSockets with Ed25519 cryptographic signatures, mandatory certificate pinning, shared token authentication, and instant mutation push.
+- **Hardened Security & RBAC:** Audited security posture including setup wizard credential validation, default-authenticated Prometheus `/metrics` (`metrics_auth = true`), trusted proxy X-Forwarded-For verification, Argon2id/TOTP bounded auth maps with active background pruners, strict SHA-256 self-updater verification, constant-time authentication via `subtle`, parameterized SQL query builders, SSRF protection, ReDoS protection via dense DFA compilation bounds, and systemd sandbox directives.
+- **Robust Telemetry:** Non-blocking query logging to SQLite in WAL mode with real upstream identification and querylog privacy anonymization, Prometheus metrics exposition ([ADR-003](docs/adr/0003-log-store-sqlite-wal.md)), and Grafana dashboard.
+- **Unix & Linux Platform Support:** Engineered for Unix-based operating systems (Linux kernel 5.4+ strongly recommended for production; macOS supported for development) utilizing `SO_REUSEPORT`, `IP_PKTINFO`, and raw POSIX socket file descriptors. Windows is not supported natively.
 
 ---
 
@@ -99,9 +100,10 @@ services:
     ports:
       - "53:53/udp"
       - "53:53/tcp"
-      - "853:853"
-      - "443:443"
-      - "8080:8080"
+      - "853:853/tcp"
+      - "853:853/udp"
+      - "443:443/tcp"
+      - "8080:8080/tcp"
     volumes:
       - ./config:/etc/sito
       - sito-data:/var/lib/sito

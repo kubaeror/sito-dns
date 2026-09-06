@@ -1785,9 +1785,8 @@ mod tests {
         let mut ctx = mock_context(&temp_dir).await;
 
         let login_res = ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1");
-        let session = match login_res {
-            crate::auth::LoginResult::Success(s) => s,
-            _ => panic!("admin login failed"),
+        let crate::auth::LoginResult::Success(session) = login_res else {
+            panic!("admin login failed");
         };
         let mut headers = HeaderMap::new();
         headers.insert(
