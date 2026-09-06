@@ -59,7 +59,7 @@ rustls-pki-types = { version = "1.15", features = ["std"] }
 rcgen = "0.14"
 base64 = "0.23"
 notify = "8.2"
-axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "matched-path", "query", "ws", "form"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "matched-path", "query", "ws", "form", "json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 hex = "0.4"
 hyper = { version = "1.11", features = ["full"] }
