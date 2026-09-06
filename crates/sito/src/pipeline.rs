@@ -247,7 +247,7 @@ impl QueryHandler for DnsPipeline {
         let query_id = query.metadata.id;
         let request_id = rand::random::<u64>();
 
-        let span = tracing::info_span!(
+        let span = tracing::debug_span!(
             "query",
             request_id = request_id,
             client_ip = %client.ip,
@@ -411,7 +411,7 @@ impl QueryHandler for DnsPipeline {
                 && let Ok(cname_target) =
                     Name::from_str(&format!("{}.", target.trim_end_matches('.')))
             {
-                info!(
+                debug!(
                     qname = %qname,
                     target = %target,
                     "Enforcing safe search CNAME rewrite"
@@ -443,7 +443,7 @@ impl QueryHandler for DnsPipeline {
                         return QueryOutcome::anti_doh_blocked(resp, domain_str, qtype);
                     }
 
-                    info!(qname = %qname, qtype = ?qtype, "Cache hit");
+                    debug!(qname = %qname, qtype = ?qtype, "Cache hit");
                     if self.cache.should_prefetch(qname, qtype, qclass).await
                         && let Ok(permit) = Arc::clone(&self.prefetch_semaphore).try_acquire_owned()
                     {
@@ -595,7 +595,7 @@ impl QueryHandler for DnsPipeline {
                         && let Some(mut stale_resp) =
                             self.cache.get_stale(qname, qtype, qclass).await
                     {
-                        info!(
+                        debug!(
                             qname = %qname,
                             "Upstream failed, serving stale cached response (RFC 8767)"
                         );
