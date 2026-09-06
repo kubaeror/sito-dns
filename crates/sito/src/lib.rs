@@ -282,18 +282,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_run_and_graceful_shutdown() {
-        let temp_dir = std::env::temp_dir().join(format!("sito_srv_test_{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
         // Find ephemeral free port
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
 
+        let probe_web = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let web_port = probe_web.local_addr().unwrap().port();
+        drop(probe_web);
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_srv_test_{}_{}_{}",
+            std::process::id(),
+            port,
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
         let mut config = Config::default();
         config.server.data_dir = temp_dir.clone();
         config.dns.bind = vec!["127.0.0.1".parse().unwrap()];
         config.dns.port = port;
+        let mut web_cfg = config.get_web_config();
+        web_cfg.bind = "127.0.0.1".parse().unwrap();
+        web_cfg.port = web_port;
+        config.set_web_config(web_cfg);
         config.upstream.servers = vec!["127.0.0.1:1".to_string()]; // mock unreachable upstream
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -301,10 +314,7 @@ mod tests {
         let server_task =
             tokio::spawn(async move { run_server_with_shutdown(config, Some(shutdown_rx)).await });
 
-        // Give server a brief moment to start
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        // Verify listener responds via UDP
+        // Verify listener responds via UDP with retry loop (allowing server time to finish startup on busy CI runners)
         let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = SocketAddr::new("127.0.0.1".parse().unwrap(), port);
         client_sock.connect(server_addr).await.unwrap();
@@ -315,10 +325,27 @@ mod tests {
             RecordType::A,
         ));
         let wire = sito_proto::encode_message(&query).unwrap();
-        client_sock.send(&wire).await.unwrap();
+
+        let mut received = false;
         let mut resp_buf = [0u8; 512];
-        let _ = tokio::time::timeout(Duration::from_millis(1000), client_sock.recv(&mut resp_buf))
-            .await;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if client_sock.send(&wire).await.is_ok()
+                && let Ok(Ok(len)) = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    client_sock.recv(&mut resp_buf),
+                )
+                .await
+                && len > 0
+            {
+                received = true;
+                break;
+            }
+        }
+        assert!(
+            received,
+            "Server failed to respond to UDP query during startup"
+        );
 
         // Trigger shutdown
         let _ = shutdown_tx.send(());
