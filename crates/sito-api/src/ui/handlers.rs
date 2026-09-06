@@ -1422,7 +1422,7 @@ pub async fn wizard_page(State(ctx): State<ServerContext>, headers: HeaderMap) -
     let auth_user = get_session_user(&ctx, &headers);
     let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
 
-    if !ctx.auth_mgr.is_first_run() && !is_admin {
+    if !ctx.is_setup_pending() && !ctx.auth_mgr.is_first_run() && !is_admin {
         return Redirect::to("/login").into_response();
     }
 
@@ -1449,7 +1449,7 @@ pub async fn wizard_complete_handler(
     headers: HeaderMap,
     Form(form): Form<WizardCompleteForm>,
 ) -> Response {
-    let is_first_run = ctx.auth_mgr.is_first_run();
+    let is_first_run = ctx.is_setup_pending() || ctx.auth_mgr.is_first_run();
     let auth_user = get_session_user(&ctx, &headers);
     let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
 
@@ -1542,6 +1542,11 @@ pub async fn wizard_complete_handler(
     );
     let _ = ctx.upstream.reload(&new_cfg.upstream, &bootstrap).await;
     crate::publish_bundle(&ctx);
+
+    ctx.set_setup_pending(false);
+    if let Some(ref starter) = ctx.dns_starter {
+        let _ = starter.send(());
+    }
 
     Redirect::to("/login").into_response()
 }

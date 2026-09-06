@@ -60,6 +60,43 @@ pub async fn slave_read_only_middleware(
     next.run(request).await
 }
 
+/// Middleware that enforces setup-pending route restrictions during bootstrap mode.
+/// When `setup_pending == true`:
+/// - Allows: `/wizard`, `/ui/wizard/*`, `/static/*`, `/assets/*`, `/ui/upstreams/test`, `/health`, `/status`.
+/// - Returns 503 Service Unavailable with body "Setup not completed" for `/api/v1/*`.
+/// - Redirects all other UI routes (including `/login`, `/`, `/dashboard`) to `/wizard` with HTTP 302 Found.
+pub async fn setup_pending_middleware(
+    axum::extract::State(ctx): axum::extract::State<ServerContext>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if ctx.is_setup_pending() {
+        let path = request.uri().path();
+        if path.starts_with("/wizard")
+            || path.starts_with("/ui/wizard")
+            || path.starts_with("/static/")
+            || path.starts_with("/assets/")
+            || path == "/ui/upstreams/test"
+            || path == "/health"
+            || path == "/status"
+        {
+            return next.run(request).await;
+        }
+
+        if path.starts_with("/api/v1/") || path == "/api/v1" {
+            return (StatusCode::SERVICE_UNAVAILABLE, "Setup not completed").into_response();
+        }
+
+        return (
+            StatusCode::FOUND,
+            [(axum::http::header::LOCATION, "/wizard")],
+        )
+            .into_response();
+    }
+
+    next.run(request).await
+}
+
 async fn not_found_handler() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
@@ -185,6 +222,10 @@ pub fn create_router(ctx: ServerContext) -> Router {
         .merge(SwaggerUi::new("/api/docs").url("/api/docs/openapi.json", ApiDoc::openapi()))
         .merge(crate::ui::ui_router())
         .fallback(not_found_handler)
+        .layer(axum::middleware::from_fn_with_state(
+            ctx.clone(),
+            setup_pending_middleware,
+        ))
         .with_state(ctx);
 
     #[cfg(not(feature = "embed-ui"))]
@@ -193,6 +234,10 @@ pub fn create_router(ctx: ServerContext) -> Router {
         .route("/metrics", get(metrics::get_metrics))
         .merge(SwaggerUi::new("/api/docs").url("/api/docs/openapi.json", ApiDoc::openapi()))
         .fallback(not_found_handler)
+        .layer(axum::middleware::from_fn_with_state(
+            ctx.clone(),
+            setup_pending_middleware,
+        ))
         .with_state(ctx);
 
     app
