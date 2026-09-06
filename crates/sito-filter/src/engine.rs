@@ -126,24 +126,17 @@ impl FilterSnapshot {
         }
     }
 
-    /// Evaluates a domain against only `$important` rules (Stages 1 and 2).
-    /// Returns `Some(verdict)` if an `$important` rule matched, or `None` if no `$important` rule applied.
-    pub fn evaluate_important(
+    /// Evaluates a domain against only `$important` rules using pre-collected candidates (Stages 1 and 2).
+    pub fn evaluate_important_candidates(
         &self,
         domain: &str,
         qtype: RecordType,
         client: &ClientContext,
+        allow_candidates: &[u32],
+        block_candidates: &[u32],
     ) -> Option<Verdict> {
-        let mut allow_candidates = Vec::new();
-        self.allowlist
-            .collect_candidates(domain, &self.interner, &mut allow_candidates);
-
-        let mut block_candidates = Vec::new();
-        self.blocklist
-            .collect_candidates(domain, &self.interner, &mut block_candidates);
-
         // Stage 1: Important Allowlist (@@...$important)
-        for &rule_id in &allow_candidates {
+        for &rule_id in allow_candidates {
             let rule = &self.rules[rule_id as usize];
             if !rule.modifiers.important {
                 continue;
@@ -163,7 +156,7 @@ impl FilterSnapshot {
         }
 
         // Stage 2: Important Blocklist (...$important)
-        for &rule_id in &block_candidates {
+        for &rule_id in block_candidates {
             let rule = &self.rules[rule_id as usize];
             if !rule.modifiers.important {
                 continue;
@@ -195,23 +188,17 @@ impl FilterSnapshot {
         None
     }
 
-    /// Evaluates a domain against standard filter rules (Stages 3 and 4).
-    pub fn evaluate_standard(
+    /// Evaluates a domain against standard filter rules using pre-collected candidates (Stages 3 and 4).
+    pub fn evaluate_standard_candidates(
         &self,
         domain: &str,
         qtype: RecordType,
         client: &ClientContext,
+        allow_candidates: &[u32],
+        block_candidates: &[u32],
     ) -> Verdict {
-        let mut allow_candidates = Vec::new();
-        self.allowlist
-            .collect_candidates(domain, &self.interner, &mut allow_candidates);
-
-        let mut block_candidates = Vec::new();
-        self.blocklist
-            .collect_candidates(domain, &self.interner, &mut block_candidates);
-
         // Stage 3: Standard Allowlist (@@...)
-        for &rule_id in &allow_candidates {
+        for &rule_id in allow_candidates {
             let rule = &self.rules[rule_id as usize];
             if rule.modifiers.important {
                 continue;
@@ -231,7 +218,7 @@ impl FilterSnapshot {
         }
 
         // Stage 4: Standard Blocklist (...)
-        for &rule_id in &block_candidates {
+        for &rule_id in block_candidates {
             let rule = &self.rules[rule_id as usize];
             if rule.modifiers.important {
                 continue;
@@ -263,12 +250,83 @@ impl FilterSnapshot {
         Verdict::Allow(None)
     }
 
+    /// Evaluates a domain against only `$important` rules (Stages 1 and 2).
+    /// Returns `Some(verdict)` if an `$important` rule matched, or `None` if no `$important` rule applied.
+    pub fn evaluate_important(
+        &self,
+        domain: &str,
+        qtype: RecordType,
+        client: &ClientContext,
+    ) -> Option<Verdict> {
+        let mut allow_candidates = Vec::new();
+        self.allowlist
+            .collect_candidates(domain, &self.interner, &mut allow_candidates);
+
+        let mut block_candidates = Vec::new();
+        self.blocklist
+            .collect_candidates(domain, &self.interner, &mut block_candidates);
+
+        self.evaluate_important_candidates(
+            domain,
+            qtype,
+            client,
+            &allow_candidates,
+            &block_candidates,
+        )
+    }
+
+    /// Evaluates a domain against standard filter rules (Stages 3 and 4).
+    pub fn evaluate_standard(
+        &self,
+        domain: &str,
+        qtype: RecordType,
+        client: &ClientContext,
+    ) -> Verdict {
+        let mut allow_candidates = Vec::new();
+        self.allowlist
+            .collect_candidates(domain, &self.interner, &mut allow_candidates);
+
+        let mut block_candidates = Vec::new();
+        self.blocklist
+            .collect_candidates(domain, &self.interner, &mut block_candidates);
+
+        self.evaluate_standard_candidates(
+            domain,
+            qtype,
+            client,
+            &allow_candidates,
+            &block_candidates,
+        )
+    }
+
     /// Evaluates a domain against the compiled snapshot following section 4.3 precedence.
+    /// Collects rule candidates once and passes them through both passes on the hot path.
     pub fn evaluate(&self, domain: &str, qtype: RecordType, client: &ClientContext) -> Verdict {
-        if let Some(verdict) = self.evaluate_important(domain, qtype, client) {
+        let mut allow_candidates = Vec::new();
+        self.allowlist
+            .collect_candidates(domain, &self.interner, &mut allow_candidates);
+
+        let mut block_candidates = Vec::new();
+        self.blocklist
+            .collect_candidates(domain, &self.interner, &mut block_candidates);
+
+        if let Some(verdict) = self.evaluate_important_candidates(
+            domain,
+            qtype,
+            client,
+            &allow_candidates,
+            &block_candidates,
+        ) {
             return verdict;
         }
-        self.evaluate_standard(domain, qtype, client)
+
+        self.evaluate_standard_candidates(
+            domain,
+            qtype,
+            client,
+            &allow_candidates,
+            &block_candidates,
+        )
     }
 }
 
