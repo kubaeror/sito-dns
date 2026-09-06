@@ -257,7 +257,7 @@ pub async fn run_server_full(
         &config.server.data_dir,
         auth_cfg.session_ttl_hours,
         auth_cfg.login_rate_limit,
-    ));
+    )?);
     auth_mgr.spawn_pruner(shutdown_rx.clone());
 
     let server_ctx = sito_api::ServerContext {

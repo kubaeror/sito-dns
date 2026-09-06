@@ -83,6 +83,14 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
+            Commands::ResetAdmin { config, password } => {
+                let config_path = config.unwrap_or(cli.config);
+                if let Err(e) = sito::cli::run_reset_admin(&config_path, password.as_deref()) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
         }
     }
 

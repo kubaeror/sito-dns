@@ -624,7 +624,7 @@ mod tests {
         assert_eq!(u1.1, 1);
 
         let u2 = upstreams.get("8.8.8.8:53").unwrap();
-        assert_eq!(u2.0, 0.0);
+        assert!(u2.0.abs() < 1e-6);
         assert_eq!(u2.1, 1);
     }
 }

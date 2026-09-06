@@ -55,6 +55,29 @@ struct PendingTotp {
     created_at: Instant,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum AuthStorageError {
+    #[error(
+        "Corrupt users file '{path}': {source}. Corrupt file backed up to '{backup_path}'. Refusing to start to prevent unauthorized bootstrap; use `sito reset-admin` to recover."
+    )]
+    CorruptUsersFile {
+        path: PathBuf,
+        backup_path: PathBuf,
+        #[source]
+        source: Box<toml::de::Error>,
+    },
+    #[error(
+        "Users file '{path}' exists but contains no user accounts. Refusing to start to prevent unauthorized bootstrap; use `sito reset-admin` to recover."
+    )]
+    EmptyUsersFile { path: PathBuf },
+    #[error("I/O error accessing users file '{path}': {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct UsersFile {
     #[serde(default)]
@@ -85,17 +108,19 @@ impl Default for AuthManager {
 impl AuthManager {
     pub fn new() -> Self {
         Self::with_config_and_storage(None, 24, 5)
+            .expect("in-memory auth initialization cannot fail")
     }
 
     pub fn with_config(session_ttl_hours: u64, login_rate_limit: usize) -> Self {
         Self::with_config_and_storage(None, session_ttl_hours, login_rate_limit)
+            .expect("in-memory auth initialization cannot fail")
     }
 
     pub fn with_storage(
         data_dir: impl AsRef<Path>,
         session_ttl_hours: u64,
         login_rate_limit: usize,
-    ) -> Self {
+    ) -> Result<Self, AuthStorageError> {
         Self::with_config_and_storage(
             Some(data_dir.as_ref().join("users.toml")),
             session_ttl_hours,
@@ -107,7 +132,7 @@ impl AuthManager {
         users_path: Option<PathBuf>,
         session_ttl_hours: u64,
         login_rate_limit: usize,
-    ) -> Self {
+    ) -> Result<Self, AuthStorageError> {
         let secs = session_ttl_hours.saturating_mul(3600);
         let session_ttl_secs = i64::try_from(secs).unwrap_or(DEFAULT_SESSION_TTL_SECS);
 
@@ -125,11 +150,66 @@ impl AuthManager {
         };
 
         if let Some(ref path) = mgr.users_path {
-            if path.exists()
-                && let Ok(content) = std::fs::read_to_string(path)
-                && let Ok(file) = toml::from_str::<UsersFile>(&content)
-                && !file.users.is_empty()
-            {
+            if path.exists() {
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(path = %path.display(), error = %e, "Failed to read users file");
+                        return Err(AuthStorageError::Io {
+                            path: path.clone(),
+                            source: e,
+                        });
+                    }
+                };
+
+                let file: UsersFile = match toml::from_str(&content) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let timestamp = chrono::Utc::now().timestamp();
+                        let backup_name = format!(
+                            "{}.corrupt.{}.bak",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            timestamp
+                        );
+                        let backup_path = path.with_file_name(backup_name);
+                        if let Err(copy_err) = std::fs::copy(path, &backup_path) {
+                            tracing::error!(
+                                source = %path.display(),
+                                dest = %backup_path.display(),
+                                error = %copy_err,
+                                "Failed to back up corrupt users file"
+                            );
+                        } else {
+                            tracing::warn!(
+                                source = %path.display(),
+                                backup = %backup_path.display(),
+                                "Backed up corrupt users file"
+                            );
+                        }
+
+                        tracing::error!(
+                            path = %path.display(),
+                            backup = %backup_path.display(),
+                            error = %e,
+                            "Corrupt users file detected; refusing to start"
+                        );
+
+                        return Err(AuthStorageError::CorruptUsersFile {
+                            path: path.clone(),
+                            backup_path,
+                            source: Box::new(e),
+                        });
+                    }
+                };
+
+                if file.users.is_empty() {
+                    tracing::error!(
+                        path = %path.display(),
+                        "Users file exists but contains no accounts; refusing to start"
+                    );
+                    return Err(AuthStorageError::EmptyUsersFile { path: path.clone() });
+                }
+
                 let (has_admin, admin_password_changed) = {
                     let mut map = mgr.users.lock().unwrap();
                     for u in file.users {
@@ -144,9 +224,10 @@ impl AuthManager {
                 if !has_admin || admin_password_changed {
                     mgr.setup_complete.store(true, Ordering::SeqCst);
                 }
-                return mgr;
+                return Ok(mgr);
             }
-            // If file does not exist or empty, initialize bootstrap admin and persist
+
+            // If file does not exist, initialize bootstrap admin and persist
             mgr.create_user_internal("admin", "adminadmin", Role::Admin);
             mgr.save_users();
         } else {
@@ -154,7 +235,41 @@ impl AuthManager {
             mgr.create_user_internal("admin", "adminadmin", Role::Admin);
         }
 
-        mgr
+        Ok(mgr)
+    }
+
+    /// Resets the administrative account credentials and persists to users.toml.
+    /// If an existing users.toml exists, it will be backed up before being overwritten.
+    pub fn reset_admin_credentials(
+        data_dir: impl AsRef<Path>,
+        new_password: &str,
+    ) -> std::io::Result<PathBuf> {
+        let path = data_dir.as_ref().join("users.toml");
+        if path.exists() {
+            let timestamp = chrono::Utc::now().timestamp();
+            let backup_name = format!(
+                "{}.reset.{}.bak",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                timestamp
+            );
+            let backup_path = path.with_file_name(backup_name);
+            let _ = std::fs::copy(&path, &backup_path);
+        }
+        let mgr = Self {
+            users: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            tokens: Arc::new(Mutex::new(HashMap::new())),
+            pending_totp_setups: Arc::new(Mutex::new(HashMap::new())),
+            partial_tokens: Arc::new(Mutex::new(HashMap::new())),
+            lockout: LockoutTracker::new(),
+            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
+            login_rate_limit: 5,
+            setup_complete: Arc::new(AtomicBool::new(false)),
+            users_path: Some(path.clone()),
+        };
+        mgr.create_user_internal("admin", new_password, Role::Admin);
+        mgr.save_users();
+        Ok(path)
     }
 
     fn save_users(&self) {
@@ -704,7 +819,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&temp_dir);
 
         {
-            let mgr = AuthManager::with_storage(&temp_dir, 24, 5);
+            let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
             assert!(mgr.is_first_run());
 
             // Change admin password
@@ -721,7 +836,7 @@ mod tests {
 
         // Simulate server restart by creating a new AuthManager pointing to same directory
         {
-            let mgr = AuthManager::with_storage(&temp_dir, 24, 5);
+            let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
             assert!(!mgr.is_first_run());
 
             // Old default credentials must FAIL
@@ -754,6 +869,89 @@ mod tests {
                 let perms = std::fs::metadata(&users_file).unwrap().permissions();
                 assert_eq!(perms.mode() & 0o777, 0o600);
             }
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_corrupt_users_file_creates_backup_and_refuses_to_start() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_auth_corrupt_test_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let users_file = temp_dir.join("users.toml");
+        let corrupt_content = "[[users]]\nusername = 'admin'\npassword_hash = invalid_syntax\n";
+        std::fs::write(&users_file, corrupt_content).unwrap();
+
+        let res = AuthManager::with_storage(&temp_dir, 24, 5);
+        match res {
+            Err(AuthStorageError::CorruptUsersFile {
+                path,
+                backup_path,
+                source: _,
+            }) => {
+                assert_eq!(path, users_file);
+                assert!(backup_path.exists());
+                let backup_content = std::fs::read_to_string(&backup_path).unwrap();
+                assert_eq!(backup_content, corrupt_content);
+            }
+            Ok(_) => panic!("Expected Err(CorruptUsersFile), got Ok"),
+            Err(other) => panic!("Expected CorruptUsersFile, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_empty_users_file_refuses_to_start() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_auth_empty_test_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let users_file = temp_dir.join("users.toml");
+        std::fs::write(&users_file, "users = []\n").unwrap();
+
+        let res = AuthManager::with_storage(&temp_dir, 24, 5);
+        match res {
+            Err(AuthStorageError::EmptyUsersFile { path }) => {
+                assert_eq!(path, users_file);
+            }
+            Ok(_) => panic!("Expected Err(EmptyUsersFile), got Ok"),
+            Err(other) => panic!("Expected EmptyUsersFile, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_reset_admin_credentials() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_auth_reset_test_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // First bootstrap
+        {
+            let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+            mgr.update_user_password("admin", "firstpassword");
+        }
+
+        // Corrupt the users file
+        let users_file = temp_dir.join("users.toml");
+        std::fs::write(&users_file, "corrupt garbage").unwrap();
+        assert!(AuthManager::with_storage(&temp_dir, 24, 5).is_err());
+
+        // Perform admin credentials reset
+        let reset_path =
+            AuthManager::reset_admin_credentials(&temp_dir, "newpassword_reset").unwrap();
+        assert_eq!(reset_path, users_file);
+
+        // Now loading with_storage must succeed
+        let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        match mgr.login("admin", "newpassword_reset", "127.0.0.1") {
+            LoginResult::Success(session) => {
+                assert_eq!(session.username, "admin");
+                assert_eq!(session.role, Role::Admin);
+            }
+            other => panic!("Expected login success after reset, got {other:?}"),
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);

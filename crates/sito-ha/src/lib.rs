@@ -165,13 +165,13 @@ mod tests {
         let mut stats_received = false;
         for _ in 0..30 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if let Some(stats) = &coordinator.list_slaves()[0].last_stats {
-                if stats.queries >= 1 {
-                    assert!(stats.blocked >= 1);
-                    assert_eq!(stats.upstreams_count, 1);
-                    stats_received = true;
-                    break;
-                }
+            if let Some(stats) = &coordinator.list_slaves()[0].last_stats
+                && stats.queries >= 1
+            {
+                assert!(stats.blocked >= 1);
+                assert_eq!(stats.upstreams_count, 1);
+                stats_received = true;
+                break;
             }
         }
         assert!(
