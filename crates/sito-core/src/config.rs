@@ -566,6 +566,15 @@ impl CacheConfig {
                 ),
             ));
         }
+        if self.min_ttl > self.negative_ttl_max {
+            return Err(ConfigError::validation(
+                "dns.cache.negative_ttl_max",
+                format!(
+                    "negative_ttl_max ({}) cannot be less than min_ttl ({})",
+                    self.negative_ttl_max, self.min_ttl
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -1229,5 +1238,19 @@ key = "/path/to/key.pem"
             cfg.get_tls_config().unwrap().cert.as_deref(),
             Some(std::path::Path::new("/path/to/cert.pem"))
         );
+    }
+
+    #[test]
+    fn test_cache_config_negative_ttl_validation() {
+        let mut cfg = CacheConfig::default();
+        cfg.min_ttl = 300;
+        cfg.negative_ttl_max = 60; // min_ttl > negative_ttl_max should fail validation
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigError::Validation { field, .. } => {
+                assert_eq!(field, "dns.cache.negative_ttl_max");
+            }
+            other => panic!("expected dns.cache.negative_ttl_max error, got {other:?}"),
+        }
     }
 }
