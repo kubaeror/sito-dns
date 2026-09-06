@@ -219,6 +219,11 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
 ReadWritePaths=/var/lib/sito /etc/sito
 LimitNOFILE=1048576
 Restart=on-failure
@@ -239,6 +244,7 @@ echo "=================================================="
 echo " sito v${SITO_VERSION} installed successfully!"
 echo " Web Dashboard: http://localhost:8080"
 echo " Initial credentials: admin / adminadmin"
+echo " [WARNING] Change default password immediately!"
 echo " Configuration: ${CONFIG_FILE}"
 echo " Service Status: systemctl status sito"
 echo "=================================================="
