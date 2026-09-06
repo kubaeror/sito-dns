@@ -173,6 +173,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_udp_concurrent_queries_no_head_of_line_blocking() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let std_socket = create_reuseport_udp_socket(&bind_addr).unwrap();
+        let port = std_socket.local_addr().unwrap().port();
+        drop(std_socket);
+
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        // Single worker listener to guarantee tests run on the same worker
+        let config = UdpConfig {
+            bind_addr: actual_addr,
+            worker_count: 1,
+            edns_udp_size: 1232,
+            rate_limit_per_ip: 100,
+        };
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let qname = query.queries[0].name().clone();
+            let is_slow = qname.to_string().starts_with("slow");
+
+            if is_slow {
+                // Simulate slow upstream resolution (e.g. 200ms)
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::NoError;
+            resp.answers.push(Record::from_rdata(
+                qname,
+                300,
+                RData::A(A(std::net::Ipv4Addr::new(1, 2, 3, 4))),
+            ));
+            Some(resp)
+        });
+
+        let _handles = start_udp_listener(config, &handler, &shutdown_rx).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // 1. Send slow query
+        let mut slow_query = Message::new(100, MessageType::Query, OpCode::Query);
+        slow_query.queries.push(Query::query(
+            Name::from_str("slow.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let slow_encoded = encode_message(&slow_query).unwrap();
+        client.send_to(&slow_encoded, actual_addr).await.unwrap();
+
+        // 2. Immediately send fast query
+        let mut fast_query = Message::new(200, MessageType::Query, OpCode::Query);
+        fast_query.queries.push(Query::query(
+            Name::from_str("fast.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let fast_encoded = encode_message(&fast_query).unwrap();
+        client.send_to(&fast_encoded, actual_addr).await.unwrap();
+
+        // 3. First packet received must be the fast response (id 200) despite being sent second!
+        let mut buf = [0u8; 1024];
+        let (len1, _) =
+            tokio::time::timeout(Duration::from_millis(150), client.recv_from(&mut buf))
+                .await
+                .expect("fast response should arrive before slow query completes")
+                .unwrap();
+        let resp1 = decode_message(&buf[..len1]).unwrap();
+        assert_eq!(
+            resp1.metadata.id, 200,
+            "Fast query must not be blocked by slow query"
+        );
+
+        // 4. Second packet received should be the slow response (id 100)
+        let (len2, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("slow response should arrive eventually")
+            .unwrap();
+        let resp2 = decode_message(&buf[..len2]).unwrap();
+        assert_eq!(resp2.metadata.id, 100);
+
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
     async fn test_tcp_query_and_pipelining() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
