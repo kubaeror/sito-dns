@@ -532,7 +532,10 @@ pub async fn filtering_toggle_handler(
     let mut new_cfg = (**ctx.config.load()).clone();
     if let Some(item) = new_cfg.filtering.lists.get_mut(id) {
         item.enabled = !item.enabled;
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         ctx.config.store(Arc::new(new_cfg.clone()));
         let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
         crate::publish_bundle(&ctx);
@@ -567,7 +570,10 @@ pub async fn filtering_add_handler(
         enabled: true,
         refresh_hours: form.refresh_hours.map(u64::from),
     });
-    let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to persist configuration to disk: {e:?}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     ctx.config.store(Arc::new(new_cfg.clone()));
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     crate::publish_bundle(&ctx);
@@ -590,7 +596,10 @@ pub async fn filtering_delete_handler(
     let mut new_cfg = (**ctx.config.load()).clone();
     if id < new_cfg.filtering.lists.len() {
         new_cfg.filtering.lists.remove(id);
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         ctx.config.store(Arc::new(new_cfg.clone()));
         let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
         crate::publish_bundle(&ctx);
@@ -624,7 +633,10 @@ pub async fn filtering_custom_rules_handler(
         .map(String::from)
         .collect();
 
-    let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to persist configuration to disk: {e:?}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     ctx.config.store(Arc::new(new_cfg.clone()));
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     crate::publish_bundle(&ctx);
@@ -779,7 +791,10 @@ pub async fn rewrites_add_handler(
     let mut new_cfg = (**ctx.config.load()).clone();
     if let Ok(val) = toml::Value::try_from(&rewrites_cfg) {
         new_cfg.rewrites = Some(val);
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         ctx.config.store(Arc::new(new_cfg));
         let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg);
         ctx.rewrites.store(Arc::new(new_table));
@@ -829,7 +844,10 @@ pub async fn rewrites_delete_handler(
     let mut new_cfg = (**ctx.config.load()).clone();
     if let Ok(val) = toml::Value::try_from(&rewrites_cfg) {
         new_cfg.rewrites = Some(val);
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         ctx.config.store(Arc::new(new_cfg));
         let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg);
         ctx.rewrites.store(Arc::new(new_table));
@@ -925,7 +943,10 @@ pub async fn clients_add_handler(
     let mut new_cfg = (**ctx.config.load()).clone();
     if let Ok(val) = toml::Value::try_from(&clients_cfg) {
         new_cfg.clients = Some(val);
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         ctx.config.store(Arc::new(new_cfg));
         let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
         ctx.clients.store(Arc::new(new_reg));
@@ -958,7 +979,10 @@ pub async fn clients_delete_handler(
     let mut new_cfg = (**ctx.config.load()).clone();
     if let Ok(val) = toml::Value::try_from(&clients_cfg) {
         new_cfg.clients = Some(val);
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         ctx.config.store(Arc::new(new_cfg));
         let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
         ctx.clients.store(Arc::new(new_reg));
@@ -1019,7 +1043,10 @@ pub async fn upstreams_add_handler(
     }
     if !clean.is_empty() && !new_cfg.upstream.servers.contains(&clean) {
         new_cfg.upstream.servers.push(clean);
-        let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+            tracing::error!("Failed to persist configuration to disk: {e:?}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         ctx.config.store(Arc::new(new_cfg));
         crate::publish_bundle(&ctx);
     }
@@ -1208,7 +1235,10 @@ pub async fn settings_save_handler(
     new_cfg.dns.dnssec.validate = form.dnssec.is_some();
     new_cfg.dns.rate_limit_per_ip = form.rate_limit;
 
-    let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to persist configuration to disk: {e:?}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     ctx.config.store(Arc::new(new_cfg));
     crate::publish_bundle(&ctx);
 
@@ -1731,6 +1761,74 @@ mod tests {
             .auth_mgr
             .login("superadmin", "SuperSecretPassword123!", "127.0.0.1");
         assert!(matches!(login_res, crate::auth::LoginResult::Success(_)));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ui_handlers_persist_failure_returns_500_and_preserves_in_memory_state() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_persist_err_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let mut ctx = mock_context(&temp_dir).await;
+
+        let login_res = ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1");
+        let session = match login_res {
+            crate::auth::LoginResult::Success(s) => s,
+            _ => panic!("admin login failed"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            format!("sito_session={}", session.id).parse().unwrap(),
+        );
+
+        // Break config_path to point to a non-writable/non-existent directory to simulate disk write failure
+        ctx.config_path = std::path::PathBuf::from("/proc/forbidden_ui_test/config.toml");
+
+        let orig_cache_size = ctx.config.load().dns.cache.size_mb;
+        let settings_resp = settings_save_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(SaveSettingsForm {
+                cache_size_mb: 9999,
+                min_ttl: 100,
+                dnssec: None,
+                rate_limit: 50,
+            }),
+        )
+        .await;
+        assert_eq!(settings_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Verify in-memory config was NOT mutated
+        assert_eq!(ctx.config.load().dns.cache.size_mb, orig_cache_size);
+
+        let filter_resp = filtering_add_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(AddFilterListForm {
+                name: "blocked-list".to_string(),
+                url: "http://example.com/hosts".to_string(),
+                refresh_hours: None,
+            }),
+        )
+        .await;
+        assert_eq!(filter_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Verify in-memory filter lists was NOT mutated
+        assert!(ctx.config.load().filtering.lists.is_empty());
+
+        let rewrite_resp = rewrites_add_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(AddRewriteForm {
+                domain: "bad.internal".to_string(),
+                record_type: "A".to_string(),
+                answer: "1.2.3.4".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(rewrite_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Verify in-memory rewrites table was NOT mutated
+        assert!(load_rewrites_config(&ctx).entries.is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
