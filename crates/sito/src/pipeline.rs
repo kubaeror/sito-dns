@@ -153,6 +153,7 @@ impl QueryHandler for DnsPipeline {
                     false,
                     String::new(),
                     RecordType::A,
+                    None,
                 );
             };
 
@@ -193,6 +194,7 @@ impl QueryHandler for DnsPipeline {
                     false,
                     domain_str,
                     qtype,
+                    None,
                 );
             }
 
@@ -221,6 +223,7 @@ impl QueryHandler for DnsPipeline {
                             false,
                             domain_str,
                             qtype,
+                            None,
                         );
                     }
 
@@ -243,6 +246,7 @@ impl QueryHandler for DnsPipeline {
                     false,
                     domain_str,
                     qtype,
+                    None,
                 );
             }
 
@@ -275,6 +279,7 @@ impl QueryHandler for DnsPipeline {
                         false,
                         domain_str,
                         qtype,
+                        None,
                     );
                 }
 
@@ -308,6 +313,7 @@ impl QueryHandler for DnsPipeline {
                         false,
                         domain_str,
                         qtype,
+                        None,
                     );
                 }
 
@@ -335,6 +341,7 @@ impl QueryHandler for DnsPipeline {
                         false,
                         domain_str,
                         qtype,
+                        None,
                     );
                 }
             }
@@ -359,6 +366,7 @@ impl QueryHandler for DnsPipeline {
                             false,
                             domain_str,
                             qtype,
+                            None,
                         );
                     }
 
@@ -391,6 +399,7 @@ impl QueryHandler for DnsPipeline {
                                 false,
                                 domain_str,
                                 qtype,
+                                None,
                             );
                         }
                     }
@@ -409,6 +418,13 @@ impl QueryHandler for DnsPipeline {
                         });
                     }
                     cached_resp.metadata.id = query_id;
+                    let cached_dnssec = if self.dnssec.mode == sito_dnssec::DnssecMode::Disabled
+                        || !cached_resp.metadata.authentic_data
+                    {
+                        None
+                    } else {
+                        Some("secure".to_string())
+                    };
                     return (
                         Some(cached_resp),
                         "allowed",
@@ -418,6 +434,7 @@ impl QueryHandler for DnsPipeline {
                         true,
                         domain_str,
                         qtype,
+                        cached_dnssec,
                     );
                 }
                 debug!(qname = %qname, qtype = ?qtype, "Cache miss");
@@ -461,6 +478,7 @@ impl QueryHandler for DnsPipeline {
                                 false,
                                 domain_str,
                                 qtype,
+                                None,
                             );
                         }
                     }
@@ -497,6 +515,7 @@ impl QueryHandler for DnsPipeline {
                                         false,
                                         domain_str,
                                         qtype,
+                                        None,
                                     );
                                 }
                             }
@@ -508,7 +527,12 @@ impl QueryHandler for DnsPipeline {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as u32;
-                    let _outcome = self.dnssec.validate_response(&mut upstream_resp, None, now);
+                    let dnssec_outcome = self.dnssec.validate_response(&mut upstream_resp, None, now);
+                    let dnssec_str = if self.dnssec.mode == sito_dnssec::DnssecMode::Disabled {
+                        None
+                    } else {
+                        Some(dnssec_outcome.as_str().to_string())
+                    };
 
                     if config.dns.cache.enabled
                         && upstream_resp.metadata.response_code == ResponseCode::NoError
@@ -524,6 +548,7 @@ impl QueryHandler for DnsPipeline {
                         false,
                         domain_str,
                         qtype,
+                        dnssec_str,
                     )
                 }
                 Err(e) => {
@@ -553,6 +578,7 @@ impl QueryHandler for DnsPipeline {
                             true,
                             domain_str,
                             qtype,
+                            None,
                         );
                     }
 
@@ -570,6 +596,7 @@ impl QueryHandler for DnsPipeline {
                         false,
                         domain_str,
                         qtype,
+                        None,
                     )
                 }
             }
@@ -577,8 +604,17 @@ impl QueryHandler for DnsPipeline {
         .instrument(span)
         .await;
 
-        let (resp, verdict_str, rule_opt, source_opt, upstream_opt, from_cache, domain_str, qtype) =
-            outcome;
+        let (
+            resp,
+            verdict_str,
+            rule_opt,
+            source_opt,
+            upstream_opt,
+            from_cache,
+            domain_str,
+            qtype,
+            dnssec_opt,
+        ) = outcome;
 
         let elapsed = start.elapsed();
         let elapsed_us = elapsed.as_micros() as i64;
@@ -613,7 +649,7 @@ impl QueryHandler for DnsPipeline {
                 list_source: source_opt,
                 upstream: upstream_opt,
                 elapsed_us: Some(elapsed_us),
-                dnssec: None,
+                dnssec: dnssec_opt,
                 proto: client.proto.clone(),
             };
             let _ = ql.try_send(entry);

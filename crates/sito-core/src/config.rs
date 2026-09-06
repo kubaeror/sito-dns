@@ -615,7 +615,15 @@ impl Default for DnssecConfig {
 
 impl DnssecConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        Ok(())
+        match self.mode.to_ascii_lowercase().as_str() {
+            "validate" | "strict" | "log_only" | "log-only" | "permissive" | "off" | "disabled" => {
+                Ok(())
+            }
+            _ => Err(ConfigError::validation(
+                "dns.dnssec.mode",
+                format!("unrecognized DNSSEC mode: '{}'", self.mode),
+            )),
+        }
     }
 
     /// Check if a domain matches any configured Negative Trust Anchor (NTA/NTP).
