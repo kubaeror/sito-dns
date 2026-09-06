@@ -1,6 +1,9 @@
+#![allow(clippy::all, clippy::pedantic)]
+
 //! Low-level socket options for IP_PKTINFO and IPV6_RECVPKTINFO on multi-homed systems.
 
-#![allow(clippy::all, clippy::pedantic)]
+#[cfg(not(unix))]
+compile_error!("sito-transport pktinfo requires a Unix-based operating system (Linux/macOS)");
 
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::RawFd;

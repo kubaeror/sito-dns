@@ -3,6 +3,9 @@
 //! Multi-protocol DNS transport listeners (UDP, TCP) with SO_REUSEPORT,
 //! IP_PKTINFO, EDNS(0), RFC 7766 pipelining, and per-IP rate limiting.
 
+#[cfg(not(unix))]
+compile_error!("sito-transport requires a Unix-based operating system (Linux/macOS)");
+
 pub mod acme;
 pub mod doh;
 pub mod doh3;
