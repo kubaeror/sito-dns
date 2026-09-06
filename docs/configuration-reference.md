@@ -4,6 +4,9 @@ This document is the exhaustive configuration reference for **sito v1.0.0**.
 
 `sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment variables can override any setting using the `DNSD__<SECTION>__<KEY>` naming convention (double underscores between hierarchy levels).
 
+> [!NOTE]
+> Configuration persistence round-trips modeled fields via the `Config` schema. Unrecognized or unmodeled keys and comments are omitted when the configuration is saved back to disk by the web console or API.
+
 ---
 
 ## 1. Top-Level Options
@@ -147,7 +150,6 @@ staging = false
 [upstream]
 servers = [
     "tls://dns.quad9.net",
-    "https://cloudflare-dns.com/dns-query",
     "udp://1.1.1.1:53"
 ]
 bootstrap = ["9.9.9.9", "1.1.1.1"]
@@ -163,7 +165,7 @@ servers = ["udp://192.168.1.1:53"]
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `servers` | array of strings | `["tls://..."]` | Upstream resolvers. Schemes: `udp://`, `tcp://`, `tls://` (DoT), `https://` (DoH), `quic://` (DoQ). |
+| `servers` | array of strings | `["tls://..."]` | Upstream resolvers. Schemes: `udp://` or `host:port` (UDP with TCP fallback), `tls://` (DoT). |
 | `bootstrap` | array of IPs | `["9.9.9.9"]` | Plain IP addresses used to bootstrap resolution of encrypted upstream domain names. |
 | `strategy` | string | `"failover"` | Forwarding strategy: `"parallel"` (fastest answer wins), `"failover"` (sequential fallback), or `"load_balance"`. |
 | `timeout_ms` | integer | `5000` | Request timeout per upstream query in milliseconds. |
@@ -192,7 +194,6 @@ custom_rules = [
 name = "OISD Big"
 url = "https://big.oisd.nl"
 enabled = true
-refresh_hours = 24
 ```
 
 | Key | Type | Default | Description |
@@ -204,7 +205,7 @@ refresh_hours = 24
 | `cname_cloaking` | boolean | `true` | Follow CNAME chains upstream and apply filter rules against intermediate canonical names. |
 | `anti_doh_bypass` | string | `"off"` | Block known public DoH/DoT resolvers to enforce network-wide filtering: `"off"`, `"block_all"`, or `"block_except_trusted"`. |
 | `custom_rules` | array of strings | `[]` | In-line custom ABP / AdGuard filter rules. |
-| `lists` | array of tables | `[]` | Subscription lists to download and compile (`name`, `url`, `enabled`, `refresh_hours`). Schemes: `http://`, `https://`, `file://`. |
+| `lists` | array of tables | `[]` | Subscription lists to download and compile (`name`, `url`, `enabled`). Schemes: `http://`, `https://`, `file://`. Global `refresh_interval_hours` controls update frequency. |
 
 ---
 

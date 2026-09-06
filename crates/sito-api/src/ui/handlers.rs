@@ -14,6 +14,7 @@ use crate::auth::manager::LoginResult;
 use crate::auth::rbac::AuthUser;
 use crate::auth::resolve_client_ip;
 use crate::auth::session::{build_clear_session_cookie, extract_session_cookie};
+use crate::auth::token::Role;
 use crate::config_writer::save_config_atomic;
 use crate::models::{FilterListDto, StatusResponse};
 use crate::state::ServerContext;
@@ -61,6 +62,8 @@ fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
 
 pub fn get_session_user(ctx: &ServerContext, headers: &HeaderMap) -> Option<AuthUser> {
@@ -118,7 +121,11 @@ pub async fn login_submit(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let trusted_proxies = ctx.config.load().get_web_config().trusted_proxies;
+    let config = ctx.config.load();
+    let trusted_proxies = config.get_web_config().trusted_proxies;
+    let tls_enabled = config.get_tls_config().is_some();
+    let is_secure =
+        crate::auth::is_https_request(peer_addr, &headers, &trusted_proxies, tls_enabled);
     let client_ip = resolve_client_ip(peer_addr, &headers, &trusted_proxies);
     let result = ctx
         .auth_mgr
@@ -126,7 +133,7 @@ pub async fn login_submit(
 
     match result {
         LoginResult::Success(session) => {
-            let cookie_header = session.to_cookie_header();
+            let cookie_header = session.to_cookie_header_secure(is_secure);
             let mut resp = Redirect::to("/dashboard").into_response();
             if let Ok(val) = cookie_header.parse() {
                 resp.headers_mut().insert(SET_COOKIE, val);
@@ -138,7 +145,7 @@ pub async fn login_submit(
                 && !code.trim().is_empty()
                 && let Some(session) = ctx.auth_mgr.verify_totp(&partial_token, code.trim())
             {
-                let cookie_header = session.to_cookie_header();
+                let cookie_header = session.to_cookie_header_secure(is_secure);
                 let mut resp = Redirect::to("/dashboard").into_response();
                 if let Ok(val) = cookie_header.parse() {
                     resp.headers_mut().insert(SET_COOKIE, val);
@@ -185,14 +192,23 @@ pub async fn login_submit(
     }
 }
 
-pub async fn logout_handler(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
+pub async fn logout_handler(
+    State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
     if let Some(cookie_hdr) = headers.get("cookie")
         && let Ok(s) = cookie_hdr.to_str()
         && let Some(session_id) = extract_session_cookie(s)
     {
         ctx.auth_mgr.logout(&session_id);
     }
-    let clear_cookie = build_clear_session_cookie();
+    let config = ctx.config.load();
+    let trusted_proxies = config.get_web_config().trusted_proxies;
+    let tls_enabled = config.get_tls_config().is_some();
+    let is_secure =
+        crate::auth::is_https_request(peer_addr, &headers, &trusted_proxies, tls_enabled);
+    let clear_cookie = build_clear_session_cookie(is_secure);
     let mut resp = Redirect::to("/login").into_response();
     if let Ok(val) = clear_cookie.parse() {
         resp.headers_mut().insert(SET_COOKIE, val);
@@ -238,12 +254,11 @@ async fn get_upstreams_list(ctx: &ServerContext) -> Vec<UpstreamViewItem> {
     for addr_str in &cfg.upstream.servers {
         let proto = if addr_str.starts_with("tls://") {
             "DoT (TLS)"
-        } else if addr_str.starts_with("https://") {
-            "DoH (HTTPS)"
-        } else if addr_str.starts_with("quic://") {
-            "DoQ (QUIC)"
-        } else if addr_str.contains(":53") || !addr_str.contains(':') {
-            "UDP/TCP"
+        } else if addr_str.starts_with("udp://")
+            || addr_str.contains(":53")
+            || !addr_str.contains(':')
+        {
+            "UDP"
         } else {
             "DNS"
         };
@@ -507,8 +522,11 @@ pub async fn filtering_toggle_handler(
     headers: HeaderMap,
     Path(id): Path<usize>,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none() {
+    let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Operator {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let mut new_cfg = (**ctx.config.load()).clone();
@@ -525,7 +543,8 @@ pub async fn filtering_toggle_handler(
 pub struct AddFilterListForm {
     pub name: String,
     pub url: String,
-    pub refresh_hours: u32,
+    #[serde(default)]
+    pub refresh_hours: Option<u32>,
 }
 
 pub async fn filtering_add_handler(
@@ -533,8 +552,11 @@ pub async fn filtering_add_handler(
     headers: HeaderMap,
     Form(form): Form<AddFilterListForm>,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none() {
+    let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Operator {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let mut new_cfg = (**ctx.config.load()).clone();
@@ -542,7 +564,7 @@ pub async fn filtering_add_handler(
         name: form.name,
         url: form.url,
         enabled: true,
-        refresh_hours: Some(u64::from(form.refresh_hours)),
+        refresh_hours: form.refresh_hours.map(u64::from),
     });
     let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
     ctx.config.store(Arc::new(new_cfg.clone()));
@@ -556,8 +578,11 @@ pub async fn filtering_delete_handler(
     headers: HeaderMap,
     Path(id): Path<usize>,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none() {
+    let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Operator {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let mut new_cfg = (**ctx.config.load()).clone();
@@ -580,8 +605,11 @@ pub async fn filtering_custom_rules_handler(
     headers: HeaderMap,
     Form(form): Form<CustomRulesForm>,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none() {
+    let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Operator {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let mut new_cfg = (**ctx.config.load()).clone();
@@ -607,8 +635,13 @@ pub struct SimulateForm {
 
 pub async fn filtering_simulate_handler(
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
     Form(form): Form<SimulateForm>,
 ) -> Response {
+    if get_session_user(&ctx, &headers).is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     let clean = form.domain.trim();
     if clean.is_empty() {
         return axum::response::Html("<span class='badge badge-neutral'>Enter a domain</span>")
@@ -658,8 +691,11 @@ pub async fn filtering_update_all_handler(
     State(ctx): State<ServerContext>,
     headers: HeaderMap,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none() {
+    let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Operator {
+        return StatusCode::FORBIDDEN.into_response();
     }
     let cfg = ctx.config.load();
     let _ = ctx.filter.reload_with_config(&cfg.filtering).await;
@@ -718,8 +754,11 @@ pub async fn rewrites_add_handler(
     headers: HeaderMap,
     Form(form): Form<AddRewriteForm>,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none() {
+    let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Operator {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let mut rewrites_cfg = load_rewrites_config(&ctx);
@@ -757,8 +796,11 @@ pub async fn rewrites_delete_handler(
     headers: HeaderMap,
     Form(form): Form<DeleteRewriteForm>,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none() {
+    let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Operator {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let mut rewrites_cfg = load_rewrites_config(&ctx);
@@ -843,8 +885,11 @@ pub async fn clients_add_handler(
     headers: HeaderMap,
     Form(form): Form<AddClientForm>,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none() {
+    let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Operator {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let mut clients_cfg = load_clients_config(&ctx);
@@ -893,8 +938,11 @@ pub async fn clients_delete_handler(
     headers: HeaderMap,
     Form(form): Form<DeleteClientForm>,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none() {
+    let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Operator {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let mut clients_cfg = load_clients_config(&ctx);
@@ -945,12 +993,22 @@ pub async fn upstreams_add_handler(
     headers: HeaderMap,
     Form(form): Form<AddUpstreamForm>,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none() {
+    let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Operator {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let mut new_cfg = (**ctx.config.load()).clone();
     let clean = form.address.trim().to_string();
+    if clean.starts_with("https://") || clean.starts_with("quic://") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "DoH and DoQ upstreams are not supported in v1.2.x; use tls:// or UDP",
+        )
+            .into_response();
+    }
     if !clean.is_empty() && !new_cfg.upstream.servers.contains(&clean) {
         new_cfg.upstream.servers.push(clean);
         let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
@@ -997,32 +1055,10 @@ async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result<f64
         return Ok(elapsed);
     }
 
-    if let Some(target) = addr_str.strip_prefix("https://") {
-        let host_port = target.split('/').next().unwrap_or(target);
-        let parts: Vec<&str> = host_port.split(':').collect();
-        let host = parts[0];
-        let port: u16 = if parts.len() > 1 {
-            parts[1].parse().unwrap_or(443)
-        } else {
-            443
-        };
-        let mut addrs = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|e| format!("DNS resolution of {host} failed: {e}"))?;
-        let addr = addrs
-            .next()
-            .ok_or_else(|| format!("Could not resolve {host}"))?;
-
-        let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            tokio::net::TcpStream::connect(addr),
-        )
-        .await
-        .map_err(|_| "Connection timed out".to_string())?
-        .map_err(|e| format!("HTTPS connection failed: {e}"))?;
-        drop(stream);
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        return Ok(elapsed);
+    if addr_str.starts_with("https://") || addr_str.starts_with("quic://") {
+        return Err(
+            "DoH (https://) and DoQ (quic://) upstreams are not supported in v1.2.x; use tls:// or UDP".to_string(),
+        );
     }
 
     // Standard UDP probe
@@ -1081,8 +1117,12 @@ async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result<f64
 
 pub async fn upstreams_test_handler(
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
     Form(form): Form<TestUpstreamForm>,
 ) -> Response {
+    if get_session_user(&ctx, &headers).is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let clean = form.address.trim();
     if clean.is_empty() {
         return axum::response::Html(
@@ -1146,8 +1186,11 @@ pub async fn settings_save_handler(
     headers: HeaderMap,
     Form(form): Form<SaveSettingsForm>,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none() {
+    let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Admin {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let mut new_cfg = (**ctx.config.load()).clone();
@@ -1190,8 +1233,11 @@ pub async fn system_reload_handler(
     State(ctx): State<ServerContext>,
     headers: HeaderMap,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none() {
+    let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Admin {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     if let Ok(toml_str) = tokio::fs::read_to_string(&ctx.config_path).await
@@ -1200,14 +1246,6 @@ pub async fn system_reload_handler(
         ctx.config.store(Arc::new(cfg));
     }
     Redirect::to("/system").into_response()
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
 }
 
 pub async fn system_update_check_handler(
@@ -1256,7 +1294,7 @@ pub async fn system_update_check_handler(
                     info.latest_version,
                     info.current_version,
                     info.release_url,
-                    html_escape(&info.release_notes),
+                    escape_html(&info.release_notes),
                     install_or_docker
                 )).into_response()
             } else {
@@ -1284,7 +1322,7 @@ pub async fn system_update_check_handler(
                         Retry
                     </button>
                 </div>"##,
-                html_escape(&e.to_string())
+                escape_html(&e.to_string())
             )).into_response()
         }
     }
@@ -1312,7 +1350,7 @@ pub async fn system_update_apply_handler(
                 <div style="font-weight: 600; color: var(--success); margin-bottom: 4px;">Update Successful!</div>
                 <div style="font-size: 0.875rem; color: var(--text-primary);">{}</div>
             </div>"#,
-            html_escape(&msg)
+            escape_html(&msg)
         )).into_response(),
         Err(e) => axum::response::Html(format!(
             r##"<div>
@@ -1323,7 +1361,7 @@ pub async fn system_update_apply_handler(
                     Back to Update Status
                 </button>
             </div>"##,
-            html_escape(&e.to_string())
+            escape_html(&e.to_string())
         )).into_response(),
     }
 }
@@ -1332,11 +1370,18 @@ pub async fn system_update_apply_handler(
 // Setup Wizard
 // ---------------------------------------------------------------------------
 
-pub async fn wizard_page(State(_ctx): State<ServerContext>) -> Response {
+pub async fn wizard_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
+    let auth_user = get_session_user(&ctx, &headers);
+    let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
+
+    if !ctx.auth_mgr.is_first_run() && !is_admin {
+        return Redirect::to("/login").into_response();
+    }
+
     HtmlTemplate(WizardTemplate {
-        is_authenticated: false,
-        username: "admin",
-        user_role: "",
+        is_authenticated: auth_user.is_some(),
+        username: auth_user.as_ref().map_or("admin", |u| &u.username),
+        user_role: auth_user.as_ref().map_or("", |u| u.role.as_str()),
         active_tab: "wizard",
         version: env!("CARGO_PKG_VERSION"),
     })
@@ -1353,11 +1398,25 @@ pub struct WizardCompleteForm {
 
 pub async fn wizard_complete_handler(
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
     Form(form): Form<WizardCompleteForm>,
 ) -> Response {
+    let is_first_run = ctx.auth_mgr.is_first_run();
+    let auth_user = get_session_user(&ctx, &headers);
+    let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
+
+    if !is_first_run && !is_admin {
+        return (
+            StatusCode::FORBIDDEN,
+            "Setup wizard is disabled. Admin session required.",
+        )
+            .into_response();
+    }
+
     let _ = ctx
         .auth_mgr
         .update_user_password(&form.admin_user, &form.admin_password);
+    ctx.auth_mgr.mark_setup_complete();
 
     let mut new_cfg = (**ctx.config.load()).clone();
     if !form.upstream.trim().is_empty() {
@@ -1370,4 +1429,161 @@ pub async fn wizard_complete_handler(
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
 
     Redirect::to("/login").into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arc_swap::ArcSwap;
+    use axum::extract::State;
+    use axum::http::header::COOKIE;
+    use axum::http::{HeaderMap, StatusCode};
+    use sito_core::config::Config;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    async fn mock_context(temp_dir: &std::path::Path) -> ServerContext {
+        let db_path = temp_dir.join("test.db");
+        let stats_db = sito_stats::StatsDb::open(&db_path).await.unwrap();
+        let querylog_writer = sito_stats::QueryLogWriter::spawn(stats_db.clone(), 100);
+        let querylog_sender = querylog_writer.sender();
+        let metrics = sito_stats::MetricsRegistry::new("1.2.1", "test");
+        let auth_mgr = Arc::new(crate::auth::AuthManager::new());
+        let config = Config::default();
+        let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+        let filter = Arc::new(
+            sito_filter::HostsFilterEngine::init(Default::default(), temp_dir.to_path_buf()).await,
+        );
+        let cache = Arc::new(sito_cache::DnsCache::new(Default::default()));
+        let bootstrap = sito_upstream::BootstrapResolver::new(
+            vec!["127.0.0.1".parse().unwrap()],
+            std::time::Duration::from_secs(1),
+        );
+        let upstream = Arc::new(
+            sito_upstream::UpstreamManager::from_config(&Default::default(), &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let clients = Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
+            Default::default(),
+        ))));
+        let rewrites = Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
+            Default::default(),
+        ))));
+
+        ServerContext {
+            config: config_arc,
+            config_path: temp_dir.join("config.toml"),
+            auth_mgr,
+            stats_db,
+            querylog_sender,
+            metrics,
+            filter,
+            cache,
+            upstream,
+            clients,
+            rewrites,
+            start_time: Instant::now(),
+            restore_tokens: Arc::new(Mutex::new(HashMap::new())),
+            master_coordinator: None,
+            slave_tracker: None,
+            resync_sender: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ui_rbac_checks() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_rbac_test_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let ctx = mock_context(&temp_dir).await;
+
+        // 1. filtering_simulate_handler rejects unauthenticated
+        let resp = filtering_simulate_handler(
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Form(SimulateForm {
+                domain: "example.com".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Create Viewer and Operator users
+        ctx.auth_mgr.create_user("view_user", "pass", Role::Viewer);
+        ctx.auth_mgr
+            .create_user("oper_user", "pass", Role::Operator);
+
+        let LoginResult::Success(view_session) =
+            ctx.auth_mgr.login("view_user", "pass", "127.0.0.1")
+        else {
+            panic!("login failed");
+        };
+        let LoginResult::Success(oper_session) =
+            ctx.auth_mgr.login("oper_user", "pass", "127.0.0.1")
+        else {
+            panic!("login failed");
+        };
+
+        let mut view_headers = HeaderMap::new();
+        view_headers.insert(COOKIE, view_session.to_cookie_header().parse().unwrap());
+
+        let mut oper_headers = HeaderMap::new();
+        oper_headers.insert(COOKIE, oper_session.to_cookie_header().parse().unwrap());
+
+        // 2. filtering_simulate_handler succeeds with authenticated Viewer
+        let resp = filtering_simulate_handler(
+            State(ctx.clone()),
+            view_headers.clone(),
+            Form(SimulateForm {
+                domain: "example.com".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 3. rewrites_add_handler forbidden for Viewer
+        let resp = rewrites_add_handler(
+            State(ctx.clone()),
+            view_headers.clone(),
+            Form(AddRewriteForm {
+                domain: "test.lan".to_string(),
+                record_type: "A".to_string(),
+                answer: "1.2.3.4".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // 4. rewrites_add_handler allowed for Operator (redirects to /rewrites)
+        let resp = rewrites_add_handler(
+            State(ctx.clone()),
+            oper_headers.clone(),
+            Form(AddRewriteForm {
+                domain: "test.lan".to_string(),
+                record_type: "A".to_string(),
+                answer: "1.2.3.4".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        // 5. settings_save_handler forbidden for Operator (requires Admin)
+        let resp = settings_save_handler(
+            State(ctx.clone()),
+            oper_headers.clone(),
+            Form(SaveSettingsForm {
+                cache_size_mb: 64,
+                min_ttl: 60,
+                dnssec: None,
+                rate_limit: 10,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

@@ -29,7 +29,7 @@ If validation passes, the command exits with code `0` and prints `"Configuration
 
 | AdGuard Home Setting | sito Equivalent | Notes |
 |---|---|---|
-| `dns.upstream_dns` | `[upstream] servers = [...]` | Full support for DoT (`tls://`), DoH (`https://`), plain DNS, and DoQ (`quic://`). |
+| `dns.upstream_dns` | `[upstream] servers = [...]` | Full support for DoT (`tls://`) and plain DNS (UDP/TCP). |
 | `dns.bootstrap_dns` | `[upstream] bootstrap = [...]` | Bootstrap IP addresses for encrypted upstreams. |
 | `dns.blocking_mode` | `[filtering] blocking_mode = "..."` | `default`/`null_ip` maps to `zero_ip` (`0.0.0.0`/`::`). |
 | `filters` (subscriptions) | `[[filtering.lists]]` | Preserves list name, URL, and enabled status. |

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO="kubaeror/sito-dns"
-SITO_VERSION="${SITO_VERSION:-1.2.0}"
+SITO_VERSION="${SITO_VERSION:-1.2.1}"
 INSTALL_BIN="/usr/local/bin/sito"
 CONFIG_DIR="/etc/sito"
 DATA_DIR="/var/lib/sito"
@@ -79,12 +79,29 @@ else
     fi
 
     if [ -f "${TMP_DIR}/${TARBALL_NAME}" ]; then
-        if [ -f "${TMP_DIR}/SHA256SUMS" ]; then
-            echo "Verifying SHA256 checksum..."
-            cd "${TMP_DIR}"
-            grep "${TARBALL_NAME}" SHA256SUMS | sha256sum -c -
-            cd - >/dev/null
+        if [ ! -f "${TMP_DIR}/SHA256SUMS" ]; then
+            echo "Error: SHA256SUMS file is missing from release v${SITO_VERSION}." >&2
+            echo "For security, sito refuses to install binaries without verified checksums." >&2
+            echo "Please check https://github.com/${REPO}/releases/tag/v${SITO_VERSION} or build from source." >&2
+            exit 1
         fi
+
+        echo "Verifying SHA256 checksum..."
+        cd "${TMP_DIR}"
+        if ! grep -F "${TARBALL_NAME}" SHA256SUMS >/dev/null 2>&1; then
+            echo "Error: Checksum entry for ${TARBALL_NAME} was not found in SHA256SUMS." >&2
+            echo "For security, sito refuses to install binaries without verified checksums." >&2
+            exit 1
+        fi
+
+        if ! grep -F "${TARBALL_NAME}" SHA256SUMS | sha256sum -c -; then
+            echo "Error: SHA256 checksum verification failed for ${TARBALL_NAME}!" >&2
+            echo "The downloaded archive does not match the published release checksum." >&2
+            echo "This could indicate a corrupted download or security tampering." >&2
+            exit 1
+        fi
+        cd - >/dev/null
+
         tar -xzf "${TMP_DIR}/${TARBALL_NAME}" -C "${TMP_DIR}"
         cp -f "${TMP_DIR}/sito" "${INSTALL_BIN}"
     else
@@ -144,7 +161,7 @@ validate = true
 [upstream]
 servers = [
     "tls://dns.quad9.net",
-    "https://cloudflare-dns.com/dns-query"
+    "1.1.1.1"
 ]
 bootstrap = ["9.9.9.9", "1.1.1.1"]
 strategy = "parallel"
@@ -162,25 +179,21 @@ custom_rules = []
 name = "OISD Big"
 url = "https://big.oisd.nl"
 enabled = true
-refresh_hours = 24
 
 [rewrites]
 auto_ptr = true
 
 [web]
+enabled = true
+bind = "0.0.0.0"
 port = 8080
-bind = ["0.0.0.0"]
-https = false
 
 [auth]
 session_ttl_hours = 24
 login_rate_limit = 5
 
 [stats]
-query_log_enabled = true
-query_log_retention_days = 90
-anonymize_client_ip = false
-prometheus_enabled = true
+retention_days = 90
 EOF
     chown sito:sito "${CONFIG_FILE}"
     chmod 640 "${CONFIG_FILE}"
@@ -206,6 +219,11 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
 ReadWritePaths=/var/lib/sito /etc/sito
 LimitNOFILE=1048576
 Restart=on-failure
@@ -226,6 +244,7 @@ echo "=================================================="
 echo " sito v${SITO_VERSION} installed successfully!"
 echo " Web Dashboard: http://localhost:8080"
 echo " Initial credentials: admin / adminadmin"
+echo " [WARNING] Change default password immediately!"
 echo " Configuration: ${CONFIG_FILE}"
 echo " Service Status: systemctl status sito"
 echo "=================================================="

@@ -5,6 +5,45 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.2.1] - 2026-09-06
+
+### Security & Robustness Audit Remediation
+Comprehensive remediation of all 24 security, stability, architecture, and correctness findings identified in `/docs/audit.md`:
+
+#### Phase 1: Critical Security (P0)
+- **Setup Wizard Gating**: Restricted `/ui/wizard` and `/ui/wizard/complete` endpoints so they can only be executed during initial first-run (when no users are registered) or by an authenticated admin session, returning HTTP 403 Forbidden once initialized.
+- **User Account Persistence & Configuration Wiring**: Wired `auth.user` and `auth.role` configuration options, persisted user accounts to `<data_dir>/users.toml`, and restored them automatically on daemon startup.
+- **Updater Integrity & Enforcement**: Enforced strict SHA256 checksum verification from `SHA256SUMS` during self-updates, protected the update check endpoint with authentication, and pinned GitHub update queries to `kubaeror/sito-dns`.
+- **Installer Configuration Hardening**: Fixed missing default tables in installer config generation and added warnings when configuration sections fail to parse.
+- **Hot-Reload Dynamic Pipeline**: Wired `ArcSwap` handles into the DNS processing pipeline to enable zero-downtime, restart-free updates of configuration, local rewrites, and client definitions.
+
+#### Phase 2: High Priority Robustness (P1)
+- **Defensive Cache TTL Clamping**: Defensively clamped TTL bounds and validated that `negative_ttl_max >= min_ttl` at configuration validation time.
+- **UDP Concurrency & Head-of-Line Blocking**: Resolved UDP head-of-line blocking by spawning concurrent Tokio worker tasks per received query bounded by a high-capacity semaphore.
+- **High-Availability Security**: Mandated TLS certificate pinning for HA replication, rejected plain WebSockets by default unless explicitly allowed, and required pre-shared token authentication for replica nodes.
+- **Session Cookie Security**: Conditionally set the `Secure` flag on session cookies based on TLS status and issued clear warnings when serving over plain HTTP on non-loopback network interfaces.
+- **Bounded State & Proactive Pruners**: Bounded lockout, session, and TOTP authentication maps with LRU eviction and spawned a dedicated background pruner task to purge expired entries every 5 minutes.
+- **Comprehensive RBAC Enforcement**: Enforced role-based access control across all mutating UI routes and the `/metrics` endpoint; exposed OpenAPI docs endpoint in documentation.
+
+#### Phase 3: Correctness & Configuration (P2)
+- **Hourly Statistics Watermark**: Implemented a persistent high-water mark for stats rollups to prevent double-counting queries in `stats_hourly`.
+- **Parameterized Query Logs**: Refactored query log filtering to use `sqlx::QueryBuilder` with strict parameterized `push_bind` expressions.
+- **Installer Checksum Verification**: Hardened `contrib/install.sh` to require valid SHA-256 checksums from `SHA256SUMS` and fail loudly on mismatches.
+- **Dead Configuration Pruning**: Removed deprecated `refresh_hours` settings from UI forms and sample configurations.
+- **DNSSEC Validation Logging**: Added configuration validation for DNSSEC modes (`off`, `process`, `log_fail`) and recorded validation outcomes in query logs.
+- **Query Log Graceful Shutdown**: Ensured the query log writer channel is flushed and awaited during graceful daemon shutdown.
+- **Filter Rule Drop Guard**: Restricted rule-count drop protection to scheduled background refreshes to avoid blocking intentional user rule deletions.
+- **Upstream Bootstrap Safety**: Guarded upstream bootstrap resolution against empty address lists using `.first()`.
+- **Protocol Documentation Alignment**: Corrected upstream protocol labels and examples to `tls://` and UDP, reflecting implemented upstream protocols.
+
+#### Phase 4: Low Priority & Code Polish (P3)
+- **Pipeline QueryOutcome Refactoring**: Introduced private `QueryOutcome` struct, unified anti-bypass checks and blocked-response builders, bounded cache prefetching tasks with a semaphore, updated cache size metrics gauge, consolidated HTML escapers, and routed missing client/rewrite endpoints.
+- **Atomic Config Persistence Documentation**: Clarified that atomic config saves preserve modeled fields and omit unknown top-level keys.
+- **Systemd Unit Hardening**: Added `MemoryDenyWriteExecute`, `ProtectKernelTunables`, `ProtectKernelModules`, `ProtectControlGroups`, and `SystemCallFilter=@system-service` directives to systemd service units, and added default password change alerts.
+- **Axum Explicit JSON Feature**: Explicitly declared `"json"` feature on `axum` workspace dependency.
+
+---
+
 ## [1.2.0] - 2026-09-05
 
 ### Added
@@ -33,6 +72,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 - **Workspace Version**: Bumped workspace package and all internal crates to `1.2.0`.
+- **Configuration Persistence**: Persisting configuration changes via the Web UI or REST API round-trips modeled fields; unmodeled or unknown keys and custom comments are not preserved on save.
 
 ---
 

@@ -81,7 +81,8 @@ pub fn start_udp_listener<H: QueryHandler>(
     for worker_id in 0..config.worker_count {
         let std_socket = create_reuseport_udp_socket(&config.bind_addr)?;
         let local_addr = std_socket.local_addr()?;
-        let async_fd = AsyncFd::new(std_socket)?;
+        let async_fd = Arc::new(AsyncFd::new(std_socket)?);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1024));
 
         let handler = Arc::clone(handler);
         let rate_limiter = Arc::clone(&rate_limiter);
@@ -114,71 +115,87 @@ pub fn start_udp_listener<H: QueryHandler>(
                             }
                         };
 
-                        match recv_with_pktinfo(fd, &mut buf) {
-                            Ok((len, peer_addr, dst_ip)) => {
-                                guard.clear_ready();
-                                trace!("UDP received {} bytes from {} (dst: {:?})", len, peer_addr, dst_ip);
+                        loop {
+                            match recv_with_pktinfo(fd, &mut buf) {
+                                Ok((len, peer_addr, dst_ip)) => {
+                                    trace!("UDP received {} bytes from {} (dst: {:?})", len, peer_addr, dst_ip);
 
-                                let client_ip = peer_addr.ip();
-                                if !rate_limiter.check(client_ip) {
-                                    debug!("Rate limit exceeded for client {}", client_ip);
-                                    continue;
-                                }
-
-                                let query = match decode_message(&buf[..len]) {
-                                    Ok(q) => q,
-                                    Err(e) => {
-                                        debug!("Failed to decode UDP DNS query from {}: {}", peer_addr, e);
+                                    let client_ip = peer_addr.ip();
+                                    if !rate_limiter.check(client_ip) {
+                                        debug!("Rate limit exceeded for client {}", client_ip);
                                         continue;
                                     }
-                                };
 
-                                let client_max_payload = client_edns_payload_size(&query);
-                                let handler = Arc::clone(&handler);
-
-                                // Process query in separate task or directly inline
-                                let resp = handler.handle(query, ClientContext::new(client_ip)).await;
-
-                                if let Some(mut response) = resp {
-                                    // Advertise server EDNS size if EDNS was present
-                                    if response.edns.is_some() {
-                                        set_edns_payload_size(&mut response, edns_udp_size);
-                                    }
-
-                                    let mut encoded = match encode_message(&response) {
-                                        Ok(bytes) => bytes,
+                                    let query = match decode_message(&buf[..len]) {
+                                        Ok(q) => q,
                                         Err(e) => {
-                                            warn!("Failed to encode response for {}: {}", peer_addr, e);
+                                            debug!("Failed to decode UDP DNS query from {}: {}", peer_addr, e);
                                             continue;
                                         }
                                     };
 
-                                    // If answer exceeds client buffer, truncate (TC=1)
-                                    if encoded.len() > client_max_payload as usize {
-                                        debug!(
-                                            "Response size {} exceeds client max payload {}, setting TC=1",
-                                            encoded.len(),
-                                            client_max_payload
+                                    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                                        warn!(
+                                            "UDP worker #{} concurrency limit reached; dropping query from {}",
+                                            worker_id, peer_addr
                                         );
-                                        let mut truncated = response.truncate();
-                                        if truncated.edns.is_some() {
-                                            set_edns_payload_size(&mut truncated, edns_udp_size);
-                                        }
-                                        if let Ok(truncated_bytes) = encode_message(&truncated) {
-                                            encoded = truncated_bytes;
-                                        }
-                                    }
+                                        continue;
+                                    };
 
-                                    if let Err(e) = send_with_pktinfo(fd, &encoded, &peer_addr, dst_ip) {
-                                        warn!("Failed to send UDP response to {}: {}", peer_addr, e);
-                                    }
+                                    let handler = Arc::clone(&handler);
+                                    let async_fd = Arc::clone(&async_fd);
+
+                                    // Process query concurrently to avoid head-of-line blocking
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        let fd = async_fd.get_ref().as_raw_fd();
+                                        let client_max_payload = client_edns_payload_size(&query);
+                                        let resp = handler.handle(query, ClientContext::new(client_ip)).await;
+
+                                        if let Some(mut response) = resp {
+                                            // Advertise server EDNS size if EDNS was present
+                                            if response.edns.is_some() {
+                                                set_edns_payload_size(&mut response, edns_udp_size);
+                                            }
+
+                                            let mut encoded = match encode_message(&response) {
+                                                Ok(bytes) => bytes,
+                                                Err(e) => {
+                                                    warn!("Failed to encode response for {}: {}", peer_addr, e);
+                                                    return;
+                                                }
+                                            };
+
+                                            // If answer exceeds client buffer, truncate (TC=1)
+                                            if encoded.len() > client_max_payload as usize {
+                                                debug!(
+                                                    "Response size {} exceeds client max payload {}, setting TC=1",
+                                                    encoded.len(),
+                                                    client_max_payload
+                                                );
+                                                let mut truncated = response.truncate();
+                                                if truncated.edns.is_some() {
+                                                    set_edns_payload_size(&mut truncated, edns_udp_size);
+                                                }
+                                                if let Ok(truncated_bytes) = encode_message(&truncated) {
+                                                    encoded = truncated_bytes;
+                                                }
+                                            }
+
+                                            if let Err(e) = send_with_pktinfo(fd, &encoded, &peer_addr, dst_ip) {
+                                                warn!("Failed to send UDP response to {}: {}", peer_addr, e);
+                                            }
+                                        }
+                                    });
                                 }
-                            }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                guard.clear_ready();
-                            }
-                            Err(e) => {
-                                warn!("UDP recv error: {}", e);
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    guard.clear_ready();
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!("UDP recv error: {}", e);
+                                    break;
+                                }
                             }
                         }
                     }

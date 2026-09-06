@@ -167,6 +167,12 @@ impl QueryLogWriter {
         self.sender.clone()
     }
 
+    /// Shuts down the writer cleanly, flushing any remaining buffered logs, and waits for task exit.
+    pub async fn shutdown(self) {
+        self.sender.shutdown().await;
+        let _ = self.join_handle.await;
+    }
+
     /// Waits for the writer task to exit.
     pub async fn wait(self) {
         let _ = self.join_handle.await;

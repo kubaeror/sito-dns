@@ -5,6 +5,9 @@
 
 {% block content %}
 <div class="card" style="max-width: 900px;">
+  <div style="margin-bottom: 20px; padding: 12px 16px; background: rgba(59, 130, 246, 0.08); border-left: 4px solid var(--accent-color); border-radius: 4px; font-size: 0.875rem;">
+    <strong>Note on Hot-Reloading:</strong> Changes to rewrites, custom filtering rules, and client groups take effect immediately. Changes to network bind addresses/ports and cache buffer sizing require a daemon restart.
+  </div>
   <form action="/ui/settings/save" method="POST">
     <div style="margin-bottom: 24px;">
       <h3 style="margin-bottom: 12px; font-size: 1.1rem;">DNS Caching & Performance</h3>
@@ -12,12 +15,12 @@
         <div class="form-group">
           <label class="form-label" for="cache-size">Cache Size (MB)</label>
           <input type="number" id="cache-size" name="cache_size_mb" class="form-input" value="{{ cache_size_mb }}" min="1" max="4096">
-          <div class="form-help">Maximum memory allocated for in-memory DNS cache.</div>
+          <div class="form-help">Maximum memory allocated for in-memory DNS cache. <em>(Requires daemon restart to resize)</em></div>
         </div>
         <div class="form-group">
           <label class="form-label" for="cache-min-ttl">Minimum TTL (Seconds)</label>
           <input type="number" id="cache-min-ttl" name="min_ttl" class="form-input" value="{{ min_ttl }}" min="0" max="86400">
-          <div class="form-help">Override low TTLs returned by authoritative servers.</div>
+          <div class="form-help">Override low TTLs returned by authoritative servers. <em>(Hot-reloaded)</em></div>
         </div>
       </div>
     </div>
@@ -27,7 +30,7 @@
       <div class="form-group" style="display: flex; align-items: center; justify-content: space-between;">
         <div>
           <div class="form-label" style="margin-bottom: 2px;">DNSSEC Validation</div>
-          <div class="form-help">Validate cryptographic signatures from root down to authoritative zone.</div>
+          <div class="form-help">Validate cryptographic signatures from root down to authoritative zone. <em>(Hot-reloaded)</em></div>
         </div>
         <label class="switch">
           <input type="checkbox" name="dnssec" {% if dnssec_enabled %}checked{% endif %}>
@@ -38,7 +41,7 @@
       <div class="form-group" style="margin-top: 16px;">
         <label class="form-label" for="rate-limit">Rate Limit Per Client IP (QPS)</label>
         <input type="number" id="rate-limit" name="rate_limit" class="form-input" value="{{ rate_limit }}" min="0" max="10000">
-        <div class="form-help">Set to 0 to disable per-client rate limiting.</div>
+        <div class="form-help">Set to 0 to disable per-client rate limiting. <em>(Takes effect on new rate-limiter interval)</em></div>
       </div>
     </div>
 

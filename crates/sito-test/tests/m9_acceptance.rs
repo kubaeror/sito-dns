@@ -302,7 +302,8 @@ fn test_m9_release_configuration_and_systemd() {
 
     // Verify workspace version is at least 1.0.0
     assert!(
-        cargo_content.contains("version = \"1.2.0\"")
+        cargo_content.contains("version = \"1.2.1\"")
+            || cargo_content.contains("version = \"1.2.0\"")
             || cargo_content.contains("version = \"1.1.1\"")
             || cargo_content.contains("version = \"1.1.0\"")
             || cargo_content.contains("version = \"1.0.1\"")

@@ -8,10 +8,10 @@ use std::str::FromStr;
 
 use crate::auth::manager::LoginResult;
 use crate::auth::rbac::RequireAdmin;
-use crate::auth::session::SESSION_COOKIE_NAME;
+use crate::auth::session::{SESSION_COOKIE_NAME, build_clear_session_cookie};
 use crate::auth::token::{ApiTokenMeta, CreateTokenResponse, Role};
 use crate::auth::totp::TotpSetupResponse;
-use crate::auth::{MaybeConnectInfo, resolve_client_ip};
+use crate::auth::{MaybeConnectInfo, is_https_request, resolve_client_ip};
 use crate::error::ProblemDetails;
 use crate::models::{
     CreateTokenRequest, GenericMessageResponse, LoginRequest, LoginResponse, TotpConfirmRequest,
@@ -36,13 +36,16 @@ pub async fn login(
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ProblemDetails> {
-    let trusted_proxies = ctx.config.load().get_web_config().trusted_proxies;
+    let config = ctx.config.load();
+    let trusted_proxies = config.get_web_config().trusted_proxies;
+    let tls_enabled = config.get_tls_config().is_some();
+    let is_secure = is_https_request(peer_addr, &headers, &trusted_proxies, tls_enabled);
     let client_ip = resolve_client_ip(peer_addr, &headers, &trusted_proxies);
     let result = ctx.auth_mgr.login(&req.user, &req.pass, &client_ip);
 
     match result {
         LoginResult::Success(session) => {
-            let cookie_header = session.to_cookie_header();
+            let cookie_header = session.to_cookie_header_secure(is_secure);
             let body = Json(LoginResponse {
                 session_id: Some(session.id),
                 username: Some(session.username),
@@ -94,6 +97,8 @@ pub async fn login(
 )]
 pub async fn verify_totp(
     State(ctx): State<ServerContext>,
+    MaybeConnectInfo(peer_addr): MaybeConnectInfo,
+    headers: HeaderMap,
     Json(req): Json<TotpVerifyRequest>,
 ) -> Result<Response, ProblemDetails> {
     let session = ctx
@@ -103,7 +108,12 @@ pub async fn verify_totp(
             ProblemDetails::unauthorized("Invalid, expired, or previously used TOTP code")
         })?;
 
-    let cookie_header = session.to_cookie_header();
+    let config = ctx.config.load();
+    let trusted_proxies = config.get_web_config().trusted_proxies;
+    let tls_enabled = config.get_tls_config().is_some();
+    let is_secure = is_https_request(peer_addr, &headers, &trusted_proxies, tls_enabled);
+
+    let cookie_header = session.to_cookie_header_secure(is_secure);
     let body = Json(LoginResponse {
         session_id: Some(session.id),
         username: Some(session.username),
@@ -126,7 +136,11 @@ pub async fn verify_totp(
         (status = 200, description = "Logged out successfully", body = GenericMessageResponse)
     )
 )]
-pub async fn logout(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
+pub async fn logout(
+    State(ctx): State<ServerContext>,
+    MaybeConnectInfo(peer_addr): MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Response {
     if let Some(cookie_header) = headers.get("cookie")
         && let Ok(cookie_str) = cookie_header.to_str()
     {
@@ -140,8 +154,11 @@ pub async fn logout(State(ctx): State<ServerContext>, headers: HeaderMap) -> Res
         }
     }
 
-    let expired_cookie =
-        format!("{SESSION_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0");
+    let config = ctx.config.load();
+    let trusted_proxies = config.get_web_config().trusted_proxies;
+    let tls_enabled = config.get_tls_config().is_some();
+    let is_secure = is_https_request(peer_addr, &headers, &trusted_proxies, tls_enabled);
+    let expired_cookie = build_clear_session_cookie(is_secure);
     let mut resp = Json(GenericMessageResponse {
         message: "Logged out successfully".to_string(),
     })

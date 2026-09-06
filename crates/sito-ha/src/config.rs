@@ -61,6 +61,18 @@ pub struct HaConfig {
     #[serde(default)]
     pub pinned_slave_fingerprints: Vec<String>,
 
+    /// Pre-shared authentication token for slave authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slave_token: Option<String>,
+
+    /// Allow unpinned TLS connections (insecure; default: false).
+    #[serde(default)]
+    pub allow_unpinned_tls: bool,
+
+    /// Allow unencrypted plaintext WebSocket connections (ws://; insecure; default: false).
+    #[serde(default)]
+    pub allow_insecure_ws: bool,
+
     /// Interval in seconds for sending periodic statistics reports from slave to master (default: 30s).
     #[serde(default = "default_stats_interval_secs")]
     pub stats_interval_secs: u64,
@@ -82,6 +94,9 @@ impl Default for HaConfig {
             key: None,
             ca: None,
             pinned_slave_fingerprints: Vec::new(),
+            slave_token: None,
+            allow_unpinned_tls: false,
+            allow_insecure_ws: false,
             stats_interval_secs: default_stats_interval_secs(),
             ping_interval_secs: default_ping_interval_secs(),
         }
@@ -110,14 +125,30 @@ impl HaConfig {
             if let Some(ref pubkey_str) = self.master_pubkey {
                 parse_public_key(pubkey_str)?;
             }
-            if let Some(ref url) = self.master_url
-                && !url.starts_with("ws://")
-                && !url.starts_with("wss://")
-            {
-                return Err(HaError::Validation {
-                    field: "master_url".to_string(),
-                    reason: format!("Invalid master_url '{url}': must start with ws:// or wss://"),
-                });
+            if let Some(ref url) = self.master_url {
+                if !url.starts_with("ws://") && !url.starts_with("wss://") {
+                    return Err(HaError::Validation {
+                        field: "master_url".to_string(),
+                        reason: format!(
+                            "Invalid master_url '{url}': must start with ws:// or wss://"
+                        ),
+                    });
+                }
+                if url.starts_with("ws://") && !self.allow_insecure_ws {
+                    return Err(HaError::Validation {
+                        field: "master_url".to_string(),
+                        reason: "Plaintext ws:// replication is rejected by default. Use wss:// or explicitly set allow_insecure_ws = true".to_string(),
+                    });
+                }
+                if url.starts_with("wss://")
+                    && self.master_fingerprint.is_none()
+                    && !self.allow_unpinned_tls
+                {
+                    return Err(HaError::Validation {
+                        field: "master_fingerprint".to_string(),
+                        reason: "WSS replication requires master_fingerprint for certificate pinning unless allow_unpinned_tls = true".to_string(),
+                    });
+                }
             }
         }
 

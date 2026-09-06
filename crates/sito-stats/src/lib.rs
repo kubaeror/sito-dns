@@ -350,4 +350,186 @@ mod tests {
         assert_eq!(total_queries, 2);
         assert_eq!(blocked_queries, 1);
     }
+
+    #[tokio::test]
+    async fn test_retention_watermark_prevents_double_counting() {
+        let db = StatsDb::in_memory().await.unwrap();
+
+        let hour_ts = 1_000_000_000_000i64;
+        let entry1 = QueryLogEntry {
+            id: None,
+            ts: hour_ts,
+            client_ip: "10.0.0.1".into(),
+            client_name: None,
+            qname: "double1.com".into(),
+            qtype: 1,
+            rcode: Some(0),
+            verdict: "allowed".into(),
+            rule: None,
+            list_source: None,
+            upstream: None,
+            elapsed_us: None,
+            dnssec: None,
+            proto: "udp".into(),
+        };
+        let entry2 = QueryLogEntry {
+            id: None,
+            ts: hour_ts + 100,
+            client_ip: "10.0.0.2".into(),
+            client_name: None,
+            qname: "double2.com".into(),
+            qtype: 1,
+            rcode: Some(0),
+            verdict: "blocked".into(),
+            rule: None,
+            list_source: None,
+            upstream: None,
+            elapsed_us: None,
+            dnssec: None,
+            proto: "udp".into(),
+        };
+
+        db.insert_batch(&[entry1, entry2]).await.unwrap();
+
+        // 1st aggregation: entries are older than 90 days
+        let rep1 = db.cleanup_retention(90).await.unwrap();
+        assert_eq!(rep1.aggregated_hours, 1);
+        assert_eq!(rep1.deleted_records, 2);
+
+        let watermark = db.get_watermark("hourly_aggregation").await.unwrap();
+        assert!(watermark.is_some());
+        let (wm_id, _) = watermark.unwrap();
+        assert!(wm_id >= 2);
+
+        // Verify stats_hourly has exactly 2 queries
+        let (queries, blocked): (i64, i64) = sqlx::query_as(
+            "SELECT queries, blocked FROM stats_hourly WHERE hour = (1000000000000 / 3600000) * 3600000",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(queries, 2);
+        assert_eq!(blocked, 1);
+
+        // Run cleanup_retention again - should aggregate 0 hours because watermark prevents double counting
+        let rep2 = db.cleanup_retention(90).await.unwrap();
+        assert_eq!(rep2.aggregated_hours, 0);
+        assert_eq!(rep2.deleted_records, 0);
+
+        let (queries2, blocked2): (i64, i64) = sqlx::query_as(
+            "SELECT queries, blocked FROM stats_hourly WHERE hour = (1000000000000 / 3600000) * 3600000",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(queries2, 2);
+        assert_eq!(blocked2, 1);
+
+        // Insert another entry in the same hour
+        let entry3 = QueryLogEntry {
+            id: None,
+            ts: hour_ts + 200,
+            client_ip: "10.0.0.3".into(),
+            client_name: None,
+            qname: "double3.com".into(),
+            qtype: 1,
+            rcode: Some(0),
+            verdict: "allowed".into(),
+            rule: None,
+            list_source: None,
+            upstream: None,
+            elapsed_us: None,
+            dnssec: None,
+            proto: "udp".into(),
+        };
+        db.insert_batch(&[entry3]).await.unwrap();
+
+        // 3rd cleanup should only aggregate entry3 (1 new query, not re-aggregating entry1 and entry2)
+        let rep3 = db.cleanup_retention(90).await.unwrap();
+        assert_eq!(rep3.aggregated_hours, 1);
+        assert_eq!(rep3.deleted_records, 1);
+
+        let (queries3, blocked3): (i64, i64) = sqlx::query_as(
+            "SELECT queries, blocked FROM stats_hourly WHERE hour = (1000000000000 / 3600000) * 3600000",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(queries3, 3);
+        assert_eq!(blocked3, 1);
+    }
+
+    #[tokio::test]
+    async fn test_query_logs_with_special_characters_sql_injection_safe() {
+        let db = StatsDb::in_memory().await.unwrap();
+
+        let entries = vec![
+            QueryLogEntry {
+                id: None,
+                ts: 1_700_000_000_000,
+                client_ip: "10.0.0.1".into(),
+                client_name: Some("client' OR '1'='1".into()),
+                qname: "foo%bar'baz.com".into(),
+                qtype: 1,
+                rcode: Some(0),
+                verdict: "allowed".into(),
+                rule: None,
+                list_source: None,
+                upstream: None,
+                elapsed_us: None,
+                dnssec: None,
+                proto: "udp".into(),
+            },
+            QueryLogEntry {
+                id: None,
+                ts: 1_700_000_000_100,
+                client_ip: "10.0.0.2".into(),
+                client_name: Some("normal-client".into()),
+                qname: "regular.org".into(),
+                qtype: 1,
+                rcode: Some(0),
+                verdict: "blocked".into(),
+                rule: None,
+                list_source: None,
+                upstream: None,
+                elapsed_us: None,
+                dnssec: None,
+                proto: "udp".into(),
+            },
+        ];
+
+        db.insert_batch(&entries).await.unwrap();
+
+        // Query by client with quote injection
+        let res_client = db
+            .query_logs(&QueryLogFilter {
+                client: Some("client' OR '1'='1".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(res_client.entries.len(), 1);
+        assert_eq!(res_client.entries[0].qname, "foo%bar'baz.com");
+
+        // Query by domain with percent and quote
+        let res_domain = db
+            .query_logs(&QueryLogFilter {
+                domain: Some("foo%bar'".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(res_domain.entries.len(), 1);
+        assert_eq!(res_domain.entries[0].qname, "foo%bar'baz.com");
+
+        // Query with malicious status injection
+        let res_status = db
+            .query_logs(&QueryLogFilter {
+                status: Some("' OR 1=1 --".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(res_status.entries.len(), 0);
+    }
 }

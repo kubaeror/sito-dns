@@ -309,12 +309,31 @@ impl HostsFilterEngine {
     }
 
     /// Reloads all configured blocklists and custom rules, updating snapshot atomically.
+    /// Applies the >50% drop guard to protect against corrupted remote sources.
     pub async fn reload(&self) -> Result<usize, FilterError> {
-        self.reload_with_config(&self.config).await
+        self.reload_internal(&self.config, true).await
     }
 
     /// Reloads blocklists and custom rules using an updated filtering configuration.
+    /// Does not enforce the >50% drop guard so intentional user deletions/edits take effect.
     pub async fn reload_with_config(&self, config: &FilteringConfig) -> Result<usize, FilterError> {
+        self.reload_internal(config, false).await
+    }
+
+    /// Reloads blocklists with an explicit option to enforce or bypass the >50% drop guard.
+    pub async fn reload_with_options(
+        &self,
+        config: &FilteringConfig,
+        apply_drop_guard: bool,
+    ) -> Result<usize, FilterError> {
+        self.reload_internal(config, apply_drop_guard).await
+    }
+
+    async fn reload_internal(
+        &self,
+        config: &FilteringConfig,
+        apply_drop_guard: bool,
+    ) -> Result<usize, FilterError> {
         if !config.enabled {
             self.snapshot.store(Arc::new(FilterSnapshot::default()));
             return Ok(0);
@@ -367,7 +386,7 @@ impl HostsFilterEngine {
         .unwrap_or_else(|_| (FilterSnapshot::default(), 0));
 
         let prev_count = self.snapshot.load().rule_count;
-        if prev_count > 0 && count < prev_count / 2 {
+        if apply_drop_guard && prev_count > 0 && count < prev_count / 2 {
             warn!(
                 previous_count = prev_count,
                 new_count = count,
@@ -681,6 +700,30 @@ mod tests {
         let count = engine.reload().await.unwrap();
         assert_eq!(count, 6);
         assert_eq!(engine.rule_count(), 6);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_intentional_user_edit_bypasses_drop_guard() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_user_edit_test_{}", std::process::id()));
+        let config = FilteringConfig {
+            custom_rules: vec![
+                "0.0.0.0 ad1.com\n0.0.0.0 ad2.com\n0.0.0.0 ad3.com\n0.0.0.0 ad4.com\n0.0.0.0 ad5.com\n0.0.0.0 ad6.com".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let engine = HostsFilterEngine::init(config.clone(), temp_dir.clone()).await;
+        assert_eq!(engine.rule_count(), 6);
+
+        // User intentionally removes rules via reload_with_config
+        let mut new_config = config.clone();
+        new_config.custom_rules = vec!["0.0.0.0 ad1.com".to_string()];
+        let count = engine.reload_with_config(&new_config).await.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(engine.rule_count(), 1);
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

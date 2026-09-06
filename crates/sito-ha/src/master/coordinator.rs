@@ -33,6 +33,7 @@ pub struct MasterCoordinator {
     pub active_push: Arc<Mutex<Option<HaMessage>>>,
     pub slaves: Arc<Mutex<HashMap<String, ActiveSlave>>>,
     pub metrics: MetricsRegistry,
+    pub slave_token: Option<String>,
 }
 
 impl MasterCoordinator {
@@ -58,7 +59,15 @@ impl MasterCoordinator {
             active_push: Arc::new(Mutex::new(None)),
             slaves: Arc::new(Mutex::new(HashMap::new())),
             metrics,
+            slave_token: None,
         }
+    }
+
+    /// Sets the required slave authentication token.
+    #[must_use]
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.slave_token = token;
+        self
     }
 
     /// Returns the currently active master configuration version.
@@ -141,7 +150,8 @@ impl MasterCoordinator {
                     instance,
                     have_version,
                     capabilities,
-                }) => (instance, have_version, capabilities),
+                    token,
+                }) => (instance, have_version, capabilities, token),
                 Ok(other) => {
                     warn!(peer = %peer_addr, "Unexpected message instead of Hello: {other:?}");
                     return;
@@ -158,7 +168,8 @@ impl MasterCoordinator {
                             instance,
                             have_version,
                             capabilities,
-                        }) => (instance, have_version, capabilities),
+                            token,
+                        }) => (instance, have_version, capabilities, token),
                         _ => return,
                     }
                 } else {
@@ -171,12 +182,25 @@ impl MasterCoordinator {
             }
         };
 
-        let (slave_instance, have_version, _) = hello_msg;
+        let (slave_instance, have_version, _, token) = hello_msg;
+
+        // Verify slave authentication token if configured
+        if let Some(ref required_token) = self.slave_token
+            && token.as_deref() != Some(required_token.as_str())
+        {
+            warn!(
+                instance = %slave_instance,
+                peer = %peer_addr,
+                "Slave authentication failed: invalid or missing token"
+            );
+            return;
+        }
+
         info!(
             instance = %slave_instance,
             have_version,
             peer = %peer_addr,
-            "Received Hello from replica slave"
+            "Received authenticated Hello from replica slave"
         );
 
         let (tx, mut rx) = mpsc::channel::<HaMessage>(32);
@@ -369,9 +393,12 @@ impl MasterCoordinator {
 /// Spawns the master WebSocket replication server listener.
 pub fn spawn_master_server(
     ha_config: HaConfig,
-    coordinator: MasterCoordinator,
+    mut coordinator: MasterCoordinator,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
+    if coordinator.slave_token.is_none() {
+        coordinator.slave_token.clone_from(&ha_config.slave_token);
+    }
     tokio::spawn(async move {
         let listen_addr = format!("{}:{}", ha_config.listen_addr, ha_config.replication_port);
         let listener = match TcpListener::bind(&listen_addr).await {

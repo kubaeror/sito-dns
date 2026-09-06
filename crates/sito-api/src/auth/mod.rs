@@ -9,7 +9,7 @@ pub mod session;
 pub mod token;
 pub mod totp;
 
-pub use client_ip::{MaybeConnectInfo, resolve_client_ip};
+pub use client_ip::{MaybeConnectInfo, is_https_request, resolve_client_ip};
 pub use lockout::LockoutTracker;
 pub use manager::{AuthManager, LoginResult};
 pub use password::{hash_password, verify_password};

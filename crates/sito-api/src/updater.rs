@@ -9,9 +9,17 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub const DEFAULT_GITHUB_REPO: &str = "kubaeror/sito-dns";
+
+/// Allowed repositories for fetching release binaries (SSRF protection).
+pub const ALLOWED_UPDATE_REPOS: &[&str] = &["kubaeror/sito-dns"];
+
+/// Returns true if the specified repository slug is allowed for updates.
+pub fn is_allowed_repo(repo: &str) -> bool {
+    ALLOWED_UPDATE_REPOS.contains(&repo)
+}
 
 #[derive(Debug, Error)]
 pub enum UpdateError {
@@ -131,6 +139,11 @@ pub fn is_version_newer(latest: &str, current: &str) -> bool {
 pub async fn check_for_update(repo: Option<&str>) -> Result<UpdateInfo, UpdateError> {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     let repo_name = repo.unwrap_or(DEFAULT_GITHUB_REPO);
+    if !is_allowed_repo(repo_name) {
+        return Err(UpdateError::Other(format!(
+            "Repository '{repo_name}' is not in the allowed repositories list"
+        )));
+    }
     let url = format!("https://api.github.com/repos/{repo_name}/releases/latest");
 
     let client = reqwest::Client::builder()
@@ -230,15 +243,43 @@ pub fn parse_checksum_from_sums(sums_content: &str, archive_name: &str) -> Optio
     None
 }
 
-/// Downloads latest release asset, verifies SHA256, and replaces running executable.
+/// Verifies that archive checksum matches expected hash from sums manifest.
+pub fn verify_archive_checksum(
+    archive_bytes: &[u8],
+    archive_name: &str,
+    sums_content: Option<&str>,
+) -> Result<(), UpdateError> {
+    let sums = sums_content.ok_or(UpdateError::ChecksumNotFound)?;
+    let computed_hash =
+        hex::encode(ring::digest::digest(&ring::digest::SHA256, archive_bytes).as_ref());
+    let expected_hash =
+        parse_checksum_from_sums(sums, archive_name).ok_or(UpdateError::ChecksumNotFound)?;
+
+    if !computed_hash.eq_ignore_ascii_case(&expected_hash) {
+        return Err(UpdateError::ChecksumMismatch {
+            expected: expected_hash,
+            actual: computed_hash,
+        });
+    }
+    Ok(())
+}
+
+/// Downloads the latest release archive, verifies checksum and signature, extracts the binary,
+/// and replaces the running executable.
 pub async fn apply_update(repo: Option<&str>, force: bool) -> Result<String, UpdateError> {
     if is_running_in_docker() {
         return Err(UpdateError::DockerEnvironment(
-            "Self-updating is not supported inside Docker containers. Run 'docker compose pull && docker compose up -d' instead.".to_string()
+            "In-app binary update is disabled inside Docker. Use container image management."
+                .to_string(),
         ));
     }
 
     let repo_name = repo.unwrap_or(DEFAULT_GITHUB_REPO);
+    if !is_allowed_repo(repo_name) {
+        return Err(UpdateError::Other(format!(
+            "Repository '{repo_name}' is not in the allowed repositories list"
+        )));
+    }
     let update_info = check_for_update(Some(repo_name)).await?;
 
     if !update_info.update_available && !force {
@@ -304,35 +345,18 @@ pub async fn apply_update(repo: Option<&str>, force: bool) -> Result<String, Upd
         .bytes()
         .await?;
 
-    // 2. Compute SHA256 of downloaded archive
-    let computed_hash =
-        hex::encode(ring::digest::digest(&ring::digest::SHA256, &archive_bytes).as_ref());
+    // 2. Compute SHA256 and hard-verify checksum
+    let sha_asset = sha256_asset.ok_or(UpdateError::ChecksumNotFound)?;
+    debug!(asset = %sha_asset.name, "Fetching checksum manifest");
+    let sums_content = client
+        .get(&sha_asset.browser_download_url)
+        .send()
+        .await?
+        .text()
+        .await?;
 
-    // 3. Verify checksum if SHA256SUMS asset exists
-    if let Some(sha_asset) = sha256_asset {
-        debug!(asset = %sha_asset.name, "Fetching checksum manifest");
-        let sums_content = client
-            .get(&sha_asset.browser_download_url)
-            .send()
-            .await?
-            .text()
-            .await?;
-
-        if let Some(expected_hash) = parse_checksum_from_sums(&sums_content, &archive.name) {
-            if !computed_hash.eq_ignore_ascii_case(&expected_hash) {
-                return Err(UpdateError::ChecksumMismatch {
-                    expected: expected_hash,
-                    actual: computed_hash,
-                });
-            }
-            info!(checksum = %computed_hash, "SHA256 checksum verified successfully");
-        } else {
-            warn!(
-                "Could not find checksum for {} in checksums file; continuing",
-                archive.name
-            );
-        }
-    }
+    verify_archive_checksum(&archive_bytes, &archive.name, Some(&sums_content))?;
+    info!(asset = %archive.name, "SHA256 checksum verified successfully");
 
     // 4. Extract 'sito' executable from tarball
     let gz = GzDecoder::new(&archive_bytes[..]);
@@ -433,5 +457,42 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
     fn test_current_target_triple() {
         let target = current_target_triple();
         assert!(!target.is_empty());
+    }
+
+    #[test]
+    fn test_updater_aborts_without_checksum() {
+        let fake_archive = b"dummy archive payload";
+        let fake_name = "sito-v1.2.1-x86_64-unknown-linux-gnu.tar.gz";
+
+        // 1. None sums content -> ChecksumNotFound
+        let err = verify_archive_checksum(fake_archive, fake_name, None).unwrap_err();
+        assert!(matches!(err, UpdateError::ChecksumNotFound));
+
+        // 2. Archive not in sums content -> ChecksumNotFound
+        let sums_other =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  other.tar.gz\n";
+        let err = verify_archive_checksum(fake_archive, fake_name, Some(sums_other)).unwrap_err();
+        assert!(matches!(err, UpdateError::ChecksumNotFound));
+
+        // 3. Mismatched checksum -> ChecksumMismatch
+        let sums_mismatch = format!(
+            "0000000000000000000000000000000000000000000000000000000000000000  {fake_name}\n"
+        );
+        let err =
+            verify_archive_checksum(fake_archive, fake_name, Some(&sums_mismatch)).unwrap_err();
+        assert!(matches!(err, UpdateError::ChecksumMismatch { .. }));
+
+        // 4. Valid checksum -> Ok(())
+        let valid_hash =
+            hex::encode(ring::digest::digest(&ring::digest::SHA256, fake_archive).as_ref());
+        let sums_valid = format!("{valid_hash}  {fake_name}\n");
+        assert!(verify_archive_checksum(fake_archive, fake_name, Some(&sums_valid)).is_ok());
+    }
+
+    #[test]
+    fn test_allowed_repos() {
+        assert!(is_allowed_repo("kubaeror/sito-dns"));
+        assert!(!is_allowed_repo("evil/attacker-repo"));
+        assert!(!is_allowed_repo("kubaeror/other-repo"));
     }
 }

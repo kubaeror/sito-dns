@@ -161,10 +161,15 @@ impl Config {
 
     /// Resolves the effective web configuration.
     pub fn get_web_config(&self) -> WebConfig {
-        if let Some(ref val) = self.web
-            && let Ok(cfg) = val.clone().try_into::<WebConfig>()
-        {
-            return cfg;
+        if let Some(ref val) = self.web {
+            match val.clone().try_into::<WebConfig>() {
+                Ok(cfg) => return cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse [web] section in configuration, falling back to defaults: {e}"
+                    );
+                }
+            }
         }
         WebConfig::default()
     }
@@ -178,12 +183,32 @@ impl Config {
 
     /// Resolves the effective stats configuration.
     pub fn get_stats_config(&self) -> StatsConfig {
-        if let Some(ref val) = self.stats
-            && let Ok(cfg) = val.clone().try_into::<StatsConfig>()
-        {
-            return cfg;
+        if let Some(ref val) = self.stats {
+            match val.clone().try_into::<StatsConfig>() {
+                Ok(cfg) => return cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse [stats] section in configuration, falling back to defaults: {e}"
+                    );
+                }
+            }
         }
         StatsConfig::default()
+    }
+
+    /// Resolves the effective auth configuration.
+    pub fn get_auth_config(&self) -> AuthConfig {
+        if let Some(ref val) = self.auth {
+            match val.clone().try_into::<AuthConfig>() {
+                Ok(cfg) => return cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse [auth] section in configuration, falling back to defaults: {e}"
+                    );
+                }
+            }
+        }
+        AuthConfig::default()
     }
 }
 
@@ -198,6 +223,8 @@ pub struct WebConfig {
     pub port: u16,
     #[serde(default)]
     pub trusted_proxies: Vec<IpAddr>,
+    #[serde(default)]
+    pub metrics_auth: bool,
 }
 
 fn default_web_enabled() -> bool {
@@ -219,6 +246,7 @@ impl Default for WebConfig {
             bind: default_web_bind(),
             port: default_web_port(),
             trusted_proxies: Vec::new(),
+            metrics_auth: false,
         }
     }
 }
@@ -226,7 +254,7 @@ impl Default for WebConfig {
 /// Query statistics and retention parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatsConfig {
-    #[serde(default = "default_retention_days")]
+    #[serde(default = "default_retention_days", alias = "query_log_retention_days")]
     pub retention_days: u32,
 }
 
@@ -238,6 +266,32 @@ impl Default for StatsConfig {
     fn default() -> Self {
         Self {
             retention_days: default_retention_days(),
+        }
+    }
+}
+
+/// Administrative authentication and session parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthConfig {
+    #[serde(default = "default_session_ttl_hours")]
+    pub session_ttl_hours: u64,
+    #[serde(default = "default_login_rate_limit")]
+    pub login_rate_limit: usize,
+}
+
+fn default_session_ttl_hours() -> u64 {
+    24
+}
+
+fn default_login_rate_limit() -> usize {
+    5
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            session_ttl_hours: default_session_ttl_hours(),
+            login_rate_limit: default_login_rate_limit(),
         }
     }
 }
@@ -515,6 +569,15 @@ impl CacheConfig {
                 ),
             ));
         }
+        if self.min_ttl > self.negative_ttl_max {
+            return Err(ConfigError::validation(
+                "dns.cache.negative_ttl_max",
+                format!(
+                    "negative_ttl_max ({}) cannot be less than min_ttl ({})",
+                    self.negative_ttl_max, self.min_ttl
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -552,7 +615,15 @@ impl Default for DnssecConfig {
 
 impl DnssecConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        Ok(())
+        match self.mode.to_ascii_lowercase().as_str() {
+            "validate" | "strict" | "log_only" | "log-only" | "permissive" | "off" | "disabled" => {
+                Ok(())
+            }
+            _ => Err(ConfigError::validation(
+                "dns.dnssec.mode",
+                format!("unrecognized DNSSEC mode: '{}'", self.mode),
+            )),
+        }
     }
 
     /// Check if a domain matches any configured Negative Trust Anchor (NTA/NTP).
@@ -848,6 +919,8 @@ pub struct FilterListConfig {
     pub url: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Deprecated/legacy per-list refresh interval.
+    /// Ignored by scheduler; global `FilteringConfig.refresh_interval_hours` is used instead.
     #[serde(default)]
     pub refresh_hours: Option<u64>,
 }
@@ -1178,5 +1251,21 @@ key = "/path/to/key.pem"
             cfg.get_tls_config().unwrap().cert.as_deref(),
             Some(std::path::Path::new("/path/to/cert.pem"))
         );
+    }
+
+    #[test]
+    fn test_cache_config_negative_ttl_validation() {
+        let cfg = CacheConfig {
+            min_ttl: 300,
+            negative_ttl_max: 60, // min_ttl > negative_ttl_max should fail validation
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigError::Validation { field, .. } => {
+                assert_eq!(field, "dns.cache.negative_ttl_max");
+            }
+            other => panic!("expected dns.cache.negative_ttl_max error, got {other:?}"),
+        }
     }
 }

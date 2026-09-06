@@ -100,7 +100,7 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
     # Upstreams
     upstreams = dns.get("upstream_dns", [])
     if not upstreams:
-        upstreams = ["tls://dns.quad9.net", "https://cloudflare-dns.com/dns-query"]
+        upstreams = ["tls://dns.quad9.net", "1.1.1.1:53"]
     bootstrap = dns.get("bootstrap_dns", ["9.9.9.9", "1.1.1.1"])
 
     lines.append("[upstream]")
@@ -152,7 +152,6 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
             f'name = "{name}"',
             f'url = "{url}"',
             f"enabled = {enabled}",
-            "refresh_hours = 24",
             "",
         ])
 

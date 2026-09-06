@@ -56,6 +56,17 @@ pub enum ValidationOutcome {
     NtaBypass,
 }
 
+impl ValidationOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Secure => "secure",
+            Self::Insecure | Self::NtaBypass => "insecure",
+            Self::Bogus { .. } => "bogus",
+            Self::Indeterminate => "indeterminate",
+        }
+    }
+}
+
 /// RFC 8914 Extended DNS Error (EDE) codes.
 pub const EDE_DNSSEC_BOGUS: u16 = 6;
 pub const EDE_SIGNATURE_EXPIRED: u16 = 7;

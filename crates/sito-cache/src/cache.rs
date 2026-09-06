@@ -198,24 +198,28 @@ impl DnsCache {
             }
 
             let raw_negative_ttl = soa_ttl.unwrap_or(300);
-            raw_negative_ttl.clamp(self.config.min_ttl, self.config.negative_ttl_max)
+            raw_negative_ttl.clamp(
+                self.config.min_ttl,
+                self.config.negative_ttl_max.max(self.config.min_ttl),
+            )
         } else {
             let mut min_record_ttl = u32::MAX;
+            let effective_max_ttl = self.config.max_ttl.max(self.config.min_ttl);
 
             for ans in &response.answers {
-                let clamped = ans.ttl.clamp(self.config.min_ttl, self.config.max_ttl);
+                let clamped = ans.ttl.clamp(self.config.min_ttl, effective_max_ttl);
                 answer_ttls.push(clamped);
                 min_record_ttl = min_record_ttl.min(clamped);
             }
 
             for auth in &response.authorities {
-                let clamped = auth.ttl.clamp(self.config.min_ttl, self.config.max_ttl);
+                let clamped = auth.ttl.clamp(self.config.min_ttl, effective_max_ttl);
                 authority_ttls.push(clamped);
                 min_record_ttl = min_record_ttl.min(clamped);
             }
 
             for add in &response.additionals {
-                let clamped = add.ttl.clamp(self.config.min_ttl, self.config.max_ttl);
+                let clamped = add.ttl.clamp(self.config.min_ttl, effective_max_ttl);
                 additional_ttls.push(clamped);
                 min_record_ttl = min_record_ttl.min(clamped);
             }
@@ -262,5 +266,15 @@ impl DnsCache {
         let _ = self.cache.invalidate_entries_if(move |k, _v| {
             k.qname == norm_clone || k.qname.ends_with(&format!(".{norm_clone}"))
         });
+    }
+
+    /// Approximate memory weight of cached items in bytes.
+    pub fn weighted_size(&self) -> u64 {
+        self.cache.weighted_size()
+    }
+
+    /// Number of active cache entries.
+    pub fn entry_count(&self) -> u64 {
+        self.cache.entry_count()
     }
 }

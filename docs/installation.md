@@ -75,7 +75,7 @@ dot_port = 853
 doh_port = 443
 
 [upstream]
-servers = ["tls://dns.quad9.net", "https://cloudflare-dns.com/dns-query"]
+servers = ["tls://dns.quad9.net", "1.1.1.1:53"]
 bootstrap = ["9.9.9.9", "1.1.1.1"]
 strategy = "parallel"
 
@@ -111,6 +111,11 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
 ReadWritePaths=/var/lib/sito /etc/sito
 LimitNOFILE=1048576
 Restart=on-failure

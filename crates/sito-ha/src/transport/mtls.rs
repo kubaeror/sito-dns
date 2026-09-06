@@ -123,12 +123,14 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
 #[derive(Debug)]
 pub struct PinnedServerCertVerifier {
     pinned_fingerprint: Option<String>,
+    allow_unpinned: bool,
 }
 
 impl PinnedServerCertVerifier {
-    pub fn new(pinned: Option<&str>) -> Self {
+    pub fn new(pinned: Option<&str>, allow_unpinned: bool) -> Self {
         Self {
             pinned_fingerprint: pinned.map(normalize_fingerprint),
+            allow_unpinned,
         }
     }
 }
@@ -147,9 +149,13 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
             .to_string()
             .to_lowercase();
 
-        if let Some(ref expected_fp) = self.pinned_fingerprint
-            && &cert_fp != expected_fp
-        {
+        if let Some(ref expected_fp) = self.pinned_fingerprint {
+            if &cert_fp != expected_fp {
+                return Err(RustlsError::InvalidCertificate(
+                    rustls::CertificateError::ApplicationVerificationFailure,
+                ));
+            }
+        } else if !self.allow_unpinned {
             return Err(RustlsError::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
@@ -211,8 +217,18 @@ pub fn build_client_tls_config(
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
     master_fingerprint: Option<&str>,
+    allow_unpinned_tls: bool,
 ) -> Result<Arc<rustls::ClientConfig>, HaError> {
-    let server_verifier = Arc::new(PinnedServerCertVerifier::new(master_fingerprint));
+    if master_fingerprint.is_none() && !allow_unpinned_tls {
+        return Err(HaError::Tls(
+            "TLS connection requires master_fingerprint for certificate pinning unless allow_unpinned_tls = true".to_string(),
+        ));
+    }
+
+    let server_verifier = Arc::new(PinnedServerCertVerifier::new(
+        master_fingerprint,
+        allow_unpinned_tls,
+    ));
 
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),

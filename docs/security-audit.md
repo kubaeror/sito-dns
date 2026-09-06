@@ -60,3 +60,37 @@ This document provides a comprehensive security review of **sito v1.0.0**, detai
 * **Mitigations Implemented:**
   1. **Minimum TLS 1.2:** Transports configured through `rustls` strictly enforce TLS 1.2 and TLS 1.3. Protocols prior to TLS 1.2 are entirely disabled at the library level and cannot be negotiated by connecting clients.
   2. **AEAD Cipher Suites:** Only authenticated encryption with associated data (AEAD) ciphers (such as TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256) are supported.
+
+---
+
+## 3. v1.2.1 Security & Architecture Audit Remediation
+
+Following the comprehensive code and architecture audit (`/docs/audit.md`), all 24 identified items across P0 through P3 severity levels were remediated and verified:
+
+| Issue | Severity | Description | Mitigation Implemented |
+|---|---|---|---|
+| **P0-1** | Critical | Setup wizard mutation without auth | Restricted `/ui/wizard` and `/ui/wizard/complete` to first-run setup or authenticated admin sessions; returns HTTP 403 once initialized. |
+| **P0-2** | Critical | Users not persisted across reboots | Persisted user database to `<data_dir>/users.toml`, wired `auth.user` and `auth.role` config sections, and restored accounts on daemon startup. |
+| **P0-3** | Critical | Updater accepted missing checksums | Enforced mandatory SHA256 checksum verification from `SHA256SUMS`, authenticated `/api/v1/system/update/check`, and restricted repo querying to `kubaeror/sito-dns`. |
+| **P0-4** | Critical | Installer generated incomplete config | Added default sections to generated configuration files and surfaced parsing warnings for corrupted sections. |
+| **P0-5** | Critical | Config and rewrites required daemon restart | Wired `ArcSwap` handles into the DNS query pipeline to allow instant, zero-downtime hot-reloading of config, rewrites, and client groups. |
+| **P1-6** | High | TTL clamping could produce invalid states | Enforced defensive TTL clamping and validated `negative_ttl_max >= min_ttl` at configuration validation time. |
+| **P1-7** | High | UDP head-of-line blocking under slow upstream | Spawned concurrent Tokio worker tasks per received UDP packet bounded by a high-capacity semaphore. |
+| **P1-8** | High | Unauthenticated HA slave replication | Mandated TLS certificate pinning for HA sync, rejected plain WebSockets by default, and required pre-shared token authentication for replicas. |
+| **P1-9** | High | Plain HTTP cookie leaks | Dynamically set the `Secure` flag on session cookies when served over TLS, and logged security warnings when binding plain HTTP to non-loopback addresses. |
+| **P1-10** | High | Memory exhaustion in auth state maps | Bounded lockout, session, and TOTP maps with maximum capacity limits and spawned a background pruner task running every 5 minutes. |
+| **P1-11** | High | Missing RBAC on metrics and UI mutations | Enforced strict role-based access control across all mutating UI routes and `/metrics`; documented OpenAPI documentation endpoints. |
+| **P2-12** | Medium | Hourly stats double counting | Added persistent watermark tracking in SQLite to prevent reprocessing query log rows during aggregation. |
+| **P2-13** | Medium | Query log SQL string interpolation | Converted dynamic query log filter construction to parameterized `sqlx::QueryBuilder` with `push_bind`. |
+| **P2-14** | Medium | Installer checksum failure ignored | Hardened `contrib/install.sh` to abort with non-zero exit code if SHA256SUMS is missing or fails validation. |
+| **P2-15** | Medium | Dead `refresh_hours` configuration | Removed deprecated and unreferenced `refresh_hours` controls from UI forms and configuration files. |
+| **P2-16** | Medium | DNSSEC mode unchecked | Validated DNSSEC mode (`off`, `process`, `log_fail`) at startup and logged validation outcomes in query logs. |
+| **P2-17** | Medium | Query logs dropped on graceful shutdown | Flushed and awaited query log background writer completion during server graceful shutdown. |
+| **P2-18** | Medium | Rule drop guard prevented deliberate deletions | Restricted drop-guard threshold checks exclusively to automated background refreshes. |
+| **P2-19** | Medium | Upstream bootstrap panic on empty list | Safely handled bootstrap resolution candidates using `.first()` rather than direct index slicing. |
+| **P2-20** | Medium | Upstream documentation and UI labels drift | Aligned UI labels, sample configs, and documentation to supported `tls://` and UDP upstream protocols. |
+| **P3-21** | Low | Code duplication and unrouted endpoints | Refactored pipeline with `QueryOutcome`, bounded prefetch tasks with a semaphore, consolidated HTML escapers, and routed missing client/rewrite endpoints. |
+| **P3-22** | Low | Unmodeled config keys omitted | Documented in configuration reference and changelog that atomic saves preserve modeled fields. |
+| **P3-23** | Low | Systemd sandbox permissions | Added `MemoryDenyWriteExecute`, `ProtectKernelTunables`, `ProtectKernelModules`, `ProtectControlGroups`, and `SystemCallFilter=@system-service` hardening directives to systemd unit. |
+| **P3-24** | Low | Missing axum json feature dependency | Explicitly added `"json"` feature to workspace `axum` dependency. |
+

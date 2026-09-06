@@ -218,4 +218,40 @@ mod tests {
             RData::A(A(std::net::Ipv4Addr::new(1, 2, 3, 4)))
         );
     }
+
+    #[tokio::test]
+    async fn test_cache_insert_does_not_panic_when_min_ttl_exceeds_negative_max() {
+        // min_ttl (300) > negative_ttl_max (60)
+        let config = make_test_config(300, 3600, 60);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("nx.test.").unwrap();
+        let mut query = Message::new(10, MessageType::Query, OpCode::Query);
+        query
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+
+        let mut response = Message::response(10, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.metadata.response_code = ResponseCode::NXDomain;
+        response.authorities.push(Record::from_rdata(
+            Name::from_str("test.").unwrap(),
+            300,
+            RData::SOA(SOA::new(
+                Name::from_str("ns1.test.").unwrap(),
+                Name::from_str("hostmaster.test.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                120,
+            )),
+        ));
+
+        // Must not panic on clamp!
+        cache.insert(&query, &response).await;
+
+        let cached = cache.get(&qname, RecordType::A, DNSClass::IN).await;
+        assert!(cached.is_some());
+    }
 }

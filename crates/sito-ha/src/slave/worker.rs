@@ -298,6 +298,7 @@ async fn connect_and_run(
             ha_config.cert.as_deref(),
             ha_config.key.as_deref(),
             ha_config.master_fingerprint.as_deref(),
+            ha_config.allow_unpinned_tls,
         )?;
 
         let server_name = ServerName::try_from(host.clone())
@@ -328,6 +329,13 @@ async fn connect_and_run(
         )
         .await
     } else {
+        if !ha_config.allow_insecure_ws {
+            return Err(HaError::Validation {
+                field: "master_url".to_string(),
+                reason: "Plaintext ws:// replication is rejected by default. Use wss:// or explicitly set allow_insecure_ws = true".to_string(),
+            });
+        }
+
         let (ws_stream, _) = tokio_tungstenite::client_async(master_url, tcp_stream)
             .await
             .map_err(|e| {
@@ -365,6 +373,7 @@ where
         instance: tracker.instance_name.clone(),
         have_version,
         capabilities: vec!["stats-v1".to_string()],
+        token: ha_config.slave_token.clone(),
     };
     ws_stream
         .send(WsMessage::Text(hello.to_json()?.into()))
@@ -397,6 +406,7 @@ where
                     instance: tracker.instance_name.clone(),
                     have_version: cur_v,
                     capabilities: vec!["stats-v1".to_string()],
+                    token: ha_config.slave_token.clone(),
                 };
                 let _ = ws_stream.send(WsMessage::Text(hello.to_json()?.into())).await;
             }

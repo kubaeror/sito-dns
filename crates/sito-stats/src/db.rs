@@ -5,7 +5,6 @@ use crate::error::StatsError;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Pool, Row, Sqlite};
-use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -80,6 +79,11 @@ pub struct StatsDb {
 }
 
 impl StatsDb {
+    /// Returns a reference to the underlying SQLite connection pool.
+    pub fn pool(&self) -> &Pool<Sqlite> {
+        &self.pool
+    }
+
     /// Opens or creates an in-memory SQLite database (primarily for testing).
     pub async fn in_memory() -> Result<Self, StatsError> {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")?
@@ -180,46 +184,52 @@ impl StatsDb {
         let limit = filter.limit.unwrap_or(50).clamp(1, 1000);
         let fetch_limit = limit + 1;
 
-        let mut query_builder = String::from(
+        let mut builder: sqlx::QueryBuilder<Sqlite> = sqlx::QueryBuilder::new(
             "SELECT id, ts, client_ip, client_name, qname, qtype, rcode, verdict, rule, list_source, upstream, elapsed_us, dnssec, proto FROM query_log WHERE 1=1",
         );
 
         if let Some(cursor) = filter.cursor {
-            let _ = write!(query_builder, " AND id < {cursor}");
+            builder.push(" AND id < ");
+            builder.push_bind(cursor);
         }
         if let Some(from) = filter.from {
-            let _ = write!(query_builder, " AND ts >= {from}");
+            builder.push(" AND ts >= ");
+            builder.push_bind(from);
         }
         if let Some(to) = filter.to {
-            let _ = write!(query_builder, " AND ts <= {to}");
+            builder.push(" AND ts <= ");
+            builder.push_bind(to);
         }
         if let Some(ref status) = filter.status {
-            let _ = write!(
-                query_builder,
-                " AND verdict = '{}'",
-                status.replace('\'', "''")
-            );
+            builder.push(" AND verdict = ");
+            builder.push_bind(status);
         }
         if let Some(qtype) = filter.qtype {
-            let _ = write!(query_builder, " AND qtype = {qtype}");
+            builder.push(" AND qtype = ");
+            builder.push_bind(i64::from(qtype));
         }
         if let Some(ref client) = filter.client {
-            let escaped = client.replace('\'', "''");
-            let _ = write!(
-                query_builder,
-                " AND (client_ip = '{escaped}' OR client_name = '{escaped}')"
-            );
+            builder.push(" AND (client_ip = ");
+            builder.push_bind(client);
+            builder.push(" OR client_name = ");
+            builder.push_bind(client);
+            builder.push(")");
         }
         if let Some(ref domain) = filter.domain {
-            let escaped = domain.replace('\'', "''").replace('%', "\\%");
-            let _ = write!(query_builder, " AND qname LIKE '%{escaped}%'");
+            builder.push(" AND qname LIKE ");
+            let escaped = domain
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let pattern = format!("%{escaped}%");
+            builder.push_bind(pattern);
+            builder.push(" ESCAPE '\\'");
         }
 
-        let _ = write!(query_builder, " ORDER BY id DESC LIMIT {fetch_limit}");
+        builder.push(" ORDER BY id DESC LIMIT ");
+        builder.push_bind(i64::try_from(fetch_limit).unwrap_or(1001));
 
-        let rows = sqlx::query(sqlx::AssertSqlSafe(query_builder.as_str()))
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = builder.build().fetch_all(&self.pool).await?;
 
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
@@ -485,6 +495,15 @@ impl StatsDb {
         Ok(stats)
     }
 
+    /// Returns the watermark (last_id, last_ts) for a given key, or None if not set.
+    pub async fn get_watermark(&self, key: &str) -> Result<Option<(i64, i64)>, StatsError> {
+        let row = sqlx::query("SELECT last_id, last_ts FROM stats_watermark WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| (r.get("last_id"), r.get("last_ts"))))
+    }
+
     /// Aggregates older logs into `stats_hourly` and prunes query logs older than retention period.
     pub async fn cleanup_retention(
         &self,
@@ -494,24 +513,36 @@ impl StatsDb {
         let retention_ms = i64::from(retention_days) * 24 * 3600 * 1000;
         let cutoff = now_ms.saturating_sub(retention_ms);
 
-        // Aggregate hourly buckets
+        let watermark_id: i64 = sqlx::query_scalar(
+            "SELECT last_id FROM stats_watermark WHERE key = 'hourly_aggregation'",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(0);
+
+        // Aggregate hourly buckets for entries newer than watermark up to cutoff
         let hours_to_aggregate = sqlx::query(
             r"
             SELECT
                 (ts / 3600000) * 3600000 as hour,
                 COUNT(*) as queries,
                 SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) as blocked,
-                SUM(CASE WHEN verdict = 'stale' OR rule = 'cache' THEN 1 ELSE 0 END) as cached
+                SUM(CASE WHEN verdict = 'stale' OR rule = 'cache' THEN 1 ELSE 0 END) as cached,
+                MAX(id) as max_id,
+                MAX(ts) as max_ts
             FROM query_log
-            WHERE ts < ?
+            WHERE ts < ? AND id > ?
             GROUP BY hour
             ",
         )
         .bind(cutoff)
+        .bind(watermark_id)
         .fetch_all(&self.pool)
         .await?;
 
         let mut aggregated_hours = 0;
+        let mut max_seen_id = watermark_id;
+        let mut max_seen_ts = 0i64;
         let mut tx = self.pool.begin().await?;
 
         for row in hours_to_aggregate {
@@ -519,6 +550,12 @@ impl StatsDb {
             let queries: i64 = row.get::<Option<i64>, _>("queries").unwrap_or(0);
             let blocked: i64 = row.get::<Option<i64>, _>("blocked").unwrap_or(0);
             let cached: i64 = row.get::<Option<i64>, _>("cached").unwrap_or(0);
+            if let Some(mid) = row.get::<Option<i64>, _>("max_id") {
+                max_seen_id = max_seen_id.max(mid);
+            }
+            if let Some(mts) = row.get::<Option<i64>, _>("max_ts") {
+                max_seen_ts = max_seen_ts.max(mts);
+            }
 
             sqlx::query(
                 r"
@@ -538,6 +575,22 @@ impl StatsDb {
             .await?;
 
             aggregated_hours += 1;
+        }
+
+        if max_seen_id > watermark_id {
+            sqlx::query(
+                r"
+                INSERT INTO stats_watermark (key, last_id, last_ts)
+                VALUES ('hourly_aggregation', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    last_id = excluded.last_id,
+                    last_ts = excluded.last_ts
+                ",
+            )
+            .bind(max_seen_id)
+            .bind(max_seen_ts)
+            .execute(&mut *tx)
+            .await?;
         }
 
         // Delete pruned rows

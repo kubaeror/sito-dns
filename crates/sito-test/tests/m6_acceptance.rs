@@ -207,3 +207,57 @@ async fn test_embedded_ui_api_route_not_found_returns_problem_details() {
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
+
+#[cfg(feature = "embed-ui")]
+#[tokio::test]
+async fn test_wizard_gate_forbidden_after_setup() {
+    let (ctx, temp_dir) = create_test_context().await;
+
+    // 1. In first-run, unauthenticated POST /ui/wizard/complete succeeds
+    let app = create_router(ctx.clone());
+    let form_body =
+        "admin_user=admin&admin_password=newpassword123&upstream=1.1.1.1&enable_adblock=on";
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ui/wizard/complete")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(form_body))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    // 2. After setup is complete, unauthenticated POST /ui/wizard/complete is rejected with 403
+    let app2 = create_router(ctx.clone());
+    let req2 = Request::builder()
+        .method("POST")
+        .uri("/ui/wizard/complete")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(
+            "admin_user=admin&admin_password=hacked123&upstream=8.8.8.8",
+        ))
+        .unwrap();
+
+    let resp2 = app2.oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
+
+    // 3. Unauthenticated GET /wizard redirects to /login
+    let app3 = create_router(ctx.clone());
+    let req3 = Request::builder()
+        .uri("/wizard")
+        .body(Body::empty())
+        .unwrap();
+    let resp3 = app3.oneshot(req3).await.unwrap();
+    assert_eq!(resp3.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp3
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "/login"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}

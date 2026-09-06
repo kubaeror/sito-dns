@@ -2591,7 +2591,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
- "tower-http 0.6.11",
+ "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -2995,7 +2995,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sito"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3029,7 +3029,7 @@ dependencies = [
 
 [[package]]
 name = "sito-api"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3062,7 +3062,6 @@ dependencies = [
  "tokio",
  "toml",
  "totp-rs",
- "tower-http 0.7.1",
  "tracing",
  "utoipa",
  "utoipa-swagger-ui",
@@ -3070,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "sito-cache"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "moka",
  "sito-core",
@@ -3081,7 +3080,7 @@ dependencies = [
 
 [[package]]
 name = "sito-clients"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "chrono",
  "croner",
@@ -3097,18 +3096,19 @@ dependencies = [
 
 [[package]]
 name = "sito-core"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "arc-swap",
  "hickory-proto",
  "serde",
  "thiserror",
  "toml",
+ "tracing",
 ]
 
 [[package]]
 name = "sito-dnssec"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
@@ -3122,7 +3122,7 @@ dependencies = [
 
 [[package]]
 name = "sito-filter"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -3142,7 +3142,7 @@ dependencies = [
 
 [[package]]
 name = "sito-ha"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3173,7 +3173,7 @@ dependencies = [
 
 [[package]]
 name = "sito-proto"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "hickory-proto",
  "idna",
@@ -3183,7 +3183,7 @@ dependencies = [
 
 [[package]]
 name = "sito-rewrites"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "hickory-proto",
  "serde",
@@ -3197,7 +3197,7 @@ dependencies = [
 
 [[package]]
 name = "sito-stats"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "chrono",
  "serde",
@@ -3212,7 +3212,7 @@ dependencies = [
 
 [[package]]
 name = "sito-test"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3262,7 +3262,7 @@ dependencies = [
 
 [[package]]
 name = "sito-transport"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3297,7 +3297,7 @@ dependencies = [
 
 [[package]]
 name = "sito-upstream"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3894,23 +3894,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "url",
-]
-
-[[package]]
-name = "tower-http"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08a05a66a4fdd61cbbe0a1d755ffe0ca6aba159dd4820936a0ff8a8278245b9c"
-dependencies = [
- "bitflags",
- "bytes",
- "http",
- "http-body",
- "percent-encoding",
- "pin-project-lite",
- "tower-layer",
- "tower-service",
- "tracing",
 ]
 
 [[package]]

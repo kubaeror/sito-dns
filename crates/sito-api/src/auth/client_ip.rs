@@ -69,6 +69,34 @@ pub fn resolve_client_ip(
     "127.0.0.1".to_string()
 }
 
+/// Determines if the request arrived over HTTPS, either directly (if server is configured with TLS)
+/// or via a trusted reverse proxy with `X-Forwarded-Proto: https`.
+pub fn is_https_request(
+    peer_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trusted_proxies: &[IpAddr],
+    tls_enabled: bool,
+) -> bool {
+    if tls_enabled {
+        return true;
+    }
+
+    if let Some(peer) = peer_addr {
+        if trusted_proxies.contains(&peer.ip())
+            && let Some(proto) = headers.get("x-forwarded-proto")
+            && let Ok(val) = proto.to_str()
+        {
+            return val.eq_ignore_ascii_case("https");
+        }
+    } else if let Some(proto) = headers.get("x-forwarded-proto")
+        && let Ok(val) = proto.to_str()
+    {
+        return val.eq_ignore_ascii_case("https");
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +154,28 @@ mod tests {
         let empty_headers = HeaderMap::new();
         let default_ip = resolve_client_ip(None, &empty_headers, &[]);
         assert_eq!(default_ip, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_is_https_request() {
+        let empty_headers = HeaderMap::new();
+        assert!(!is_https_request(None, &empty_headers, &[], false));
+        assert!(is_https_request(None, &empty_headers, &[], true));
+
+        let mut https_headers = HeaderMap::new();
+        https_headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(is_https_request(None, &https_headers, &[], false));
+
+        let proxy_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let peer = SocketAddr::new(proxy_ip, 12345);
+        // Untrusted proxy
+        assert!(!is_https_request(Some(peer), &https_headers, &[], false));
+        // Trusted proxy
+        assert!(is_https_request(
+            Some(peer),
+            &https_headers,
+            &[proxy_ip],
+            false
+        ));
     }
 }

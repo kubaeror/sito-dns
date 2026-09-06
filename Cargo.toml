@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 rust-version = "1.98.1"
 license = "GPL-3.0-only"
@@ -59,13 +59,12 @@ rustls-pki-types = { version = "1.15", features = ["std"] }
 rcgen = "0.14"
 base64 = "0.23"
 notify = "8.2"
-axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "matched-path", "query", "ws", "form"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "matched-path", "query", "ws", "form", "json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 hex = "0.4"
 hyper = { version = "1.11", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "http1", "http2", "service"] }
 x509-parser = "0.18"
-tower-http = { version = "0.7", features = ["cors", "trace"] }
 rust-embed = "8.12"
 mime_guess = "2.0"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -85,20 +84,20 @@ tar = "0.4"
 utoipa = { version = "5.5", features = ["axum_extras"] }
 
 # Internal workspace dependencies
-sito = { path = "crates/sito", version = "1.2.0" }
-sito-core = { path = "crates/sito-core", version = "1.2.0" }
-sito-proto = { path = "crates/sito-proto", version = "1.2.0" }
-sito-transport = { path = "crates/sito-transport", version = "1.2.0" }
-sito-upstream = { path = "crates/sito-upstream", version = "1.2.0" }
-sito-cache = { path = "crates/sito-cache", version = "1.2.0" }
-sito-filter = { path = "crates/sito-filter", version = "1.2.0" }
-sito-dnssec = { path = "crates/sito-dnssec", version = "1.2.0" }
-sito-clients = { path = "crates/sito-clients", version = "1.2.0" }
-sito-rewrites = { path = "crates/sito-rewrites", version = "1.2.0" }
-sito-api = { path = "crates/sito-api", version = "1.2.0" }
-sito-stats = { path = "crates/sito-stats", version = "1.2.0" }
-sito-ha = { path = "crates/sito-ha", version = "1.2.0" }
-sito-test = { path = "crates/sito-test", version = "1.2.0" }
+sito = { path = "crates/sito", version = "1.2.1" }
+sito-core = { path = "crates/sito-core", version = "1.2.1" }
+sito-proto = { path = "crates/sito-proto", version = "1.2.1" }
+sito-transport = { path = "crates/sito-transport", version = "1.2.1" }
+sito-upstream = { path = "crates/sito-upstream", version = "1.2.1" }
+sito-cache = { path = "crates/sito-cache", version = "1.2.1" }
+sito-filter = { path = "crates/sito-filter", version = "1.2.1" }
+sito-dnssec = { path = "crates/sito-dnssec", version = "1.2.1" }
+sito-clients = { path = "crates/sito-clients", version = "1.2.1" }
+sito-rewrites = { path = "crates/sito-rewrites", version = "1.2.1" }
+sito-api = { path = "crates/sito-api", version = "1.2.1" }
+sito-stats = { path = "crates/sito-stats", version = "1.2.1" }
+sito-ha = { path = "crates/sito-ha", version = "1.2.1" }
+sito-test = { path = "crates/sito-test", version = "1.2.1" }
 
 [workspace.lints.rust]
 # Future Rust lints can be specified here

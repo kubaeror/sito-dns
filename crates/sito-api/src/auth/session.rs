@@ -41,21 +41,28 @@ impl Session {
     }
 
     pub fn to_cookie_header(&self) -> String {
+        self.to_cookie_header_secure(true)
+    }
+
+    pub fn to_cookie_header_secure(&self, secure: bool) -> String {
         let max_age = self.expires_at - chrono::Utc::now().timestamp();
-        build_session_cookie(&self.id, max_age.max(0))
+        build_session_cookie(&self.id, max_age.max(0), secure)
     }
 }
 
-/// Generates a Set-Cookie header value conforming to `HttpOnly; Secure; SameSite=Strict; Path=/`.
-pub fn build_session_cookie(session_id: &str, max_age_secs: i64) -> String {
+/// Generates a Set-Cookie header value conforming to `HttpOnly; SameSite=Strict; Path=/`,
+/// conditionally including `Secure` if `secure` is true.
+pub fn build_session_cookie(session_id: &str, max_age_secs: i64, secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
     format!(
-        "sito_session={session_id}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age_secs}"
+        "sito_session={session_id}; Path=/; HttpOnly{secure_attr}; SameSite=Strict; Max-Age={max_age_secs}"
     )
 }
 
 /// Generates a Set-Cookie header value to clear the session cookie.
-pub fn build_clear_session_cookie() -> String {
-    "sito_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0".to_string()
+pub fn build_clear_session_cookie(secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!("sito_session=; Path=/; HttpOnly{secure_attr}; SameSite=Strict; Max-Age=0")
 }
 
 /// Extracts the session ID from a Cookie header string.
@@ -82,16 +89,25 @@ mod tests {
         assert_eq!(session.id.len(), 64);
         assert!(!session.is_expired());
 
-        let cookie = build_session_cookie(&session.id, 3600);
+        let cookie = build_session_cookie(&session.id, 3600, true);
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains(&session.id));
 
+        let plain_cookie = build_session_cookie(&session.id, 3600, false);
+        assert!(plain_cookie.contains("HttpOnly"));
+        assert!(!plain_cookie.contains("Secure"));
+
         let extracted = extract_session_cookie(&format!("theme=dark; {cookie}; lang=en"));
         assert_eq!(extracted, Some(session.id));
 
-        let clear = build_clear_session_cookie();
+        let clear = build_clear_session_cookie(true);
         assert!(clear.contains("Max-Age=0"));
+        assert!(clear.contains("Secure"));
+
+        let clear_plain = build_clear_session_cookie(false);
+        assert!(clear_plain.contains("Max-Age=0"));
+        assert!(!clear_plain.contains("Secure"));
     }
 }

@@ -17,13 +17,19 @@ pub enum Role {
     Admin = 3,
 }
 
+impl Role {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Operator => "operator",
+            Self::Admin => "admin",
+        }
+    }
+}
+
 impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Viewer => write!(f, "viewer"),
-            Self::Operator => write!(f, "operator"),
-            Self::Admin => write!(f, "admin"),
-        }
+        write!(f, "{}", self.as_str())
     }
 }
 

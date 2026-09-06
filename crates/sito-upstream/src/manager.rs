@@ -57,7 +57,9 @@ async fn create_managed_entry(
 
             // Resolve hostname via bootstrap
             let resolved_ips = bootstrap.resolve_hostname(host).await?;
-            let target_ip = resolved_ips[0];
+            let target_ip = resolved_ips.first().copied().ok_or_else(|| {
+                UpstreamError::BadResponse(format!("no IP addresses resolved for '{host}'"))
+            })?;
             let socket_addr = SocketAddr::new(target_ip, port);
 
             let dot = DotUpstream::new(socket_addr, host.to_string(), timeout_duration, pool_size)?;
@@ -76,7 +78,10 @@ async fn create_managed_entry(
                 };
 
                 let resolved_ips = bootstrap.resolve_hostname(host).await?;
-                SocketAddr::new(resolved_ips[0], port)
+                let target_ip = resolved_ips.first().copied().ok_or_else(|| {
+                    UpstreamError::BadResponse(format!("no IP addresses resolved for '{host}'"))
+                })?;
+                SocketAddr::new(target_ip, port)
             };
 
             let plain = PlainUpstream::new(socket_addr, timeout_duration);
@@ -88,6 +93,12 @@ async fn create_managed_entry(
         upstream,
         health: Arc::new(RwLock::new(UpstreamHealth::new())),
     })
+}
+
+fn clean_rule_domain(d: &str) -> String {
+    let s = d.trim().to_lowercase();
+    let s = s.trim_start_matches('*').trim_start_matches('.');
+    s.trim_end_matches('.').to_string()
 }
 
 impl UpstreamManager {
@@ -115,7 +126,13 @@ impl UpstreamManager {
                         .await?,
                 );
             }
-            per_domain_rules.push((pd.domains.clone(), pd_entries));
+            let cleaned_domains = pd
+                .domains
+                .iter()
+                .map(|d| clean_rule_domain(d))
+                .filter(|d| !d.is_empty())
+                .collect();
+            per_domain_rules.push((cleaned_domains, pd_entries));
         }
 
         Ok(Self {
@@ -159,6 +176,11 @@ impl UpstreamManager {
         self.per_domain_rules = rules
             .into_iter()
             .map(|(domains, upstreams)| {
+                let cleaned_domains = domains
+                    .iter()
+                    .map(|d| clean_rule_domain(d))
+                    .filter(|d| !d.is_empty())
+                    .collect();
                 let entries = upstreams
                     .into_iter()
                     .map(|(name, upstream)| ManagedEntry {
@@ -167,7 +189,7 @@ impl UpstreamManager {
                         health: Arc::new(RwLock::new(UpstreamHealth::new())),
                     })
                     .collect();
-                (domains, entries)
+                (cleaned_domains, entries)
             })
             .collect();
         self
@@ -204,10 +226,8 @@ impl UpstreamManager {
             let qname_clean = qname_str.trim_end_matches('.');
             for (domains, group) in &self.per_domain_rules {
                 for d in domains {
-                    let d_clean = d.trim().to_lowercase();
-                    let d_clean = d_clean.trim_end_matches('.');
-                    if !d_clean.is_empty()
-                        && (qname_clean == d_clean || qname_clean.ends_with(&format!(".{d_clean}")))
+                    if let Some(prefix) = qname_clean.strip_suffix(d.as_str())
+                        && (prefix.is_empty() || prefix.ends_with('.'))
                     {
                         debug!(
                             "Routing query for {} to per-domain upstreams {:?}",
