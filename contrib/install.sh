@@ -179,7 +179,6 @@ custom_rules = []
 name = "OISD Big"
 url = "https://big.oisd.nl"
 enabled = true
-refresh_hours = 24
 
 [rewrites]
 auto_ptr = true

@@ -152,7 +152,6 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
             f'name = "{name}"',
             f'url = "{url}"',
             f"enabled = {enabled}",
-            "refresh_hours = 24",
             "",
         ])
 

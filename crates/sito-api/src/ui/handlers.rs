@@ -542,7 +542,8 @@ pub async fn filtering_toggle_handler(
 pub struct AddFilterListForm {
     pub name: String,
     pub url: String,
-    pub refresh_hours: u32,
+    #[serde(default)]
+    pub refresh_hours: Option<u32>,
 }
 
 pub async fn filtering_add_handler(
@@ -562,7 +563,7 @@ pub async fn filtering_add_handler(
         name: form.name,
         url: form.url,
         enabled: true,
-        refresh_hours: Some(u64::from(form.refresh_hours)),
+        refresh_hours: form.refresh_hours.map(u64::from),
     });
     let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
     ctx.config.store(Arc::new(new_cfg.clone()));

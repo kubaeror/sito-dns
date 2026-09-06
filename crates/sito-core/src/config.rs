@@ -911,6 +911,8 @@ pub struct FilterListConfig {
     pub url: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Deprecated/legacy per-list refresh interval.
+    /// Ignored by scheduler; global `FilteringConfig.refresh_interval_hours` is used instead.
     #[serde(default)]
     pub refresh_hours: Option<u64>,
 }
