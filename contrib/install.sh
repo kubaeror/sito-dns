@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO="kubaeror/sito-dns"
-SITO_VERSION="${SITO_VERSION:-1.3.0}"
+SITO_VERSION="${SITO_VERSION:-1.4.0}"
 INSTALL_BIN="/usr/local/bin/sito"
 CONFIG_DIR="/etc/sito"
 DATA_DIR="/var/lib/sito"

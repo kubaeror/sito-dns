@@ -5,6 +5,35 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.4.0] - 2026-09-06
+
+### First-Time Setup Wizard & Installer Hardening
+
+#### First-Time Setup & Bootstrap Mode
+- **Web-Based First-Time Setup Wizard**: When `config.toml` is missing at startup, the server boots into an in-memory bootstrap `setup_pending` mode, serving only the web panel on port 8080 and delaying DNS listener port bindings until setup is finished.
+- **Route Gating Middleware**: While in `setup_pending` mode, all UI requests redirect (HTTP 302) to `/wizard`, API v1 endpoints return HTTP 503 `Setup not completed`, while `/wizard`, static assets, and upstream testing are permitted.
+- **Expanded 6-Section Setup Wizard**: Implemented a comprehensive single-page wizard with pre-filled defaults covering:
+  1. Administrator Account (username, password, confirm password)
+  2. DNS Listeners & Protocols (IPv4/IPv6 bindings, UDP/TCP 53, DoT 853, DoH 443, DoQ disabled by default)
+  3. Upstream Resolvers (presets for Cloudflare, Quad9, Google, resolution strategies, bootstrap IPs, and live HTMX latency testing)
+  4. Cache & DNSSEC (local cache toggle, cache size, DNSSEC modes and validation)
+  5. Filtering & Protection (blocking modes, CNAME cloaking defense, and one-click presets for OISD Big, OISD Small, StevenBlack, and HaGeZi Pro)
+  6. Web Panel & Statistics (binding address, port, and query log retention days)
+- **Headless Mode (`--no-setup`)**: Added `--no-setup` CLI flag to bypass wizard gating and immediately initialize all services with default configuration for automated or headless deployments.
+- **In-Process DNS Listener Startup**: DNS listener pipelines are spawned in-process upon wizard completion without requiring a daemon restart.
+
+#### Installer Hardening & Supply Chain Security
+- **Config Generation Removed**: `contrib/install.sh` no longer writes a static `config.toml` or prints default credentials, directing operators to complete setup via the web wizard.
+- **Download Retries & Backoff**: Added retry logic (up to 3 attempts with exponential backoff) and removed error swallowing.
+- **Cosign Verification**: Added optional Cosign keyless signature verification for release archives with fallback to SHA-256 checksum validation.
+- **Upgrade Detection & Backup**: Automatically detects existing installations and backs up the existing binary to `/usr/local/bin/sito.bak`.
+- **Post-Install Health Check**: Added automated post-install health checks verifying `systemctl is-active` and HTTP server response, printing journal diagnostics on failure.
+- **Firewall Guidance**: Added UFW and firewalld rule instructions to the installation summary.
+- **CI ShellCheck Job**: Integrated automated shellcheck validation in both `.github/workflows/ci.yml` and `.github/workflows/release.yml`.
+- **Port Conflict Fix**: Disabled DoQ by default (`doq_port = 0`) to eliminate default port collision with DoT on port 853.
+
+---
+
 ## [1.3.0] - 2026-09-06
 
 ### Security, Performance & Operational Audit Remediation (Audit 2)

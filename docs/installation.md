@@ -17,8 +17,9 @@ The installer automatically:
 2. Fetches the latest signed release binary and verifies SHA256 checksums.
 3. Creates the unprivileged system user `sito`.
 4. Grants `CAP_NET_BIND_SERVICE` capability to bind ports 53 and 443 without root.
-5. Deploys the hardened systemd unit and enables the service.
-6. Opens the web panel URL at `http://<server-ip>:8080`.
+5. Deploys the hardened systemd unit, enables, and starts the service.
+6. Runs post-install health verification (`systemctl is-active` and HTTP check).
+7. Prompts you to complete setup via the web wizard at `http://<server-ip>:8080`.
 
 ---
 
@@ -57,8 +58,12 @@ sudo chmod 755 /usr/local/bin/sito
 sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito
 ```
 
-### 2.4 Configuration Skeleton
-Create `/etc/sito/config.toml`:
+### 2.4 Configuration Skeleton (Optional)
+> [!NOTE]
+> On a clean boot without an existing `config.toml`, **sito** starts in **setup-pending mode** serving only the web panel on port 8080. You can simply open `http://<server-ip>:8080` to generate your configuration via the web wizard, or pass `--no-setup` to boot immediately with built-in defaults.
+>
+> If you prefer to supply configuration up-front, create `/etc/sito/config.toml`:
+
 ```toml
 config_version = 1
 
@@ -73,6 +78,7 @@ bind = ["0.0.0.0", "::"]
 port = 53
 dot_port = 853
 doh_port = 443
+doq_port = 0
 
 [upstream]
 servers = ["tls://dns.quad9.net", "1.1.1.1:53"]
@@ -90,7 +96,7 @@ enabled = true
 
 [web]
 port = 8080
-bind = ["0.0.0.0"]
+bind = "0.0.0.0"
 ```
 
 ### 2.5 Install Systemd Unit

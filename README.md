@@ -117,14 +117,28 @@ volumes:
 # Build release binary with embedded Web UI and mimalloc allocator
 cargo build --release --locked --features "embed-ui,mimalloc"
 
-# Verify configuration
+# Verify configuration (if an existing config.toml is provided)
 ./target/release/sito check-config --config /etc/sito/config.toml
 
-# Start daemon
+# Start daemon (if config is missing, boots into setup wizard mode on port 8080)
 ./target/release/sito --config /etc/sito/config.toml
+
+# For headless environments, skip the wizard and boot immediately with secure defaults:
+./target/release/sito --no-setup
 ```
 
-Once started, navigate to `http://localhost:8080` to access the reactive HTMX administration web panel (Dashboard, Query Log, Filter Subscriptions, Custom Rules Editor, Local Rewrites, Clients, Upstream Latency Tester, System Settings). Initial credentials: `admin` / `adminadmin`.
+### 🧙 First-Time Setup Wizard
+On a fresh installation without a configuration file, **sito** starts in **setup-pending mode** on port `8080` (DNS listener ports 53/853/443 remain closed until initial setup is confirmed).
+
+Open **`http://<server-ip>:8080`** in any browser to launch the 6-section configuration wizard:
+* **Administrator Account:** Set custom admin username and password (or defaults).
+* **DNS Listeners:** Configure IPv4/IPv6 bindings, UDP/TCP, DoT, and DoH ports.
+* **Upstream Resolvers:** Select presets (Cloudflare, Quad9, Google) with live latency testing.
+* **Cache & DNSSEC:** Tune in-memory cache and cryptographic DNSSEC validation.
+* **Filtering:** Choose blocking modes, enable CNAME cloaking defense, and subscribe to popular blocklists (OISD, StevenBlack, HaGeZi).
+* **Web Panel & Statistics:** Configure web bind and retention policies.
+
+Once setup is submitted, DNS listeners are bound in-process without needing a server restart.
 
 Swagger UI / OpenAPI documentation is available at `http://localhost:8080/swagger-ui`.
 
