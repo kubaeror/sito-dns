@@ -95,6 +95,12 @@ async fn create_managed_entry(
     })
 }
 
+fn clean_rule_domain(d: &str) -> String {
+    let s = d.trim().to_lowercase();
+    let s = s.trim_start_matches('*').trim_start_matches('.');
+    s.trim_end_matches('.').to_string()
+}
+
 impl UpstreamManager {
     /// Create an UpstreamManager from configuration and bootstrap resolver.
     pub async fn from_config(
@@ -120,7 +126,13 @@ impl UpstreamManager {
                         .await?,
                 );
             }
-            per_domain_rules.push((pd.domains.clone(), pd_entries));
+            let cleaned_domains = pd
+                .domains
+                .iter()
+                .map(|d| clean_rule_domain(d))
+                .filter(|d| !d.is_empty())
+                .collect();
+            per_domain_rules.push((cleaned_domains, pd_entries));
         }
 
         Ok(Self {
@@ -164,6 +176,11 @@ impl UpstreamManager {
         self.per_domain_rules = rules
             .into_iter()
             .map(|(domains, upstreams)| {
+                let cleaned_domains = domains
+                    .iter()
+                    .map(|d| clean_rule_domain(d))
+                    .filter(|d| !d.is_empty())
+                    .collect();
                 let entries = upstreams
                     .into_iter()
                     .map(|(name, upstream)| ManagedEntry {
@@ -172,7 +189,7 @@ impl UpstreamManager {
                         health: Arc::new(RwLock::new(UpstreamHealth::new())),
                     })
                     .collect();
-                (domains, entries)
+                (cleaned_domains, entries)
             })
             .collect();
         self
@@ -209,10 +226,8 @@ impl UpstreamManager {
             let qname_clean = qname_str.trim_end_matches('.');
             for (domains, group) in &self.per_domain_rules {
                 for d in domains {
-                    let d_clean = d.trim().to_lowercase();
-                    let d_clean = d_clean.trim_end_matches('.');
-                    if !d_clean.is_empty()
-                        && (qname_clean == d_clean || qname_clean.ends_with(&format!(".{d_clean}")))
+                    if let Some(prefix) = qname_clean.strip_suffix(d.as_str())
+                        && (prefix.is_empty() || prefix.ends_with('.'))
                     {
                         debug!(
                             "Routing query for {} to per-domain upstreams {:?}",

@@ -728,6 +728,44 @@
       }
     },
     "/api/v1/clients/groups/{name}": {
+      "get": {
+        "tags": [
+          "Clients"
+        ],
+        "operationId": "get_client_group_by_name",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Group name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Client group retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientGroupDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not Found"
+          }
+        }
+      },
       "put": {
         "tags": [
           "Clients"
@@ -813,6 +851,44 @@
       }
     },
     "/api/v1/clients/{name}": {
+      "get": {
+        "tags": [
+          "Clients"
+        ],
+        "operationId": "get_client_by_name",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Client name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Client details retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not Found"
+          }
+        }
+      },
       "put": {
         "tags": [
           "Clients"
@@ -1903,6 +1979,54 @@
       }
     },
     "/api/v1/rewrites/{id}": {
+      "put": {
+        "tags": [
+          "Rewrites"
+        ],
+        "operationId": "update_rewrite",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Rewrite index ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddRewriteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "DNS rewrite updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RewriteDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Not Found"
+          }
+        }
+      },
       "delete": {
         "tags": [
           "Rewrites"

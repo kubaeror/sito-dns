@@ -62,6 +62,8 @@ fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
 
 pub fn get_session_user(ctx: &ServerContext, headers: &HeaderMap) -> Option<AuthUser> {
@@ -1246,14 +1248,6 @@ pub async fn system_reload_handler(
     Redirect::to("/system").into_response()
 }
 
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
-}
-
 pub async fn system_update_check_handler(
     State(ctx): State<ServerContext>,
     headers: HeaderMap,
@@ -1300,7 +1294,7 @@ pub async fn system_update_check_handler(
                     info.latest_version,
                     info.current_version,
                     info.release_url,
-                    html_escape(&info.release_notes),
+                    escape_html(&info.release_notes),
                     install_or_docker
                 )).into_response()
             } else {
@@ -1328,7 +1322,7 @@ pub async fn system_update_check_handler(
                         Retry
                     </button>
                 </div>"##,
-                html_escape(&e.to_string())
+                escape_html(&e.to_string())
             )).into_response()
         }
     }
@@ -1356,7 +1350,7 @@ pub async fn system_update_apply_handler(
                 <div style="font-weight: 600; color: var(--success); margin-bottom: 4px;">Update Successful!</div>
                 <div style="font-size: 0.875rem; color: var(--text-primary);">{}</div>
             </div>"#,
-            html_escape(&msg)
+            escape_html(&msg)
         )).into_response(),
         Err(e) => axum::response::Html(format!(
             r##"<div>
@@ -1367,7 +1361,7 @@ pub async fn system_update_apply_handler(
                     Back to Update Status
                 </button>
             </div>"##,
-            html_escape(&e.to_string())
+            escape_html(&e.to_string())
         )).into_response(),
     }
 }

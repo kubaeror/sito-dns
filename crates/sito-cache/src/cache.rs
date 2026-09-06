@@ -267,4 +267,14 @@ impl DnsCache {
             k.qname == norm_clone || k.qname.ends_with(&format!(".{norm_clone}"))
         });
     }
+
+    /// Approximate memory weight of cached items in bytes.
+    pub fn weighted_size(&self) -> u64 {
+        self.cache.weighted_size()
+    }
+
+    /// Number of active cache entries.
+    pub fn entry_count(&self) -> u64 {
+        self.cache.entry_count()
+    }
 }

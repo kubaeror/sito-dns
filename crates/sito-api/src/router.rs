@@ -107,7 +107,9 @@ pub fn create_router(ctx: ServerContext) -> Router {
         )
         .route(
             "/clients/{name}",
-            put(clients::update_client).delete(clients::delete_client),
+            get(clients::get_client_by_name)
+                .put(clients::update_client)
+                .delete(clients::delete_client),
         )
         .route(
             "/clients/groups",
@@ -115,14 +117,19 @@ pub fn create_router(ctx: ServerContext) -> Router {
         )
         .route(
             "/clients/groups/{name}",
-            put(clients::update_client_group).delete(clients::delete_client_group),
+            get(clients::get_client_group_by_name)
+                .put(clients::update_client_group)
+                .delete(clients::delete_client_group),
         )
         // Rewrites
         .route(
             "/rewrites",
             get(rewrites::get_rewrites).post(rewrites::add_rewrite),
         )
-        .route("/rewrites/{id}", delete(rewrites::delete_rewrite))
+        .route(
+            "/rewrites/{id}",
+            put(rewrites::update_rewrite).delete(rewrites::delete_rewrite),
+        )
         // Upstream
         .route(
             "/upstream",
