@@ -453,7 +453,8 @@ impl QueryHandler for DnsPipeline {
                         tokio::spawn(async move {
                             let _permit = permit;
                             if let Ok(resp) = bg_upstream.resolve(&bg_query).await
-                                && resp.metadata.response_code == ResponseCode::NoError
+                                && (resp.metadata.response_code == ResponseCode::NoError
+                                    || resp.metadata.response_code == ResponseCode::NXDomain)
                             {
                                 bg_cache.insert(&bg_query, &resp).await;
                             }
@@ -559,7 +560,8 @@ impl QueryHandler for DnsPipeline {
                     };
 
                     if config.dns.cache.enabled
-                        && upstream_resp.metadata.response_code == ResponseCode::NoError
+                        && (upstream_resp.metadata.response_code == ResponseCode::NoError
+                            || upstream_resp.metadata.response_code == ResponseCode::NXDomain)
                     {
                         self.cache.insert(&query, &upstream_resp).await;
                         if let Some(ref m) = self.metrics {
