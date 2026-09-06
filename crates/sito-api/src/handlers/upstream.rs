@@ -308,6 +308,8 @@ mod tests {
             master_coordinator: None,
             slave_tracker: None,
             resync_sender: None,
+            setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dns_starter: None,
         }
     }
 

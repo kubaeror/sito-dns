@@ -77,6 +77,8 @@ async fn create_test_context(temp_dir: &Path) -> (ServerContext, PathBuf, QueryL
         master_coordinator: None,
         slave_tracker: None,
         resync_sender: None,
+        setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        dns_starter: None,
     };
 
     (ctx, config_path, querylog_writer)

@@ -11,8 +11,10 @@ use sito_stats::{MetricsRegistry, QueryLogSender, StatsDb};
 use sito_upstream::UpstreamManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Shared application state container across all REST API handlers.
 #[derive(Clone)]
@@ -34,9 +36,21 @@ pub struct ServerContext {
     pub master_coordinator: Option<sito_ha::MasterCoordinator>,
     pub slave_tracker: Option<sito_ha::SlaveStatusTracker>,
     pub resync_sender: Option<tokio::sync::mpsc::Sender<()>>,
+    pub setup_pending: Arc<AtomicBool>,
+    pub dns_starter: Option<UnboundedSender<()>>,
 }
 
 impl ServerContext {
+    /// Returns whether the server is running in setup-pending bootstrap mode.
+    pub fn is_setup_pending(&self) -> bool {
+        self.setup_pending.load(Ordering::SeqCst)
+    }
+
+    /// Updates the setup-pending state.
+    pub fn set_setup_pending(&self, pending: bool) {
+        self.setup_pending.store(pending, Ordering::SeqCst);
+    }
+
     /// Resolves the URL of the master node for redirect headers (`X-Dnsd-Master`).
     pub fn resolve_master_url(&self) -> String {
         if let Some(ref tracker) = self.slave_tracker

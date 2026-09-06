@@ -10,6 +10,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use sito_cache::DnsCache;
 use sito_core::config::Config;
 use sito_dnssec::DnssecValidator;
@@ -34,7 +35,7 @@ struct IntegrationsConfig {
 /// Runs the complete sito DNS server with graceful shutdown handling.
 pub async fn run_server(config: Config) -> anyhow::Result<()> {
     let config_path = config.server.data_dir.join("config.toml");
-    run_server_full(config, config_path, None).await
+    run_server_full(config, config_path, None, false).await
 }
 
 /// Runs the DNS server with an optional custom shutdown receiver (useful for testing).
@@ -43,14 +44,15 @@ pub async fn run_server_with_shutdown(
     custom_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> anyhow::Result<()> {
     let config_path = config.server.data_dir.join("config.toml");
-    run_server_full(config, config_path, custom_shutdown).await
+    run_server_full(config, config_path, custom_shutdown, false).await
 }
 
-/// Runs the DNS server with custom config path and shutdown receiver.
+/// Runs the DNS server with custom config path, shutdown receiver, and setup-pending mode.
 pub async fn run_server_full(
     config: Config,
     config_path: impl AsRef<Path>,
     custom_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+    setup_pending: bool,
 ) -> anyhow::Result<()> {
     let config_path_buf = config_path.as_ref().to_path_buf();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -260,6 +262,13 @@ pub async fn run_server_full(
     )?);
     auth_mgr.spawn_pruner(shutdown_rx.clone());
 
+    let (dns_start_tx, mut dns_start_rx) = tokio::sync::mpsc::unbounded_channel();
+    let dns_starter = if setup_pending {
+        Some(dns_start_tx)
+    } else {
+        None
+    };
+
     let server_ctx = sito_api::ServerContext {
         config: config_arc.clone(),
         config_path: config_path_buf.clone(),
@@ -277,6 +286,8 @@ pub async fn run_server_full(
         master_coordinator: master_coordinator.clone(),
         slave_tracker: slave_tracker.clone(),
         resync_sender,
+        setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(setup_pending)),
+        dns_starter,
     };
 
     let api_router = sito_api::create_router(server_ctx);
@@ -587,105 +598,63 @@ pub async fn run_server_full(
         );
     }
 
-    let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-
     let mut all_handles = Vec::new();
 
-    // Bind listeners
-    for bind_ip in &config.dns.bind {
-        let addr = SocketAddr::new(*bind_ip, config.dns.port);
+    if setup_pending {
+        info!(
+            "Server running in setup-pending mode: DNS listeners (ports 53/853/443) are not bound until setup completes via web panel"
+        );
+        tokio::select! {
+            res = wait_for_shutdown_signal(custom_shutdown) => {
+                res?;
+            }
+            Some(()) = dns_start_rx.recv() => {
+                info!("Setup wizard completed: binding and starting DNS listeners in-process...");
+                let current_cfg = config_arc.load();
+                let dns_handles = start_dns_listeners(
+                    &current_cfg,
+                    pipeline.clone(),
+                    shutdown_rx.clone(),
+                    dot_acceptor_mgr.clone(),
+                    doh_acceptor_mgr.clone(),
+                    doq_acceptor_mgr.clone(),
+                    doh3_acceptor_mgr.clone(),
+                    http01_challenges.clone(),
+                ).await?;
+                all_handles.extend(dns_handles);
 
-        // Start UDP listener
-        let udp_config = UdpConfig {
-            bind_addr: addr,
-            worker_count,
-            edns_udp_size: config.dns.edns_udp_size,
-            rate_limit_per_ip: config.dns.rate_limit_per_ip,
-        };
-        let udp_handles = start_udp_listener(udp_config, &pipeline, &shutdown_rx)?;
-        all_handles.extend(udp_handles);
+                info!(
+                    port = current_cfg.dns.port,
+                    bind = ?current_cfg.dns.bind,
+                    "sito DNS server successfully initialized and listening"
+                );
 
-        // Start TCP listener
-        let tcp_config = TcpConfig {
-            bind_addr: addr,
-            max_connections: config.dns.max_tcp_connections,
-            idle_timeout: Duration::from_secs(10),
-            rate_limit_per_ip: config.dns.rate_limit_per_ip,
-        };
-        let tcp_handle =
-            start_tcp_listener(tcp_config, pipeline.clone(), shutdown_rx.clone()).await?;
-        all_handles.push(tcp_handle);
-
-        // Start DoT listener if dot_port > 0 and TLS is configured
-        if config.dns.dot_port > 0
-            && let Some(ref dot_mgr) = dot_acceptor_mgr
-        {
-            let dot_addr = SocketAddr::new(*bind_ip, config.dns.dot_port);
-            let mut dot_config = DotConfig::new(dot_addr, dot_mgr.clone());
-            dot_config.dot_padding = config.dns.dot_padding;
-            dot_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-            dot_config.max_connections = config.dns.max_tcp_connections;
-            let dot_handle =
-                start_dot_listener(dot_config, pipeline.clone(), shutdown_rx.clone()).await?;
-            all_handles.push(dot_handle);
-        }
-
-        // Start DoH listener if doh_port > 0 and (TLS configured or non-default port)
-        if config.dns.doh_port > 0 && (doh_acceptor_mgr.is_some() || config.dns.doh_port != 443) {
-            let doh_addr = SocketAddr::new(*bind_ip, config.dns.doh_port);
-            let mut doh_config = DohConfig::new(doh_addr, doh_acceptor_mgr.clone())
-                .with_http01_challenges(http01_challenges.clone())
-                .with_alt_svc_port(if config.dns.doh3_port > 0 {
-                    Some(config.dns.doh3_port)
-                } else {
-                    None
-                });
-            doh_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-            doh_config.max_connections = config.dns.max_tcp_connections;
-            let doh_handle =
-                start_doh_listener(doh_config, pipeline.clone(), shutdown_rx.clone()).await?;
-            all_handles.push(doh_handle);
-        }
-
-        // Start DoQ listener if doq_port > 0 and TLS is configured
-        if config.dns.doq_port > 0
-            && let Some(ref doq_mgr) = doq_acceptor_mgr
-        {
-            let doq_addr = SocketAddr::new(*bind_ip, config.dns.doq_port);
-            let mut doq_config = DoqConfig::new(doq_addr, Some(doq_mgr.clone()));
-            doq_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-            doq_config.max_connections = config.dns.max_tcp_connections;
-            match start_doq_listener(doq_config, pipeline.clone(), shutdown_rx.clone()).await {
-                Ok(doq_handle) => all_handles.push(doq_handle),
-                Err(e) => warn!("Failed to start DoQ listener on {doq_addr}: {e}"),
+                wait_for_shutdown_signal(None).await?;
             }
         }
+    } else {
+        let dns_handles = start_dns_listeners(
+            &config,
+            pipeline.clone(),
+            shutdown_rx.clone(),
+            dot_acceptor_mgr.clone(),
+            doh_acceptor_mgr.clone(),
+            doq_acceptor_mgr.clone(),
+            doh3_acceptor_mgr.clone(),
+            http01_challenges.clone(),
+        )
+        .await?;
+        all_handles.extend(dns_handles);
 
-        // Start DoH3 listener if doh3_port > 0 and TLS is configured
-        if config.dns.doh3_port > 0
-            && let Some(ref doh3_mgr) = doh3_acceptor_mgr
-        {
-            let doh3_addr = SocketAddr::new(*bind_ip, config.dns.doh3_port);
-            let mut doh3_config = Doh3Config::new(doh3_addr, Some(doh3_mgr.clone()));
-            doh3_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-            doh3_config.max_connections = config.dns.max_tcp_connections;
-            match start_doh3_listener(doh3_config, pipeline.clone(), shutdown_rx.clone()).await {
-                Ok(doh3_handle) => all_handles.push(doh3_handle),
-                Err(e) => warn!("Failed to start DoH3 listener on {doh3_addr}: {e}"),
-            }
-        }
+        info!(
+            port = config.dns.port,
+            bind = ?config.dns.bind,
+            "sito DNS server successfully initialized and listening"
+        );
+
+        // Wait for termination signal
+        wait_for_shutdown_signal(custom_shutdown).await?;
     }
-
-    let _ = all_handles;
-
-    info!(
-        port = config.dns.port,
-        bind = ?config.dns.bind,
-        "sito DNS server successfully initialized and listening"
-    );
-
-    // Wait for termination signal
-    wait_for_shutdown_signal(custom_shutdown).await?;
 
     info!("Initiating graceful shutdown (stopping listeners)...");
     let _ = shutdown_tx.send(true);
@@ -708,6 +677,107 @@ pub async fn run_server_full(
 
     info!("Graceful shutdown complete, exiting");
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_dns_listeners(
+    config: &Config,
+    pipeline: Arc<DnsPipeline>,
+    shutdown_rx: watch::Receiver<bool>,
+    dot_acceptor_mgr: Option<TlsAcceptorManager>,
+    doh_acceptor_mgr: Option<TlsAcceptorManager>,
+    doq_acceptor_mgr: Option<TlsAcceptorManager>,
+    doh3_acceptor_mgr: Option<TlsAcceptorManager>,
+    http01_challenges: Arc<DashMap<String, String>>,
+) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+    let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let mut handles = Vec::new();
+
+    for bind_ip in &config.dns.bind {
+        let addr = SocketAddr::new(*bind_ip, config.dns.port);
+
+        // Start UDP listener
+        let udp_config = UdpConfig {
+            bind_addr: addr,
+            worker_count,
+            edns_udp_size: config.dns.edns_udp_size,
+            rate_limit_per_ip: config.dns.rate_limit_per_ip,
+        };
+        let udp_handles = start_udp_listener(udp_config, &pipeline, &shutdown_rx)?;
+        handles.extend(udp_handles);
+
+        // Start TCP listener
+        let tcp_config = TcpConfig {
+            bind_addr: addr,
+            max_connections: config.dns.max_tcp_connections,
+            idle_timeout: Duration::from_secs(10),
+            rate_limit_per_ip: config.dns.rate_limit_per_ip,
+        };
+        let tcp_handle =
+            start_tcp_listener(tcp_config, pipeline.clone(), shutdown_rx.clone()).await?;
+        handles.push(tcp_handle);
+
+        // Start DoT listener if dot_port > 0 and TLS is configured
+        if config.dns.dot_port > 0
+            && let Some(ref dot_mgr) = dot_acceptor_mgr
+        {
+            let dot_addr = SocketAddr::new(*bind_ip, config.dns.dot_port);
+            let mut dot_config = DotConfig::new(dot_addr, dot_mgr.clone());
+            dot_config.dot_padding = config.dns.dot_padding;
+            dot_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            dot_config.max_connections = config.dns.max_tcp_connections;
+            let dot_handle =
+                start_dot_listener(dot_config, pipeline.clone(), shutdown_rx.clone()).await?;
+            handles.push(dot_handle);
+        }
+
+        // Start DoH listener if doh_port > 0 and (TLS configured or non-default port)
+        if config.dns.doh_port > 0 && (doh_acceptor_mgr.is_some() || config.dns.doh_port != 443) {
+            let doh_addr = SocketAddr::new(*bind_ip, config.dns.doh_port);
+            let mut doh_config = DohConfig::new(doh_addr, doh_acceptor_mgr.clone())
+                .with_http01_challenges(http01_challenges.clone())
+                .with_alt_svc_port(if config.dns.doh3_port > 0 {
+                    Some(config.dns.doh3_port)
+                } else {
+                    None
+                });
+            doh_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            doh_config.max_connections = config.dns.max_tcp_connections;
+            let doh_handle =
+                start_doh_listener(doh_config, pipeline.clone(), shutdown_rx.clone()).await?;
+            handles.push(doh_handle);
+        }
+
+        // Start DoQ listener if doq_port > 0 and TLS is configured
+        if config.dns.doq_port > 0
+            && let Some(ref doq_mgr) = doq_acceptor_mgr
+        {
+            let doq_addr = SocketAddr::new(*bind_ip, config.dns.doq_port);
+            let mut doq_config = DoqConfig::new(doq_addr, Some(doq_mgr.clone()));
+            doq_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            doq_config.max_connections = config.dns.max_tcp_connections;
+            match start_doq_listener(doq_config, pipeline.clone(), shutdown_rx.clone()).await {
+                Ok(doq_handle) => handles.push(doq_handle),
+                Err(e) => warn!("Failed to start DoQ listener on {doq_addr}: {e}"),
+            }
+        }
+
+        // Start DoH3 listener if doh3_port > 0 and TLS is configured
+        if config.dns.doh3_port > 0
+            && let Some(ref doh3_mgr) = doh3_acceptor_mgr
+        {
+            let doh3_addr = SocketAddr::new(*bind_ip, config.dns.doh3_port);
+            let mut doh3_config = Doh3Config::new(doh3_addr, Some(doh3_mgr.clone()));
+            doh3_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            doh3_config.max_connections = config.dns.max_tcp_connections;
+            match start_doh3_listener(doh3_config, pipeline.clone(), shutdown_rx.clone()).await {
+                Ok(doh3_handle) => handles.push(doh3_handle),
+                Err(e) => warn!("Failed to start DoH3 listener on {doh3_addr}: {e}"),
+            }
+        }
+    }
+
+    Ok(handles)
 }
 
 async fn wait_for_shutdown_signal(

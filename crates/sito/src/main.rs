@@ -96,21 +96,28 @@ async fn main() -> anyhow::Result<()> {
 
     // Server execution path
     let config_path = cli.config;
-    let content = std::fs::read_to_string(&config_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to open configuration file '{}': {}",
-            config_path.display(),
-            e
-        )
-    })?;
+    let (config, setup_pending) = if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to open configuration file '{}': {}",
+                config_path.display(),
+                e
+            )
+        })?;
 
-    let config = Config::from_toml_str(&content).map_err(|e| {
-        anyhow::anyhow!(
-            "Invalid configuration in '{}': {}",
-            config_path.display(),
-            e
-        )
-    })?;
+        let config = Config::from_toml_str(&content).map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid configuration in '{}': {}",
+                config_path.display(),
+                e
+            )
+        })?;
+        (config, false)
+    } else if cli.no_setup {
+        (Config::default(), false)
+    } else {
+        (Config::default(), true)
+    };
 
     // Initialize tracing subscriber per configuration
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -128,11 +135,37 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
+    if setup_pending {
+        let web_cfg = config.get_web_config();
+        let host_display = if web_cfg.bind.is_unspecified() {
+            "localhost".to_string()
+        } else {
+            web_cfg.bind.to_string()
+        };
+        eprintln!("\n==================================================================");
+        eprintln!(
+            " First run detected: open http://{}:{} to complete setup",
+            host_display, web_cfg.port
+        );
+        eprintln!("==================================================================\n");
+        tracing::info!(
+            "First run detected: open http://{}:{} to complete setup",
+            host_display,
+            web_cfg.port
+        );
+    } else if !config_path.exists() && cli.no_setup {
+        tracing::info!(
+            config = %config_path.display(),
+            "Configuration file not found; running with built-in defaults (--no-setup)"
+        );
+    }
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         config = %config_path.display(),
+        setup_pending,
         "Starting sito DNS server"
     );
 
-    run_server_full(config, config_path, None).await
+    run_server_full(config, config_path, None, setup_pending).await
 }
