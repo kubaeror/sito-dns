@@ -252,12 +252,11 @@ async fn get_upstreams_list(ctx: &ServerContext) -> Vec<UpstreamViewItem> {
     for addr_str in &cfg.upstream.servers {
         let proto = if addr_str.starts_with("tls://") {
             "DoT (TLS)"
-        } else if addr_str.starts_with("https://") {
-            "DoH (HTTPS)"
-        } else if addr_str.starts_with("quic://") {
-            "DoQ (QUIC)"
-        } else if addr_str.contains(":53") || !addr_str.contains(':') {
-            "UDP/TCP"
+        } else if addr_str.starts_with("udp://")
+            || addr_str.contains(":53")
+            || !addr_str.contains(':')
+        {
+            "UDP"
         } else {
             "DNS"
         };
@@ -1001,6 +1000,13 @@ pub async fn upstreams_add_handler(
 
     let mut new_cfg = (**ctx.config.load()).clone();
     let clean = form.address.trim().to_string();
+    if clean.starts_with("https://") || clean.starts_with("quic://") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "DoH and DoQ upstreams are not supported in v1.2.x; use tls:// or UDP",
+        )
+            .into_response();
+    }
     if !clean.is_empty() && !new_cfg.upstream.servers.contains(&clean) {
         new_cfg.upstream.servers.push(clean);
         let _ = save_config_atomic(&ctx.config_path, &new_cfg).await;
@@ -1047,32 +1053,10 @@ async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result<f64
         return Ok(elapsed);
     }
 
-    if let Some(target) = addr_str.strip_prefix("https://") {
-        let host_port = target.split('/').next().unwrap_or(target);
-        let parts: Vec<&str> = host_port.split(':').collect();
-        let host = parts[0];
-        let port: u16 = if parts.len() > 1 {
-            parts[1].parse().unwrap_or(443)
-        } else {
-            443
-        };
-        let mut addrs = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|e| format!("DNS resolution of {host} failed: {e}"))?;
-        let addr = addrs
-            .next()
-            .ok_or_else(|| format!("Could not resolve {host}"))?;
-
-        let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            tokio::net::TcpStream::connect(addr),
-        )
-        .await
-        .map_err(|_| "Connection timed out".to_string())?
-        .map_err(|e| format!("HTTPS connection failed: {e}"))?;
-        drop(stream);
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        return Ok(elapsed);
+    if addr_str.starts_with("https://") || addr_str.starts_with("quic://") {
+        return Err(
+            "DoH (https://) and DoQ (quic://) upstreams are not supported in v1.2.x; use tls:// or UDP".to_string(),
+        );
     }
 
     // Standard UDP probe

@@ -31,7 +31,7 @@ validate = false
 ntp = []
 
 [upstream]
-servers = ["1.1.1.1:53", "1.0.0.1:53"]
+servers = ["tls://dns.quad9.net", "1.1.1.1:53"]
 bootstrap = ["9.9.9.9", "149.112.112.112"]
 strategy = "failover"
 timeout_ms = 5000

@@ -75,7 +75,7 @@ dot_port = 853
 doh_port = 443
 
 [upstream]
-servers = ["tls://dns.quad9.net", "https://cloudflare-dns.com/dns-query"]
+servers = ["tls://dns.quad9.net", "1.1.1.1:53"]
 bootstrap = ["9.9.9.9", "1.1.1.1"]
 strategy = "parallel"
 
