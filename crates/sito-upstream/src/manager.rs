@@ -57,7 +57,9 @@ async fn create_managed_entry(
 
             // Resolve hostname via bootstrap
             let resolved_ips = bootstrap.resolve_hostname(host).await?;
-            let target_ip = resolved_ips[0];
+            let target_ip = resolved_ips.first().copied().ok_or_else(|| {
+                UpstreamError::BadResponse(format!("no IP addresses resolved for '{host}'"))
+            })?;
             let socket_addr = SocketAddr::new(target_ip, port);
 
             let dot = DotUpstream::new(socket_addr, host.to_string(), timeout_duration, pool_size)?;
@@ -76,7 +78,10 @@ async fn create_managed_entry(
                 };
 
                 let resolved_ips = bootstrap.resolve_hostname(host).await?;
-                SocketAddr::new(resolved_ips[0], port)
+                let target_ip = resolved_ips.first().copied().ok_or_else(|| {
+                    UpstreamError::BadResponse(format!("no IP addresses resolved for '{host}'"))
+                })?;
+                SocketAddr::new(target_ip, port)
             };
 
             let plain = PlainUpstream::new(socket_addr, timeout_duration);
