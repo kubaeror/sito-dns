@@ -60,6 +60,11 @@ jobs:
             cargo build --release --locked --target ${{ matrix.target }} -p sito --features "${{ matrix.features }}"
           fi
 
+      - name: Verify installer script with shellcheck
+        run: |
+          command -v shellcheck >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y shellcheck)
+          shellcheck -S error contrib/install.sh
+
       - name: Package release archive
         run: |
           VERSION="${GITHUB_REF_NAME:-${{ github.event.inputs.tag_name }}}"
