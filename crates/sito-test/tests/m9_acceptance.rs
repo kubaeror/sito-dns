@@ -302,7 +302,8 @@ fn test_m9_release_configuration_and_systemd() {
 
     // Verify workspace version is at least 1.0.0
     assert!(
-        cargo_content.contains("version = \"1.3.0\"")
+        cargo_content.contains("version = \"1.4.0\"")
+            || cargo_content.contains("version = \"1.3.0\"")
             || cargo_content.contains("version = \"1.2.1\"")
             || cargo_content.contains("version = \"1.2.0\"")
             || cargo_content.contains("version = \"1.1.1\"")
@@ -345,7 +346,7 @@ fn test_m9_release_configuration_and_systemd() {
     assert!(svc_content.contains("CAP_NET_BIND_SERVICE"));
     assert!(svc_content.contains("LimitNOFILE=1048576"));
 
-    // Verify install.sh script exists
+    // Verify install.sh script exists and is hardened
     let install_path = Path::new("../../contrib/install.sh");
     let inst_full = if install_path.exists() {
         install_path.to_path_buf()
@@ -353,4 +354,41 @@ fn test_m9_release_configuration_and_systemd() {
         Path::new("contrib/install.sh").to_path_buf()
     };
     assert!(inst_full.exists(), "install.sh must exist");
+
+    let install_content = fs::read_to_string(&inst_full).expect("read install.sh");
+    // Hardening: no generated default config heredoc
+    assert!(
+        !install_content.contains("cat > \"${CONFIG_FILE}\""),
+        "install.sh must not create a default config.toml heredoc"
+    );
+    // Hardening: no default admin credentials printed
+    assert!(
+        !install_content.contains("admin / adminadmin"),
+        "install.sh must not print default admin credentials"
+    );
+    // Hardening: download retry logic present
+    assert!(
+        install_content.contains("max_attempts="),
+        "install.sh must include retry attempts for downloads"
+    );
+    // Hardening: cosign signature verification present
+    assert!(
+        install_content.contains("cosign verify-blob"),
+        "install.sh must support cosign signature verification"
+    );
+    // Hardening: binary backup for upgrade detection
+    assert!(
+        install_content.contains("${INSTALL_BIN}.bak"),
+        "install.sh must back up existing binary on upgrade"
+    );
+    // Hardening: post-install health check
+    assert!(
+        install_content.contains("systemctl is-active"),
+        "install.sh must verify service health after install"
+    );
+    // Hardening: first-time setup wizard guidance
+    assert!(
+        install_content.contains("Open http://"),
+        "install.sh must direct users to web-based first-time setup"
+    );
 }

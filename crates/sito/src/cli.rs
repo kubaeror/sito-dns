@@ -21,6 +21,10 @@ pub struct Cli {
     #[arg(short, long, default_value = "config.toml")]
     pub config: PathBuf,
 
+    /// Skip web-based setup wizard gating and start with defaults immediately
+    #[arg(long)]
+    pub no_setup: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -390,4 +394,26 @@ pub fn run_reset_admin(config_path: &Path, password: Option<&str>) -> Result<(),
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_no_setup_flag() {
+        let args_no_setup = vec!["sito", "--no-setup"];
+        let cli = Cli::try_parse_from(args_no_setup).expect("parse args");
+        assert!(cli.no_setup);
+        assert_eq!(cli.config, PathBuf::from("config.toml"));
+
+        let args_default = vec!["sito"];
+        let cli_default = Cli::try_parse_from(args_default).expect("parse args");
+        assert!(!cli_default.no_setup);
+
+        let args_custom = vec!["sito", "--config", "/etc/sito/custom.toml", "--no-setup"];
+        let cli_custom = Cli::try_parse_from(args_custom).expect("parse args");
+        assert!(cli_custom.no_setup);
+        assert_eq!(cli_custom.config, PathBuf::from("/etc/sito/custom.toml"));
+    }
 }

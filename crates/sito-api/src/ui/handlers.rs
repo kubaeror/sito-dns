@@ -25,7 +25,7 @@ use crate::ui::templates::{
     UpstreamViewItem, UpstreamsTemplate, WizardTemplate,
 };
 use sito_core::FilterEngine;
-use sito_core::config::FilterListConfig;
+use sito_core::config::{BlockingMode, Config, FilterListConfig, UpstreamStrategy};
 use sito_stats::QueryLogFilter;
 
 pub fn format_duration(secs: u64) -> String {
@@ -1163,7 +1163,10 @@ pub async fn upstreams_test_handler(
     headers: HeaderMap,
     Form(form): Form<TestUpstreamForm>,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none() {
+    if get_session_user(&ctx, &headers).is_none()
+        && !ctx.is_setup_pending()
+        && !ctx.auth_mgr.is_first_run()
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let clean = form.address.trim();
@@ -1422,7 +1425,7 @@ pub async fn wizard_page(State(ctx): State<ServerContext>, headers: HeaderMap) -
     let auth_user = get_session_user(&ctx, &headers);
     let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
 
-    if !ctx.auth_mgr.is_first_run() && !is_admin {
+    if !ctx.is_setup_pending() && !ctx.auth_mgr.is_first_run() && !is_admin {
         return Redirect::to("/login").into_response();
     }
 
@@ -1436,12 +1439,359 @@ pub async fn wizard_page(State(ctx): State<ServerContext>, headers: HeaderMap) -
     .into_response()
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct WizardCompleteForm {
-    pub admin_user: String,
-    pub admin_password: String,
-    pub upstream: String,
+    // 1. Administrator account
+    pub admin_user: Option<String>,
+    pub admin_password: Option<String>,
+    pub confirm_password: Option<String>,
+
+    // 2. DNS listeners
+    pub bind_ipv4: Option<String>,
+    pub bind_ipv6: Option<String>,
+    pub port: Option<String>,
+    pub dot_port: Option<String>,
+    pub doh_port: Option<String>,
+    pub doq_port: Option<String>,
+
+    // 3. Upstreams
+    pub upstreams: Option<String>,
+    pub upstream: Option<String>,
+    pub upstream_strategy: Option<String>,
+    pub bootstrap: Option<String>,
+    pub timeout_ms: Option<String>,
+
+    // 4. Cache & DNSSEC
+    pub cache_enabled: Option<String>,
+    pub cache_size_mb: Option<String>,
+    pub dnssec_mode: Option<String>,
+    pub dnssec_validate: Option<String>,
+
+    // 5. Filtering
+    pub filtering_enabled: Option<String>,
     pub enable_adblock: Option<String>,
+    pub blocking_mode: Option<String>,
+    pub cname_cloaking: Option<String>,
+    pub list_oisd_big: Option<String>,
+    pub list_oisd_small: Option<String>,
+    pub list_stevenblack: Option<String>,
+    pub list_hagezi: Option<String>,
+
+    // 6. Web panel & stats
+    pub web_bind: Option<String>,
+    pub web_port: Option<String>,
+    pub retention_days: Option<String>,
+}
+
+impl WizardCompleteForm {
+    fn is_checkbox_checked(val: Option<&str>) -> bool {
+        match val {
+            Some(v) => {
+                let v = v.trim();
+                v == "on" || v == "true" || v == "yes" || v == "1"
+            }
+            None => false,
+        }
+    }
+
+    pub fn build_config(&self, base: &Config) -> Result<Config, String> {
+        let mut cfg = base.clone();
+
+        // 2. DNS Listeners
+        let v4_present = self.bind_ipv4.is_some();
+        let v6_present = self.bind_ipv6.is_some();
+        if v4_present || v6_present {
+            let mut binds = Vec::new();
+            if Self::is_checkbox_checked(self.bind_ipv4.as_deref()) {
+                binds.push(IpAddr::from_str("0.0.0.0").unwrap());
+            }
+            if Self::is_checkbox_checked(self.bind_ipv6.as_deref()) {
+                binds.push(IpAddr::from_str("::").unwrap());
+            }
+            if binds.is_empty() {
+                return Err(
+                    "At least one DNS bind address (IPv4 or IPv6) must be selected".to_string(),
+                );
+            }
+            cfg.dns.bind = binds;
+        }
+
+        if let Some(s) = self
+            .port
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cfg.dns.port = s
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid DNS port: '{s}'"))?;
+        }
+        if let Some(s) = self
+            .dot_port
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cfg.dns.dot_port = s
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid DoT port: '{s}'"))?;
+        }
+        if let Some(s) = self
+            .doh_port
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cfg.dns.doh_port = s
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid DoH port: '{s}'"))?;
+        }
+        if let Some(s) = self
+            .doq_port
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cfg.dns.doq_port = s
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid DoQ port: '{s}'"))?;
+        }
+
+        // 3. Upstream Resolvers
+        let mut servers = Vec::new();
+        if let Some(s) = self
+            .upstreams
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            for line in s.lines() {
+                for part in line.split(',') {
+                    let clean = part.trim();
+                    if !clean.is_empty() {
+                        servers.push(clean.to_string());
+                    }
+                }
+            }
+        }
+        if servers.is_empty()
+            && let Some(single) = self
+                .upstream
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            servers.push(single.to_string());
+        }
+        if !servers.is_empty() {
+            cfg.upstream.servers = servers;
+        }
+
+        if let Some(s) = self
+            .upstream_strategy
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            match s.to_ascii_lowercase().as_str() {
+                "failover" => cfg.upstream.strategy = UpstreamStrategy::Failover,
+                "parallel" => cfg.upstream.strategy = UpstreamStrategy::Parallel,
+                "load_balance" | "loadbalance" => {
+                    cfg.upstream.strategy = UpstreamStrategy::LoadBalance;
+                }
+                other => return Err(format!("Invalid upstream strategy: '{other}'")),
+            }
+        }
+
+        if let Some(s) = self
+            .bootstrap
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let mut boots = Vec::new();
+            for part in s.split([',', ' ', '\n']) {
+                let clean = part.trim();
+                if !clean.is_empty() {
+                    let ip = IpAddr::from_str(clean)
+                        .map_err(|_| format!("Invalid bootstrap IP: '{clean}'"))?;
+                    boots.push(ip);
+                }
+            }
+            if !boots.is_empty() {
+                cfg.upstream.bootstrap = boots;
+            }
+        }
+
+        if let Some(s) = self
+            .timeout_ms
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cfg.upstream.timeout_ms = s
+                .parse::<u64>()
+                .map_err(|_| format!("Invalid timeout_ms: '{s}'"))?;
+        }
+
+        // 4. Cache & DNSSEC
+        if self.cache_enabled.is_some() {
+            cfg.dns.cache.enabled = Self::is_checkbox_checked(self.cache_enabled.as_deref());
+        }
+        if let Some(s) = self
+            .cache_size_mb
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cfg.dns.cache.size_mb = s
+                .parse::<usize>()
+                .map_err(|_| format!("Invalid cache_size_mb: '{s}'"))?;
+        }
+        if let Some(s) = self
+            .dnssec_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cfg.dns.dnssec.mode = s.to_string();
+        }
+        if self.dnssec_validate.is_some() {
+            cfg.dns.dnssec.validate = Self::is_checkbox_checked(self.dnssec_validate.as_deref());
+        }
+
+        // 5. Filtering & Protection
+        if self.filtering_enabled.is_some() {
+            cfg.filtering.enabled = Self::is_checkbox_checked(self.filtering_enabled.as_deref());
+        } else if self.enable_adblock.is_some() {
+            cfg.filtering.enabled = Self::is_checkbox_checked(self.enable_adblock.as_deref());
+        }
+
+        if let Some(s) = self
+            .blocking_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            match s.to_ascii_lowercase().as_str() {
+                "zero_ip" => cfg.filtering.blocking_mode = BlockingMode::ZeroIp,
+                "nxdomain" => cfg.filtering.blocking_mode = BlockingMode::Nxdomain,
+                "refused" => cfg.filtering.blocking_mode = BlockingMode::Refused,
+                "null_rdata" => cfg.filtering.blocking_mode = BlockingMode::NullRdata,
+                other => {
+                    if let Ok(ip) = IpAddr::from_str(other) {
+                        cfg.filtering.blocking_mode = BlockingMode::CustomIp(ip);
+                    } else {
+                        return Err(format!("Invalid blocking mode: '{other}'"));
+                    }
+                }
+            }
+        }
+
+        if self.cname_cloaking.is_some() {
+            cfg.filtering.cname_cloaking =
+                Self::is_checkbox_checked(self.cname_cloaking.as_deref());
+        }
+
+        let mut lists = Vec::new();
+        if Self::is_checkbox_checked(self.list_oisd_big.as_deref()) {
+            lists.push(FilterListConfig {
+                name: "OISD Big".to_string(),
+                url: "https://big.oisd.nl".to_string(),
+                enabled: true,
+                refresh_hours: None,
+            });
+        }
+        if Self::is_checkbox_checked(self.list_oisd_small.as_deref()) {
+            lists.push(FilterListConfig {
+                name: "OISD Small".to_string(),
+                url: "https://small.oisd.nl".to_string(),
+                enabled: true,
+                refresh_hours: None,
+            });
+        }
+        if Self::is_checkbox_checked(self.list_stevenblack.as_deref()) {
+            lists.push(FilterListConfig {
+                name: "StevenBlack Hosts".to_string(),
+                url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts".to_string(),
+                enabled: true,
+                refresh_hours: None,
+            });
+        }
+        if Self::is_checkbox_checked(self.list_hagezi.as_deref()) {
+            lists.push(FilterListConfig {
+                name: "Hagezi Pro".to_string(),
+                url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt"
+                    .to_string(),
+                enabled: true,
+                refresh_hours: None,
+            });
+        }
+
+        // If filtering is enabled and no preset lists were specifically checked,
+        // preserve existing lists if any, or provide default OISD Big
+        if lists.is_empty()
+            && cfg.filtering.enabled
+            && (self.enable_adblock.is_some() || self.filtering_enabled.is_some())
+        {
+            if cfg.filtering.lists.is_empty() {
+                lists.push(FilterListConfig {
+                    name: "OISD Big".to_string(),
+                    url: "https://big.oisd.nl".to_string(),
+                    enabled: true,
+                    refresh_hours: None,
+                });
+            } else {
+                lists.clone_from(&cfg.filtering.lists);
+            }
+        }
+        if !lists.is_empty() {
+            cfg.filtering.lists = lists;
+        }
+
+        // 6. Web Panel & Stats
+        let mut web = cfg.get_web_config();
+        if let Some(s) = self
+            .web_bind
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            web.bind = IpAddr::from_str(s).map_err(|_| format!("Invalid web bind IP: '{s}'"))?;
+        }
+        if let Some(s) = self
+            .web_port
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            web.port = s
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid web port: '{s}'"))?;
+        }
+        cfg.set_web_config(web);
+
+        let mut stats = cfg.get_stats_config();
+        if let Some(s) = self
+            .retention_days
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            stats.retention_days = s
+                .parse::<u32>()
+                .map_err(|_| format!("Invalid retention_days: '{s}'"))?;
+        }
+        if let Ok(val) = toml::Value::try_from(stats) {
+            cfg.stats = Some(val);
+        }
+
+        // Validate final configuration
+        cfg.validate()
+            .map_err(|e| format!("Configuration validation failed: {e}"))?;
+
+        Ok(cfg)
+    }
 }
 
 pub async fn wizard_complete_handler(
@@ -1449,7 +1799,7 @@ pub async fn wizard_complete_handler(
     headers: HeaderMap,
     Form(form): Form<WizardCompleteForm>,
 ) -> Response {
-    let is_first_run = ctx.auth_mgr.is_first_run();
+    let is_first_run = ctx.is_setup_pending() || ctx.auth_mgr.is_first_run();
     let auth_user = get_session_user(&ctx, &headers);
     let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
 
@@ -1461,16 +1811,17 @@ pub async fn wizard_complete_handler(
             .into_response();
     }
 
-    let admin_user = form.admin_user.trim();
-    let admin_password = form.admin_password.trim();
-
-    if admin_user.is_empty() || admin_password.is_empty() || admin_password.len() < 8 {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Invalid username or password: password must be at least 8 characters long.",
-        )
-            .into_response();
-    }
+    let admin_user = match form.admin_user.as_deref().map(str::trim) {
+        Some("") => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid username: cannot be empty.",
+            )
+                .into_response();
+        }
+        Some(u) => u,
+        None => "admin",
+    };
 
     if admin_user.contains(|c: char| c.is_whitespace() || c.is_control()) {
         return (
@@ -1480,11 +1831,73 @@ pub async fn wizard_complete_handler(
             .into_response();
     }
 
+    let admin_pass_input = form.admin_password.as_deref().map_or("", str::trim);
+    let confirm_pass_input = form.confirm_password.as_deref().map_or("", str::trim);
+
+    let effective_password = if admin_pass_input.is_empty() {
+        if !confirm_pass_input.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Password confirmation provided, but password field was empty.",
+            )
+                .into_response();
+        }
+        if is_first_run {
+            "adminadmin"
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid password: password cannot be empty.",
+            )
+                .into_response();
+        }
+    } else {
+        if admin_pass_input.len() < 8 {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid username or password: password must be at least 8 characters long.",
+            )
+                .into_response();
+        }
+        if !confirm_pass_input.is_empty() && confirm_pass_input != admin_pass_input {
+            return (StatusCode::BAD_REQUEST, "Passwords do not match.").into_response();
+        }
+        if admin_pass_input.contains(|c: char| c.is_whitespace() || c.is_control()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid password: cannot contain whitespace or control characters.",
+            )
+                .into_response();
+        }
+        admin_pass_input
+    };
+
+    let base_cfg = (**ctx.config.load()).clone();
+    let new_cfg = match form.build_config(&base_cfg) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid configuration: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to save config in wizard: {e:?}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to save configuration",
+        )
+            .into_response();
+    }
+
     if is_first_run {
         if ctx.auth_mgr.has_user(admin_user) {
             if !ctx
                 .auth_mgr
-                .update_user_password(admin_user, admin_password)
+                .update_user_password(admin_user, effective_password)
             {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -1495,7 +1908,7 @@ pub async fn wizard_complete_handler(
         } else {
             // Nonexistent user: create as admin
             ctx.auth_mgr
-                .create_user(admin_user, admin_password, Role::Admin);
+                .create_user(admin_user, effective_password, Role::Admin);
             // If custom admin username chosen, remove default 'admin' account if still on bootstrap password
             if admin_user != "admin" && ctx.auth_mgr.is_default_admin_active() {
                 ctx.auth_mgr.delete_user("admin");
@@ -1509,7 +1922,7 @@ pub async fn wizard_complete_handler(
         }
         if !ctx
             .auth_mgr
-            .update_user_password(admin_user, admin_password)
+            .update_user_password(admin_user, effective_password)
         {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1517,21 +1930,6 @@ pub async fn wizard_complete_handler(
             )
                 .into_response();
         }
-    }
-
-    let mut new_cfg = (**ctx.config.load()).clone();
-    if !form.upstream.trim().is_empty() {
-        new_cfg.upstream.servers = vec![form.upstream.trim().to_string()];
-    }
-    new_cfg.filtering.enabled = form.enable_adblock.is_some();
-
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to save config in wizard: {e:?}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to save configuration",
-        )
-            .into_response();
     }
 
     ctx.config.store(Arc::new(new_cfg.clone()));
@@ -1542,6 +1940,11 @@ pub async fn wizard_complete_handler(
     );
     let _ = ctx.upstream.reload(&new_cfg.upstream, &bootstrap).await;
     crate::publish_bundle(&ctx);
+
+    ctx.set_setup_pending(false);
+    if let Some(ref starter) = ctx.dns_starter {
+        let _ = starter.send(());
+    }
 
     Redirect::to("/login").into_response()
 }
@@ -1604,6 +2007,8 @@ mod tests {
             master_coordinator: None,
             slave_tracker: None,
             resync_sender: None,
+            setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dns_starter: None,
         }
     }
 
@@ -1713,10 +2118,10 @@ mod tests {
 
         // 1. Wrong username (empty) -> 400 Bad Request, first_run stays true
         let empty_user_form = WizardCompleteForm {
-            admin_user: String::new(),
-            admin_password: "ValidPassword123!".to_string(),
-            upstream: "1.1.1.1:53".to_string(),
-            enable_adblock: None,
+            admin_user: Some(String::new()),
+            admin_password: Some("ValidPassword123!".to_string()),
+            upstream: Some("1.1.1.1:53".to_string()),
+            ..Default::default()
         };
         let resp =
             wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(empty_user_form))
@@ -1726,10 +2131,10 @@ mod tests {
 
         // 2. Wrong username (whitespace) -> 400 Bad Request, first_run stays true
         let space_user_form = WizardCompleteForm {
-            admin_user: "admin user".to_string(),
-            admin_password: "ValidPassword123!".to_string(),
-            upstream: "1.1.1.1:53".to_string(),
-            enable_adblock: None,
+            admin_user: Some("admin user".to_string()),
+            admin_password: Some("ValidPassword123!".to_string()),
+            upstream: Some("1.1.1.1:53".to_string()),
+            ..Default::default()
         };
         let resp =
             wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(space_user_form))
@@ -1739,10 +2144,10 @@ mod tests {
 
         // 3. Short password -> 400 Bad Request, first_run stays true
         let short_pass_form = WizardCompleteForm {
-            admin_user: "admin".to_string(),
-            admin_password: "short".to_string(),
-            upstream: "1.1.1.1:53".to_string(),
-            enable_adblock: None,
+            admin_user: Some("admin".to_string()),
+            admin_password: Some("short".to_string()),
+            upstream: Some("1.1.1.1:53".to_string()),
+            ..Default::default()
         };
         let resp =
             wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(short_pass_form))
@@ -1752,10 +2157,11 @@ mod tests {
 
         // 4. Nonexistent user -> created as admin, first_run becomes false, default admin purged
         let nonexistent_user_form = WizardCompleteForm {
-            admin_user: "superadmin".to_string(),
-            admin_password: "SuperSecretPassword123!".to_string(),
-            upstream: "1.1.1.1:53".to_string(),
+            admin_user: Some("superadmin".to_string()),
+            admin_password: Some("SuperSecretPassword123!".to_string()),
+            upstream: Some("1.1.1.1:53".to_string()),
             enable_adblock: Some("on".to_string()),
+            ..Default::default()
         };
         let resp = wizard_complete_handler(
             State(ctx.clone()),
@@ -1773,6 +2179,167 @@ mod tests {
             .auth_mgr
             .login("superadmin", "SuperSecretPassword123!", "127.0.0.1");
         assert!(matches!(login_res, crate::auth::LoginResult::Success(_)));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_wizard_all_empty_fields_fallback_to_defaults() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_defaults_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let empty_form = WizardCompleteForm::default();
+        let resp =
+            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(empty_form)).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(!ctx.auth_mgr.is_first_run());
+        assert!(!ctx.is_setup_pending());
+        assert!(ctx.auth_mgr.has_user("admin"));
+
+        // Password fell back to default adminadmin
+        let login_res = ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1");
+        assert!(matches!(login_res, crate::auth::LoginResult::Success(_)));
+
+        let cfg = ctx.config.load();
+        assert_eq!(cfg.dns.port, 53);
+        assert_eq!(cfg.dns.dot_port, 853);
+        assert_eq!(cfg.dns.doq_port, 0);
+        assert_eq!(
+            cfg.dns.bind,
+            vec![
+                IpAddr::from_str("0.0.0.0").unwrap(),
+                IpAddr::from_str("::").unwrap()
+            ]
+        );
+        assert_eq!(cfg.get_web_config().port, 8080);
+        assert_eq!(cfg.get_stats_config().retention_days, 90);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_wizard_password_mismatch() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_mismatch_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let mismatch_form = WizardCompleteForm {
+            admin_user: Some("admin".to_string()),
+            admin_password: Some("Password123!".to_string()),
+            confirm_password: Some("Mismatch123!".to_string()),
+            ..Default::default()
+        };
+        let resp =
+            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(mismatch_form))
+                .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_wizard_custom_config_and_presets() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_custom_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let custom_form = WizardCompleteForm {
+            admin_user: Some("customadmin".to_string()),
+            admin_password: Some("custompassword123".to_string()),
+            confirm_password: Some("custompassword123".to_string()),
+            bind_ipv4: Some("on".to_string()),
+            bind_ipv6: None,
+            port: Some("5353".to_string()),
+            dot_port: Some("8853".to_string()),
+            doh_port: Some("8443".to_string()),
+            doq_port: Some("0".to_string()),
+            upstreams: Some("9.9.9.9\n149.112.112.112".to_string()),
+            upstream: None,
+            upstream_strategy: Some("parallel".to_string()),
+            bootstrap: Some("1.1.1.1, 8.8.8.8".to_string()),
+            timeout_ms: Some("3000".to_string()),
+            cache_enabled: Some("on".to_string()),
+            cache_size_mb: Some("128".to_string()),
+            dnssec_mode: Some("strict".to_string()),
+            dnssec_validate: Some("on".to_string()),
+            filtering_enabled: Some("on".to_string()),
+            enable_adblock: None,
+            blocking_mode: Some("nxdomain".to_string()),
+            cname_cloaking: Some("on".to_string()),
+            list_oisd_big: Some("on".to_string()),
+            list_oisd_small: None,
+            list_stevenblack: None,
+            list_hagezi: Some("on".to_string()),
+            web_bind: Some("127.0.0.1".to_string()),
+            web_port: Some("9090".to_string()),
+            retention_days: Some("30".to_string()),
+        };
+
+        let resp =
+            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(custom_form)).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        let cfg = ctx.config.load();
+        assert_eq!(cfg.dns.port, 5353);
+        assert_eq!(cfg.dns.dot_port, 8853);
+        assert_eq!(cfg.dns.doh_port, 8443);
+        assert_eq!(cfg.dns.bind, vec![IpAddr::from_str("0.0.0.0").unwrap()]);
+        assert_eq!(cfg.upstream.servers, vec!["9.9.9.9", "149.112.112.112"]);
+        assert_eq!(cfg.upstream.strategy, UpstreamStrategy::Parallel);
+        assert_eq!(
+            cfg.upstream.bootstrap,
+            vec![
+                IpAddr::from_str("1.1.1.1").unwrap(),
+                IpAddr::from_str("8.8.8.8").unwrap()
+            ]
+        );
+        assert_eq!(cfg.upstream.timeout_ms, 3000);
+        assert_eq!(cfg.dns.cache.size_mb, 128);
+        assert_eq!(cfg.dns.dnssec.mode, "strict");
+        assert!(cfg.dns.dnssec.validate);
+        assert_eq!(cfg.filtering.blocking_mode, BlockingMode::Nxdomain);
+        assert_eq!(cfg.filtering.lists.len(), 2);
+        assert_eq!(cfg.filtering.lists[0].name, "OISD Big");
+        assert_eq!(cfg.filtering.lists[1].name, "Hagezi Pro");
+        assert_eq!(
+            cfg.get_web_config().bind,
+            IpAddr::from_str("127.0.0.1").unwrap()
+        );
+        assert_eq!(cfg.get_web_config().port, 9090);
+        assert_eq!(cfg.get_stats_config().retention_days, 30);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_wizard_invalid_ports_and_ips() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_inv_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        // Invalid port
+        let bad_port_form = WizardCompleteForm {
+            port: Some("not_a_port".to_string()),
+            ..Default::default()
+        };
+        let resp =
+            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(bad_port_form))
+                .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Invalid web bind IP
+        let bad_ip_form = WizardCompleteForm {
+            web_bind: Some("not_an_ip".to_string()),
+            ..Default::default()
+        };
+        let resp =
+            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(bad_ip_form)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
