@@ -161,10 +161,15 @@ impl Config {
 
     /// Resolves the effective web configuration.
     pub fn get_web_config(&self) -> WebConfig {
-        if let Some(ref val) = self.web
-            && let Ok(cfg) = val.clone().try_into::<WebConfig>()
-        {
-            return cfg;
+        if let Some(ref val) = self.web {
+            match val.clone().try_into::<WebConfig>() {
+                Ok(cfg) => return cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse [web] section in configuration, falling back to defaults: {e}"
+                    );
+                }
+            }
         }
         WebConfig::default()
     }
@@ -178,20 +183,30 @@ impl Config {
 
     /// Resolves the effective stats configuration.
     pub fn get_stats_config(&self) -> StatsConfig {
-        if let Some(ref val) = self.stats
-            && let Ok(cfg) = val.clone().try_into::<StatsConfig>()
-        {
-            return cfg;
+        if let Some(ref val) = self.stats {
+            match val.clone().try_into::<StatsConfig>() {
+                Ok(cfg) => return cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse [stats] section in configuration, falling back to defaults: {e}"
+                    );
+                }
+            }
         }
         StatsConfig::default()
     }
 
     /// Resolves the effective auth configuration.
     pub fn get_auth_config(&self) -> AuthConfig {
-        if let Some(ref val) = self.auth
-            && let Ok(cfg) = val.clone().try_into::<AuthConfig>()
-        {
-            return cfg;
+        if let Some(ref val) = self.auth {
+            match val.clone().try_into::<AuthConfig>() {
+                Ok(cfg) => return cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse [auth] section in configuration, falling back to defaults: {e}"
+                    );
+                }
+            }
         }
         AuthConfig::default()
     }
@@ -236,7 +251,7 @@ impl Default for WebConfig {
 /// Query statistics and retention parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatsConfig {
-    #[serde(default = "default_retention_days")]
+    #[serde(default = "default_retention_days", alias = "query_log_retention_days")]
     pub retention_days: u32,
 }
 

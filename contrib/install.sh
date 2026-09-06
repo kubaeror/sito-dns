@@ -144,7 +144,7 @@ validate = true
 [upstream]
 servers = [
     "tls://dns.quad9.net",
-    "https://cloudflare-dns.com/dns-query"
+    "1.1.1.1"
 ]
 bootstrap = ["9.9.9.9", "1.1.1.1"]
 strategy = "parallel"
@@ -168,19 +168,16 @@ refresh_hours = 24
 auto_ptr = true
 
 [web]
+enabled = true
+bind = "0.0.0.0"
 port = 8080
-bind = ["0.0.0.0"]
-https = false
 
 [auth]
 session_ttl_hours = 24
 login_rate_limit = 5
 
 [stats]
-query_log_enabled = true
-query_log_retention_days = 90
-anonymize_client_ip = false
-prometheus_enabled = true
+retention_days = 90
 EOF
     chown sito:sito "${CONFIG_FILE}"
     chmod 640 "${CONFIG_FILE}"
