@@ -185,6 +185,16 @@ impl Config {
         }
         StatsConfig::default()
     }
+
+    /// Resolves the effective auth configuration.
+    pub fn get_auth_config(&self) -> AuthConfig {
+        if let Some(ref val) = self.auth
+            && let Ok(cfg) = val.clone().try_into::<AuthConfig>()
+        {
+            return cfg;
+        }
+        AuthConfig::default()
+    }
 }
 
 /// Web administrative server parameters.
@@ -238,6 +248,32 @@ impl Default for StatsConfig {
     fn default() -> Self {
         Self {
             retention_days: default_retention_days(),
+        }
+    }
+}
+
+/// Administrative authentication and session parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthConfig {
+    #[serde(default = "default_session_ttl_hours")]
+    pub session_ttl_hours: u64,
+    #[serde(default = "default_login_rate_limit")]
+    pub login_rate_limit: usize,
+}
+
+fn default_session_ttl_hours() -> u64 {
+    24
+}
+
+fn default_login_rate_limit() -> usize {
+    5
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            session_ttl_hours: default_session_ttl_hours(),
+            login_rate_limit: default_login_rate_limit(),
         }
     }
 }

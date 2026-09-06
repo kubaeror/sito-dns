@@ -235,10 +235,17 @@ pub async fn run_server_full(
     };
 
     // Administrative REST API server
+    let auth_cfg = config.get_auth_config();
+    let auth_mgr = Arc::new(sito_api::AuthManager::with_storage(
+        &config.server.data_dir,
+        auth_cfg.session_ttl_hours,
+        auth_cfg.login_rate_limit,
+    ));
+
     let server_ctx = sito_api::ServerContext {
         config: config_arc.clone(),
         config_path: config_path_buf.clone(),
-        auth_mgr: Arc::new(sito_api::AuthManager::new()),
+        auth_mgr,
         stats_db: stats_db.clone(),
         querylog_sender: querylog_sender.clone(),
         metrics: metrics.clone(),

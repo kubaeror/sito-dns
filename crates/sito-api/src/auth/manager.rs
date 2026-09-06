@@ -8,6 +8,7 @@ use crate::auth::totp::{TotpConfig, TotpSetupResponse};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,11 +36,18 @@ struct PartialAuth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct UserAccount {
-    username: String,
-    password_hash: String,
-    role: Role,
-    totp: Option<TotpConfig>,
+pub struct UserAccount {
+    pub username: String,
+    pub password_hash: String,
+    pub role: Role,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp: Option<TotpConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct UsersFile {
+    #[serde(default)]
+    users: Vec<UserAccount>,
 }
 
 /// Central state manager for authentication and authorization.
@@ -54,6 +62,7 @@ pub struct AuthManager {
     session_ttl_secs: i64,
     login_rate_limit: usize,
     setup_complete: Arc<AtomicBool>,
+    users_path: Option<PathBuf>,
 }
 
 impl Default for AuthManager {
@@ -64,29 +73,140 @@ impl Default for AuthManager {
 
 impl AuthManager {
     pub fn new() -> Self {
-        let mut mgr = Self {
+        Self::with_config_and_storage(None, 24, 5)
+    }
+
+    pub fn with_config(session_ttl_hours: u64, login_rate_limit: usize) -> Self {
+        Self::with_config_and_storage(None, session_ttl_hours, login_rate_limit)
+    }
+
+    pub fn with_storage(
+        data_dir: impl AsRef<Path>,
+        session_ttl_hours: u64,
+        login_rate_limit: usize,
+    ) -> Self {
+        Self::with_config_and_storage(
+            Some(data_dir.as_ref().join("users.toml")),
+            session_ttl_hours,
+            login_rate_limit,
+        )
+    }
+
+    pub fn with_config_and_storage(
+        users_path: Option<PathBuf>,
+        session_ttl_hours: u64,
+        login_rate_limit: usize,
+    ) -> Self {
+        let secs = session_ttl_hours.saturating_mul(3600);
+        let session_ttl_secs = i64::try_from(secs).unwrap_or(DEFAULT_SESSION_TTL_SECS);
+
+        let mgr = Self {
             users: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             tokens: Arc::new(Mutex::new(HashMap::new())),
             pending_totp_setups: Arc::new(Mutex::new(HashMap::new())),
             partial_tokens: Arc::new(Mutex::new(HashMap::new())),
             lockout: LockoutTracker::new(),
-            session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
-            login_rate_limit: 5,
+            session_ttl_secs,
+            login_rate_limit,
             setup_complete: Arc::new(AtomicBool::new(false)),
+            users_path,
         };
 
-        // Create default bootstrap admin account (admin / adminadmin)
-        mgr.create_user("admin", "adminadmin", Role::Admin);
+        if let Some(ref path) = mgr.users_path {
+            if path.exists()
+                && let Ok(content) = std::fs::read_to_string(path)
+                && let Ok(file) = toml::from_str::<UsersFile>(&content)
+                && !file.users.is_empty()
+            {
+                let (has_admin, admin_password_changed) = {
+                    let mut map = mgr.users.lock().unwrap();
+                    for u in file.users {
+                        map.insert(u.username.clone(), u);
+                    }
+                    if let Some(admin) = map.get("admin") {
+                        (true, !verify_password("adminadmin", &admin.password_hash))
+                    } else {
+                        (false, false)
+                    }
+                };
+                if !has_admin || admin_password_changed {
+                    mgr.setup_complete.store(true, Ordering::SeqCst);
+                }
+                return mgr;
+            }
+            // If file does not exist or empty, initialize bootstrap admin and persist
+            mgr.create_user_internal("admin", "adminadmin", Role::Admin);
+            mgr.save_users();
+        } else {
+            // Memory-only fallback for tests
+            mgr.create_user_internal("admin", "adminadmin", Role::Admin);
+        }
+
         mgr
     }
 
-    pub fn with_config(session_ttl_hours: u64, login_rate_limit: usize) -> Self {
-        let mut mgr = Self::new();
-        let secs = session_ttl_hours.saturating_mul(3600);
-        mgr.session_ttl_secs = i64::try_from(secs).unwrap_or(DEFAULT_SESSION_TTL_SECS);
-        mgr.login_rate_limit = login_rate_limit;
-        mgr
+    fn save_users(&self) {
+        let Some(ref path) = self.users_path else {
+            return;
+        };
+        let users_list: Vec<UserAccount> = {
+            let users = self.users.lock().unwrap();
+            users.values().cloned().collect()
+        };
+        let file_content = UsersFile { users: users_list };
+        let Ok(toml_str) = toml::to_string_pretty(&file_content) else {
+            tracing::error!("Failed to serialize users to TOML");
+            return;
+        };
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let tmp_path = path.with_extension(format!("tmp.{}", rand::random::<u32>()));
+        let write_res = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp_path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = file.metadata()?.permissions();
+                perms.set_mode(0o600);
+                file.set_permissions(perms)?;
+            }
+            file.write_all(toml_str.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp_path, path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(path)?.permissions();
+                perms.set_mode(0o600);
+                std::fs::set_permissions(path, perms)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = write_res {
+            tracing::error!("Failed to persist users to {}: {e}", path.display());
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    }
+
+    fn create_user_internal(&self, username: &str, password: &str, role: Role) {
+        let hash = hash_password(password).expect("valid password hash");
+        let user = UserAccount {
+            username: username.to_string(),
+            password_hash: hash,
+            role,
+            totp: None,
+        };
+        self.users
+            .lock()
+            .unwrap()
+            .insert(username.to_string(), user);
     }
 
     /// Returns true if the server is in first-run state (setup has not been completed and default credentials are active).
@@ -120,6 +240,7 @@ impl AuthManager {
             .lock()
             .unwrap()
             .insert(username.to_string(), user);
+        self.save_users();
     }
 
     /// Updates password for an existing user.
@@ -128,6 +249,8 @@ impl AuthManager {
             let mut users = self.users.lock().unwrap();
             if let Some(user) = users.get_mut(username) {
                 user.password_hash = hash;
+                drop(users);
+                self.save_users();
                 return true;
             }
         }
@@ -231,7 +354,11 @@ impl AuthManager {
             self.partial_tokens.lock().unwrap().remove(partial_token);
             self.lockout.record_success(&username);
 
-            let session = Session::new(&username, user.role, self.session_ttl_secs);
+            let role = user.role;
+            drop(users);
+            self.save_users();
+
+            let session = Session::new(&username, role, self.session_ttl_secs);
             self.sessions
                 .lock()
                 .unwrap()
@@ -265,6 +392,8 @@ impl AuthManager {
             let mut users = self.users.lock().unwrap();
             if let Some(user) = users.get_mut(username) {
                 user.totp = Some(config);
+                drop(users);
+                self.save_users();
                 return true;
             }
         }
@@ -276,6 +405,8 @@ impl AuthManager {
         let mut users = self.users.lock().unwrap();
         if let Some(user) = users.get_mut(username) {
             user.totp = None;
+            drop(users);
+            self.save_users();
             true
         } else {
             false
@@ -412,5 +543,67 @@ mod tests {
         assert!(mgr.delete_token(&meta.id));
         assert!(mgr.validate_token(&resp.token).is_none());
         assert_eq!(mgr.list_tokens().len(), 0);
+    }
+
+    #[test]
+    fn test_user_persistence_across_restart() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_auth_test_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        {
+            let mut mgr = AuthManager::with_storage(&temp_dir, 24, 5);
+            assert!(mgr.is_first_run());
+
+            // Change admin password
+            assert!(mgr.update_user_password("admin", "newsecret123"));
+            assert!(!mgr.is_first_run());
+
+            // Create operator user
+            mgr.create_user("operator1", "oppassword", Role::Operator);
+
+            // Setup TOTP for operator1
+            let setup = mgr.init_totp_setup("operator1").expect("totp setup");
+            assert!(mgr.confirm_totp_setup("operator1", &setup.backup_codes[0]));
+        }
+
+        // Simulate server restart by creating a new AuthManager pointing to same directory
+        {
+            let mgr = AuthManager::with_storage(&temp_dir, 24, 5);
+            assert!(!mgr.is_first_run());
+
+            // Old default credentials must FAIL
+            match mgr.login("admin", "adminadmin", "127.0.0.1") {
+                LoginResult::InvalidCredentials { .. } => {}
+                other => panic!("expected invalid credentials, got {other:?}"),
+            }
+
+            // New password must SUCCEED
+            match mgr.login("admin", "newsecret123", "127.0.0.1") {
+                LoginResult::Success(session) => {
+                    assert_eq!(session.username, "admin");
+                    assert_eq!(session.role, Role::Admin);
+                }
+                other => panic!("expected success, got {other:?}"),
+            }
+
+            // Operator must exist and require TOTP
+            match mgr.login("operator1", "oppassword", "127.0.0.1") {
+                LoginResult::TotpRequired { .. } => {}
+                other => panic!("expected TotpRequired, got {other:?}"),
+            }
+
+            // Verify file permissions (0600 on Unix)
+            let users_file = temp_dir.join("users.toml");
+            assert!(users_file.exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::metadata(&users_file).unwrap().permissions();
+                assert_eq!(perms.mode() & 0o777, 0o600);
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
