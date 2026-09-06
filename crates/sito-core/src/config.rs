@@ -434,7 +434,7 @@ fn default_dns_doh_port() -> u16 {
     443
 }
 fn default_dns_doq_port() -> u16 {
-    853
+    0
 }
 fn default_dns_doh3_port() -> u16 {
     443
@@ -1289,5 +1289,17 @@ key = "/path/to/key.pem"
             }
             other => panic!("expected dns.cache.negative_ttl_max error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_default_config_doq_port_disabled_and_conflict_free() {
+        let cfg = Config::default();
+        assert_eq!(cfg.dns.dot_port, 853);
+        assert_eq!(
+            cfg.dns.doq_port, 0,
+            "DoQ must be disabled (port 0) by default to avoid port conflict with DoT"
+        );
+        assert_ne!(cfg.dns.dot_port, cfg.dns.doq_port);
+        assert!(cfg.validate().is_ok());
     }
 }
