@@ -263,3 +263,117 @@ async fn test_wizard_gate_forbidden_after_setup() {
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
+
+#[cfg(feature = "embed-ui")]
+#[tokio::test]
+async fn test_setup_pending_route_gating_and_wizard_flow() {
+    let (ctx, temp_dir) = create_test_context().await;
+    ctx.set_setup_pending(true);
+
+    let app = create_router(ctx.clone());
+
+    // 1. UI routes redirect to /wizard (302 Found)
+    for path in [
+        "/",
+        "/login",
+        "/dashboard",
+        "/settings",
+        "/querylog",
+        "/filtering",
+    ] {
+        let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FOUND,
+            "Path {path} should return 302 FOUND"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "/wizard",
+            "Path {path} should redirect to /wizard"
+        );
+    }
+
+    // 2. API v1 endpoints return 503 Service Unavailable with "Setup not completed"
+    for path in [
+        "/api/v1/status",
+        "/api/v1/config",
+        "/api/v1/clients",
+        "/api/v1/rewrites",
+    ] {
+        let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "API path {path} should return 503"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "Setup not completed");
+    }
+
+    // 3. Allowed endpoints: /wizard, /ui/upstreams/test
+    let req = Request::builder()
+        .uri("/wizard")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let test_upstream_req = Request::builder()
+        .method("POST")
+        .uri("/ui/upstreams/test")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from("address=1.1.1.1"))
+        .unwrap();
+    let resp = app.clone().oneshot(test_upstream_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 4. Complete setup wizard via POST /ui/wizard/complete
+    let complete_req = Request::builder()
+        .method("POST")
+        .uri("/ui/wizard/complete")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(
+            "admin_user=setupadmin&admin_password=Setuppassword123!&confirm_password=Setuppassword123!&bind_ipv4=on&port=5353&upstreams=1.1.1.1"
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(complete_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "/login"
+    );
+
+    // 5. Setup pending is now flipped to false
+    assert!(!ctx.is_setup_pending());
+
+    // 6. UI routes no longer redirect to /wizard
+    let req = Request::builder()
+        .uri("/login")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 7. API v1 endpoints no longer return 503
+    let req = Request::builder()
+        .uri("/api/v1/status")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_ne!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
