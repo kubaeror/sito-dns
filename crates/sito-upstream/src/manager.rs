@@ -221,6 +221,14 @@ impl UpstreamManager {
 
     /// Resolve a DNS query according to domain rules and configured strategy (parallel, load balance, failover).
     pub async fn resolve(&self, msg: &Message) -> Result<Message, UpstreamError> {
+        self.resolve_with_upstream(msg).await.map(|(resp, _)| resp)
+    }
+
+    /// Resolve a DNS query according to domain rules and return the response along with the upstream identifier.
+    pub async fn resolve_with_upstream(
+        &self,
+        msg: &Message,
+    ) -> Result<(Message, String), UpstreamError> {
         if let Some(query) = msg.queries.first() {
             let qname_str = query.name.to_utf8().to_lowercase();
             let qname_clean = qname_str.trim_end_matches('.');
@@ -246,7 +254,7 @@ impl UpstreamManager {
         &self,
         entries: &[ManagedEntry],
         msg: &Message,
-    ) -> Result<Message, UpstreamError> {
+    ) -> Result<(Message, String), UpstreamError> {
         if entries.is_empty() {
             return Err(UpstreamError::AllDown);
         }
@@ -278,7 +286,7 @@ impl UpstreamManager {
                         match u.resolve(&m).await {
                             Ok(resp) => {
                                 h.write().await.record_success();
-                                Ok(resp)
+                                Ok((resp, name))
                             }
                             Err(e) => {
                                 warn!("Upstream {} failed parallel query: {}", name, e);
@@ -302,7 +310,7 @@ impl UpstreamManager {
                     match entry.upstream.resolve(msg).await {
                         Ok(response) => {
                             entry.health.write().await.record_success();
-                            return Ok(response);
+                            return Ok((response, entry.name.clone()));
                         }
                         Err(e) => {
                             warn!("Upstream {} failed query: {}", entry.name, e);
@@ -320,7 +328,7 @@ impl UpstreamManager {
                     match entry.upstream.resolve(msg).await {
                         Ok(response) => {
                             entry.health.write().await.record_success();
-                            return Ok(response);
+                            return Ok((response, entry.name.clone()));
                         }
                         Err(e) => {
                             warn!("Upstream {} failed query: {}", entry.name, e);

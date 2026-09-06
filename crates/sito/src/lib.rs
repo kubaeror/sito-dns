@@ -111,6 +111,10 @@ mod tests {
         let services = Arc::new(ServiceRegistry::bundled());
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
 
+        let stats_db = sito_stats::StatsDb::in_memory().await.unwrap();
+        let querylog_writer = sito_stats::QueryLogWriter::spawn(stats_db.clone(), 100);
+        let metrics = sito_stats::MetricsRegistry::new("1.2.1", "test");
+
         let pipeline = DnsPipeline::new(
             Arc::new(config.clone()),
             filter,
@@ -122,7 +126,8 @@ mod tests {
             services,
             rewrites,
             in_flight,
-        );
+        )
+        .with_stats(querylog_writer.sender(), metrics);
 
         let client = ClientContext::new("127.0.0.1".parse().unwrap());
 
@@ -163,6 +168,19 @@ mod tests {
             resp_allowed.answers[0].data,
             RData::A(A(Ipv4Addr::new(93, 184, 216, 34)))
         );
+
+        // Verify real upstream identifier was recorded in query log
+        querylog_writer.sender().flush().await;
+        let logs = stats_db
+            .query_logs(&sito_stats::QueryLogFilter::default())
+            .await
+            .unwrap();
+        let upstream_log = logs
+            .entries
+            .iter()
+            .find(|e| e.qname == "example.com")
+            .expect("should find example.com query log");
+        assert_eq!(upstream_log.upstream, Some(mock_addr.to_string()));
 
         // 5. Test second query -> cache hit
         let mut query_cached = Message::new(303, MessageType::Query, OpCode::Query);

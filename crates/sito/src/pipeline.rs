@@ -487,8 +487,8 @@ impl QueryHandler for DnsPipeline {
             }
 
             // 6. Upstream resolution
-            match self.upstream.resolve(&query).await {
-                Ok(mut upstream_resp) => {
+            match self.upstream.resolve_with_upstream(&query).await {
+                Ok((mut upstream_resp, upstream_name)) => {
                     upstream_resp.metadata.id = query_id;
 
                     // Anti-DoH bypass: inspect resolved A and AAAA records for known resolver IPs
@@ -575,7 +575,7 @@ impl QueryHandler for DnsPipeline {
                         verdict: "allowed",
                         rule: None,
                         source: None,
-                        upstream: Some("upstream".to_string()),
+                        upstream: Some(upstream_name),
                         from_cache: false,
                         domain_str,
                         qtype,

@@ -23,6 +23,8 @@ pub struct Config {
     pub tls: Option<TlsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acme: Option<AcmeConfig>,
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
 
     // Additional forward-compatible sections that might be present in full configs
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +57,7 @@ impl Default for Config {
             filtering: FilteringConfig::default(),
             tls: None,
             acme: None,
+            privacy: PrivacyConfig::default(),
             clients: None,
             rewrites: None,
             web: None,
@@ -90,6 +93,7 @@ impl Config {
         self.dns.validate()?;
         self.upstream.validate()?;
         self.filtering.validate()?;
+        self.privacy.validate()?;
         if let Some(ref tls) = self.tls {
             tls.validate()?;
         }
@@ -1062,6 +1066,20 @@ impl AcmeConfig {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+/// Privacy and anonymization configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PrivacyConfig {
+    /// Mask client IP addresses in query log database (/24 for IPv4, /56 for IPv6).
+    #[serde(default, alias = "anonymize_client_ip")]
+    pub anonymize_querylog: bool,
+}
+
+impl PrivacyConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         Ok(())
     }
 }

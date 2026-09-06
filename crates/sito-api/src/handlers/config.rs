@@ -129,6 +129,8 @@ pub async fn update_config(
 
     // Atomic write
     save_config_atomic(&ctx.config_path, &parsed).await?;
+    ctx.querylog_sender
+        .set_anonymize(parsed.privacy.anonymize_querylog);
     ctx.config.store(Arc::new(parsed));
     crate::publish_bundle(&ctx);
 
@@ -160,6 +162,8 @@ pub async fn reload_config(
     let parsed = Config::from_toml_str(&raw)
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid configuration on disk: {e}")))?;
 
+    ctx.querylog_sender
+        .set_anonymize(parsed.privacy.anonymize_querylog);
     ctx.config.store(Arc::new(parsed));
     crate::publish_bundle(&ctx);
 
@@ -369,6 +373,8 @@ pub async fn confirm_restore(
         .map_err(|e| ProblemDetails::bad_request(format!("Configuration error: {e}")))?;
 
     save_config_atomic(&ctx.config_path, &parsed).await?;
+    ctx.querylog_sender
+        .set_anonymize(parsed.privacy.anonymize_querylog);
     ctx.config.store(Arc::new(parsed));
     crate::publish_bundle(&ctx);
 

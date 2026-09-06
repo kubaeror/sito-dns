@@ -64,7 +64,11 @@ pub async fn run_server_full(
     let stats_db = StatsDb::open(&db_path).await?;
 
     // Initialize QueryLogWriter (10k buffer per M5.1)
-    let querylog_writer = QueryLogWriter::spawn(stats_db.clone(), 10_000);
+    let querylog_writer = QueryLogWriter::spawn_with_anonymize(
+        stats_db.clone(),
+        10_000,
+        config.privacy.anonymize_querylog,
+    );
     let querylog_sender = querylog_writer.sender();
 
     // Initialize Prometheus metrics registry with 18 metrics per Table 14.2

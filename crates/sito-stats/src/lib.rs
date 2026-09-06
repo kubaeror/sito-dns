@@ -152,6 +152,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_writer_anonymize_ip_toggle() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let writer = QueryLogWriter::spawn_with_anonymize(db.clone(), 100, true);
+        let sender = writer.sender();
+
+        let mut live_tail = sender.subscribe();
+
+        let entry = QueryLogEntry {
+            id: None,
+            ts: chrono::Utc::now().timestamp_millis(),
+            client_ip: "192.168.1.100".into(),
+            client_name: None,
+            qname: "privacy.test".into(),
+            qtype: 1,
+            rcode: Some(0),
+            verdict: "allowed".into(),
+            rule: None,
+            list_source: None,
+            upstream: Some("1.1.1.1:53".into()),
+            elapsed_us: Some(500),
+            dnssec: None,
+            proto: "udp".into(),
+        };
+
+        assert!(sender.try_send(entry));
+        let live = live_tail.recv().await.unwrap();
+        assert_eq!(live.client_ip, "192.168.1.0");
+
+        sender.flush().await;
+
+        let page = db.query_logs(&QueryLogFilter::default()).await.unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].client_ip, "192.168.1.0");
+        assert_eq!(page.entries[0].upstream, Some("1.1.1.1:53".into()));
+
+        // Toggle off
+        sender.set_anonymize(false);
+        let entry2 = QueryLogEntry {
+            id: None,
+            ts: chrono::Utc::now().timestamp_millis(),
+            client_ip: "10.45.99.123".into(),
+            client_name: None,
+            qname: "raw.test".into(),
+            qtype: 1,
+            rcode: Some(0),
+            verdict: "allowed".into(),
+            rule: None,
+            list_source: None,
+            upstream: Some("8.8.8.8:53".into()),
+            elapsed_us: Some(300),
+            dnssec: None,
+            proto: "udp".into(),
+        };
+
+        assert!(sender.try_send(entry2));
+        let live2 = live_tail.recv().await.unwrap();
+        assert_eq!(live2.client_ip, "10.45.99.123");
+
+        sender.flush().await;
+        let page2 = db.query_logs(&QueryLogFilter::default()).await.unwrap();
+        assert_eq!(page2.entries.len(), 2);
+        assert_eq!(page2.entries[0].client_ip, "10.45.99.123");
+        assert_eq!(page2.entries[0].upstream, Some("8.8.8.8:53".into()));
+
+        sender.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_retention_cleaner_and_aggregation() {
         let db = StatsDb::in_memory().await.unwrap();
 
