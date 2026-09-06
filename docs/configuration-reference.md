@@ -4,6 +4,9 @@ This document is the exhaustive configuration reference for **sito v1.0.0**.
 
 `sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment variables can override any setting using the `DNSD__<SECTION>__<KEY>` naming convention (double underscores between hierarchy levels).
 
+> [!NOTE]
+> Configuration persistence round-trips modeled fields via the `Config` schema. Unrecognized or unmodeled keys and comments are omitted when the configuration is saved back to disk by the web console or API.
+
 ---
 
 ## 1. Top-Level Options

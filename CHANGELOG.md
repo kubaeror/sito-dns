@@ -33,6 +33,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 - **Workspace Version**: Bumped workspace package and all internal crates to `1.2.0`.
+- **Configuration Persistence**: Persisting configuration changes via the Web UI or REST API round-trips modeled fields; unmodeled or unknown keys and custom comments are not preserved on save.
 
 ---
 
