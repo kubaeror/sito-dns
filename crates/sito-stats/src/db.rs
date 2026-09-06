@@ -5,7 +5,6 @@ use crate::error::StatsError;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Pool, Row, Sqlite};
-use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -185,46 +184,52 @@ impl StatsDb {
         let limit = filter.limit.unwrap_or(50).clamp(1, 1000);
         let fetch_limit = limit + 1;
 
-        let mut query_builder = String::from(
+        let mut builder: sqlx::QueryBuilder<Sqlite> = sqlx::QueryBuilder::new(
             "SELECT id, ts, client_ip, client_name, qname, qtype, rcode, verdict, rule, list_source, upstream, elapsed_us, dnssec, proto FROM query_log WHERE 1=1",
         );
 
         if let Some(cursor) = filter.cursor {
-            let _ = write!(query_builder, " AND id < {cursor}");
+            builder.push(" AND id < ");
+            builder.push_bind(cursor);
         }
         if let Some(from) = filter.from {
-            let _ = write!(query_builder, " AND ts >= {from}");
+            builder.push(" AND ts >= ");
+            builder.push_bind(from);
         }
         if let Some(to) = filter.to {
-            let _ = write!(query_builder, " AND ts <= {to}");
+            builder.push(" AND ts <= ");
+            builder.push_bind(to);
         }
         if let Some(ref status) = filter.status {
-            let _ = write!(
-                query_builder,
-                " AND verdict = '{}'",
-                status.replace('\'', "''")
-            );
+            builder.push(" AND verdict = ");
+            builder.push_bind(status);
         }
         if let Some(qtype) = filter.qtype {
-            let _ = write!(query_builder, " AND qtype = {qtype}");
+            builder.push(" AND qtype = ");
+            builder.push_bind(i64::from(qtype));
         }
         if let Some(ref client) = filter.client {
-            let escaped = client.replace('\'', "''");
-            let _ = write!(
-                query_builder,
-                " AND (client_ip = '{escaped}' OR client_name = '{escaped}')"
-            );
+            builder.push(" AND (client_ip = ");
+            builder.push_bind(client);
+            builder.push(" OR client_name = ");
+            builder.push_bind(client);
+            builder.push(")");
         }
         if let Some(ref domain) = filter.domain {
-            let escaped = domain.replace('\'', "''").replace('%', "\\%");
-            let _ = write!(query_builder, " AND qname LIKE '%{escaped}%'");
+            builder.push(" AND qname LIKE ");
+            let escaped = domain
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let pattern = format!("%{escaped}%");
+            builder.push_bind(pattern);
+            builder.push(" ESCAPE '\\'");
         }
 
-        let _ = write!(query_builder, " ORDER BY id DESC LIMIT {fetch_limit}");
+        builder.push(" ORDER BY id DESC LIMIT ");
+        builder.push_bind(i64::try_from(fetch_limit).unwrap_or(1001));
 
-        let rows = sqlx::query(sqlx::AssertSqlSafe(query_builder.as_str()))
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = builder.build().fetch_all(&self.pool).await?;
 
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {

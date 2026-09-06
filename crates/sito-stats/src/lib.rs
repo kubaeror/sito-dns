@@ -458,4 +458,78 @@ mod tests {
         assert_eq!(queries3, 3);
         assert_eq!(blocked3, 1);
     }
+
+    #[tokio::test]
+    async fn test_query_logs_with_special_characters_sql_injection_safe() {
+        let db = StatsDb::in_memory().await.unwrap();
+
+        let entries = vec![
+            QueryLogEntry {
+                id: None,
+                ts: 1_700_000_000_000,
+                client_ip: "10.0.0.1".into(),
+                client_name: Some("client' OR '1'='1".into()),
+                qname: "foo%bar'baz.com".into(),
+                qtype: 1,
+                rcode: Some(0),
+                verdict: "allowed".into(),
+                rule: None,
+                list_source: None,
+                upstream: None,
+                elapsed_us: None,
+                dnssec: None,
+                proto: "udp".into(),
+            },
+            QueryLogEntry {
+                id: None,
+                ts: 1_700_000_000_100,
+                client_ip: "10.0.0.2".into(),
+                client_name: Some("normal-client".into()),
+                qname: "regular.org".into(),
+                qtype: 1,
+                rcode: Some(0),
+                verdict: "blocked".into(),
+                rule: None,
+                list_source: None,
+                upstream: None,
+                elapsed_us: None,
+                dnssec: None,
+                proto: "udp".into(),
+            },
+        ];
+
+        db.insert_batch(&entries).await.unwrap();
+
+        // Query by client with quote injection
+        let res_client = db
+            .query_logs(&QueryLogFilter {
+                client: Some("client' OR '1'='1".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(res_client.entries.len(), 1);
+        assert_eq!(res_client.entries[0].qname, "foo%bar'baz.com");
+
+        // Query by domain with percent and quote
+        let res_domain = db
+            .query_logs(&QueryLogFilter {
+                domain: Some("foo%bar'".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(res_domain.entries.len(), 1);
+        assert_eq!(res_domain.entries[0].qname, "foo%bar'baz.com");
+
+        // Query with malicious status injection
+        let res_status = db
+            .query_logs(&QueryLogFilter {
+                status: Some("' OR 1=1 --".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(res_status.entries.len(), 0);
+    }
 }
