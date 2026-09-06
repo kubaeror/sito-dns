@@ -200,6 +200,44 @@ impl MetricsRegistry {
         self.querylog_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Returns total query count and blocked query count processed by this registry.
+    pub fn get_queries_and_blocked(&self) -> (u64, u64) {
+        let map = self.queries_total.lock().unwrap();
+        let mut total = 0u64;
+        let mut blocked = 0u64;
+        for ((_proto, _qtype, verdict), count) in map.iter() {
+            total += count;
+            if verdict == "blocked" {
+                blocked += count;
+            }
+        }
+        (total, blocked)
+    }
+
+    /// Returns a map of upstream identifiers to (rtt_ms, total_errors).
+    pub fn get_upstream_reports(&self) -> std::collections::HashMap<String, (f64, u64)> {
+        let mut res = std::collections::HashMap::new();
+        {
+            let rtt_map = self.upstream_rtt.lock().unwrap();
+            for (upstream, hist) in rtt_map.iter() {
+                let rtt_ms = if hist.count > 0 {
+                    (hist.sum / hist.count as f64) * 1000.0
+                } else {
+                    0.0
+                };
+                res.insert(upstream.clone(), (rtt_ms, 0u64));
+            }
+        }
+        {
+            let err_map = self.upstream_errors.lock().unwrap();
+            for ((upstream, _kind), count) in err_map.iter() {
+                let entry = res.entry(upstream.clone()).or_insert((0.0, 0u64));
+                entry.1 += count;
+            }
+        }
+        res
+    }
+
     /// Generates the Prometheus text exposition representation conforming to Table 14.2.
     pub fn render_prometheus(&self) -> String {
         let mut out = String::new();

@@ -600,4 +600,31 @@ mod tests {
             .unwrap();
         assert_eq!(res_status.entries.len(), 0);
     }
+
+    #[test]
+    fn test_metrics_registry_queries_and_upstream_reports() {
+        let metrics = MetricsRegistry::new("1.0.0", "test");
+        metrics.inc_queries("udp", 1, "allowed");
+        metrics.inc_queries("udp", 28, "blocked");
+        metrics.inc_queries("tcp", 1, "allowed");
+
+        let (total, blocked) = metrics.get_queries_and_blocked();
+        assert_eq!(total, 3);
+        assert_eq!(blocked, 1);
+
+        metrics.observe_upstream_rtt("1.1.1.1:53", 0.025);
+        metrics.observe_upstream_rtt("1.1.1.1:53", 0.035);
+        metrics.inc_upstream_errors("1.1.1.1:53", "timeout");
+        metrics.inc_upstream_errors("8.8.8.8:53", "network");
+
+        let upstreams = metrics.get_upstream_reports();
+        assert_eq!(upstreams.len(), 2);
+        let u1 = upstreams.get("1.1.1.1:53").unwrap();
+        assert!((u1.0 - 30.0).abs() < 1e-3);
+        assert_eq!(u1.1, 1);
+
+        let u2 = upstreams.get("8.8.8.8:53").unwrap();
+        assert_eq!(u2.0, 0.0);
+        assert_eq!(u2.1, 1);
+    }
 }
