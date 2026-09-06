@@ -241,13 +241,19 @@ mod tests {
         {
             let mut attempts = tracker.attempts.lock().unwrap();
             if let Some(rec) = attempts.get_mut("user1") {
-                rec.last_attempt = Instant::now() - Duration::from_secs(1000); // > 15 mins
+                rec.last_attempt = Instant::now()
+                    .checked_sub(Duration::from_secs(1000))
+                    .unwrap(); // > 15 mins
             }
         }
         {
             let mut ip_rates = tracker.ip_rates.lock().unwrap();
             if let Some(rec) = ip_rates.get_mut("1.2.3.4") {
-                rec.timestamps = vec![Instant::now() - Duration::from_secs(120)]; // > 60s
+                rec.timestamps = vec![
+                    Instant::now()
+                        .checked_sub(Duration::from_secs(120))
+                        .unwrap(),
+                ]; // > 60s
             }
         }
 

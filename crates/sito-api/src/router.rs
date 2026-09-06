@@ -169,6 +169,8 @@ pub fn create_router(ctx: ServerContext) -> Router {
             slave_read_only_middleware,
         ));
 
+    // Note: Swagger UI at /api/docs and OpenAPI JSON are intentionally unauthenticated
+    // to enable client generation and documentation discovery. Restrict via reverse proxy if needed.
     #[cfg(feature = "embed-ui")]
     let app = Router::new()
         .nest("/api/v1", api_v1)

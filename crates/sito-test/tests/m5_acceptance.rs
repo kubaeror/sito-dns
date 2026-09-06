@@ -739,3 +739,58 @@ async fn test_acceptance_m5_api_backup_and_token_restore() {
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
+
+#[tokio::test]
+async fn test_acceptance_m5_metrics_auth() {
+    let temp_dir = std::env::temp_dir().join(format!("sito_m5_metrics_{}", rand::random::<u64>()));
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let (ctx, _cfg_path, _writer) = create_test_context(&temp_dir).await;
+
+    // Enable metrics_auth in config
+    let mut cfg = (**ctx.config.load()).clone();
+    cfg.web = Some(
+        toml::Value::try_from(sito_core::config::WebConfig {
+            enabled: true,
+            bind: "127.0.0.1".parse().unwrap(),
+            port: 8080,
+            trusted_proxies: Vec::new(),
+            metrics_auth: true,
+        })
+        .unwrap(),
+    );
+    ctx.config.store(Arc::new(cfg));
+
+    // Create accounts
+    let view_tok = ctx.auth_mgr.create_token("viewer", Role::Viewer).1.token;
+
+    let app = sito_api::create_router(ctx.clone());
+
+    // 1. /metrics with metrics_auth = true rejects unauthenticated
+    let req = Request::builder()
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. /metrics with invalid token rejected
+    let req = Request::builder()
+        .uri("/metrics")
+        .header(header::AUTHORIZATION, "Bearer invalid-token")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. /metrics with valid Viewer token succeeds
+    let req = Request::builder()
+        .uri("/metrics")
+        .header(header::AUTHORIZATION, format!("Bearer {view_tok}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}

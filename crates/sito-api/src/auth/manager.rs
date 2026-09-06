@@ -239,7 +239,7 @@ impl AuthManager {
     }
 
     /// Creates or updates a user account.
-    pub fn create_user(&mut self, username: &str, password: &str, role: Role) {
+    pub fn create_user(&self, username: &str, password: &str, role: Role) {
         let hash = hash_password(password).expect("valid password hash");
         let user = UserAccount {
             username: username.to_string(),
@@ -601,7 +601,7 @@ impl AuthManager {
     pub fn expire_partial_tokens_for_test(&self) {
         let mut partials = self.partial_tokens.lock().unwrap();
         for auth in partials.values_mut() {
-            auth.expires_at = Instant::now() - Duration::from_secs(10);
+            auth.expires_at = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
         }
     }
 
@@ -609,7 +609,9 @@ impl AuthManager {
     pub fn expire_pending_totp_for_test(&self) {
         let mut pending = self.pending_totp_setups.lock().unwrap();
         for p in pending.values_mut() {
-            p.created_at = Instant::now() - Duration::from_secs(1000);
+            p.created_at = Instant::now()
+                .checked_sub(Duration::from_secs(1000))
+                .unwrap();
         }
     }
 }
@@ -678,7 +680,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&temp_dir);
 
         {
-            let mut mgr = AuthManager::with_storage(&temp_dir, 24, 5);
+            let mgr = AuthManager::with_storage(&temp_dir, 24, 5);
             assert!(mgr.is_first_run());
 
             // Change admin password
@@ -737,9 +739,8 @@ mod tests {
     async fn test_prune_expired_entries() {
         let mgr = Arc::new(AuthManager::new());
         // 1. Create a session and expire it
-        let session = match mgr.login("admin", "adminadmin", "127.0.0.1") {
-            LoginResult::Success(s) => s,
-            _ => panic!("login failed"),
+        let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1") else {
+            panic!("login failed");
         };
         assert_eq!(mgr.sessions_len(), 1);
         mgr.expire_session_for_test(&session.id);

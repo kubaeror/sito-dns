@@ -223,6 +223,8 @@ pub struct WebConfig {
     pub port: u16,
     #[serde(default)]
     pub trusted_proxies: Vec<IpAddr>,
+    #[serde(default)]
+    pub metrics_auth: bool,
 }
 
 fn default_web_enabled() -> bool {
@@ -244,6 +246,7 @@ impl Default for WebConfig {
             bind: default_web_bind(),
             port: default_web_port(),
             trusted_proxies: Vec::new(),
+            metrics_auth: false,
         }
     }
 }
@@ -1242,9 +1245,11 @@ key = "/path/to/key.pem"
 
     #[test]
     fn test_cache_config_negative_ttl_validation() {
-        let mut cfg = CacheConfig::default();
-        cfg.min_ttl = 300;
-        cfg.negative_ttl_max = 60; // min_ttl > negative_ttl_max should fail validation
+        let cfg = CacheConfig {
+            min_ttl: 300,
+            negative_ttl_max: 60, // min_ttl > negative_ttl_max should fail validation
+            ..Default::default()
+        };
         let err = cfg.validate().unwrap_err();
         match err {
             ConfigError::Validation { field, .. } => {
