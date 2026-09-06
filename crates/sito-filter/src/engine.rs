@@ -15,7 +15,7 @@ use sito_proto::normalize_domain;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// In-memory snapshot of compiled filter rules.
 #[derive(Default, Debug, Clone)]
@@ -383,7 +383,10 @@ impl HostsFilterEngine {
             (snapshot, count)
         })
         .await
-        .unwrap_or_else(|_| (FilterSnapshot::default(), 0));
+        .map_err(|e| {
+            error!("Filter rule compilation task failed: {e}");
+            FilterError::CompileTaskFailed(e.to_string())
+        })?;
 
         let prev_count = self.snapshot.load().rule_count;
         if apply_drop_guard && prev_count > 0 && count < prev_count / 2 {
@@ -724,6 +727,26 @@ mod tests {
         let count = engine.reload_with_config(&new_config).await.unwrap();
         assert_eq!(count, 1);
         assert_eq!(engine.rule_count(), 1);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_compile_error_retains_existing_snapshot() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_join_err_test_{}", std::process::id()));
+        let config = FilteringConfig {
+            custom_rules: vec!["0.0.0.0 ad1.com".to_string(), "0.0.0.0 ad2.com".to_string()],
+            ..Default::default()
+        };
+
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+        assert_eq!(engine.rule_count(), 2);
+
+        // Verify CompileTaskFailed error variant can be formatted and matches
+        let err = FilterError::CompileTaskFailed("task panicked".to_string());
+        assert!(matches!(err, FilterError::CompileTaskFailed(_)));
+        assert_eq!(engine.rule_count(), 2);
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

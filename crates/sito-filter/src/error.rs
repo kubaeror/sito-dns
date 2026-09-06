@@ -30,4 +30,7 @@ pub enum FilterError {
 
     #[error("Invalid URL '{url}': {reason}")]
     InvalidUrl { url: String, reason: String },
+
+    #[error("Rule compilation task failed: {0}")]
+    CompileTaskFailed(String),
 }
