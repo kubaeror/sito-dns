@@ -124,27 +124,27 @@ pub async fn run_server_full(
         );
     }
 
-    // Construct pipeline with query logging and Prometheus metrics
-    let pipeline = Arc::new(
-        DnsPipeline::new(
-            Arc::new(config.clone()),
-            filter_engine.clone(),
-            cache.clone(),
-            upstream_manager.clone(),
-            dnssec,
-            client_registry.clone(),
-            parental_registry,
-            service_registry,
-            rewrite_table.clone(),
-            in_flight.clone(),
-        )
-        .with_stats(querylog_sender.clone(), metrics.clone()),
-    );
-
     // Setup ArcSwaps for hot-reloadable components
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config.clone())));
     let clients_arc = Arc::new(ArcSwap::new(client_registry.clone()));
     let rewrites_arc = Arc::new(ArcSwap::new(rewrite_table.clone()));
+
+    // Construct pipeline with query logging and Prometheus metrics
+    let pipeline = Arc::new(
+        DnsPipeline::new(
+            config_arc.clone(),
+            filter_engine.clone(),
+            cache.clone(),
+            upstream_manager.clone(),
+            dnssec,
+            clients_arc.clone(),
+            parental_registry,
+            service_registry,
+            rewrites_arc.clone(),
+            in_flight.clone(),
+        )
+        .with_stats(querylog_sender.clone(), metrics.clone()),
+    );
 
     // Initialize High Availability (HA) clustering subsystem per role
     let ha_config: sito_ha::HaConfig = config
@@ -311,6 +311,8 @@ pub async fn run_server_full(
     // Spawn config file watcher for hot-reload
     let watcher_config_path = config_path_buf.clone();
     let watcher_config_arc = config_arc.clone();
+    let watcher_clients_arc = clients_arc.clone();
+    let watcher_rewrites_arc = rewrites_arc.clone();
     let watcher_filter = filter_engine.clone();
     let watcher_coordinator = master_coordinator.clone();
     let mut watcher_shutdown_rx = shutdown_rx.clone();
@@ -359,6 +361,22 @@ pub async fn run_server_full(
                             Ok(new_cfg) => {
                                 info!("Detected configuration file change, hot-reloading");
                                 let _ = watcher_filter.reload_with_config(&new_cfg.filtering).await;
+                                let new_rewrites_cfg: sito_rewrites::RewritesConfig = new_cfg
+                                    .rewrites
+                                    .as_ref()
+                                    .and_then(|v| v.clone().try_into().ok())
+                                    .unwrap_or_default();
+                                watcher_rewrites_arc
+                                    .store(Arc::new(sito_rewrites::RewriteTable::new(new_rewrites_cfg)));
+
+                                let new_clients_cfg: sito_clients::ClientsConfig = new_cfg
+                                    .clients
+                                    .as_ref()
+                                    .and_then(|v| v.clone().try_into().ok())
+                                    .unwrap_or_default();
+                                watcher_clients_arc
+                                    .store(Arc::new(sito_clients::ClientRegistry::new(new_clients_cfg)));
+
                                 watcher_config_arc.store(Arc::new(new_cfg.clone()));
 
                                 if let Some(ref coord) = watcher_coordinator {

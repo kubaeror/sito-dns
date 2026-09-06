@@ -327,4 +327,92 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[tokio::test]
+    async fn test_pipeline_picks_up_rewrite_change_without_restart() {
+        use arc_swap::ArcSwap;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_rewrite_swap_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut config = Config::default();
+        config.server.data_dir = temp_dir.clone();
+        config.upstream.servers = vec!["127.0.0.1:1".to_string()];
+
+        let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
+        let upstream = Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let cache = Arc::new(DnsCache::new(config.dns.cache.clone()));
+        let filter_engine = Arc::new(
+            HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
+        );
+        let dnssec = Arc::new(sito_dnssec::DnssecValidator::from_config(
+            &config.dns.dnssec,
+        ));
+        let client_registry = Arc::new(ArcSwap::new(Arc::new(ClientRegistry::new(
+            ClientsConfig::default(),
+        ))));
+        let parental_registry = Arc::new(ParentalRegistry::bundled());
+        let service_registry = Arc::new(ServiceRegistry::bundled());
+        let rewrites = Arc::new(ArcSwap::new(Arc::new(RewriteTable::new(
+            RewritesConfig::default(),
+        ))));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+
+        let config_arc = Arc::new(ArcSwap::new(Arc::new(config.clone())));
+
+        let pipeline = DnsPipeline::new(
+            config_arc,
+            filter_engine,
+            cache,
+            upstream,
+            dnssec,
+            client_registry,
+            parental_registry,
+            service_registry,
+            rewrites.clone(),
+            in_flight,
+        );
+
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let mut query = Message::new(101, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("router.lan.").unwrap(),
+            RecordType::A,
+        ));
+
+        // Before update: rewrites table is empty; upstream 127.0.0.1:1 fails or SERVFAIL
+        let resp = pipeline
+            .handle(query.clone(), client.clone())
+            .await
+            .unwrap();
+        assert_ne!(resp.metadata.response_code, ResponseCode::NoError);
+
+        // Update rewrites table dynamically via ArcSwap
+        let new_rewrites = RewritesConfig {
+            auto_ptr: true,
+            entries: vec![sito_rewrites::RewriteEntryConfig {
+                domain: "router.lan".to_string(),
+                r#type: "A".to_string(),
+                answer: "192.168.1.1".to_string(),
+                exception_clients: vec![],
+            }],
+        };
+        rewrites.store(Arc::new(RewriteTable::new(new_rewrites)));
+
+        // After update: query resolves immediately without pipeline restart!
+        let resp2 = pipeline.handle(query, client).await.unwrap();
+        assert_eq!(resp2.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp2.answers.len(), 1);
+        assert_eq!(
+            resp2.answers[0].data,
+            RData::A(A(Ipv4Addr::new(192, 168, 1, 1)))
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

@@ -1,5 +1,6 @@
 //! DNS query execution pipeline.
 
+use arc_swap::ArcSwap;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use sito_cache::DnsCache;
@@ -20,6 +21,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{Instrument, debug, info, trace, warn};
 
+/// Helper trait to accept either `Arc<T>` or `Arc<ArcSwap<T>>`.
+pub trait IntoArcSwap<T> {
+    fn into_arc_swap(self) -> Arc<ArcSwap<T>>;
+}
+
+impl<T> IntoArcSwap<T> for Arc<ArcSwap<T>> {
+    fn into_arc_swap(self) -> Arc<ArcSwap<T>> {
+        self
+    }
+}
+
+impl<T> IntoArcSwap<T> for Arc<T> {
+    fn into_arc_swap(self) -> Arc<ArcSwap<T>> {
+        Arc::new(ArcSwap::new(self))
+    }
+}
+
 /// Tracks in-flight queries using RAII.
 struct InFlightGuard(Arc<AtomicUsize>);
 
@@ -31,16 +49,16 @@ impl Drop for InFlightGuard {
 
 /// The core DNS query resolution pipeline.
 pub struct DnsPipeline {
-    config: Arc<Config>,
+    config: Arc<ArcSwap<Config>>,
     filter: Arc<HostsFilterEngine>,
     anti_bypass: Arc<AntiBypassRegistry>,
     cache: Arc<DnsCache>,
     upstream: Arc<UpstreamManager>,
     dnssec: Arc<DnssecValidator>,
-    clients: Arc<ClientRegistry>,
+    clients: Arc<ArcSwap<ClientRegistry>>,
     parental: Arc<ParentalRegistry>,
     services: Arc<ServiceRegistry>,
-    rewrites: Arc<RewriteTable>,
+    rewrites: Arc<ArcSwap<RewriteTable>>,
     in_flight: Arc<AtomicUsize>,
     querylog: Option<sito_stats::QueryLogSender>,
     metrics: Option<sito_stats::MetricsRegistry>,
@@ -49,28 +67,28 @@ pub struct DnsPipeline {
 impl DnsPipeline {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        config: Arc<Config>,
+        config: impl IntoArcSwap<Config>,
         filter: Arc<HostsFilterEngine>,
         cache: Arc<DnsCache>,
         upstream: Arc<UpstreamManager>,
         dnssec: Arc<DnssecValidator>,
-        clients: Arc<ClientRegistry>,
+        clients: impl IntoArcSwap<ClientRegistry>,
         parental: Arc<ParentalRegistry>,
         services: Arc<ServiceRegistry>,
-        rewrites: Arc<RewriteTable>,
+        rewrites: impl IntoArcSwap<RewriteTable>,
         in_flight: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            config,
+            config: config.into_arc_swap(),
             filter,
             anti_bypass: Arc::new(AntiBypassRegistry::bundled()),
             cache,
             upstream,
             dnssec,
-            clients,
+            clients: clients.into_arc_swap(),
             parental,
             services,
-            rewrites,
+            rewrites: rewrites.into_arc_swap(),
             in_flight,
             querylog: None,
             metrics: None,
@@ -100,9 +118,13 @@ impl QueryHandler for DnsPipeline {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         let _guard = InFlightGuard(Arc::clone(&self.in_flight));
 
+        let config = self.config.load();
+        let clients = self.clients.load();
+        let rewrites = self.rewrites.load();
+
         let mut client = client;
         let now = chrono::Utc::now();
-        let policy = self.clients.resolve(&mut client, now);
+        let policy = clients.resolve(&mut client, now);
 
         let query_id = query.metadata.id;
         let request_id = rand::random::<u64>();
@@ -141,7 +163,7 @@ impl QueryHandler for DnsPipeline {
 
             trace!(qname = %qname, qtype = ?qtype, "Processing DNS query");
 
-            let bypass_check_needed = match self.config.filtering.anti_doh_bypass.as_str() {
+            let bypass_check_needed = match config.filtering.anti_doh_bypass.as_str() {
                 "block_all" => true,
                 "block_except_trusted" => !policy.trusted,
                 _ => false,
@@ -158,8 +180,8 @@ impl QueryHandler for DnsPipeline {
                 }
                 let mut blocked_resp = synthesize_blocked_response(
                     &query,
-                    &self.config.filtering.blocking_mode,
-                    self.config.filtering.blocking_ttl,
+                    &config.filtering.blocking_mode,
+                    config.filtering.blocking_ttl,
                 );
                 blocked_resp.metadata.id = query_id;
                 return (
@@ -186,8 +208,8 @@ impl QueryHandler for DnsPipeline {
                         );
                         let mut blocked_resp = synthesize_blocked_response(
                             &query,
-                            &self.config.filtering.blocking_mode,
-                            self.config.filtering.blocking_ttl,
+                            &config.filtering.blocking_mode,
+                            config.filtering.blocking_ttl,
                         );
                         blocked_resp.metadata.id = query_id;
                         return (
@@ -203,7 +225,7 @@ impl QueryHandler for DnsPipeline {
                     }
 
             // ADR-0007 Stage 2: Local DNS rewrites and auto-PTR
-            if let Some(records) = self.rewrites.lookup(qname, qtype, &client) {
+            if let Some(records) = rewrites.lookup(qname, qtype, &client) {
                 trace!(
                     qname = %qname,
                     qtype = ?qtype,
@@ -240,8 +262,8 @@ impl QueryHandler for DnsPipeline {
                     );
                     let mut blocked_resp = synthesize_blocked_response(
                         &query,
-                        &self.config.filtering.blocking_mode,
-                        self.config.filtering.blocking_ttl,
+                        &config.filtering.blocking_mode,
+                        config.filtering.blocking_ttl,
                     );
                     blocked_resp.metadata.id = query_id;
                     return (
@@ -273,8 +295,8 @@ impl QueryHandler for DnsPipeline {
                     );
                     let mut blocked_resp = synthesize_blocked_response(
                         &query,
-                        &self.config.filtering.blocking_mode,
-                        self.config.filtering.blocking_ttl,
+                        &config.filtering.blocking_mode,
+                        config.filtering.blocking_ttl,
                     );
                     blocked_resp.metadata.id = query_id;
                     return (
@@ -300,8 +322,8 @@ impl QueryHandler for DnsPipeline {
                     );
                     let mut blocked_resp = synthesize_blocked_response(
                         &query,
-                        &self.config.filtering.blocking_mode,
-                        self.config.filtering.blocking_ttl,
+                        &config.filtering.blocking_mode,
+                        config.filtering.blocking_ttl,
                     );
                     blocked_resp.metadata.id = query_id;
                     return (
@@ -341,7 +363,7 @@ impl QueryHandler for DnsPipeline {
                     }
 
             // 5. Cache lookup
-            if self.config.dns.cache.enabled {
+            if config.dns.cache.enabled {
                 if let Some(mut cached_resp) = self.cache.get(qname, qtype, qclass).await {
                     if bypass_check_needed {
                         let has_bypass_ip = cached_resp.answers.iter().any(|rec| match &rec.data {
@@ -356,8 +378,8 @@ impl QueryHandler for DnsPipeline {
                             }
                             let mut blocked_resp = synthesize_blocked_response(
                                 &query,
-                                &self.config.filtering.blocking_mode,
-                                self.config.filtering.blocking_ttl,
+                                &config.filtering.blocking_mode,
+                                config.filtering.blocking_ttl,
                             );
                             blocked_resp.metadata.id = query_id;
                             return (
@@ -426,8 +448,8 @@ impl QueryHandler for DnsPipeline {
                             }
                             let mut blocked_resp = synthesize_blocked_response(
                                 &query,
-                                &self.config.filtering.blocking_mode,
-                                self.config.filtering.blocking_ttl,
+                                &config.filtering.blocking_mode,
+                                config.filtering.blocking_ttl,
                             );
                             blocked_resp.metadata.id = query_id;
                             return (
@@ -444,8 +466,8 @@ impl QueryHandler for DnsPipeline {
                     }
 
                     // 7. CNAME uncloaking: inspect any CNAME targets against FilterEngine
-                    if self.config.filtering.enabled
-                        && self.config.filtering.cname_cloaking
+                    if config.filtering.enabled
+                        && config.filtering.cname_cloaking
                         && policy.is_filtering_enabled
                     {
                         for record in &upstream_resp.answers {
@@ -462,8 +484,8 @@ impl QueryHandler for DnsPipeline {
                                     );
                                     let mut blocked_resp = synthesize_blocked_response(
                                         &query,
-                                        &self.config.filtering.blocking_mode,
-                                        self.config.filtering.blocking_ttl,
+                                        &config.filtering.blocking_mode,
+                                        config.filtering.blocking_ttl,
                                     );
                                     blocked_resp.metadata.id = query_id;
                                     return (
@@ -488,7 +510,7 @@ impl QueryHandler for DnsPipeline {
                         .as_secs() as u32;
                     let _outcome = self.dnssec.validate_response(&mut upstream_resp, None, now);
 
-                    if self.config.dns.cache.enabled
+                    if config.dns.cache.enabled
                         && upstream_resp.metadata.response_code == ResponseCode::NoError
                     {
                         self.cache.insert(&query, &upstream_resp).await;
@@ -512,8 +534,8 @@ impl QueryHandler for DnsPipeline {
                         "Upstream resolution failed"
                     );
 
-                    if self.config.dns.cache.enabled
-                        && self.config.dns.cache.serve_stale_hours > 0
+                    if config.dns.cache.enabled
+                        && config.dns.cache.serve_stale_hours > 0
                         && let Some(mut stale_resp) =
                             self.cache.get_stale(qname, qtype, qclass).await
                     {
