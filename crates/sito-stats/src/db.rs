@@ -80,6 +80,11 @@ pub struct StatsDb {
 }
 
 impl StatsDb {
+    /// Returns a reference to the underlying SQLite connection pool.
+    pub fn pool(&self) -> &Pool<Sqlite> {
+        &self.pool
+    }
+
     /// Opens or creates an in-memory SQLite database (primarily for testing).
     pub async fn in_memory() -> Result<Self, StatsError> {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")?
@@ -485,6 +490,15 @@ impl StatsDb {
         Ok(stats)
     }
 
+    /// Returns the watermark (last_id, last_ts) for a given key, or None if not set.
+    pub async fn get_watermark(&self, key: &str) -> Result<Option<(i64, i64)>, StatsError> {
+        let row = sqlx::query("SELECT last_id, last_ts FROM stats_watermark WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| (r.get("last_id"), r.get("last_ts"))))
+    }
+
     /// Aggregates older logs into `stats_hourly` and prunes query logs older than retention period.
     pub async fn cleanup_retention(
         &self,
@@ -494,24 +508,36 @@ impl StatsDb {
         let retention_ms = i64::from(retention_days) * 24 * 3600 * 1000;
         let cutoff = now_ms.saturating_sub(retention_ms);
 
-        // Aggregate hourly buckets
+        let watermark_id: i64 = sqlx::query_scalar(
+            "SELECT last_id FROM stats_watermark WHERE key = 'hourly_aggregation'",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(0);
+
+        // Aggregate hourly buckets for entries newer than watermark up to cutoff
         let hours_to_aggregate = sqlx::query(
             r"
             SELECT
                 (ts / 3600000) * 3600000 as hour,
                 COUNT(*) as queries,
                 SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) as blocked,
-                SUM(CASE WHEN verdict = 'stale' OR rule = 'cache' THEN 1 ELSE 0 END) as cached
+                SUM(CASE WHEN verdict = 'stale' OR rule = 'cache' THEN 1 ELSE 0 END) as cached,
+                MAX(id) as max_id,
+                MAX(ts) as max_ts
             FROM query_log
-            WHERE ts < ?
+            WHERE ts < ? AND id > ?
             GROUP BY hour
             ",
         )
         .bind(cutoff)
+        .bind(watermark_id)
         .fetch_all(&self.pool)
         .await?;
 
         let mut aggregated_hours = 0;
+        let mut max_seen_id = watermark_id;
+        let mut max_seen_ts = 0i64;
         let mut tx = self.pool.begin().await?;
 
         for row in hours_to_aggregate {
@@ -519,6 +545,12 @@ impl StatsDb {
             let queries: i64 = row.get::<Option<i64>, _>("queries").unwrap_or(0);
             let blocked: i64 = row.get::<Option<i64>, _>("blocked").unwrap_or(0);
             let cached: i64 = row.get::<Option<i64>, _>("cached").unwrap_or(0);
+            if let Some(mid) = row.get::<Option<i64>, _>("max_id") {
+                max_seen_id = max_seen_id.max(mid);
+            }
+            if let Some(mts) = row.get::<Option<i64>, _>("max_ts") {
+                max_seen_ts = max_seen_ts.max(mts);
+            }
 
             sqlx::query(
                 r"
@@ -538,6 +570,22 @@ impl StatsDb {
             .await?;
 
             aggregated_hours += 1;
+        }
+
+        if max_seen_id > watermark_id {
+            sqlx::query(
+                r"
+                INSERT INTO stats_watermark (key, last_id, last_ts)
+                VALUES ('hourly_aggregation', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    last_id = excluded.last_id,
+                    last_ts = excluded.last_ts
+                ",
+            )
+            .bind(max_seen_id)
+            .bind(max_seen_ts)
+            .execute(&mut *tx)
+            .await?;
         }
 
         // Delete pruned rows
