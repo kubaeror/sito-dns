@@ -19,6 +19,8 @@ pub enum HaMessage {
         have_version: u64,
         #[serde(default)]
         capabilities: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
 
     /// Master pushes a signed configuration state bundle to connected slave(s).
@@ -90,6 +92,7 @@ mod tests {
             instance: "slave-pi".to_string(),
             have_version: 41,
             capabilities: vec!["stats-v1".to_string()],
+            token: None,
         };
         let json = hello.to_json().unwrap();
         assert!(json.contains("\"type\":\"hello\""));

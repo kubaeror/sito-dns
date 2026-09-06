@@ -252,6 +252,27 @@ When a slave node fails or must be reprovisioned from bare metal:
    curl -s http://192.168.1.10:3000/metrics | grep sito_ha_
    ```
    Look for:
-   - `sito_ha_slaves_connected`: Number of active slaves connected.
-   - `sito_ha_config_version{instance="sito-master"}`: Current config version.
-   - `sito_ha_replication_lag_seconds{slave="sito-slave-1"}`: Replication delay.
+    - `sito_ha_slaves_connected`: Number of active slaves connected.
+    - `sito_ha_config_version{instance="sito-master"}`: Current config version.
+    - `sito_ha_replication_lag_seconds{slave="sito-slave-1"}`: Replication delay.
+
+---
+
+## 6. Security Considerations: Transport Security, Certificate Pinning & Authentication
+
+The HA replication channel synchronizes entire server configuration bundles, custom rules, DNS rewrites, and client definitions between nodes. Protecting this transport against interception, tampering, and unauthorized slave connections is critical.
+
+### 1. Certificate Pinning & Transport Encryption
+- **Pinned TLS (Default & Recommended)**: Slave nodes connecting to `wss://` require `master_fingerprint = "blake3:..."` matching the master's certificate. This prevents man-in-the-middle (MITM) attacks even if a rogue CA is trusted in the system certificate store.
+- **Unpinned TLS (`allow_unpinned_tls = true`)**:
+  > [!WARNING]
+  > Setting `allow_unpinned_tls = true` allows the slave to trust any server certificate issued by the configured CA without fingerprint pinning. This is discouraged in production because any compromised certificate issued by that CA could intercept or alter the cluster configuration bundle.
+- **Plaintext WebSocket (`allow_insecure_ws = true`)**:
+  > [!CAUTION]
+  > Plaintext `ws://` connections are refused by default. Setting `allow_insecure_ws = true` transmits replication data without TLS encryption. Do NOT enable `allow_insecure_ws` across untrusted or public networks, as configuration details, network topology, and client tokens will be exposed in cleartext. Only use for local loopback debugging.
+
+### 2. Slave Authentication Handshake (`slave_token`)
+To prevent unauthorized nodes from connecting to the master replication port and receiving signed configuration bundles:
+- Set `slave_token = "<PRE_SHARED_SECRET>"` in the `[ha]` section on both master and slave nodes.
+- The slave transmits this token in the initial `Hello` handshake over the encrypted replication channel.
+- The master validates the token and drops the connection immediately if the token is missing or mismatched.

@@ -159,4 +159,129 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_unpinned_tls_rejected_by_default() {
+        let mut cfg = HaConfig {
+            master_url: Some("wss://127.0.0.1:8953".to_string()),
+            master_fingerprint: None,
+            allow_unpinned_tls: false,
+            ..Default::default()
+        };
+        assert!(cfg.validate("slave").is_err());
+
+        // Explicitly allowing unpinned TLS passes validation
+        cfg.allow_unpinned_tls = true;
+        assert!(cfg.validate("slave").is_ok());
+
+        // build_client_tls_config rejects None fingerprint when allow_unpinned_tls is false
+        let err = build_client_tls_config(None, None, None, false);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_insecure_ws_rejected_by_default() {
+        let mut cfg = HaConfig {
+            master_url: Some("ws://127.0.0.1:8953".to_string()),
+            allow_insecure_ws: false,
+            ..Default::default()
+        };
+        assert!(cfg.validate("slave").is_err());
+
+        cfg.allow_insecure_ws = true;
+        assert!(cfg.validate("slave").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_slave_rejected_by_master() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ha_auth_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let certs = generate_ha_certs(&temp_dir, true, true).unwrap();
+        let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        let metrics = sito_stats::MetricsRegistry::new("0.1.0", "test");
+
+        let coordinator = MasterCoordinator::new(
+            "master-auth".to_string(),
+            1,
+            signing_key.clone(),
+            metrics.clone(),
+        )
+        .with_token(Some("required-slave-token".to_string()));
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let master_ha_cfg = HaConfig {
+            replication_port: port,
+            listen_addr: "127.0.0.1".to_string(),
+            cert: certs.master_cert_path.clone(),
+            key: certs.master_key_path.clone(),
+            pinned_slave_fingerprints: vec![certs.slave_fingerprint.clone().unwrap()],
+            slave_token: Some("required-slave-token".to_string()),
+            ..Default::default()
+        };
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let _server_handle = spawn_master_server(master_ha_cfg, coordinator.clone(), shutdown_rx);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let slave_tracker = SlaveStatusTracker::new(
+            "unauth-slave".to_string(),
+            0,
+            Some(format!("wss://127.0.0.1:{port}")),
+        );
+        let base_config = sito_core::config::Config::default();
+        let config_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(base_config.clone())));
+        let filter_engine = Arc::new(
+            sito_filter::HostsFilterEngine::init(base_config.filtering.clone(), temp_dir.clone())
+                .await,
+        );
+        let rewrites_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            sito_rewrites::RewriteTable::new(Default::default()),
+        )));
+        let clients_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            sito_clients::ClientRegistry::new(Default::default()),
+        )));
+
+        let handles = SlaveAppHandles {
+            config: config_arc,
+            filter: filter_engine,
+            rewrites: rewrites_arc,
+            clients: clients_arc,
+            metrics: metrics.clone(),
+            config_path: None,
+        };
+
+        // Slave with wrong token
+        let bad_slave_cfg = HaConfig {
+            master_url: Some(format!("wss://127.0.0.1:{port}")),
+            master_fingerprint: certs.master_fingerprint.clone(),
+            master_pubkey: Some(signing_key.public_key_hex()),
+            cert: certs.slave_cert_path.clone(),
+            key: certs.slave_key_path.clone(),
+            slave_token: Some("wrong-token".to_string()),
+            ..Default::default()
+        };
+
+        let (_resync_tx, resync_rx) = tokio::sync::mpsc::channel(1);
+        let _worker_handle = spawn_slave_worker(
+            bad_slave_cfg,
+            slave_tracker.clone(),
+            handles,
+            resync_rx,
+            shutdown_tx.subscribe(),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // Master must refuse unauthenticated slave
+        assert_eq!(coordinator.connected_slave_count(), 0);
+        assert_ne!(slave_tracker.get_state(), SlaveState::Synced);
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
