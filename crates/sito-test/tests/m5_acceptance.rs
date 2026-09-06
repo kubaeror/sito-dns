@@ -544,10 +544,15 @@ async fn test_acceptance_m5_prometheus_table_14_2() {
     ctx.metrics.set_ha_slaves_connected(2);
     ctx.metrics.inc_querylog_dropped();
 
+    let (_meta, token_resp) = ctx.auth_mgr.create_token("viewer", Role::Viewer);
     let app = sito_api::create_router(ctx);
 
     let req = Request::builder()
         .uri("/metrics")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", token_resp.token),
+        )
         .body(Body::empty())
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
@@ -747,26 +752,12 @@ async fn test_acceptance_m5_metrics_auth() {
 
     let (ctx, _cfg_path, _writer) = create_test_context(&temp_dir).await;
 
-    // Enable metrics_auth in config
-    let mut cfg = (**ctx.config.load()).clone();
-    cfg.web = Some(
-        toml::Value::try_from(sito_core::config::WebConfig {
-            enabled: true,
-            bind: "127.0.0.1".parse().unwrap(),
-            port: 8080,
-            trusted_proxies: Vec::new(),
-            metrics_auth: true,
-        })
-        .unwrap(),
-    );
-    ctx.config.store(Arc::new(cfg));
-
-    // Create accounts
+    // Create viewer account
     let view_tok = ctx.auth_mgr.create_token("viewer", Role::Viewer).1.token;
 
     let app = sito_api::create_router(ctx.clone());
 
-    // 1. /metrics with metrics_auth = true rejects unauthenticated
+    // 1. By default, /metrics requires authentication and rejects unauthenticated request
     let req = Request::builder()
         .uri("/metrics")
         .body(Body::empty())
@@ -787,6 +778,27 @@ async fn test_acceptance_m5_metrics_auth() {
     let req = Request::builder()
         .uri("/metrics")
         .header(header::AUTHORIZATION, format!("Bearer {view_tok}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 4. When metrics_auth = false is explicitly configured, anonymous access is permitted
+    let mut cfg = (**ctx.config.load()).clone();
+    cfg.web = Some(
+        toml::Value::try_from(sito_core::config::WebConfig {
+            enabled: true,
+            bind: "127.0.0.1".parse().unwrap(),
+            port: 8080,
+            trusted_proxies: Vec::new(),
+            metrics_auth: false,
+        })
+        .unwrap(),
+    );
+    ctx.config.store(Arc::new(cfg));
+
+    let req = Request::builder()
+        .uri("/metrics")
         .body(Body::empty())
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();

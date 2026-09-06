@@ -223,8 +223,12 @@ pub struct WebConfig {
     pub port: u16,
     #[serde(default)]
     pub trusted_proxies: Vec<IpAddr>,
-    #[serde(default)]
+    #[serde(default = "default_metrics_auth")]
     pub metrics_auth: bool,
+}
+
+fn default_metrics_auth() -> bool {
+    true
 }
 
 fn default_web_enabled() -> bool {
@@ -246,7 +250,7 @@ impl Default for WebConfig {
             bind: default_web_bind(),
             port: default_web_port(),
             trusted_proxies: Vec::new(),
-            metrics_auth: false,
+            metrics_auth: default_metrics_auth(),
         }
     }
 }
