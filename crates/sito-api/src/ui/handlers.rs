@@ -1448,7 +1448,7 @@ mod tests {
         let stats_db = sito_stats::StatsDb::open(&db_path).await.unwrap();
         let querylog_writer = sito_stats::QueryLogWriter::spawn(stats_db.clone(), 100);
         let querylog_sender = querylog_writer.sender();
-        let metrics = sito_stats::MetricsRegistry::new("1.2.0", "test");
+        let metrics = sito_stats::MetricsRegistry::new("1.2.1", "test");
         let auth_mgr = Arc::new(crate::auth::AuthManager::new());
         let config = Config::default();
         let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));

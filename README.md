@@ -15,7 +15,7 @@
 
 ## 📊 Feature Comparison: sito vs. AdGuard Home vs. Pi-hole
 
-| Feature / Capability | **sito** (v1.1) | **AdGuard Home** | **Pi-hole (FTL)** |
+| Feature / Capability | **sito** (v1.2) | **AdGuard Home** | **Pi-hole (FTL)** |
 |---|---|---|---|
 | **Language & Runtime** | **Rust (edition 2024, zero GC, zero Node.js)** | Go (GC overhead under load) | C (FTL) + PHP Web UI |
 | **Max Cache Throughput** | **≥ 500,000 QPS** (measured 584k) | ~100,000 QPS | ~50,000 QPS |
@@ -34,13 +34,14 @@
 
 ## ⚡ Key Highlights
 
-- **Blazing Fast Hot Path:** Zero garbage collection pauses, multi-socket `SO_REUSEPORT` listeners, and concurrent `moka` caching delivering **> 580k QPS** with **0.34 ms p99 latency** on reference hardware ([ADR-008](docs/adr/0008-performance-budget.md)).
+- **Blazing Fast Hot Path:** Zero garbage collection pauses, multi-socket `SO_REUSEPORT` listeners, concurrent UDP query workers, and concurrent `moka` caching delivering **> 580k QPS** with **0.34 ms p99 latency** on reference hardware ([ADR-008](docs/adr/0008-performance-budget.md)).
+- **Zero-Downtime Hot Reloading:** ArcSwap-backed query pipeline picks up configuration, local rewrites, and client group changes immediately without dropping persistent transport connections or restarting the daemon.
 - **Zero-Node.js Embedded Web Console:** Lightweight, reactive admin panel powered by Axum, Askama compile-time templates, HTMX, and Alpine.js embedded directly into the standalone binary via `rust-embed` (zero npm/Node.js build or runtime dependencies, <1 MB footprint).
 - **AdGuard / ABP Syntax Compatibility:** High-throughput `SuffixTrie` with string interning, Aho-Corasick substring matching, and backtracking-free regex DFAs.
 - **Modern Encryption:** Native support for plain UDP/TCP, DNS-over-TLS (DoT/853), DNS-over-HTTPS (DoH/443, H2), DNS-over-QUIC (DoQ/853), and DNS-over-HTTP/3 (DoH3/443).
-- **Zero-Consensus High Availability:** Real-time master/slave push replication over mTLS WebSockets with Ed25519 cryptographic signatures and atomic snapshot updates ([ADR-002](docs/adr/0002-ha-master-slave-push.md)).
-- **Hardened Security:** Constant-time authentication with `subtle`, SSRF protection on list subscriptions, ReDoS protection via dense DFA compilation bounds, and minimum TLS 1.2 enforcement.
-- **Robust Telemetry:** Non-blocking query logging to SQLite in WAL mode with Prometheus metrics exposition ([ADR-003](docs/adr/0003-log-store-sqlite-wal.md)) and Grafana dashboard.
+- **Zero-Consensus High Availability:** Real-time master/slave push replication over mTLS WebSockets with Ed25519 cryptographic signatures, certificate pinning, and atomic snapshot updates ([ADR-002](docs/adr/0002-ha-master-slave-push.md)).
+- **Hardened Security & RBAC:** Audited security posture including setup wizard access gating, Argon2id/TOTP bounded auth maps with active background pruners, strict SHA-256 self-updater verification, constant-time authentication via `subtle`, parameterized SQL query builders, SSRF protection, ReDoS protection via dense DFA compilation bounds, and systemd sandbox directives.
+- **Robust Telemetry:** Non-blocking query logging to SQLite in WAL mode with watermark aggregation protection, Prometheus metrics exposition ([ADR-003](docs/adr/0003-log-store-sqlite-wal.md)), and Grafana dashboard.
 
 ---
 

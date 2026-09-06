@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 rust-version = "1.98.1"
 license = "GPL-3.0-only"
@@ -84,20 +84,20 @@ tar = "0.4"
 utoipa = { version = "5.5", features = ["axum_extras"] }
 
 # Internal workspace dependencies
-sito = { path = "crates/sito", version = "1.2.0" }
-sito-core = { path = "crates/sito-core", version = "1.2.0" }
-sito-proto = { path = "crates/sito-proto", version = "1.2.0" }
-sito-transport = { path = "crates/sito-transport", version = "1.2.0" }
-sito-upstream = { path = "crates/sito-upstream", version = "1.2.0" }
-sito-cache = { path = "crates/sito-cache", version = "1.2.0" }
-sito-filter = { path = "crates/sito-filter", version = "1.2.0" }
-sito-dnssec = { path = "crates/sito-dnssec", version = "1.2.0" }
-sito-clients = { path = "crates/sito-clients", version = "1.2.0" }
-sito-rewrites = { path = "crates/sito-rewrites", version = "1.2.0" }
-sito-api = { path = "crates/sito-api", version = "1.2.0" }
-sito-stats = { path = "crates/sito-stats", version = "1.2.0" }
-sito-ha = { path = "crates/sito-ha", version = "1.2.0" }
-sito-test = { path = "crates/sito-test", version = "1.2.0" }
+sito = { path = "crates/sito", version = "1.2.1" }
+sito-core = { path = "crates/sito-core", version = "1.2.1" }
+sito-proto = { path = "crates/sito-proto", version = "1.2.1" }
+sito-transport = { path = "crates/sito-transport", version = "1.2.1" }
+sito-upstream = { path = "crates/sito-upstream", version = "1.2.1" }
+sito-cache = { path = "crates/sito-cache", version = "1.2.1" }
+sito-filter = { path = "crates/sito-filter", version = "1.2.1" }
+sito-dnssec = { path = "crates/sito-dnssec", version = "1.2.1" }
+sito-clients = { path = "crates/sito-clients", version = "1.2.1" }
+sito-rewrites = { path = "crates/sito-rewrites", version = "1.2.1" }
+sito-api = { path = "crates/sito-api", version = "1.2.1" }
+sito-stats = { path = "crates/sito-stats", version = "1.2.1" }
+sito-ha = { path = "crates/sito-ha", version = "1.2.1" }
+sito-test = { path = "crates/sito-test", version = "1.2.1" }
 
 [workspace.lints.rust]
 # Future Rust lints can be specified here
