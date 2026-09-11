@@ -164,6 +164,12 @@ impl HaConfig {
                     reason: "Replication port must be greater than 0".to_string(),
                 });
             }
+            if self.master_pubkey.is_none() {
+                return Err(HaError::Validation {
+                    field: "master_pubkey".to_string(),
+                    reason: "Slave replication requires master_pubkey to verify signed configuration pushes".to_string(),
+                });
+            }
             if let Some(ref pubkey_str) = self.master_pubkey {
                 parse_public_key(pubkey_str)?;
             }
@@ -208,6 +214,7 @@ mod tests {
 replication_port = 8953
 master_url = "wss://127.0.0.1:8953"
 master_fingerprint = "blake3:abcdef0123456789"
+master_pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
 pinned_slave_fingerprints = ["blake3:11223344"]
 "#;
         let val: toml::Value = toml::from_str(toml_str).unwrap();

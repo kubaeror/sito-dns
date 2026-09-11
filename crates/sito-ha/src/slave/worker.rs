@@ -312,6 +312,7 @@ async fn connect_and_run(
             ha_config.key.as_deref(),
             ha_config.master_fingerprint.as_deref(),
             ha_config.allow_unpinned_tls,
+            ha_config.ca.as_deref(),
         )?;
 
         let server_name = ServerName::try_from(host.clone())
@@ -387,6 +388,8 @@ where
         have_version,
         capabilities: vec!["stats-v1".to_string()],
         token: ha_config.slave_token.clone(),
+        role: Some("slave".to_string()),
+        protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
     };
     ws_stream
         .send(WsMessage::Text(hello.to_json()?.into()))
@@ -424,6 +427,8 @@ where
                     have_version: cur_v,
                     capabilities: vec!["stats-v1".to_string()],
                     token: ha_config.slave_token.clone(),
+                    role: Some("slave".to_string()),
+                    protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
                 };
                 let _ = ws_stream.send(WsMessage::Text(hello.to_json()?.into())).await;
             }

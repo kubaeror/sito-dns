@@ -312,7 +312,12 @@ ignoring the configured `dns.bind`.
 >
 > Follow-up progress: **WP-10 (updater artifact signature verification) — done**
 > (`server.update_require_signature`, cosign verification of `.sig`/`.pem`,
-> `SITO_REQUIRE_SIGNATURE=1` installer support).
+> `SITO_REQUIRE_SIGNATURE=1` installer support);
+> **WP-3 (persistent sessions/tokens) — done** (`auth.session_persist`,
+> `sessions.toml`/`tokens.toml` 0600, `auth.token_default_ttl_days`,
+> `sito reset-sessions`); **WP-9 (HA leftovers) — done** (`Hello` role +
+> protocol version, `stats-v1` capability check, heartbeat watchdog,
+> `ca` chain validation, mandatory slave `master_pubkey`).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated

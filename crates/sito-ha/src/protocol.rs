@@ -21,6 +21,12 @@ pub enum HaMessage {
         capabilities: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
+        /// Node role ("slave" for replicas). Optional for backwards compatibility.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        /// HA protocol version of the sender.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u32>,
     },
 
     /// Master pushes a signed configuration state bundle to connected slave(s).
@@ -93,6 +99,8 @@ mod tests {
             have_version: 41,
             capabilities: vec!["stats-v1".to_string()],
             token: None,
+            role: Some("slave".to_string()),
+            protocol_version: Some(PROTOCOL_VERSION),
         };
         let json = hello.to_json().unwrap();
         assert!(json.contains("\"type\":\"hello\""));

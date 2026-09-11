@@ -55,30 +55,53 @@ fn normalize_fingerprint(fp: &str) -> String {
     fp.trim().trim_start_matches("blake3:").to_lowercase()
 }
 
-/// A server-side client certificate verifier enforcing BLAKE3 fingerprint pinning.
+/// A server-side client certificate verifier enforcing BLAKE3 fingerprint pinning
+/// (and optionally chain validation against a provided CA).
 #[derive(Debug)]
 pub struct PinnedClientCertVerifier {
     pinned_fingerprints: Vec<String>,
+    webpki: Option<Arc<dyn ClientCertVerifier>>,
 }
 
 impl PinnedClientCertVerifier {
     pub fn new(pinned: &[String]) -> Self {
         Self {
             pinned_fingerprints: pinned.iter().map(|s| normalize_fingerprint(s)).collect(),
+            webpki: None,
         }
+    }
+
+    /// Additionally validate the client chain against the provided CA certificate.
+    pub fn with_ca(mut self, ca_path: &Path) -> Result<Self, HaError> {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in load_certs_pem(ca_path)? {
+            roots
+                .add(cert)
+                .map_err(|e| HaError::Tls(format!("Invalid CA certificate: {e}")))?;
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .map_err(|e| HaError::Tls(format!("Failed to build client CA verifier: {e}")))?;
+        self.webpki = Some(verifier);
+        Ok(self)
     }
 }
 
 impl ClientCertVerifier for PinnedClientCertVerifier {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &[]
+        self.webpki
+            .as_ref()
+            .map_or(&[], |verifier| verifier.root_hint_subjects())
     }
 
     fn verify_client_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _now: UnixTime,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
     ) -> Result<ClientCertVerified, RustlsError> {
         if self.pinned_fingerprints.is_empty() {
             return Err(RustlsError::InvalidCertificate(
@@ -97,6 +120,11 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
             ));
         }
 
+        // Optional defense-in-depth: validate the chain/validity against the CA.
+        if let Some(ref webpki) = self.webpki {
+            webpki.verify_client_cert(end_entity, intermediates, now)?;
+        }
+
         Ok(ClientCertVerified::assertion())
     }
 
@@ -106,6 +134,9 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
+        if let Some(ref webpki) = self.webpki {
+            return webpki.verify_tls12_signature(message, cert, dss);
+        }
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
@@ -120,6 +151,9 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
+        if let Some(ref webpki) = self.webpki {
+            return webpki.verify_tls13_signature(message, cert, dss);
+        }
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -129,17 +163,22 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        if let Some(ref webpki) = self.webpki {
+            return webpki.supported_verify_schemes();
+        }
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
 }
 
-/// A client-side server certificate verifier enforcing BLAKE3 fingerprint pinning of the master node.
+/// A client-side server certificate verifier enforcing BLAKE3 fingerprint pinning
+/// of the master node (and optionally chain validation against a provided CA).
 #[derive(Debug)]
 pub struct PinnedServerCertVerifier {
     pinned_fingerprint: Option<String>,
     allow_unpinned: bool,
+    webpki: Option<Arc<dyn ServerCertVerifier>>,
 }
 
 impl PinnedServerCertVerifier {
@@ -147,7 +186,26 @@ impl PinnedServerCertVerifier {
         Self {
             pinned_fingerprint: pinned.map(normalize_fingerprint),
             allow_unpinned,
+            webpki: None,
         }
+    }
+
+    /// Additionally validate the server chain against the provided CA certificate.
+    pub fn with_ca(mut self, ca_path: &Path) -> Result<Self, HaError> {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in load_certs_pem(ca_path)? {
+            roots
+                .add(cert)
+                .map_err(|e| HaError::Tls(format!("Invalid CA certificate: {e}")))?;
+        }
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .map_err(|e| HaError::Tls(format!("Failed to build server CA verifier: {e}")))?;
+        self.webpki = Some(verifier);
+        Ok(self)
     }
 }
 
@@ -155,10 +213,10 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
     ) -> Result<ServerCertVerified, RustlsError> {
         let cert_fp = blake3::hash(end_entity.as_ref())
             .to_hex()
@@ -177,6 +235,17 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
             ));
         }
 
+        // Optional defense-in-depth: validate the chain/validity against the CA.
+        if let Some(ref webpki) = self.webpki {
+            webpki.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            )?;
+        }
+
         Ok(ServerCertVerified::assertion())
     }
 
@@ -186,6 +255,9 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
+        if let Some(ref webpki) = self.webpki {
+            return webpki.verify_tls12_signature(message, cert, dss);
+        }
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
@@ -200,6 +272,9 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, RustlsError> {
+        if let Some(ref webpki) = self.webpki {
+            return webpki.verify_tls13_signature(message, cert, dss);
+        }
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -209,6 +284,9 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        if let Some(ref webpki) = self.webpki {
+            return webpki.supported_verify_schemes();
+        }
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
@@ -220,11 +298,16 @@ pub fn build_server_tls_config(
     cert_path: &Path,
     key_path: &Path,
     pinned_slave_fingerprints: &[String],
+    ca_path: Option<&Path>,
 ) -> Result<Arc<rustls::ServerConfig>, HaError> {
     let certs = load_certs_pem(cert_path)?;
     let key = load_key_pem(key_path)?;
 
-    let client_verifier = Arc::new(PinnedClientCertVerifier::new(pinned_slave_fingerprints));
+    let mut client_verifier = PinnedClientCertVerifier::new(pinned_slave_fingerprints);
+    if let Some(ca) = ca_path {
+        client_verifier = client_verifier.with_ca(ca)?;
+    }
+    let client_verifier = Arc::new(client_verifier);
 
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -244,6 +327,7 @@ pub fn build_client_tls_config(
     key_path: Option<&Path>,
     master_fingerprint: Option<&str>,
     allow_unpinned_tls: bool,
+    ca_path: Option<&Path>,
 ) -> Result<Arc<rustls::ClientConfig>, HaError> {
     if master_fingerprint.is_none() && !allow_unpinned_tls {
         return Err(HaError::Tls(
@@ -251,10 +335,11 @@ pub fn build_client_tls_config(
         ));
     }
 
-    let server_verifier = Arc::new(PinnedServerCertVerifier::new(
-        master_fingerprint,
-        allow_unpinned_tls,
-    ));
+    let mut server_verifier = PinnedServerCertVerifier::new(master_fingerprint, allow_unpinned_tls);
+    if let Some(ca) = ca_path {
+        server_verifier = server_verifier.with_ca(ca)?;
+    }
+    let server_verifier = Arc::new(server_verifier);
 
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),

@@ -35,6 +35,8 @@ pub struct MasterCoordinator {
     pub slaves: Arc<Mutex<HashMap<String, ActiveSlave>>>,
     pub metrics: MetricsRegistry,
     pub slave_token: Option<String>,
+    /// Heartbeat interval in seconds (watchdog removes slaves silent for 3× this).
+    pub ping_interval_secs: u64,
 }
 
 impl MasterCoordinator {
@@ -61,7 +63,15 @@ impl MasterCoordinator {
             slaves: Arc::new(Mutex::new(HashMap::new())),
             metrics,
             slave_token: None,
+            ping_interval_secs: 15,
         }
+    }
+
+    /// Sets the heartbeat ping interval (used for the liveness watchdog).
+    #[must_use]
+    pub fn with_ping_interval_secs(mut self, secs: u64) -> Self {
+        self.ping_interval_secs = secs.max(1);
+        self
     }
 
     /// Sets the required slave authentication token.
@@ -181,7 +191,16 @@ impl MasterCoordinator {
                     have_version,
                     capabilities,
                     token,
-                }) => (instance, have_version, capabilities, token),
+                    role,
+                    protocol_version,
+                }) => (
+                    instance,
+                    have_version,
+                    capabilities,
+                    token,
+                    role,
+                    protocol_version,
+                ),
                 Ok(other) => {
                     warn!(peer = %peer_addr, "Unexpected message instead of Hello: {other:?}");
                     return;
@@ -199,7 +218,16 @@ impl MasterCoordinator {
                             have_version,
                             capabilities,
                             token,
-                        }) => (instance, have_version, capabilities, token),
+                            role,
+                            protocol_version,
+                        }) => (
+                            instance,
+                            have_version,
+                            capabilities,
+                            token,
+                            role,
+                            protocol_version,
+                        ),
                         _ => return,
                     }
                 } else {
@@ -212,7 +240,42 @@ impl MasterCoordinator {
             }
         };
 
-        let (slave_instance, have_version, _, token) = hello_msg;
+        let (slave_instance, have_version, capabilities, token, role, protocol_version) = hello_msg;
+
+        // Protocol version negotiation
+        if let Some(version) = protocol_version
+            && version != crate::protocol::PROTOCOL_VERSION
+        {
+            warn!(
+                instance = %slave_instance,
+                peer = %peer_addr,
+                version,
+                expected = crate::protocol::PROTOCOL_VERSION,
+                "Rejecting slave with incompatible HA protocol version"
+            );
+            return;
+        }
+
+        // Role validation: only replica slaves may connect.
+        match role.as_deref() {
+            Some("slave") => {}
+            Some(other) => {
+                warn!(
+                    instance = %slave_instance,
+                    peer = %peer_addr,
+                    role = %other,
+                    "Rejecting HA connection with non-slave role"
+                );
+                return;
+            }
+            None => {
+                warn!(
+                    instance = %slave_instance,
+                    peer = %peer_addr,
+                    "Legacy Hello without role field; assuming slave for backwards compatibility"
+                );
+            }
+        }
 
         // Verify slave authentication token if configured (constant-time compare)
         if let Some(ref required_token) = self.slave_token {
@@ -251,6 +314,7 @@ impl MasterCoordinator {
                     connected_at: Utc::now(),
                     last_stats: None,
                     sender: tx.clone(),
+                    capabilities: capabilities.clone(),
                 },
             );
             #[allow(clippy::cast_possible_wrap)]
@@ -277,8 +341,9 @@ impl MasterCoordinator {
             }
         }
 
-        // Heartbeat ping interval
-        let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+        // Heartbeat ping interval (watchdog closes sessions silent for 3× this)
+        let ping_secs = self.ping_interval_secs.max(1);
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(ping_secs));
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Session loop
@@ -292,8 +357,21 @@ impl MasterCoordinator {
                         }
                 }
 
-                // Periodic ping
+                // Periodic ping + liveness watchdog
                 _ = ping_interval.tick() => {
+                    let stale = {
+                        let slaves = self.slaves.lock().unwrap();
+                        slaves.get(&slave_instance).is_some_and(|s| {
+                            s.last_ping.elapsed() > Duration::from_secs(ping_secs.saturating_mul(3))
+                        })
+                    };
+                    if stale {
+                        warn!(
+                            instance = %slave_instance,
+                            "HA slave heartbeat timed out; closing replication session"
+                        );
+                        break;
+                    }
                     #[allow(clippy::cast_sign_loss)]
                     let ts = Utc::now().timestamp_millis() as u64;
                     let ping = HaMessage::Ping { ts };
@@ -394,6 +472,13 @@ impl MasterCoordinator {
                 let upstreams_count = upstreams.len();
                 let mut slaves = self.slaves.lock().unwrap();
                 if let Some(s) = slaves.get_mut(slave_instance) {
+                    if !s.capabilities.iter().any(|c| c == "stats-v1") {
+                        warn!(
+                            instance = %slave_instance,
+                            "Ignoring StatsReport from slave that did not advertise the 'stats-v1' capability"
+                        );
+                        return true;
+                    }
                     s.last_stats = Some(SlaveStatsSummary {
                         window_s,
                         queries,
@@ -436,6 +521,7 @@ pub fn spawn_master_server(
     if coordinator.slave_token.is_none() {
         coordinator.slave_token.clone_from(&ha_config.slave_token);
     }
+    coordinator = coordinator.with_ping_interval_secs(ha_config.ping_interval_secs);
     tokio::spawn(async move {
         if ha_config.replication_port == 0 {
             info!("Master HA replication is disabled (replication_port is 0)");
@@ -446,8 +532,12 @@ pub fn spawn_master_server(
         let tls_acceptor = if let (Some(cert_path), Some(key_path)) =
             (&ha_config.cert, &ha_config.key)
         {
-            match build_server_tls_config(cert_path, key_path, &ha_config.pinned_slave_fingerprints)
-            {
+            match build_server_tls_config(
+                cert_path,
+                key_path,
+                &ha_config.pinned_slave_fingerprints,
+                ha_config.ca.as_deref(),
+            ) {
                 Ok(cfg) => Some(TlsAcceptor::from(cfg)),
                 Err(e) => {
                     error!("Failed to initialize mTLS for master HA replication server: {e}");

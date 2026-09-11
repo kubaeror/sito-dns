@@ -285,11 +285,13 @@ pub async fn run_server_full(
     // users.toml is missing, fail closed instead of silently re-enabling the
     // default credentials.
     let bootstrap_allowed = !config_path_buf.exists();
-    let auth_mgr = Arc::new(sito_api::AuthManager::with_storage_checked(
+    let auth_mgr = Arc::new(sito_api::AuthManager::with_storage_full(
         &config.server.data_dir,
         auth_cfg.session_ttl_hours,
         auth_cfg.login_rate_limit,
         bootstrap_allowed,
+        auth_cfg.session_persist,
+        auth_cfg.token_default_ttl_days,
     )?);
     auth_mgr.spawn_pruner(shutdown_rx.clone());
 

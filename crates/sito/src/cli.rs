@@ -93,6 +93,12 @@ pub enum Commands {
         #[arg(short, long)]
         password: Option<String>,
     },
+    /// Invalidate all persisted web sessions and API tokens (users are kept)
+    ResetSessions {
+        /// Optional path to configuration file (defaults to main --config)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -466,6 +472,47 @@ pub fn run_reset_admin(config_path: &Path, password: Option<&str>) -> Result<(),
         println!("Password: (custom password set)");
     }
 
+    Ok(())
+}
+
+/// Executes the `reset-sessions` subcommand: removes persisted sessions and API tokens.
+pub fn run_reset_sessions(config_path: &Path) -> Result<(), anyhow::Error> {
+    let content = std::fs::read_to_string(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read configuration file '{}': {}",
+            config_path.display(),
+            e
+        )
+    })?;
+
+    let config = Config::from_toml_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "Configuration validation failed for '{}': {}",
+            config_path.display(),
+            e
+        )
+    })?;
+
+    let data_dir = &config.server.data_dir;
+    let mut removed = 0;
+    for name in ["sessions.toml", "tokens.toml"] {
+        let path = data_dir.join(name);
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| anyhow::anyhow!("Failed to remove '{}': {e}", path.display()))?;
+            removed += 1;
+            println!("Removed {}", path.display());
+        }
+    }
+
+    if removed == 0 {
+        println!(
+            "No persisted sessions or tokens found in '{}'.",
+            data_dir.display()
+        );
+    } else {
+        println!("All web sessions and API tokens have been invalidated.");
+    }
     Ok(())
 }
 

@@ -120,6 +120,14 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
+            Commands::ResetSessions { config } => {
+                let config_path = config.unwrap_or(cli.config);
+                if let Err(e) = sito::cli::run_reset_sessions(&config_path) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
         }
     }
 

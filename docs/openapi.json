@@ -2572,6 +2572,14 @@
             "type": "integer",
             "format": "int64"
           },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix timestamp after which the token is rejected (`None` = no expiry)."
+          },
           "hash": {
             "type": "string"
           },

@@ -189,6 +189,7 @@ mod tests {
             master_url: Some("wss://127.0.0.1:8953".to_string()),
             master_fingerprint: None,
             allow_unpinned_tls: false,
+            master_pubkey: Some("0".repeat(64)),
             ..Default::default()
         };
         assert!(cfg.validate("slave").is_err());
@@ -198,7 +199,7 @@ mod tests {
         assert!(cfg.validate("slave").is_ok());
 
         // build_client_tls_config rejects None fingerprint when allow_unpinned_tls is false
-        let err = build_client_tls_config(None, None, None, false);
+        let err = build_client_tls_config(None, None, None, false, None);
         assert!(err.is_err());
     }
 
@@ -207,6 +208,7 @@ mod tests {
         let mut cfg = HaConfig {
             master_url: Some("ws://127.0.0.1:8953".to_string()),
             allow_insecure_ws: false,
+            master_pubkey: Some("0".repeat(64)),
             ..Default::default()
         };
         assert!(cfg.validate("slave").is_err());

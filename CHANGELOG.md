@@ -29,6 +29,8 @@ Full findings and remediation mapping: `docs/audit3.md`.
 
 #### Follow-ups (deferred work plan)
 - **Updater signature verification (WP-10)**: `apply_update`/`sito update` now verify cosign keyless signatures (`<archive>.sig` + `<archive>.pem`) when present; a present signature must always verify. New `server.update_require_signature` (default `false`) makes signatures mandatory and aborts when assets or the `cosign` binary are missing. Installer honors `SITO_REQUIRE_SIGNATURE=1`. Full plan: `docs/audit3-followup-plan.md`.
+- **Persistent sessions and API tokens (WP-3)**: sessions (`sessions.toml`) and API tokens (`tokens.toml`, hashes only) are persisted 0600 in `data_dir` when `auth.session_persist = true` (default). Sessions/tokens survive restarts until their TTL, are revoked on credential changes, and corrupt stores are backed up and start empty. New `auth.token_default_ttl_days` (`0` = never) and `sito reset-sessions` CLI.
+- **HA hardening (WP-9)**: `Hello` now carries the node role and HA protocol version (non-slave roles and version mismatches rejected); stat reports require the advertised `stats-v1` capability; the master sends heartbeats at `ha.ping_interval_secs` and drops slaves silent for 3× that interval; `ca` now performs additional chain validation on top of BLAKE3 pinning; slaves must configure `master_pubkey`.
 
 #### Deferred (tracked in `docs/audit3-followup-plan.md`)
 - Full DNSSEC DS/DNSKEY chain walking (validation currently verifies against configured trust anchors only).

@@ -55,6 +55,9 @@ pub struct ApiTokenMeta {
     pub scope: Role,
     pub created_at: i64,
     pub last_used: Option<i64>,
+    /// Unix timestamp after which the token is rejected (`None` = no expiry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 
 /// Response returned when creating an API token.
@@ -88,6 +91,7 @@ pub fn generate_token(name: &str, scope: Role) -> (ApiTokenMeta, CreateTokenResp
         scope,
         created_at: now,
         last_used: None,
+        expires_at: None,
     };
 
     let response = CreateTokenResponse {

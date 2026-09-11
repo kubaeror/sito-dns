@@ -38,6 +38,8 @@ pub struct ActiveSlave {
     pub connected_at: DateTime<Utc>,
     pub last_stats: Option<SlaveStatsSummary>,
     pub sender: mpsc::Sender<HaMessage>,
+    /// Capabilities advertised in the slave's Hello (e.g. `stats-v1`).
+    pub capabilities: Vec<String>,
 }
 
 impl ActiveSlave {

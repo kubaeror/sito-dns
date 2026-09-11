@@ -278,6 +278,8 @@ trusted_proxies = ["10.0.0.1", "192.168.1.10"]   # individual proxy IPs
 [auth]
 session_ttl_hours = 24
 login_rate_limit = 5
+session_persist = true          # persist sessions/tokens across restarts
+token_default_ttl_days = 0      # 0 = API tokens never expire
 ```
 
 | Key | Type | Default | Description |
@@ -288,8 +290,9 @@ login_rate_limit = 5
 | `web.metrics_auth` | boolean | `true` | Require authentication (token or session) for `/metrics`. |
 | `web.trusted_proxies`| array of IP addresses | `[]` | Individual proxy IPs trusted to supply `X-Forwarded-For`/`X-Forwarded-Proto` (CIDR is **not** supported here). |
 | `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required. |
-| `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required. |
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
+| `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL; corrupt stores are backed up and start empty. Use `sito reset-sessions` to invalidate everything. |
+| `auth.token_default_ttl_days` | integer | `0` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
 
 ---
 
@@ -318,10 +321,12 @@ anonymize_querylog = false
 ```toml
 [ha]
 replication_port = 8953
+# ping_interval_secs = 15        # master heartbeat; slaves silent for 3x are dropped
 
 # On Slave instance:
 # master_url = "wss://192.168.1.10:8953"
 # master_fingerprint = "blake3:4f8a12..."
+# master_pubkey = "<ed25519 public key>"   # required on slaves (signed bundle verification)
 # cert = "/etc/sito/ha_slave.crt"
 # key = "/etc/sito/ha_slave.key"
 # ca = "/etc/sito/ha_ca.crt"
@@ -332,7 +337,10 @@ replication_port = 8953
 | `replication_port` | integer | `8953` | Mutual-TLS WebSocket port for config synchronization. |
 | `master_url` | string | `None` | (Slave only) WebSocket URL of the master instance. |
 | `master_fingerprint` | string | `None` | (Slave only) Expected Blake3 public certificate fingerprint of master for pinning. |
-| `cert` / `key` / `ca` | string | `None` | Paths to mTLS certificates and CA bundles for replication channel. |
+| `master_pubkey` | string | `None` | (Slave only, **required**) Ed25519 public key of the master used to verify signed configuration pushes. |
+| `cert` / `key` / `ca` | string | `None` | Paths to mTLS certificates and CA bundles for replication. When `ca` is set, the peer chain is additionally validated against it (on top of BLAKE3 pinning). |
+| `ping_interval_secs` | integer | `15` | Master heartbeat interval. Slaves silent for 3× this interval are disconnected and removed from the active tracker. |
+| `slave_token` | string | `None` | Pre-shared token for slave authentication (mandatory when serving plaintext `ws://`). |
 
 ---
 
