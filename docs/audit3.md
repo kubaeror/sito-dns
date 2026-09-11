@@ -307,6 +307,9 @@ ignoring the configured `dns.bind`.
 
 ### Explicitly deferred to follow-up work
 
+> Implementation plan for all deferred items: **[docs/audit3-followup-plan.md](audit3-followup-plan.md)**
+> (work packages, dependencies, estimates, acceptance criteria, PR sequencing).
+
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated
   cache data to DNSSEC-aware clients is blocked. Chain-of-trust validation
