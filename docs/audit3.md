@@ -317,7 +317,9 @@ ignoring the configured `dns.bind`.
 > `sessions.toml`/`tokens.toml` 0600, `auth.token_default_ttl_days`,
 > `sito reset-sessions`); **WP-9 (HA leftovers) — done** (`Hello` role +
 > protocol version, `stats-v1` capability check, heartbeat watchdog,
-> `ca` chain validation, mandatory slave `master_pubkey`).
+> `ca` chain validation, mandatory slave `master_pubkey`);
+> **WP-4 (per-list refresh) — done** (nearest-due scheduler, partial list
+> reload keeping other lists' rules).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated
