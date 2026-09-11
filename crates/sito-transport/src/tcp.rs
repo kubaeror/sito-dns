@@ -15,6 +15,9 @@ use sito_proto::{decode_message, encode_message};
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
 
+/// Maximum in-flight pipelined queries per TCP/DoT connection.
+const MAX_PIPELINED_QUERIES: usize = 64;
+
 /// Configuration options for the TCP listener.
 #[derive(Debug, Clone, Copy)]
 pub struct TcpConfig {
@@ -110,6 +113,10 @@ async fn handle_tcp_connection<H: QueryHandler>(
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
 
+    // Bound the number of in-flight pipelined queries per connection so a
+    // client cannot spawn unbounded tasks by pipelining.
+    let pipeline_semaphore = Arc::new(Semaphore::new(MAX_PIPELINED_QUERIES));
+
     // Writer task
     let write_task = tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
@@ -171,9 +178,13 @@ async fn handle_tcp_connection<H: QueryHandler>(
 
         let handler = Arc::clone(&handler);
         let tx = tx.clone();
+        let Ok(pipeline_permit) = Arc::clone(&pipeline_semaphore).acquire_owned().await else {
+            break;
+        };
 
         // Pipelining: process queries asynchronously on the connection
         tokio::spawn(async move {
+            let _permit = pipeline_permit;
             if let Some(response) = handler
                 .handle(query, ClientContext::new(client_ip).with_proto("tcp"))
                 .await

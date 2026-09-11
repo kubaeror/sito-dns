@@ -15,7 +15,7 @@
 
 ## 📊 Feature Comparison: sito vs. AdGuard Home vs. Pi-hole
 
-| Feature / Capability | **sito** (v1.3) | **AdGuard Home** | **Pi-hole (FTL)** |
+| Feature / Capability | **sito** (v1.4) | **AdGuard Home** | **Pi-hole (FTL)** |
 |---|---|---|---|
 | **Language & Runtime** | **Rust (edition 2024, zero GC, zero Node.js)** | Go (GC overhead under load) | C (FTL) + PHP Web UI |
 | **Max Cache Throughput** | **≥ 500,000 QPS** (measured 584k) | ~100,000 QPS | ~50,000 QPS |
@@ -92,7 +92,7 @@ curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/main/contrib/inst
 ```yaml
 services:
   sito:
-    image: ghcr.io/kubaeror/sito:latest
+    image: ghcr.io/kubaeror/sito-dns:latest
     container_name: sito
     restart: unless-stopped
     cap_add:
@@ -140,7 +140,7 @@ Open **`http://<server-ip>:8080`** in any browser to launch the 6-section config
 
 Once setup is submitted, DNS listeners are bound in-process without needing a server restart.
 
-Swagger UI / OpenAPI documentation is available at `http://localhost:8080/swagger-ui`.
+Swagger UI / OpenAPI documentation is available at `http://localhost:8080/api/docs`.
 
 ---
 

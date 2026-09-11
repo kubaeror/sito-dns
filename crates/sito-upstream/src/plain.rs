@@ -7,7 +7,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 use tracing::{debug, trace};
 
-use crate::upstream::Upstream;
+use crate::upstream::{Upstream, validate_response};
 use sito_core::error::UpstreamError;
 use sito_proto::{Message, decode_message, encode_message};
 
@@ -29,7 +29,11 @@ impl PlainUpstream {
         self.server_addr
     }
 
-    async fn resolve_tcp(&self, encoded_query: &[u8]) -> Result<Message, UpstreamError> {
+    async fn resolve_tcp(
+        &self,
+        query: &Message,
+        encoded_query: &[u8],
+    ) -> Result<Message, UpstreamError> {
         let mut stream =
             match timeout(self.query_timeout, TcpStream::connect(self.server_addr)).await {
                 Ok(Ok(s)) => s,
@@ -55,7 +59,10 @@ impl PlainUpstream {
 
         match res {
             Ok(Ok(bytes)) => {
-                decode_message(&bytes).map_err(|e| UpstreamError::BadResponse(e.to_string()))
+                let response = decode_message(&bytes)
+                    .map_err(|e| UpstreamError::BadResponse(e.to_string()))?;
+                validate_response(query, &response)?;
+                Ok(response)
             }
             Ok(Err(e)) => Err(classify_io_error(&e)),
             Err(_) => Err(UpstreamError::Timeout),
@@ -99,6 +106,7 @@ impl Upstream for PlainUpstream {
 
         let response = decode_message(&buf[..bytes_read])
             .map_err(|e| UpstreamError::BadResponse(e.to_string()))?;
+        validate_response(msg, &response)?;
 
         // Fallback to TCP if UDP response was truncated
         if response.metadata.truncation {
@@ -106,7 +114,7 @@ impl Upstream for PlainUpstream {
                 "Upstream {} returned TC=1 over UDP, retrying over TCP",
                 self.server_addr
             );
-            return self.resolve_tcp(&encoded).await;
+            return self.resolve_tcp(msg, &encoded).await;
         }
 
         trace!(

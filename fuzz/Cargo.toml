@@ -4,6 +4,10 @@ version = "0.0.0"
 publish = false
 edition = "2024"
 
+# Standalone workspace so `cargo fuzz` does not get confused by the parent
+# workspace (fuzz is intentionally not a member of the main workspace).
+[workspace]
+
 [package.metadata]
 cargo-fuzz = true
 

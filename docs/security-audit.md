@@ -70,7 +70,7 @@ Following the comprehensive code and architecture audit (`/docs/audit.md`), all 
 | Issue | Severity | Description | Mitigation Implemented |
 |---|---|---|---|
 | **P0-1** | Critical | Setup wizard mutation without auth | Restricted `/ui/wizard` and `/ui/wizard/complete` to first-run setup or authenticated admin sessions; returns HTTP 403 once initialized. |
-| **P0-2** | Critical | Users not persisted across reboots | Persisted user database to `<data_dir>/users.toml`, wired `auth.user` and `auth.role` config sections, and restored accounts on daemon startup. |
+| **P0-2** | Critical | Users not persisted across reboots | Persisted user database to `<data_dir>/users.toml` (0600, corrupt/missing file fails closed) and restored accounts on daemon startup. Note: `auth.user`/`auth.role` config keys are not supported; roles are assigned per account in `users.toml`. |
 | **P0-3** | Critical | Updater accepted missing checksums | Enforced mandatory SHA256 checksum verification from `SHA256SUMS`, authenticated `/api/v1/system/update/check`, and restricted repo querying to `kubaeror/sito-dns`. |
 | **P0-4** | Critical | Installer generated incomplete config | Added default sections to generated configuration files and surfaced parsing warnings for corrupted sections. |
 | **P0-5** | Critical | Config and rewrites required daemon restart | Wired `ArcSwap` handles into the DNS query pipeline to allow instant, zero-downtime hot-reloading of config, rewrites, and client groups. |
@@ -83,8 +83,8 @@ Following the comprehensive code and architecture audit (`/docs/audit.md`), all 
 | **P2-12** | Medium | Hourly stats double counting | Added persistent watermark tracking in SQLite to prevent reprocessing query log rows during aggregation. |
 | **P2-13** | Medium | Query log SQL string interpolation | Converted dynamic query log filter construction to parameterized `sqlx::QueryBuilder` with `push_bind`. |
 | **P2-14** | Medium | Installer checksum failure ignored | Hardened `contrib/install.sh` to abort with non-zero exit code if SHA256SUMS is missing or fails validation. |
-| **P2-15** | Medium | Dead `refresh_hours` configuration | Removed deprecated and unreferenced `refresh_hours` controls from UI forms and configuration files. |
-| **P2-16** | Medium | DNSSEC mode unchecked | Validated DNSSEC mode (`off`, `process`, `log_fail`) at startup and logged validation outcomes in query logs. |
+| **P2-15** | Medium | Dead `refresh_hours` configuration | The per-list `refresh_hours` field is still accepted for HA metadata but scheduled refreshes use the global `filtering.refresh_interval_hours`; it is documented as deprecated. |
+| **P2-16** | Medium | DNSSEC mode unchecked | Validated DNSSEC mode at startup (accepted: `validate`/`strict`, `log_only`/`log-only`/`permissive`/`log_fail`, `off`/`disabled`) and logged validation outcomes in query logs. Full DS/DNSKEY chain walking remains future work. |
 | **P2-17** | Medium | Query logs dropped on graceful shutdown | Flushed and awaited query log background writer completion during server graceful shutdown. |
 | **P2-18** | Medium | Rule drop guard prevented deliberate deletions | Restricted drop-guard threshold checks exclusively to automated background refreshes. |
 | **P2-19** | Medium | Upstream bootstrap panic on empty list | Safely handled bootstrap resolution candidates using `.first()` rather than direct index slicing. |

@@ -5,6 +5,42 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+### Audit 3 Remediation (security, correctness, ops)
+
+Full findings and remediation mapping: `docs/audit3.md`.
+
+#### Security (P0/P1)
+- **Installer fixes**: release archives are now extracted with `--strip-components=1` (fresh installs from GitHub releases previously failed with a missing-binary error); the unverified local-binary path is now gated behind `SITO_INSTALL_LOCAL_BINARY=1`; health check derives the web port from config and restores the previous binary on failure.
+- **TOTP hardening**: `verify_totp` now enforces the IP rate limit and account lockout, caps wrong codes per partial token (`MAX_TOTP_ATTEMPTS = 5`), consumes the token when locked, and invalidates sessions on password/TOTP changes.
+- **Setup wizard**: completing setup with an empty or default `adminadmin` password is rejected; the wizard requires a real administrator password on first run.
+- **Auth fail-closed**: if `config.toml` exists but `users.toml` is missing, the server now refuses to start instead of silently re-bootstrapping default credentials (`sito reset-admin` recovers).
+- **HA**: signed-bundle envelope version is now bound to the signed payload version (replay/downgrade rejected); pushes are no longer dropped on a full queue; non-monotonic `update_bundle` is rejected; plaintext master replication requires a token; per-slave metric labels are removed on disconnect and escaped in `/metrics`.
+- **Upstreams**: responses are validated against the sent query (ID + question); IPv6 literal upstreams work (`[::1]:853`, bare IPv6); unsupported schemes are rejected with a clear error.
+- **Transport**: DoH3 request bodies are capped at 65535 bytes; TCP pipelining is bounded per connection; ACME certificate reloads keep TLS-ALPN challenge keys, and ACME account/key files are written 0600; plaintext DoH is limited to unprivileged loopback ports unless `dns.allow_plaintext_doh = true`.
+- **DNSSEC**: `permissive`/`log_fail` now map to log-only (previously silently strict); all RRSIGs are evaluated instead of failing on the first bad signature; upstream queries force the DO bit and DNSSEC-aware clients are never served non-validated cache entries.
+- **API/UI**: CSRF same-origin checks and baseline security headers (CSP, X-Frame-Options, nosniff, Referrer-Policy, HSTS when HTTPS); slave read-only middleware now also covers the web UI; `X-Forwarded-For` is ignored without a trusted peer; sessions are purged on credential changes; config writes are 0600 with unique temp names; `slave_token` is masked in `GET /api/v1/config`; TOTP endpoints use the authenticated username instead of a hardcoded `admin`.
+- **Filtering**: `$important` allowlists now override standard blocks; `$dnsrewrite` rules are honored; a single invalid regex no longer disables all regex/wildcard rules; overlapping regex matches are all collected; subscription downloads are streamed with a hard size cap (including `file://`).
+- **Rewrites**: CNAME loops are depth-limited and can no longer crash the resolver with unbounded recursion; wildcards no longer match the bare suffix.
+- **Hot reload**: config watcher watches the parent directory (works when config.toml is created later) and now reloads upstreams, cache settings, filter configuration and anonymization; scheduled filter refresh keeps hot-reloaded list settings.
+- **Ops/release**: HA compose env-var overrides removed (configuration comes from `config.toml` only); container health check passes during setup-wizard mode; `443/udp` exposed; cosign keyless signing added to the release workflow; `latest` container tag published on tag builds; fuzz workspace fixed.
+- **Docs/config**: configuration reference corrected (web bind type, clients group map, stats/privacy split, DNSSEC modes, ACME `domains`), README/GHCR image names, Swagger path, AdGuard migration script now emits valid config and maps DoH/DoQ upstreams to `tls://`.
+
+#### Deferred (tracked in `docs/audit3.md`)
+- Full DNSSEC DS/DNSKEY chain walking (validation currently verifies against configured trust anchors only).
+- Native DoH/DoQ upstream transports.
+- Persistent sessions/API tokens across restarts (tokens remain memory-only, but are revoked on credential change).
+- Per-list `refresh_hours` scheduling (deprecated; global interval used).
+- Per-client upstream overrides are still not wired into the pipeline.
+
+### Breaking changes
+- Plaintext DoH on non-loopback or privileged ports now requires `dns.allow_plaintext_doh = true`.
+- RouterOS integration no longer disables TLS verification by default; set `allow_invalid_certs = true` for self-signed router certificates.
+- Invalid `[web]`/`[auth]`/`[stats]` TOML sections now fail validation instead of silently falling back to defaults.
+
+---
+
 ## [1.4.0] - 2026-09-06
 
 ### First-Time Setup Wizard & Installer Hardening

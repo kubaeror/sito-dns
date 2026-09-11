@@ -122,13 +122,6 @@ impl HaConfig {
                     .is_some_and(|t| !t.trim().is_empty());
                 let has_pins = !self.pinned_slave_fingerprints.is_empty();
 
-                if !has_token && !has_pins {
-                    return Err(HaError::Validation {
-                        field: "slave_token".to_string(),
-                        reason: "Master replication requires authentication: either slave_token or pinned_slave_fingerprints must be configured".to_string(),
-                    });
-                }
-
                 let has_cert = self.cert.is_some();
                 let has_key = self.key.is_some();
 
@@ -140,11 +133,28 @@ impl HaConfig {
                     });
                 }
 
-                if (!has_cert || !has_key) && !self.allow_insecure_ws {
-                    return Err(HaError::Validation {
-                        field: "cert".to_string(),
-                        reason: "Master replication requires TLS certificate and key unless allow_insecure_ws = true".to_string(),
-                    });
+                if has_cert && has_key {
+                    if !has_token && !has_pins {
+                        return Err(HaError::Validation {
+                            field: "slave_token".to_string(),
+                            reason: "Master replication requires authentication: either slave_token or pinned_slave_fingerprints must be configured".to_string(),
+                        });
+                    }
+                } else {
+                    if !self.allow_insecure_ws {
+                        return Err(HaError::Validation {
+                            field: "cert".to_string(),
+                            reason: "Master replication requires TLS certificate and key unless allow_insecure_ws = true".to_string(),
+                        });
+                    }
+                    // Certificate pins cannot be enforced without TLS, so
+                    // plaintext replication must use a pre-shared token.
+                    if !has_token {
+                        return Err(HaError::Validation {
+                            field: "slave_token".to_string(),
+                            reason: "Plaintext (allow_insecure_ws) replication requires a non-empty slave_token".to_string(),
+                        });
+                    }
                 }
             }
         } else if role == "slave" {
@@ -226,8 +236,13 @@ pinned_slave_fingerprints = ["blake3:11223344"]
         cfg.slave_token = None;
         assert!(cfg.validate("master").is_err());
 
-        // Pinned slave fingerprints satisfies auth
+        // Pins do not authenticate plaintext replication (no TLS to pin).
         cfg.pinned_slave_fingerprints = vec!["blake3:abc123".to_string()];
+        assert!(cfg.validate("master").is_err());
+
+        // Pins are sufficient auth when TLS is configured.
+        cfg.cert = Some(std::path::PathBuf::from("/etc/sito/certs/master.crt"));
+        cfg.key = Some(std::path::PathBuf::from("/etc/sito/certs/master.key"));
         assert!(cfg.validate("master").is_ok());
 
         // replication_port == 0 (disabled) always passes master validation

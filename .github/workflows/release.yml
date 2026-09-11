@@ -67,11 +67,11 @@ jobs:
 
       - name: Package release archive
         run: |
-          VERSION="${GITHUB_REF_NAME:-${{ github.event.inputs.tag_name }}}"
+          VERSION="${{ github.event.inputs.tag_name || github.ref_name }}"
           ARCHIVE_DIR="sito-${VERSION}-${{ matrix.target }}"
           mkdir -p "${ARCHIVE_DIR}"
           cp "target/${{ matrix.target }}/release/sito" "${ARCHIVE_DIR}/"
-          cp LICENSE README.md "${ARCHIVE_DIR}/"
+          cp LICENSE README.md config.example.toml "${ARCHIVE_DIR}/"
           mkdir -p "${ARCHIVE_DIR}/contrib/systemd"
           cp contrib/systemd/sito.service "${ARCHIVE_DIR}/contrib/systemd/"
           cp contrib/install.sh "${ARCHIVE_DIR}/"
@@ -114,10 +114,24 @@ jobs:
         with:
           tool: cargo-sbom
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Generate SPDX SBOM
         run: |
           cargo sbom --output-format spdx_json_2_3 > release-assets/sito.spdx.json
           sha256sum release-assets/sito.spdx.json >> release-assets/SHA256SUMS
+
+      - name: Sign release archives (cosign keyless)
+        run: |
+          cd release-assets
+          for archive in *.tar.gz; do
+            cosign sign-blob --yes \
+              --output-signature "${archive}.sig" \
+              --output-certificate "${archive}.pem" \
+              "${archive}"
+          done
+          ls -la
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -155,7 +169,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
             type=raw,value=${{ github.event.inputs.tag_name }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push multi-arch Docker image
@@ -167,3 +181,5 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

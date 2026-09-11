@@ -37,6 +37,8 @@ pub async fn slave_read_only_middleware(
         let is_allowed = path.starts_with("/api/v1/auth")
             || path == "/api/v1/ha/resync"
             || path == "/ha/resync"
+            || path == "/ui/login"
+            || path == "/ui/logout"
             || path.starts_with("/auth");
 
         if !is_allowed {
@@ -220,7 +222,12 @@ pub fn create_router(ctx: ServerContext) -> Router {
         .nest("/api/v1", api_v1)
         .route("/metrics", get(metrics::get_metrics))
         .merge(SwaggerUi::new("/api/docs").url("/api/docs/openapi.json", ApiDoc::openapi()))
-        .merge(crate::ui::ui_router())
+        .merge(
+            crate::ui::ui_router().layer(axum::middleware::from_fn_with_state(
+                ctx.clone(),
+                slave_read_only_middleware,
+            )),
+        )
         .fallback(not_found_handler)
         .layer(axum::middleware::from_fn_with_state(
             ctx.clone(),
@@ -240,5 +247,10 @@ pub fn create_router(ctx: ServerContext) -> Router {
         ))
         .with_state(ctx);
 
-    app
+    app.layer(axum::middleware::from_fn(
+        crate::security::csrf_origin_middleware,
+    ))
+    .layer(axum::middleware::from_fn(
+        crate::security::security_headers_middleware,
+    ))
 }

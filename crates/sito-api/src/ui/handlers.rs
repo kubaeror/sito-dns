@@ -143,14 +143,44 @@ pub async fn login_submit(
         LoginResult::TotpRequired { partial_token } => {
             if let Some(ref code) = form.totp
                 && !code.trim().is_empty()
-                && let Some(session) = ctx.auth_mgr.verify_totp(&partial_token, code.trim())
             {
-                let cookie_header = session.to_cookie_header_secure(is_secure);
-                let mut resp = Redirect::to("/dashboard").into_response();
-                if let Ok(val) = cookie_header.parse() {
-                    resp.headers_mut().insert(SET_COOKIE, val);
+                match ctx
+                    .auth_mgr
+                    .verify_totp(&partial_token, code.trim(), &client_ip)
+                {
+                    crate::auth::manager::TotpVerifyResult::Success(session) => {
+                        let cookie_header = session.to_cookie_header_secure(is_secure);
+                        let mut resp = Redirect::to("/dashboard").into_response();
+                        if let Ok(val) = cookie_header.parse() {
+                            resp.headers_mut().insert(SET_COOKIE, val);
+                        }
+                        return resp;
+                    }
+                    crate::auth::manager::TotpVerifyResult::LockedOut { .. } => {
+                        return HtmlTemplate(LoginTemplate {
+                            is_authenticated: false,
+                            username: &form.username,
+                            user_role: "",
+                            active_tab: "login",
+                            version: env!("CARGO_PKG_VERSION"),
+                            error_message: "Account locked out due to failed attempts. Try again later.",
+                        })
+                        .into_response();
+                    }
+                    crate::auth::manager::TotpVerifyResult::RateLimited => {
+                        return HtmlTemplate(LoginTemplate {
+                            is_authenticated: false,
+                            username: &form.username,
+                            user_role: "",
+                            active_tab: "login",
+                            version: env!("CARGO_PKG_VERSION"),
+                            error_message: "Too many attempts. Please wait and try again.",
+                        })
+                        .into_response();
+                    }
+                    crate::auth::manager::TotpVerifyResult::Invalid
+                    | crate::auth::manager::TotpVerifyResult::TokenExpired => {}
                 }
-                return resp;
             }
             HtmlTemplate(LoginTemplate {
                 is_authenticated: false,
@@ -1835,22 +1865,12 @@ pub async fn wizard_complete_handler(
     let confirm_pass_input = form.confirm_password.as_deref().map_or("", str::trim);
 
     let effective_password = if admin_pass_input.is_empty() {
-        if !confirm_pass_input.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Password confirmation provided, but password field was empty.",
-            )
-                .into_response();
-        }
-        if is_first_run {
-            "adminadmin"
-        } else {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Invalid password: password cannot be empty.",
-            )
-                .into_response();
-        }
+        // Never allow completing setup with the default bootstrap password.
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid password: a non-default administrator password is required.",
+        )
+            .into_response();
     } else {
         if admin_pass_input.len() < 8 {
             return (
@@ -1866,6 +1886,13 @@ pub async fn wizard_complete_handler(
             return (
                 StatusCode::BAD_REQUEST,
                 "Invalid password: cannot contain whitespace or control characters.",
+            )
+                .into_response();
+        }
+        if admin_pass_input.eq_ignore_ascii_case("adminadmin") {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid password: the default password is not allowed.",
             )
                 .into_response();
         }
@@ -2184,24 +2211,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wizard_all_empty_fields_fallback_to_defaults() {
+    async fn test_wizard_rejects_empty_and_default_password() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_ui_wiz_defaults_{}", rand::random::<u64>()));
         let _ = std::fs::create_dir_all(&temp_dir);
         let ctx = mock_context(&temp_dir).await;
 
+        // Empty password must not complete setup with bootstrap credentials.
         let empty_form = WizardCompleteForm::default();
         let resp =
             wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(empty_form)).await;
-        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-        assert!(!ctx.auth_mgr.is_first_run());
-        assert!(!ctx.is_setup_pending());
-        assert!(ctx.auth_mgr.has_user("admin"));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(ctx.auth_mgr.is_first_run());
+        assert!(!ctx.auth_mgr.has_user("admin") || ctx.auth_mgr.is_default_admin_active());
 
-        // Password fell back to default adminadmin
-        let login_res = ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1");
-        assert!(matches!(login_res, crate::auth::LoginResult::Success(_)));
+        // The literal default password is rejected as well.
+        let default_pass_form = WizardCompleteForm {
+            admin_user: Some("admin".to_string()),
+            admin_password: Some("adminadmin".to_string()),
+            ..Default::default()
+        };
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Form(default_pass_form),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(ctx.auth_mgr.is_first_run());
 
+        // Wizard-rejected attempts must not have modified the config.
         let cfg = ctx.config.load();
         assert_eq!(cfg.dns.port, 53);
         assert_eq!(cfg.dns.dot_port, 853);
@@ -2324,6 +2363,8 @@ mod tests {
 
         // Invalid port
         let bad_port_form = WizardCompleteForm {
+            admin_user: Some("admin".to_string()),
+            admin_password: Some("ValidPassword123!".to_string()),
             port: Some("not_a_port".to_string()),
             ..Default::default()
         };
@@ -2334,6 +2375,8 @@ mod tests {
 
         // Invalid web bind IP
         let bad_ip_form = WizardCompleteForm {
+            admin_user: Some("admin".to_string()),
+            admin_password: Some("ValidPassword123!".to_string()),
             web_bind: Some("not_an_ip".to_string()),
             ..Default::default()
         };

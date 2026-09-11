@@ -94,54 +94,91 @@ async fn create_managed_entry(
     timeout_duration: Duration,
     pool_size: usize,
 ) -> Result<ManagedEntry, UpstreamError> {
-    let (name, upstream): (String, Arc<dyn Upstream>) =
-        if let Some(tls_target) = server_str.strip_prefix("tls://") {
-            let parts: Vec<&str> = tls_target.split(':').collect();
-            let host = parts[0];
-            let port: u16 = if parts.len() > 1 {
-                parts[1].parse().unwrap_or(853)
-            } else {
-                853
-            };
+    let (name, upstream): (String, Arc<dyn Upstream>) = if let Some(tls_target) =
+        server_str.strip_prefix("tls://")
+    {
+        let (host, port) = split_host_port(tls_target, 853);
 
-            // Resolve hostname via bootstrap
-            let resolved_ips = bootstrap.resolve_hostname(host).await?;
+        // Resolve hostname via bootstrap (IP literals are returned as-is)
+        let resolved_ips = bootstrap.resolve_hostname(&host).await?;
+        let target_ip = resolved_ips.first().copied().ok_or_else(|| {
+            UpstreamError::BadResponse(format!("no IP addresses resolved for '{host}'"))
+        })?;
+        let socket_addr = SocketAddr::new(target_ip, port);
+
+        let dot = DotUpstream::new(socket_addr, host, timeout_duration, pool_size)?;
+        (server_str.to_string(), Arc::new(dot))
+    } else {
+        let target_str = server_str.strip_prefix("udp://").unwrap_or(server_str);
+        if let Some(scheme) = unsupported_scheme(target_str) {
+            return Err(UpstreamError::BadResponse(format!(
+                "unsupported upstream scheme '{scheme}://' in '{server_str}'; supported schemes are tls://, udp:// and plain host/IP"
+            )));
+        }
+        let socket_addr = if let Ok(addr) = SocketAddr::from_str(target_str) {
+            addr
+        } else {
+            let (host, port) = split_host_port(target_str, 53);
+
+            let resolved_ips = bootstrap.resolve_hostname(&host).await?;
             let target_ip = resolved_ips.first().copied().ok_or_else(|| {
                 UpstreamError::BadResponse(format!("no IP addresses resolved for '{host}'"))
             })?;
-            let socket_addr = SocketAddr::new(target_ip, port);
-
-            let dot = DotUpstream::new(socket_addr, host.to_string(), timeout_duration, pool_size)?;
-            (server_str.to_string(), Arc::new(dot))
-        } else {
-            let target_str = server_str.strip_prefix("udp://").unwrap_or(server_str);
-            let socket_addr = if let Ok(addr) = SocketAddr::from_str(target_str) {
-                addr
-            } else {
-                let parts: Vec<&str> = target_str.split(':').collect();
-                let host = parts[0];
-                let port: u16 = if parts.len() > 1 {
-                    parts[1].parse().unwrap_or(53)
-                } else {
-                    53
-                };
-
-                let resolved_ips = bootstrap.resolve_hostname(host).await?;
-                let target_ip = resolved_ips.first().copied().ok_or_else(|| {
-                    UpstreamError::BadResponse(format!("no IP addresses resolved for '{host}'"))
-                })?;
-                SocketAddr::new(target_ip, port)
-            };
-
-            let plain = PlainUpstream::new(socket_addr, timeout_duration);
-            (server_str.to_string(), Arc::new(plain))
+            SocketAddr::new(target_ip, port)
         };
+
+        let plain = PlainUpstream::new(socket_addr, timeout_duration);
+        (server_str.to_string(), Arc::new(plain))
+    };
 
     Ok(ManagedEntry {
         name,
         upstream,
         health: Arc::new(RwLock::new(UpstreamHealth::new())),
     })
+}
+
+/// Returns the scheme of an upstream string if it uses an unsupported `xxx://` prefix.
+fn unsupported_scheme(target: &str) -> Option<String> {
+    let (scheme, _) = target.split_once("://")?;
+    if scheme.is_empty() || scheme.eq_ignore_ascii_case("tls") || scheme.eq_ignore_ascii_case("udp")
+    {
+        None
+    } else {
+        Some(scheme.to_string())
+    }
+}
+
+/// Splits an upstream target into `(host, port)`, supporting IPv6 literals in
+/// brackets (`[::1]:853`), bare IPv6 literals (`2001:db8::1`) and hostnames.
+fn split_host_port(target: &str, default_port: u16) -> (String, u16) {
+    let target = target.trim();
+
+    // [IPv6]:port or [IPv6]
+    if let Some(rest) = target.strip_prefix('[')
+        && let Some((host, tail)) = rest.split_once(']')
+    {
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return (host.to_string(), port);
+    }
+
+    // Bare IPv6 literal without brackets/port
+    if target.matches(':').count() >= 2 && target.parse::<std::net::Ipv6Addr>().is_ok() {
+        return (target.to_string(), default_port);
+    }
+
+    // host:port
+    if let Some((host, port)) = target.rsplit_once(':')
+        && !host.is_empty()
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return (host.to_string(), port);
+    }
+
+    (target.trim_end_matches('.').to_string(), default_port)
 }
 
 fn clean_rule_domain(d: &str) -> String {
@@ -673,5 +710,41 @@ mod tests {
         let statuses = manager.statuses().await;
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].0, "1.1.1.1:53");
+    }
+
+    #[test]
+    fn test_split_host_port_supports_ipv6_literals() {
+        assert_eq!(
+            split_host_port("[2606:4700:4700::1111]:853", 853),
+            ("2606:4700:4700::1111".to_string(), 853)
+        );
+        assert_eq!(
+            split_host_port("[2606:4700:4700::1111]", 853),
+            ("2606:4700:4700::1111".to_string(), 853)
+        );
+        assert_eq!(
+            split_host_port("2606:4700:4700::1111", 853),
+            ("2606:4700:4700::1111".to_string(), 853)
+        );
+        assert_eq!(
+            split_host_port("dns.quad9.net:8853", 853),
+            ("dns.quad9.net".to_string(), 8853)
+        );
+        assert_eq!(
+            split_host_port("dns.quad9.net", 853),
+            ("dns.quad9.net".to_string(), 853)
+        );
+        assert_eq!(split_host_port("1.1.1.1", 53), ("1.1.1.1".to_string(), 53));
+    }
+
+    #[test]
+    fn test_unsupported_scheme_detection() {
+        assert_eq!(
+            unsupported_scheme("https://dns.quad9.net/dns-query").as_deref(),
+            Some("https")
+        );
+        assert_eq!(unsupported_scheme("tls://dns.quad9.net"), None);
+        assert_eq!(unsupported_scheme("udp://1.1.1.1"), None);
+        assert_eq!(unsupported_scheme("1.1.1.1"), None);
     }
 }

@@ -73,4 +73,4 @@ If validation passes, the command exits with code `0` and prints `"Configuration
    # Should return: 0.0.0.0
    ```
 4. **Access Dashboard:**
-   Navigate to `http://<server-ip>:8080` and log in with default credentials (`admin` / `adminadmin`).
+   Navigate to `http://<server-ip>:8080` and complete the first-time setup wizard (or log in with the bootstrap credentials `admin` / `adminadmin` if `--no-setup` was used, then change the password immediately).

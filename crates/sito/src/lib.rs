@@ -200,6 +200,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pipeline_important_allow_overrides_block() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_important_pipe_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Mock upstream
+        let mock_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while let Ok((len, src)) = mock_socket.recv_from(&mut buf).await {
+                if let Ok(query) = sito_proto::decode_message(&buf[..len]) {
+                    let mut resp =
+                        Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                    resp.metadata.response_code = ResponseCode::NoError;
+                    resp.queries = query.queries.clone();
+                    if let Some(q) = query.queries.first() {
+                        resp.answers.push(Record::from_rdata(
+                            q.name().clone(),
+                            300,
+                            RData::A(A(Ipv4Addr::new(93, 184, 216, 34))),
+                        ));
+                    }
+                    let encoded = sito_proto::encode_message(&resp).unwrap();
+                    let _ = mock_socket.send_to(&encoded, src).await;
+                }
+            }
+        });
+
+        // 2. Config: standard block + important allow for the same domain, and a
+        //    $dnsrewrite rule for another domain.
+        let mut config = Config::default();
+        config.server.data_dir = temp_dir.clone();
+        config.upstream.servers = vec![mock_addr.to_string()];
+        config.filtering.custom_rules = vec![
+            "||ads.example.com^".to_string(),
+            "@@||ads.example.com^$important".to_string(),
+            "||rewrite.test^$dnsrewrite=1.2.3.4".to_string(),
+        ];
+
+        let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
+        let upstream = Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let cache = Arc::new(DnsCache::new(config.dns.cache.clone()));
+        let filter = Arc::new(
+            HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
+        );
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let dnssec = Arc::new(sito_dnssec::DnssecValidator::from_config(
+            &config.dns.dnssec,
+        ));
+        let clients = Arc::new(ClientRegistry::new(ClientsConfig::default()));
+        let parental = Arc::new(ParentalRegistry::bundled());
+        let services = Arc::new(ServiceRegistry::bundled());
+        let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
+
+        let pipeline = DnsPipeline::new(
+            Arc::new(config.clone()),
+            filter,
+            cache,
+            upstream,
+            dnssec,
+            clients,
+            parental,
+            services,
+            rewrites,
+            in_flight,
+        );
+
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+        // $important allow must override the standard block (upstream answer).
+        let mut query_allowed = Message::new(401, MessageType::Query, OpCode::Query);
+        query_allowed.queries.push(Query::query(
+            Name::from_str("ads.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let resp = pipeline
+            .handle(query_allowed, client.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(
+            resp.answers[0].data,
+            RData::A(A(Ipv4Addr::new(93, 184, 216, 34))),
+            "$important allowlist must bypass the standard blocklist"
+        );
+
+        // $dnsrewrite must synthesize a response (no upstream involvement).
+        let mut query_rewrite = Message::new(402, MessageType::Query, OpCode::Query);
+        query_rewrite.queries.push(Query::query(
+            Name::from_str("rewrite.test.").unwrap(),
+            RecordType::A,
+        ));
+        let resp_rw = pipeline.handle(query_rewrite, client).await.unwrap();
+        assert_eq!(resp_rw.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp_rw.answers.len(), 1);
+        assert_eq!(
+            resp_rw.answers[0].data,
+            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+            "$dnsrewrite must synthesize the configured address"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
     async fn test_pipeline_cname_uncloaking() {
         use hickory_proto::rr::rdata::CNAME;
 

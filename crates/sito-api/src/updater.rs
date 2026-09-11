@@ -264,8 +264,23 @@ pub fn verify_archive_checksum(
     Ok(())
 }
 
-/// Downloads the latest release archive, verifies checksum and signature, extracts the binary,
-/// and replaces the running executable.
+/// Maximum accepted release archive size (defense against oversized downloads).
+const MAX_UPDATE_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Returns true when the URL points at an expected GitHub release host.
+fn is_allowed_download_host(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    host == "github.com"
+        || host == "api.github.com"
+        || host == "objects.githubusercontent.com"
+        || host.ends_with(".githubusercontent.com")
+}
+
+/// Downloads the latest release archive, verifies its SHA-256 checksum, extracts
+/// the binary, and replaces the running executable.
 pub async fn apply_update(repo: Option<&str>, force: bool) -> Result<String, UpdateError> {
     if is_running_in_docker() {
         return Err(UpdateError::DockerEnvironment(
@@ -337,6 +352,28 @@ pub async fn apply_update(repo: Option<&str>, force: bool) -> Result<String, Upd
     let archive =
         archive_asset.ok_or_else(|| UpdateError::NoCompatibleAsset(target.to_string()))?;
 
+    if archive.size > MAX_UPDATE_ARCHIVE_BYTES {
+        return Err(UpdateError::Other(format!(
+            "Release archive '{}' is unexpectedly large ({} bytes); refusing to download",
+            archive.name, archive.size
+        )));
+    }
+    if !is_allowed_download_host(&archive.browser_download_url) {
+        return Err(UpdateError::Other(format!(
+            "Release asset URL '{}' does not point at an allowed GitHub host",
+            archive.browser_download_url
+        )));
+    }
+
+    // 2. Compute SHA256 and hard-verify checksum
+    let sha_asset = sha256_asset.ok_or_else(|| UpdateError::ChecksumNotFound)?;
+    if !is_allowed_download_host(&sha_asset.browser_download_url) {
+        return Err(UpdateError::Other(format!(
+            "Checksum asset URL '{}' does not point at an allowed GitHub host",
+            sha_asset.browser_download_url
+        )));
+    }
+
     info!(asset = %archive.name, url = %archive.browser_download_url, "Downloading release archive");
     let archive_bytes = client
         .get(&archive.browser_download_url)
@@ -345,8 +382,12 @@ pub async fn apply_update(repo: Option<&str>, force: bool) -> Result<String, Upd
         .bytes()
         .await?;
 
-    // 2. Compute SHA256 and hard-verify checksum
-    let sha_asset = sha256_asset.ok_or(UpdateError::ChecksumNotFound)?;
+    if archive_bytes.len() as u64 > MAX_UPDATE_ARCHIVE_BYTES {
+        return Err(UpdateError::Other(
+            "Release archive exceeded the maximum download size".to_string(),
+        ));
+    }
+
     debug!(asset = %sha_asset.name, "Fetching checksum manifest");
     let sums_content = client
         .get(&sha_asset.browser_download_url)
@@ -494,5 +535,20 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
         assert!(is_allowed_repo("kubaeror/sito-dns"));
         assert!(!is_allowed_repo("evil/attacker-repo"));
         assert!(!is_allowed_repo("kubaeror/other-repo"));
+    }
+
+    #[test]
+    fn test_allowed_download_hosts() {
+        assert!(is_allowed_download_host(
+            "https://github.com/kubaeror/sito-dns/releases/download/v1.4.0/sito.tar.gz"
+        ));
+        assert!(is_allowed_download_host(
+            "https://objects.githubusercontent.com/github-production-release-asset/file"
+        ));
+        assert!(!is_allowed_download_host("http://github.com/file"));
+        assert!(!is_allowed_download_host("https://evil.example.com/file"));
+        assert!(!is_allowed_download_host(
+            "https://github.com.evil.example.com/file"
+        ));
     }
 }

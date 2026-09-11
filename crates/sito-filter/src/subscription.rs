@@ -121,12 +121,34 @@ impl SubscriptionFetcher {
         // Handle file:// URI scheme directly
         if let Some(file_path) = url.strip_prefix("file://") {
             debug!(list = %list_name, path = %file_path, "Reading blocklist from local file");
-            return tokio::fs::read_to_string(file_path)
+            let metadata = tokio::fs::metadata(file_path)
                 .await
                 .map_err(|e| FilterError::Io {
                     path: PathBuf::from(file_path),
                     source: e,
+                })?;
+            if metadata.len() as usize > self.max_bytes {
+                return Err(FilterError::ListTooLarge {
+                    list: list_name.to_string(),
+                    size: metadata.len() as usize,
+                    limit: self.max_bytes,
                 });
+            }
+            let content =
+                tokio::fs::read_to_string(file_path)
+                    .await
+                    .map_err(|e| FilterError::Io {
+                        path: PathBuf::from(file_path),
+                        source: e,
+                    })?;
+            if content.len() > self.max_bytes {
+                return Err(FilterError::ListTooLarge {
+                    list: list_name.to_string(),
+                    size: content.len(),
+                    limit: self.max_bytes,
+                });
+            }
+            return Ok(content);
         }
 
         // Restrict HTTP list download schemes to http and https (SSRF protection)
@@ -211,20 +233,47 @@ impl SubscriptionFetcher {
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
 
-                    let bytes = match resp.bytes().await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            last_error = Some(FilterError::DownloadFailed {
-                                list: list_name.to_string(),
-                                url: url.to_string(),
-                                source: e,
-                            });
-                            if attempt < self.max_retries {
-                                continue;
+                    // Stream the body with a hard size cap so a chunked
+                    // response without Content-Length cannot exhaust memory.
+                    let mut resp = resp;
+                    let mut body: Vec<u8> = Vec::new();
+                    let mut too_large = false;
+                    let mut body_error = None;
+                    loop {
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                if body.len().saturating_add(chunk.len()) > self.max_bytes {
+                                    too_large = true;
+                                    break;
+                                }
+                                body.extend_from_slice(&chunk);
                             }
-                            break;
+                            Ok(None) => break,
+                            Err(e) => {
+                                body_error = Some(FilterError::DownloadFailed {
+                                    list: list_name.to_string(),
+                                    url: url.to_string(),
+                                    source: e,
+                                });
+                                break;
+                            }
                         }
-                    };
+                    }
+                    if too_large {
+                        return Err(FilterError::ListTooLarge {
+                            list: list_name.to_string(),
+                            size: body.len(),
+                            limit: self.max_bytes,
+                        });
+                    }
+                    if let Some(e) = body_error {
+                        last_error = Some(e);
+                        if attempt < self.max_retries {
+                            continue;
+                        }
+                        break;
+                    }
+                    let bytes = body;
 
                     if bytes.len() > self.max_bytes {
                         return Err(FilterError::ListTooLarge {
@@ -234,7 +283,7 @@ impl SubscriptionFetcher {
                         });
                     }
 
-                    let Ok(content) = String::from_utf8(bytes.to_vec()) else {
+                    let Ok(content) = String::from_utf8(bytes) else {
                         return Err(FilterError::InvalidUrl {
                             url: url.to_string(),
                             reason: "Blocklist content is not valid UTF-8".to_string(),

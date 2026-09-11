@@ -857,7 +857,7 @@ Note: distroless nonroot + `CAP_NET_BIND_SERVICE` granted in compose/k8s; altern
 ```yaml
 services:
   sito:
-    image: ghcr.io/<org>/sito:latest
+    image: ghcr.io/kubaeror/sito-dns:latest
     cap_add: [NET_BIND_SERVICE]
     ports: ["53:53/udp", "53:53", "853:853", "443:443", "8080:8080"]
     volumes: ["./config:/etc/sito", "sito-data:/var/lib/sito"]

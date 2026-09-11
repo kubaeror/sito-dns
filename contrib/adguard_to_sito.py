@@ -9,6 +9,7 @@ Usage:
 
 import sys
 import argparse
+import ipaddress
 import re
 from typing import Any, Dict, List
 
@@ -30,6 +31,45 @@ def parse_yaml_fallback(text: str) -> Dict[str, Any]:
             current_section = line.split(":")[0].strip()
             data[current_section] = {}
     return data
+
+
+def normalize_upstream(value: str) -> str:
+    """Maps AdGuard upstream URLs to the schemes supported by sito.
+
+    sito supports `tls://` (DoT) and plain host/IP (`udp://` optional).
+    DoH (`https://host/dns-query`) and DoQ (`quic://host`) are mapped to
+    `tls://host`, which provides equivalent transport encryption.
+    """
+    value = str(value).strip()
+    lower = value.lower()
+    if lower.startswith("https://") or lower.startswith("http://"):
+        host = value.split("://", 1)[1].split("/", 1)[0]
+        return f"tls://{host}"
+    if lower.startswith("quic://") or lower.startswith("h3://"):
+        host = value.split("://", 1)[1].split("/", 1)[0]
+        return f"tls://{host}"
+    return value
+
+
+def normalize_bootstrap(value: str) -> str:
+    """Extracts a plain IP address from a bootstrap value (supports IPv6)."""
+    v = str(value).strip()
+    if "://" in v:
+        v = v.split("://", 1)[1]
+    v = v.split("/", 1)[0]
+    try:
+        return str(ipaddress.ip_address(v))
+    except ValueError:
+        pass
+    if v.startswith("[") and "]" in v:
+        return v[1:v.index("]")]
+    host, _, port = v.rpartition(":")
+    if host and port.isdigit():
+        try:
+            return str(ipaddress.ip_address(host))
+        except ValueError:
+            return host
+    return v
 
 
 def convert_blocking_mode(agh_mode: str) -> str:
@@ -65,8 +105,8 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
         "[dns]",
     ]
 
-    # DNS bind
-    bind_hosts = dns.get("bind_hosts", ["0.0.0.0"])
+    # DNS bind (AdGuard uses an empty list to mean all interfaces)
+    bind_hosts = dns.get("bind_hosts") or ["0.0.0.0"]
     bind_quoted = ", ".join(f'"{h}"' for h in bind_hosts)
     lines.append(f"bind = [{bind_quoted}]")
     lines.append(f"port = {dns.get('port', 53)}")
@@ -106,13 +146,11 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
     lines.append("[upstream]")
     lines.append("servers = [")
     for u in upstreams:
-        lines.append(f'    "{u}",')
+        lines.append(f'    "{normalize_upstream(u)}",')
     lines.append("]")
     lines.append("bootstrap = [")
     for b in bootstrap:
-        # Normalize plain IPs
-        clean_b = b.split("://")[-1].split(":")[0]
-        lines.append(f'    "{clean_b}",')
+        lines.append(f'    "{normalize_bootstrap(b)}",')
     lines.append("]")
     lines.append('strategy = "parallel"')
     lines.append("timeout_ms = 5000")
@@ -193,31 +231,43 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
                 f'name = "{c_name}"',
                 f"ids = [{ids_str}]",
                 f'group = "default"',
-                f"safe_search = {str(c.get('safe_search', False)).lower()}",
                 "",
             ])
+
+    # TLS (certificates for DoT/DoH)
+    cert_path = tls.get("certificate_path")
+    key_path = tls.get("private_key_path")
+    if cert_path and key_path:
+        lines.extend([
+            "[tls]",
+            f'cert = "{cert_path}"',
+            f'key = "{key_path}"',
+            "",
+        ])
 
     # Web & Auth
     http_port = agh_cfg.get("http", {}).get("port", 8080)
     lines.extend([
         "[web]",
+        "enabled = true",
         f"port = {http_port}",
-        'bind = ["0.0.0.0"]',
-        f"https = {str(tls.get('enabled', False)).lower()}",
+        'bind = "0.0.0.0"',
+        "metrics_auth = true",
+        "",
+        "[auth]",
+        "session_ttl_hours = 24",
+        "login_rate_limit = 5",
+        "",
     ])
-    if tls.get("certificate_path"):
-        lines.append(f'cert = "{tls.get("certificate_path")}"')
-    if tls.get("private_key_path"):
-        lines.append(f'key = "{tls.get("private_key_path")}"')
-    lines.append("")
 
-    # Stats
+    # Stats & privacy (sito models query logging retention and anonymization
+    # separately from AdGuard)
     lines.extend([
         "[stats]",
-        f"query_log_enabled = {str(querylog.get('enabled', True)).lower()}",
-        f"query_log_retention_days = {max(7, int(querylog.get('interval', 90)))}",
-        f"anonymize_client_ip = {str(querylog.get('anonymize_client_ip', False)).lower()}",
-        "prometheus_enabled = true",
+        f"retention_days = {max(7, int(querylog.get('interval', 90)))}",
+        "",
+        "[privacy]",
+        f"anonymize_querylog = {str(querylog.get('anonymize_client_ip', False)).lower()}",
         "",
     ])
 

@@ -6,7 +6,7 @@ use axum::http::header::{HeaderMap, SET_COOKIE};
 use axum::response::{IntoResponse, Response};
 use std::str::FromStr;
 
-use crate::auth::manager::LoginResult;
+use crate::auth::manager::{LoginResult, TotpVerifyResult};
 use crate::auth::rbac::RequireAdmin;
 use crate::auth::session::{SESSION_COOKIE_NAME, build_clear_session_cookie};
 use crate::auth::token::{ApiTokenMeta, CreateTokenResponse, Role};
@@ -101,15 +101,32 @@ pub async fn verify_totp(
     headers: HeaderMap,
     Json(req): Json<TotpVerifyRequest>,
 ) -> Result<Response, ProblemDetails> {
-    let session = ctx
-        .auth_mgr
-        .verify_totp(&req.partial_token, &req.code)
-        .ok_or_else(|| {
-            ProblemDetails::unauthorized("Invalid, expired, or previously used TOTP code")
-        })?;
-
     let config = ctx.config.load();
     let trusted_proxies = config.get_web_config().trusted_proxies;
+    let client_ip = resolve_client_ip(peer_addr, &headers, &trusted_proxies);
+
+    let session = match ctx
+        .auth_mgr
+        .verify_totp(&req.partial_token, &req.code, &client_ip)
+    {
+        TotpVerifyResult::Success(session) => session,
+        TotpVerifyResult::LockedOut { remaining_seconds } => {
+            return Err(ProblemDetails::too_many_requests(format!(
+                "Account locked out due to repeated failures. Try again in {remaining_seconds}s."
+            )));
+        }
+        TotpVerifyResult::RateLimited => {
+            return Err(ProblemDetails::too_many_requests(
+                "Too many login attempts from this IP address. Please wait.",
+            ));
+        }
+        TotpVerifyResult::Invalid | TotpVerifyResult::TokenExpired => {
+            return Err(ProblemDetails::unauthorized(
+                "Invalid, expired, or previously used TOTP code",
+            ));
+        }
+    };
+
     let tls_enabled = config.get_tls_config().is_some();
     let is_secure = is_https_request(peer_addr, &headers, &trusted_proxies, tls_enabled);
 
@@ -182,12 +199,13 @@ pub async fn logout(
     security(("bearer_auth" = []), ("cookie_auth" = []))
 )]
 pub async fn get_totp_setup(
-    _admin: RequireAdmin,
+    admin: RequireAdmin,
     State(ctx): State<ServerContext>,
 ) -> Result<Json<TotpSetupResponse>, ProblemDetails> {
+    let username = session_username(&admin)?;
     let setup = ctx
         .auth_mgr
-        .init_totp_setup("admin")
+        .init_totp_setup(username)
         .ok_or_else(|| ProblemDetails::internal_error("Failed to generate TOTP credentials"))?;
 
     Ok(Json(setup))
@@ -207,11 +225,12 @@ pub async fn get_totp_setup(
     security(("bearer_auth" = []), ("cookie_auth" = []))
 )]
 pub async fn enable_totp(
-    _admin: RequireAdmin,
+    admin: RequireAdmin,
     State(ctx): State<ServerContext>,
     Json(req): Json<TotpConfirmRequest>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
-    if ctx.auth_mgr.confirm_totp_setup("admin", &req.code) {
+    let username = session_username(&admin)?;
+    if ctx.auth_mgr.confirm_totp_setup(username, &req.code) {
         Ok(Json(GenericMessageResponse {
             message: "TOTP 2FA enabled successfully".to_string(),
         }))
@@ -234,13 +253,24 @@ pub async fn enable_totp(
     security(("bearer_auth" = []), ("cookie_auth" = []))
 )]
 pub async fn disable_totp(
-    _admin: RequireAdmin,
+    admin: RequireAdmin,
     State(ctx): State<ServerContext>,
-) -> Json<GenericMessageResponse> {
-    ctx.auth_mgr.disable_totp("admin");
-    Json(GenericMessageResponse {
+) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
+    let username = session_username(&admin)?;
+    ctx.auth_mgr.disable_totp(username);
+    Ok(Json(GenericMessageResponse {
         message: "TOTP 2FA disabled successfully".to_string(),
-    })
+    }))
+}
+
+/// TOTP management is only meaningful for real user sessions, not API tokens.
+fn session_username(admin: &RequireAdmin) -> Result<&str, ProblemDetails> {
+    if admin.token_id.is_some() {
+        return Err(ProblemDetails::forbidden(
+            "TOTP management requires an authenticated user session, not an API token",
+        ));
+    }
+    Ok(&admin.username)
 }
 
 /// List all API tokens.

@@ -215,6 +215,19 @@ pub fn spawn_slave_worker(
                 Ok(()) => {
                     info!("Replication connection finished cleanly");
                     backoff.reset();
+                    // Avoid a tight reconnect loop when the master accepts and
+                    // immediately closes the connection.
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        _ = resync_rx.recv() => {
+                            info!("Manual resync triggered; reconnecting immediately");
+                        }
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!("Replication connection error: {e}");
@@ -494,6 +507,22 @@ where
         }
         HaMessage::ConfigPush { ref version, .. } => {
             let target_version = *version;
+
+            // Already at (or ahead of) this version: acknowledge without
+            // re-applying. The master always pushes on connect.
+            if target_version <= tracker.get_version() {
+                let ack = HaMessage::Ack {
+                    version: tracker.get_version(),
+                    applied: true,
+                    error: None,
+                };
+                ws_stream
+                    .send(WsMessage::Text(ack.to_json()?.into()))
+                    .await
+                    .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                return Ok(());
+            }
+
             tracker.set_state(SlaveState::Applying);
 
             let pubkey = master_pubkey.ok_or_else(|| {

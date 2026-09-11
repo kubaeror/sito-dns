@@ -1,8 +1,8 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v1.0.0**.
+This document is the exhaustive configuration reference for **sito v1.4.0**.
 
-`sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment variables can override any setting using the `DNSD__<SECTION>__<KEY>` naming convention (double underscores between hierarchy levels).
+`sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. Only `DNSD_SECRET_<NAME>` variables are used to resolve HA secret placeholders.
 
 > [!NOTE]
 > Configuration persistence round-trips modeled fields via the `Config` schema. Unrecognized or unmodeled keys and comments are omitted when the configuration is saved back to disk by the web console or API.
@@ -22,19 +22,19 @@ This document is the exhaustive configuration reference for **sito v1.0.0**.
 ```toml
 [server]
 role = "master"                        # "master" | "slave"
-instance_name = "sito-node-01"         # Unique identifier in cluster
+instance_name = "sito-main"            # Unique identifier in cluster
 data_dir = "/var/lib/sito"             # Base path for database, caches, and state
 log_level = "info"                     # "trace" | "debug" | "info" | "warn" | "error"
-log_format = "pretty"                  # "pretty" | "json"
+log_format = "json"                    # "pretty" | "json"
 ```
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `role` | string | `"master"` | HA cluster role: `"master"` (reads/writes, replicates state) or `"slave"` (read-only replica). |
-| `instance_name` | string | `"sito-node-01"` | Name of this server instance, reported in metrics and logs. |
-| `data_dir` | string | `"/var/lib/sito"` | Directory where persistent SQLite DB (`sito.db`), list caches, and TLS state are stored. |
+| `instance_name` | string | `"sito-main"` | Name of this server instance, reported in metrics and logs. |
+| `data_dir` | string | `"/var/lib/sito"` | Directory where the persistent SQLite DB (`stats.db`), list caches, and TLS state are stored. |
 | `log_level` | string | `"info"` | Logging verbosity: `"trace"`, `"debug"`, `"info"`, `"warn"`, or `"error"`. |
-| `log_format` | string | `"pretty"` | Formatting for stdout logs: `"pretty"` (human readable with colors) or `"json"` (structured). |
+| `log_format` | string | `"json"` | Formatting for stdout logs: `"pretty"` (human readable with colors) or `"json"` (structured). |
 
 ---
 
@@ -46,7 +46,7 @@ bind = ["0.0.0.0", "::"]
 port = 53
 dot_port = 853
 doh_port = 443
-doq_port = 853
+doq_port = 0
 doh3_port = 443
 doh_dedicated_hostname = "dns.example.com"
 dot_padding = false
@@ -58,12 +58,12 @@ max_tcp_connections = 256
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `bind` | array of strings | `["0.0.0.0", "::"]` | IP addresses to bind listeners on. |
-| `port` | integer | `53` | Standard UDP and TCP DNS listener port. `0` disables plain UDP/TCP. |
+| `port` | integer | `53` | Standard UDP and TCP DNS listener port (must be greater than 0). |
 | `dot_port` | integer | `853` | DNS-over-TLS (DoT) listener port. `0` disables DoT. |
 | `doh_port` | integer | `443` | DNS-over-HTTPS (DoH, HTTP/1.1 and HTTP/2) port. `0` disables DoH. |
-| `doq_port` | integer | `853` | DNS-over-QUIC (DoQ) UDP port. `0` disables DoQ. |
+| `doq_port` | integer | `0` | DNS-over-QUIC (DoQ) UDP port. `0` (default) disables DoQ; set `853` only when it does not conflict with DoT. |
 | `doh3_port` | integer | `443` | DNS-over-HTTP/3 (DoH3) UDP port. `0` disables DoH3. |
-| `doh_dedicated_hostname` | string | `""` | Optional hostname restriction for DoH virtual hosts. Empty string allows any Host/SNI. |
+| `doh_dedicated_hostname` | string | `""` | Reserved for future DoH virtual-host routing; currently **not enforced**. |
 | `dot_padding` | boolean | `false` | RFC 7830/8467 padding on DoT responses to mitigate traffic analysis. |
 | `edns_udp_size` | integer | `1232` | Maximum EDNS0 UDP buffer size (1232 bytes prevents IPv6 fragmentation). |
 | `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual client IP. `0` disables rate limiting. |
@@ -107,9 +107,9 @@ ntp = ["local.internal"]
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `mode` | string | `"validate"` | Validation mode (`"validate"`, `"log_only"`, or `"off"`). |
-| `validate` | boolean | `true` | Enable RFC 4035 cryptographic DNSSEC validation against root trust anchors. |
-| `ntp` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation. |
+| `mode` | string | `"validate"` | Validation mode. Accepted: `"validate"`/`"strict"` (bogus = SERVFAIL), `"log_only"`/`"log-only"`/`"permissive"`/`"log_fail"` (log and clear AD), `"off"`/`"disabled"`. |
+| `validate` | boolean | `true` | Enable DNSSEC processing. **Note:** validation currently verifies RRSIGs against configured trust anchors only; full DS/DNSKEY chain walking is not yet implemented, so responses from zones chain-of-trust-validated beyond the direct anchor are reported `indeterminate`. |
+| `ntp` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (`ntp` in config, RFC 7646 style trust-anchor exemptions). |
 
 ---
 
@@ -128,7 +128,7 @@ key = "/etc/sito/wildcard_key.pem"
 [acme]
 enabled = false
 email = "admin@example.com"
-domain = "dns.example.com"
+domains = ["dns.example.com"]
 staging = false
 ```
 
@@ -139,7 +139,7 @@ staging = false
 | `tls.sni_certs` | array of tables | `[]` | Additional certificate/key pairs mapped to specific SNI hostnames. |
 | `acme.enabled` | boolean | `false` | Enables automated certificate issuance via Let's Encrypt / ACME. |
 | `acme.email` | string | `""` | Contact email address for ACME registration. |
-| `acme.domain` | string | `""` | Primary domain name for ACME TLS-ALPN-01 / HTTP-01 certificates. |
+| `acme.domains` | array of strings | `[]` | Domain names for ACME TLS-ALPN-01 / HTTP-01 certificates. |
 | `acme.staging` | boolean | `false` | When `true`, uses Let's Encrypt Staging API to avoid rate limits during testing. |
 
 ---
@@ -218,22 +218,28 @@ enabled = true
 name = "kids-tablet"
 ids = ["192.168.1.55", "tablet.dns.example.com", "dc:a6:32:11:22:33"]
 group = "kids"
-safe_search = true
-parental_control = true
-blocked_services = ["tiktok", "youtube"]
+ignore_query_log = false
+trusted = false
 
-[[clients.groups]]
-name = "kids"
-filtering_enabled = true
+[clients.groups.kids]
+filtering = true
+lists = ["OISD"]
+custom_rules = ["||fortnite.com^$important"]
 safe_search = true
-parental_control = true
-blocked_categories = ["adult", "gambling"]
+parental = true
+parental_categories = ["adult", "gambling"]
+schedule_enabled = true
+schedule = "0 0 15-21 * * MON-FRI"
+
+[[clients.groups.kids.blocked_services]]
+service = "tiktok"
+schedule = "0 0 15-21 * * MON-FRI"
 ```
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `entries` | array of tables | `[]` | Client definitions mapping IP addresses, CIDR subnets, MAC addresses, or DoT/DoH ClientIDs to groups. |
-| `groups` | array of tables | `[]` | Policy groups with distinct filtering, safe search, parental control, and service schedules. |
+| `entries` | array of tables | `[]` | Client definitions mapping IP addresses, Hostnames (DoT SNI / DoH ClientID) and MAC addresses to groups. Available entry keys: `name`, `ids`, `group`, `ignore_query_log`, `ignore_stats`, `use_global_upstreams`, `upstreams`, `trusted`. |
+| `groups` | table (map of name → group) | `{}` | Policy groups keyed by group name, e.g. `[clients.groups.kids]`, with optional `[[clients.groups.<name>.blocked_services]]` entries. |
 
 ---
 
@@ -261,10 +267,11 @@ exception_clients = ["admin-laptop"]
 
 ```toml
 [web]
+enabled = true
 port = 8080
-bind = ["0.0.0.0"]
-https = false
-trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+bind = "0.0.0.0"          # single IP address, not an array
+metrics_auth = true
+trusted_proxies = ["10.0.0.1", "192.168.1.10"]   # individual proxy IPs
 
 [auth]
 session_ttl_hours = 24
@@ -273,10 +280,12 @@ login_rate_limit = 5
 
 | Key | Type | Default | Description |
 |---|---|---|---|
+| `web.enabled` | boolean | `true` | Enable the web dashboard and REST API. |
 | `web.port` | integer | `8080` | Port for the Web Dashboard and REST API (`/api/v1/`). |
-| `web.bind` | array of strings | `["0.0.0.0"]` | Bind addresses for web server. |
-| `web.https` | boolean | `false` | When `true`, serves Web UI exclusively over HTTPS using `tls.cert`/`tls.key`. |
-| `web.trusted_proxies`| array of CIDRs | `[]` | CIDR blocks trusted to forward client IP headers (`X-Forwarded-For`). |
+| `web.bind` | string (IP address) | `"0.0.0.0"` | Bind address for the web server. |
+| `web.metrics_auth` | boolean | `true` | Require authentication (token or session) for `/metrics`. |
+| `web.trusted_proxies`| array of IP addresses | `[]` | Individual proxy IPs trusted to supply `X-Forwarded-For`/`X-Forwarded-Proto` (CIDR is **not** supported here). |
+| `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required. |
 | `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required. |
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
 
@@ -286,18 +295,19 @@ login_rate_limit = 5
 
 ```toml
 [stats]
-query_log_enabled = true
-query_log_retention_days = 90
-anonymize_client_ip = false
-prometheus_enabled = true
+# `retention_days` also accepts the legacy alias `query_log_retention_days`
+retention_days = 90
+
+[privacy]
+anonymize_querylog = false
 ```
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `query_log_enabled` | boolean | `true` | Enable recording queries to persistent SQLite storage. |
-| `query_log_retention_days` | integer | `90` | Days to keep detailed per-query records before automated pruning and hourly aggregation. |
-| `anonymize_client_ip` | boolean | `false` | Mask client IPs (/24 for IPv4, /56 for IPv6) before persisting to database for privacy. |
-| `prometheus_enabled` | boolean | `true` | Expose Prometheus metrics on `/metrics` endpoint. |
+| `stats.retention_days` | integer | `90` | Days to keep detailed per-query records before automated pruning and hourly aggregation (alias: `query_log_retention_days`). |
+| `privacy.anonymize_querylog` | boolean | `false` | Mask client IPs (/24 for IPv4, /56 for IPv6) before persisting to database and before live-tail broadcast. |
+
+> Query logging is always enabled when `[stats]` is present; Prometheus metrics are always exposed on `/metrics` and protected according to `web.metrics_auth`.
 
 ---
 

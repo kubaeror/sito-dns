@@ -1,5 +1,6 @@
 //! In-memory DNS cache implementation using moka with weighted byte sizing.
 
+use arc_swap::ArcSwap;
 use moka::future::Cache;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -16,7 +17,7 @@ use crate::key::CacheKey;
 /// High-performance concurrent DNS response cache.
 pub struct DnsCache {
     cache: Cache<CacheKey, CacheEntry>,
-    config: CacheConfig,
+    config: ArcSwap<CacheConfig>,
 }
 
 impl DnsCache {
@@ -29,12 +30,22 @@ impl DnsCache {
             .max_capacity(max_capacity_bytes)
             .build();
 
-        Self { cache, config }
+        Self {
+            cache,
+            config: ArcSwap::new(Arc::new(config)),
+        }
+    }
+
+    /// Applies hot-reloaded cache settings. Note: `size_mb` changes require a
+    /// restart because the underlying capacity cannot be resized at runtime.
+    pub fn update_config(&self, config: CacheConfig) {
+        self.config.store(Arc::new(config));
     }
 
     /// Retrieve a response for the given query from cache, adjusting TTLs according to elapsed time.
     pub async fn get(&self, name: &Name, qtype: RecordType, qclass: DNSClass) -> Option<Message> {
-        if !self.config.enabled {
+        let config = self.config.load();
+        if !config.enabled {
             return None;
         }
 
@@ -44,7 +55,7 @@ impl DnsCache {
         let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
         let max_stale_secs = entry
             .max_lifespan_secs
-            .saturating_add(self.config.serve_stale_hours * 3600);
+            .saturating_add(config.serve_stale_hours.saturating_mul(3600));
 
         if elapsed_secs >= max_stale_secs {
             trace!(
@@ -105,7 +116,8 @@ impl DnsCache {
     ) -> Option<Message> {
         const STALE_SERVE_TTL: u32 = 30;
 
-        if !self.config.enabled || self.config.serve_stale_hours == 0 {
+        let config = self.config.load();
+        if !config.enabled || config.serve_stale_hours == 0 {
             return None;
         }
 
@@ -115,7 +127,7 @@ impl DnsCache {
         let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
         let max_stale_secs = entry
             .max_lifespan_secs
-            .saturating_add(self.config.serve_stale_hours * 3600);
+            .saturating_add(config.serve_stale_hours.saturating_mul(3600));
 
         if elapsed_secs >= max_stale_secs {
             self.cache.invalidate(&key).await;
@@ -145,7 +157,8 @@ impl DnsCache {
     /// Check whether a cached entry is eligible for background prefetch
     /// (prefetch enabled, hits >= 2, and remaining TTL <= 10% of lifespan or <= 10 seconds).
     pub async fn should_prefetch(&self, name: &Name, qtype: RecordType, qclass: DNSClass) -> bool {
-        if !self.config.enabled || !self.config.prefetch {
+        let config = self.config.load();
+        if !config.enabled || !config.prefetch {
             return false;
         }
 
@@ -163,7 +176,8 @@ impl DnsCache {
 
     /// Insert a response into the cache, calculating clamped TTLs and entry weight.
     pub async fn insert(&self, query: &Message, response: &Message) {
-        if !self.config.enabled {
+        let config = self.config.load();
+        if !config.enabled {
             return;
         }
 
@@ -198,38 +212,36 @@ impl DnsCache {
             }
 
             let raw_negative_ttl = soa_ttl.unwrap_or(300);
-            let clamped_ttl = raw_negative_ttl.clamp(
-                self.config.min_ttl,
-                self.config.negative_ttl_max.max(self.config.min_ttl),
-            );
+            let clamped_ttl =
+                raw_negative_ttl.clamp(config.min_ttl, config.negative_ttl_max.max(config.min_ttl));
             for auth in &response.authorities {
                 authority_ttls.push(auth.ttl.min(clamped_ttl));
             }
             clamped_ttl
         } else {
             let mut min_record_ttl = u32::MAX;
-            let effective_max_ttl = self.config.max_ttl.max(self.config.min_ttl);
+            let effective_max_ttl = config.max_ttl.max(config.min_ttl);
 
             for ans in &response.answers {
-                let clamped = ans.ttl.clamp(self.config.min_ttl, effective_max_ttl);
+                let clamped = ans.ttl.clamp(config.min_ttl, effective_max_ttl);
                 answer_ttls.push(clamped);
                 min_record_ttl = min_record_ttl.min(clamped);
             }
 
             for auth in &response.authorities {
-                let clamped = auth.ttl.clamp(self.config.min_ttl, effective_max_ttl);
+                let clamped = auth.ttl.clamp(config.min_ttl, effective_max_ttl);
                 authority_ttls.push(clamped);
                 min_record_ttl = min_record_ttl.min(clamped);
             }
 
             for add in &response.additionals {
-                let clamped = add.ttl.clamp(self.config.min_ttl, effective_max_ttl);
+                let clamped = add.ttl.clamp(config.min_ttl, effective_max_ttl);
                 additional_ttls.push(clamped);
                 min_record_ttl = min_record_ttl.min(clamped);
             }
 
             if min_record_ttl == u32::MAX {
-                self.config.min_ttl
+                config.min_ttl
             } else {
                 min_record_ttl
             }

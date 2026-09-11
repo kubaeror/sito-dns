@@ -33,6 +33,22 @@ pub enum LoginResult {
 struct PartialAuth {
     username: String,
     expires_at: Instant,
+    failed_attempts: u32,
+}
+
+/// Outcome of the second login phase (`POST /auth/totp/verify`).
+#[derive(Debug, Clone)]
+pub enum TotpVerifyResult {
+    /// TOTP verified and a session was created.
+    Success(Session),
+    /// Invalid code (partial token remains valid until the attempt limit is hit).
+    Invalid,
+    /// Partial token is missing, expired, or was consumed.
+    TokenExpired,
+    /// Account is locked out.
+    LockedOut { remaining_seconds: u64 },
+    /// IP rate limit exceeded.
+    RateLimited,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +64,8 @@ pub const MAX_SESSIONS: usize = 10_000;
 pub const MAX_PENDING_TOTP: usize = 10_000;
 pub const MAX_PARTIAL_TOKENS: usize = 10_000;
 pub const PENDING_TOTP_TTL: Duration = Duration::from_secs(600); // 10 minutes
+/// Maximum wrong TOTP codes per partial token before it is invalidated.
+pub const MAX_TOTP_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone)]
 struct PendingTotp {
@@ -70,6 +88,10 @@ pub enum AuthStorageError {
         "Users file '{path}' exists but contains no user accounts. Refusing to start to prevent unauthorized bootstrap; use `sito reset-admin` to recover."
     )]
     EmptyUsersFile { path: PathBuf },
+    #[error(
+        "Users file '{path}' is missing while a configuration file exists. Refusing to start to prevent unauthorized bootstrap; run `sito reset-admin` to recover, or remove the configuration to re-run the setup wizard."
+    )]
+    MissingUsersFile { path: PathBuf },
     #[error("I/O error accessing users file '{path}': {source}")]
     Io {
         path: PathBuf,
@@ -128,10 +150,36 @@ impl AuthManager {
         )
     }
 
+    /// Like [`with_storage`], but fails when the users file is missing and
+    /// `bootstrap_allowed` is false. Used by the production server so that a
+    /// deleted/lost `users.toml` cannot silently re-enable the default admin.
+    pub fn with_storage_checked(
+        data_dir: impl AsRef<Path>,
+        session_ttl_hours: u64,
+        login_rate_limit: usize,
+        bootstrap_allowed: bool,
+    ) -> Result<Self, AuthStorageError> {
+        Self::with_config_and_storage_checked(
+            Some(data_dir.as_ref().join("users.toml")),
+            session_ttl_hours,
+            login_rate_limit,
+            bootstrap_allowed,
+        )
+    }
+
     pub fn with_config_and_storage(
         users_path: Option<PathBuf>,
         session_ttl_hours: u64,
         login_rate_limit: usize,
+    ) -> Result<Self, AuthStorageError> {
+        Self::with_config_and_storage_checked(users_path, session_ttl_hours, login_rate_limit, true)
+    }
+
+    pub fn with_config_and_storage_checked(
+        users_path: Option<PathBuf>,
+        session_ttl_hours: u64,
+        login_rate_limit: usize,
+        bootstrap_allowed: bool,
     ) -> Result<Self, AuthStorageError> {
         let secs = session_ttl_hours.saturating_mul(3600);
         let session_ttl_secs = i64::try_from(secs).unwrap_or(DEFAULT_SESSION_TTL_SECS);
@@ -227,7 +275,15 @@ impl AuthManager {
                 return Ok(mgr);
             }
 
-            // If file does not exist, initialize bootstrap admin and persist
+            // If file does not exist, initialize bootstrap admin and persist —
+            // but only while the deployment is still in first-run / setup mode.
+            if !bootstrap_allowed {
+                tracing::error!(
+                    path = %path.display(),
+                    "Users file is missing while a configuration exists; refusing to start"
+                );
+                return Err(AuthStorageError::MissingUsersFile { path: path.clone() });
+            }
             mgr.create_user_internal("admin", "adminadmin", Role::Admin);
             mgr.save_users();
         } else {
@@ -393,7 +449,7 @@ impl AuthManager {
         self.save_users();
     }
 
-    /// Updates password for an existing user.
+    /// Updates password for an existing user and invalidates their sessions.
     pub fn update_user_password(&self, username: &str, password: &str) -> bool {
         if let Ok(hash) = hash_password(password) {
             let mut users = self.users.lock().unwrap();
@@ -401,10 +457,19 @@ impl AuthManager {
                 user.password_hash = hash;
                 drop(users);
                 self.save_users();
+                self.purge_user_sessions(username);
                 return true;
             }
         }
         false
+    }
+
+    /// Removes all active sessions belonging to a user (used after credential changes).
+    pub fn purge_user_sessions(&self, username: &str) {
+        self.sessions
+            .lock()
+            .unwrap()
+            .retain(|_, session| session.username != username);
     }
 
     fn insert_session(&self, session: Session) {
@@ -488,6 +553,7 @@ impl AuthManager {
                 PartialAuth {
                     username: username.to_string(),
                     expires_at: now + Duration::from_secs(300), // 5 minutes
+                    failed_attempts: 0,
                 },
             );
 
@@ -502,21 +568,50 @@ impl AuthManager {
     }
 
     /// Second login phase: verify TOTP code with partial token (`POST /auth/totp/verify`).
-    pub fn verify_totp(&self, partial_token: &str, code: &str) -> Option<Session> {
+    pub fn verify_totp(
+        &self,
+        partial_token: &str,
+        code: &str,
+        client_ip: &str,
+    ) -> TotpVerifyResult {
+        // 1. IP rate limiting (mirrors the first login phase)
+        if !client_ip.is_empty()
+            && !self
+                .lockout
+                .check_ip_rate_limit(client_ip, self.login_rate_limit)
+        {
+            return TotpVerifyResult::RateLimited;
+        }
+
+        // 2. Resolve and validate the partial token
         let (username, is_expired) = {
             let partials = self.partial_tokens.lock().unwrap();
-            let auth = partials.get(partial_token)?;
+            let Some(auth) = partials.get(partial_token) else {
+                return TotpVerifyResult::TokenExpired;
+            };
             (auth.username.clone(), Instant::now() >= auth.expires_at)
         };
 
         if is_expired {
             self.partial_tokens.lock().unwrap().remove(partial_token);
-            return None;
+            return TotpVerifyResult::TokenExpired;
+        }
+
+        // 3. Account lockout check
+        if let Some(secs) = self.lockout.check_lockout(&username) {
+            return TotpVerifyResult::LockedOut {
+                remaining_seconds: secs,
+            };
         }
 
         let mut users = self.users.lock().unwrap();
-        let user = users.get_mut(&username)?;
-        let totp = user.totp.as_mut()?;
+        let Some(user) = users.get_mut(&username) else {
+            self.partial_tokens.lock().unwrap().remove(partial_token);
+            return TotpVerifyResult::TokenExpired;
+        };
+        let Some(totp) = user.totp.as_mut() else {
+            return TotpVerifyResult::Invalid;
+        };
 
         if totp.verify(code, &username, "sito") {
             // Success: consume partial token, reset lockout, generate session
@@ -529,10 +624,30 @@ impl AuthManager {
 
             let session = Session::new(&username, role, self.session_ttl_secs);
             self.insert_session(session.clone());
-            Some(session)
+            TotpVerifyResult::Success(session)
         } else {
-            self.lockout.record_failure(&username);
-            None
+            // Failure: count it against both the partial token and the account lockout.
+            let (locked, _rem) = self.lockout.record_failure(&username);
+            let remaining_attempts = {
+                let mut partials = self.partial_tokens.lock().unwrap();
+                if let Some(auth) = partials.get_mut(partial_token) {
+                    auth.failed_attempts += 1;
+                    MAX_TOTP_ATTEMPTS.saturating_sub(auth.failed_attempts)
+                } else {
+                    0
+                }
+            };
+            if locked {
+                // Account locked: consume the partial token as well.
+                self.partial_tokens.lock().unwrap().remove(partial_token);
+                return TotpVerifyResult::LockedOut {
+                    remaining_seconds: 15 * 60,
+                };
+            }
+            if remaining_attempts == 0 {
+                self.partial_tokens.lock().unwrap().remove(partial_token);
+            }
+            TotpVerifyResult::Invalid
         }
     }
 
@@ -577,19 +692,22 @@ impl AuthManager {
                 user.totp = Some(item.config);
                 drop(users);
                 self.save_users();
+                // Changing the second factor invalidates existing sessions.
+                self.purge_user_sessions(username);
                 return true;
             }
         }
         false
     }
 
-    /// Disables TOTP 2FA for a user.
+    /// Disables TOTP 2FA for a user and invalidates their sessions.
     pub fn disable_totp(&self, username: &str) -> bool {
         let mut users = self.users.lock().unwrap();
         if let Some(user) = users.get_mut(username) {
             user.totp = None;
             drop(users);
             self.save_users();
+            self.purge_user_sessions(username);
             true
         } else {
             false
@@ -787,14 +905,56 @@ mod tests {
         match mgr.login("admin", "adminadmin", "127.0.0.1") {
             LoginResult::TotpRequired { partial_token } => {
                 // Invalid code fails
-                assert!(mgr.verify_totp(&partial_token, "000000").is_none());
+                assert!(matches!(
+                    mgr.verify_totp(&partial_token, "000000", "127.0.0.1"),
+                    TotpVerifyResult::Invalid
+                ));
                 // Valid backup code succeeds
-                let session = mgr.verify_totp(&partial_token, &setup.backup_codes[1]);
-                assert!(session.is_some());
-                assert_eq!(session.unwrap().role, Role::Admin);
+                let session =
+                    match mgr.verify_totp(&partial_token, &setup.backup_codes[1], "127.0.0.1") {
+                        TotpVerifyResult::Success(session) => session,
+                        other => panic!("expected TOTP success, got {other:?}"),
+                    };
+                assert_eq!(session.role, Role::Admin);
             }
             _ => panic!("Expected TOTP required"),
         }
+    }
+
+    #[test]
+    fn test_totp_bruteforce_attempt_limit() {
+        // High IP rate limit so the per-account lockout/attempt cap is exercised.
+        let mgr = AuthManager::with_config(24, 1000);
+        let setup = mgr.init_totp_setup("admin").expect("setup");
+        assert!(mgr.confirm_totp_setup("admin", &setup.backup_codes[0]));
+
+        let LoginResult::TotpRequired { partial_token } =
+            mgr.login("admin", "adminadmin", "127.0.0.1")
+        else {
+            panic!("Expected TOTP required");
+        };
+
+        let mut saw_terminal = false;
+        for _ in 0..MAX_TOTP_ATTEMPTS {
+            match mgr.verify_totp(&partial_token, "000000", "127.0.0.1") {
+                TotpVerifyResult::Invalid => {}
+                TotpVerifyResult::LockedOut { .. } => {
+                    saw_terminal = true;
+                    break;
+                }
+                other => panic!("unexpected TOTP result: {other:?}"),
+            }
+        }
+        assert!(
+            saw_terminal,
+            "repeated wrong TOTP codes must eventually lock the account"
+        );
+
+        // The partial token is consumed and cannot be used with a valid code.
+        assert!(matches!(
+            mgr.verify_totp(&partial_token, &setup.backup_codes[1], "127.0.0.1"),
+            TotpVerifyResult::TokenExpired | TotpVerifyResult::LockedOut { .. }
+        ));
     }
 
     #[test]

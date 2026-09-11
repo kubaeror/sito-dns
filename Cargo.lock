@@ -3071,6 +3071,7 @@ dependencies = [
 name = "sito-cache"
 version = "1.4.0"
 dependencies = [
+ "arc-swap",
  "moka",
  "sito-core",
  "sito-proto",
@@ -3163,6 +3164,7 @@ dependencies = [
  "sito-filter",
  "sito-rewrites",
  "sito-stats",
+ "subtle",
  "thiserror",
  "tokio",
  "tokio-rustls",
