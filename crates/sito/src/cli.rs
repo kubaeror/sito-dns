@@ -380,7 +380,12 @@ pub fn run_ha_gen_certs(dir: &Path, master: bool, slave: bool) -> Result<(), any
 }
 
 /// Executes the `update` subcommand.
-pub async fn run_update(check: bool, force: bool, repo: Option<&str>) -> Result<(), anyhow::Error> {
+pub async fn run_update(
+    check: bool,
+    force: bool,
+    repo: Option<&str>,
+    config_path: &Path,
+) -> Result<(), anyhow::Error> {
     println!("Checking for updates...");
     let info = sito_api::updater::check_for_update(repo)
         .await
@@ -412,7 +417,14 @@ pub async fn run_update(check: bool, force: bool, repo: Option<&str>) -> Result<
     }
 
     println!("\nApplying update to v{}...", info.latest_version);
-    let msg = sito_api::updater::apply_update(repo, force)
+    let require_signature = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|content| Config::from_toml_str(&content).ok())
+        .is_some_and(|cfg| cfg.server.update_require_signature);
+    if require_signature {
+        println!("Signature verification is required by configuration.");
+    }
+    let msg = sito_api::updater::apply_update(repo, force, require_signature)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to apply update: {e}"))?;
 

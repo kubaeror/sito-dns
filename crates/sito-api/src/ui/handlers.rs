@@ -1425,7 +1425,8 @@ pub async fn system_update_apply_handler(
         ).into_response();
     }
 
-    match crate::updater::apply_update(None, false).await {
+    let require_signature = ctx.config.load().server.update_require_signature;
+    match crate::updater::apply_update(None, false, require_signature).await {
         Ok(msg) => axum::response::Html(format!(
             r#"<div style="padding: 14px; background: rgba(34, 197, 94, 0.1); border: 1px solid var(--success); border-radius: 6px;">
                 <div style="font-weight: 600; color: var(--success); margin-bottom: 4px;">Update Successful!</div>

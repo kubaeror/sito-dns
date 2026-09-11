@@ -137,6 +137,18 @@ else
         fi
     fi
 
+    # Optional strict signature enforcement
+    if [ "${SITO_REQUIRE_SIGNATURE:-0}" = "1" ]; then
+        if [ "${HAVE_SIG}" -eq 0 ]; then
+            echo "Error: SITO_REQUIRE_SIGNATURE=1 but no cosign signature artifacts were found." >&2
+            exit 1
+        fi
+        if ! command -v cosign >/dev/null 2>&1; then
+            echo "Error: SITO_REQUIRE_SIGNATURE=1 but 'cosign' is not installed." >&2
+            exit 1
+        fi
+    fi
+
     if [ "${HAVE_SIG}" -eq 1 ] && command -v cosign >/dev/null 2>&1; then
         echo "Verifying cosign keyless signature..."
         if cosign verify-blob \

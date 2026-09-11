@@ -3035,6 +3035,7 @@ dependencies = [
  "arc-swap",
  "argon2",
  "askama",
+ "async-trait",
  "axum",
  "blake3",
  "chrono",

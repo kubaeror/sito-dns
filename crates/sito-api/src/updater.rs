@@ -35,6 +35,12 @@ pub enum UpdateError {
     ChecksumMismatch { expected: String, actual: String },
     #[error("Checksum file not found in release assets")]
     ChecksumNotFound,
+    #[error("Release signature is required but no .sig/.pem assets were found")]
+    SignatureMissing,
+    #[error("Release signature verification failed: {0}")]
+    SignatureInvalid(String),
+    #[error("Release signature is required but no verifier is available: {0}")]
+    SignatureVerifierUnavailable(String),
     #[error("I/O error during update: {0}")]
     Io(#[from] std::io::Error),
     #[error("Archive extraction error: {0}")]
@@ -267,7 +273,153 @@ pub fn verify_archive_checksum(
 /// Maximum accepted release archive size (defense against oversized downloads).
 const MAX_UPDATE_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Returns true when the URL points at an expected GitHub release host.
+/// Maximum accepted signature/certificate asset size.
+const MAX_SIGNATURE_ASSET_BYTES: u64 = 1024 * 1024;
+
+/// Outcome of release signature verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureOutcome {
+    /// A signature was present and verified successfully.
+    Verified,
+    /// No signature was present (or no verifier is installed) and the policy
+    /// does not require one; checksum verification still applies.
+    UnsignedAllowed,
+}
+
+/// Verifies detached release signatures.
+#[async_trait::async_trait]
+pub trait SignatureVerifier: Send + Sync {
+    /// Returns true when the underlying verification tooling is available.
+    fn is_available(&self) -> bool;
+
+    /// Verifies `artifact` against a detached `signature` and `certificate`.
+    async fn verify(
+        &self,
+        artifact: &Path,
+        signature: &Path,
+        certificate: &Path,
+    ) -> Result<(), UpdateError>;
+}
+
+/// Cosign keyless signature verifier shelling out to the `cosign` binary.
+pub struct CosignVerifier {
+    identity_regexp: String,
+}
+
+impl CosignVerifier {
+    /// Creates a verifier that requires the signature identity to belong to the
+    /// given GitHub repository's release workflow.
+    pub fn new(repo: &str) -> Self {
+        Self {
+            identity_regexp: format!("https://github.com/{repo}/.*"),
+        }
+    }
+
+    fn binary() -> Option<std::path::PathBuf> {
+        for candidate in ["/usr/bin/cosign", "/usr/local/bin/cosign"] {
+            let path = std::path::PathBuf::from(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        // Fall back to PATH lookup.
+        let path_var = std::env::var_os("PATH")?;
+        std::env::split_paths(&path_var)
+            .map(|dir| dir.join("cosign"))
+            .find(|p| p.is_file())
+    }
+}
+
+#[async_trait::async_trait]
+impl SignatureVerifier for CosignVerifier {
+    fn is_available(&self) -> bool {
+        Self::binary().is_some()
+    }
+
+    async fn verify(
+        &self,
+        artifact: &Path,
+        signature: &Path,
+        certificate: &Path,
+    ) -> Result<(), UpdateError> {
+        let binary = Self::binary().ok_or_else(|| {
+            UpdateError::SignatureVerifierUnavailable(
+                "cosign binary not found in /usr/bin, /usr/local/bin or PATH".to_string(),
+            )
+        })?;
+
+        let output = tokio::process::Command::new(binary)
+            .arg("verify-blob")
+            .arg("--certificate")
+            .arg(certificate)
+            .arg("--signature")
+            .arg(signature)
+            .arg("--certificate-identity-regexp")
+            .arg(&self.identity_regexp)
+            .arg("--certificate-oidc-issuer")
+            .arg("https://token.actions.githubusercontent.com")
+            .arg(artifact)
+            .output()
+            .await
+            .map_err(|e| UpdateError::SignatureInvalid(format!("failed to execute cosign: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.lines().last().unwrap_or("unknown error");
+            return Err(UpdateError::SignatureInvalid(detail.to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// Locates the detached signature and certificate assets for an archive.
+pub fn find_signature_assets(
+    assets: &[ReleaseAsset],
+    archive_name: &str,
+) -> (Option<ReleaseAsset>, Option<ReleaseAsset>) {
+    let sig_name = format!("{archive_name}.sig");
+    let cert_name = format!("{archive_name}.pem");
+    let signature = assets.iter().find(|a| a.name == sig_name).cloned();
+    let certificate = assets.iter().find(|a| a.name == cert_name).cloned();
+    (signature, certificate)
+}
+
+/// Applies the release signature policy.
+///
+/// * A signature that is present must verify, regardless of `required`.
+/// * If no signature is present (or no verifier is installed), verification is
+///   only skipped when `required` is false; otherwise an error is returned.
+pub async fn verify_release_signature(
+    artifact: &Path,
+    signature: Option<&Path>,
+    certificate: Option<&Path>,
+    required: bool,
+    verifier: &dyn SignatureVerifier,
+) -> Result<SignatureOutcome, UpdateError> {
+    if let (Some(sig), Some(cert)) = (signature, certificate) {
+        if !verifier.is_available() {
+            if required {
+                return Err(UpdateError::SignatureVerifierUnavailable(
+                    "release ships a signature but no verifier is installed".to_string(),
+                ));
+            }
+            tracing::warn!(
+                "Release ships a signature but no verifier is available; relying on SHA-256 checksum only"
+            );
+            return Ok(SignatureOutcome::UnsignedAllowed);
+        }
+        verifier.verify(artifact, sig, cert).await?;
+        tracing::info!("Release signature verified successfully");
+        return Ok(SignatureOutcome::Verified);
+    }
+
+    if required {
+        return Err(UpdateError::SignatureMissing);
+    }
+    tracing::warn!("Release does not ship signature assets; relying on SHA-256 checksum only");
+    Ok(SignatureOutcome::UnsignedAllowed)
+}
+
 fn is_allowed_download_host(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
@@ -279,9 +431,94 @@ fn is_allowed_download_host(url: &str) -> bool {
         || host.ends_with(".githubusercontent.com")
 }
 
-/// Downloads the latest release archive, verifies its SHA-256 checksum, extracts
-/// the binary, and replaces the running executable.
-pub async fn apply_update(repo: Option<&str>, force: bool) -> Result<String, UpdateError> {
+/// Downloads release signature assets (when present) and applies the configured
+/// signature policy to the archive bytes.
+#[allow(clippy::too_many_arguments)]
+async fn apply_signature_policy(
+    client: &reqwest::Client,
+    repo_name: &str,
+    archive: &ReleaseAsset,
+    archive_bytes: &[u8],
+    sig_asset: Option<&ReleaseAsset>,
+    cert_asset: Option<&ReleaseAsset>,
+    required: bool,
+) -> Result<SignatureOutcome, UpdateError> {
+    let verifier = CosignVerifier::new(repo_name);
+
+    let (Some(sig), Some(cert)) = (sig_asset, cert_asset) else {
+        return verify_release_signature(Path::new(&archive.name), None, None, required, &verifier)
+            .await;
+    };
+
+    for asset in [sig, cert] {
+        if asset.size > MAX_SIGNATURE_ASSET_BYTES {
+            return Err(UpdateError::Other(format!(
+                "Signature asset '{}' is unexpectedly large ({} bytes)",
+                asset.name, asset.size
+            )));
+        }
+        if !is_allowed_download_host(&asset.browser_download_url) {
+            return Err(UpdateError::Other(format!(
+                "Signature asset URL '{}' does not point at an allowed GitHub host",
+                asset.browser_download_url
+            )));
+        }
+    }
+
+    debug!(asset = %sig.name, "Downloading release signature");
+    let sig_bytes = client
+        .get(&sig.browser_download_url)
+        .send()
+        .await?
+        .bytes()
+        .await?;
+    let cert_bytes = client
+        .get(&cert.browser_download_url)
+        .send()
+        .await?
+        .bytes()
+        .await?;
+    if sig_bytes.len() as u64 > MAX_SIGNATURE_ASSET_BYTES
+        || cert_bytes.len() as u64 > MAX_SIGNATURE_ASSET_BYTES
+    {
+        return Err(UpdateError::Other(
+            "Signature/certificate asset exceeded the maximum size".to_string(),
+        ));
+    }
+
+    // cosign needs real files; use a unique temporary directory and always clean up.
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito-update-verify-{}", rand::random::<u64>()));
+    tokio::fs::create_dir_all(&temp_dir).await?;
+    let artifact_path = temp_dir.join(&archive.name);
+    let sig_path = temp_dir.join(format!("{}.sig", archive.name));
+    let cert_path = temp_dir.join(format!("{}.pem", archive.name));
+
+    tokio::fs::write(&artifact_path, archive_bytes).await?;
+    tokio::fs::write(&sig_path, &sig_bytes).await?;
+    tokio::fs::write(&cert_path, &cert_bytes).await?;
+
+    let result = verify_release_signature(
+        &artifact_path,
+        Some(&sig_path),
+        Some(&cert_path),
+        required,
+        &verifier,
+    )
+    .await;
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    result
+}
+
+/// Downloads the latest release archive, verifies the release signature (when
+/// present) and SHA-256 checksum, extracts the binary, and replaces the running
+/// executable.
+pub async fn apply_update(
+    repo: Option<&str>,
+    force: bool,
+    require_signature: bool,
+) -> Result<String, UpdateError> {
     if is_running_in_docker() {
         return Err(UpdateError::DockerEnvironment(
             "In-app binary update is disabled inside Docker. Use container image management."
@@ -320,37 +557,32 @@ pub async fn apply_update(repo: Option<&str>, force: bool) -> Result<String, Upd
         .ok_or_else(|| UpdateError::Parse("Release payload has no assets".to_string()))?;
 
     let target = current_target_triple();
+    let assets: Vec<ReleaseAsset> = assets_arr
+        .iter()
+        .filter_map(|asset| {
+            Some(ReleaseAsset {
+                name: asset["name"].as_str()?.to_string(),
+                browser_download_url: asset["browser_download_url"].as_str()?.to_string(),
+                size: asset["size"].as_u64().unwrap_or(0),
+            })
+        })
+        .collect();
 
     // 1. Locate binary archive asset
-    let mut archive_asset: Option<ReleaseAsset> = None;
-    let mut sha256_asset: Option<ReleaseAsset> = None;
+    let archive = assets
+        .iter()
+        .find(|a| {
+            (a.name.contains(target) || a.name.ends_with(&format!("{target}.tar.gz")))
+                && a.name.ends_with(".tar.gz")
+        })
+        .cloned()
+        .ok_or_else(|| UpdateError::NoCompatibleAsset(target.to_string()))?;
 
-    for asset in assets_arr {
-        let name = asset["name"].as_str().unwrap_or("");
-        let download_url = asset["browser_download_url"].as_str().unwrap_or("");
-        let size = asset["size"].as_u64().unwrap_or(0);
-
-        if (name.contains(target) || name.ends_with(&format!("{target}.tar.gz")))
-            && name.ends_with(".tar.gz")
-        {
-            archive_asset = Some(ReleaseAsset {
-                name: name.to_string(),
-                browser_download_url: download_url.to_string(),
-                size,
-            });
-        }
-
-        if name == "SHA256SUMS" || name.ends_with(".tar.gz.sha256") {
-            sha256_asset = Some(ReleaseAsset {
-                name: name.to_string(),
-                browser_download_url: download_url.to_string(),
-                size,
-            });
-        }
-    }
-
-    let archive =
-        archive_asset.ok_or_else(|| UpdateError::NoCompatibleAsset(target.to_string()))?;
+    let sha_asset = assets
+        .iter()
+        .find(|a| a.name == "SHA256SUMS" || a.name.ends_with(".tar.gz.sha256"))
+        .cloned()
+        .ok_or(UpdateError::ChecksumNotFound)?;
 
     if archive.size > MAX_UPDATE_ARCHIVE_BYTES {
         return Err(UpdateError::Other(format!(
@@ -364,9 +596,6 @@ pub async fn apply_update(repo: Option<&str>, force: bool) -> Result<String, Upd
             archive.browser_download_url
         )));
     }
-
-    // 2. Compute SHA256 and hard-verify checksum
-    let sha_asset = sha256_asset.ok_or_else(|| UpdateError::ChecksumNotFound)?;
     if !is_allowed_download_host(&sha_asset.browser_download_url) {
         return Err(UpdateError::Other(format!(
             "Checksum asset URL '{}' does not point at an allowed GitHub host",
@@ -388,6 +617,20 @@ pub async fn apply_update(repo: Option<&str>, force: bool) -> Result<String, Upd
         ));
     }
 
+    // 2. Release signature policy (present signatures must always verify)
+    let (sig_asset, cert_asset) = find_signature_assets(&assets, &archive.name);
+    apply_signature_policy(
+        &client,
+        repo_name,
+        &archive,
+        archive_bytes.as_ref(),
+        sig_asset.as_ref(),
+        cert_asset.as_ref(),
+        require_signature,
+    )
+    .await?;
+
+    // 3. Verify SHA-256 checksum
     debug!(asset = %sha_asset.name, "Fetching checksum manifest");
     let sums_content = client
         .get(&sha_asset.browser_download_url)
@@ -550,5 +793,144 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
         assert!(!is_allowed_download_host(
             "https://github.com.evil.example.com/file"
         ));
+    }
+
+    fn asset(name: &str) -> ReleaseAsset {
+        ReleaseAsset {
+            name: name.to_string(),
+            browser_download_url: format!("https://github.com/kubaeror/sito-dns/releases/{name}"),
+            size: 100,
+        }
+    }
+
+    #[test]
+    fn test_find_signature_assets() {
+        let assets = vec![
+            asset("sito-v1.4.0-x86_64-unknown-linux-gnu.tar.gz"),
+            asset("sito-v1.4.0-x86_64-unknown-linux-gnu.tar.gz.sig"),
+            asset("sito-v1.4.0-x86_64-unknown-linux-gnu.tar.gz.pem"),
+            asset("SHA256SUMS"),
+        ];
+        let (sig, cert) =
+            find_signature_assets(&assets, "sito-v1.4.0-x86_64-unknown-linux-gnu.tar.gz");
+        assert_eq!(
+            sig.expect("sig asset").name,
+            "sito-v1.4.0-x86_64-unknown-linux-gnu.tar.gz.sig"
+        );
+        assert_eq!(
+            cert.expect("cert asset").name,
+            "sito-v1.4.0-x86_64-unknown-linux-gnu.tar.gz.pem"
+        );
+
+        let (sig, cert) = find_signature_assets(&assets, "other.tar.gz");
+        assert!(sig.is_none());
+        assert!(cert.is_none());
+    }
+
+    struct MockVerifier {
+        available: bool,
+        result: Result<(), UpdateError>,
+    }
+
+    #[async_trait::async_trait]
+    impl SignatureVerifier for MockVerifier {
+        fn is_available(&self) -> bool {
+            self.available
+        }
+
+        async fn verify(
+            &self,
+            _artifact: &Path,
+            _signature: &Path,
+            _certificate: &Path,
+        ) -> Result<(), UpdateError> {
+            match &self.result {
+                Ok(()) => Ok(()),
+                Err(UpdateError::SignatureInvalid(msg)) => {
+                    Err(UpdateError::SignatureInvalid(msg.clone()))
+                }
+                Err(_) => Err(UpdateError::SignatureInvalid("mock failure".to_string())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_signature_policy_present_and_valid() {
+        let verifier = MockVerifier {
+            available: true,
+            result: Ok(()),
+        };
+        let outcome = verify_release_signature(
+            Path::new("archive.tar.gz"),
+            Some(Path::new("archive.tar.gz.sig")),
+            Some(Path::new("archive.tar.gz.pem")),
+            true,
+            &verifier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, SignatureOutcome::Verified);
+    }
+
+    #[tokio::test]
+    async fn test_signature_policy_present_but_invalid_always_fails() {
+        let verifier = MockVerifier {
+            available: true,
+            result: Err(UpdateError::SignatureInvalid("bad sig".to_string())),
+        };
+        let err = verify_release_signature(
+            Path::new("archive.tar.gz"),
+            Some(Path::new("archive.tar.gz.sig")),
+            Some(Path::new("archive.tar.gz.pem")),
+            false, // not required, but a present signature must still verify
+            &verifier,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, UpdateError::SignatureInvalid(_)));
+    }
+
+    #[tokio::test]
+    async fn test_signature_policy_missing_required_fails() {
+        let verifier = MockVerifier {
+            available: true,
+            result: Ok(()),
+        };
+        let err =
+            verify_release_signature(Path::new("archive.tar.gz"), None, None, true, &verifier)
+                .await
+                .unwrap_err();
+        assert!(matches!(err, UpdateError::SignatureMissing));
+    }
+
+    #[tokio::test]
+    async fn test_signature_policy_missing_optional_allowed() {
+        let verifier = MockVerifier {
+            available: true,
+            result: Ok(()),
+        };
+        let outcome =
+            verify_release_signature(Path::new("archive.tar.gz"), None, None, false, &verifier)
+                .await
+                .unwrap();
+        assert_eq!(outcome, SignatureOutcome::UnsignedAllowed);
+    }
+
+    #[tokio::test]
+    async fn test_signature_policy_required_without_verifier_fails() {
+        let verifier = MockVerifier {
+            available: false,
+            result: Ok(()),
+        };
+        let err = verify_release_signature(
+            Path::new("archive.tar.gz"),
+            Some(Path::new("archive.tar.gz.sig")),
+            Some(Path::new("archive.tar.gz.pem")),
+            true,
+            &verifier,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, UpdateError::SignatureVerifierUnavailable(_)));
     }
 }

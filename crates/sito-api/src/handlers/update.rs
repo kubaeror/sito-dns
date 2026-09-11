@@ -1,12 +1,13 @@
 //! System update endpoints for checking and applying software updates.
 
 use axum::Json;
-use axum::extract::Query;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::rbac::{RequireAdmin, RequireViewer};
 use crate::error::ProblemDetails;
+use crate::state::ServerContext;
 use crate::updater::{self, UpdateInfo};
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -75,6 +76,7 @@ pub async fn check_update(
 )]
 pub async fn apply_update(
     _admin: RequireAdmin,
+    State(ctx): State<ServerContext>,
     payload: Option<Json<ApplyUpdatePayload>>,
 ) -> Result<Json<ApplyUpdateResponse>, ProblemDetails> {
     let (repo, force) = if let Some(Json(p)) = payload {
@@ -91,7 +93,8 @@ pub async fn apply_update(
         )));
     }
 
-    match updater::apply_update(repo.as_deref(), force).await {
+    let require_signature = ctx.config.load().server.update_require_signature;
+    match updater::apply_update(repo.as_deref(), force, require_signature).await {
         Ok(message) => Ok(Json(ApplyUpdateResponse {
             message,
             status: "success".to_string(),

@@ -351,6 +351,10 @@ pub struct ServerConfig {
     pub log_level: String,
     #[serde(default = "default_server_log_format")]
     pub log_format: String,
+    /// Require a verified release signature (cosign) for in-app updates.
+    /// Default: false (checksum-only) until signed releases are guaranteed.
+    #[serde(default)]
+    pub update_require_signature: bool,
 }
 
 fn default_server_role() -> String {
@@ -377,6 +381,7 @@ impl Default for ServerConfig {
             data_dir: default_server_data_dir(),
             log_level: default_server_log_level(),
             log_format: default_server_log_format(),
+            update_require_signature: false,
         }
     }
 }
