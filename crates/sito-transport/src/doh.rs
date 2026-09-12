@@ -33,8 +33,9 @@ pub struct DohConfig {
     pub acceptor_mgr: Option<TlsAcceptorManager>,
     pub max_connections: usize,
     pub rate_limit_per_ip: u32,
-    pub http01_challenges: Option<Arc<dashmap::DashMap<String, String>>>,
     pub alt_svc_port: Option<u16>,
+    /// When set, requests whose Host header does not match are rejected with 421.
+    pub dedicated_hostname: Option<String>,
 }
 
 impl DohConfig {
@@ -44,18 +45,9 @@ impl DohConfig {
             acceptor_mgr,
             max_connections: 256,
             rate_limit_per_ip: 20,
-            http01_challenges: None,
             alt_svc_port: Some(443),
+            dedicated_hostname: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_http01_challenges(
-        mut self,
-        challenges: Arc<dashmap::DashMap<String, String>>,
-    ) -> Self {
-        self.http01_challenges = Some(challenges);
-        self
     }
 
     #[must_use]
@@ -63,13 +55,29 @@ impl DohConfig {
         self.alt_svc_port = port;
         self
     }
+
+    /// Restricts this DoH listener to a single Host/SNI name.
+    #[must_use]
+    pub fn with_dedicated_hostname(mut self, hostname: Option<String>) -> Self {
+        self.dedicated_hostname = hostname.filter(|h| !h.trim().is_empty());
+        self
+    }
 }
 
 struct DohState<H: QueryHandler> {
     handler: Arc<H>,
     rate_limiter: Arc<RateLimiter>,
-    http01_challenges: Option<Arc<dashmap::DashMap<String, String>>>,
     alt_svc_header: Option<HeaderValue>,
+    dedicated_hostname: Option<String>,
+}
+
+/// Returns true when the request Host matches the configured dedicated hostname.
+fn host_matches(headers: &HeaderMap, expected: &str) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let host = host.split(':').next().unwrap_or(host).trim();
+    host.eq_ignore_ascii_case(expected.trim())
 }
 
 fn decode_base64url(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
@@ -87,6 +95,16 @@ async fn handle_doh_request<H: QueryHandler>(
     params: HashMap<String, String>,
     body: Bytes,
 ) -> Response {
+    if let Some(ref expected) = state.dedicated_hostname
+        && !host_matches(&headers, expected)
+    {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "Misdirected Request: unknown DoH hostname",
+        )
+            .into_response();
+    }
+
     let client_ip = peer_addr.ip();
     if !state.rate_limiter.check(client_ip) {
         debug!("DoH rate limit exceeded for client {}", client_ip);
@@ -211,23 +229,6 @@ async fn doh_route_with_client<H: QueryHandler>(
     .await
 }
 
-async fn acme_http01_route<H: QueryHandler>(
-    State(state): State<Arc<DohState<H>>>,
-    Path(token): Path<String>,
-) -> Response {
-    if let Some(ref store) = state.http01_challenges
-        && let Some(key_auth) = store.get(&token)
-    {
-        return (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/plain")],
-            key_auth.clone(),
-        )
-            .into_response();
-    }
-    StatusCode::NOT_FOUND.into_response()
-}
-
 /// Start the DNS over HTTPS listener.
 pub async fn start_doh_listener<H: QueryHandler + 'static>(
     config: DohConfig,
@@ -249,18 +250,14 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
             config.rate_limit_per_ip,
             config.rate_limit_per_ip * 2,
         )),
-        http01_challenges: config.http01_challenges,
         alt_svc_header,
+        dedicated_hostname: config.dedicated_hostname,
     });
     state.rate_limiter.spawn_pruner(shutdown_rx.clone());
 
     let app = Router::new()
         .route("/dns-query", any(doh_route::<H>))
         .route("/dns-query/{client_id}", any(doh_route_with_client::<H>))
-        .route(
-            "/.well-known/acme-challenge/{token}",
-            axum::routing::get(acme_http01_route::<H>),
-        )
         .with_state(state);
 
     let semaphore = Arc::new(Semaphore::new(config.max_connections));
@@ -335,4 +332,24 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
     });
 
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dedicated_hostname_matching() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("dns.example.com:8443"),
+        );
+        assert!(host_matches(&headers, "dns.example.com"));
+        assert!(host_matches(&headers, "DNS.EXAMPLE.COM"));
+        assert!(!host_matches(&headers, "other.example.com"));
+
+        let empty = HeaderMap::new();
+        assert!(!host_matches(&empty, "dns.example.com"));
+    }
 }

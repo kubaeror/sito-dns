@@ -34,6 +34,7 @@ Full findings and remediation mapping: `docs/audit3.md`.
 - **Per-list blocklist refresh (WP-4)**: the filter scheduler now honors each list's `refresh_hours` (nearest-due wake-ups) and refreshes only due lists while keeping other lists' parsed rules cached; lists without `refresh_hours` keep using `filtering.refresh_interval_hours`.
 - **Per-client upstreams and stats policy (WP-5)**: client entries with `use_global_upstreams = false` and `upstreams = [...]` now resolve through a dedicated `UpstreamManager`; cache is bypassed for these clients to avoid cross-scope answer leakage, and `ignore_stats = true` suppresses Prometheus query counters/durations (query log opt-out remains `ignore_query_log`). Scopes are built at startup; changing a client's upstream list requires a restart.
 - **Native DoH upstream (WP-2)**: `https://host[:port]/dns-query` upstreams are now supported (RFC 8484 POST with GET fallback, ID 0 handling, Content-Type validation, response ID/question validation, size caps). DoQ (`quic://`) remains future work.
+- **ACME HTTP-01 and DoH hostname (WP-8)**: ACME HTTP-01 challenges are served by a dedicated plaintext listener on `acme.http_port` (default 80) instead of the DoH listener; `/.well-known/acme-challenge/*` is no longer exposed on DoH. `dns.doh_dedicated_hostname` is now enforced: DoH and DoH3 requests with a mismatching Host/authority return 421.
 
 #### Deferred (tracked in `docs/audit3-followup-plan.md`)
 - Full DNSSEC DS/DNSKEY chain walking (validation currently verifies against configured trust anchors only).

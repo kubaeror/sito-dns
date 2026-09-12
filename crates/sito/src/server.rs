@@ -10,7 +10,6 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
 use sito_cache::DnsCache;
 use sito_core::config::Config;
 use sito_dnssec::DnssecValidator;
@@ -682,6 +681,34 @@ pub async fn run_server_full(
         let doh_alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()];
         let service_cfg =
             AcmeServiceConfig::new(email, acme.domains, storage_dir).with_staging(acme.staging);
+
+        // Dedicated plaintext HTTP-01 listener (ACME validators always use port 80).
+        if acme.http_port > 0 {
+            let acme_http_addr = SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                acme.http_port,
+            );
+            match sito_transport::start_acme_http01_listener(
+                acme_http_addr,
+                http01_challenges.clone(),
+                shutdown_rx.clone(),
+            )
+            .await
+            {
+                Ok(_handle) => {
+                    info!(
+                        port = acme.http_port,
+                        "ACME HTTP-01 challenge listener active"
+                    );
+                }
+                Err(e) => warn!(
+                    port = acme.http_port,
+                    error = %e,
+                    "Failed to bind ACME HTTP-01 listener; HTTP-01 validation will not be available"
+                ),
+            }
+        }
+
         let _acme_handle = start_acme_manager(
             service_cfg,
             doh_acceptor_mgr.clone(),
@@ -712,7 +739,6 @@ pub async fn run_server_full(
                     doh_acceptor_mgr.clone(),
                     doq_acceptor_mgr.clone(),
                     doh3_acceptor_mgr.clone(),
-                    http01_challenges.clone(),
                 ).await?;
                 all_handles.extend(dns_handles);
 
@@ -734,7 +760,6 @@ pub async fn run_server_full(
             doh_acceptor_mgr.clone(),
             doq_acceptor_mgr.clone(),
             doh3_acceptor_mgr.clone(),
-            http01_challenges.clone(),
         )
         .await?;
         all_handles.extend(dns_handles);
@@ -781,7 +806,6 @@ async fn start_dns_listeners(
     doh_acceptor_mgr: Option<TlsAcceptorManager>,
     doq_acceptor_mgr: Option<TlsAcceptorManager>,
     doh3_acceptor_mgr: Option<TlsAcceptorManager>,
-    http01_challenges: Arc<DashMap<String, String>>,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let mut handles = Vec::new();
@@ -836,13 +860,15 @@ async fn start_dns_listeners(
                 );
             } else {
                 let doh_addr = SocketAddr::new(*bind_ip, config.dns.doh_port);
+                let dedicated_host = (!config.dns.doh_dedicated_hostname.trim().is_empty())
+                    .then(|| config.dns.doh_dedicated_hostname.trim().to_string());
                 let mut doh_config = DohConfig::new(doh_addr, doh_acceptor_mgr.clone())
-                    .with_http01_challenges(http01_challenges.clone())
                     .with_alt_svc_port(if config.dns.doh3_port > 0 {
                         Some(config.dns.doh3_port)
                     } else {
                         None
-                    });
+                    })
+                    .with_dedicated_hostname(dedicated_host);
                 doh_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
                 doh_config.max_connections = config.dns.max_tcp_connections;
                 let doh_handle =
@@ -870,7 +896,10 @@ async fn start_dns_listeners(
             && let Some(ref doh3_mgr) = doh3_acceptor_mgr
         {
             let doh3_addr = SocketAddr::new(*bind_ip, config.dns.doh3_port);
-            let mut doh3_config = Doh3Config::new(doh3_addr, Some(doh3_mgr.clone()));
+            let dedicated_host = (!config.dns.doh_dedicated_hostname.trim().is_empty())
+                .then(|| config.dns.doh_dedicated_hostname.trim().to_string());
+            let mut doh3_config = Doh3Config::new(doh3_addr, Some(doh3_mgr.clone()))
+                .with_dedicated_hostname(dedicated_host);
             doh3_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
             doh3_config.max_connections = config.dns.max_tcp_connections;
             match start_doh3_listener(doh3_config, pipeline.clone(), shutdown_rx.clone()).await {

@@ -30,6 +30,8 @@ pub struct Doh3Config {
     pub max_connections: usize,
     pub rate_limit_per_ip: u32,
     pub idle_timeout: Duration,
+    /// When set, requests whose authority/Host does not match are rejected with 421.
+    pub dedicated_hostname: Option<String>,
 }
 
 impl Doh3Config {
@@ -41,7 +43,15 @@ impl Doh3Config {
             max_connections: 256,
             rate_limit_per_ip: 20,
             idle_timeout: Duration::from_secs(30),
+            dedicated_hostname: None,
         }
+    }
+
+    /// Restricts this DoH3 listener to a single Host/authority name.
+    #[must_use]
+    pub fn with_dedicated_hostname(mut self, hostname: Option<String>) -> Self {
+        self.dedicated_hostname = hostname.filter(|h| !h.trim().is_empty());
+        self
     }
 
     #[must_use]
@@ -116,6 +126,7 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
     rate_limiter.spawn_pruner(shutdown_rx.clone());
     let semaphore = Arc::new(Semaphore::new(config.max_connections));
     let acceptor_mgr = config.acceptor_mgr.clone();
+    let dedicated_hostname = config.dedicated_hostname.clone();
 
     let endpoint_accept = endpoint.clone();
     let mut accept_shutdown_rx = shutdown_rx.clone();
@@ -142,6 +153,7 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
 
                     let handler = Arc::clone(&handler);
                     let rate_limiter = Arc::clone(&rate_limiter);
+                    let dedicated_hostname = dedicated_hostname.clone();
 
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -184,6 +196,7 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                             let handler = Arc::clone(&handler);
                             let rate_limiter = Arc::clone(&rate_limiter);
                             let sni = sni.clone();
+                            let dedicated_hostname = dedicated_hostname.clone();
 
                             tokio::spawn(async move {
                                 if !rate_limiter.check(client_ip) {
@@ -198,6 +211,32 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                         return;
                                     }
                                 };
+
+                                if let Some(ref expected) = dedicated_hostname {
+                                    let host = req
+                                        .uri()
+                                        .host()
+                                        .map(str::to_string)
+                                        .or_else(|| {
+                                            req.headers()
+                                                .get(http::header::HOST)
+                                                .and_then(|v| v.to_str().ok())
+                                                .map(|h| {
+                                                    h.split(':').next().unwrap_or(h).to_string()
+                                                })
+                                        });
+                                    let matches = host
+                                        .is_some_and(|h| h.eq_ignore_ascii_case(expected.trim()));
+                                    if !matches {
+                                        let resp = http::Response::builder()
+                                            .status(http::StatusCode::MISDIRECTED_REQUEST)
+                                            .body(())
+                                            .unwrap();
+                                        let _ = stream.send_response(resp).await;
+                                        let _ = stream.finish().await;
+                                        return;
+                                    }
+                                }
 
                                 let path = req.uri().path();
                                 let method = req.method().clone();

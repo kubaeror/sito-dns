@@ -323,7 +323,9 @@ ignoring the configured `dns.bind`.
 > (scoped `UpstreamManager` per client upstream list, cache bypass, and
 > `ignore_stats` suppressing Prometheus counters); **WP-2 (DoH upstream) —
 > done** (RFC 8484 POST + GET fallback, response validation, size caps;
-> DoQ remains deferred).
+> DoQ remains deferred); **WP-8 (ACME HTTP-01 + DoH hostname) — done**
+> (dedicated port-80 challenge listener, `doh_dedicated_hostname` enforced
+> with 421 on DoH/DoH3).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated

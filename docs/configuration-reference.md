@@ -65,7 +65,7 @@ max_tcp_connections = 256
 | `doh_port` | integer | `443` | DNS-over-HTTPS (DoH, HTTP/1.1 and HTTP/2) port. `0` disables DoH. |
 | `doq_port` | integer | `0` | DNS-over-QUIC (DoQ) UDP port. `0` (default) disables DoQ; set `853` only when it does not conflict with DoT. |
 | `doh3_port` | integer | `443` | DNS-over-HTTP/3 (DoH3) UDP port. `0` disables DoH3. |
-| `doh_dedicated_hostname` | string | `""` | Reserved for future DoH virtual-host routing; currently **not enforced**. |
+| `doh_dedicated_hostname` | string | `""` | When set, DoH/DoH3 requests whose Host/authority does not match are rejected with `421 Misdirected Request`. Empty allows any hostname. |
 | `dot_padding` | boolean | `false` | RFC 7830/8467 padding on DoT responses to mitigate traffic analysis. |
 | `edns_udp_size` | integer | `1232` | Maximum EDNS0 UDP buffer size (1232 bytes prevents IPv6 fragmentation). |
 | `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual client IP. `0` disables rate limiting. |
