@@ -9,7 +9,9 @@ in every crate and verifies both directions:
 * every key documented in a table exists in the corresponding struct;
 * every struct field is documented (so new settings cannot be added silently).
 
-Run with ``--github`` for a compact CI-friendly failure summary.
+Run with ``--github`` for a compact CI-friendly failure summary. Run with
+``--write`` to append placeholder rows for newly added struct fields (existing
+prose is preserved and the author fills in the description afterwards).
 """
 
 from __future__ import annotations
@@ -58,16 +60,31 @@ SECTIONS: dict[int, tuple[str, list[tuple[str, str]]]] = {
     14: ("`[integrations.mikrotik]`", [("crates/sito-clients/src/routeros.rs", "RouterOsConfig")]),
 }
 
+# Fields that are containers for other documented sections or documented
+# inline inside array-of-table rows, so they have no table row of their own.
+SKIP_REVERSE_BY_SECTION = {
+    1: {
+        "server", "dns", "upstream", "filtering", "tls", "acme", "privacy",
+        "clients", "rewrites", "web", "auth", "stats", "ha", "integrations",
+    },
+    3: {"cache", "dnssec", "tls"},
+    # Nested/array-of-table structs documented inline in a single row.
+    6: {"sni_certs"},
+    7: {"per_domain"},
+    9: {"entries", "groups"},
+    10: {"entries"},
+}
+
 SECTION_RE = re.compile(r"^##\s+(\d+)\.\s")
 ROW_RE = re.compile(r"^\|([^|]+)\|")
 STRUCT_RE = re.compile(r"^\s*pub struct\s+(\w+)")
-FIELD_RE = re.compile(r"^\s*pub\s+([a-z_][a-z0-9_]*)\s*:")
+FIELD_RE = re.compile(r"^\s*pub\s+([a-z_][a-z0-9_]*)\s*:\s*(.+?),?\s*$")
 RENAME_RE = re.compile(r'#\[serde\([^]]*rename\s*=\s*"([^"]+)"')
 
 
-def parse_struct_fields(path: Path) -> dict[str, set[str]]:
-    """Return {struct_name: {toml_key, ...}} for all pub fields in *path*."""
-    structs: dict[str, set[str]] = {}
+def parse_struct_fields(path: Path) -> dict[str, dict[str, str]]:
+    """Return {struct_name: {toml_key: rust_type}} for all pub fields in *path*."""
+    structs: dict[str, dict[str, str]] = {}
     current: str | None = None
     pending_rename: str | None = None
     brace_depth = 0
@@ -77,7 +94,7 @@ def parse_struct_fields(path: Path) -> dict[str, set[str]]:
             m = STRUCT_RE.match(line)
             if m:
                 current = m.group(1)
-                structs.setdefault(current, set())
+                structs.setdefault(current, {})
                 brace_depth = line.count("{") - line.count("}")
                 pending_rename = None
             continue
@@ -87,7 +104,7 @@ def parse_struct_fields(path: Path) -> dict[str, set[str]]:
             pending_rename = rename.group(1)
         field = FIELD_RE.match(line)
         if field:
-            structs[current].add(pending_rename or field.group(1))
+            structs[current][pending_rename or field.group(1)] = field.group(2).strip()
             pending_rename = None
         brace_depth += line.count("{") - line.count("}")
         if brace_depth <= 0 and "}" in line:
@@ -138,31 +155,131 @@ def struct_for_key(key: str, structs: dict[str, set[str]]) -> set[str]:
     }
 
 
+def rust_type_to_doc(rust_type: str) -> str:
+    """Maps a Rust field type to the reference's human-readable type column."""
+    compact = rust_type.replace(" ", "")
+    while compact.startswith("Option<") and compact.endswith(">"):
+        compact = compact[len("Option<") : -1]
+    if compact == "bool":
+        return "boolean"
+    if compact.startswith("Vec<") and compact.endswith(">"):
+        element = compact[4:-1]
+        if element in {"String", "PathBuf"}:
+            return "array of strings"
+        if element == "IpAddr":
+            return "array of IP addresses"
+        if element.endswith("Config"):
+            return "array of tables"
+        return "array"
+    if compact in {"String", "PathBuf"}:
+        return "string"
+    if compact == "IpAddr":
+        return "string (IP address)"
+    if compact in {
+        "u8", "u16", "u32", "u64", "usize",
+        "i8", "i16", "i32", "i64", "isize",
+    }:
+        return "integer"
+    if compact.startswith("toml::") or compact == "toml::Value":
+        return "table"
+    return "value"
+
+
+def write_missing_rows() -> list[str]:
+    """Appends placeholder rows for undocumented struct fields.
+
+    Existing rows, prose and TOML examples are preserved; only new rows with a
+    TODO description are added, so authors can fill in wording without the CI
+    check failing on the intermediate state.
+    """
+    field_cache: dict[Path, dict[str, dict[str, str]]] = {}
+    lines = DOC.read_text().splitlines()
+    documented = parse_doc_rows()
+    added: list[str] = []
+
+    for number, (title, sources) in SECTIONS.items():
+        structs: dict[str, dict[str, str]] = {}
+        for rel, struct_name in sources:
+            path = ROOT / rel
+            if path not in field_cache:
+                field_cache[path] = parse_struct_fields(path)
+            structs[struct_name] = field_cache[path].get(struct_name, {})
+
+        documented_keys = set(documented.get(number, []))
+        skip_reverse = SKIP_REVERSE_BY_SECTION.get(number, set())
+        expected: dict[str, str] = {}
+        for struct_name, fields in structs.items():
+            prefix = ""
+            if len(structs) > 1:
+                prefix = struct_name.lower().removesuffix("config") + "."
+            for field, rust_type in fields.items():
+                expected[prefix + field] = rust_type
+
+        missing = {
+            key: rust_type
+            for key, rust_type in expected.items()
+            if key not in documented_keys and key not in skip_reverse
+        }
+        if not missing:
+            continue
+
+        heading = next(
+            (i for i, line in enumerate(lines) if line.startswith(f"## {number}.")),
+            None,
+        )
+        if heading is None:
+            continue
+        section_end = next(
+            (
+                i
+                for i in range(heading + 1, len(lines))
+                if lines[i].startswith("## ")
+            ),
+            len(lines),
+        )
+        table_end = next(
+            (
+                i
+                for i in range(section_end - 1, heading, -1)
+                if lines[i].startswith("|")
+            ),
+            None,
+        )
+        if table_end is None:
+            continue
+
+        new_rows = [
+            f"| `{key}` | {rust_type_to_doc(rust_type)} | `—` | TODO: describe `{key}`. |"
+            for key, rust_type in sorted(missing.items())
+        ]
+        lines[table_end + 1 : table_end + 1] = new_rows
+        added.extend(new_rows)
+
+    if added:
+        DOC.write_text("\n".join(lines) + "\n")
+    return added
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--github", action="store_true", help="annotate failures for GitHub Actions")
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help="append placeholder rows for undocumented fields before checking",
+    )
     args = parser.parse_args()
 
-    field_cache: dict[Path, dict[str, set[str]]] = {}
+    if args.write:
+        added = write_missing_rows()
+        for row in added:
+            print(f"added placeholder row: {row}")
+
+    field_cache: dict[Path, dict[str, dict[str, str]]] = {}
     errors: list[str] = []
 
     doc_rows = parse_doc_rows()
     documented_by_section = doc_rows
-
-    # Fields that are containers for other documented sections or documented
-    # inline inside array-of-table rows, so they have no table row of their own.
-    skip_reverse_by_section = {
-        1: {
-            "server", "dns", "upstream", "filtering", "tls", "acme", "privacy",
-            "clients", "rewrites", "web", "auth", "stats", "ha", "integrations",
-        },
-        3: {"cache", "dnssec", "tls"},
-        # Nested/array-of-table structs documented inline in a single row.
-        7: {"per_domain"},
-        9: {"entries", "groups"},
-        10: {"entries"},
-        6: {"sni_certs"},
-    }
 
     for number, (title, sources) in SECTIONS.items():
         structs: dict[str, set[str]] = {}
@@ -185,7 +302,7 @@ def main() -> int:
             if len(structs) > 1:
                 prefix = struct_name.lower().removesuffix("config") + "."
             expected |= {prefix + field for field in structs[struct_name]}
-        skip_reverse = skip_reverse_by_section.get(number, set())
+        skip_reverse = SKIP_REVERSE_BY_SECTION.get(number, set())
 
         for key in sorted(expected - documented - skip_reverse):
             errors.append(f"section {number} ({title}): struct field `{key}` is not documented")
