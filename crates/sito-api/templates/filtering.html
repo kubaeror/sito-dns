@@ -111,6 +111,7 @@
           <th>Version</th>
           <th style="text-align: right;">Entries</th>
           <th>License</th>
+          <th>Status</th>
           <th>Source</th>
         </tr>
       </thead>
@@ -121,6 +122,10 @@
           <td class="mono" style="font-size: 0.8rem;">{{ list.version }}</td>
           <td style="text-align: right; font-weight: 600;">{{ list.entries }}</td>
           <td>{{ list.license }}</td>
+          <td>
+            {{ list.state }}
+            <div style="font-size: 0.75rem; color: var(--text-muted);">Last refresh: {{ list.last_refresh }}</div>
+          </td>
           <td class="mono" style="font-size: 0.8rem; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
             <a href="{{ list.source }}" target="_blank" rel="noopener">{{ list.source }}</a>
           </td>

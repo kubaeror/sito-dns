@@ -296,10 +296,15 @@ mod tests {
             clients.clone(),
             rewrites.clone(),
         ));
+        let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
+            Arc::new(sito_clients::ParentalRegistry::bundled()),
+            Arc::new(sito_clients::ServiceRegistry::bundled()),
+        ));
 
         ServerContext {
             config: config_arc,
             runtime,
+            runtime_lists,
             config_path: temp_dir.join("config.toml"),
             auth_mgr,
             stats_db,

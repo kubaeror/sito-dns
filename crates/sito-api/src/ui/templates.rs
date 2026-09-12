@@ -118,6 +118,20 @@ pub struct QueryLogRowsPartialTemplate<'a> {
     pub entries: &'a [QueryLogRowItem],
 }
 
+/// One curated list row on the filtering page.
+#[derive(Debug, Clone)]
+pub struct BundledListView {
+    pub id: String,
+    pub kind: String,
+    pub version: String,
+    pub source: String,
+    pub license: String,
+    pub entries: u64,
+    /// `built-in (minimal)` until the category is refreshed from a configured source.
+    pub state: String,
+    pub last_refresh: String,
+}
+
 #[derive(Template)]
 #[template(path = "filtering.html")]
 pub struct FilteringTemplate<'a> {
@@ -128,8 +142,8 @@ pub struct FilteringTemplate<'a> {
     pub version: &'a str,
     pub lists: &'a [FilterListDto],
     pub custom_rules: &'a str,
-    /// Metadata of the curated lists bundled into the binary.
-    pub bundled_lists: Vec<sito_clients::BundledList>,
+    /// Metadata of the curated lists bundled into the binary plus runtime state.
+    pub bundled_lists: Vec<BundledListView>,
 }
 
 #[derive(Template)]

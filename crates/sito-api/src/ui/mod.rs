@@ -193,7 +193,16 @@ mod tests {
             version: "1.2.1",
             lists: &[],
             custom_rules: "||ad.com^",
-            bundled_lists: sito_clients::ParentalRegistry::bundled().lists().to_vec(),
+            bundled_lists: vec![crate::ui::templates::BundledListView {
+                id: "adult".to_string(),
+                kind: "domains".to_string(),
+                version: "2026.09.2".to_string(),
+                source: "https://example.com/adult.txt".to_string(),
+                license: "CC0-1.0".to_string(),
+                entries: 40,
+                state: "built-in (minimal)".to_string(),
+                last_refresh: "—".to_string(),
+            }],
         };
         let filtering_html = filter_tmpl.render().expect("render filtering page");
         assert!(filtering_html.contains("built-in (minimal)"));

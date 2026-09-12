@@ -86,13 +86,18 @@ FIELD_RE = re.compile(r"^\s*pub\s+([a-z_][a-z0-9_]*)\s*:\s*(.+?),?\s*$")
 RENAME_RE = re.compile(r'#\[serde\([^]]*rename\s*=\s*"([^"]+)"')
 
 
-def parse_struct_fields(path: Path) -> dict[str, dict[str, str]]:
-    """Return {struct_name: {toml_key: rust_type}} for all pub fields in *path*."""
-    structs: dict[str, dict[str, str]] = {}
+def parse_struct_fields(path: Path) -> dict[str, dict[str, dict[str, str]]]:
+    """Return {struct: {toml_key: {"type": ..., "doc": ...}}} for pub fields."""
+    structs: dict[str, dict[str, dict[str, str]]] = {}
     current: str | None = None
     pending_rename: str | None = None
+    pending_doc: list[str] = []
     brace_depth = 0
     for raw in path.read_text().splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("///"):
+            pending_doc.append(stripped.removeprefix("///").strip())
+            continue
         line = raw.split("//")[0]
         if current is None:
             m = STRUCT_RE.match(line)
@@ -101,6 +106,7 @@ def parse_struct_fields(path: Path) -> dict[str, dict[str, str]]:
                 structs.setdefault(current, {})
                 brace_depth = line.count("{") - line.count("}")
                 pending_rename = None
+                pending_doc = []
             continue
 
         rename = RENAME_RE.search(line)
@@ -108,8 +114,15 @@ def parse_struct_fields(path: Path) -> dict[str, dict[str, str]]:
             pending_rename = rename.group(1)
         field = FIELD_RE.match(line)
         if field:
-            structs[current][pending_rename or field.group(1)] = field.group(2).strip()
+            key = pending_rename or field.group(1)
+            structs[current][key] = {
+                "type": field.group(2).strip(),
+                "doc": " ".join(pending_doc),
+            }
             pending_rename = None
+            pending_doc = []
+        elif line.strip() and not line.strip().startswith("#["):
+            pending_doc = []
         brace_depth += line.count("{") - line.count("}")
         if brace_depth <= 0 and "}" in line:
             current = None
@@ -196,13 +209,13 @@ def write_missing_rows() -> list[str]:
     TODO description are added, so authors can fill in wording without the CI
     check failing on the intermediate state.
     """
-    field_cache: dict[Path, dict[str, dict[str, str]]] = {}
+    field_cache: dict[Path, dict[str, dict[str, dict[str, str]]]] = {}
     lines = DOC.read_text().splitlines()
     documented = parse_doc_rows()
     added: list[str] = []
 
     for number, (title, sources) in SECTIONS.items():
-        structs: dict[str, dict[str, str]] = {}
+        structs: dict[str, dict[str, dict[str, str]]] = {}
         for rel, struct_name in sources:
             path = ROOT / rel
             if path not in field_cache:
@@ -211,17 +224,17 @@ def write_missing_rows() -> list[str]:
 
         documented_keys = set(documented.get(number, []))
         skip_reverse = SKIP_REVERSE_BY_SECTION.get(number, set())
-        expected: dict[str, str] = {}
+        expected: dict[str, dict[str, str]] = {}
         for struct_name, fields in structs.items():
             prefix = ""
             if len(structs) > 1:
                 prefix = struct_name.lower().removesuffix("config") + "."
-            for field, rust_type in fields.items():
-                expected[prefix + field] = rust_type
+            for field, meta in fields.items():
+                expected[prefix + field] = meta
 
         missing = {
-            key: rust_type
-            for key, rust_type in expected.items()
+            key: meta
+            for key, meta in expected.items()
             if key not in documented_keys and key not in skip_reverse
         }
         if not missing:
@@ -253,8 +266,16 @@ def write_missing_rows() -> list[str]:
             continue
 
         new_rows = [
-            f"| `{key}` | {rust_type_to_doc(rust_type)} | `—` | TODO: describe `{key}`. |"
-            for key, rust_type in sorted(missing.items())
+            "| `{key}` | {kind} | `—` | {description} |".format(
+                key=key,
+                kind=rust_type_to_doc(meta["type"]),
+                description=(
+                    meta["doc"].replace("|", "\\|")
+                    if meta["doc"]
+                    else f"TODO: describe `{key}`."
+                ),
+            )
+            for key, meta in sorted(missing.items())
         ]
         lines[table_end + 1 : table_end + 1] = new_rows
         added.extend(new_rows)
@@ -279,7 +300,7 @@ def main() -> int:
         for row in added:
             print(f"added placeholder row: {row}")
 
-    field_cache: dict[Path, dict[str, dict[str, str]]] = {}
+    field_cache: dict[Path, dict[str, dict[str, dict[str, str]]]] = {}
     errors: list[str] = []
 
     doc_rows = parse_doc_rows()
@@ -291,7 +312,7 @@ def main() -> int:
             path = ROOT / rel
             if path not in field_cache:
                 field_cache[path] = parse_struct_fields(path)
-            structs[struct_name] = field_cache[path].get(struct_name, set())
+            structs[struct_name] = field_cache[path].get(struct_name, {})
 
         documented = set(documented_by_section.get(number, []))
 

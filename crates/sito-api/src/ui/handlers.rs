@@ -535,14 +535,64 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
 
     let custom_rules = cfg.filtering.custom_rules.join("\n");
 
-    // Curated lists bundled into the binary (parental categories + services).
-    let mut bundled_lists = sito_clients::ParentalRegistry::bundled().lists().to_vec();
-    bundled_lists.extend(
-        sito_clients::ServiceRegistry::bundled()
-            .lists()
-            .iter()
-            .cloned(),
-    );
+    // Curated lists bundled into the binary plus any runtime refresh state.
+    let manifest = sito_clients::BundledManifest::bundled();
+    let statuses: std::collections::HashMap<String, sito_clients::RuntimeListStatus> = ctx
+        .runtime_lists
+        .statuses()
+        .into_iter()
+        .map(|status| (status.category.clone(), status))
+        .collect();
+    let format_refresh = |ts: Option<u64>| {
+        ts.and_then(|ts| chrono::DateTime::from_timestamp(ts.cast_signed(), 0))
+            .map_or_else(
+                || "—".to_string(),
+                |dt| dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+            )
+    };
+
+    let mut bundled_lists: Vec<crate::ui::templates::BundledListView> = manifest
+        .lists
+        .iter()
+        .map(|list| {
+            let status = statuses.get(&list.id);
+            crate::ui::templates::BundledListView {
+                id: list.id.clone(),
+                kind: list.kind.clone(),
+                version: list.version.clone(),
+                source: status
+                    .and_then(|status| status.source_url.clone())
+                    .unwrap_or_else(|| list.source.clone()),
+                license: list.license.clone(),
+                entries: status.map_or(list.entries, |status| status.entries),
+                state: if status.is_some_and(|status| !status.bundled) {
+                    "runtime refresh".to_string()
+                } else {
+                    "built-in (minimal)".to_string()
+                },
+                last_refresh: format_refresh(status.and_then(|status| status.last_refresh_unix)),
+            }
+        })
+        .collect();
+    for status in ctx.runtime_lists.statuses() {
+        if manifest.list(&status.category).is_some() {
+            continue;
+        }
+        bundled_lists.push(crate::ui::templates::BundledListView {
+            id: status.category.clone(),
+            kind: "custom".to_string(),
+            version: "—".to_string(),
+            source: status.source_url.clone().unwrap_or_default(),
+            license: "—".to_string(),
+            entries: status.entries,
+            state: if status.bundled {
+                "built-in".to_string()
+            } else {
+                "runtime refresh".to_string()
+            },
+            last_refresh: format_refresh(status.last_refresh_unix),
+        });
+    }
     bundled_lists.sort_by(|a, b| a.id.cmp(&b.id));
 
     HtmlTemplate(FilteringTemplate {
@@ -2088,10 +2138,15 @@ mod tests {
             clients.clone(),
             rewrites.clone(),
         ));
+        let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
+            Arc::new(sito_clients::ParentalRegistry::bundled()),
+            Arc::new(sito_clients::ServiceRegistry::bundled()),
+        ));
 
         ServerContext {
             config: config_arc,
             runtime,
+            runtime_lists,
             config_path: temp_dir.join("config.toml"),
             auth_mgr,
             stats_db,

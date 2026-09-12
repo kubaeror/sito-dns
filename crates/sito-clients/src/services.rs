@@ -51,6 +51,12 @@ impl ServiceRegistry {
         &self.lists
     }
 
+    /// Number of services in the registry.
+    #[must_use]
+    pub fn service_count(&self) -> usize {
+        self.services.len()
+    }
+
     /// Parse service definitions from a JSON string.
     ///
     /// Supports both map format `{"service": ["domain1", "domain2"]}` and

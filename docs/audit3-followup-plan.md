@@ -474,14 +474,14 @@ integration point and should land last in its wave to avoid merge churn in
 - [x] WP-4 Per-list `refresh_hours` scheduling
 - [x] WP-5 Per-client upstreams and `ignore_stats`
 - [x] WP-6 Atomic runtime snapshot + live reload of restart-only settings — `RuntimeSnapshot`/`RuntimeState` (no torn state per query), cache `size_mb` resize with carry-over, per-cycle retention, log-level reload, hot rate limits, in-process listener rebind with revert, and restart-only API signalling for the truly immutable settings (server identity/format, web, tls, acme, ha)
-- [ ] WP-7 Maintained parental/service lists — partial: versioned manifest with source/license/BLAKE3 checks, `[integrations.lists]` runtime refresh with per-category schedules and hot registry swap, metadata shown on the Filtering page; remaining: curated data expansion (larger source lists) and refresh status/version display
+- [x] WP-7 Maintained parental/service lists — versioned manifest with source/license/BLAKE3 checks, expanded built-in data (adult/gambling/services incl. ads), `[integrations.lists]` runtime refresh with per-category schedules and hot registry swap, and Filtering-page display of state, source and last refresh
 - [x] WP-8 DoH dedicated hostname + ACME HTTP-01 on port 80
 - [x] WP-9 HA heartbeat watchdog, protocol role, `ca` validation
 - [x] WP-10 Updater artifact signature verification
 - [ ] WP-11 Architecture cleanup — partial: cert-watcher lifetime fix, shutdown joins, dead-code sweep, allocation-free domain matching, deterministic pattern ordering, `handle` helper extraction (blocked builders, anti-DoH checks, filter stages) done; remaining: nothing blocking, `handle` could be split further
 - [x] WP-12 Supply chain & installer ops — `--uninstall`, `SITO_VERSION` pin, `SITO_REQUIRE_SIGNATURE`, armv7 image, SBOM, SHA-pinned Actions, `deny.toml` tightened (`multiple-versions = "deny"` with explicit known-duplicate skips, `unused-allowed-license = "deny"`), shellcheck raised to `warning`, Docker ownership and release-verification/reproducibility documented; advisories are covered by the `cargo-deny` CI job
 - [x] WP-13 Test-suite quality — wall-clock gating, `SITO_BENCH_TESTS`, ephemeral HA ports, chaos/promotion tightening, broadcast/monotonic/pubkey tests, plaintext/push-policy/duplicate-instance coverage, reconnect/backoff E2E, behavioral config/systemd checks and the nightly `--release` job all done
-- [ ] WP-14 Docs/OpenAPI automation — partial: CI drift checks for `docs/openapi.json` and `docs/configuration-reference.md` (bidirectional struct-vs-doc validator) done; `--write` generates placeholder rows for new fields, preserving prose; only full prose generation remains manual
+- [x] WP-14 Docs/OpenAPI automation — CI drift checks for `docs/openapi.json` and `docs/configuration-reference.md` (bidirectional struct-vs-doc validator), `--write` scaffolding with Rust doc-comment descriptions; only fields without doc comments need manual wording
 
 When a WP lands, update `docs/audit3.md` (move the item out of "Explicitly
 deferred") and check it off here.

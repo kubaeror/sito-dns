@@ -8,7 +8,7 @@
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::parental::ParentalRegistry;
 use crate::services::ServiceRegistry;
@@ -72,20 +72,96 @@ impl ListCategoriesConfig {
     }
 }
 
+/// Refresh state of one curated category.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeListStatus {
+    pub category: String,
+    /// Last successfully applied source URL, if the category was refreshed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    /// Unix timestamp of the last successful refresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_refresh_unix: Option<u64>,
+    /// Number of entries in the currently active content.
+    pub entries: u64,
+    /// Whether the active content is the bundled fallback.
+    pub bundled: bool,
+}
+
 /// Hot-swappable parental and service registries used by the query pipeline.
 #[derive(Debug)]
 pub struct RuntimeLists {
     parental: ArcSwap<ParentalRegistry>,
     services: ArcSwap<ServiceRegistry>,
+    statuses: RwLock<HashMap<String, RuntimeListStatus>>,
 }
 
 impl RuntimeLists {
     /// Wraps existing registries.
     #[must_use]
     pub fn from_arcs(parental: Arc<ParentalRegistry>, services: Arc<ServiceRegistry>) -> Self {
+        let mut statuses = HashMap::new();
+        for list in parental.lists() {
+            statuses.insert(
+                list.id.clone(),
+                RuntimeListStatus {
+                    category: list.id.clone(),
+                    source_url: None,
+                    last_refresh_unix: None,
+                    entries: list.entries,
+                    bundled: true,
+                },
+            );
+        }
+        for list in services.lists() {
+            statuses.insert(
+                list.id.clone(),
+                RuntimeListStatus {
+                    category: list.id.clone(),
+                    source_url: None,
+                    last_refresh_unix: None,
+                    entries: list.entries,
+                    bundled: true,
+                },
+            );
+        }
         Self {
             parental: ArcSwap::from(parental),
             services: ArcSwap::from(services),
+            statuses: RwLock::new(statuses),
+        }
+    }
+
+    /// Refresh state of every known category, sorted by id.
+    #[must_use]
+    pub fn statuses(&self) -> Vec<RuntimeListStatus> {
+        let mut statuses: Vec<RuntimeListStatus> = self
+            .statuses
+            .read()
+            .map(|guard| guard.values().cloned().collect())
+            .unwrap_or_default();
+        statuses.sort_by(|a, b| a.category.cmp(&b.category));
+        statuses
+    }
+
+    /// Marks a category as refreshed from `source_url` at the current time.
+    pub fn mark_refreshed(&self, category: &str, source_url: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if let Ok(mut statuses) = self.statuses.write() {
+            let entry = statuses
+                .entry(category.to_string())
+                .or_insert_with(|| RuntimeListStatus {
+                    category: category.to_string(),
+                    source_url: None,
+                    last_refresh_unix: None,
+                    entries: 0,
+                    bundled: false,
+                });
+            entry.source_url = Some(source_url.to_string());
+            entry.last_refresh_unix = Some(now);
+            entry.bundled = false;
         }
     }
 
@@ -106,17 +182,40 @@ impl RuntimeLists {
     /// The category `services` expects service JSON; every other category is
     /// parsed as a domain list (ABP `||domain^` and hosts syntax accepted) and
     /// replaces the previous content of that parental category.
-    pub fn apply_content(&self, category: &str, content: &str) -> Result<(), String> {
-        if category.eq_ignore_ascii_case("services") {
+    pub fn apply_content(&self, category: &str, content: &str) -> Result<u64, String> {
+        let entries = if category.eq_ignore_ascii_case("services") {
             let registry = ServiceRegistry::from_json(content).map_err(|e| e.to_string())?;
+            let entries = registry.service_count() as u64;
             self.services.store(Arc::new(registry));
-            return Ok(());
-        }
+            entries
+        } else {
+            let entries = content
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim();
+                    !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with('!')
+                })
+                .count() as u64;
+            let mut parental = (*self.parental.load_full()).clone();
+            parental.set_category_list(category, content);
+            self.parental.store(Arc::new(parental));
+            entries
+        };
 
-        let mut parental = (*self.parental.load_full()).clone();
-        parental.set_category_list(category, content);
-        self.parental.store(Arc::new(parental));
-        Ok(())
+        if let Ok(mut statuses) = self.statuses.write() {
+            let entry = statuses
+                .entry(category.to_string())
+                .or_insert_with(|| RuntimeListStatus {
+                    category: category.to_string(),
+                    source_url: None,
+                    last_refresh_unix: None,
+                    entries: 0,
+                    bundled: false,
+                });
+            entry.entries = entries;
+            entry.bundled = false;
+        }
+        Ok(entries)
     }
 }
 
@@ -166,6 +265,32 @@ mod tests {
         let services = store.services();
         assert!(services.is_service_domain("custom", "custom.example"));
         assert!(!services.is_service_domain("tiktok", "tiktok.com"));
+    }
+
+    #[test]
+    fn test_refresh_status_tracking() {
+        let store = store();
+        let bundled = store.statuses();
+        assert!(bundled.iter().any(|s| s.category == "adult" && s.bundled));
+
+        let entries = store
+            .apply_content("adult", "a.example\nb.example\n# comment\n")
+            .unwrap();
+        assert_eq!(entries, 2);
+        store.mark_refreshed("adult", "https://lists.example.com/adult.txt");
+
+        let status = store
+            .statuses()
+            .into_iter()
+            .find(|s| s.category == "adult")
+            .unwrap();
+        assert!(!status.bundled);
+        assert_eq!(status.entries, 2);
+        assert_eq!(
+            status.source_url.as_deref(),
+            Some("https://lists.example.com/adult.txt")
+        );
+        assert!(status.last_refresh_unix.is_some());
     }
 
     #[test]

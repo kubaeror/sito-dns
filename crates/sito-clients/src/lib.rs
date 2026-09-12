@@ -25,7 +25,7 @@ pub use parental::ParentalRegistry;
 pub use policy::EffectivePolicy;
 pub use registry::{ClientRegistry, RouterOsLease, UnidentifiedClient};
 pub use routeros::{RouterOsConfig, RouterOsError, fetch_routeros_leases, spawn_routeros_sync};
-pub use runtime_lists::{ListCategoriesConfig, ListSourceConfig, RuntimeLists};
+pub use runtime_lists::{ListCategoriesConfig, ListSourceConfig, RuntimeListStatus, RuntimeLists};
 pub use safe_search::{YouTubeSafeSearchMode, match_safe_search};
 pub use schedule::{Schedule, ScheduleError};
 pub use services::ServiceRegistry;

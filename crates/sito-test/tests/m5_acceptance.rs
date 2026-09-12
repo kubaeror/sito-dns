@@ -65,9 +65,14 @@ async fn create_test_context(temp_dir: &Path) -> (ServerContext, PathBuf, QueryL
         clients.clone(),
         rewrites.clone(),
     ));
+    let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
+        Arc::new(sito_clients::ParentalRegistry::bundled()),
+        Arc::new(sito_clients::ServiceRegistry::bundled()),
+    ));
     let ctx = ServerContext {
         config: config_arc,
         runtime,
+        runtime_lists,
         config_path: config_path.clone(),
         auth_mgr,
         stats_db,

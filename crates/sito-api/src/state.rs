@@ -22,6 +22,8 @@ pub struct ServerContext {
     pub config: Arc<ArcSwap<Config>>,
     /// Atomic view over config, clients and rewrites for the DNS pipeline.
     pub runtime: Arc<sito_runtime::RuntimeState>,
+    /// Hot-swappable parental/service registries and their refresh status.
+    pub runtime_lists: Arc<sito_clients::RuntimeLists>,
     pub config_path: PathBuf,
     pub auth_mgr: Arc<AuthManager>,
     pub stats_db: StatsDb,

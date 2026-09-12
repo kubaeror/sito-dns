@@ -374,6 +374,7 @@ pub async fn run_server_full(
     let server_ctx = sito_api::ServerContext {
         config: config_arc.clone(),
         runtime: runtime.clone(),
+        runtime_lists: runtime_lists.clone(),
         config_path: config_path_buf.clone(),
         auth_mgr,
         stats_db: stats_db.clone(),
@@ -973,11 +974,15 @@ pub(crate) async fn run_list_refresh(
                 let cache_name = format!("integration-{name}");
                 match fetcher.fetch_or_cached(&cache_name, &url, &data_dir).await {
                     Ok(content) => match store.apply_content(&name, &content) {
-                        Ok(()) => info!(
-                            category = %name,
-                            url = %url,
-                            "Refreshed curated list category"
-                        ),
+                        Ok(entries) => {
+                            store.mark_refreshed(&name, &url);
+                            info!(
+                                category = %name,
+                                url = %url,
+                                entries,
+                                "Refreshed curated list category"
+                            );
+                        }
                         Err(e) => warn!(
                             category = %name,
                             "Ignoring invalid refreshed curated list: {e}"

@@ -736,6 +736,18 @@ mod tests {
             !store.parental().matches_category("adult", "pornhub.com"),
             "refreshed list must replace the bundled fallback"
         );
+        let status = store
+            .statuses()
+            .into_iter()
+            .find(|status| status.category == "adult")
+            .expect("adult status");
+        assert!(!status.bundled);
+        assert_eq!(status.entries, 2);
+        assert_eq!(
+            status.source_url.as_deref(),
+            Some(format!("file://{}", source_path.display()).as_str())
+        );
+        assert!(status.last_refresh_unix.is_some());
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), refresh_handle).await;

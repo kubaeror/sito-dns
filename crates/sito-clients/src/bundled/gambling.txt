@@ -1,3 +1,5 @@
+# Curated gambling fallback list (built-in, minimal).
+# Runtime refresh via [integrations.lists] replaces this content.
 bet365.com
 pokerstars.com
 bwin.com
@@ -8,5 +10,33 @@ unibet.com
 draftkings.com
 fanduel.com
 betway.com
-ladbrokes.com
+betano.com
+1xbet.com
+betwinner.com
+melbet.com
 pinnacle.com
+22bet.com
+leovegas.com
+jackpotcitycasino.com
+spin.com
+royalpanda.com
+casumo.com
+betsson.com
+nordicbet.com
+coolbet.com
+smarkets.com
+betfred.com
+paddypower.com
+ladbrokes.com
+coral.co.uk
+marathonbet.com
+bovada.lv
+mybookie.ag
+betonline.ag
+ignitioncasino.eu
+slots.lv
+caesars.com
+mgmresorts.com
+wynnbet.com
+pointsbet.com
+barstoolsportsbook.com
