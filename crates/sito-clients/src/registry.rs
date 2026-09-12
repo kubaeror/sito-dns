@@ -67,16 +67,6 @@ impl ClientRegistry {
         *self.routeros_leases.write().unwrap() = leases;
     }
 
-    /// Get list of detected but undefined clients.
-    pub fn get_unidentified_clients(&self) -> Vec<UnidentifiedClient> {
-        self.unidentified_clients
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect()
-    }
-
     /// Resolves an incoming query's ClientContext to an EffectivePolicy,
     /// and populates any missing fields (client_name, group, mac) in `ctx`.
     pub fn resolve(&self, ctx: &mut ClientContext, now: DateTime<Utc>) -> EffectivePolicy {

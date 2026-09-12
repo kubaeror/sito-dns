@@ -275,12 +275,6 @@ pub struct CreateTokenRequest {
     pub scope: String,
 }
 
-/// Stub response for HA endpoints returning 501 Not Implemented.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct HaStubResponse {
-    pub message: String,
-}
-
 /// HA cluster status response for `GET /api/v1/ha/status`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HaStatusResponse {

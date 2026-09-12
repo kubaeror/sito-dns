@@ -478,7 +478,7 @@ integration point and should land last in its wave to avoid merge churn in
 - [x] WP-8 DoH dedicated hostname + ACME HTTP-01 on port 80
 - [x] WP-9 HA heartbeat watchdog, protocol role, `ca` validation
 - [x] WP-10 Updater artifact signature verification
-- [ ] WP-11 Architecture cleanup (pipeline, shutdown, dead code, precedence)
+- [ ] WP-11 Architecture cleanup — partial: cert-watcher lifetime fix, shutdown joins, dead-code sweep, allocation-free domain matching, deterministic pattern ordering done; remaining: `handle` helper extraction, `IntoArcSwap` removal
 - [ ] WP-12 Supply chain & installer ops — partial: `--uninstall`, `SITO_VERSION` pin, armv7 image done; SHA-pinned Actions, `deny.toml` tightening pending
 - [ ] WP-13 Test-suite quality — partial: wall-clock gating, `SITO_BENCH_TESTS`, ephemeral HA ports, chaos/promotion tightening, broadcast/monotonic/pubkey tests done; remaining: m9 grep-based checks, additional plaintext-WS/reconnect coverage
 - [ ] WP-14 Docs/OpenAPI automation — partial: CI drift check for `docs/openapi.json` done; config-reference generation pending

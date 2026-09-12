@@ -280,7 +280,7 @@ fn normalize_domain_key(domain: &str) -> String {
 
 fn matches_wildcard(candidate: &str, suffix: &str) -> bool {
     // `*.example.com` matches subdomains only, not the apex itself.
-    candidate.ends_with(&format!(".{suffix}"))
+    sito_core::matches_strict_subdomain(candidate, suffix)
 }
 
 fn parse_entry_record(rtype: &str, answer: &str) -> Option<(RecordType, LocalRecordData)> {

@@ -422,16 +422,6 @@ impl HostsFilterEngine {
         self.reload_internal(&config, true, Some(names)).await
     }
 
-    /// Reloads blocklists with an explicit option to enforce or bypass the >50% drop guard.
-    pub async fn reload_with_options(
-        &self,
-        config: &FilteringConfig,
-        apply_drop_guard: bool,
-    ) -> Result<usize, FilterError> {
-        self.config.store(Arc::new(config.clone()));
-        self.reload_internal(config, apply_drop_guard, None).await
-    }
-
     async fn reload_internal(
         &self,
         config: &FilteringConfig,
@@ -537,7 +527,10 @@ impl HostsFilterEngine {
 
     /// Spawns a background task that refreshes blocklists according to their
     /// per-list `refresh_hours` (falling back to `refresh_interval_hours`).
-    pub fn spawn_refresh_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_refresh_task(
+        self: Arc<Self>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut next_due: FnvHashMap<String, Instant> = FnvHashMap::default();
             loop {
@@ -547,7 +540,15 @@ impl HostsFilterEngine {
                 };
 
                 if due.is_empty() {
-                    tokio::time::sleep(sleep_for).await;
+                    tokio::select! {
+                        () = tokio::time::sleep(sleep_for) => {}
+                        res = shutdown_rx.changed() => {
+                            if res.is_err() || *shutdown_rx.borrow() {
+                                info!("Filter refresh task shutting down");
+                                break;
+                            }
+                        }
+                    }
                     continue;
                 }
 

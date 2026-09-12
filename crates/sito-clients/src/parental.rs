@@ -65,9 +65,9 @@ impl ParentalRegistry {
             return true;
         }
 
-        // Check suffix subdomains
+        // Check suffix subdomains (allocation-free)
         for blocked in domains {
-            if q.ends_with(&format!(".{blocked}")) {
+            if sito_core::matches_strict_subdomain(&q, blocked) {
                 return true;
             }
         }

@@ -3186,18 +3186,6 @@
           }
         }
       },
-      "HaStubResponse": {
-        "type": "object",
-        "description": "Stub response for HA endpoints returning 501 Not Implemented.",
-        "required": [
-          "message"
-        ],
-        "properties": {
-          "message": {
-            "type": "string"
-          }
-        }
-      },
       "InvalidateCacheQuery": {
         "type": "object",
         "description": "Query parameters for cache invalidation.",

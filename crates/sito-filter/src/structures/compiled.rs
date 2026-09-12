@@ -152,7 +152,10 @@ impl RuleSetBuilder {
         for (prefix, rule_id) in self.prefixes {
             prefix_map.entry(prefix).or_default().push(rule_id);
         }
-        let prefixes: Vec<(String, Vec<u32>)> = prefix_map.into_iter().collect();
+        // Deterministic order (by lowest rule id) so candidate precedence does
+        // not depend on hash iteration order.
+        let mut prefixes: Vec<(String, Vec<u32>)> = prefix_map.into_iter().collect();
+        prefixes.sort_by_key(|(_, rules)| rules.iter().copied().min().unwrap_or(u32::MAX));
 
         // 3. Aho-Corasick for substrings
         let (ac, ac_pattern_to_rules) = if self.substrings.is_empty() {
@@ -162,9 +165,11 @@ impl RuleSetBuilder {
             for (sub, rule_id) in self.substrings {
                 unique_subs.entry(sub).or_default().push(rule_id);
             }
-            let mut pat_strings = Vec::with_capacity(unique_subs.len());
-            let mut pat_to_rules = Vec::with_capacity(unique_subs.len());
-            for (sub, rules) in unique_subs {
+            let mut entries: Vec<(String, Vec<u32>)> = unique_subs.into_iter().collect();
+            entries.sort_by_key(|(_, rules)| rules.iter().copied().min().unwrap_or(u32::MAX));
+            let mut pat_strings = Vec::with_capacity(entries.len());
+            let mut pat_to_rules = Vec::with_capacity(entries.len());
+            for (sub, rules) in entries {
                 pat_strings.push(sub);
                 pat_to_rules.push(rules);
             }
@@ -196,9 +201,11 @@ impl RuleSetBuilder {
             for (pattern, rule_id) in self.regexes {
                 unique_re.entry(pattern).or_default().push(rule_id);
             }
-            let mut pat_strings = Vec::with_capacity(unique_re.len());
-            let mut pat_to_rules = Vec::with_capacity(unique_re.len());
-            for (pat, rules) in unique_re {
+            let mut regex_entries: Vec<(String, Vec<u32>)> = unique_re.into_iter().collect();
+            regex_entries.sort_by_key(|(_, rules)| rules.iter().copied().min().unwrap_or(u32::MAX));
+            let mut pat_strings = Vec::with_capacity(regex_entries.len());
+            let mut pat_to_rules = Vec::with_capacity(regex_entries.len());
+            for (pat, rules) in regex_entries {
                 pat_strings.push(pat);
                 pat_to_rules.push(rules);
             }

@@ -72,7 +72,7 @@ impl ServiceRegistry {
         let q = query_domain.trim_end_matches('.').to_ascii_lowercase();
 
         for rule in rules {
-            if q == *rule || q.ends_with(&format!(".{rule}")) {
+            if sito_core::matches_domain_suffix(&q, rule) {
                 return true;
             }
         }
@@ -89,13 +89,6 @@ impl ServiceRegistry {
         services
             .into_iter()
             .find(|&svc| self.is_service_domain(svc, query_domain))
-    }
-
-    /// Returns list of available service identifiers.
-    pub fn available_services(&self) -> Vec<&str> {
-        let mut list: Vec<&str> = self.services.keys().map(String::as_str).collect();
-        list.sort_unstable();
-        list
     }
 }
 

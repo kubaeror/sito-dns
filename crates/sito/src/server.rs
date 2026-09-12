@@ -116,7 +116,9 @@ pub async fn run_server_full(
     let filter_engine = Arc::new(
         HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
     );
-    let _refresh_handle = filter_engine.clone().spawn_refresh_task();
+    let _refresh_handle = filter_engine
+        .clone()
+        .spawn_refresh_task(shutdown_rx.clone());
 
     // Initialize DNSSEC validator
     let dnssec = Arc::new(DnssecValidator::from_config(&config.dns.dnssec));
@@ -599,6 +601,8 @@ pub async fn run_server_full(
 
     let http01_challenges = Arc::new(dashmap::DashMap::<String, String>::new());
     let challenge_keys = Arc::new(dashmap::DashMap::new());
+    // Kept alive for the lifetime of the server so certificate hot-reload works.
+    let mut cert_watchers: Vec<sito_transport::CertWatcher> = Vec::new();
 
     let (dot_acceptor_mgr, doh_acceptor_mgr, doq_acceptor_mgr, doh3_acceptor_mgr) =
         if let (Some(cert), Some(key)) = (&effective_cert, &effective_key) {
@@ -612,7 +616,10 @@ pub async fn run_server_full(
             ) {
                 Ok(cfg) => {
                     let mgr = TlsAcceptorManager::with_challenge_keys(cfg, challenge_keys.clone());
-                    let _ = CertWatcher::start(cert, key, &sni_tuples, &doh_alpn, mgr.clone());
+                    match CertWatcher::start(cert, key, &sni_tuples, &doh_alpn, mgr.clone()) {
+                        Ok(watcher) => cert_watchers.push(watcher),
+                        Err(e) => warn!("Certificate watcher failed to start: {e}"),
+                    }
                     Some(mgr)
                 }
                 Err(e) => {
@@ -625,7 +632,10 @@ pub async fn run_server_full(
             let dot_mgr = match load_server_config(cert, key, &sni_tuples, dot_alpn.clone()) {
                 Ok(cfg) => {
                     let mgr = TlsAcceptorManager::new(cfg);
-                    let _ = CertWatcher::start(cert, key, &sni_tuples, &dot_alpn, mgr.clone());
+                    match CertWatcher::start(cert, key, &sni_tuples, &dot_alpn, mgr.clone()) {
+                        Ok(watcher) => cert_watchers.push(watcher),
+                        Err(e) => warn!("Certificate watcher failed to start: {e}"),
+                    }
                     Some(mgr)
                 }
                 Err(e) => {
@@ -638,7 +648,10 @@ pub async fn run_server_full(
             let doq_mgr = match load_server_config(cert, key, &sni_tuples, doq_alpn.clone()) {
                 Ok(cfg) => {
                     let mgr = TlsAcceptorManager::new(cfg);
-                    let _ = CertWatcher::start(cert, key, &sni_tuples, &doq_alpn, mgr.clone());
+                    match CertWatcher::start(cert, key, &sni_tuples, &doq_alpn, mgr.clone()) {
+                        Ok(watcher) => cert_watchers.push(watcher),
+                        Err(e) => warn!("Certificate watcher failed to start: {e}"),
+                    }
                     Some(mgr)
                 }
                 Err(e) => {
@@ -651,7 +664,10 @@ pub async fn run_server_full(
             let doh3_mgr = match load_server_config(cert, key, &sni_tuples, doh3_alpn.clone()) {
                 Ok(cfg) => {
                     let mgr = TlsAcceptorManager::new(cfg);
-                    let _ = CertWatcher::start(cert, key, &sni_tuples, &doh3_alpn, mgr.clone());
+                    match CertWatcher::start(cert, key, &sni_tuples, &doh3_alpn, mgr.clone()) {
+                        Ok(watcher) => cert_watchers.push(watcher),
+                        Err(e) => warn!("Certificate watcher failed to start: {e}"),
+                    }
                     Some(mgr)
                 }
                 Err(e) => {
@@ -792,6 +808,14 @@ pub async fn run_server_full(
 
     info!("Flushing and shutting down query log writer...");
     querylog_writer.shutdown().await;
+
+    // Join listener tasks so sockets/tasks are fully released before exit.
+    for handle in all_handles {
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    // Stop certificate watchers after listeners have drained.
+    drop(cert_watchers);
 
     info!("Graceful shutdown complete, exiting");
     Ok(())

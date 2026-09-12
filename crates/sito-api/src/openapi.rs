@@ -93,7 +93,6 @@ use utoipa::OpenApi;
             crate::models::TotpVerifyRequest,
             crate::models::TotpConfirmRequest,
             crate::models::CreateTokenRequest,
-            crate::models::HaStubResponse,
             crate::models::HaStatusResponse,
             crate::models::HaSlaveSummary,
             crate::models::HaSlaveStatsSummary,

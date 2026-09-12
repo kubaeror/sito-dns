@@ -258,7 +258,6 @@ impl DnsCache {
             authority_ttls,
             additional_ttls,
             hits: Arc::new(AtomicU32::new(0)),
-            is_negative,
             estimated_bytes,
         };
 
@@ -287,10 +286,5 @@ impl DnsCache {
     /// Approximate memory weight of cached items in bytes.
     pub fn weighted_size(&self) -> u64 {
         self.cache.weighted_size()
-    }
-
-    /// Number of active cache entries.
-    pub fn entry_count(&self) -> u64 {
-        self.cache.entry_count()
     }
 }

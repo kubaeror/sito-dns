@@ -329,7 +329,10 @@ ignoring the configured `dns.bind`.
 > (`--uninstall`, `SITO_VERSION` pin, armv7 image; SHA-pinned Actions
 > pending); **WP-13 (test quality) — partial** (perf budgets behind
 > `SITO_BENCH_TESTS`, ephemeral HA ports, real mid-push chaos test,
-> monotonic/broadcast/pubkey tests; remaining items tracked in the plan).
+> monotonic/broadcast/pubkey tests; remaining items tracked in the plan);
+> **WP-11 (architecture cleanup) — partial** (certificate watcher lifetime bug
+> fix, shutdown joins, dead-code removal, allocation-free suffix matching,
+> deterministic pattern order; pipeline helper extraction pending).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated
