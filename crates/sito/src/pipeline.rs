@@ -785,11 +785,17 @@ impl QueryHandler for DnsPipeline {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as u32;
-                    let dnssec_outcome = self.dnssec.validate_response(
-                        &mut upstream_resp,
-                        Some(upstream_name.as_str()),
-                        now,
-                    );
+                    let key_fetcher =
+                        sito_upstream::UpstreamKeyFetcher::new(Arc::clone(&effective_upstream));
+                    let dnssec_outcome = self
+                        .dnssec
+                        .validate_with_key_fetcher(
+                            &mut upstream_resp,
+                            Some(upstream_name.as_str()),
+                            now,
+                            &key_fetcher,
+                        )
+                        .await;
                     if let Some(ref m) = self.metrics
                         && matches!(dnssec_outcome, sito_dnssec::ValidationOutcome::Bogus { .. })
                     {

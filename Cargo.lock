@@ -3104,6 +3104,7 @@ name = "sito-core"
 version = "1.4.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "hickory-proto",
  "serde",
  "thiserror",
@@ -3116,12 +3117,14 @@ name = "sito-dnssec"
 version = "1.4.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "base64 0.23.1",
  "dashmap",
  "hickory-proto",
  "sito-core",
  "sito-proto",
  "time",
+ "tokio",
  "tracing",
 ]
 

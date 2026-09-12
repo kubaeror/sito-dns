@@ -5,6 +5,7 @@
 
 pub mod client;
 pub mod config;
+pub mod dnssec_fetch;
 pub mod domain;
 pub mod engine;
 pub mod error;
@@ -17,6 +18,7 @@ pub use config::{
     FilteringConfig, PerDomainUpstream, ServerConfig, SniCertConfig, TlsConfig, UpstreamConfig,
     UpstreamStrategy,
 };
+pub use dnssec_fetch::DnssecKeyFetcher;
 pub use domain::{matches_domain_suffix, matches_strict_subdomain};
 pub use engine::FilterEngine;
 pub use error::{ConfigError, UpstreamError};

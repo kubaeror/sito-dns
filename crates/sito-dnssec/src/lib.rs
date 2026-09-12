@@ -18,6 +18,7 @@ use hickory_proto::dnssec::{PublicKeyBuf, TrustAnchors, Verifier};
 use hickory_proto::op::{Edns, Message, ResponseCode};
 use hickory_proto::rr::rdata::opt::EdnsOption;
 use hickory_proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
+use sito_core::DnssecKeyFetcher;
 use sito_core::config::DnssecConfig;
 
 /// DNSSEC validation mode.
@@ -213,6 +214,140 @@ impl KeyCache {
     }
 }
 
+/// Unique signer zones referenced by RRSIG records in a message.
+fn collect_rrsig_signers(response: &Message) -> Vec<Name> {
+    let mut seen = HashSet::new();
+    let mut signers = Vec::new();
+    for record in response
+        .answers
+        .iter()
+        .chain(response.authorities.iter())
+        .chain(response.additionals.iter())
+    {
+        let signer = match &record.data {
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some(&rrsig.input().signer_name),
+            RData::DNSSEC(DNSSECRData::SIG(sig)) => Some(&sig.input().signer_name),
+            _ => None,
+        };
+        if let Some(signer) = signer
+            && seen.insert(LowerName::from(signer))
+        {
+            signers.push(signer.clone());
+        }
+    }
+    signers
+}
+
+/// Copies DNSSEC-relevant records (DNSKEY/DS/RRSIG/SIG) from a fetched message
+/// into the response's additional section for chain validation.
+fn append_dnssec_records(response: &mut Message, fetched: &Message) {
+    for record in fetched
+        .answers
+        .iter()
+        .chain(fetched.authorities.iter())
+        .chain(fetched.additionals.iter())
+    {
+        if matches!(
+            record.data,
+            RData::DNSSEC(
+                DNSSECRData::DNSKEY(_)
+                    | DNSSECRData::DS(_)
+                    | DNSSECRData::RRSIG(_)
+                    | DNSSECRData::SIG(_)
+            )
+        ) {
+            response.additionals.push(record.clone());
+        }
+    }
+}
+
+/// Whether a fetched DNSKEY message contains a key anchored for `zone`.
+fn fetched_has_anchor(fetched: &Message, zone: &Name, anchors: &TrustAnchors) -> bool {
+    let lower = LowerName::from(zone);
+    fetched
+        .answers
+        .iter()
+        .chain(fetched.authorities.iter())
+        .chain(fetched.additionals.iter())
+        .any(|record| {
+            record.name == *zone
+                && matches!(&record.data, RData::DNSSEC(DNSSECRData::DNSKEY(key))
+                    if anchors.contains(key.public_key())
+                        || anchors.contains_with_name(key.public_key(), &lower))
+        })
+}
+
+/// Whether a fetched message contains DS records for `zone`.
+fn fetched_has_ds(fetched: &Message, zone: &Name) -> bool {
+    fetched
+        .answers
+        .iter()
+        .chain(fetched.authorities.iter())
+        .chain(fetched.additionals.iter())
+        .any(|record| {
+            record.name == *zone && matches!(&record.data, RData::DNSSEC(DNSSECRData::DS(_)))
+        })
+}
+
+/// Fetches the DNSKEY/DS chain for `zone`, appending records to `response`.
+///
+/// Returns `Some(())` when at least one lookup succeeded. The walk stops at an
+/// anchored DNSKEY, at an unsigned delegation (no DS), at the root, when the
+/// zone was already visited, or when the budget is exhausted.
+async fn fetch_zone_chain(
+    anchors: &TrustAnchors,
+    fetcher: &dyn DnssecKeyFetcher,
+    zone: &Name,
+    budget: &mut u8,
+    visited: &mut HashSet<LowerName>,
+    response: &mut Message,
+) -> Option<()> {
+    let mut current = zone.clone();
+    let mut depth = 0u8;
+    let mut fetched_any = false;
+
+    loop {
+        if *budget == 0 || depth > 12 || current.is_root() {
+            break;
+        }
+        if !visited.insert(LowerName::from(&current)) {
+            break;
+        }
+
+        *budget -= 1;
+        let Ok(dnskey_message) = fetcher.query(&current, RecordType::DNSKEY).await else {
+            break;
+        };
+        append_dnssec_records(response, &dnskey_message);
+        fetched_any = true;
+        if fetched_has_anchor(&dnskey_message, &current, anchors) {
+            return Some(());
+        }
+
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        let Ok(ds_message) = fetcher.query(&current, RecordType::DS).await else {
+            break;
+        };
+        append_dnssec_records(response, &ds_message);
+        if !fetched_has_ds(&ds_message, &current) {
+            // Unsigned delegation: nothing further to walk.
+            return Some(());
+        }
+
+        let parent = current.base_name();
+        if parent == current {
+            break;
+        }
+        current = parent;
+        depth += 1;
+    }
+
+    fetched_any.then_some(())
+}
+
 /// Verifies `rrsig` over the RRset it covers using `key`.
 fn verify_rrsig_covered(response: &Message, owner: &Name, rrsig: &SIG, key: &DNSKEY) -> bool {
     let type_covered = rrsig.input().type_covered;
@@ -346,6 +481,64 @@ impl DnssecValidator {
             let n = nta.trim_end_matches('.').to_ascii_lowercase();
             norm == n || norm.ends_with(&format!(".{n}"))
         })
+    }
+
+    /// Validates a response, resolving missing DNSKEY/DS records through the
+    /// fetcher when the in-response chain is incomplete.
+    ///
+    /// The synchronous chain walk runs first. Only an `Indeterminate` result
+    /// (signatures verified but not linked to an anchor) triggers network
+    /// fetches, bounded to a small per-query budget; fetched records are
+    /// appended temporarily for validation and removed again.
+    pub async fn validate_with_key_fetcher(
+        &self,
+        response: &mut Message,
+        upstream: Option<&str>,
+        now: u32,
+        fetcher: &dyn DnssecKeyFetcher,
+    ) -> ValidationOutcome {
+        let baseline = self.validate_response(response, upstream, now);
+        if baseline != ValidationOutcome::Indeterminate || self.mode == DnssecMode::Disabled {
+            return baseline;
+        }
+
+        let signers = collect_rrsig_signers(response);
+        if signers.is_empty() {
+            return baseline;
+        }
+
+        let original_additionals = response.additionals.len();
+        let anchors = self.trust_anchors.load();
+        let mut budget = 6u8;
+        let mut visited = HashSet::new();
+        let mut fetched_any = false;
+        for signer in signers.iter().take(4) {
+            if budget == 0 {
+                break;
+            }
+            if fetch_zone_chain(
+                &anchors,
+                fetcher,
+                signer,
+                &mut budget,
+                &mut visited,
+                response,
+            )
+            .await
+            .is_some()
+            {
+                fetched_any = true;
+            }
+        }
+
+        if !fetched_any {
+            response.additionals.truncate(original_additionals);
+            return baseline;
+        }
+
+        let outcome = self.validate_response(response, upstream, now);
+        response.additionals.truncate(original_additionals);
+        outcome
     }
 
     /// Walks DS/DNSKEY links present in the response to extend trust from the
@@ -936,6 +1129,219 @@ mod tests {
             validator.metrics.get_bogus("1.1.1.1", "Signature expired"),
             1
         );
+    }
+
+    use sito_core::error::UpstreamError;
+
+    struct StaticFetcher {
+        responses: std::collections::HashMap<(LowerName, RecordType), Message>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StaticFetcher {
+        fn new() -> Self {
+            Self {
+                responses: std::collections::HashMap::new(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn with(mut self, name: &Name, rtype: RecordType, message: Message) -> Self {
+            self.responses
+                .insert((LowerName::from(name), rtype), message);
+            self
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DnssecKeyFetcher for StaticFetcher {
+        async fn query(&self, name: &Name, rtype: RecordType) -> Result<Message, UpstreamError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .responses
+                .get(&(LowerName::from(name), rtype))
+                .cloned()
+                .unwrap_or_else(|| Message::new(0, MessageType::Response, OpCode::Query)))
+        }
+    }
+
+    fn fetched_dnskey_message(owner: &Name, keys: &[DNSKEY], signature: Option<Record>) -> Message {
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+        for key in keys {
+            message.additionals.push(Record::from_rdata(
+                owner.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(key.clone())),
+            ));
+        }
+        if let Some(signature) = signature {
+            message.additionals.push(signature);
+        }
+        message
+    }
+
+    fn signed_a_response(
+        origin: &Name,
+        signer: &hickory_proto::dnssec::DnssecSigner,
+    ) -> (Record, Record) {
+        use hickory_proto::rr::RecordSet;
+        let answer = Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(203, 0, 113, 7))),
+        );
+        let mut set = RecordSet::new(origin.clone(), RecordType::A, 0);
+        set.insert(answer.clone(), 0);
+        (answer, sign_test_rrset(&set, signer))
+    }
+
+    #[tokio::test]
+    async fn test_chain_fetch_resolves_ksk_zsk() {
+        use hickory_proto::rr::RecordSet;
+
+        let (origin, ksk, ksk_signer) = create_test_signer("fetch.example.");
+        let (_name, zsk, zsk_signer) = create_test_signer("fetch.example.");
+
+        let (answer, answer_sig) = signed_a_response(&origin, &zsk_signer);
+
+        let mut key_set = RecordSet::new(origin.clone(), RecordType::DNSKEY, 0);
+        key_set.insert(
+            Record::from_rdata(
+                origin.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(ksk.clone())),
+            ),
+            0,
+        );
+        key_set.insert(
+            Record::from_rdata(
+                origin.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(zsk.clone())),
+            ),
+            0,
+        );
+        let key_sig = sign_test_rrset(&key_set, &ksk_signer);
+
+        let fetcher = StaticFetcher::new().with(
+            &origin,
+            RecordType::DNSKEY,
+            fetched_dnskey_message(&origin, &[ksk.clone(), zsk.clone()], Some(key_sig)),
+        );
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(ksk.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let mut response = Message::new(20, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(origin.clone(), RecordType::A));
+        response.answers.push(answer);
+        response.answers.push(answer_sig);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("test"), now, &fetcher)
+            .await;
+
+        assert_eq!(outcome, ValidationOutcome::Secure);
+        assert!(response.metadata.authentic_data);
+        assert_eq!(fetcher.calls(), 1);
+        // Fetched keys must not leak into the client response.
+        assert!(
+            response
+                .additionals
+                .iter()
+                .all(|record| !matches!(record.data, RData::DNSSEC(DNSSECRData::DNSKEY(_))))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chain_fetch_resolves_ds_delegation() {
+        use hickory_proto::dnssec::DigestType;
+        use hickory_proto::rr::RecordSet;
+
+        let (parent, parent_key, parent_signer) = create_test_signer("example.");
+        let (child, child_key, child_signer) = create_test_signer("sub.example.");
+
+        let (answer, answer_sig) = signed_a_response(&child, &child_signer);
+
+        let ds = DS::from_key(child_key.public_key(), &child, DigestType::SHA256).unwrap();
+        let ds_record = Record::from_rdata(child.clone(), 300, RData::DNSSEC(DNSSECRData::DS(ds)));
+        let mut ds_set = RecordSet::new(child.clone(), RecordType::DS, 0);
+        ds_set.insert(ds_record.clone(), 0);
+        let ds_sig = sign_test_rrset(&ds_set, &parent_signer);
+        let mut ds_message = Message::new(0, MessageType::Response, OpCode::Query);
+        ds_message.authorities.push(ds_record);
+        ds_message.authorities.push(ds_sig);
+
+        let fetcher = StaticFetcher::new()
+            .with(
+                &child,
+                RecordType::DNSKEY,
+                fetched_dnskey_message(&child, &[child_key], None),
+            )
+            .with(&child, RecordType::DS, ds_message)
+            .with(
+                &parent,
+                RecordType::DNSKEY,
+                fetched_dnskey_message(&parent, &[parent_key.clone()], None),
+            );
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(parent_key.public_key(), LowerName::from(&parent));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let mut response = Message::new(21, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(child.clone(), RecordType::A));
+        response.answers.push(answer);
+        response.answers.push(answer_sig);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("test"), now, &fetcher)
+            .await;
+
+        assert_eq!(outcome, ValidationOutcome::Secure);
+        assert!(response.metadata.authentic_data);
+        assert_eq!(fetcher.calls(), 3);
+        assert!(response.additionals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chain_fetch_budget_for_unsigned_delegation() {
+        let (origin, _zsk, zsk_signer) = create_test_signer("unsigned.example.");
+        let (answer, answer_sig) = signed_a_response(&origin, &zsk_signer);
+
+        let fetcher = StaticFetcher::new();
+
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+
+        let mut response = Message::new(22, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(origin.clone(), RecordType::A));
+        response.answers.push(answer);
+        response.answers.push(answer_sig);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("test"), now, &fetcher)
+            .await;
+
+        assert_eq!(outcome, ValidationOutcome::Indeterminate);
+        // One DNSKEY and one DS lookup for the signer zone, then stop.
+        assert_eq!(fetcher.calls(), 2);
+        assert!(response.additionals.is_empty());
     }
 
     #[test]

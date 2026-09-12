@@ -8,6 +8,7 @@ description = "Core contracts, shared types, verdicts, and traits for sito"
 
 [dependencies]
 arc-swap.workspace = true
+async-trait.workspace = true
 hickory-proto.workspace = true
 serde.workspace = true
 thiserror.workspace = true
