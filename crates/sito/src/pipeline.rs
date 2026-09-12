@@ -2,12 +2,14 @@
 
 use arc_swap::ArcSwap;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
-use hickory_proto::rr::{Name, RData, RecordType};
+use hickory_proto::rr::rdata::{A, AAAA, CNAME};
+use hickory_proto::rr::{Name, RData, Record, RecordType};
 use sito_cache::DnsCache;
 use sito_clients::{ClientRegistry, ParentalRegistry, ServiceRegistry, match_safe_search};
 use sito_core::FilterEngine;
 use sito_core::client::ClientContext;
 use sito_core::config::Config;
+use sito_core::verdict::{RewriteAction, Verdict};
 use sito_dnssec::DnssecValidator;
 use sito_filter::{AntiBypassRegistry, HostsFilterEngine};
 use sito_proto::synthesize_blocked_response;
@@ -152,6 +154,65 @@ fn make_blocked_response(
     blocked_resp
 }
 
+/// Builds a synthesized response for an ABP `$dnsrewrite` action.
+fn make_rewrite_response(query: &Message, action: &RewriteAction, query_id: u16) -> Message {
+    let RewriteAction::DnsRewrite {
+        rcode,
+        rtype,
+        value,
+    } = action
+    else {
+        // `SynthesizeAnswer` is not emitted by the current filter engine; return
+        // a plain NOERROR response for the query instead.
+        let mut resp = Message::new(query_id, MessageType::Response, OpCode::Query);
+        resp.metadata.recursion_desired = query.metadata.recursion_desired;
+        resp.metadata.recursion_available = true;
+        resp.queries.clone_from(&query.queries);
+        return resp;
+    };
+
+    let mut resp = Message::new(query_id, MessageType::Response, OpCode::Query);
+    resp.metadata.recursion_desired = query.metadata.recursion_desired;
+    resp.metadata.recursion_available = true;
+    resp.queries.clone_from(&query.queries);
+
+    resp.metadata.response_code = match rcode.to_ascii_uppercase().as_str() {
+        "NXDOMAIN" => ResponseCode::NXDomain,
+        "REFUSED" => ResponseCode::Refused,
+        "SERVFAIL" => ResponseCode::ServFail,
+        "FORMERR" => ResponseCode::FormErr,
+        "NOTIMP" => ResponseCode::NotImp,
+        _ => ResponseCode::NoError,
+    };
+
+    if resp.metadata.response_code == ResponseCode::NoError
+        && let (Some(rtype), Some(value)) = (rtype.as_deref(), value.as_deref())
+        && let Some(question) = query.queries.first()
+    {
+        let rtype = rtype.to_ascii_uppercase();
+        let rdata = match rtype.as_str() {
+            "A" => value
+                .parse::<std::net::Ipv4Addr>()
+                .ok()
+                .map(|ip| RData::A(A(ip))),
+            "AAAA" => value
+                .parse::<std::net::Ipv6Addr>()
+                .ok()
+                .map(|ip| RData::AAAA(AAAA(ip))),
+            "CNAME" => Name::from_str(value.trim_end_matches('.'))
+                .ok()
+                .map(|name| RData::CNAME(CNAME(name))),
+            _ => None,
+        };
+        if let Some(rdata) = rdata {
+            let record = Record::from_rdata(question.name().clone(), 60, rdata);
+            resp.answers.push(record);
+        }
+    }
+
+    resp
+}
+
 fn answers_contain_bypass_ip(
     anti_bypass: &AntiBypassRegistry,
     answers: &[hickory_proto::rr::Record],
@@ -243,6 +304,13 @@ impl QueryHandler for DnsPipeline {
         let mut client = client;
         let now = chrono::Utc::now();
         let policy = clients.resolve(&mut client, now);
+        if let Some(ref m) = self.metrics {
+            m.inc_clients_identified(if client.client_name.is_some() {
+                "identified"
+            } else {
+                "ip"
+            });
+        }
 
         let query_id = query.metadata.id;
         let request_id = rand::random::<u64>();
@@ -267,6 +335,10 @@ impl QueryHandler for DnsPipeline {
             let qtype = first_query.query_type();
             let qclass = first_query.query_class();
             let domain_str = qname.to_utf8();
+            let client_wants_dnssec = query
+                .edns
+                .as_ref()
+                .is_some_and(|edns| edns.flags().dnssec_ok);
 
             trace!(qname = %qname, qtype = ?qtype, "Processing DNS query");
 
@@ -295,27 +367,40 @@ impl QueryHandler for DnsPipeline {
             }
 
             // ADR-0007 Stage 1: $important filter rules (takes precedence over local rewrites)
+            let mut important_allowed = false;
             if policy.is_filtering_enabled
                 && let Some(verdict) = self.filter.evaluate_important(qname, qtype, &client)
-                && verdict.is_blocked()
             {
-                info!(
-                    qname = %qname,
-                    qtype = ?qtype,
-                    verdict = ?verdict,
-                    "Query blocked by $important filter rule"
-                );
-                let resp = make_blocked_response(
-                    &query,
-                    &config.filtering.blocking_mode,
-                    config.filtering.blocking_ttl,
-                    query_id,
-                );
-                return QueryOutcome::blocked(resp, None, None, domain_str, qtype);
+                match verdict {
+                    Verdict::Block(_) => {
+                        info!(
+                            qname = %qname,
+                            qtype = ?qtype,
+                            verdict = ?verdict,
+                            "Query blocked by $important filter rule"
+                        );
+                        let resp = make_blocked_response(
+                            &query,
+                            &config.filtering.blocking_mode,
+                            config.filtering.blocking_ttl,
+                            query_id,
+                        );
+                        return QueryOutcome::blocked(resp, None, None, domain_str, qtype);
+                    }
+                    Verdict::Rewrite(action) => {
+                        debug!(qname = %qname, "Query rewritten by $important rule");
+                        let resp = make_rewrite_response(&query, &action, query_id);
+                        return QueryOutcome::rewritten(resp, domain_str, qtype);
+                    }
+                    Verdict::Allow(_) => {
+                        // $important allow overrides rewrites and all standard blocks.
+                        important_allowed = true;
+                    }
+                }
             }
 
             // ADR-0007 Stage 2: Local DNS rewrites and auto-PTR
-            if let Some(records) = rewrites.lookup(qname, qtype, &client) {
+            if !important_allowed && let Some(records) = rewrites.lookup(qname, qtype, &client) {
                 trace!(
                     qname = %qname,
                     qtype = ?qtype,
@@ -328,7 +413,7 @@ impl QueryHandler for DnsPipeline {
             }
 
             // ADR-0007 Stage 3: Standard filtering, Parental Control, and Service Blocking
-            if policy.is_filtering_enabled {
+            if policy.is_filtering_enabled && !important_allowed {
                 // 3a. Parental Control categories (adult, gambling)
                 if policy.parental
                     && self.parental.matches_any_category(
@@ -388,25 +473,34 @@ impl QueryHandler for DnsPipeline {
 
                 // 3c. Standard filter rules
                 let verdict = self.filter.evaluate_standard(qname, qtype, &client);
-                if verdict.is_blocked() {
-                    info!(
-                        qname = %qname,
-                        qtype = ?qtype,
-                        verdict = ?verdict,
-                        "Query blocked by standard filter"
-                    );
-                    let resp = make_blocked_response(
-                        &query,
-                        &config.filtering.blocking_mode,
-                        config.filtering.blocking_ttl,
-                        query_id,
-                    );
-                    return QueryOutcome::blocked(resp, None, None, domain_str, qtype);
+                match verdict {
+                    Verdict::Block(_) => {
+                        info!(
+                            qname = %qname,
+                            qtype = ?qtype,
+                            verdict = ?verdict,
+                            "Query blocked by standard filter"
+                        );
+                        let resp = make_blocked_response(
+                            &query,
+                            &config.filtering.blocking_mode,
+                            config.filtering.blocking_ttl,
+                            query_id,
+                        );
+                        return QueryOutcome::blocked(resp, None, None, domain_str, qtype);
+                    }
+                    Verdict::Rewrite(action) => {
+                        debug!(qname = %qname, "Query rewritten by standard filter rule");
+                        let resp = make_rewrite_response(&query, &action, query_id);
+                        return QueryOutcome::rewritten(resp, domain_str, qtype);
+                    }
+                    Verdict::Allow(_) => {}
                 }
             }
 
             // ADR-0007 Stage 4: Safe Search CNAME rewrites (Google, Bing, YouTube, DuckDuckGo)
-            if policy.safe_search
+            if !important_allowed
+                && policy.safe_search
                 && let Some(target) = match_safe_search(&domain_str, policy.safe_search_youtube)
                 && let Ok(cname_target) =
                     Name::from_str(&format!("{}.", target.trim_end_matches('.')))
@@ -423,7 +517,23 @@ impl QueryHandler for DnsPipeline {
 
             // 5. Cache lookup
             if config.dns.cache.enabled {
-                if let Some(mut cached_resp) = self.cache.get(qname, qtype, qclass).await {
+                // Never serve an unvalidated cached answer to a DNSSEC-aware
+                // client while validation is enabled: force an upstream lookup.
+                let cached = match self.cache.get(qname, qtype, qclass).await {
+                    Some(resp)
+                        if client_wants_dnssec
+                            && self.dnssec.mode != sito_dnssec::DnssecMode::Disabled
+                            && !resp.metadata.authentic_data =>
+                    {
+                        debug!(
+                            qname = %qname,
+                            "Ignoring non-validated cache entry for DNSSEC-aware client"
+                        );
+                        None
+                    }
+                    other => other,
+                };
+                if let Some(mut cached_resp) = cached {
                     if bypass_check_needed
                         && answers_contain_bypass_ip(&self.anti_bypass, &cached_resp.answers)
                     {
@@ -487,8 +597,28 @@ impl QueryHandler for DnsPipeline {
             }
 
             // 6. Upstream resolution
-            match self.upstream.resolve_with_upstream(&query).await {
+            // Force the DNSSEC OK bit when validation is enabled so upstreams
+            // return RRSIGs even for non-DO clients.
+            let upstream_query = if self.dnssec.mode == sito_dnssec::DnssecMode::Disabled {
+                query.clone()
+            } else {
+                let mut q = query.clone();
+                let mut edns = q.edns.clone().unwrap_or_default();
+                edns.set_dnssec_ok(true);
+                edns.set_max_payload(config.dns.edns_udp_size.max(1232));
+                q.set_edns(edns);
+                q
+            };
+            let upstream_start = std::time::Instant::now();
+            match self.upstream.resolve_with_upstream(&upstream_query).await {
                 Ok((mut upstream_resp, upstream_name)) => {
+                    if let Some(ref m) = self.metrics {
+                        m.observe_upstream_rtt(
+                            &upstream_name,
+                            upstream_start.elapsed().as_secs_f64(),
+                        );
+                        m.set_upstream_health(&upstream_name, 1.0);
+                    }
                     upstream_resp.metadata.id = query_id;
 
                     // Anti-DoH bypass: inspect resolved A and AAAA records for known resolver IPs
@@ -551,8 +681,16 @@ impl QueryHandler for DnsPipeline {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as u32;
-                    let dnssec_outcome =
-                        self.dnssec.validate_response(&mut upstream_resp, None, now);
+                    let dnssec_outcome = self.dnssec.validate_response(
+                        &mut upstream_resp,
+                        Some(upstream_name.as_str()),
+                        now,
+                    );
+                    if let Some(ref m) = self.metrics
+                        && matches!(dnssec_outcome, sito_dnssec::ValidationOutcome::Bogus { .. })
+                    {
+                        m.inc_dnssec_bogus(&upstream_name);
+                    }
                     let dnssec_str = if self.dnssec.mode == sito_dnssec::DnssecMode::Disabled {
                         None
                     } else {
@@ -589,6 +727,9 @@ impl QueryHandler for DnsPipeline {
                         error = %e,
                         "Upstream resolution failed"
                     );
+                    if let Some(ref m) = self.metrics {
+                        m.inc_upstream_errors("all", &e.to_string());
+                    }
 
                     if config.dns.cache.enabled
                         && config.dns.cache.serve_stale_hours > 0
@@ -599,6 +740,9 @@ impl QueryHandler for DnsPipeline {
                             qname = %qname,
                             "Upstream failed, serving stale cached response (RFC 8767)"
                         );
+                        if let Some(ref m) = self.metrics {
+                            m.inc_cache_stale_served();
+                        }
                         stale_resp.metadata.id = query_id;
                         return QueryOutcome {
                             response: Some(stale_resp),

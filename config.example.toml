@@ -12,10 +12,14 @@ bind = ["0.0.0.0", "::"]
 port = 53
 dot_port = 853
 doh_port = 443
-doq_port = 853
+# DoQ is disabled by default because its default port (853/udp) conflicts
+# with DoT when bound on the same wildcard address.
+doq_port = 0
 edns_udp_size = 1232
 rate_limit_per_ip = 20
 max_tcp_connections = 256
+# Plaintext DoH is only started on loopback unless explicitly allowed here.
+allow_plaintext_doh = false
 
 [dns.cache]
 enabled = true
@@ -31,6 +35,8 @@ validate = false
 ntp = []
 
 [upstream]
+# Upstream schemes supported: tls:// (DoT) and plain host/IP (udp:// optional).
+# DoH (https://) and DoQ (quic://) upstreams are not implemented yet.
 servers = ["tls://dns.quad9.net", "1.1.1.1:53"]
 bootstrap = ["9.9.9.9", "149.112.112.112"]
 strategy = "failover"
@@ -51,8 +57,14 @@ custom_rules = [
     "127.0.0.1 tracker.bad.net"
 ]
 
+[privacy]
+anonymize_querylog = false
+
 [web]
 enabled = true
 bind = "0.0.0.0"
 port = 8080
 metrics_auth = true
+# When binding non-loopback over plain HTTP the admin interface is reachable
+# without transport encryption; use a TLS reverse proxy or [tls] in production.
+trusted_proxies = []

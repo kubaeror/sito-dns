@@ -435,11 +435,12 @@ impl CertWatcher {
                     "Detected change in TLS certificate/key files; reloading..."
                 );
 
-                match load_server_config(
+                match load_server_config_with_challenges(
                     &cert_path_clone,
                     &key_path_clone,
                     &sni_certs_clone,
                     alpn_clone.clone(),
+                    acceptor_mgr.challenge_keys(),
                 ) {
                     Ok(new_config) => {
                         acceptor_mgr.reload(new_config);

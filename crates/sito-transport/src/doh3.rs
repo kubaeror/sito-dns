@@ -18,6 +18,9 @@ use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
 use crate::tls::TlsAcceptorManager;
 
+/// Maximum accepted DoH request body: 65535 bytes (the DNS-over-TCP size ceiling).
+const MAX_DOH3_BODY_BYTES: usize = 65_535;
+
 /// Configuration options for the DoH3 listener.
 #[derive(Clone)]
 pub struct Doh3Config {
@@ -246,6 +249,21 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                         let mut body_bytes = Vec::new();
                                         while let Ok(Some(mut chunk)) = stream.recv_data().await {
                                             let remaining = chunk.remaining();
+                                            if body_bytes.len().saturating_add(remaining)
+                                                > MAX_DOH3_BODY_BYTES
+                                            {
+                                                warn!(
+                                                    "DoH3 request body from {} exceeds {} bytes; rejecting",
+                                                    peer_addr, MAX_DOH3_BODY_BYTES
+                                                );
+                                                let resp = http::Response::builder()
+                                                    .status(http::StatusCode::PAYLOAD_TOO_LARGE)
+                                                    .body(())
+                                                    .unwrap();
+                                                let _ = stream.send_response(resp).await;
+                                                let _ = stream.finish().await;
+                                                return;
+                                            }
                                             let mut chunk_buf = vec![0u8; remaining];
                                             chunk.copy_to_slice(&mut chunk_buf);
                                             body_bytes.extend_from_slice(&chunk_buf);

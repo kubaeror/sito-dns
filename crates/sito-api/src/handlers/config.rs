@@ -24,16 +24,24 @@ use crate::models::{
 };
 use crate::state::ServerContext;
 
+/// Returns true when a TOML key holds a secret value.
+fn is_sensitive_key(key: &str) -> bool {
+    matches!(
+        key,
+        "key" | "password" | "password_hash" | "secret" | "token" | "api_key" | "slave_token"
+    ) || key.ends_with("_token")
+        || key.ends_with("_password")
+        || key.ends_with("_secret")
+        || key.ends_with("_key")
+}
+
 /// Mask sensitive values (e.g. key = "...", password = "...") with "***"
 pub fn mask_sensitive_toml(toml_str: &str) -> String {
     let mut out = Vec::new();
     for line in toml_str.lines() {
         let trimmed = line.trim_start();
-        if (trimmed.starts_with("key =")
-            || trimmed.starts_with("password =")
-            || trimmed.starts_with("secret =")
-            || trimmed.starts_with("token =")
-            || trimmed.starts_with("password_hash ="))
+        let key = trimmed.split('=').next().unwrap_or("").trim();
+        if is_sensitive_key(key)
             && let Some(idx) = line.find('=')
         {
             let (prefix, _) = line.split_at(idx + 1);
@@ -54,11 +62,12 @@ pub fn unmask_sensitive_toml(new_toml: &str, current_toml: &str) -> String {
         let trimmed = new_line.trim_start();
         if trimmed.contains("\"***\"") {
             let key_prefix = trimmed.split('=').next().unwrap_or("").trim();
-            // Find matching key in current_toml
+            // Find matching key in current_toml (exact key name match)
             let mut matched = false;
             for cur_line in &current_lines {
                 let cur_trimmed = cur_line.trim_start();
-                if cur_trimmed.starts_with(key_prefix) && cur_trimmed.contains('=') {
+                let cur_key = cur_trimmed.split('=').next().unwrap_or("").trim();
+                if cur_key == key_prefix && cur_trimmed.contains('=') {
                     out.push((*cur_line).to_string());
                     matched = true;
                     break;

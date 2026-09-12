@@ -12,6 +12,9 @@ use crate::config::RewritesConfig;
 
 const DEFAULT_REWRITE_TTL: u32 = 60;
 
+/// Maximum CNAME chain depth before resolution stops (loop protection).
+const MAX_CNAME_DEPTH: usize = 8;
+
 /// Parsed local rewrite record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalRecordData {
@@ -131,7 +134,28 @@ impl RewriteTable {
         qtype: RecordType,
         client: &ClientContext,
     ) -> Option<Vec<Record>> {
+        let mut visited = Vec::new();
+        self.lookup_inner(qname, qtype, client, &mut visited, 0)
+    }
+
+    fn lookup_inner(
+        &self,
+        qname: &Name,
+        qtype: RecordType,
+        client: &ClientContext,
+        visited: &mut Vec<String>,
+        depth: usize,
+    ) -> Option<Vec<Record>> {
+        if depth > MAX_CNAME_DEPTH {
+            return None;
+        }
+
         let qname_str = normalize_domain_key(&qname.to_string());
+        if visited.iter().any(|seen| seen == &qname_str) {
+            // CNAME loop detected; stop resolving to avoid unbounded recursion.
+            return None;
+        }
+        visited.push(qname_str.clone());
 
         // 1. Check exact match
         if let Some(rules) = self.exact.get(&(qname_str.clone(), qtype)) {
@@ -152,7 +176,9 @@ impl RewriteTable {
                 {
                     let mut answers = vec![build_record(qname, &rule.data)];
                     // Chain resolution: check if target is also in our rewrite table
-                    if let Some(target_answers) = self.lookup(target, qtype, client) {
+                    if let Some(target_answers) =
+                        self.lookup_inner(target, qtype, client, visited, depth + 1)
+                    {
                         answers.extend(target_answers);
                     }
                     return Some(answers);
@@ -185,7 +211,9 @@ impl RewriteTable {
                     && let LocalRecordData::Cname(ref target) = rule.data
                 {
                     let mut answers = vec![build_record(qname, &rule.data)];
-                    if let Some(target_answers) = self.lookup(target, qtype, client) {
+                    if let Some(target_answers) =
+                        self.lookup_inner(target, qtype, client, visited, depth + 1)
+                    {
                         answers.extend(target_answers);
                     }
                     return Some(answers);
@@ -251,13 +279,8 @@ fn normalize_domain_key(domain: &str) -> String {
 }
 
 fn matches_wildcard(candidate: &str, suffix: &str) -> bool {
-    if candidate == suffix {
-        return true;
-    }
-    if candidate.ends_with(&format!(".{suffix}")) {
-        return true;
-    }
-    false
+    // `*.example.com` matches subdomains only, not the apex itself.
+    candidate.ends_with(&format!(".{suffix}"))
 }
 
 fn parse_entry_record(rtype: &str, answer: &str) -> Option<(RecordType, LocalRecordData)> {
@@ -396,6 +419,41 @@ entries = [
         assert_eq!(answers.len(), 1);
         // Should get .99 from exact match, not .10 from wildcard
         assert_eq!(answers[0].data, RData::A(A(Ipv4Addr::new(192, 168, 1, 99))));
+    }
+
+    #[test]
+    fn test_cname_cycle_does_not_overflow() {
+        let toml_str = r#"
+auto_ptr = false
+entries = [
+    { domain = "a.lan", type = "CNAME", answer = "b.lan" },
+    { domain = "b.lan", type = "CNAME", answer = "a.lan" }
+]
+"#;
+        let cfg: RewritesConfig = toml::from_str(toml_str).unwrap();
+        let table = RewriteTable::new(cfg);
+        let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+        let qname = Name::from_str("a.lan.").unwrap();
+
+        // Must terminate (loop protection) instead of recursing until stack overflow.
+        let answers = table.lookup(&qname, RecordType::A, &client);
+        assert!(answers.is_some());
+        assert!(
+            answers
+                .unwrap()
+                .iter()
+                .all(|r| r.record_type() == RecordType::CNAME),
+            "cycle resolution should stop at the CNAME chain limit"
+        );
+    }
+
+    #[test]
+    fn test_wildcard_does_not_match_apex() {
+        let table = sample_table();
+        let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+        // `*.home.arpa` must not match the bare `home.arpa` apex.
+        let qname = Name::from_str("home.arpa.").unwrap();
+        assert!(table.lookup(&qname, RecordType::A, &client).is_none());
     }
 
     #[test]

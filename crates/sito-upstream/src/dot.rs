@@ -162,6 +162,7 @@ impl Upstream for DotUpstream {
             Ok(Ok(bytes)) => {
                 let response = decode_message(&bytes)
                     .map_err(|e| UpstreamError::BadResponse(e.to_string()))?;
+                crate::upstream::validate_response(msg, &response)?;
                 // Return connection back to the pool
                 self.release_connection(conn).await;
                 Ok(response)

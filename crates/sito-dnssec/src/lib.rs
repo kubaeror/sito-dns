@@ -34,7 +34,7 @@ pub enum DnssecMode {
 impl From<&str> for DnssecMode {
     fn from(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
-            "log-only" | "log_only" => Self::LogOnly,
+            "log-only" | "log_only" | "log_fail" | "permissive" => Self::LogOnly,
             "disabled" | "off" => Self::Disabled,
             _ => Self::Validate,
         }
@@ -358,29 +358,24 @@ impl DnssecValidator {
             return outcome;
         }
 
-        // Validate each RRSIG
+        // Validate each RRSIG. A response is bogus only if every candidate
+        // signature fails; a single valid signature (even if another is
+        // expired) is sufficient.
         let mut has_secure_validation = false;
+        let mut first_failure: Option<(&'static str, u16)> = None;
 
         for (rrsig_owner, rrsig) in &rrsigs {
             let inception = rrsig.input().sig_inception.get();
             let expiration = rrsig.input().sig_expiration.get();
 
             if now < inception {
-                return self.handle_bogus(
-                    response,
-                    upstream,
-                    "Signature not yet valid",
-                    EDE_DNSSEC_BOGUS,
-                );
+                first_failure.get_or_insert(("Signature not yet valid", EDE_DNSSEC_BOGUS));
+                continue;
             }
 
             if now > expiration {
-                return self.handle_bogus(
-                    response,
-                    upstream,
-                    "Signature expired",
-                    EDE_SIGNATURE_EXPIRED,
-                );
+                first_failure.get_or_insert(("Signature expired", EDE_SIGNATURE_EXPIRED));
+                continue;
             }
 
             let type_covered = rrsig.input().type_covered;
@@ -430,12 +425,11 @@ impl DnssecValidator {
                         )
                         .is_err()
                     {
-                        return self.handle_bogus(
-                            response,
-                            upstream,
+                        first_failure.get_or_insert((
                             "Cryptographic signature verification failed",
                             EDE_DNSSEC_BOGUS,
-                        );
+                        ));
+                        continue;
                     }
                 }
 
@@ -455,6 +449,8 @@ impl DnssecValidator {
             let outcome = ValidationOutcome::Secure;
             self.metrics.record_validation(&outcome);
             outcome
+        } else if let Some((reason, ede_code)) = first_failure {
+            self.handle_bogus(response, upstream, reason, ede_code)
         } else {
             // RRSIGs were present and valid, but could not link to trust anchor
             response.metadata.authentic_data = false;

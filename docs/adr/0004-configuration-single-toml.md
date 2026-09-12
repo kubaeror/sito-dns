@@ -23,7 +23,7 @@ Requirements:
 We designate a **single TOML file** (`sito.toml`) as the primary persistent configuration source.
 
 Architecture:
-1. **Centralized `ConfigManager`:** All mutations initiated from the REST API or UI must pass through `ConfigManager`. Direct raw disk writes from outside the daemon are monitored via `notify` file watching and SIGHUP signals.
+1. **Centralized `ConfigManager`:** All mutations initiated from the REST API or UI must pass through `ConfigManager`. Direct raw disk writes from outside the daemon are monitored via `notify` file watching. SIGHUP reload is not implemented; SIGTERM/SIGINT trigger a graceful shutdown.
 2. **Pre-commit Validation:** Before writing to disk or applying changes, the new configuration is fully parsed and validated against schema constraints and network invariants. If validation fails, changes are rejected with actionable error messages.
 3. **Atomic Disk Writes:** Changes are written to a temporary sibling file (`sito.toml.tmp`) with `fsync`, then atomically moved to `sito.toml` via `rename(2)`.
 4. **Lock-Free Pipeline Updates:** Validated configurations are converted into immutable snapshot structs and atomically installed into `AppState` using `arc-swap::ArcSwap`. In-flight queries retain references to their initial snapshot without lock contention.

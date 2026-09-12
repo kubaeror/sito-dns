@@ -160,10 +160,10 @@ fn validate_cron_fields(expr: &str) -> Result<(), ScheduleError> {
     let fields: Vec<&str> = expr.split_whitespace().collect();
     let num_fields = fields.len();
 
-    if !(5..=7).contains(&num_fields) {
+    if !(5..=6).contains(&num_fields) {
         return Err(ScheduleError::general_error(
             expr,
-            format!("cron expression must have 5, 6, or 7 fields, got {num_fields}"),
+            format!("cron expression must have 5 or 6 fields, got {num_fields}"),
         ));
     }
 
@@ -267,41 +267,64 @@ fn classify_croner_error(expr: &str, err: &croner::errors::CronError) -> Schedul
 }
 
 /// Builds a window-matching Cron expression if the user wrote an interval
-/// with `0 0 ...` representing active hours.
+/// representing active hours/minutes.
+///
+/// A window is only derived when the expression constrains the hour and/or
+/// minute to a range, list, or step. Expressions like `0 0 * * * *` (once an
+/// hour) or `0 0 * * *` (daily at midnight) are instants and must not be
+/// widened to always-active windows.
 fn build_window_cron(expr: &str) -> Option<Cron> {
     if expr.starts_with('@') {
         return None;
     }
 
     let parts: Vec<&str> = expr.split_whitespace().collect();
+
+    let is_range = |field: &str| field.contains('-') || field.contains('/') || field.contains(',');
+
     if parts.len() == 6 {
         // [sec, min, hour, dom, mon, dow]
-        if parts[0] == "0" && parts[1] == "0" {
+        let (sec, min, hour) = (parts[0], parts[1], parts[2]);
+        if sec == "0" && min == "0" && is_range(hour) {
+            // e.g. `0 0 15-21 * * MON-FRI` -> active for all of hours 15-21.
             let mut window_parts = parts.clone();
             window_parts[0] = "*";
             window_parts[1] = "*";
-            let window_expr = window_parts.join(" ");
-            return Cron::from_str(&window_expr).ok();
-        } else if parts[0] == "0" && parts[1].contains('-') {
-            // e.g. 0 15-30 10 * * *
+            return Cron::from_str(&window_parts.join(" ")).ok();
+        }
+        if sec == "0" && is_range(min) {
+            // e.g. `0 15-30 10 * * *` -> active for all of minutes 15-30 in hour 10.
             let mut window_parts = parts.clone();
             window_parts[0] = "*";
-            let window_expr = window_parts.join(" ");
-            return Cron::from_str(&window_expr).ok();
+            return Cron::from_str(&window_parts.join(" ")).ok();
         }
-    } else if parts.len() == 5 {
+        return None;
+    }
+
+    if parts.len() == 5 {
         // [min, hour, dom, mon, dow]
-        if parts[0] == "0" {
-            let mut window_parts = vec!["*", "*"];
-            window_parts.extend_from_slice(&parts[1..]);
-            let window_expr = window_parts.join(" ");
-            return Cron::from_str(&window_expr).ok();
+        let (min, hour) = (parts[0], parts[1]);
+
+        // `* * * * *` means "every minute": for a schedule check at arbitrary
+        // seconds this must be treated as always active.
+        if min == "*" && hour == "*" {
+            return Cron::from_str("* * * * * *").ok();
         }
 
-        let mut window_parts = vec!["*"];
-        window_parts.extend_from_slice(&parts);
-        let window_expr = window_parts.join(" ");
-        return Cron::from_str(&window_expr).ok();
+        // Only widen to an hour window when the hour is an explicit range/list,
+        // never for single-hour instants like `0 0 * * *`.
+        if min == "0" && is_range(hour) {
+            let mut window_parts = vec!["*", "*"];
+            window_parts.extend_from_slice(&parts[1..]);
+            return Cron::from_str(&window_parts.join(" ")).ok();
+        }
+
+        if is_range(min) {
+            // e.g. `*/15 9-17 * * 1-5`
+            let mut window_parts = vec!["*"];
+            window_parts.extend_from_slice(&parts);
+            return Cron::from_str(&window_parts.join(" ")).ok();
+        }
     }
 
     None
@@ -391,7 +414,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(field_number, None);
-                assert!(message.contains("must have 5, 6, or 7 fields"));
+                assert!(message.contains("must have 5 or 6 fields"));
             }
         }
     }
@@ -442,5 +465,27 @@ mod tests {
 
         let t4 = Utc.with_ymd_and_hms(2026, 9, 7, 10, 31, 0).unwrap();
         assert!(!schedule.is_active(&t4));
+    }
+
+    #[test]
+    fn test_instant_crons_are_not_widened_to_full_hours() {
+        // Daily at midnight must not become active for all of 00:00-00:59.
+        let schedule = Schedule::parse("0 0 * * *").unwrap();
+        let midnight = Utc.with_ymd_and_hms(2026, 9, 7, 0, 0, 0).unwrap();
+        let mid_hour = Utc.with_ymd_and_hms(2026, 9, 7, 0, 30, 0).unwrap();
+        assert!(schedule.is_active(&midnight));
+        assert!(!schedule.is_active(&mid_hour));
+
+        // `0 0 * * * *` (hourly at :00) must not be always-active either.
+        let hourly = Schedule::parse("0 0 * * * *").unwrap();
+        let at_0100 = Utc.with_ymd_and_hms(2026, 9, 7, 1, 0, 0).unwrap();
+        let at_0130 = Utc.with_ymd_and_hms(2026, 9, 7, 1, 30, 0).unwrap();
+        assert!(hourly.is_active(&at_0100));
+        assert!(!hourly.is_active(&at_0130));
+    }
+
+    #[test]
+    fn test_seven_field_cron_rejected() {
+        assert!(Schedule::parse("0 0 0 0 0 0 2026").is_err());
     }
 }

@@ -4,8 +4,10 @@ use super::interner::LabelInterner;
 use super::trie::SuffixTrie;
 use aho_corasick::{AhoCorasick, MatchKind};
 use fnv::FnvHashMap;
-use regex_automata::dfa::regex::Regex;
-use tracing::warn;
+use regex_automata::dfa::Automaton;
+use regex_automata::dfa::dense::{Builder as DfaBuilder, Config as DfaConfig, DFA};
+use regex_automata::{Input, MatchKind as RegexMatchKind, PatternSet};
+use tracing::{error, warn};
 
 /// Converts an ABP wildcard string into an anchored regex pattern.
 pub fn wildcard_to_regex(wildcard: &str) -> String {
@@ -36,8 +38,8 @@ pub struct CompiledRuleSet {
     pub ac: Option<AhoCorasick>,
     /// Maps AC pattern index to list of rule IDs.
     pub ac_pattern_to_rules: Vec<Vec<u32>>,
-    /// Regex DFA for regular expressions and wildcards.
-    pub regex: Option<Regex>,
+    /// Dense regex DFA for regular expressions and wildcards (MatchKind::All).
+    pub regex: Option<DFA<Vec<u32>>>,
     /// Maps regex pattern index to list of rule IDs.
     pub regex_pattern_to_rules: Vec<Vec<u32>>,
     /// Prefix rules: (prefix, list of rule IDs).
@@ -80,12 +82,17 @@ impl CompiledRuleSet {
             }
         }
 
-        // 5. Regex DFA match
-        if let Some(re) = &self.regex {
-            for mat in re.find_iter(domain.as_bytes()) {
-                let pat_idx = mat.pattern().as_usize();
-                if let Some(rules) = self.regex_pattern_to_rules.get(pat_idx) {
-                    candidates.extend_from_slice(rules);
+        // 5. Regex DFA match (overlapping, reports every matching pattern)
+        if let Some(dfa) = &self.regex {
+            let mut patset = PatternSet::new(dfa.pattern_len());
+            if dfa
+                .try_which_overlapping_matches(&Input::new(domain.as_bytes()), &mut patset)
+                .is_ok()
+            {
+                for pat_idx in patset.iter() {
+                    if let Some(rules) = self.regex_pattern_to_rules.get(pat_idx.as_usize()) {
+                        candidates.extend_from_slice(rules);
+                    }
                 }
             }
         }
@@ -196,16 +203,55 @@ impl RuleSetBuilder {
                 pat_to_rules.push(rules);
             }
 
-            let mut builder = regex_automata::dfa::regex::Builder::new();
-            builder.dense(
-                regex_automata::dfa::dense::Config::new().dfa_size_limit(Some(10 * 1024 * 1024)), // 10 MB strict DFA memory ceiling
-            );
+            let make_builder = || {
+                let mut builder = DfaBuilder::new();
+                builder.configure(
+                    DfaConfig::new()
+                        .match_kind(RegexMatchKind::All)
+                        .dfa_size_limit(Some(10 * 1024 * 1024)), // 10 MB strict DFA memory ceiling
+                );
+                builder
+            };
 
-            match builder.build_many(&pat_strings) {
-                Ok(re) => (Some(re), pat_to_rules),
+            match make_builder().build_many(&pat_strings) {
+                Ok(dfa) => (Some(dfa), pat_to_rules),
                 Err(e) => {
-                    warn!(error = %e, "Failed to compile regex DFA; skipping regex matcher");
-                    (None, Vec::new())
+                    // A single unsupported pattern must not disable the whole
+                    // regex + wildcard rule class. Compile individually and
+                    // keep everything that succeeds.
+                    warn!(
+                        error = %e,
+                        "Unified regex DFA compilation failed; compiling patterns individually"
+                    );
+                    let mut kept_patterns = Vec::new();
+                    let mut kept_rules = Vec::new();
+                    for (pat, rules) in pat_strings.iter().zip(pat_to_rules.iter()) {
+                        if make_builder().build(pat).is_ok() {
+                            kept_patterns.push(pat.clone());
+                            kept_rules.push(rules.clone());
+                        } else {
+                            error!(
+                                pattern = %pat,
+                                "Skipping invalid/unsupported regex blocking rule"
+                            );
+                        }
+                    }
+
+                    if kept_patterns.is_empty() {
+                        (None, Vec::new())
+                    } else {
+                        match make_builder().build_many(&kept_patterns) {
+                            Ok(dfa) => (Some(dfa), kept_rules),
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    kept = kept_patterns.len(),
+                                    "Failed to build regex DFA even after dropping invalid patterns"
+                                );
+                                (None, Vec::new())
+                            }
+                        }
+                    }
                 }
             }
         };

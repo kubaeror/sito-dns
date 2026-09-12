@@ -1,7 +1,7 @@
 //! Binary entry point for the `sito` DNS server CLI.
 
 use clap::Parser;
-use sito::cli::{Cli, Commands, run_backup, run_check_config, run_healthcheck, run_restore};
+use sito::cli::{Cli, Commands, run_backup, run_check_config, run_healthcheck_or_web, run_restore};
 use sito::server::run_server_full;
 use sito_core::config::Config;
 use std::net::SocketAddr;
@@ -29,19 +29,46 @@ async fn main() -> anyhow::Result<()> {
                 address,
                 timeout_ms,
             } => {
-                let target_addr = if let Some(addr) = address {
-                    addr
+                let (dns_target, web_target) = if let Some(addr) = address {
+                    (Some(addr), "127.0.0.1:8080".parse().unwrap())
                 } else if let Ok(content) = std::fs::read_to_string(&cli.config) {
                     if let Ok(cfg) = Config::from_toml_str(&content) {
-                        SocketAddr::new("127.0.0.1".parse().unwrap(), cfg.dns.port)
+                        let bind_ip = cfg
+                            .dns
+                            .bind
+                            .iter()
+                            .find(|ip| !ip.is_unspecified())
+                            .copied()
+                            .unwrap_or_else(|| {
+                                if cfg.dns.bind.iter().any(std::net::IpAddr::is_ipv6) {
+                                    "::1".parse().unwrap()
+                                } else {
+                                    "127.0.0.1".parse().unwrap()
+                                }
+                            });
+                        let web_cfg = cfg.get_web_config();
+                        let web_ip = if web_cfg.bind.is_unspecified() {
+                            "127.0.0.1".parse().unwrap()
+                        } else {
+                            web_cfg.bind
+                        };
+                        (
+                            Some(SocketAddr::new(bind_ip, cfg.dns.port)),
+                            SocketAddr::new(web_ip, web_cfg.port),
+                        )
                     } else {
-                        "127.0.0.1:53".parse().unwrap()
+                        (
+                            Some("127.0.0.1:53".parse().unwrap()),
+                            "127.0.0.1:8080".parse().unwrap(),
+                        )
                     }
                 } else {
-                    "127.0.0.1:53".parse().unwrap()
+                    // No configuration yet: the setup wizard web server is the
+                    // only listener that should be up.
+                    (None, "127.0.0.1:8080".parse().unwrap())
                 };
 
-                if let Err(e) = run_healthcheck(target_addr, timeout_ms).await {
+                if let Err(e) = run_healthcheck_or_web(dns_target, web_target, timeout_ms).await {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }

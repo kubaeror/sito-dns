@@ -7,11 +7,12 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use sito_stats::MetricsRegistry;
 
@@ -78,6 +79,15 @@ impl MasterCoordinator {
     /// Sets and signs a new configuration bundle, immediately broadcasting it to all connected slaves.
     pub fn update_bundle(&self, bundle: ConfigBundle) -> Result<u64, HaError> {
         let version = bundle.version;
+        let current = self.current_version.load(Ordering::SeqCst);
+        if version <= current {
+            return Err(HaError::Validation {
+                field: "version".to_string(),
+                reason: format!(
+                    "Refusing to publish non-monotonic configuration version {version} (current {current})"
+                ),
+            });
+        }
         self.current_version.store(version, Ordering::SeqCst);
 
         let push_msg = build_and_sign_push(&bundle, &self.signing_key)?;
@@ -107,7 +117,27 @@ impl MasterCoordinator {
     pub fn broadcast(&self, msg: &HaMessage) {
         let slaves = self.slaves.lock().unwrap();
         for slave in slaves.values() {
-            let _ = slave.sender.try_send(msg.clone());
+            match slave.sender.try_send(msg.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Queue is full: do not silently drop the update. Fall back to
+                    // an async send so the message is delivered once there is room.
+                    warn!(
+                        instance = %slave.instance,
+                        "HA push queue full; scheduling asynchronous delivery"
+                    );
+                    let sender = slave.sender.clone();
+                    let queued = msg.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = sender.send(queued).await {
+                            warn!("Failed to deliver queued HA push: {e}");
+                        }
+                    });
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    debug!(instance = %slave.instance, "HA push channel closed");
+                }
+            }
         }
     }
 
@@ -184,16 +214,19 @@ impl MasterCoordinator {
 
         let (slave_instance, have_version, _, token) = hello_msg;
 
-        // Verify slave authentication token if configured
-        if let Some(ref required_token) = self.slave_token
-            && token.as_deref() != Some(required_token.as_str())
-        {
-            warn!(
-                instance = %slave_instance,
-                peer = %peer_addr,
-                "Slave authentication failed: invalid or missing token"
-            );
-            return;
+        // Verify slave authentication token if configured (constant-time compare)
+        if let Some(ref required_token) = self.slave_token {
+            let provided = token.as_deref().unwrap_or("");
+            let tokens_match = provided.len() == required_token.len()
+                && bool::from(provided.as_bytes().ct_eq(required_token.as_bytes()));
+            if !tokens_match {
+                warn!(
+                    instance = %slave_instance,
+                    peer = %peer_addr,
+                    "Slave authentication failed: invalid or missing token"
+                );
+                return;
+            }
         }
 
         info!(
@@ -227,18 +260,21 @@ impl MasterCoordinator {
                 .set_ha_config_version(&slave_instance, have_version as f64);
         }
 
-        // If slave is behind current version, immediately enqueue push
-        let cur_v = self.get_current_version();
-        if have_version < cur_v
-            && let Some(ref push) = *self.active_push.lock().unwrap()
-        {
+        // Always enqueue the current push on connect; a slave that is already
+        // up to date acknowledges without re-applying. This avoids trusting the
+        // client-reported `have_version`, which an inflated value could use to
+        // suppress replication.
+        if let Some(ref push) = *self.active_push.lock().unwrap() {
+            let cur_v = self.get_current_version();
             info!(
                 instance = %slave_instance,
                 have_version,
                 cur_v,
-                "Slave is behind master version; pushing latest bundle immediately"
+                "Pushing current configuration bundle to newly connected slave"
             );
-            let _ = tx.try_send(push.clone());
+            if let Err(e) = tx.try_send(push.clone()) {
+                warn!(instance = %slave_instance, "Initial HA push could not be queued: {e}");
+            }
         }
 
         // Heartbeat ping interval
@@ -308,6 +344,7 @@ impl MasterCoordinator {
             #[allow(clippy::cast_possible_wrap)]
             self.metrics.set_ha_slaves_connected(slaves.len() as i64);
         }
+        self.metrics.remove_ha_config_version(&slave_instance);
         info!(instance = %slave_instance, "Unregistered replica slave from active tracker");
     }
 
@@ -371,15 +408,15 @@ impl MasterCoordinator {
                     s.last_ping = Instant::now();
                 }
             }
-            HaMessage::Hello { have_version, .. } => {
-                // Resync requested
-                let cur_v = self.get_current_version();
-                if have_version < cur_v
-                    && let Some(ref push) = *self.active_push.lock().unwrap()
-                {
+            HaMessage::Hello { .. } => {
+                // Resync requested: always re-push the active bundle; the slave
+                // acknowledges without re-applying when it is already current.
+                if let Some(ref push) = *self.active_push.lock().unwrap() {
                     let slaves = self.slaves.lock().unwrap();
-                    if let Some(s) = slaves.get(slave_instance) {
-                        let _ = s.sender.try_send(push.clone());
+                    if let Some(s) = slaves.get(slave_instance)
+                        && let Err(e) = s.sender.try_send(push.clone())
+                    {
+                        warn!(instance = %slave_instance, "Resync push could not be queued: {e}");
                     }
                 }
             }

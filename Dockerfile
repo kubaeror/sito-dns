@@ -2,7 +2,7 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p sito --features "embed-ui"
+RUN cargo build --release --locked -p sito --features "embed-ui,mimalloc"
 
 # Runtime stage
 FROM gcr.io/distroless/cc-debian12:nonroot
@@ -13,6 +13,6 @@ COPY --from=builder /src/target/release/sito /usr/bin/sito
 #   cap_add:
 #     - NET_BIND_SERVICE
 USER nonroot
-EXPOSE 53/udp 53/tcp 853/tcp 853/udp 443/tcp 8080/tcp
+EXPOSE 53/udp 53/tcp 853/tcp 853/udp 443/tcp 443/udp 8080/tcp
 VOLUME ["/var/lib/sito"]
 ENTRYPOINT ["/usr/bin/sito", "--config", "/etc/sito/config.toml"]

@@ -29,6 +29,10 @@ pub struct RouterOsConfig {
     pub password_env: Option<String>,
     #[serde(default = "default_interval_s")]
     pub interval_s: u64,
+    /// Accept invalid/untrusted TLS certificates from the RouterOS API
+    /// (default false; enable only for self-signed router certificates).
+    #[serde(default)]
+    pub allow_invalid_certs: bool,
 }
 
 fn default_url() -> String {
@@ -49,6 +53,7 @@ impl Default for RouterOsConfig {
             password: None,
             password_env: None,
             interval_s: default_interval_s(),
+            allow_invalid_certs: false,
         }
     }
 }
@@ -179,7 +184,7 @@ pub fn spawn_routeros_sync(
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(config.allow_invalid_certs)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -188,10 +193,14 @@ pub fn spawn_routeros_sync(
 
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        info!("RouterOS DHCP lease sync task shutting down");
-                        break;
+                res = shutdown_rx.changed() => {
+                    match res {
+                        Ok(()) if *shutdown_rx.borrow() => {
+                            info!("RouterOS DHCP lease sync task shutting down");
+                            break;
+                        }
+                        Ok(()) => {}
+                        Err(_) => break,
                     }
                 }
                 _ = ticker.tick() => {
@@ -283,6 +292,7 @@ mod tests {
             password: Some("secret".to_string()),
             password_env: None,
             interval_s: 300,
+            allow_invalid_certs: false,
         };
 
         let client = reqwest::Client::new();

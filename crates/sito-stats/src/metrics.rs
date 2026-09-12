@@ -192,6 +192,13 @@ impl MetricsRegistry {
         map.insert(instance.to_string(), version);
     }
 
+    /// Removes the per-instance HA config version label (e.g. on disconnect) to
+    /// prevent unbounded metric cardinality growth.
+    pub fn remove_ha_config_version(&self, instance: &str) {
+        let mut map = self.ha_config_version.lock().unwrap();
+        map.remove(instance);
+    }
+
     pub fn set_querylog_dropped(&self, dropped: u64) {
         self.querylog_dropped.store(dropped, Ordering::Relaxed);
     }
@@ -540,7 +547,8 @@ impl MetricsRegistry {
                 for (instance, version) in map.iter() {
                     let _ = writeln!(
                         out,
-                        "sito_ha_config_version{{instance=\"{instance}\"}} {version}"
+                        "sito_ha_config_version{{instance=\"{}\"}} {version}",
+                        escape_label_value(instance)
                     );
                 }
             }
@@ -566,6 +574,20 @@ impl MetricsRegistry {
 
         out
     }
+}
+
+/// Escapes a Prometheus label value per the exposition format spec.
+fn escape_label_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -614,5 +636,20 @@ mod tests {
         assert!(rendered.contains("sito_ha_config_version"));
         assert!(rendered.contains("sito_querylog_dropped_total"));
         assert!(rendered.contains("sito_build_info"));
+    }
+
+    #[test]
+    fn test_ha_config_version_label_escaping_and_removal() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        let hostile = "evil\"}\ninjected";
+        reg.set_ha_config_version(hostile, 3.0);
+
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains(r#"instance="evil\"}\ninjected""#));
+        assert!(!rendered.contains("\ninjected"));
+
+        reg.remove_ha_config_version(hostile);
+        let rendered_after = reg.render_prometheus();
+        assert!(!rendered_after.contains("evil"));
     }
 }

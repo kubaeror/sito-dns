@@ -154,7 +154,7 @@ docker run -d \
   -p 8080:8080 \
   -v /opt/sito/config:/etc/sito \
   -v sito-data:/var/lib/sito \
-  ghcr.io/kubaeror/sito:latest
+  ghcr.io/kubaeror/sito-dns:latest
 ```
 
 ---
@@ -165,7 +165,7 @@ docker run -d \
 ```yaml
 services:
   sito:
-    image: ghcr.io/kubaeror/sito:latest
+    image: ghcr.io/kubaeror/sito-dns:latest
     container_name: sito
     restart: unless-stopped
     cap_add:
@@ -205,7 +205,7 @@ networks:
 
 services:
   sito-master:
-    image: ghcr.io/kubaeror/sito:latest
+    image: ghcr.io/kubaeror/sito-dns:latest
     container_name: sito-master
     cap_add: [NET_BIND_SERVICE]
     networks:
@@ -216,7 +216,7 @@ services:
       - master-data:/var/lib/sito
 
   sito-slave:
-    image: ghcr.io/kubaeror/sito:latest
+    image: ghcr.io/kubaeror/sito-dns:latest
     container_name: sito-slave
     cap_add: [NET_BIND_SERVICE]
     networks:
@@ -248,4 +248,4 @@ dig @127.0.0.1 -p 53 doubleclick.net +short
 curl -fsSL http://127.0.0.1:8080/api/v1/status | jq .
 ```
 
-Open `http://<host-ip>:8080` in your web browser to access the dashboard. Default credentials on initial run: `admin` / `adminadmin` (system prompts for immediate password change and optional TOTP enrollment on first login).
+Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard. If the wizard is skipped with `--no-setup`, the bootstrap credentials are `admin` / `adminadmin` and **must be changed immediately** (Settings -> Administrator).

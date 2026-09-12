@@ -1,7 +1,7 @@
 //! CLI arguments and subcommand execution for sito.
 
 use clap::{Parser, Subcommand};
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 use sito_core::config::Config;
 use std::net::SocketAddr;
@@ -199,6 +199,51 @@ pub fn run_check_config(path: &Path) -> Result<(), anyhow::Error> {
 
 /// Executes the `healthcheck` subcommand by sending a test DNS query.
 pub async fn run_healthcheck(addr: SocketAddr, timeout_ms: u64) -> Result<(), anyhow::Error> {
+    probe_dns(addr, timeout_ms).await
+}
+
+/// Healthcheck that also accepts a reachable admin web interface as healthy.
+///
+/// This keeps container healthchecks green while the first-run setup wizard is
+/// active (DNS listeners are intentionally unbound until setup completes).
+pub async fn run_healthcheck_or_web(
+    dns_addr: Option<SocketAddr>,
+    web_addr: SocketAddr,
+    timeout_ms: u64,
+) -> Result<(), anyhow::Error> {
+    let dns_error = if let Some(addr) = dns_addr {
+        match probe_dns(addr, timeout_ms).await {
+            Ok(()) => return Ok(()),
+            Err(e) => Some(e),
+        }
+    } else {
+        None
+    };
+
+    let connect = tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        tokio::net::TcpStream::connect(web_addr),
+    );
+    if let Ok(Ok(_stream)) = connect.await {
+        if let Some(e) = dns_error {
+            println!(
+                "Healthcheck OK: DNS probe failed ({e}), but admin web interface {web_addr} is reachable (likely setup wizard mode)"
+            );
+        } else {
+            println!("Healthcheck OK: admin web interface {web_addr} is reachable");
+        }
+        return Ok(());
+    }
+
+    match dns_error {
+        Some(e) => Err(e),
+        None => Err(anyhow::anyhow!(
+            "Healthcheck failed: neither DNS nor the admin web interface at {web_addr} responded within {timeout_ms}ms"
+        )),
+    }
+}
+
+async fn probe_dns(addr: SocketAddr, timeout_ms: u64) -> Result<(), anyhow::Error> {
     let bind_addr = if addr.is_ipv6() {
         "[::]:0"
     } else {
@@ -224,6 +269,22 @@ pub async fn run_healthcheck(addr: SocketAddr, timeout_ms: u64) -> Result<(), an
 
     let resp = sito_proto::decode_message(&buf[..len])?;
     let elapsed = start.elapsed();
+
+    if resp.metadata.id != 0x4242 {
+        anyhow::bail!(
+            "Healthcheck failed: response ID mismatch (expected 0x4242, got {:#06x})",
+            resp.metadata.id
+        );
+    }
+    if resp.metadata.message_type != MessageType::Response {
+        anyhow::bail!("Healthcheck failed: received a non-response DNS message");
+    }
+    match resp.metadata.response_code {
+        ResponseCode::NoError | ResponseCode::NXDomain => {}
+        other => {
+            anyhow::bail!("Healthcheck failed: resolver returned {other:?}");
+        }
+    }
 
     println!(
         "Healthcheck OK: received response (id: {}, rcode: {:?}) in {:?}",

@@ -333,7 +333,7 @@ impl FilterSnapshot {
 /// Thread-safe filtering engine implementing AdGuard ABP and hosts blocking.
 pub struct HostsFilterEngine {
     snapshot: ArcSwap<FilterSnapshot>,
-    config: FilteringConfig,
+    config: ArcSwap<FilteringConfig>,
     data_dir: PathBuf,
     downloader: ListDownloader,
 }
@@ -343,7 +343,7 @@ impl HostsFilterEngine {
     pub fn new(config: FilteringConfig, data_dir: PathBuf) -> Self {
         Self {
             snapshot: ArcSwap::new(Arc::new(FilterSnapshot::default())),
-            config,
+            config: ArcSwap::new(Arc::new(config)),
             data_dir,
             downloader: ListDownloader::default(),
         }
@@ -369,12 +369,15 @@ impl HostsFilterEngine {
     /// Reloads all configured blocklists and custom rules, updating snapshot atomically.
     /// Applies the >50% drop guard to protect against corrupted remote sources.
     pub async fn reload(&self) -> Result<usize, FilterError> {
-        self.reload_internal(&self.config, true).await
+        let config = self.config.load_full();
+        self.reload_internal(&config, true).await
     }
 
     /// Reloads blocklists and custom rules using an updated filtering configuration.
     /// Does not enforce the >50% drop guard so intentional user deletions/edits take effect.
+    /// The new configuration is retained for subsequent scheduled refreshes.
     pub async fn reload_with_config(&self, config: &FilteringConfig) -> Result<usize, FilterError> {
+        self.config.store(Arc::new(config.clone()));
         self.reload_internal(config, false).await
     }
 
@@ -384,6 +387,7 @@ impl HostsFilterEngine {
         config: &FilteringConfig,
         apply_drop_guard: bool,
     ) -> Result<usize, FilterError> {
+        self.config.store(Arc::new(config.clone()));
         self.reload_internal(config, apply_drop_guard).await
     }
 
@@ -462,16 +466,14 @@ impl HostsFilterEngine {
     }
 
     /// Spawns a background task that periodically refreshes the blocklists.
+    /// The interval is re-read from the live configuration on every cycle so
+    /// hot-reloaded `refresh_interval_hours` values take effect.
     pub fn spawn_refresh_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let interval_hours = self.config.refresh_interval_hours.max(1);
-        let interval = Duration::from_secs(interval_hours * 3600);
-
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.tick().await;
-
             loop {
-                ticker.tick().await;
+                let interval_hours = self.config.load().refresh_interval_hours.max(1);
+                let interval = Duration::from_secs(interval_hours.saturating_mul(3600));
+                tokio::time::sleep(interval).await;
                 info!("Running scheduled blocklist refresh...");
                 if let Err(err) = self.reload().await {
                     warn!(error = %err, "Scheduled blocklist refresh failed");
@@ -487,7 +489,7 @@ impl HostsFilterEngine {
         qtype: RecordType,
         client: &ClientContext,
     ) -> Option<Verdict> {
-        if !self.config.enabled {
+        if !self.config.load().enabled {
             return None;
         }
 
@@ -507,7 +509,7 @@ impl HostsFilterEngine {
         qtype: RecordType,
         client: &ClientContext,
     ) -> Verdict {
-        if !self.config.enabled {
+        if !self.config.load().enabled {
             return Verdict::Allow(None);
         }
 
@@ -523,7 +525,7 @@ impl HostsFilterEngine {
 
 impl FilterEngine for HostsFilterEngine {
     fn evaluate(&self, qname: &Name, qtype: RecordType, client: &ClientContext) -> Verdict {
-        if !self.config.enabled {
+        if !self.config.load().enabled {
             return Verdict::Allow(None);
         }
 
@@ -753,11 +755,13 @@ mod tests {
             ..Default::default()
         };
 
-        let mut engine = HostsFilterEngine::init(config.clone(), temp_dir.clone()).await;
+        let engine = HostsFilterEngine::init(config.clone(), temp_dir.clone()).await;
         assert_eq!(engine.rule_count(), 6);
 
         // Update config to drop to 1 rule (>50% drop)
-        engine.config.custom_rules = vec!["0.0.0.0 ad1.com".to_string()];
+        let mut droppped = (*engine.config.load_full()).clone();
+        droppped.custom_rules = vec!["0.0.0.0 ad1.com".to_string()];
+        engine.config.store(std::sync::Arc::new(droppped));
         let count = engine.reload().await.unwrap();
         assert_eq!(count, 6);
         assert_eq!(engine.rule_count(), 6);
@@ -805,6 +809,30 @@ mod tests {
         let err = FilterError::CompileTaskFailed("task panicked".to_string());
         assert!(matches!(err, FilterError::CompileTaskFailed(_)));
         assert_eq!(engine.rule_count(), 2);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_important_allowlist_evaluated_as_allow() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_important_test_{}", std::process::id()));
+        let config = FilteringConfig {
+            custom_rules: vec![
+                "@@||ads.example.com^$important".to_string(),
+                "||ads.example.com^".to_string(),
+            ],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+        let qname = Name::from_str("ads.example.com.").unwrap();
+        let client = ClientContext::new(std::net::IpAddr::from_str("192.168.1.20").unwrap());
+
+        // The important allow must win over the standard block.
+        assert!(matches!(
+            engine.evaluate_important(&qname, RecordType::A, &client),
+            Some(Verdict::Allow(_))
+        ));
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

@@ -114,12 +114,11 @@ download_file() {
     return 1
 }
 
-# If local binary exists in build path, prefer local install
-if [ -f "target/release/sito" ]; then
-    echo "Using existing local release binary target/release/sito..."
+# Support installing a locally built binary only when explicitly requested
+# (verification cannot be performed for local builds).
+if [ "${SITO_INSTALL_LOCAL_BINARY:-0}" = "1" ] && [ -f "target/release/sito" ]; then
+    echo "Using existing local release binary target/release/sito (verification skipped)..."
     cp -f "target/release/sito" "${INSTALL_BIN}"
-elif [ -f "${TMP_DIR}/sito" ]; then
-    cp -f "${TMP_DIR}/sito" "${INSTALL_BIN}"
 else
     download_file "${DOWNLOAD_URL}" "${TMP_DIR}/${TARBALL_NAME}"
     download_file "${CHECKSUMS_URL}" "${TMP_DIR}/SHA256SUMS"
@@ -177,7 +176,13 @@ else
         fi
     )
 
-    tar -xzf "${TMP_DIR}/${TARBALL_NAME}" -C "${TMP_DIR}"
+    # The release archive contains a top-level directory; strip it so the binary
+    # lands directly in TMP_DIR.
+    tar -xzf "${TMP_DIR}/${TARBALL_NAME}" --strip-components=1 -C "${TMP_DIR}"
+    if [ ! -f "${TMP_DIR}/sito" ]; then
+        echo "Error: 'sito' binary not found inside ${TARBALL_NAME}." >&2
+        exit 1
+    fi
     cp -f "${TMP_DIR}/sito" "${INSTALL_BIN}"
 fi
 
@@ -231,6 +236,17 @@ EOF
     # Post-install health check
     echo "Performing post-install health check..."
     sleep 2
+
+    WEB_PORT="${SITO_WEB_PORT:-}"
+    if [ -z "${WEB_PORT}" ] && [ -f "${CONFIG_DIR}/config.toml" ]; then
+        WEB_PORT="$(awk '
+            /^\[web\]/ { in_web=1; next }
+            /^\[/ { in_web=0 }
+            in_web && $1 == "port" { gsub(/[^0-9]/, "", $0); print; exit }
+        ' "${CONFIG_DIR}/config.toml")"
+    fi
+    WEB_PORT="${WEB_PORT:-8080}"
+
     HEALTH_OK=1
     if ! systemctl is-active --quiet sito 2>/dev/null; then
         HEALTH_OK=0
@@ -238,10 +254,10 @@ EOF
     fi
 
     if command -v curl >/dev/null 2>&1; then
-        if ! curl -fsS http://localhost:8080/ >/dev/null 2>&1 && \
-           ! curl -fsS http://localhost:8080/wizard >/dev/null 2>&1; then
+        if ! curl -fsS "http://localhost:${WEB_PORT}/" >/dev/null 2>&1 && \
+           ! curl -fsS "http://localhost:${WEB_PORT}/wizard" >/dev/null 2>&1; then
             HEALTH_OK=0
-            echo "Error: sito web server did not respond on http://localhost:8080" >&2
+            echo "Error: sito web server did not respond on http://localhost:${WEB_PORT}" >&2
         fi
     fi
 
@@ -252,8 +268,13 @@ EOF
         journalctl -u sito -n 50 --no-pager >&2 || true
         echo "" >&2
         echo "Troubleshooting hints:" >&2
-        echo " - Check if port 8080 or port 53 is already in use: ss -tulpn | grep -E ':(53|8080)'" >&2
+        echo " - Check if port ${WEB_PORT} or port 53 is already in use: ss -tulpn | grep -E ':(${WEB_PORT}|53)'" >&2
         echo " - Check system logs: journalctl -u sito -e" >&2
+        echo " - Restoring previous binary from ${INSTALL_BIN}.bak (if present)..." >&2
+        if [ -f "${INSTALL_BIN}.bak" ]; then
+            cp -f "${INSTALL_BIN}.bak" "${INSTALL_BIN}"
+            systemctl restart sito || true
+        fi
         exit 1
     else
         echo "sito service is active and responding."

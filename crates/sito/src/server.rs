@@ -65,6 +65,9 @@ pub async fn run_server_full(
     let db_path = config.server.data_dir.join("stats.db");
     let stats_db = StatsDb::open(&db_path).await?;
 
+    // Initialize Prometheus metrics registry with 18 metrics per Table 14.2
+    let metrics = MetricsRegistry::new(env!("CARGO_PKG_VERSION"), "git");
+
     // Initialize QueryLogWriter (10k buffer per M5.1)
     let querylog_writer = QueryLogWriter::spawn_with_anonymize(
         stats_db.clone(),
@@ -73,8 +76,30 @@ pub async fn run_server_full(
     );
     let querylog_sender = querylog_writer.sender();
 
-    // Initialize Prometheus metrics registry with 18 metrics per Table 14.2
-    let metrics = MetricsRegistry::new(env!("CARGO_PKG_VERSION"), "git");
+    // Forward querylog drop counters to Prometheus (the writer cannot depend on
+    // the metrics registry directly without a circular dependency).
+    {
+        let sender = querylog_sender.clone();
+        let metrics = metrics.clone();
+        let mut drop_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        metrics.set_querylog_dropped(sender.dropped_total());
+                    }
+                    _ = drop_shutdown.changed() => {
+                        if *drop_shutdown.borrow() {
+                            metrics.set_querylog_dropped(sender.dropped_total());
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Initialize upstream manager with bootstrap resolver
     let bootstrap = BootstrapResolver::new(
@@ -255,10 +280,16 @@ pub async fn run_server_full(
 
     // Administrative REST API server
     let auth_cfg = config.get_auth_config();
-    let auth_mgr = Arc::new(sito_api::AuthManager::with_storage(
+    // Only bootstrap the default admin when no persisted configuration exists
+    // (setup wizard / --no-setup first boot). If config.toml exists but
+    // users.toml is missing, fail closed instead of silently re-enabling the
+    // default credentials.
+    let bootstrap_allowed = !config_path_buf.exists();
+    let auth_mgr = Arc::new(sito_api::AuthManager::with_storage_checked(
         &config.server.data_dir,
         auth_cfg.session_ttl_hours,
         auth_cfg.login_rate_limit,
+        bootstrap_allowed,
     )?);
     auth_mgr.spawn_pruner(shutdown_rx.clone());
 
@@ -349,14 +380,20 @@ pub async fn run_server_full(
     let watcher_rewrites_arc = rewrites_arc.clone();
     let watcher_filter = filter_engine.clone();
     let watcher_coordinator = master_coordinator.clone();
+    let watcher_upstream = upstream_manager.clone();
+    let watcher_bootstrap = bootstrap.clone();
+    let watcher_querylog = querylog_sender.clone();
+    let watcher_cache = cache.clone();
     let mut watcher_shutdown_rx = shutdown_rx.clone();
 
     tokio::spawn(async move {
         use notify::{Event, RecursiveMode, Watcher};
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let event_filter_path = watcher_config_path.clone();
         let mut watcher = match notify::recommended_watcher(move |res: Result<Event, _>| {
             if let Ok(event) = res
                 && (event.kind.is_modify() || event.kind.is_create())
+                && event.paths.contains(&event_filter_path)
             {
                 let _ = tx.send(());
             }
@@ -368,12 +405,15 @@ pub async fn run_server_full(
             }
         };
 
-        if watcher_config_path.exists()
-            && let Err(e) = watcher.watch(&watcher_config_path, RecursiveMode::NonRecursive)
-        {
+        // Watch the parent directory so a config file created after startup
+        // (first-run wizard) is also picked up.
+        let watch_target = watcher_config_path
+            .parent()
+            .map_or_else(|| watcher_config_path.clone(), std::path::Path::to_path_buf);
+        if let Err(e) = watcher.watch(&watch_target, RecursiveMode::NonRecursive) {
             warn!(
-                "Failed to watch config file {}: {e}",
-                watcher_config_path.display()
+                "Failed to watch config directory {}: {e}",
+                watch_target.display()
             );
             return;
         }
@@ -410,6 +450,16 @@ pub async fn run_server_full(
                                     .unwrap_or_default();
                                 watcher_clients_arc
                                     .store(Arc::new(sito_clients::ClientRegistry::new(new_clients_cfg)));
+
+                                if let Err(e) = watcher_upstream
+                                    .reload(&new_cfg.upstream, &watcher_bootstrap)
+                                    .await
+                                {
+                                    warn!("Failed to hot-reload upstream configuration: {e}");
+                                }
+                                watcher_querylog
+                                    .set_anonymize(new_cfg.privacy.anonymize_querylog);
+                                watcher_cache.update_config(new_cfg.dns.cache.clone());
 
                                 watcher_config_arc.store(Arc::new(new_cfg.clone()));
 
@@ -731,21 +781,31 @@ async fn start_dns_listeners(
             handles.push(dot_handle);
         }
 
-        // Start DoH listener if doh_port > 0 and (TLS configured or non-default port)
-        if config.dns.doh_port > 0 && (doh_acceptor_mgr.is_some() || config.dns.doh_port != 443) {
-            let doh_addr = SocketAddr::new(*bind_ip, config.dns.doh_port);
-            let mut doh_config = DohConfig::new(doh_addr, doh_acceptor_mgr.clone())
-                .with_http01_challenges(http01_challenges.clone())
-                .with_alt_svc_port(if config.dns.doh3_port > 0 {
-                    Some(config.dns.doh3_port)
-                } else {
-                    None
-                });
-            doh_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-            doh_config.max_connections = config.dns.max_tcp_connections;
-            let doh_handle =
-                start_doh_listener(doh_config, pipeline.clone(), shutdown_rx.clone()).await?;
-            handles.push(doh_handle);
+        // Start DoH listener if doh_port > 0. Plaintext HTTP DoH is only
+        // started on unprivileged loopback ports or when explicitly opted in.
+        if config.dns.doh_port > 0 {
+            let plaintext_allowed = config.dns.allow_plaintext_doh
+                || (bind_ip.is_loopback() && config.dns.doh_port >= 1024);
+            if doh_acceptor_mgr.is_none() && !plaintext_allowed {
+                warn!(
+                    addr = %SocketAddr::new(*bind_ip, config.dns.doh_port),
+                    "DoH port configured without TLS on a non-loopback address; skipping plaintext DoH listener (set dns.allow_plaintext_doh = true to override)"
+                );
+            } else {
+                let doh_addr = SocketAddr::new(*bind_ip, config.dns.doh_port);
+                let mut doh_config = DohConfig::new(doh_addr, doh_acceptor_mgr.clone())
+                    .with_http01_challenges(http01_challenges.clone())
+                    .with_alt_svc_port(if config.dns.doh3_port > 0 {
+                        Some(config.dns.doh3_port)
+                    } else {
+                        None
+                    });
+                doh_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+                doh_config.max_connections = config.dns.max_tcp_connections;
+                let doh_handle =
+                    start_doh_listener(doh_config, pipeline.clone(), shutdown_rx.clone()).await?;
+                handles.push(doh_handle);
+            }
         }
 
         // Start DoQ listener if doq_port > 0 and TLS is configured

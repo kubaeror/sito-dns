@@ -71,7 +71,7 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
 5. **Verify master status**:
    Query the local status endpoint:
    ```bash
-   curl -s http://localhost:3000/api/v1/ha/status | jq .
+   curl -s http://localhost:8080/api/v1/ha/status | jq .
    ```
    Expected response:
    ```json
@@ -108,10 +108,9 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
 Run the built-in certificate generator:
 ```bash
 sito ha gen-certs \
-  --out-dir /etc/sito/certs/next \
-  --master-ip 192.168.1.10 \
-  --slave-ip 192.168.1.11 \
-  --days 365
+  --dir /etc/sito/certs/next \
+  --master 192.168.1.10 \
+  --slave 192.168.1.11
 ```
 Note down the new fingerprints printed by the command:
 - Master cert BLAKE3 fingerprint: `a1b2c3...`
@@ -191,15 +190,20 @@ When a slave node fails or must be reprovisioned from bare metal:
    [server]
    role = "slave"
    instance_name = "sito-slave-2"
-   listen_addrs = ["0.0.0.0:53"]
    data_dir = "/var/lib/sito"
+
+   [dns]
+   bind = ["0.0.0.0"]
 
    [ha]
    master_url = "wss://192.168.1.10:8953"
    master_fingerprint = "<BLAKE3_FINGERPRINT_OF_MASTER>"
+   master_pubkey = "<ED25519_PUBLIC_KEY_OF_MASTER>"
    cert = "/etc/sito/certs/slave.crt"
    key = "/etc/sito/certs/slave.key"
    ca = "/etc/sito/certs/ca.crt"
+   # Required when the master sets a slave_token (recommended)
+   slave_token = "<SHARED_TOKEN>"
    ```
 4. **Register Slave Fingerprint on Master**:
    If the master enforces pinned fingerprints, add the new slave's certificate fingerprint to `pinned_slave_fingerprints` in `/etc/sito/config.toml` on the master.
@@ -210,7 +214,7 @@ When a slave node fails or must be reprovisioned from bare metal:
 6. **Verify Initial Synchronization**:
    Check the slave status endpoint:
    ```bash
-   curl -s http://localhost:3000/api/v1/ha/status | jq .
+   curl -s http://localhost:8080/api/v1/ha/status | jq .
    ```
    The slave will transition through `Connecting` -> `HelloSent` -> `Applying` -> `Synced` in under 2 seconds. Verify that custom rules, rewrites, and client lists match the master.
 
@@ -232,24 +236,24 @@ When a slave node fails or must be reprovisioned from bare metal:
 
 1. **Check HA status on Master**:
    ```bash
-   curl -s http://192.168.1.10:3000/api/v1/ha/status | jq .
-   curl -s http://192.168.1.10:3000/api/v1/ha/slaves | jq .
+   curl -s http://192.168.1.10:8080/api/v1/ha/status | jq .
+   curl -s http://192.168.1.10:8080/api/v1/ha/slaves | jq .
    ```
 2. **Check HA status on Slave**:
    ```bash
-   curl -s http://192.168.1.11:3000/api/v1/ha/status | jq .
+   curl -s http://192.168.1.11:8080/api/v1/ha/status | jq .
    ```
 3. **Trigger Manual Resynchronization**:
    ```bash
    # From the master:
-   curl -s -X POST http://192.168.1.10:3000/api/v1/ha/resync | jq .
+   curl -s -X POST http://192.168.1.10:8080/api/v1/ha/resync | jq .
 
    # Or from a slave:
-   curl -s -X POST http://192.168.1.11:3000/api/v1/ha/resync | jq .
+   curl -s -X POST http://192.168.1.11:8080/api/v1/ha/resync | jq .
    ```
 4. **Inspect Prometheus HA Metrics**:
    ```bash
-   curl -s http://192.168.1.10:3000/metrics | grep sito_ha_
+   curl -s http://192.168.1.10:8080/metrics | grep sito_ha_
    ```
    Look for:
     - `sito_ha_slaves_connected`: Number of active slaves connected.

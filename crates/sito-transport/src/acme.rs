@@ -8,7 +8,7 @@
 //! - Background renewal ticker (renewing 30 days before expiration)
 //! - Zero-downtime certificate reloading via `TlsAcceptorManager`
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,7 +20,29 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tracing::{debug, error, info, warn};
 
-use crate::tls::{TlsAcceptorManager, create_certified_key, load_server_config};
+use crate::tls::{TlsAcceptorManager, create_certified_key, load_server_config_with_challenges};
+
+/// Writes a file containing key material with owner-only permissions (0600).
+fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
 
 /// Configuration for ACME certificate management.
 #[derive(Clone, Debug)]
@@ -172,7 +194,7 @@ async fn load_or_create_account(
         .map_err(|e| format!("Failed to serialize account credentials: {e}"))?;
 
     let _ = std::fs::create_dir_all(&config.storage_dir);
-    std::fs::write(&creds_file, serialized).map_err(|e| {
+    write_secret_file(&creds_file, serialized.as_bytes()).map_err(|e| {
         format!(
             "Failed to persist account credentials to {}: {e}",
             creds_file.display()
@@ -382,7 +404,7 @@ pub async fn obtain_or_renew_certificate(
 
     std::fs::write(&cert_path, &cert_chain_pem)
         .map_err(|e| format!("Failed to write cert.pem to {}: {e}", cert_path.display()))?;
-    std::fs::write(&key_path, &private_key_pem)
+    write_secret_file(&key_path, private_key_pem.as_bytes())
         .map_err(|e| format!("Failed to write key.pem to {}: {e}", key_path.display()))?;
 
     info!(
@@ -390,9 +412,17 @@ pub async fn obtain_or_renew_certificate(
         config.storage_dir
     );
 
-    // Reload the running server TLS config if acceptor_mgr is provided
+    // Reload the running server TLS config if acceptor_mgr is provided.
+    // Reuse the manager's shared challenge-key map so in-flight ACME
+    // TLS-ALPN-01 challenges survive the reload.
     if let Some(mgr) = acceptor_mgr {
-        match load_server_config(&cert_path, &key_path, &[], alpn_protocols.to_vec()) {
+        match load_server_config_with_challenges(
+            &cert_path,
+            &key_path,
+            &[],
+            alpn_protocols.to_vec(),
+            mgr.challenge_keys(),
+        ) {
             Ok(new_config) => {
                 mgr.reload(new_config);
                 info!("TlsAcceptorManager successfully reloaded with ACME certificate");

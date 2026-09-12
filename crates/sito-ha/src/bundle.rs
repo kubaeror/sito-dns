@@ -314,7 +314,23 @@ pub fn verify_and_unpack_push(
     let bundle_str = std::str::from_utf8(&payload_bytes)
         .map_err(|e| HaError::Serialization(format!("Bundle payload is not valid UTF-8: {e}")))?;
 
-    ConfigBundle::from_json(bundle_str)
+    let bundle = ConfigBundle::from_json(bundle_str)?;
+
+    // 6. Envelope/payload version binding: the version the monotonicity guard
+    // checked must be the same one actually carried inside the signed payload,
+    // otherwise an attacker can replay an old signed bundle with a bumped
+    // envelope version and roll the slave's configuration backward.
+    if bundle.version != version {
+        return Err(HaError::Validation {
+            field: "version".to_string(),
+            reason: format!(
+                "Envelope version {version} does not match signed bundle version {} (replay/downgrade rejected)",
+                bundle.version
+            ),
+        });
+    }
+
+    Ok(bundle)
 }
 
 #[cfg(test)]
@@ -407,6 +423,48 @@ token = "mikrotik_secret_token_12345"
         let wrong_key = Ed25519SigningKey::generate().unwrap();
         let sig_err = verify_and_unpack_push(&push_msg, 9, &wrong_key.public_key());
         assert!(sig_err.is_err());
+    }
+
+    #[test]
+    fn test_envelope_version_must_match_signed_payload() {
+        let signing_key = Ed25519SigningKey::generate().unwrap();
+
+        let bundle = ConfigBundle {
+            version: 10,
+            timestamp: 123_456_789,
+            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+            custom_rules: vec![],
+            rewrites: None,
+            clients: None,
+            lists: vec![],
+        };
+
+        let push_msg = build_and_sign_push(&bundle, &signing_key).unwrap();
+
+        // Tamper with the unsigned envelope version (replay/downgrade attempt):
+        // bumping it must not bypass the signed-payload version check.
+        let tampered = match push_msg {
+            HaMessage::ConfigPush {
+                hash_blake3,
+                signature_ed25519,
+                payload_b64,
+                payload_hash_blake3,
+                ..
+            } => HaMessage::ConfigPush {
+                version: 11,
+                hash_blake3,
+                signature_ed25519,
+                payload_b64,
+                payload_hash_blake3,
+            },
+            other => panic!("expected ConfigPush, got {other:?}"),
+        };
+
+        let err = verify_and_unpack_push(&tampered, 9, &signing_key.public_key());
+        assert!(
+            err.is_err(),
+            "envelope version not bound to the signed payload must be rejected"
+        );
     }
 
     #[test]

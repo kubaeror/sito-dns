@@ -30,9 +30,10 @@ where
 
 /// Resolves the effective client IP address from optional peer address and HTTP headers.
 ///
-/// Only trusts `X-Forwarded-For` if the direct peer address is in `trusted_proxies`.
-/// If peer address is not available (e.g. mock test harnesses), `X-Forwarded-For`
-/// will be used if present and valid, otherwise defaults to `"127.0.0.1"`.
+/// `X-Forwarded-For` is only trusted when the direct peer address is in
+/// `trusted_proxies`, and only the last (proxy-appended) entry is considered.
+/// Without peer information the direct client cannot be authenticated, so
+/// client-supplied forwarding headers are ignored entirely.
 pub fn resolve_client_ip(
     peer_addr: Option<SocketAddr>,
     headers: &HeaderMap,
@@ -45,19 +46,13 @@ pub fn resolve_client_ip(
             && let Some(forwarded) = headers.get("x-forwarded-for")
             && let Ok(val) = forwarded.to_str()
         {
-            // Reverse proxies append client IP to X-Forwarded-For (RFC 7239 / standard practice).
-            // To prevent client-side spoofing, take the last entry added by the trusted proxy,
-            // falling back to leftmost if the last entry is not a valid IP.
+            // Reverse proxies append the client IP to X-Forwarded-For. Only the
+            // last entry was written by the trusted proxy; earlier entries are
+            // attacker-controlled and must never be used.
             if let Some(last) = val.rsplit(',').next() {
                 let candidate = last.trim();
-                if candidate.parse::<IpAddr>().is_ok() {
-                    return candidate.to_string();
-                }
-            }
-            if let Some(first) = val.split(',').next() {
-                let candidate = first.trim();
-                if candidate.parse::<IpAddr>().is_ok() {
-                    return candidate.to_string();
+                if let Ok(ip) = candidate.parse::<IpAddr>() {
+                    return ip.to_string();
                 }
             }
         }
@@ -65,24 +60,7 @@ pub fn resolve_client_ip(
         return peer_ip.to_string();
     }
 
-    // Direct unit test / test harness without socket
-    if let Some(forwarded) = headers.get("x-forwarded-for")
-        && let Ok(val) = forwarded.to_str()
-    {
-        if let Some(last) = val.rsplit(',').next() {
-            let candidate = last.trim();
-            if candidate.parse::<IpAddr>().is_ok() {
-                return candidate.to_string();
-            }
-        }
-        if let Some(first) = val.split(',').next() {
-            let candidate = first.trim();
-            if candidate.parse::<IpAddr>().is_ok() {
-                return candidate.to_string();
-            }
-        }
-    }
-
+    // No peer information available: do not trust client-supplied headers.
     "127.0.0.1".to_string()
 }
 
@@ -163,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trusted_proxy_fallback_to_leftmost_if_last_entry_invalid() {
+    fn test_trusted_proxy_fallback_to_peer_if_last_entry_invalid() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
@@ -174,7 +152,7 @@ mod tests {
         let trusted = vec![proxy_ip];
 
         let ip = resolve_client_ip(Some(peer), &headers, &trusted);
-        assert_eq!(ip, "198.51.100.42");
+        assert_eq!(ip, "10.0.0.1");
     }
 
     #[test]
@@ -190,11 +168,11 @@ mod tests {
     }
 
     #[test]
-    fn test_no_connect_info_falls_back_to_forwarded_or_localhost() {
+    fn test_no_connect_info_ignores_forwarded_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", HeaderValue::from_static("192.168.1.50"));
         let ip = resolve_client_ip(None, &headers, &[]);
-        assert_eq!(ip, "192.168.1.50");
+        assert_eq!(ip, "127.0.0.1");
 
         let empty_headers = HeaderMap::new();
         let default_ip = resolve_client_ip(None, &empty_headers, &[]);

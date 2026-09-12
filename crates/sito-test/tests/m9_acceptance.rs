@@ -391,4 +391,14 @@ fn test_m9_release_configuration_and_systemd() {
         install_content.contains("Open http://"),
         "install.sh must direct users to web-based first-time setup"
     );
+    // Release archive layout: top-level directory must be stripped on extraction
+    assert!(
+        install_content.contains("--strip-components=1"),
+        "install.sh must strip the release archive's top-level directory"
+    );
+    // Local binary bypass must be explicit opt-in only
+    assert!(
+        install_content.contains("SITO_INSTALL_LOCAL_BINARY"),
+        "install.sh must gate the unverified local-binary install behind an explicit opt-in"
+    );
 }

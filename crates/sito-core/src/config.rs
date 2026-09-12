@@ -101,6 +101,40 @@ impl Config {
             acme.validate()?;
         }
 
+        // Validate the structured sections stored as raw TOML so that type
+        // errors (e.g. `[web] bind = ["0.0.0.0"]`) fail fast instead of being
+        // silently replaced by defaults at runtime.
+        if let Some(ref val) = self.web {
+            let _: WebConfig = val.clone().try_into().map_err(|e| {
+                ConfigError::validation("web", format!("invalid [web] section: {e}"))
+            })?;
+        }
+        if let Some(ref val) = self.auth {
+            let _: AuthConfig = val.clone().try_into().map_err(|e| {
+                ConfigError::validation("auth", format!("invalid [auth] section: {e}"))
+            })?;
+        }
+        if let Some(ref val) = self.stats {
+            let _: StatsConfig = val.clone().try_into().map_err(|e| {
+                ConfigError::validation("stats", format!("invalid [stats] section: {e}"))
+            })?;
+        }
+        for (name, section) in [
+            ("ha", &self.ha),
+            ("clients", &self.clients),
+            ("rewrites", &self.rewrites),
+            ("integrations", &self.integrations),
+        ] {
+            if let Some(val) = section
+                && val.as_table().is_none()
+            {
+                return Err(ConfigError::validation(
+                    name,
+                    format!("[{name}] must be a table"),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -404,6 +438,10 @@ pub struct DnsConfig {
     pub doh_dedicated_hostname: String,
     #[serde(default)]
     pub dot_padding: bool,
+    /// Allow plaintext HTTP DoH when no TLS certificate is configured
+    /// (default: false; ignored for loopback binds).
+    #[serde(default)]
+    pub allow_plaintext_doh: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
     #[serde(default = "default_dns_edns_udp_size")]
@@ -460,6 +498,7 @@ impl Default for DnsConfig {
             doh3_port: default_dns_doh3_port(),
             doh_dedicated_hostname: String::new(),
             dot_padding: false,
+            allow_plaintext_doh: false,
             tls: None,
             edns_udp_size: default_dns_edns_udp_size(),
             rate_limit_per_ip: default_dns_rate_limit_per_ip(),
@@ -1155,13 +1194,13 @@ entries = []
 
 [web]
 port = 8080
-bind = ["0.0.0.0"]
+bind = "0.0.0.0"
 
 [auth]
 session_ttl_hours = 24
 
 [stats]
-query_log_enabled = true
+retention_days = 90
 
 [ha]
 replication_port = 8953
