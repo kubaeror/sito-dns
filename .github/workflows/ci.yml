@@ -49,6 +49,8 @@ jobs:
         run: cargo test --workspace --all-features
       - name: Verify docs/openapi.json is up to date
         run: git diff --exit-code docs/openapi.json
+      - name: Verify configuration reference matches the config structs
+        run: python3 scripts/check_config_reference.py --github
 
   deny:
     name: deny

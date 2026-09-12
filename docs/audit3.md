@@ -334,7 +334,9 @@ ignoring the configured `dns.bind`.
 > fix, shutdown joins, dead-code removal, allocation-free suffix matching,
 > deterministic pattern order; pipeline helper extraction pending);
 > **WP-12 — partial** (SHA-pinned GitHub Actions in addition to the earlier
-> installer/armv7 work; `deny.toml` tightening pending).
+> installer/armv7 work; `deny.toml` tightening pending);
+> **WP-14 — partial** (bidirectional config-reference drift validator in CI,
+> which fixed several undocumented settings; table generation pending).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated

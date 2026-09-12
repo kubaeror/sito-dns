@@ -5,6 +5,8 @@ This document is the exhaustive configuration reference for **sito v1.4.0**.
 `sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. Only `DNSD_SECRET_<NAME>` variables are used to resolve HA secret placeholders.
 
 > [!NOTE]
+> The tables below are validated against the Rust config structs in CI (`scripts/check_config_reference.py`); adding a setting without documenting it fails the build.
+>
 > Configuration persistence round-trips modeled fields via the `Config` schema. Unrecognized or unmodeled keys and comments are omitted when the configuration is saved back to disk by the web console or API.
 
 ---
@@ -55,6 +57,7 @@ dot_padding = false
 edns_udp_size = 1232
 rate_limit_per_ip = 20
 max_tcp_connections = 256
+allow_plaintext_doh = false
 ```
 
 | Key | Type | Default | Description |
@@ -70,6 +73,7 @@ max_tcp_connections = 256
 | `edns_udp_size` | integer | `1232` | Maximum EDNS0 UDP buffer size (1232 bytes prevents IPv6 fragmentation). |
 | `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual client IP. `0` disables rate limiting. |
 | `max_tcp_connections` | integer | `256` | Maximum concurrent TCP, DoT, and DoH client connections. |
+| `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
 ---
 
@@ -111,7 +115,9 @@ ntp = ["local.internal"]
 |---|---|---|---|
 | `mode` | string | `"validate"` | Validation mode. Accepted: `"validate"`/`"strict"` (bogus = SERVFAIL), `"log_only"`/`"log-only"`/`"permissive"`/`"log_fail"` (log and clear AD), `"off"`/`"disabled"`. |
 | `validate` | boolean | `true` | Enable DNSSEC processing. **Note:** validation currently verifies RRSIGs against configured trust anchors only; full DS/DNSKEY chain walking is not yet implemented, so responses from zones chain-of-trust-validated beyond the direct anchor are reported `indeterminate`. |
-| `ntp` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (`ntp` in config, RFC 7646 style trust-anchor exemptions). |
+| `ntp` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). Alias retained for compatibility; `nta` is the preferred key. |
+| `nta` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). |
+| `trust_anchors` | array of strings | `[]` | Trust anchors used as the top of the DS/DNSKEY chain (DS or DNSKEY records in zone-file/hex form). Empty uses validation of RRSIGs against configured anchors only. |
 
 ---
 
@@ -143,6 +149,8 @@ staging = false
 | `acme.email` | string | `""` | Contact email address for ACME registration. |
 | `acme.domains` | array of strings | `[]` | Domain names for ACME TLS-ALPN-01 / HTTP-01 certificates. |
 | `acme.staging` | boolean | `false` | When `true`, uses Let's Encrypt Staging API to avoid rate limits during testing. |
+| `acme.cache_dir` | string | `None` | Directory used to persist ACME account keys and certificates (defaults to `<data_dir>/acme`). |
+| `acme.http_port` | integer | `80` | Port for the dedicated ACME HTTP-01 challenge listener. |
 
 ---
 
@@ -337,12 +345,17 @@ replication_port = 8953
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `replication_port` | integer | `8953` | Mutual-TLS WebSocket port for config synchronization. |
+| `listen_addr` | string | `"0.0.0.0"` | Address the master replication listener binds to. |
 | `master_url` | string | `None` | (Slave only) WebSocket URL of the master instance. |
 | `master_fingerprint` | string | `None` | (Slave only) Expected Blake3 public certificate fingerprint of master for pinning. |
 | `master_pubkey` | string | `None` | (Slave only, **required**) Ed25519 public key of the master used to verify signed configuration pushes. |
 | `cert` / `key` / `ca` | string | `None` | Paths to mTLS certificates and CA bundles for replication. When `ca` is set, the peer chain is additionally validated against it (on top of BLAKE3 pinning). |
 | `ping_interval_secs` | integer | `15` | Master heartbeat interval. Slaves silent for 3× this interval are disconnected and removed from the active tracker. |
 | `slave_token` | string | `None` | Pre-shared token for slave authentication (mandatory when serving plaintext `ws://`). |
+| `pinned_slave_fingerprints` | array of strings | `[]` | BLAKE3 fingerprints of slave certificates accepted by the master. |
+| `allow_unpinned_tls` | boolean | `false` | Allow TLS peers without a configured fingerprint (insecure; only for controlled networks). |
+| `allow_insecure_ws` | boolean | `false` | Allow plaintext `ws://` replication. Requires a non-empty `slave_token`; must be set explicitly on both ends. |
+| `stats_interval_secs` | integer | `30` | Interval between slave-to-master statistics reports. |
 
 ---
 
@@ -360,5 +373,9 @@ interval_s = 300
 |---|---|---|---|
 | `enabled` | boolean | `false` | Enable automated client discovery from RouterOS DHCP server. |
 | `url` | string | `""` | Base URL of RouterOS REST API (`https://router.lan`). |
-| `token_env` | string | `""` | Environment variable containing HTTP basic/bearer authentication token. |
+| `token_env` | string | `"MIKROTIK_API_TOKEN"` | Environment variable containing the RouterOS API token. |
+| `username` | string | `None` | Username for HTTP basic authentication when no token is used. |
+| `password` | string | `None` | Password for HTTP basic authentication (prefer `password_env` to keep secrets out of the config). |
+| `password_env` | string | `None` | Environment variable containing the RouterOS password. |
+| `allow_invalid_certs` | boolean | `false` | Accept untrusted/self-signed RouterOS TLS certificates (insecure; lab use only). |
 | `interval_s` | integer | `300` | Polling interval in seconds to refresh active DHCP lease table. |
