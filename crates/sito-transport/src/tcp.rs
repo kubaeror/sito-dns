@@ -19,12 +19,16 @@ use crate::limiter::RateLimiter;
 const MAX_PIPELINED_QUERIES: usize = 64;
 
 /// Configuration options for the TCP listener.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TcpConfig {
     pub bind_addr: SocketAddr,
     pub max_connections: usize,
     pub idle_timeout: Duration,
     pub rate_limit_per_ip: u32,
+    /// Optional shared limiter; lets the server hot-reload the rate
+    /// limit while keeping listener state. Built from `rate_limit_per_ip`
+    /// when absent.
+    pub rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl Default for TcpConfig {
@@ -34,6 +38,7 @@ impl Default for TcpConfig {
             max_connections: 256,
             idle_timeout: Duration::from_secs(10),
             rate_limit_per_ip: 20,
+            rate_limiter: None,
         }
     }
 }
@@ -49,10 +54,12 @@ pub async fn start_tcp_listener<H: QueryHandler>(
     info!("TCP listener started on {}", local_addr);
 
     let semaphore = Arc::new(Semaphore::new(config.max_connections));
-    let rate_limiter = Arc::new(RateLimiter::new(
-        config.rate_limit_per_ip,
-        config.rate_limit_per_ip * 2,
-    ));
+    let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
+        Arc::new(RateLimiter::new(
+            config.rate_limit_per_ip,
+            config.rate_limit_per_ip * 2,
+        ))
+    });
     rate_limiter.spawn_pruner(shutdown_rx.clone());
 
     let handle = tokio::spawn(async move {

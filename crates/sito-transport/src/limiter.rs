@@ -2,17 +2,23 @@
 
 use dashmap::DashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
+#[derive(Debug)]
 struct Bucket {
     tokens: f64,
     last_replenished: Instant,
 }
 
 /// Token-bucket based rate limiter keyed by client IP address.
+///
+/// The configured rate lives in atomics so `dns.rate_limit_per_ip` can be
+/// hot-reloaded without rebinding listeners.
+#[derive(Debug)]
 pub struct RateLimiter {
-    rate_per_sec: u32,
-    burst: u32,
+    rate_per_sec: AtomicU32,
+    burst: AtomicU32,
     buckets: DashMap<IpAddr, Bucket>,
 }
 
@@ -21,22 +27,30 @@ impl RateLimiter {
     /// A `rate_per_sec` of 0 disables rate limiting (always permits requests).
     pub fn new(rate_per_sec: u32, burst: u32) -> Self {
         Self {
-            rate_per_sec,
-            burst: burst.max(1),
+            rate_per_sec: AtomicU32::new(rate_per_sec),
+            burst: AtomicU32::new(burst.max(1)),
             buckets: DashMap::new(),
         }
+    }
+
+    /// Applies a new rate limit. `rate_per_sec = 0` disables limiting.
+    pub fn set_rate(&self, rate_per_sec: u32) {
+        self.rate_per_sec.store(rate_per_sec, Ordering::Relaxed);
+        self.burst
+            .store(rate_per_sec.saturating_mul(2).max(1), Ordering::Relaxed);
     }
 
     /// Check if a request from the given IP is allowed.
     /// Returns `true` if permitted, `false` if rate limit exceeded.
     pub fn check(&self, ip: IpAddr) -> bool {
-        if self.rate_per_sec == 0 {
+        let rate_per_sec = self.rate_per_sec.load(Ordering::Relaxed);
+        if rate_per_sec == 0 {
             return true;
         }
 
         let now = Instant::now();
-        let max_tokens = f64::from(self.burst);
-        let refill_rate = f64::from(self.rate_per_sec);
+        let max_tokens = f64::from(self.burst.load(Ordering::Relaxed));
+        let refill_rate = f64::from(rate_per_sec);
 
         let mut entry = self.buckets.entry(ip).or_insert_with(|| Bucket {
             tokens: max_tokens,
@@ -104,6 +118,27 @@ mod tests {
 
         // 6th should fail because burst is exhausted
         assert!(!limiter.check(ip));
+    }
+
+    #[test]
+    fn test_rate_limiter_hot_update() {
+        let limiter = RateLimiter::new(0, 1);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        for _ in 0..50 {
+            assert!(limiter.check(ip));
+        }
+
+        limiter.set_rate(1);
+        // A fresh bucket starts at burst (2 x rate) tokens.
+        assert!(limiter.check(ip));
+        assert!(limiter.check(ip));
+        assert!(
+            !limiter.check(ip),
+            "tokens exhausted after enabling the limit"
+        );
+
+        limiter.set_rate(0);
+        assert!(limiter.check(ip), "disabling the limit permits again");
     }
 
     #[test]

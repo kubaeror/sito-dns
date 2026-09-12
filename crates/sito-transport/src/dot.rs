@@ -27,6 +27,10 @@ pub struct DotConfig {
     pub max_queries_per_connection: usize,
     pub max_connection_duration: Duration,
     pub rate_limit_per_ip: u32,
+    /// Optional shared limiter; lets the server hot-reload the rate
+    /// limit while keeping listener state. Built from `rate_limit_per_ip`
+    /// when absent.
+    pub rate_limiter: Option<Arc<RateLimiter>>,
     pub dot_padding: bool,
 }
 
@@ -40,6 +44,7 @@ impl DotConfig {
             max_queries_per_connection: 1000,
             max_connection_duration: Duration::from_secs(300),
             rate_limit_per_ip: 20,
+            rate_limiter: None,
             dot_padding: true,
         }
     }
@@ -56,10 +61,12 @@ pub async fn start_dot_listener<H: QueryHandler>(
     info!("DoT listener started on {}", local_addr);
 
     let semaphore = Arc::new(Semaphore::new(config.max_connections));
-    let rate_limiter = Arc::new(RateLimiter::new(
-        config.rate_limit_per_ip,
-        config.rate_limit_per_ip * 2,
-    ));
+    let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
+        Arc::new(RateLimiter::new(
+            config.rate_limit_per_ip,
+            config.rate_limit_per_ip * 2,
+        ))
+    });
     rate_limiter.spawn_pruner(shutdown_rx.clone());
 
     let handle = tokio::spawn(async move {

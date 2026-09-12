@@ -350,7 +350,7 @@ ignoring the configured `dns.bind`.
 > shuffled-order precedence test; `handle` helper extraction pending);
 > **WP-6 — partial** (hot cache resize with carry-over, retention read per
 > cycle, atomic `RuntimeSnapshot` via the new `sito-runtime` crate; listener
-> rebind, rate-limiter/log-level reload and restart signalling pending).
+> rebind pending; rate-limiter and log-level reload plus restart signalling done).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated

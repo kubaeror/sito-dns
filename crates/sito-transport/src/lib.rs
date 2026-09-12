@@ -71,6 +71,7 @@ mod tests {
             worker_count: 2,
             edns_udp_size: 1232,
             rate_limit_per_ip: 100,
+            rate_limiter: None,
         };
 
         let handler = Arc::new(|query: Message, _client: ClientContext| async move {
@@ -86,7 +87,7 @@ mod tests {
             Some(resp)
         });
 
-        let _handles = start_udp_listener(config, &handler, &shutdown_rx).unwrap();
+        let _handles = start_udp_listener(&config, &handler, &shutdown_rx).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -131,6 +132,7 @@ mod tests {
             worker_count: 1,
             edns_udp_size: 1232,
             rate_limit_per_ip: 100,
+            rate_limiter: None,
         };
 
         // Handler generates a huge response > 512 bytes
@@ -149,7 +151,7 @@ mod tests {
             Some(resp)
         });
 
-        let _handles = start_udp_listener(config, &handler, &shutdown_rx).unwrap();
+        let _handles = start_udp_listener(&config, &handler, &shutdown_rx).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -193,6 +195,7 @@ mod tests {
             worker_count: 1,
             edns_udp_size: 1232,
             rate_limit_per_ip: 100,
+            rate_limiter: None,
         };
 
         let handler = Arc::new(|query: Message, _client: ClientContext| async move {
@@ -215,7 +218,7 @@ mod tests {
             Some(resp)
         });
 
-        let _handles = start_udp_listener(config, &handler, &shutdown_rx).unwrap();
+        let _handles = start_udp_listener(&config, &handler, &shutdown_rx).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -275,6 +278,7 @@ mod tests {
             max_connections: 10,
             idle_timeout: Duration::from_secs(5),
             rate_limit_per_ip: 100,
+            rate_limiter: None,
         };
 
         let handler = Arc::new(|query: Message, _client: ClientContext| async move {

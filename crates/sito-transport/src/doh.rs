@@ -33,6 +33,10 @@ pub struct DohConfig {
     pub acceptor_mgr: Option<TlsAcceptorManager>,
     pub max_connections: usize,
     pub rate_limit_per_ip: u32,
+    /// Optional shared limiter; lets the server hot-reload the rate
+    /// limit while keeping listener state. Built from `rate_limit_per_ip`
+    /// when absent.
+    pub rate_limiter: Option<Arc<RateLimiter>>,
     pub alt_svc_port: Option<u16>,
     /// When set, requests whose Host header does not match are rejected with 421.
     pub dedicated_hostname: Option<String>,
@@ -45,6 +49,7 @@ impl DohConfig {
             acceptor_mgr,
             max_connections: 256,
             rate_limit_per_ip: 20,
+            rate_limiter: None,
             alt_svc_port: Some(443),
             dedicated_hostname: None,
         }
@@ -246,10 +251,12 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
 
     let state = Arc::new(DohState {
         handler,
-        rate_limiter: Arc::new(RateLimiter::new(
-            config.rate_limit_per_ip,
-            config.rate_limit_per_ip * 2,
-        )),
+        rate_limiter: config.rate_limiter.clone().unwrap_or_else(|| {
+            Arc::new(RateLimiter::new(
+                config.rate_limit_per_ip,
+                config.rate_limit_per_ip * 2,
+            ))
+        }),
         alt_svc_header,
         dedicated_hostname: config.dedicated_hostname,
     });

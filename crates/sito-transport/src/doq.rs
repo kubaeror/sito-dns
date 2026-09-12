@@ -25,6 +25,10 @@ pub struct DoqConfig {
     pub server_config: Option<rustls::ServerConfig>,
     pub max_connections: usize,
     pub rate_limit_per_ip: u32,
+    /// Optional shared limiter; lets the server hot-reload the rate
+    /// limit while keeping listener state. Built from `rate_limit_per_ip`
+    /// when absent.
+    pub rate_limiter: Option<Arc<RateLimiter>>,
     pub idle_timeout: Duration,
 }
 
@@ -36,6 +40,7 @@ impl DoqConfig {
             server_config: None,
             max_connections: 256,
             rate_limit_per_ip: 20,
+            rate_limiter: None,
             idle_timeout: Duration::from_secs(30),
         }
     }
@@ -98,10 +103,12 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
     let local_addr = endpoint.local_addr()?;
     info!("DoQ listener started on {}", local_addr);
 
-    let rate_limiter = Arc::new(RateLimiter::new(
-        config.rate_limit_per_ip,
-        config.rate_limit_per_ip * 2,
-    ));
+    let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
+        Arc::new(RateLimiter::new(
+            config.rate_limit_per_ip,
+            config.rate_limit_per_ip * 2,
+        ))
+    });
     rate_limiter.spawn_pruner(shutdown_rx.clone());
     let semaphore = Arc::new(Semaphore::new(config.max_connections));
     let acceptor_mgr = config.acceptor_mgr.clone();

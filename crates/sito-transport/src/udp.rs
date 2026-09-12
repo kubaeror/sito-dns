@@ -19,12 +19,16 @@ use crate::limiter::RateLimiter;
 use crate::pktinfo::{enable_pktinfo, recv_with_pktinfo, send_with_pktinfo};
 
 /// Options for configuring a UDP listener instance.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct UdpConfig {
     pub bind_addr: SocketAddr,
     pub worker_count: usize,
     pub edns_udp_size: u16,
     pub rate_limit_per_ip: u32,
+    /// Optional shared limiter; lets the server hot-reload the rate
+    /// limit while keeping listener state. Built from `rate_limit_per_ip`
+    /// when absent.
+    pub rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl Default for UdpConfig {
@@ -34,6 +38,7 @@ impl Default for UdpConfig {
             worker_count: 1,
             edns_udp_size: 1232,
             rate_limit_per_ip: 20,
+            rate_limiter: None,
         }
     }
 }
@@ -70,14 +75,16 @@ pub fn create_reuseport_udp_socket(addr: &SocketAddr) -> std::io::Result<std::ne
 
 /// Start UDP worker listeners across `worker_count` tasks.
 pub fn start_udp_listener<H: QueryHandler>(
-    config: UdpConfig,
+    config: &UdpConfig,
     handler: &Arc<H>,
     shutdown_rx: &Receiver<bool>,
 ) -> std::io::Result<Vec<tokio::task::JoinHandle<()>>> {
-    let rate_limiter = Arc::new(RateLimiter::new(
-        config.rate_limit_per_ip,
-        config.rate_limit_per_ip * 2,
-    ));
+    let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
+        Arc::new(RateLimiter::new(
+            config.rate_limit_per_ip,
+            config.rate_limit_per_ip * 2,
+        ))
+    });
     let mut tasks = Vec::new();
     tasks.push(rate_limiter.spawn_pruner(shutdown_rx.clone()));
 

@@ -426,9 +426,14 @@ pub async fn run_server_full(
         }
     });
 
+    // Rate limiters created by listeners; shared so the watcher can hot-update.
+    let rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
     // Spawn config file watcher for hot-reload
     let watcher_config_path = config_path_buf.clone();
     let watcher_runtime = runtime.clone();
+    let watcher_rate_limiters = rate_limiters.clone();
     let watcher_filter = filter_engine.clone();
     let watcher_coordinator = master_coordinator.clone();
     let watcher_upstream = upstream_manager.clone();
@@ -517,6 +522,11 @@ pub async fn run_server_full(
                                 watcher_querylog
                                     .set_anonymize(new_cfg.privacy.anonymize_querylog);
                                 watcher_cache.update_config(new_cfg.dns.cache.clone()).await;
+                                if let Ok(limiters) = watcher_rate_limiters.lock() {
+                                    for limiter in limiters.iter() {
+                                        limiter.set_rate(new_cfg.dns.rate_limit_per_ip);
+                                    }
+                                }
 
                                 // Publish config, clients and rewrites together so a
                                 // query cannot observe a half-applied reload.
@@ -766,7 +776,7 @@ pub async fn run_server_full(
             Some(()) = dns_start_rx.recv() => {
                 info!("Setup wizard completed: binding and starting DNS listeners in-process...");
                 let current_cfg = config_arc.load();
-                let dns_handles = start_dns_listeners(
+                let (dns_handles, dns_limiters) = start_dns_listeners(
                     &current_cfg,
                     pipeline.clone(),
                     shutdown_rx.clone(),
@@ -776,6 +786,10 @@ pub async fn run_server_full(
                     doh3_acceptor_mgr.clone(),
                 ).await?;
                 all_handles.extend(dns_handles);
+                rate_limiters
+                    .lock()
+                    .expect("rate limiter registry poisoned")
+                    .extend(dns_limiters);
 
                 info!(
                     port = current_cfg.dns.port,
@@ -787,7 +801,7 @@ pub async fn run_server_full(
             }
         }
     } else {
-        let dns_handles = start_dns_listeners(
+        let (dns_handles, dns_limiters) = start_dns_listeners(
             &config,
             pipeline.clone(),
             shutdown_rx.clone(),
@@ -798,6 +812,10 @@ pub async fn run_server_full(
         )
         .await?;
         all_handles.extend(dns_handles);
+        rate_limiters
+            .lock()
+            .expect("rate limiter registry poisoned")
+            .extend(dns_limiters);
 
         info!(
             port = config.dns.port,
@@ -849,29 +867,45 @@ async fn start_dns_listeners(
     doh_acceptor_mgr: Option<TlsAcceptorManager>,
     doq_acceptor_mgr: Option<TlsAcceptorManager>,
     doh3_acceptor_mgr: Option<TlsAcceptorManager>,
-) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+) -> anyhow::Result<(
+    Vec<tokio::task::JoinHandle<()>>,
+    Vec<Arc<sito_transport::RateLimiter>>,
+)> {
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let mut handles = Vec::new();
+    let mut rate_limiters = Vec::new();
 
     for bind_ip in &config.dns.bind {
         let addr = SocketAddr::new(*bind_ip, config.dns.port);
 
         // Start UDP listener
+        let udp_limiter = Arc::new(sito_transport::RateLimiter::new(
+            config.dns.rate_limit_per_ip,
+            config.dns.rate_limit_per_ip * 2,
+        ));
+        rate_limiters.push(udp_limiter.clone());
         let udp_config = UdpConfig {
             bind_addr: addr,
             worker_count,
             edns_udp_size: config.dns.edns_udp_size,
             rate_limit_per_ip: config.dns.rate_limit_per_ip,
+            rate_limiter: Some(udp_limiter),
         };
-        let udp_handles = start_udp_listener(udp_config, &pipeline, &shutdown_rx)?;
+        let udp_handles = start_udp_listener(&udp_config, &pipeline, &shutdown_rx)?;
         handles.extend(udp_handles);
 
         // Start TCP listener
+        let tcp_limiter = Arc::new(sito_transport::RateLimiter::new(
+            config.dns.rate_limit_per_ip,
+            config.dns.rate_limit_per_ip * 2,
+        ));
+        rate_limiters.push(tcp_limiter.clone());
         let tcp_config = TcpConfig {
             bind_addr: addr,
             max_connections: config.dns.max_tcp_connections,
             idle_timeout: Duration::from_secs(10),
             rate_limit_per_ip: config.dns.rate_limit_per_ip,
+            rate_limiter: Some(tcp_limiter),
         };
         let tcp_handle =
             start_tcp_listener(tcp_config, pipeline.clone(), shutdown_rx.clone()).await?;
@@ -885,6 +919,13 @@ async fn start_dns_listeners(
             let mut dot_config = DotConfig::new(dot_addr, dot_mgr.clone());
             dot_config.dot_padding = config.dns.dot_padding;
             dot_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            dot_config.rate_limiter = Some(Arc::new(sito_transport::RateLimiter::new(
+                config.dns.rate_limit_per_ip,
+                config.dns.rate_limit_per_ip * 2,
+            )));
+            if let Some(limiter) = &dot_config.rate_limiter {
+                rate_limiters.push(limiter.clone());
+            }
             dot_config.max_connections = config.dns.max_tcp_connections;
             let dot_handle =
                 start_dot_listener(dot_config, pipeline.clone(), shutdown_rx.clone()).await?;
@@ -913,6 +954,13 @@ async fn start_dns_listeners(
                     })
                     .with_dedicated_hostname(dedicated_host);
                 doh_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+                doh_config.rate_limiter = Some(Arc::new(sito_transport::RateLimiter::new(
+                    config.dns.rate_limit_per_ip,
+                    config.dns.rate_limit_per_ip * 2,
+                )));
+                if let Some(limiter) = &doh_config.rate_limiter {
+                    rate_limiters.push(limiter.clone());
+                }
                 doh_config.max_connections = config.dns.max_tcp_connections;
                 let doh_handle =
                     start_doh_listener(doh_config, pipeline.clone(), shutdown_rx.clone()).await?;
@@ -927,6 +975,13 @@ async fn start_dns_listeners(
             let doq_addr = SocketAddr::new(*bind_ip, config.dns.doq_port);
             let mut doq_config = DoqConfig::new(doq_addr, Some(doq_mgr.clone()));
             doq_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            doq_config.rate_limiter = Some(Arc::new(sito_transport::RateLimiter::new(
+                config.dns.rate_limit_per_ip,
+                config.dns.rate_limit_per_ip * 2,
+            )));
+            if let Some(limiter) = &doq_config.rate_limiter {
+                rate_limiters.push(limiter.clone());
+            }
             doq_config.max_connections = config.dns.max_tcp_connections;
             match start_doq_listener(doq_config, pipeline.clone(), shutdown_rx.clone()).await {
                 Ok(doq_handle) => handles.push(doq_handle),
@@ -944,6 +999,13 @@ async fn start_dns_listeners(
             let mut doh3_config = Doh3Config::new(doh3_addr, Some(doh3_mgr.clone()))
                 .with_dedicated_hostname(dedicated_host);
             doh3_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            doh3_config.rate_limiter = Some(Arc::new(sito_transport::RateLimiter::new(
+                config.dns.rate_limit_per_ip,
+                config.dns.rate_limit_per_ip * 2,
+            )));
+            if let Some(limiter) = &doh3_config.rate_limiter {
+                rate_limiters.push(limiter.clone());
+            }
             doh3_config.max_connections = config.dns.max_tcp_connections;
             match start_doh3_listener(doh3_config, pipeline.clone(), shutdown_rx.clone()).await {
                 Ok(doh3_handle) => handles.push(doh3_handle),
@@ -952,7 +1014,7 @@ async fn start_dns_listeners(
         }
     }
 
-    Ok(handles)
+    Ok((handles, rate_limiters))
 }
 
 async fn wait_for_shutdown_signal(
