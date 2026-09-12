@@ -47,6 +47,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --workspace --all-features
+      - name: Verify docs/openapi.json is up to date
+        run: git diff --exit-code docs/openapi.json
 
   deny:
     name: deny

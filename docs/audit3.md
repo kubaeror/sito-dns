@@ -325,7 +325,10 @@ ignoring the configured `dns.bind`.
 > done** (RFC 8484 POST + GET fallback, response validation, size caps;
 > DoQ remains deferred); **WP-8 (ACME HTTP-01 + DoH hostname) — done**
 > (dedicated port-80 challenge listener, `doh_dedicated_hostname` enforced
-> with 421 on DoH/DoH3).
+> with 421 on DoH/DoH3); **WP-14 (OpenAPI drift check) — partial** (CI gate
+> added; config-reference generation pending); **WP-12 — partial**
+> (`--uninstall`, `SITO_VERSION` pin, armv7 image; SHA-pinned Actions
+> pending).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated

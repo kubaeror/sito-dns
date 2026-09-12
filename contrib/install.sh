@@ -9,6 +9,21 @@ CONFIG_DIR="/etc/sito"
 DATA_DIR="/var/lib/sito"
 SERVICE_PATH="/etc/systemd/system/sito.service"
 
+UNINSTALL=0
+for arg in "$@"; do
+    case "${arg}" in
+        --uninstall)
+            UNINSTALL=1
+            ;;
+        -h|--help)
+            echo "Usage: install.sh [--uninstall]"
+            echo "  --uninstall  Remove the sito binary and systemd unit (keeps config/data)"
+            echo "  SITO_VERSION=<version>  Pin a specific release version (default: ${SITO_VERSION})"
+            exit 0
+            ;;
+    esac
+done
+
 echo "=================================================="
 echo "    sito DNS Server Installer — v${SITO_VERSION}"
 echo "=================================================="
@@ -17,6 +32,20 @@ echo "=================================================="
 if [ "$(id -u)" -ne 0 ]; then
     echo "Error: This installer must be run as root (use sudo)." >&2
     exit 1
+fi
+
+if [ "${UNINSTALL}" -eq 1 ]; then
+    echo "Uninstalling sito..."
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop sito || true
+        systemctl disable sito || true
+        rm -f "${SERVICE_PATH}"
+        systemctl daemon-reload || true
+    fi
+    rm -f "${INSTALL_BIN}" "${INSTALL_BIN}.bak"
+    echo "Removed ${INSTALL_BIN} and ${SERVICE_PATH}."
+    echo "Configuration (${CONFIG_DIR}) and data (${DATA_DIR}) were kept."
+    exit 0
 fi
 
 # 2. Architecture detection

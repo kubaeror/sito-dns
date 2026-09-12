@@ -479,9 +479,9 @@ integration point and should land last in its wave to avoid merge churn in
 - [x] WP-9 HA heartbeat watchdog, protocol role, `ca` validation
 - [x] WP-10 Updater artifact signature verification
 - [ ] WP-11 Architecture cleanup (pipeline, shutdown, dead code, precedence)
-- [ ] WP-12 Supply chain & installer ops
+- [ ] WP-12 Supply chain & installer ops — partial: `--uninstall`, `SITO_VERSION` pin, armv7 image done; SHA-pinned Actions, `deny.toml` tightening pending
 - [ ] WP-13 Test-suite quality
-- [ ] WP-14 Docs/OpenAPI automation
+- [ ] WP-14 Docs/OpenAPI automation — partial: CI drift check for `docs/openapi.json` done; config-reference generation pending
 
 When a WP lands, update `docs/audit3.md` (move the item out of "Explicitly
 deferred") and check it off here.
