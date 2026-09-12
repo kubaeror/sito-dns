@@ -226,6 +226,21 @@ pinned_slave_fingerprints = ["blake3:11223344"]
     }
 
     #[test]
+    fn test_slave_validation_requires_master_pubkey() {
+        let mut cfg = HaConfig {
+            master_url: Some("wss://127.0.0.1:8953".to_string()),
+            master_fingerprint: Some("blake3:abcdef0123456789".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            cfg.validate("slave").is_err(),
+            "slave without master_pubkey must be rejected (pushes cannot be verified)"
+        );
+        cfg.master_pubkey = Some("00".repeat(32));
+        assert!(cfg.validate("slave").is_ok());
+    }
+
+    #[test]
     fn test_master_validation_requires_auth_and_tls() {
         // Default config with replication_port > 0 fails without auth
         let mut cfg = HaConfig::default();

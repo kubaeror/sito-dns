@@ -618,3 +618,81 @@ pub fn spawn_master_server(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::tracker::ActiveSlave;
+
+    fn test_coordinator() -> MasterCoordinator {
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        MasterCoordinator::new(
+            "test-master".to_string(),
+            1,
+            key,
+            sito_stats::MetricsRegistry::new("test", "test"),
+        )
+    }
+
+    fn test_bundle(version: u64) -> ConfigBundle {
+        ConfigBundle {
+            version,
+            timestamp: 1,
+            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+            custom_rules: vec![],
+            rewrites: None,
+            clients: None,
+            lists: vec![],
+        }
+    }
+
+    #[test]
+    fn test_update_bundle_rejects_non_monotonic_versions() {
+        let coordinator = test_coordinator();
+        assert_eq!(coordinator.update_bundle(test_bundle(2)).unwrap(), 2);
+
+        // Equal and lower versions must be rejected.
+        assert!(coordinator.update_bundle(test_bundle(2)).is_err());
+        assert!(coordinator.update_bundle(test_bundle(1)).is_err());
+        assert_eq!(coordinator.get_current_version(), 2);
+
+        assert_eq!(coordinator.update_bundle(test_bundle(3)).unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_falls_back_to_async_delivery_when_queue_full() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<HaMessage>(1);
+        // Fill the queue so broadcast's try_send fails.
+        tx.send(HaMessage::Ping { ts: 1 }).await.unwrap();
+        coordinator.slaves.lock().unwrap().insert(
+            "slave-1".to_string(),
+            ActiveSlave {
+                instance: "slave-1".to_string(),
+                remote_addr: "127.0.0.1:12345".parse().unwrap(),
+                synced_version: 1,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx.clone(),
+                capabilities: vec!["stats-v1".to_string()],
+            },
+        );
+
+        coordinator.broadcast(&HaMessage::Ping { ts: 2 });
+
+        // First message drains the queue; the queued fallback push follows.
+        assert!(rx.recv().await.is_some());
+        let delivered = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("fallback delivery timed out")
+            .expect("channel closed");
+        assert!(matches!(delivered, HaMessage::Ping { ts: 2 }));
+
+        // Cleanup removes the per-instance metric label.
+        coordinator.metrics.set_ha_config_version("slave-1", 1.0);
+        coordinator.metrics.remove_ha_config_version("slave-1");
+    }
+}

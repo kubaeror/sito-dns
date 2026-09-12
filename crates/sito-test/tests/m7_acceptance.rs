@@ -349,6 +349,7 @@ async fn test_m7_anti_doh_bypass_filter_and_pipeline() {
 
     let db_path = temp_dir.join("stats.db");
     let stats_db = StatsDb::open(&db_path).await.unwrap();
+    let stats_db_probe = stats_db.clone();
     let querylog_writer = QueryLogWriter::spawn(stats_db, 100);
     let metrics = MetricsRegistry::new("0.1.0", "test");
 
@@ -459,7 +460,7 @@ async fn test_m7_anti_doh_bypass_filter_and_pipeline() {
         .handle(query.clone(), trusted_client_ctx)
         .await
         .unwrap();
-    // Not blocked by anti_doh_bypass (will return answer from cache/upstream or empty if mock upstream)
+    // Not blocked by anti_doh_bypass: no 0.0.0.0 sinkhole answer...
     for ans in &resp_trusted.answers {
         if let RData::A(a) = &ans.data {
             assert_ne!(
@@ -469,6 +470,22 @@ async fn test_m7_anti_doh_bypass_filter_and_pipeline() {
             );
         }
     }
+    // ...and the query log must not classify the trusted query as anti-DoH blocked.
+    querylog_writer.sender().flush().await;
+    let logs = stats_db_probe
+        .query_logs(&sito_stats::QueryLogFilter::default())
+        .await
+        .unwrap();
+    let trusted_entry = logs
+        .entries
+        .iter()
+        .find(|e| e.client_ip == "192.168.1.50")
+        .expect("trusted client query must be logged");
+    assert_ne!(
+        trusted_entry.rule.as_deref(),
+        Some("anti_doh_bypass"),
+        "trusted client must bypass the Anti-DoH block"
+    );
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

@@ -328,7 +328,9 @@ ignoring the configured `dns.bind`.
 > with 421 on DoH/DoH3); **WP-14 (OpenAPI drift check) — partial** (CI gate
 > added; config-reference generation pending); **WP-12 — partial**
 > (`--uninstall`, `SITO_VERSION` pin, armv7 image; SHA-pinned Actions
-> pending).
+> pending); **WP-13 (test quality) — partial** (perf budgets behind
+> `SITO_BENCH_TESTS`, ephemeral HA ports, real mid-push chaos test,
+> monotonic/broadcast/pubkey tests; remaining items tracked in the plan).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated

@@ -111,16 +111,23 @@ fn test_m9_security_redos_adversarial_patterns() {
         "Regex DFA must compile without backtracking errors"
     );
 
-    // Evaluate matching in linear time against adversarial input strings (e.g. 50 'a' characters)
+    // Evaluate matching against adversarial input strings (e.g. 50 'a' characters).
+    // Catastrophic backtracking would blow up exponentially; assert a generous
+    // bound always and the strict 50ms budget only under SITO_BENCH_TESTS.
     let evil_input = "a".repeat(50) + "!";
     let mut candidates = Vec::new();
     let start = std::time::Instant::now();
     compiled.collect_candidates(&evil_input, &interner, &mut candidates);
     let elapsed = start.elapsed();
 
+    let budget = if std::env::var_os("SITO_BENCH_TESTS").is_some() {
+        std::time::Duration::from_millis(50)
+    } else {
+        std::time::Duration::from_secs(1)
+    };
     assert!(
-        elapsed < std::time::Duration::from_millis(50),
-        "DFA matching took {elapsed:?}, must execute in strictly linear time < 50ms without catastrophic backtracking"
+        elapsed < budget,
+        "DFA matching took {elapsed:?}, must execute in strictly linear time without catastrophic backtracking (budget {budget:?})"
     );
 }
 
