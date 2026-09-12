@@ -796,10 +796,14 @@ impl QueryHandler for DnsPipeline {
                             &key_fetcher,
                         )
                         .await;
-                    if let Some(ref m) = self.metrics
-                        && matches!(dnssec_outcome, sito_dnssec::ValidationOutcome::Bogus { .. })
-                    {
-                        m.inc_dnssec_bogus(&upstream_name);
+                    if let Some(ref m) = self.metrics {
+                        if matches!(dnssec_outcome, sito_dnssec::ValidationOutcome::Bogus { .. }) {
+                            m.inc_dnssec_bogus(&upstream_name);
+                        }
+                        m.set_dnssec_key_cache(
+                            self.dnssec.metrics.key_cache_hits(),
+                            self.dnssec.metrics.key_cache_misses(),
+                        );
                     }
                     let dnssec_str = if self.dnssec.mode == sito_dnssec::DnssecMode::Disabled {
                         None

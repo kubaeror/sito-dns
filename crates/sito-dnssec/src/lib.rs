@@ -97,6 +97,10 @@ pub struct DnssecMetrics {
     pub bogus_total: AtomicU64,
     pub indeterminate_total: AtomicU64,
     pub nta_bypass_total: AtomicU64,
+    /// DNSKEY lookups served from the validated-key cache.
+    pub key_cache_hits: AtomicU64,
+    /// DNSKEY lookups that had to be resolved from the response or upstream.
+    pub key_cache_misses: AtomicU64,
     pub bogus_by_upstream_reason: DashMap<(String, String), AtomicU64>,
 }
 
@@ -123,6 +127,27 @@ impl DnssecMetrics {
                 self.nta_bypass_total.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Records a validated-key cache lookup.
+    pub fn record_key_cache(&self, hit: bool) {
+        if hit {
+            self.key_cache_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.key_cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Cumulative validated-key cache hits.
+    #[must_use]
+    pub fn key_cache_hits(&self) -> u64 {
+        self.key_cache_hits.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative validated-key cache misses.
+    #[must_use]
+    pub fn key_cache_misses(&self) -> u64 {
+        self.key_cache_misses.load(Ordering::Relaxed)
     }
 
     pub fn record_bogus(&self, upstream: Option<&str>, reason: &str) {
@@ -781,7 +806,9 @@ impl DnssecValidator {
 
             // Find matching DNSKEY
             let lower_signer = LowerName::from(signer_name);
-            let mut matching_key = self.key_cache.get(&lower_signer, key_tag, now);
+            let cached_key = self.key_cache.get(&lower_signer, key_tag, now);
+            self.metrics.record_key_cache(cached_key.is_some());
+            let mut matching_key = cached_key;
 
             if matching_key.is_none() {
                 for (key_owner, dnskey) in &response_dnskeys {
@@ -1197,6 +1224,34 @@ mod tests {
         let mut set = RecordSet::new(origin.clone(), RecordType::A, 0);
         set.insert(answer.clone(), 0);
         (answer, sign_test_rrset(&set, signer))
+    }
+
+    #[test]
+    fn test_key_cache_metrics_across_validations() {
+        let (origin, dnskey, a_record, rrsig_record, _) =
+            create_test_signed_domain("kcache.example.");
+
+        // No trust anchors: signatures verify but chain is not linked, which
+        // still exercises the key cache lookups.
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+        for _ in 0..2 {
+            let mut msg = Message::new(23, MessageType::Response, OpCode::Query);
+            msg.queries
+                .push(Query::query(origin.clone(), RecordType::A));
+            msg.answers.push(a_record.clone());
+            msg.answers.push(rrsig_record.clone());
+            msg.additionals.push(Record::from_rdata(
+                origin.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+            ));
+            let _ = validator.validate_response(&mut msg, Some("cache-test"), now);
+        }
+
+        assert_eq!(validator.metrics.key_cache_misses(), 1);
+        assert_eq!(validator.metrics.key_cache_hits(), 1);
     }
 
     #[tokio::test]

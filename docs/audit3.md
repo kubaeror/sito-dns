@@ -338,8 +338,8 @@ ignoring the configured `dns.bind`.
 > **WP-14 — partial** (bidirectional config-reference drift validator in CI,
 > which fixed several undocumented settings; table generation pending);
 > **WP-1 — partial** (in-response DS/DNSKEY chain walk plus bounded upstream
-> key fetching via `DnssecKeyFetcher`, validated-only key cache; NSEC/NSEC3
-> negative proofs pending);
+> key fetching via `DnssecKeyFetcher`, validated-only key cache with Prometheus
+> hit/miss counters and a fuzz target; NSEC/NSEC3 negative proofs pending);
 > **WP-7 — partial** (versioned bundled-list manifest with source, license and
 > BLAKE3 integrity checks exposed by the registries; curated expansion and
 > runtime refresh pending);

@@ -47,6 +47,7 @@ jobs:
           - fuzz_toml_config
           - fuzz_client_id
           - fuzz_dns_wire
+          - fuzz_dnssec_response
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
