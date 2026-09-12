@@ -106,6 +106,80 @@ struct UsersFile {
     users: Vec<UserAccount>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SessionsFile {
+    #[serde(default)]
+    sessions: Vec<Session>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TokensFile {
+    #[serde(default)]
+    tokens: Vec<ApiTokenMeta>,
+}
+
+/// Atomically writes a secret file with owner-only permissions.
+fn atomic_write_secret(path: &Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let tmp_path = path.with_extension(format!("tmp.{}", rand::random::<u32>()));
+    let write_res = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = file.metadata()?.permissions();
+            perms.set_mode(0o600);
+            file.set_permissions(perms)?;
+        }
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        tracing::error!("Failed to persist {}: {e}", path.display());
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+}
+
+/// Backs up a corrupt state file so operators can inspect it after recovery.
+fn backup_corrupt_file(path: &Path, label: &str) {
+    let timestamp = chrono::Utc::now().timestamp();
+    let backup_name = format!(
+        "{}.corrupt.{}.bak",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        timestamp
+    );
+    let backup_path = path.with_file_name(backup_name);
+    match std::fs::copy(path, &backup_path) {
+        Ok(_) => tracing::warn!(
+            file = label,
+            source = %path.display(),
+            backup = %backup_path.display(),
+            "Backed up corrupt state file"
+        ),
+        Err(copy_err) => tracing::error!(
+            file = label,
+            source = %path.display(),
+            error = %copy_err,
+            "Failed to back up corrupt state file"
+        ),
+    }
+}
+
 /// Central state manager for authentication and authorization.
 #[derive(Clone)]
 pub struct AuthManager {
@@ -119,6 +193,10 @@ pub struct AuthManager {
     login_rate_limit: usize,
     setup_complete: Arc<AtomicBool>,
     users_path: Option<PathBuf>,
+    sessions_path: Option<PathBuf>,
+    tokens_path: Option<PathBuf>,
+    tokens_dirty: Arc<AtomicBool>,
+    token_default_ttl_days: u64,
 }
 
 impl Default for AuthManager {
@@ -167,6 +245,25 @@ impl AuthManager {
         )
     }
 
+    /// Production constructor with persistence policy for sessions and tokens.
+    pub fn with_storage_full(
+        data_dir: impl AsRef<Path>,
+        session_ttl_hours: u64,
+        login_rate_limit: usize,
+        bootstrap_allowed: bool,
+        session_persist: bool,
+        token_default_ttl_days: u64,
+    ) -> Result<Self, AuthStorageError> {
+        Self::with_config_and_storage_full(
+            Some(data_dir.as_ref().join("users.toml")),
+            session_ttl_hours,
+            login_rate_limit,
+            bootstrap_allowed,
+            session_persist,
+            token_default_ttl_days,
+        )
+    }
+
     pub fn with_config_and_storage(
         users_path: Option<PathBuf>,
         session_ttl_hours: u64,
@@ -181,8 +278,39 @@ impl AuthManager {
         login_rate_limit: usize,
         bootstrap_allowed: bool,
     ) -> Result<Self, AuthStorageError> {
+        Self::with_config_and_storage_full(
+            users_path,
+            session_ttl_hours,
+            login_rate_limit,
+            bootstrap_allowed,
+            true,
+            0,
+        )
+    }
+
+    pub fn with_config_and_storage_full(
+        users_path: Option<PathBuf>,
+        session_ttl_hours: u64,
+        login_rate_limit: usize,
+        bootstrap_allowed: bool,
+        session_persist: bool,
+        token_default_ttl_days: u64,
+    ) -> Result<Self, AuthStorageError> {
         let secs = session_ttl_hours.saturating_mul(3600);
         let session_ttl_secs = i64::try_from(secs).unwrap_or(DEFAULT_SESSION_TTL_SECS);
+
+        let data_dir = users_path.as_ref().and_then(|p| p.parent());
+        let (sessions_path, tokens_path) = if session_persist {
+            match data_dir {
+                Some(dir) => (
+                    Some(dir.join("sessions.toml")),
+                    Some(dir.join("tokens.toml")),
+                ),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
 
         let mgr = Self {
             users: Arc::new(Mutex::new(HashMap::new())),
@@ -195,6 +323,10 @@ impl AuthManager {
             login_rate_limit,
             setup_complete: Arc::new(AtomicBool::new(false)),
             users_path,
+            sessions_path,
+            tokens_path,
+            tokens_dirty: Arc::new(AtomicBool::new(false)),
+            token_default_ttl_days,
         };
 
         if let Some(ref path) = mgr.users_path {
@@ -272,6 +404,8 @@ impl AuthManager {
                 if !has_admin || admin_password_changed {
                     mgr.setup_complete.store(true, Ordering::SeqCst);
                 }
+                mgr.load_sessions();
+                mgr.load_tokens();
                 return Ok(mgr);
             }
 
@@ -291,6 +425,8 @@ impl AuthManager {
             mgr.create_user_internal("admin", "adminadmin", Role::Admin);
         }
 
+        mgr.load_sessions();
+        mgr.load_tokens();
         Ok(mgr)
     }
 
@@ -322,6 +458,10 @@ impl AuthManager {
             login_rate_limit: 5,
             setup_complete: Arc::new(AtomicBool::new(false)),
             users_path: Some(path.clone()),
+            sessions_path: None,
+            tokens_path: None,
+            tokens_dirty: Arc::new(AtomicBool::new(false)),
+            token_default_ttl_days: 0,
         };
         mgr.create_user_internal("admin", new_password, Role::Admin);
         mgr.save_users();
@@ -341,39 +481,94 @@ impl AuthManager {
             tracing::error!("Failed to serialize users to TOML");
             return;
         };
+        atomic_write_secret(path, &toml_str);
+    }
 
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    fn save_sessions(&self) {
+        let Some(ref path) = self.sessions_path else {
+            return;
+        };
+        let sessions: Vec<Session> = self.sessions.lock().unwrap().values().cloned().collect();
+        let Ok(toml_str) = toml::to_string_pretty(&SessionsFile { sessions }) else {
+            tracing::error!("Failed to serialize sessions to TOML");
+            return;
+        };
+        atomic_write_secret(path, &toml_str);
+    }
+
+    fn save_tokens(&self) {
+        let Some(ref path) = self.tokens_path else {
+            return;
+        };
+        let tokens: Vec<ApiTokenMeta> = self.tokens.lock().unwrap().values().cloned().collect();
+        let Ok(toml_str) = toml::to_string_pretty(&TokensFile { tokens }) else {
+            tracing::error!("Failed to serialize API tokens to TOML");
+            return;
+        };
+        atomic_write_secret(path, &toml_str);
+        self.tokens_dirty.store(false, Ordering::SeqCst);
+    }
+
+    fn load_sessions(&self) {
+        let Some(ref path) = self.sessions_path else {
+            return;
+        };
+        if !path.exists() {
+            return;
         }
-
-        let tmp_path = path.with_extension(format!("tmp.{}", rand::random::<u32>()));
-        let write_res = (|| -> std::io::Result<()> {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&tmp_path)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = file.metadata()?.permissions();
-                perms.set_mode(0o600);
-                file.set_permissions(perms)?;
+        let Ok(content) = std::fs::read_to_string(path) else {
+            tracing::error!(path = %path.display(), "Failed to read sessions file");
+            return;
+        };
+        match toml::from_str::<SessionsFile>(&content) {
+            Ok(file) => {
+                let mut sessions = self.sessions.lock().unwrap();
+                for session in file.sessions {
+                    if !session.is_expired() {
+                        sessions.insert(session.id.clone(), session);
+                    }
+                }
             }
-            file.write_all(toml_str.as_bytes())?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&tmp_path, path)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(path)?.permissions();
-                perms.set_mode(0o600);
-                std::fs::set_permissions(path, perms)?;
+            Err(e) => {
+                backup_corrupt_file(path, "sessions");
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "Corrupt sessions file detected; starting with no active sessions"
+                );
             }
-            Ok(())
-        })();
+        }
+    }
 
-        if let Err(e) = write_res {
-            tracing::error!("Failed to persist users to {}: {e}", path.display());
-            let _ = std::fs::remove_file(&tmp_path);
+    fn load_tokens(&self) {
+        let Some(ref path) = self.tokens_path else {
+            return;
+        };
+        if !path.exists() {
+            return;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            tracing::error!(path = %path.display(), "Failed to read API tokens file");
+            return;
+        };
+        match toml::from_str::<TokensFile>(&content) {
+            Ok(file) => {
+                let now = chrono::Utc::now().timestamp();
+                let mut tokens = self.tokens.lock().unwrap();
+                for token in file.tokens {
+                    if token.expires_at.is_none_or(|exp| now < exp) {
+                        tokens.insert(token.hash.clone(), token);
+                    }
+                }
+            }
+            Err(e) => {
+                backup_corrupt_file(path, "tokens");
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "Corrupt API tokens file detected; starting with no active tokens"
+                );
+            }
         }
     }
 
@@ -466,10 +661,15 @@ impl AuthManager {
 
     /// Removes all active sessions belonging to a user (used after credential changes).
     pub fn purge_user_sessions(&self, username: &str) {
-        self.sessions
-            .lock()
-            .unwrap()
-            .retain(|_, session| session.username != username);
+        let removed = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let before = sessions.len();
+            sessions.retain(|_, session| session.username != username);
+            sessions.len() != before
+        };
+        if removed {
+            self.save_sessions();
+        }
     }
 
     fn insert_session(&self, session: Session) {
@@ -483,6 +683,8 @@ impl AuthManager {
             }
         }
         sessions.insert(session.id.clone(), session);
+        drop(sessions);
+        self.save_sessions();
     }
 
     /// Primary login flow (`POST /auth/login`).
@@ -731,16 +933,26 @@ impl AuthManager {
 
     /// Logs out and destroys an active session.
     pub fn logout(&self, session_id: &str) {
-        self.sessions.lock().unwrap().remove(session_id);
+        let removed = self.sessions.lock().unwrap().remove(session_id).is_some();
+        if removed {
+            self.save_sessions();
+        }
     }
 
     /// Creates a new API token with the specified scope.
     pub fn create_token(&self, name: &str, scope: Role) -> (ApiTokenMeta, CreateTokenResponse) {
-        let (meta, resp) = generate_token(name, scope);
+        let (mut meta, resp) = generate_token(name, scope);
+        if self.token_default_ttl_days > 0 {
+            let ttl_secs = i64::try_from(self.token_default_ttl_days)
+                .unwrap_or(i64::MAX / 86_400)
+                .saturating_mul(86_400);
+            meta.expires_at = Some(chrono::Utc::now().timestamp().saturating_add(ttl_secs));
+        }
         self.tokens
             .lock()
             .unwrap()
             .insert(meta.hash.clone(), meta.clone());
+        self.save_tokens();
         (meta, resp)
     }
 
@@ -758,6 +970,8 @@ impl AuthManager {
             .map(|(k, _)| k.clone())
         {
             tokens.remove(&key);
+            drop(tokens);
+            self.save_tokens();
             true
         } else {
             false
@@ -769,6 +983,7 @@ impl AuthManager {
         let hash = hash_token(token);
         let hash_bytes = hash.as_bytes();
         let mut tokens = self.tokens.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
 
         let mut matched_key: Option<String> = None;
         for stored_hash in tokens.keys() {
@@ -779,11 +994,22 @@ impl AuthManager {
             }
         }
 
-        if let Some(key) = matched_key
-            && let Some(meta) = tokens.get_mut(&key)
-        {
-            meta.last_used = Some(chrono::Utc::now().timestamp_millis());
-            return Some(meta.clone());
+        if let Some(key) = matched_key {
+            if tokens
+                .get(&key)
+                .and_then(|meta| meta.expires_at)
+                .is_some_and(|expires_at| now >= expires_at)
+            {
+                tokens.remove(&key);
+                drop(tokens);
+                self.save_tokens();
+                return None;
+            }
+            if let Some(meta) = tokens.get_mut(&key) {
+                meta.last_used = Some(chrono::Utc::now().timestamp_millis());
+                self.tokens_dirty.store(true, Ordering::SeqCst);
+                return Some(meta.clone());
+            }
         }
         None
     }
@@ -791,9 +1017,24 @@ impl AuthManager {
     /// Prunes expired sessions, partial tokens, pending TOTP setups, and lockout/rate limits.
     pub fn prune(&self) {
         self.lockout.prune();
-        {
+        let sessions_changed = {
             let mut sessions = self.sessions.lock().unwrap();
+            let before = sessions.len();
             sessions.retain(|_, s| !s.is_expired());
+            sessions.len() != before
+        };
+        if sessions_changed {
+            self.save_sessions();
+        }
+        let tokens_changed = {
+            let now = chrono::Utc::now().timestamp();
+            let mut tokens = self.tokens.lock().unwrap();
+            let before = tokens.len();
+            tokens.retain(|_, t| t.expires_at.is_none_or(|exp| now < exp));
+            tokens.len() != before
+        };
+        if tokens_changed || self.tokens_dirty.load(Ordering::SeqCst) {
+            self.save_tokens();
         }
         {
             let now = Instant::now();
@@ -1145,5 +1386,150 @@ mod tests {
             .await
             .expect("pruner should shutdown cleanly")
             .unwrap();
+    }
+
+    #[test]
+    fn test_session_persistence_across_restart() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_sess_test_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let session_id = {
+            let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+            let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1")
+            else {
+                panic!("login failed");
+            };
+            session.id
+        };
+
+        // Restart: session must still validate and the file must be 0600.
+        let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        assert!(mgr.validate_session(&session_id).is_some());
+
+        let sessions_file = temp_dir.join("sessions.toml");
+        assert!(sessions_file.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&sessions_file).unwrap().permissions();
+            assert_eq!(perms.mode() & 0o777, 0o600);
+        }
+
+        // Logout must persist the revocation across another restart.
+        mgr.logout(&session_id);
+        let mgr2 = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        assert!(mgr2.validate_session(&session_id).is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_token_persistence_and_expiry() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_tok_test_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let plaintext = {
+            let mgr = AuthManager::with_config_and_storage_full(
+                Some(temp_dir.join("users.toml")),
+                24,
+                5,
+                true,
+                true,
+                30, // 30-day token TTL
+            )
+            .unwrap();
+            let (meta, resp) = mgr.create_token("ci", Role::Operator);
+            assert!(meta.expires_at.is_some(), "default TTL must be applied");
+            resp.token
+        };
+
+        // Restart: the token still authenticates and the hash is persisted.
+        let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        let meta = mgr
+            .validate_token(&plaintext)
+            .expect("token survives restart");
+        assert_eq!(meta.scope, Role::Operator);
+
+        let tokens_file = temp_dir.join("tokens.toml");
+        assert!(tokens_file.exists());
+        let content = std::fs::read_to_string(&tokens_file).unwrap();
+        assert!(
+            !content.contains(&plaintext),
+            "plaintext token must never be persisted"
+        );
+
+        // Revocation persists.
+        assert!(mgr.delete_token(&meta.id));
+        let mgr2 = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        assert!(mgr2.validate_token(&plaintext).is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_expired_token_rejected_on_load() {
+        let temp_dir = std::env::temp_dir().join(format!("sito_tokexp_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        let (mut meta, resp) = mgr.create_token("expired", Role::Viewer);
+        meta.expires_at = Some(chrono::Utc::now().timestamp() - 10);
+        mgr.tokens.lock().unwrap().insert(meta.hash.clone(), meta);
+        mgr.save_tokens();
+        drop(mgr);
+
+        let mgr2 = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        assert!(mgr2.validate_token(&resp.token).is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_corrupt_session_store_backed_up_and_empty() {
+        let temp_dir = std::env::temp_dir().join(format!("sito_sesscor_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Bootstrap a valid manager, then corrupt the sessions file.
+        {
+            let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+            let _ = mgr.login("admin", "adminadmin", "127.0.0.1");
+        }
+        std::fs::write(temp_dir.join("sessions.toml"), "not = [valid toml").unwrap();
+
+        let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        assert_eq!(mgr.sessions_len(), 0, "corrupt store starts empty");
+        let backups: Vec<_> = std::fs::read_dir(&temp_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt."))
+            .collect();
+        assert_eq!(backups.len(), 1, "corrupt file must be backed up");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_session_persistence_can_be_disabled() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_nopersist_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let mgr = AuthManager::with_config_and_storage_full(
+            Some(temp_dir.join("users.toml")),
+            24,
+            5,
+            true,
+            false, // session_persist disabled
+            0,
+        )
+        .unwrap();
+        let LoginResult::Success(_session) = mgr.login("admin", "adminadmin", "127.0.0.1") else {
+            panic!("login failed");
+        };
+        assert!(!temp_dir.join("sessions.toml").exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

@@ -17,6 +17,7 @@ sito-core = { path = "../crates/sito-core" }
 sito-filter = { path = "../crates/sito-filter" }
 sito-proto = { path = "../crates/sito-proto" }
 sito-clients = { path = "../crates/sito-clients" }
+sito-dnssec = { path = "../crates/sito-dnssec" }
 
 [[bin]]
 name = "fuzz_abp_parser"
@@ -39,5 +40,11 @@ doc = false
 [[bin]]
 name = "fuzz_dns_wire"
 path = "fuzz_targets/fuzz_dns_wire.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_dnssec_response"
+path = "fuzz_targets/fuzz_dnssec_response.rs"
 test = false
 doc = false

@@ -59,6 +59,8 @@ pub struct MetricsRegistry {
     cache_hits: Arc<AtomicU64>,
     cache_misses: Arc<AtomicU64>,
     cache_size_bytes: Arc<AtomicI64>,
+    dnssec_key_cache_hits: Arc<AtomicU64>,
+    dnssec_key_cache_misses: Arc<AtomicU64>,
     cache_stale_served: Arc<AtomicU64>,
     filter_rules: Arc<Mutex<BTreeMap<String, i64>>>,
     filter_compile: Arc<Mutex<HistogramState>>,
@@ -90,6 +92,8 @@ impl MetricsRegistry {
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
             cache_size_bytes: Arc::new(AtomicI64::new(0)),
+            dnssec_key_cache_hits: Arc::new(AtomicU64::new(0)),
+            dnssec_key_cache_misses: Arc::new(AtomicU64::new(0)),
             cache_stale_served: Arc::new(AtomicU64::new(0)),
             filter_rules: Arc::new(Mutex::new(BTreeMap::new())),
             filter_compile: Arc::new(Mutex::new(HistogramState::new())),
@@ -153,6 +157,13 @@ impl MetricsRegistry {
 
     pub fn set_cache_size_bytes(&self, bytes: i64) {
         self.cache_size_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Publishes DNSSEC validated-key cache hit/miss counters.
+    pub fn set_dnssec_key_cache(&self, hits: u64, misses: u64) {
+        self.dnssec_key_cache_hits.store(hits, Ordering::Relaxed);
+        self.dnssec_key_cache_misses
+            .store(misses, Ordering::Relaxed);
     }
 
     pub fn inc_cache_stale_served(&self) {
@@ -429,6 +440,22 @@ impl MetricsRegistry {
         );
 
         // 7. sito_cache_size_bytes
+        out.push_str("# HELP sito_dnssec_key_cache_hits_total DNSSEC validated-key cache hits\n");
+        out.push_str("# TYPE sito_dnssec_key_cache_hits_total counter\n");
+        let _ = writeln!(
+            out,
+            "sito_dnssec_key_cache_hits_total {}",
+            self.dnssec_key_cache_hits.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP sito_dnssec_key_cache_misses_total DNSSEC validated-key cache misses\n",
+        );
+        out.push_str("# TYPE sito_dnssec_key_cache_misses_total counter\n");
+        let _ = writeln!(
+            out,
+            "sito_dnssec_key_cache_misses_total {}",
+            self.dnssec_key_cache_misses.load(Ordering::Relaxed)
+        );
         out.push_str("# HELP sito_cache_size_bytes Current memory size of cache in bytes\n");
         out.push_str("# TYPE sito_cache_size_bytes gauge\n");
         let _ = writeln!(
@@ -609,6 +636,7 @@ mod tests {
         reg.set_filter_rules("oisd", 250_000);
         reg.observe_filter_compile_seconds(0.12);
         reg.inc_dnssec_bogus("tls://dns.quad9.net");
+        reg.set_dnssec_key_cache(7, 3);
         reg.inc_clients_identified("ip");
         reg.inc_doh_bypass_blocked();
         reg.set_ha_slaves_connected(2);
@@ -630,6 +658,8 @@ mod tests {
         assert!(rendered.contains("sito_filter_rules"));
         assert!(rendered.contains("sito_filter_compile_seconds"));
         assert!(rendered.contains("sito_dnssec_bogus_total"));
+        assert!(rendered.contains("sito_dnssec_key_cache_hits_total 7"));
+        assert!(rendered.contains("sito_dnssec_key_cache_misses_total 3"));
         assert!(rendered.contains("sito_clients_identified_total"));
         assert!(rendered.contains("sito_doh_bypass_blocked_total"));
         assert!(rendered.contains("sito_ha_slaves_connected"));

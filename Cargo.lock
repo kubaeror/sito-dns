@@ -3018,6 +3018,7 @@ dependencies = [
  "sito-ha",
  "sito-proto",
  "sito-rewrites",
+ "sito-runtime",
  "sito-stats",
  "sito-transport",
  "sito-upstream",
@@ -3055,6 +3056,7 @@ dependencies = [
  "sito-ha",
  "sito-proto",
  "sito-rewrites",
+ "sito-runtime",
  "sito-stats",
  "sito-upstream",
  "subtle",
@@ -3084,6 +3086,8 @@ dependencies = [
 name = "sito-clients"
 version = "1.4.0"
 dependencies = [
+ "arc-swap",
+ "blake3",
  "chrono",
  "croner",
  "reqwest",
@@ -3101,6 +3105,7 @@ name = "sito-core"
 version = "1.4.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "hickory-proto",
  "serde",
  "thiserror",
@@ -3113,12 +3118,15 @@ name = "sito-dnssec"
 version = "1.4.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "base64 0.23.1",
  "dashmap",
+ "data-encoding",
  "hickory-proto",
  "sito-core",
  "sito-proto",
  "time",
+ "tokio",
  "tracing",
 ]
 
@@ -3199,6 +3207,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sito-runtime"
+version = "1.4.0"
+dependencies = [
+ "arc-swap",
+ "sito-clients",
+ "sito-core",
+ "sito-rewrites",
+]
+
+[[package]]
 name = "sito-stats"
 version = "1.4.0"
 dependencies = [
@@ -3248,6 +3266,7 @@ dependencies = [
  "sito-ha",
  "sito-proto",
  "sito-rewrites",
+ "sito-runtime",
  "sito-stats",
  "sito-transport",
  "sito-upstream",
@@ -3304,8 +3323,12 @@ version = "1.4.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "base64 0.23.1",
  "futures-util",
+ "quinn",
  "rand 0.10.2",
+ "rcgen",
+ "reqwest",
  "rustls",
  "sito-core",
  "sito-proto",

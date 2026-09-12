@@ -319,6 +319,12 @@ pub struct AuthConfig {
     pub session_ttl_hours: u64,
     #[serde(default = "default_login_rate_limit")]
     pub login_rate_limit: usize,
+    /// Persist web sessions and API tokens across restarts (`sessions.toml`/`tokens.toml`).
+    #[serde(default = "default_session_persist")]
+    pub session_persist: bool,
+    /// Default lifetime for newly created API tokens in days (`0` = no expiry).
+    #[serde(default)]
+    pub token_default_ttl_days: u64,
 }
 
 fn default_session_ttl_hours() -> u64 {
@@ -329,11 +335,17 @@ fn default_login_rate_limit() -> usize {
     5
 }
 
+fn default_session_persist() -> bool {
+    true
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             session_ttl_hours: default_session_ttl_hours(),
             login_rate_limit: default_login_rate_limit(),
+            session_persist: default_session_persist(),
+            token_default_ttl_days: 0,
         }
     }
 }
@@ -971,8 +983,8 @@ pub struct FilterListConfig {
     pub url: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Deprecated/legacy per-list refresh interval.
-    /// Ignored by scheduler; global `FilteringConfig.refresh_interval_hours` is used instead.
+    /// Per-list refresh interval in hours. When unset, the global
+    /// `FilteringConfig.refresh_interval_hours` is used.
     #[serde(default)]
     pub refresh_hours: Option<u64>,
 }

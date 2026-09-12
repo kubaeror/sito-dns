@@ -7,6 +7,7 @@
 compile_error!("sito-transport requires a Unix-based operating system (Linux/macOS)");
 
 pub mod acme;
+pub mod acme_http;
 pub mod doh;
 pub mod doh3;
 pub mod doq;
@@ -22,6 +23,7 @@ pub use acme::{
     AcmeServiceConfig, days_until_expiration, generate_tls_alpn_01_cert,
     obtain_or_renew_certificate, start_acme_manager,
 };
+pub use acme_http::start_acme_http01_listener;
 pub use doh::{DohConfig, start_doh_listener};
 pub use doh3::{Doh3Config, build_quinn_h3_server_config, start_doh3_listener};
 pub use doq::{DoqConfig, build_quinn_server_config, start_doq_listener};
@@ -69,6 +71,7 @@ mod tests {
             worker_count: 2,
             edns_udp_size: 1232,
             rate_limit_per_ip: 100,
+            rate_limiter: None,
         };
 
         let handler = Arc::new(|query: Message, _client: ClientContext| async move {
@@ -84,7 +87,7 @@ mod tests {
             Some(resp)
         });
 
-        let _handles = start_udp_listener(config, &handler, &shutdown_rx).unwrap();
+        let _handles = start_udp_listener(&config, &handler, &shutdown_rx).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -129,6 +132,7 @@ mod tests {
             worker_count: 1,
             edns_udp_size: 1232,
             rate_limit_per_ip: 100,
+            rate_limiter: None,
         };
 
         // Handler generates a huge response > 512 bytes
@@ -147,7 +151,7 @@ mod tests {
             Some(resp)
         });
 
-        let _handles = start_udp_listener(config, &handler, &shutdown_rx).unwrap();
+        let _handles = start_udp_listener(&config, &handler, &shutdown_rx).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -191,6 +195,7 @@ mod tests {
             worker_count: 1,
             edns_udp_size: 1232,
             rate_limit_per_ip: 100,
+            rate_limiter: None,
         };
 
         let handler = Arc::new(|query: Message, _client: ClientContext| async move {
@@ -213,7 +218,7 @@ mod tests {
             Some(resp)
         });
 
-        let _handles = start_udp_listener(config, &handler, &shutdown_rx).unwrap();
+        let _handles = start_udp_listener(&config, &handler, &shutdown_rx).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -273,6 +278,7 @@ mod tests {
             max_connections: 10,
             idle_timeout: Duration::from_secs(5),
             rate_limit_per_ip: 100,
+            rate_limiter: None,
         };
 
         let handler = Arc::new(|query: Message, _client: ClientContext| async move {

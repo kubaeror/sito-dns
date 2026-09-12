@@ -16,7 +16,6 @@ use sito_core::engine::FilterEngine;
 use sito_proto::{Name, RecordType};
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::Arc;
 
 #[utoipa::path(
     get,
@@ -81,7 +80,7 @@ pub async fn add_filter_list(
 
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
-    ctx.config.store(Arc::new(new_cfg));
+    ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);
 
     Ok(Json(FilterListDto {
@@ -147,7 +146,7 @@ pub async fn update_filter_list(
 
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
-    ctx.config.store(Arc::new(new_cfg));
+    ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);
 
     Ok(Json(updated_dto))
@@ -180,7 +179,7 @@ pub async fn delete_filter_list(
     let removed = new_cfg.filtering.lists.remove(id);
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
-    ctx.config.store(Arc::new(new_cfg));
+    ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);
 
     Ok(Json(GenericMessageResponse {
@@ -254,7 +253,7 @@ pub async fn set_filtering_rules(
 
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
-    ctx.config.store(Arc::new(new_cfg));
+    ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);
 
     Ok(Json(CustomRulesDto {

@@ -310,28 +310,30 @@ ignoring the configured `dns.bind`.
 > Implementation plan for all deferred items: **[docs/audit3-followup-plan.md](audit3-followup-plan.md)**
 > (work packages, dependencies, estimates, acceptance criteria, PR sequencing).
 >
-> Follow-up progress: **WP-10 (updater artifact signature verification) — done**
-> (`server.update_require_signature`, cosign verification of `.sig`/`.pem`,
-> `SITO_REQUIRE_SIGNATURE=1` installer support).
+> Follow-up progress (plan: [docs/audit3-followup-plan.md](audit3-followup-plan.md)):
+>
+> **Complete:** WP-2 (native DoH + DoQ upstreams), WP-3 (persistent
+> sessions/tokens), WP-4 (per-list `refresh_hours` scheduling), WP-5
+> (per-client upstreams + `ignore_stats`), WP-6 (atomic `RuntimeSnapshot`,
+> hot cache resize/retention/log level/rate limits, in-process listener
+> rebind with revert, restart signalling), WP-7 (versioned bundled-list
+> manifest, expanded curated data, `[integrations.lists]` runtime refresh,
+> Filtering-page status), WP-8 (ACME HTTP-01 listener + DoH hostname),
+> WP-9 (HA role/version/capabilities/heartbeat/`ca`), WP-10 (updater cosign
+> signature policy), WP-11 (dead-code sweep, cert-watcher lifetime, shutdown
+> joins, allocation-free matching, deterministic precedence, `handle`
+> helper extraction), WP-12 (installer ops, SHA-pinned Actions, SBOM,
+> tightened `deny.toml`, release verification docs), WP-13 (test-suite
+> quality, nightly release job), WP-14 (OpenAPI/config-reference drift
+> gates with doc-comment-driven `--write`).
+>
+> **Complete:** all fourteen work packages, including WP-1 — in-response
+> DS/DNSKEY chain walk, bounded upstream key fetching (`DnssecKeyFetcher`),
+> validated-only key cache with Prometheus hit/miss counters, NSEC denial
+> proofs and RFC 5155 NSEC3 opt-out enumeration, plus the fuzz target.
 
-- **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
-  configured trust anchors and forces the DO bit upstream; serving unvalidated
-  cache data to DNSSEC-aware clients is blocked. Chain-of-trust validation
-  beyond the direct anchor remains future work (P1-2).
-- **Native DoH/DoQ upstream transports** are still not implemented; unsupported
-  schemes are now rejected with a clear error instead of being misparsed (P1-4).
-- **Persistent sessions/API tokens.** Sessions and tokens remain memory-only;
-  this PR adds revocation on password/TOTP changes (P1-10).
-- **Per-list `refresh_hours` scheduling** remains deprecated; the global
-  `filtering.refresh_interval_hours` is used (P2-10).
-- **Per-client upstream overrides / `ignore_stats` / `use_global_upstreams`**
-  are still not wired into the pipeline (P2-6).
-- **Restart-only settings:** cache `size_mb`, listener ports/binds, rate
-  limits, `stats.retention_days` and log settings still require a restart;
-  cache enable/prefetch/stale and filter/upstream settings now hot-reload
-  (P1-14).
-- **Parental/service category lists** remain the small bundled sets shipped in
-  the binary (P2-5).
-- **`doh_dedicated_hostname`** and `acme.http_port` are documented as
-  reserved/ignored (`acme.http_port` is fixed at the internal HTTP-01 mount)
-  (P2-10).
+- Restart-only settings are now limited to server identity/format, web, tls,
+  acme and ha; the API reports them through `ConfigUpdateResponse` instead of
+  pretending they were applied.
+- Parental/service data is refreshed at runtime from `[integrations.lists]`;
+  the bundled sets remain the verified minimal fallback.

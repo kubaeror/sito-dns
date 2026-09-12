@@ -64,10 +64,6 @@ impl ProblemDetails {
             detail,
         )
     }
-
-    pub fn not_implemented(detail: impl Into<String>) -> Self {
-        Self::new(StatusCode::NOT_IMPLEMENTED, "Not Implemented", detail)
-    }
 }
 
 impl IntoResponse for ProblemDetails {

@@ -20,6 +20,10 @@ use tokio::sync::mpsc::UnboundedSender;
 #[derive(Clone)]
 pub struct ServerContext {
     pub config: Arc<ArcSwap<Config>>,
+    /// Atomic view over config, clients and rewrites for the DNS pipeline.
+    pub runtime: Arc<sito_runtime::RuntimeState>,
+    /// Hot-swappable parental/service registries and their refresh status.
+    pub runtime_lists: Arc<sito_clients::RuntimeLists>,
     pub config_path: PathBuf,
     pub auth_mgr: Arc<AuthManager>,
     pub stats_db: StatsDb,
@@ -41,6 +45,21 @@ pub struct ServerContext {
 }
 
 impl ServerContext {
+    /// Publishes a new configuration to the pipeline and UI atomically.
+    pub fn set_config(&self, config: Config) {
+        self.runtime.set_config(config);
+    }
+
+    /// Publishes a new client registry to the pipeline and UI atomically.
+    pub fn set_clients(&self, clients: ClientRegistry) {
+        self.runtime.set_clients(clients);
+    }
+
+    /// Publishes a new rewrite table to the pipeline and UI atomically.
+    pub fn set_rewrites(&self, rewrites: RewriteTable) {
+        self.runtime.set_rewrites(rewrites);
+    }
+
     /// Returns whether the server is running in setup-pending bootstrap mode.
     pub fn is_setup_pending(&self) -> bool {
         self.setup_pending.load(Ordering::SeqCst)

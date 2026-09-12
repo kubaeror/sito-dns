@@ -199,6 +199,15 @@ pub struct GenericMessageResponse {
     pub message: String,
 }
 
+/// Result of a configuration update, including restart requirements.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ConfigUpdateResponse {
+    pub message: String,
+    /// Settings that changed but only take effect after a process restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart_required: Vec<String>,
+}
+
 /// Full configuration response with secrets masked.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ConfigResponse {
@@ -273,12 +282,6 @@ pub struct TotpConfirmRequest {
 pub struct CreateTokenRequest {
     pub name: String,
     pub scope: String,
-}
-
-/// Stub response for HA endpoints returning 501 Not Implemented.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct HaStubResponse {
-    pub message: String,
 }
 
 /// HA cluster status response for `GET /api/v1/ha/status`.

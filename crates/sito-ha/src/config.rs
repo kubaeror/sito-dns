@@ -164,6 +164,12 @@ impl HaConfig {
                     reason: "Replication port must be greater than 0".to_string(),
                 });
             }
+            if self.master_pubkey.is_none() {
+                return Err(HaError::Validation {
+                    field: "master_pubkey".to_string(),
+                    reason: "Slave replication requires master_pubkey to verify signed configuration pushes".to_string(),
+                });
+            }
             if let Some(ref pubkey_str) = self.master_pubkey {
                 parse_public_key(pubkey_str)?;
             }
@@ -208,6 +214,7 @@ mod tests {
 replication_port = 8953
 master_url = "wss://127.0.0.1:8953"
 master_fingerprint = "blake3:abcdef0123456789"
+master_pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
 pinned_slave_fingerprints = ["blake3:11223344"]
 "#;
         let val: toml::Value = toml::from_str(toml_str).unwrap();
@@ -215,6 +222,21 @@ pinned_slave_fingerprints = ["blake3:11223344"]
         assert_eq!(cfg.replication_port, 8953);
         assert_eq!(cfg.master_url.as_deref(), Some("wss://127.0.0.1:8953"));
         assert_eq!(cfg.pinned_slave_fingerprints.len(), 1);
+        assert!(cfg.validate("slave").is_ok());
+    }
+
+    #[test]
+    fn test_slave_validation_requires_master_pubkey() {
+        let mut cfg = HaConfig {
+            master_url: Some("wss://127.0.0.1:8953".to_string()),
+            master_fingerprint: Some("blake3:abcdef0123456789".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            cfg.validate("slave").is_err(),
+            "slave without master_pubkey must be rejected (pushes cannot be verified)"
+        );
+        cfg.master_pubkey = Some("00".repeat(32));
         assert!(cfg.validate("slave").is_ok());
     }
 

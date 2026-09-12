@@ -15,6 +15,5 @@ pub struct CacheEntry {
     pub authority_ttls: Vec<u32>,
     pub additional_ttls: Vec<u32>,
     pub hits: Arc<AtomicU32>,
-    pub is_negative: bool,
     pub estimated_bytes: u32,
 }

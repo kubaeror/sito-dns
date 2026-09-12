@@ -17,6 +17,9 @@ pub enum UpstreamError {
     #[error("Bad or invalid upstream response: {0}")]
     BadResponse(String),
 
+    #[error("Upstream does not support the requested operation")]
+    Unsupported,
+
     #[error("DNSSEC validation failure (bogus response)")]
     DnssecBogus,
 

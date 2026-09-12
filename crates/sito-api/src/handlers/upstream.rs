@@ -130,7 +130,7 @@ pub async fn update_upstream_config(
             .await;
         return Err(e);
     }
-    ctx.config.store(Arc::new(new_config));
+    ctx.set_config(new_config);
     crate::publish_bundle(&ctx);
 
     Ok(Json(dto))
@@ -291,8 +291,20 @@ mod tests {
             Default::default(),
         ))));
 
+        let runtime = Arc::new(sito_runtime::RuntimeState::new(
+            config_arc.clone(),
+            clients.clone(),
+            rewrites.clone(),
+        ));
+        let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
+            Arc::new(sito_clients::ParentalRegistry::bundled()),
+            Arc::new(sito_clients::ServiceRegistry::bundled()),
+        ));
+
         ServerContext {
             config: config_arc,
+            runtime,
+            runtime_lists,
             config_path: temp_dir.join("config.toml"),
             auth_mgr,
             stats_db,

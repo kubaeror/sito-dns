@@ -19,6 +19,23 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  release-tests:
+    name: release-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: nightly-release-tests
+
+      - name: Run full test suite in release mode
+        env:
+          SITO_BENCH_TESTS: "1"
+        run: cargo test --workspace --release --all-features
+
   fuzz:
     name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
@@ -30,17 +47,18 @@ jobs:
           - fuzz_toml_config
           - fuzz_client_id
           - fuzz_dns_wire
+          - fuzz_dnssec_response
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: fuzz-${{ matrix.target }}
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cargo-fuzz
+        uses: taiki-e/install-action@82fc405565b9cf90abfe700ba43b4751ce2fe422 # cargo-fuzz
 
       - name: Run fuzzer on ${{ matrix.target }}
         run: |
@@ -50,7 +68,7 @@ jobs:
 
       - name: Upload artifacts on crash
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: crash-reproducer-${{ matrix.target }}
           path: |

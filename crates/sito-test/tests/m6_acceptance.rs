@@ -56,8 +56,19 @@ async fn create_test_context() -> (ServerContext, PathBuf) {
     ))));
     let auth_mgr = Arc::new(AuthManager::new());
 
+    let runtime = Arc::new(sito_runtime::RuntimeState::new(
+        config_arc.clone(),
+        clients.clone(),
+        rewrites.clone(),
+    ));
+    let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
+        Arc::new(sito_clients::ParentalRegistry::bundled()),
+        Arc::new(sito_clients::ServiceRegistry::bundled()),
+    ));
     let ctx = ServerContext {
         config: config_arc,
+        runtime,
+        runtime_lists,
         config_path,
         auth_mgr,
         stats_db,

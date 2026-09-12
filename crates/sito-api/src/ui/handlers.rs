@@ -8,7 +8,6 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::Arc;
 
 use crate::auth::manager::LoginResult;
 use crate::auth::rbac::AuthUser;
@@ -27,6 +26,7 @@ use crate::ui::templates::{
 use sito_core::FilterEngine;
 use sito_core::config::{BlockingMode, Config, FilterListConfig, UpstreamStrategy};
 use sito_stats::QueryLogFilter;
+use sito_upstream::Upstream as _;
 
 pub fn format_duration(secs: u64) -> String {
     let days = secs / 86400;
@@ -535,6 +535,66 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
 
     let custom_rules = cfg.filtering.custom_rules.join("\n");
 
+    // Curated lists bundled into the binary plus any runtime refresh state.
+    let manifest = sito_clients::BundledManifest::bundled();
+    let statuses: std::collections::HashMap<String, sito_clients::RuntimeListStatus> = ctx
+        .runtime_lists
+        .statuses()
+        .into_iter()
+        .map(|status| (status.category.clone(), status))
+        .collect();
+    let format_refresh = |ts: Option<u64>| {
+        ts.and_then(|ts| chrono::DateTime::from_timestamp(ts.cast_signed(), 0))
+            .map_or_else(
+                || "—".to_string(),
+                |dt| dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+            )
+    };
+
+    let mut bundled_lists: Vec<crate::ui::templates::BundledListView> = manifest
+        .lists
+        .iter()
+        .map(|list| {
+            let status = statuses.get(&list.id);
+            crate::ui::templates::BundledListView {
+                id: list.id.clone(),
+                kind: list.kind.clone(),
+                version: list.version.clone(),
+                source: status
+                    .and_then(|status| status.source_url.clone())
+                    .unwrap_or_else(|| list.source.clone()),
+                license: list.license.clone(),
+                entries: status.map_or(list.entries, |status| status.entries),
+                state: if status.is_some_and(|status| !status.bundled) {
+                    "runtime refresh".to_string()
+                } else {
+                    "built-in (minimal)".to_string()
+                },
+                last_refresh: format_refresh(status.and_then(|status| status.last_refresh_unix)),
+            }
+        })
+        .collect();
+    for status in ctx.runtime_lists.statuses() {
+        if manifest.list(&status.category).is_some() {
+            continue;
+        }
+        bundled_lists.push(crate::ui::templates::BundledListView {
+            id: status.category.clone(),
+            kind: "custom".to_string(),
+            version: "—".to_string(),
+            source: status.source_url.clone().unwrap_or_default(),
+            license: "—".to_string(),
+            entries: status.entries,
+            state: if status.bundled {
+                "built-in".to_string()
+            } else {
+                "runtime refresh".to_string()
+            },
+            last_refresh: format_refresh(status.last_refresh_unix),
+        });
+    }
+    bundled_lists.sort_by(|a, b| a.id.cmp(&b.id));
+
     HtmlTemplate(FilteringTemplate {
         is_authenticated: true,
         username: &user.username,
@@ -543,6 +603,7 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
         version: env!("CARGO_PKG_VERSION"),
         lists: &lists,
         custom_rules: &custom_rules,
+        bundled_lists,
     })
     .into_response()
 }
@@ -566,7 +627,7 @@ pub async fn filtering_toggle_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg.clone()));
+        ctx.set_config(new_cfg.clone());
         let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
         crate::publish_bundle(&ctx);
     }
@@ -604,7 +665,7 @@ pub async fn filtering_add_handler(
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    ctx.config.store(Arc::new(new_cfg.clone()));
+    ctx.set_config(new_cfg.clone());
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     crate::publish_bundle(&ctx);
 
@@ -630,7 +691,7 @@ pub async fn filtering_delete_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg.clone()));
+        ctx.set_config(new_cfg.clone());
         let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
         crate::publish_bundle(&ctx);
     }
@@ -667,7 +728,7 @@ pub async fn filtering_custom_rules_handler(
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    ctx.config.store(Arc::new(new_cfg.clone()));
+    ctx.set_config(new_cfg.clone());
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     crate::publish_bundle(&ctx);
 
@@ -825,9 +886,9 @@ pub async fn rewrites_add_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg));
+        ctx.set_config(new_cfg);
         let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg);
-        ctx.rewrites.store(Arc::new(new_table));
+        ctx.set_rewrites(new_table);
         crate::publish_bundle(&ctx);
     }
 
@@ -878,9 +939,9 @@ pub async fn rewrites_delete_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg));
+        ctx.set_config(new_cfg);
         let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg);
-        ctx.rewrites.store(Arc::new(new_table));
+        ctx.set_rewrites(new_table);
         crate::publish_bundle(&ctx);
     }
 
@@ -977,9 +1038,9 @@ pub async fn clients_add_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg));
+        ctx.set_config(new_cfg);
         let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
-        ctx.clients.store(Arc::new(new_reg));
+        ctx.set_clients(new_reg);
         crate::publish_bundle(&ctx);
     }
 
@@ -1013,9 +1074,9 @@ pub async fn clients_delete_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg));
+        ctx.set_config(new_cfg);
         let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
-        ctx.clients.store(Arc::new(new_reg));
+        ctx.set_clients(new_reg);
         crate::publish_bundle(&ctx);
     }
 
@@ -1064,20 +1125,13 @@ pub async fn upstreams_add_handler(
 
     let mut new_cfg = (**ctx.config.load()).clone();
     let clean = form.address.trim().to_string();
-    if clean.starts_with("https://") || clean.starts_with("quic://") {
-        return (
-            StatusCode::BAD_REQUEST,
-            "DoH and DoQ upstreams are not supported in v1.2.x; use tls:// or UDP",
-        )
-            .into_response();
-    }
     if !clean.is_empty() && !new_cfg.upstream.servers.contains(&clean) {
         new_cfg.upstream.servers.push(clean);
         if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg.clone()));
+        ctx.set_config(new_cfg.clone());
         let bootstrap = sito_upstream::BootstrapResolver::new(
             new_cfg.upstream.bootstrap.clone(),
             std::time::Duration::from_millis(new_cfg.upstream.timeout_ms),
@@ -1094,6 +1148,28 @@ pub async fn upstreams_add_handler(
 #[derive(Deserialize)]
 pub struct TestUpstreamForm {
     pub address: String,
+}
+
+fn split_probe_host_port(addr_str: &str, scheme: &str, default_port: u16) -> (String, u16) {
+    let rest = addr_str
+        .strip_prefix(&format!("{scheme}://"))
+        .unwrap_or(addr_str);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if let Some(inner) = authority.strip_prefix('[')
+        && let Some((host, tail)) = inner.split_once(']')
+    {
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default_port);
+        return (host.to_string(), port);
+    }
+    if let Some((host, port)) = authority.rsplit_once(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return (host.to_string(), port);
+    }
+    (authority.to_string(), default_port)
 }
 
 async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result<f64, String> {
@@ -1128,10 +1204,48 @@ async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result<f64
         return Ok(elapsed);
     }
 
-    if addr_str.starts_with("https://") || addr_str.starts_with("quic://") {
-        return Err(
-            "DoH (https://) and DoQ (quic://) upstreams are not supported in v1.2.x; use tls:// or UDP".to_string(),
-        );
+    if addr_str.starts_with("https://") {
+        let (host, port) = split_probe_host_port(addr_str, "https", 443);
+        let mut addrs = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|e| format!("DNS resolution of {host} failed: {e}"))?;
+        let ip = addrs
+            .next()
+            .map(|sa| sa.ip())
+            .ok_or_else(|| format!("Could not resolve {host}"))?;
+        let doh =
+            sito_upstream::HttpsUpstream::new(addr_str, &[ip], std::time::Duration::from_secs(3))
+                .map_err(|e| format!("Invalid DoH upstream: {e}"))?;
+        let mut query =
+            sito_proto::Message::new(0, sito_proto::MessageType::Query, sito_proto::OpCode::Query);
+        query
+            .queries
+            .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
+        doh.resolve(&query)
+            .await
+            .map_err(|e| format!("DoH query failed: {e}"))?;
+        return Ok(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    if addr_str.starts_with("quic://") {
+        let (host, port) = split_probe_host_port(addr_str, "quic", 853);
+        let mut addrs = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|e| format!("DNS resolution of {host} failed: {e}"))?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| format!("Could not resolve {host}"))?;
+        let doq = sito_upstream::QuicUpstream::new(&host, addr, std::time::Duration::from_secs(3))
+            .map_err(|e| format!("Invalid DoQ upstream: {e}"))?;
+        let mut query =
+            sito_proto::Message::new(0, sito_proto::MessageType::Query, sito_proto::OpCode::Query);
+        query
+            .queries
+            .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
+        doq.resolve(&query)
+            .await
+            .map_err(|e| format!("DoQ query failed: {e}"))?;
+        return Ok(start.elapsed().as_secs_f64() * 1000.0);
     }
 
     // Standard UDP probe
@@ -1279,7 +1393,7 @@ pub async fn settings_save_handler(
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    ctx.config.store(Arc::new(new_cfg));
+    ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);
 
     Redirect::to("/settings").into_response()
@@ -1323,7 +1437,7 @@ pub async fn system_reload_handler(
     if let Ok(toml_str) = tokio::fs::read_to_string(&ctx.config_path).await
         && let Ok(cfg) = sito_core::config::Config::from_toml_str(&toml_str)
     {
-        ctx.config.store(Arc::new(cfg));
+        ctx.set_config(cfg);
         crate::publish_bundle(&ctx);
     }
     Redirect::to("/system").into_response()
@@ -1960,7 +2074,7 @@ pub async fn wizard_complete_handler(
         }
     }
 
-    ctx.config.store(Arc::new(new_cfg.clone()));
+    ctx.set_config(new_cfg.clone());
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     let bootstrap = sito_upstream::BootstrapResolver::new(
         new_cfg.upstream.bootstrap.clone(),
@@ -1986,6 +2100,7 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode};
     use sito_core::config::Config;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::Instant;
 
@@ -2018,8 +2133,20 @@ mod tests {
             Default::default(),
         ))));
 
+        let runtime = Arc::new(sito_runtime::RuntimeState::new(
+            config_arc.clone(),
+            clients.clone(),
+            rewrites.clone(),
+        ));
+        let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
+            Arc::new(sito_clients::ParentalRegistry::bundled()),
+            Arc::new(sito_clients::ServiceRegistry::bundled()),
+        ));
+
         ServerContext {
             config: config_arc,
+            runtime,
+            runtime_lists,
             config_path: temp_dir.join("config.toml"),
             auth_mgr,
             stats_db,

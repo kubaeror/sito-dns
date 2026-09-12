@@ -257,7 +257,7 @@ impl RuleModifiers {
             let lower = fqdn.to_ascii_lowercase();
             let domain = lower.strip_suffix('.').unwrap_or(&lower);
             for d in list {
-                if domain == d || domain.ends_with(&format!(".{d}")) {
+                if sito_core::matches_domain_suffix(domain, d) {
                     return true;
                 }
             }

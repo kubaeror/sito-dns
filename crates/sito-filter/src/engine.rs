@@ -5,7 +5,7 @@ use crate::error::FilterError;
 use crate::parser::{Pattern, Rule, RuleKind, parse_rules};
 use crate::structures::{CompiledRuleSet, LabelInterner, RuleSetBuilder};
 use arc_swap::ArcSwap;
-use fnv::FnvHashSet;
+use fnv::{FnvHashMap, FnvHashSet};
 use hickory_proto::rr::{Name, RecordType};
 use sito_core::client::ClientContext;
 use sito_core::config::FilteringConfig;
@@ -14,7 +14,7 @@ use sito_core::verdict::{BlockReason, RewriteAction, RuleRef, Verdict};
 use sito_proto::normalize_domain;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 /// In-memory snapshot of compiled filter rules.
@@ -330,12 +330,46 @@ impl FilterSnapshot {
     }
 }
 
+/// Computes the next refresh wake-up and the list names that are due.
+///
+/// Lists without `refresh_hours` use the global `refresh_interval_hours`.
+fn refresh_schedule(
+    config: &FilteringConfig,
+    next_due: &mut FnvHashMap<String, Instant>,
+    now: Instant,
+) -> (Duration, Vec<String>) {
+    let global = Duration::from_secs(config.refresh_interval_hours.max(1).saturating_mul(3600));
+    next_due.retain(|name, _| config.lists.iter().any(|l| l.enabled && &l.name == name));
+
+    let mut due = Vec::new();
+    let mut soonest: Option<Instant> = None;
+    for list in config.lists.iter().filter(|l| l.enabled) {
+        let interval = list.refresh_hours.map_or(global, |hours| {
+            Duration::from_secs(hours.max(1).saturating_mul(3600))
+        });
+        let entry = next_due.entry(list.name.clone()).or_insert(now + interval);
+        if *entry <= now {
+            due.push(list.name.clone());
+        }
+        soonest = Some(soonest.map_or(*entry, |s| s.min(*entry)));
+    }
+
+    let sleep_for = if due.is_empty() {
+        soonest.map_or(global, |s| s.saturating_duration_since(now))
+    } else {
+        Duration::ZERO
+    };
+    (sleep_for, due)
+}
+
 /// Thread-safe filtering engine implementing AdGuard ABP and hosts blocking.
 pub struct HostsFilterEngine {
     snapshot: ArcSwap<FilterSnapshot>,
     config: ArcSwap<FilteringConfig>,
     data_dir: PathBuf,
     downloader: ListDownloader,
+    /// Parsed rules per list, used to refresh individual lists without refetching all.
+    list_rules: std::sync::Mutex<FnvHashMap<String, Vec<Rule>>>,
 }
 
 impl HostsFilterEngine {
@@ -346,6 +380,7 @@ impl HostsFilterEngine {
             config: ArcSwap::new(Arc::new(config)),
             data_dir,
             downloader: ListDownloader::default(),
+            list_rules: std::sync::Mutex::new(FnvHashMap::default()),
         }
     }
 
@@ -370,7 +405,7 @@ impl HostsFilterEngine {
     /// Applies the >50% drop guard to protect against corrupted remote sources.
     pub async fn reload(&self) -> Result<usize, FilterError> {
         let config = self.config.load_full();
-        self.reload_internal(&config, true).await
+        self.reload_internal(&config, true, None).await
     }
 
     /// Reloads blocklists and custom rules using an updated filtering configuration.
@@ -378,26 +413,24 @@ impl HostsFilterEngine {
     /// The new configuration is retained for subsequent scheduled refreshes.
     pub async fn reload_with_config(&self, config: &FilteringConfig) -> Result<usize, FilterError> {
         self.config.store(Arc::new(config.clone()));
-        self.reload_internal(config, false).await
+        self.reload_internal(config, false, None).await
     }
 
-    /// Reloads blocklists with an explicit option to enforce or bypass the >50% drop guard.
-    pub async fn reload_with_options(
-        &self,
-        config: &FilteringConfig,
-        apply_drop_guard: bool,
-    ) -> Result<usize, FilterError> {
-        self.config.store(Arc::new(config.clone()));
-        self.reload_internal(config, apply_drop_guard).await
+    /// Refreshes only the named blocklists, keeping rules from all other lists.
+    pub async fn reload_lists(&self, names: &[String]) -> Result<usize, FilterError> {
+        let config = self.config.load_full();
+        self.reload_internal(&config, true, Some(names)).await
     }
 
     async fn reload_internal(
         &self,
         config: &FilteringConfig,
         apply_drop_guard: bool,
+        only_lists: Option<&[String]>,
     ) -> Result<usize, FilterError> {
         if !config.enabled {
             self.snapshot.store(Arc::new(FilterSnapshot::default()));
+            self.list_rules.lock().unwrap().clear();
             return Ok(0);
         }
 
@@ -405,6 +438,12 @@ impl HostsFilterEngine {
 
         for list in &config.lists {
             if !list.enabled {
+                continue;
+            }
+
+            if let Some(only) = only_lists
+                && !only.iter().any(|name| name == &list.name)
+            {
                 continue;
             }
 
@@ -428,13 +467,33 @@ impl HostsFilterEngine {
         }
 
         let custom_rules = config.custom_rules.clone();
+        let full_refresh = only_lists.is_none();
+        let base_rules = self.list_rules.lock().unwrap().clone();
+        let enabled_names: FnvHashSet<String> = config
+            .lists
+            .iter()
+            .filter(|l| l.enabled)
+            .map(|l| l.name.clone())
+            .collect();
 
         // Compile rules in blocking task to avoid stalling the tokio async runtime
-        let (new_snapshot, count) = tokio::task::spawn_blocking(move || {
-            let mut all_rules = Vec::new();
+        let (new_snapshot, count, new_list_rules) = tokio::task::spawn_blocking(move || {
+            let mut map = if full_refresh {
+                FnvHashMap::default()
+            } else {
+                base_rules
+            };
+            // Drop rules for lists that are no longer enabled/configured.
+            map.retain(|name, _| enabled_names.contains(name));
+
             for (name, content) in list_contents {
                 let (rules, _) = parse_rules(&content, &name);
-                all_rules.extend(rules);
+                map.insert(name, rules);
+            }
+
+            let mut all_rules = Vec::new();
+            for rules in map.values() {
+                all_rules.extend(rules.iter().cloned());
             }
             for rule_text in &custom_rules {
                 let (rules, _) = parse_rules(rule_text, "custom");
@@ -442,7 +501,7 @@ impl HostsFilterEngine {
             }
             let snapshot = FilterSnapshot::compile(all_rules);
             let count = snapshot.rule_count;
-            (snapshot, count)
+            (snapshot, count, map)
         })
         .await
         .map_err(|e| {
@@ -461,22 +520,57 @@ impl HostsFilterEngine {
         }
 
         self.snapshot.store(Arc::new(new_snapshot));
+        *self.list_rules.lock().unwrap() = new_list_rules;
         info!(rule_count = count, "Filter snapshot compiled and loaded");
         Ok(count)
     }
 
-    /// Spawns a background task that periodically refreshes the blocklists.
-    /// The interval is re-read from the live configuration on every cycle so
-    /// hot-reloaded `refresh_interval_hours` values take effect.
-    pub fn spawn_refresh_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+    /// Spawns a background task that refreshes blocklists according to their
+    /// per-list `refresh_hours` (falling back to `refresh_interval_hours`).
+    pub fn spawn_refresh_task(
+        self: Arc<Self>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            let mut next_due: FnvHashMap<String, Instant> = FnvHashMap::default();
             loop {
-                let interval_hours = self.config.load().refresh_interval_hours.max(1);
-                let interval = Duration::from_secs(interval_hours.saturating_mul(3600));
-                tokio::time::sleep(interval).await;
-                info!("Running scheduled blocklist refresh...");
-                if let Err(err) = self.reload().await {
+                let (sleep_for, due) = {
+                    let config = self.config.load_full();
+                    refresh_schedule(&config, &mut next_due, Instant::now())
+                };
+
+                if due.is_empty() {
+                    tokio::select! {
+                        () = tokio::time::sleep(sleep_for) => {}
+                        res = shutdown_rx.changed() => {
+                            if res.is_err() || *shutdown_rx.borrow() {
+                                info!("Filter refresh task shutting down");
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                info!(lists = ?due, "Running scheduled blocklist refresh...");
+                if let Err(err) = self.reload_lists(&due).await {
                     warn!(error = %err, "Scheduled blocklist refresh failed");
+                }
+
+                let config = self.config.load_full();
+                let global =
+                    Duration::from_secs(config.refresh_interval_hours.max(1).saturating_mul(3600));
+                let now = Instant::now();
+                for name in &due {
+                    let interval = config
+                        .lists
+                        .iter()
+                        .find(|l| &l.name == name)
+                        .and_then(|l| l.refresh_hours)
+                        .map_or(global, |hours| {
+                            Duration::from_secs(hours.max(1).saturating_mul(3600))
+                        });
+                    next_due.insert(name.clone(), now + interval);
                 }
             }
         })
@@ -835,5 +929,52 @@ mod tests {
         ));
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[test]
+    fn test_per_list_refresh_schedule() {
+        let config = FilteringConfig {
+            refresh_interval_hours: 24,
+            lists: vec![
+                FilterListConfig {
+                    name: "fast".to_string(),
+                    url: "https://example.com/fast.txt".to_string(),
+                    enabled: true,
+                    refresh_hours: Some(1),
+                },
+                FilterListConfig {
+                    name: "slow".to_string(),
+                    url: "https://example.com/slow.txt".to_string(),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+                FilterListConfig {
+                    name: "off".to_string(),
+                    url: "https://example.com/off.txt".to_string(),
+                    enabled: false,
+                    refresh_hours: Some(1),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut next_due = FnvHashMap::default();
+        let now = Instant::now();
+        let (sleep_for, due) = refresh_schedule(&config, &mut next_due, now);
+        assert!(due.is_empty());
+        assert_eq!(
+            sleep_for,
+            Duration::from_secs(3600),
+            "the 1h list must be the earliest wake-up"
+        );
+
+        // One hour later only the fast list is due.
+        let later = now + Duration::from_secs(3601);
+        let (_sleep, due) = refresh_schedule(&config, &mut next_due, later);
+        assert_eq!(due, vec!["fast".to_string()]);
+
+        // Disabled lists are never scheduled.
+        assert!(!next_due.contains_key("off"));
+        assert!(next_due.contains_key("slow"));
     }
 }

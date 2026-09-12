@@ -6,9 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::IpAddr;
-use std::path::Path;
 use std::str::FromStr;
-use tracing::{debug, warn};
 
 /// Known public resolver dataset entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,25 +47,6 @@ impl AntiBypassRegistry {
         }
 
         registry
-    }
-
-    /// Load or merge resolver dataset from a JSON file.
-    pub fn load_from_file(&mut self, path: &Path) -> std::io::Result<()> {
-        if path.exists() {
-            let content = std::fs::read_to_string(path)?;
-            if let Ok(entries) = serde_json::from_str::<Vec<DohResolverEntry>>(&content) {
-                for entry in entries {
-                    self.add_entry(&entry);
-                }
-                debug!("Loaded anti-bypass resolvers from {}", path.display());
-            } else {
-                warn!(
-                    "Failed to parse anti-bypass resolvers from {}",
-                    path.display()
-                );
-            }
-        }
-        Ok(())
     }
 
     /// Add an entry to the registry.

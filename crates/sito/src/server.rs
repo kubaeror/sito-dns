@@ -2,15 +2,14 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
 use sito_cache::DnsCache;
 use sito_core::config::Config;
 use sito_dnssec::DnssecValidator;
@@ -30,6 +29,7 @@ use crate::pipeline::DnsPipeline;
 #[derive(serde::Deserialize, Default)]
 struct IntegrationsConfig {
     mikrotik: Option<sito_clients::RouterOsConfig>,
+    lists: Option<sito_clients::ListCategoriesConfig>,
 }
 
 /// Runs the complete sito DNS server with graceful shutdown handling.
@@ -117,7 +117,9 @@ pub async fn run_server_full(
     let filter_engine = Arc::new(
         HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
     );
-    let _refresh_handle = filter_engine.clone().spawn_refresh_task();
+    let _refresh_handle = filter_engine
+        .clone()
+        .spawn_refresh_task(shutdown_rx.clone());
 
     // Initialize DNSSEC validator
     let dnssec = Arc::new(DnssecValidator::from_config(&config.dns.dnssec));
@@ -128,11 +130,70 @@ pub async fn run_server_full(
         .as_ref()
         .and_then(|v| v.clone().try_into().ok())
         .unwrap_or_default();
+
+    // Build per-client upstream managers for entries that opt out of the globals.
+    let scoped_upstreams: Arc<HashMap<String, Arc<UpstreamManager>>> = {
+        let mut scoped: HashMap<String, Arc<UpstreamManager>> = HashMap::new();
+        for entry in &clients_config.entries {
+            if entry.use_global_upstreams {
+                continue;
+            }
+            let Some(ref servers) = entry.upstreams else {
+                continue;
+            };
+            if servers.is_empty() {
+                continue;
+            }
+            let key = servers.join(",");
+            if scoped.contains_key(&key) {
+                continue;
+            }
+            let mut upstream_cfg = config.upstream.clone();
+            upstream_cfg.servers.clone_from(servers);
+            upstream_cfg.per_domain.clear();
+            match UpstreamManager::from_config(&upstream_cfg, &bootstrap).await {
+                Ok(manager) => {
+                    info!(
+                        client = %entry.name,
+                        servers = ?servers,
+                        "Initialized per-client upstream scope"
+                    );
+                    scoped.insert(key, Arc::new(manager));
+                }
+                Err(e) => warn!(
+                    client = %entry.name,
+                    error = %e,
+                    "Failed to initialize per-client upstreams; this client falls back to global upstreams"
+                ),
+            }
+        }
+        Arc::new(scoped)
+    };
+
     let client_registry = Arc::new(sito_clients::ClientRegistry::new(clients_config));
 
     // Initialize parental and service registries
     let parental_registry = Arc::new(sito_clients::ParentalRegistry::bundled());
     let service_registry = Arc::new(sito_clients::ServiceRegistry::bundled());
+    let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
+        parental_registry.clone(),
+        service_registry.clone(),
+    ));
+    if let Some(ref int_val) = config.integrations
+        && let Ok(integrations) = int_val.clone().try_into::<IntegrationsConfig>()
+        && let Some(lists_cfg) = integrations.lists
+    {
+        if let Err(e) = lists_cfg.validate() {
+            warn!("Ignoring invalid [integrations.lists] configuration: {e}");
+        } else if !lists_cfg.categories.is_empty() {
+            let lists_store = runtime_lists.clone();
+            let lists_data_dir = config.server.data_dir.clone();
+            let lists_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                run_list_refresh(lists_cfg, lists_store, lists_data_dir, lists_shutdown).await;
+            });
+        }
+    }
 
     // Initialize local rewrites table
     let rewrites_config: sito_rewrites::RewritesConfig = config
@@ -155,10 +216,15 @@ pub async fn run_server_full(
         );
     }
 
-    // Setup ArcSwaps for hot-reloadable components
+    // Setup ArcSwaps for hot-reloadable components and a coherent runtime view
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config.clone())));
     let clients_arc = Arc::new(ArcSwap::new(client_registry.clone()));
     let rewrites_arc = Arc::new(ArcSwap::new(rewrite_table.clone()));
+    let runtime = Arc::new(sito_runtime::RuntimeState::new(
+        config_arc.clone(),
+        clients_arc.clone(),
+        rewrites_arc.clone(),
+    ));
 
     // Construct pipeline with query logging and Prometheus metrics
     let pipeline = Arc::new(
@@ -174,6 +240,9 @@ pub async fn run_server_full(
             rewrites_arc.clone(),
             in_flight.clone(),
         )
+        .with_runtime(runtime.clone())
+        .with_runtime_lists(runtime_lists.clone())
+        .with_scoped_upstreams(scoped_upstreams)
         .with_stats(querylog_sender.clone(), metrics.clone()),
     );
 
@@ -285,11 +354,13 @@ pub async fn run_server_full(
     // users.toml is missing, fail closed instead of silently re-enabling the
     // default credentials.
     let bootstrap_allowed = !config_path_buf.exists();
-    let auth_mgr = Arc::new(sito_api::AuthManager::with_storage_checked(
+    let auth_mgr = Arc::new(sito_api::AuthManager::with_storage_full(
         &config.server.data_dir,
         auth_cfg.session_ttl_hours,
         auth_cfg.login_rate_limit,
         bootstrap_allowed,
+        auth_cfg.session_persist,
+        auth_cfg.token_default_ttl_days,
     )?);
     auth_mgr.spawn_pruner(shutdown_rx.clone());
 
@@ -302,6 +373,8 @@ pub async fn run_server_full(
 
     let server_ctx = sito_api::ServerContext {
         config: config_arc.clone(),
+        runtime: runtime.clone(),
+        runtime_lists: runtime_lists.clone(),
         config_path: config_path_buf.clone(),
         auth_mgr,
         stats_db: stats_db.clone(),
@@ -350,9 +423,10 @@ pub async fn run_server_full(
         info!("sito admin REST API listening on http://{bound_addr}");
     }
 
-    // Periodic stats retention cleanup task (every 24h)
+    // Periodic stats retention cleanup task (every 24h).
+    // `retention_days` is read on every cycle so config hot-reload applies.
     let retention_db = stats_db.clone();
-    let retention_days = config_arc.load().get_stats_config().retention_days;
+    let retention_config = config_arc.clone();
     let mut retention_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_hours(24));
@@ -365,6 +439,7 @@ pub async fn run_server_full(
                     }
                 }
                 _ = interval.tick() => {
+                    let retention_days = retention_config.load().get_stats_config().retention_days;
                     if let Err(e) = retention_db.cleanup_retention(retention_days).await {
                         warn!("Error during stats retention cleanup: {e}");
                     }
@@ -373,11 +448,23 @@ pub async fn run_server_full(
         }
     });
 
+    // Rate limiters created by listeners; shared so the watcher can hot-update.
+    let rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Listener generation and TLS acceptors, shared with the config watcher so
+    // bind/port changes can be applied in-process.
+    let listener_manager: Arc<tokio::sync::Mutex<Option<DnsListenerManager>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let listener_acceptors: Arc<tokio::sync::Mutex<Option<ListenerAcceptors>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
     // Spawn config file watcher for hot-reload
     let watcher_config_path = config_path_buf.clone();
-    let watcher_config_arc = config_arc.clone();
-    let watcher_clients_arc = clients_arc.clone();
-    let watcher_rewrites_arc = rewrites_arc.clone();
+    let watcher_runtime = runtime.clone();
+    let watcher_rate_limiters = rate_limiters.clone();
+    let watcher_listener_manager = listener_manager.clone();
+    let watcher_listener_acceptors = listener_acceptors.clone();
+    let watcher_pipeline = pipeline.clone();
     let watcher_filter = filter_engine.clone();
     let watcher_coordinator = master_coordinator.clone();
     let watcher_upstream = upstream_manager.clone();
@@ -434,22 +521,28 @@ pub async fn run_server_full(
                         Ok(content) => match Config::from_toml_str(&content) {
                             Ok(new_cfg) => {
                                 info!("Detected configuration file change, hot-reloading");
+                                if crate::logging::reload_level(&new_cfg.server.log_level) {
+                                    info!(
+                                        level = %new_cfg.server.log_level,
+                                        "Applied hot-reloaded log level"
+                                    );
+                                }
                                 let _ = watcher_filter.reload_with_config(&new_cfg.filtering).await;
                                 let new_rewrites_cfg: sito_rewrites::RewritesConfig = new_cfg
                                     .rewrites
                                     .as_ref()
                                     .and_then(|v| v.clone().try_into().ok())
                                     .unwrap_or_default();
-                                watcher_rewrites_arc
-                                    .store(Arc::new(sito_rewrites::RewriteTable::new(new_rewrites_cfg)));
+                                let new_rewrites =
+                                    sito_rewrites::RewriteTable::new(new_rewrites_cfg);
 
                                 let new_clients_cfg: sito_clients::ClientsConfig = new_cfg
                                     .clients
                                     .as_ref()
                                     .and_then(|v| v.clone().try_into().ok())
                                     .unwrap_or_default();
-                                watcher_clients_arc
-                                    .store(Arc::new(sito_clients::ClientRegistry::new(new_clients_cfg)));
+                                let new_clients =
+                                    sito_clients::ClientRegistry::new(new_clients_cfg);
 
                                 if let Err(e) = watcher_upstream
                                     .reload(&new_cfg.upstream, &watcher_bootstrap)
@@ -459,9 +552,58 @@ pub async fn run_server_full(
                                 }
                                 watcher_querylog
                                     .set_anonymize(new_cfg.privacy.anonymize_querylog);
-                                watcher_cache.update_config(new_cfg.dns.cache.clone());
+                                watcher_cache.update_config(new_cfg.dns.cache.clone()).await;
+                                if let Ok(limiters) = watcher_rate_limiters.lock() {
+                                    for limiter in limiters.iter() {
+                                        limiter.set_rate(new_cfg.dns.rate_limit_per_ip);
+                                    }
+                                }
 
-                                watcher_config_arc.store(Arc::new(new_cfg.clone()));
+                                // Publish config, clients and rewrites together so a
+                                // query cannot observe a half-applied reload.
+                                watcher_runtime.replace(sito_runtime::RuntimeSnapshot {
+                                    config: Arc::new(new_cfg.clone()),
+                                    clients: Arc::new(new_clients),
+                                    rewrites: Arc::new(new_rewrites),
+                                });
+
+                                // Rebind listeners when bind/port/related settings change.
+                                let current_manager =
+                                    watcher_listener_manager.lock().await.take();
+                                if let Some(manager) = current_manager {
+                                    if manager.needs_restart(&new_cfg) {
+                                        let acceptors =
+                                            watcher_listener_acceptors.lock().await.clone();
+                                        if let Some(acceptors) = acceptors {
+                                            info!("DNS listener bindings changed; rebinding in-process");
+                                            match manager
+                                                .restart(
+                                                    &new_cfg,
+                                                    watcher_pipeline.clone(),
+                                                    acceptors,
+                                                    watcher_rate_limiters.clone(),
+                                                )
+                                                .await
+                                            {
+                                                Ok(new_manager) => {
+                                                    *watcher_listener_manager.lock().await =
+                                                        Some(new_manager);
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to rebind DNS listeners: {e}");
+                                                }
+                                            }
+                                        } else {
+                                            warn!(
+                                                "Listener TLS acceptors unavailable; keeping current listeners"
+                                            );
+                                            *watcher_listener_manager.lock().await =
+                                                Some(manager);
+                                        }
+                                    } else {
+                                        *watcher_listener_manager.lock().await = Some(manager);
+                                    }
+                                }
 
                                 if let Some(ref coord) = watcher_coordinator {
                                     let next_version = coord.get_current_version() + 1;
@@ -557,6 +699,8 @@ pub async fn run_server_full(
 
     let http01_challenges = Arc::new(dashmap::DashMap::<String, String>::new());
     let challenge_keys = Arc::new(dashmap::DashMap::new());
+    // Kept alive for the lifetime of the server so certificate hot-reload works.
+    let mut cert_watchers: Vec<sito_transport::CertWatcher> = Vec::new();
 
     let (dot_acceptor_mgr, doh_acceptor_mgr, doq_acceptor_mgr, doh3_acceptor_mgr) =
         if let (Some(cert), Some(key)) = (&effective_cert, &effective_key) {
@@ -570,7 +714,10 @@ pub async fn run_server_full(
             ) {
                 Ok(cfg) => {
                     let mgr = TlsAcceptorManager::with_challenge_keys(cfg, challenge_keys.clone());
-                    let _ = CertWatcher::start(cert, key, &sni_tuples, &doh_alpn, mgr.clone());
+                    match CertWatcher::start(cert, key, &sni_tuples, &doh_alpn, mgr.clone()) {
+                        Ok(watcher) => cert_watchers.push(watcher),
+                        Err(e) => warn!("Certificate watcher failed to start: {e}"),
+                    }
                     Some(mgr)
                 }
                 Err(e) => {
@@ -583,7 +730,10 @@ pub async fn run_server_full(
             let dot_mgr = match load_server_config(cert, key, &sni_tuples, dot_alpn.clone()) {
                 Ok(cfg) => {
                     let mgr = TlsAcceptorManager::new(cfg);
-                    let _ = CertWatcher::start(cert, key, &sni_tuples, &dot_alpn, mgr.clone());
+                    match CertWatcher::start(cert, key, &sni_tuples, &dot_alpn, mgr.clone()) {
+                        Ok(watcher) => cert_watchers.push(watcher),
+                        Err(e) => warn!("Certificate watcher failed to start: {e}"),
+                    }
                     Some(mgr)
                 }
                 Err(e) => {
@@ -596,7 +746,10 @@ pub async fn run_server_full(
             let doq_mgr = match load_server_config(cert, key, &sni_tuples, doq_alpn.clone()) {
                 Ok(cfg) => {
                     let mgr = TlsAcceptorManager::new(cfg);
-                    let _ = CertWatcher::start(cert, key, &sni_tuples, &doq_alpn, mgr.clone());
+                    match CertWatcher::start(cert, key, &sni_tuples, &doq_alpn, mgr.clone()) {
+                        Ok(watcher) => cert_watchers.push(watcher),
+                        Err(e) => warn!("Certificate watcher failed to start: {e}"),
+                    }
                     Some(mgr)
                 }
                 Err(e) => {
@@ -609,7 +762,10 @@ pub async fn run_server_full(
             let doh3_mgr = match load_server_config(cert, key, &sni_tuples, doh3_alpn.clone()) {
                 Ok(cfg) => {
                     let mgr = TlsAcceptorManager::new(cfg);
-                    let _ = CertWatcher::start(cert, key, &sni_tuples, &doh3_alpn, mgr.clone());
+                    match CertWatcher::start(cert, key, &sni_tuples, &doh3_alpn, mgr.clone()) {
+                        Ok(watcher) => cert_watchers.push(watcher),
+                        Err(e) => warn!("Certificate watcher failed to start: {e}"),
+                    }
                     Some(mgr)
                 }
                 Err(e) => {
@@ -622,6 +778,14 @@ pub async fn run_server_full(
         } else {
             (None, None, None, None)
         };
+
+    // Share TLS acceptors with the config watcher for in-process listener rebinds.
+    *listener_acceptors.lock().await = Some(ListenerAcceptors {
+        dot: dot_acceptor_mgr.clone(),
+        doh: doh_acceptor_mgr.clone(),
+        doq: doq_acceptor_mgr.clone(),
+        doh3: doh3_acceptor_mgr.clone(),
+    });
 
     // If ACME is enabled, start ACME renewal background manager
     if let Some(acme) = acme_cfg
@@ -639,6 +803,34 @@ pub async fn run_server_full(
         let doh_alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()];
         let service_cfg =
             AcmeServiceConfig::new(email, acme.domains, storage_dir).with_staging(acme.staging);
+
+        // Dedicated plaintext HTTP-01 listener (ACME validators always use port 80).
+        if acme.http_port > 0 {
+            let acme_http_addr = SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                acme.http_port,
+            );
+            match sito_transport::start_acme_http01_listener(
+                acme_http_addr,
+                http01_challenges.clone(),
+                shutdown_rx.clone(),
+            )
+            .await
+            {
+                Ok(_handle) => {
+                    info!(
+                        port = acme.http_port,
+                        "ACME HTTP-01 challenge listener active"
+                    );
+                }
+                Err(e) => warn!(
+                    port = acme.http_port,
+                    error = %e,
+                    "Failed to bind ACME HTTP-01 listener; HTTP-01 validation will not be available"
+                ),
+            }
+        }
+
         let _acme_handle = start_acme_manager(
             service_cfg,
             doh_acceptor_mgr.clone(),
@@ -647,8 +839,6 @@ pub async fn run_server_full(
             shutdown_rx.clone(),
         );
     }
-
-    let mut all_handles = Vec::new();
 
     if setup_pending {
         info!(
@@ -661,17 +851,19 @@ pub async fn run_server_full(
             Some(()) = dns_start_rx.recv() => {
                 info!("Setup wizard completed: binding and starting DNS listeners in-process...");
                 let current_cfg = config_arc.load();
-                let dns_handles = start_dns_listeners(
+                let manager = DnsListenerManager::start(
                     &current_cfg,
                     pipeline.clone(),
-                    shutdown_rx.clone(),
-                    dot_acceptor_mgr.clone(),
-                    doh_acceptor_mgr.clone(),
-                    doq_acceptor_mgr.clone(),
-                    doh3_acceptor_mgr.clone(),
-                    http01_challenges.clone(),
-                ).await?;
-                all_handles.extend(dns_handles);
+                    ListenerAcceptors {
+                        dot: dot_acceptor_mgr.clone(),
+                        doh: doh_acceptor_mgr.clone(),
+                        doq: doq_acceptor_mgr.clone(),
+                        doh3: doh3_acceptor_mgr.clone(),
+                    },
+                    rate_limiters.clone(),
+                )
+                .await?;
+                *listener_manager.lock().await = Some(manager);
 
                 info!(
                     port = current_cfg.dns.port,
@@ -683,18 +875,19 @@ pub async fn run_server_full(
             }
         }
     } else {
-        let dns_handles = start_dns_listeners(
+        let manager = DnsListenerManager::start(
             &config,
             pipeline.clone(),
-            shutdown_rx.clone(),
-            dot_acceptor_mgr.clone(),
-            doh_acceptor_mgr.clone(),
-            doq_acceptor_mgr.clone(),
-            doh3_acceptor_mgr.clone(),
-            http01_challenges.clone(),
+            ListenerAcceptors {
+                dot: dot_acceptor_mgr.clone(),
+                doh: doh_acceptor_mgr.clone(),
+                doq: doq_acceptor_mgr.clone(),
+                doh3: doh3_acceptor_mgr.clone(),
+            },
+            rate_limiters.clone(),
         )
         .await?;
-        all_handles.extend(dns_handles);
+        *listener_manager.lock().await = Some(manager);
 
         info!(
             port = config.dns.port,
@@ -708,6 +901,10 @@ pub async fn run_server_full(
 
     info!("Initiating graceful shutdown (stopping listeners)...");
     let _ = shutdown_tx.send(true);
+    let current_manager = listener_manager.lock().await.take();
+    if let Some(manager) = current_manager {
+        manager.stop().await;
+    }
 
     // Wait for in-flight queries to finish (5 s timeout per plan section 3.5)
     let shutdown_deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -725,8 +922,217 @@ pub async fn run_server_full(
     info!("Flushing and shutting down query log writer...");
     querylog_writer.shutdown().await;
 
+    // Stop certificate watchers after listeners have drained.
+    drop(cert_watchers);
+
     info!("Graceful shutdown complete, exiting");
     Ok(())
+}
+
+/// Periodically refreshes `[integrations.lists]` categories through the
+/// shared subscription downloader (ETag/disk cache/size caps) and swaps the
+/// runtime registries on success.
+pub(crate) async fn run_list_refresh(
+    config: sito_clients::ListCategoriesConfig,
+    store: Arc<sito_clients::RuntimeLists>,
+    data_dir: PathBuf,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let fetcher = sito_filter::subscription::SubscriptionFetcher::default();
+    let default_hours = config.refresh_hours.max(1);
+    let mut entries: Vec<(String, String, Duration, tokio::time::Instant)> = config
+        .categories
+        .into_iter()
+        .map(|(name, source)| {
+            let hours = source.refresh_hours.unwrap_or(default_hours).max(1);
+            (
+                name,
+                source.url,
+                Duration::from_secs(hours.saturating_mul(3600)),
+                tokio::time::Instant::now(),
+            )
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+
+    while let Some((next_idx, _)) = entries.iter().enumerate().min_by_key(|(_, entry)| entry.3) {
+        let wait = entries[next_idx]
+            .3
+            .saturating_duration_since(tokio::time::Instant::now());
+
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            () = tokio::time::sleep(wait) => {
+                let name = entries[next_idx].0.clone();
+                let url = entries[next_idx].1.clone();
+                let cache_name = format!("integration-{name}");
+                match fetcher.fetch_or_cached(&cache_name, &url, &data_dir).await {
+                    Ok(content) => match store.apply_content(&name, &content) {
+                        Ok(entries) => {
+                            store.mark_refreshed(&name, &url);
+                            info!(
+                                category = %name,
+                                url = %url,
+                                entries,
+                                "Refreshed curated list category"
+                            );
+                        }
+                        Err(e) => warn!(
+                            category = %name,
+                            "Ignoring invalid refreshed curated list: {e}"
+                        ),
+                    },
+                    Err(e) => warn!(
+                        category = %name,
+                        url = %url,
+                        "Failed to refresh curated list: {e}"
+                    ),
+                }
+                entries[next_idx].3 =
+                    tokio::time::Instant::now() + entries[next_idx].2;
+            }
+        }
+    }
+}
+
+/// TLS acceptor managers shared with the config watcher so listeners can be
+/// rebound without restarting the process.
+#[derive(Clone)]
+struct ListenerAcceptors {
+    dot: Option<TlsAcceptorManager>,
+    doh: Option<TlsAcceptorManager>,
+    doq: Option<TlsAcceptorManager>,
+    doh3: Option<TlsAcceptorManager>,
+}
+
+/// Settings that determine how the DNS listeners are constructed. Changing
+/// any of them requires stopping and rebinding the affected listeners.
+#[derive(Clone, PartialEq, Eq)]
+struct ListenerPlan {
+    bind: Vec<std::net::IpAddr>,
+    port: u16,
+    dot_port: u16,
+    doh_port: u16,
+    doq_port: u16,
+    doh3_port: u16,
+    doh_dedicated_hostname: String,
+    allow_plaintext_doh: bool,
+    edns_udp_size: u16,
+    max_tcp_connections: usize,
+    dot_padding: bool,
+}
+
+impl ListenerPlan {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            bind: config.dns.bind.clone(),
+            port: config.dns.port,
+            dot_port: config.dns.dot_port,
+            doh_port: config.dns.doh_port,
+            doq_port: config.dns.doq_port,
+            doh3_port: config.dns.doh3_port,
+            doh_dedicated_hostname: config.dns.doh_dedicated_hostname.clone(),
+            allow_plaintext_doh: config.dns.allow_plaintext_doh,
+            edns_udp_size: config.dns.edns_udp_size,
+            max_tcp_connections: config.dns.max_tcp_connections,
+            dot_padding: config.dns.dot_padding,
+        }
+    }
+}
+
+/// Owns one generation of DNS listener tasks and supports rebinding.
+struct DnsListenerManager {
+    shutdown_tx: watch::Sender<bool>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
+    plan: ListenerPlan,
+    config: Config,
+}
+
+impl DnsListenerManager {
+    async fn start(
+        config: &Config,
+        pipeline: Arc<DnsPipeline>,
+        acceptors: ListenerAcceptors,
+        rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
+    ) -> anyhow::Result<Self> {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (handles, limiters) = start_dns_listeners(
+            config,
+            pipeline,
+            shutdown_rx,
+            acceptors.dot,
+            acceptors.doh,
+            acceptors.doq,
+            acceptors.doh3,
+        )
+        .await?;
+
+        if let Ok(mut registry) = rate_limiters.lock() {
+            registry.clear();
+            registry.extend(limiters);
+        }
+
+        Ok(Self {
+            shutdown_tx,
+            handles,
+            rate_limiters,
+            plan: ListenerPlan::from_config(config),
+            config: config.clone(),
+        })
+    }
+
+    fn needs_restart(&self, config: &Config) -> bool {
+        self.plan != ListenerPlan::from_config(config)
+    }
+
+    async fn stop(mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Ok(mut registry) = self.rate_limiters.lock() {
+            registry.clear();
+        }
+        for handle in self.handles.drain(..) {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        }
+    }
+
+    /// Stops the current listeners and binds a new generation. If the new
+    /// bindings cannot be established, the previous configuration is restored.
+    async fn restart(
+        self,
+        config: &Config,
+        pipeline: Arc<DnsPipeline>,
+        acceptors: ListenerAcceptors,
+        rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
+    ) -> anyhow::Result<Self> {
+        let previous = self.config.clone();
+        self.stop().await;
+
+        match Self::start(
+            config,
+            pipeline.clone(),
+            acceptors.clone(),
+            rate_limiters.clone(),
+        )
+        .await
+        {
+            Ok(manager) => Ok(manager),
+            Err(e) => {
+                warn!(
+                    "Failed to bind new DNS listener configuration ({e}); restoring previous bindings"
+                );
+                Self::start(&previous, pipeline, acceptors, rate_limiters)
+                    .await
+                    .map_err(|revert| anyhow::anyhow!("{e}; revert failed: {revert}"))
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -738,30 +1144,45 @@ async fn start_dns_listeners(
     doh_acceptor_mgr: Option<TlsAcceptorManager>,
     doq_acceptor_mgr: Option<TlsAcceptorManager>,
     doh3_acceptor_mgr: Option<TlsAcceptorManager>,
-    http01_challenges: Arc<DashMap<String, String>>,
-) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+) -> anyhow::Result<(
+    Vec<tokio::task::JoinHandle<()>>,
+    Vec<Arc<sito_transport::RateLimiter>>,
+)> {
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let mut handles = Vec::new();
+    let mut rate_limiters = Vec::new();
 
     for bind_ip in &config.dns.bind {
         let addr = SocketAddr::new(*bind_ip, config.dns.port);
 
         // Start UDP listener
+        let udp_limiter = Arc::new(sito_transport::RateLimiter::new(
+            config.dns.rate_limit_per_ip,
+            config.dns.rate_limit_per_ip * 2,
+        ));
+        rate_limiters.push(udp_limiter.clone());
         let udp_config = UdpConfig {
             bind_addr: addr,
             worker_count,
             edns_udp_size: config.dns.edns_udp_size,
             rate_limit_per_ip: config.dns.rate_limit_per_ip,
+            rate_limiter: Some(udp_limiter),
         };
-        let udp_handles = start_udp_listener(udp_config, &pipeline, &shutdown_rx)?;
+        let udp_handles = start_udp_listener(&udp_config, &pipeline, &shutdown_rx)?;
         handles.extend(udp_handles);
 
         // Start TCP listener
+        let tcp_limiter = Arc::new(sito_transport::RateLimiter::new(
+            config.dns.rate_limit_per_ip,
+            config.dns.rate_limit_per_ip * 2,
+        ));
+        rate_limiters.push(tcp_limiter.clone());
         let tcp_config = TcpConfig {
             bind_addr: addr,
             max_connections: config.dns.max_tcp_connections,
             idle_timeout: Duration::from_secs(10),
             rate_limit_per_ip: config.dns.rate_limit_per_ip,
+            rate_limiter: Some(tcp_limiter),
         };
         let tcp_handle =
             start_tcp_listener(tcp_config, pipeline.clone(), shutdown_rx.clone()).await?;
@@ -775,6 +1196,13 @@ async fn start_dns_listeners(
             let mut dot_config = DotConfig::new(dot_addr, dot_mgr.clone());
             dot_config.dot_padding = config.dns.dot_padding;
             dot_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            dot_config.rate_limiter = Some(Arc::new(sito_transport::RateLimiter::new(
+                config.dns.rate_limit_per_ip,
+                config.dns.rate_limit_per_ip * 2,
+            )));
+            if let Some(limiter) = &dot_config.rate_limiter {
+                rate_limiters.push(limiter.clone());
+            }
             dot_config.max_connections = config.dns.max_tcp_connections;
             let dot_handle =
                 start_dot_listener(dot_config, pipeline.clone(), shutdown_rx.clone()).await?;
@@ -793,14 +1221,23 @@ async fn start_dns_listeners(
                 );
             } else {
                 let doh_addr = SocketAddr::new(*bind_ip, config.dns.doh_port);
+                let dedicated_host = (!config.dns.doh_dedicated_hostname.trim().is_empty())
+                    .then(|| config.dns.doh_dedicated_hostname.trim().to_string());
                 let mut doh_config = DohConfig::new(doh_addr, doh_acceptor_mgr.clone())
-                    .with_http01_challenges(http01_challenges.clone())
                     .with_alt_svc_port(if config.dns.doh3_port > 0 {
                         Some(config.dns.doh3_port)
                     } else {
                         None
-                    });
+                    })
+                    .with_dedicated_hostname(dedicated_host);
                 doh_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+                doh_config.rate_limiter = Some(Arc::new(sito_transport::RateLimiter::new(
+                    config.dns.rate_limit_per_ip,
+                    config.dns.rate_limit_per_ip * 2,
+                )));
+                if let Some(limiter) = &doh_config.rate_limiter {
+                    rate_limiters.push(limiter.clone());
+                }
                 doh_config.max_connections = config.dns.max_tcp_connections;
                 let doh_handle =
                     start_doh_listener(doh_config, pipeline.clone(), shutdown_rx.clone()).await?;
@@ -815,6 +1252,13 @@ async fn start_dns_listeners(
             let doq_addr = SocketAddr::new(*bind_ip, config.dns.doq_port);
             let mut doq_config = DoqConfig::new(doq_addr, Some(doq_mgr.clone()));
             doq_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            doq_config.rate_limiter = Some(Arc::new(sito_transport::RateLimiter::new(
+                config.dns.rate_limit_per_ip,
+                config.dns.rate_limit_per_ip * 2,
+            )));
+            if let Some(limiter) = &doq_config.rate_limiter {
+                rate_limiters.push(limiter.clone());
+            }
             doq_config.max_connections = config.dns.max_tcp_connections;
             match start_doq_listener(doq_config, pipeline.clone(), shutdown_rx.clone()).await {
                 Ok(doq_handle) => handles.push(doq_handle),
@@ -827,8 +1271,18 @@ async fn start_dns_listeners(
             && let Some(ref doh3_mgr) = doh3_acceptor_mgr
         {
             let doh3_addr = SocketAddr::new(*bind_ip, config.dns.doh3_port);
-            let mut doh3_config = Doh3Config::new(doh3_addr, Some(doh3_mgr.clone()));
+            let dedicated_host = (!config.dns.doh_dedicated_hostname.trim().is_empty())
+                .then(|| config.dns.doh_dedicated_hostname.trim().to_string());
+            let mut doh3_config = Doh3Config::new(doh3_addr, Some(doh3_mgr.clone()))
+                .with_dedicated_hostname(dedicated_host);
             doh3_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            doh3_config.rate_limiter = Some(Arc::new(sito_transport::RateLimiter::new(
+                config.dns.rate_limit_per_ip,
+                config.dns.rate_limit_per_ip * 2,
+            )));
+            if let Some(limiter) = &doh3_config.rate_limiter {
+                rate_limiters.push(limiter.clone());
+            }
             doh3_config.max_connections = config.dns.max_tcp_connections;
             match start_doh3_listener(doh3_config, pipeline.clone(), shutdown_rx.clone()).await {
                 Ok(doh3_handle) => handles.push(doh3_handle),
@@ -837,7 +1291,7 @@ async fn start_dns_listeners(
         }
     }
 
-    Ok(handles)
+    Ok((handles, rate_limiters))
 }
 
 async fn wait_for_shutdown_signal(

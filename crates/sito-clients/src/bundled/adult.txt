@@ -1,3 +1,5 @@
+# Curated adult-content fallback list (built-in, minimal).
+# Runtime refresh via [integrations.lists] replaces this content.
 pornhub.com
 xvideos.com
 xnxx.com
@@ -8,13 +10,33 @@ chaturbate.com
 onlyfans.com
 cam4.com
 livejasmin.com
+bongacams.com
 stripchat.com
-tube8.com
+myfreecams.com
 spankbang.com
+txxx.com
 beeg.com
-brazzers.com
+tube8.com
+youjizz.com
+motherless.com
 eporner.com
 hqporner.com
-porn.com
-xvideos2.com
+porn300.com
 rule34.xxx
+e621.net
+hanime.tv
+nhentai.net
+literotica.com
+fapello.com
+erome.com
+thothub.to
+porntrex.com
+hclips.com
+tnaflix.com
+empflix.com
+drtuber.com
+sunporno.com
+porndig.com
+anyporn.com
+yespornplease.com
+pornhd.com

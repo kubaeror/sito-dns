@@ -116,5 +116,74 @@
   "hulu": [
     "hulu.com",
     "hulustream.com"
+  ],
+  "linkedin": [
+    "linkedin.com",
+    "licdn.com"
+  ],
+  "zoom": [
+    "zoom.us",
+    "zoom.com",
+    "zoomgov.com"
+  ],
+  "minecraft": [
+    "minecraft.net",
+    "mojang.com"
+  ],
+  "viber": [
+    "viber.com",
+    "viber.co"
+  ],
+  "line": [
+    "line.me",
+    "line-apps.com",
+    "line-scdn.net"
+  ],
+  "tumblr": [
+    "tumblr.com",
+    "tumblr.co"
+  ],
+  "imgur": [
+    "imgur.com",
+    "imgur.io"
+  ],
+  "soundcloud": [
+    "soundcloud.com",
+    "sndcdn.com"
+  ],
+  "crunchyroll": [
+    "crunchyroll.com",
+    "crunchyrollsvc.com"
+  ],
+  "hbo": [
+    "hbo.com",
+    "hbomax.com",
+    "max.com"
+  ],
+  "primevideo": [
+    "primevideo.com",
+    "amazonvideo.com"
+  ],
+  "ads": [
+    "doubleclick.net",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "google-analytics.com",
+    "adnxs.com",
+    "criteo.com",
+    "criteo.net",
+    "taboola.com",
+    "outbrain.com",
+    "adcolony.com",
+    "applovin.com",
+    "unityads.unity3d.com",
+    "mopub.com",
+    "rubiconproject.com",
+    "pubmatic.com",
+    "openx.net",
+    "casalemedia.com",
+    "smartadserver.com",
+    "sharethrough.com",
+    "33across.com"
   ]
 }

@@ -8,7 +8,6 @@ use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::{Path, State};
 use sito_clients::{ClientEntryConfig, ClientGroupConfig, ClientsConfig};
-use std::sync::Arc;
 
 fn load_clients_config(ctx: &ServerContext) -> ClientsConfig {
     ctx.config
@@ -30,11 +29,11 @@ async fn save_clients_config(
     new_cfg.clients = Some(val);
 
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
-    ctx.config.store(Arc::new(new_cfg));
+    ctx.set_config(new_cfg);
 
     // Update active registry
     let new_reg = sito_clients::ClientRegistry::new(clients_cfg.clone());
-    ctx.clients.store(Arc::new(new_reg));
+    ctx.set_clients(new_reg);
     crate::publish_bundle(ctx);
     Ok(())
 }

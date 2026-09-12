@@ -8,7 +8,6 @@ use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::{Path, State};
 use sito_rewrites::{RewriteEntryConfig, RewritesConfig};
-use std::sync::Arc;
 
 fn load_rewrites_config(ctx: &ServerContext) -> RewritesConfig {
     ctx.config
@@ -30,11 +29,11 @@ async fn save_rewrites_config(
     new_cfg.rewrites = Some(val);
 
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
-    ctx.config.store(Arc::new(new_cfg));
+    ctx.set_config(new_cfg);
 
     // Update active rewrite table
     let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg.clone());
-    ctx.rewrites.store(Arc::new(new_table));
+    ctx.set_rewrites(new_table);
     crate::publish_bundle(ctx);
     Ok(())
 }

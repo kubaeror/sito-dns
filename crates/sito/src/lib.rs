@@ -3,6 +3,7 @@
 //! Fast, memory-efficient, filtering DNS resolver server and CLI.
 
 pub mod cli;
+pub mod logging;
 pub mod pipeline;
 pub mod server;
 
@@ -16,7 +17,9 @@ mod tests {
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
     use sito_cache::DnsCache;
-    use sito_clients::{ClientRegistry, ClientsConfig, ParentalRegistry, ServiceRegistry};
+    use sito_clients::{
+        ClientEntryConfig, ClientRegistry, ClientsConfig, ParentalRegistry, ServiceRegistry,
+    };
     use sito_core::client::ClientContext;
     use sito_core::config::Config;
     use sito_filter::HostsFilterEngine;
@@ -24,6 +27,7 @@ mod tests {
     use sito_rewrites::{RewriteTable, RewritesConfig};
     use sito_transport::QueryHandler;
     use sito_upstream::{BootstrapResolver, UpstreamManager};
+    use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::str::FromStr;
     use std::sync::Arc;
@@ -116,15 +120,15 @@ mod tests {
         let metrics = sito_stats::MetricsRegistry::new("1.2.1", "test");
 
         let pipeline = DnsPipeline::new(
-            Arc::new(config.clone()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(config.clone()))),
             filter,
             cache.clone(),
             upstream,
             dnssec,
-            clients,
+            Arc::new(arc_swap::ArcSwap::new(clients.clone())),
             parental,
             services,
-            rewrites,
+            Arc::new(arc_swap::ArcSwap::new(rewrites.clone())),
             in_flight,
         )
         .with_stats(querylog_writer.sender(), metrics);
@@ -260,15 +264,15 @@ mod tests {
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
 
         let pipeline = DnsPipeline::new(
-            Arc::new(config.clone()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(config.clone()))),
             filter,
             cache,
             upstream,
             dnssec,
-            clients,
+            Arc::new(arc_swap::ArcSwap::new(clients.clone())),
             parental,
             services,
-            rewrites,
+            Arc::new(arc_swap::ArcSwap::new(rewrites.clone())),
             in_flight,
         );
 
@@ -305,6 +309,180 @@ mod tests {
             resp_rw.answers[0].data,
             RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
             "$dnsrewrite must synthesize the configured address"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_per_client_upstreams_and_ignore_stats() {
+        async fn spawn_mock(ip: Ipv4Addr) -> SocketAddr {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                while let Ok((len, src)) = socket.recv_from(&mut buf).await {
+                    if let Ok(query) = sito_proto::decode_message(&buf[..len]) {
+                        let mut resp =
+                            Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                        resp.metadata.response_code = ResponseCode::NoError;
+                        resp.queries = query.queries.clone();
+                        if let Some(q) = query.queries.first() {
+                            resp.answers.push(Record::from_rdata(
+                                q.name().clone(),
+                                300,
+                                RData::A(A(ip)),
+                            ));
+                        }
+                        let encoded = sito_proto::encode_message(&resp).unwrap();
+                        let _ = socket.send_to(&encoded, src).await;
+                    }
+                }
+            });
+            addr
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!("sito_scoped_up_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let addr_a = spawn_mock(Ipv4Addr::new(1, 1, 1, 1)).await;
+        let addr_b = spawn_mock(Ipv4Addr::new(2, 2, 2, 2)).await;
+        let addr_global = spawn_mock(Ipv4Addr::new(9, 9, 9, 9)).await;
+
+        let mut base = Config::default();
+        base.server.data_dir = temp_dir.clone();
+        base.upstream.servers = vec![addr_global.to_string()];
+        let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
+
+        async fn scoped_manager(
+            base: &Config,
+            bootstrap: &BootstrapResolver,
+            addr: SocketAddr,
+        ) -> Arc<UpstreamManager> {
+            let mut upstream_cfg = base.upstream.clone();
+            upstream_cfg.servers = vec![addr.to_string()];
+            Arc::new(
+                UpstreamManager::from_config(&upstream_cfg, bootstrap)
+                    .await
+                    .unwrap(),
+            )
+        }
+
+        let global_upstream = Arc::new(
+            UpstreamManager::from_config(&base.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let key_a = addr_a.to_string();
+        let key_b = addr_b.to_string();
+        let mut scoped = HashMap::new();
+        scoped.insert(
+            key_a.clone(),
+            scoped_manager(&base, &bootstrap, addr_a).await,
+        );
+        scoped.insert(
+            key_b.clone(),
+            scoped_manager(&base, &bootstrap, addr_b).await,
+        );
+
+        let clients_cfg = ClientsConfig {
+            entries: vec![
+                ClientEntryConfig {
+                    name: "client-a".to_string(),
+                    ids: vec!["10.0.0.1".to_string()],
+                    group: "default".to_string(),
+                    ignore_query_log: false,
+                    ignore_stats: true,
+                    use_global_upstreams: false,
+                    upstreams: Some(vec![key_a]),
+                    trusted: false,
+                },
+                ClientEntryConfig {
+                    name: "client-b".to_string(),
+                    ids: vec!["10.0.0.2".to_string()],
+                    group: "default".to_string(),
+                    ignore_query_log: false,
+                    ignore_stats: false,
+                    use_global_upstreams: false,
+                    upstreams: Some(vec![key_b]),
+                    trusted: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let filter =
+            Arc::new(HostsFilterEngine::init(base.filtering.clone(), temp_dir.clone()).await);
+        let cache = Arc::new(DnsCache::new(base.dns.cache.clone()));
+        let dnssec = Arc::new(sito_dnssec::DnssecValidator::from_config(&base.dns.dnssec));
+        let clients = Arc::new(ClientRegistry::new(clients_cfg));
+        let parental = Arc::new(ParentalRegistry::bundled());
+        let services = Arc::new(ServiceRegistry::bundled());
+        let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
+        let stats_db = sito_stats::StatsDb::in_memory().await.unwrap();
+        let writer = sito_stats::QueryLogWriter::spawn(stats_db.clone(), 100);
+        let metrics = sito_stats::MetricsRegistry::new("test", "test");
+
+        let pipeline = DnsPipeline::new(
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(base.clone()))),
+            filter,
+            cache,
+            global_upstream,
+            dnssec,
+            Arc::new(arc_swap::ArcSwap::new(clients.clone())),
+            parental,
+            services,
+            Arc::new(arc_swap::ArcSwap::new(rewrites.clone())),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .with_scoped_upstreams(Arc::new(scoped))
+        .with_stats(writer.sender(), metrics.clone());
+
+        async fn resolve_ip(pipeline: &DnsPipeline, name: &str, client_ip: &str) -> Ipv4Addr {
+            let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+            query
+                .queries
+                .push(Query::query(Name::from_str(name).unwrap(), RecordType::A));
+            let resp = pipeline
+                .handle(query, ClientContext::new(client_ip.parse().unwrap()))
+                .await
+                .unwrap();
+            match resp.answers[0].data {
+                RData::A(a) => a.0,
+                ref other => panic!("expected A record, got {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            resolve_ip(&pipeline, "a.test.", "10.0.0.1").await,
+            Ipv4Addr::new(1, 1, 1, 1)
+        );
+        assert_eq!(
+            resolve_ip(&pipeline, "b.test.", "10.0.0.2").await,
+            Ipv4Addr::new(2, 2, 2, 2)
+        );
+        // Unknown client falls back to the global upstream.
+        assert_eq!(
+            resolve_ip(&pipeline, "g.test.", "10.0.0.3").await,
+            Ipv4Addr::new(9, 9, 9, 9)
+        );
+
+        // The same name resolved from two scopes must not share cached answers.
+        assert_eq!(
+            resolve_ip(&pipeline, "same.test.", "10.0.0.1").await,
+            Ipv4Addr::new(1, 1, 1, 1)
+        );
+        assert_eq!(
+            resolve_ip(&pipeline, "same.test.", "10.0.0.2").await,
+            Ipv4Addr::new(2, 2, 2, 2)
+        );
+
+        // client-a sets ignore_stats: only b.test, g.test and same.test (client-b)
+        // contribute; the two client-a queries are excluded.
+        assert_eq!(
+            metrics.get_queries_and_blocked().0,
+            3,
+            "ignore_stats clients must not contribute Prometheus counters"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -378,15 +556,15 @@ mod tests {
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
 
         let pipeline = DnsPipeline::new(
-            Arc::new(config.clone()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(config.clone()))),
             filter,
             cache,
             upstream,
             dnssec,
-            clients,
+            Arc::new(arc_swap::ArcSwap::new(clients.clone())),
             parental,
             services,
-            rewrites,
+            Arc::new(arc_swap::ArcSwap::new(rewrites.clone())),
             in_flight,
         );
 
@@ -502,6 +680,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_curated_list_refresh_replaces_bundled_data() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_list_refresh_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let source_path = temp_dir.join("adult.txt");
+        std::fs::write(&source_path, "refreshed.example\nsub.refreshed.example\n").unwrap();
+
+        let mut lists_cfg = sito_clients::ListCategoriesConfig::default();
+        lists_cfg.categories.insert(
+            "adult".to_string(),
+            sito_clients::ListSourceConfig {
+                url: format!("file://{}", source_path.display()),
+                refresh_hours: None,
+                license: Some("CC0-1.0".to_string()),
+            },
+        );
+        lists_cfg.validate().unwrap();
+
+        let store = Arc::new(sito_clients::RuntimeLists::from_arcs(
+            Arc::new(ParentalRegistry::bundled()),
+            Arc::new(ServiceRegistry::bundled()),
+        ));
+        assert!(store.parental().matches_category("adult", "pornhub.com"));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let refresh_handle = tokio::spawn(crate::server::run_list_refresh(
+            lists_cfg,
+            store.clone(),
+            temp_dir.clone(),
+            shutdown_rx,
+        ));
+
+        let mut refreshed = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if store
+                .parental()
+                .matches_category("adult", "sub.refreshed.example")
+            {
+                refreshed = true;
+                break;
+            }
+        }
+        assert!(refreshed, "curated list refresh did not apply");
+        assert!(
+            store
+                .parental()
+                .matches_category("adult", "refreshed.example")
+        );
+        assert!(
+            !store.parental().matches_category("adult", "pornhub.com"),
+            "refreshed list must replace the bundled fallback"
+        );
+        let status = store
+            .statuses()
+            .into_iter()
+            .find(|status| status.category == "adult")
+            .expect("adult status");
+        assert!(!status.bundled);
+        assert_eq!(status.entries, 2);
+        assert_eq!(
+            status.source_url.as_deref(),
+            Some(format!("file://{}", source_path.display()).as_str())
+        );
+        assert!(status.last_refresh_unix.is_some());
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), refresh_handle).await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_dns_listener_rebinds_on_port_change() {
+        let reserve_udp_port = || {
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            port
+        };
+        let first_port = reserve_udp_port();
+        let second_port = reserve_udp_port();
+        let probe_web = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let web_port = probe_web.local_addr().unwrap().port();
+        drop(probe_web);
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_rebind_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut config = Config::default();
+        config.server.data_dir = temp_dir.clone();
+        config.dns.bind = vec!["127.0.0.1".parse().unwrap()];
+        config.dns.port = first_port;
+        let mut web_cfg = config.get_web_config();
+        web_cfg.bind = "127.0.0.1".parse().unwrap();
+        web_cfg.port = web_port;
+        config.set_web_config(web_cfg);
+        config.upstream.servers = vec!["127.0.0.1:1".to_string()];
+
+        // The config file is written only after startup: the watcher must pick
+        // up a newly created file and rebind to its port.
+        let config_path = temp_dir.join("config.toml");
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_config = config.clone();
+        let server_task = tokio::spawn(async move {
+            run_server_with_shutdown(server_config, Some(shutdown_rx)).await
+        });
+
+        async fn query_port(port: u16) -> bool {
+            let sock = match tokio::net::UdpSocket::bind("127.0.0.1:0").await {
+                Ok(sock) => sock,
+                Err(_) => return false,
+            };
+            if sock
+                .connect(SocketAddr::new("127.0.0.1".parse().unwrap(), port))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            let mut query = Message::new(1001, MessageType::Query, OpCode::Query);
+            query.queries.push(Query::query(
+                Name::from_str("blocked.test.").unwrap(),
+                RecordType::A,
+            ));
+            let Ok(wire) = sito_proto::encode_message(&query) else {
+                return false;
+            };
+            if sock.send(&wire).await.is_err() {
+                return false;
+            }
+            let mut buf = [0u8; 512];
+            matches!(
+                tokio::time::timeout(Duration::from_millis(200), sock.recv(&mut buf)).await,
+                Ok(Ok(len)) if len > 0
+            )
+        }
+
+        // Wait for the initial listener to come up.
+        let mut up = false;
+        for _ in 0..100 {
+            if server_task.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if query_port(first_port).await {
+                up = true;
+                break;
+            }
+        }
+        if !up && server_task.is_finished() {
+            panic!("server exited early: {:?}", server_task.await);
+        }
+        assert!(up, "server did not start listening on the initial port");
+
+        // Change the DNS port; the watcher must rebind without a restart.
+        config.dns.port = second_port;
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&config).expect("serialize config"),
+        )
+        .unwrap();
+
+        let mut rebound = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if query_port(second_port).await {
+                rebound = true;
+                break;
+            }
+        }
+        assert!(rebound, "server did not rebind to the new DNS port");
+
+        let _ = shutdown_tx.send(());
+        let result = tokio::time::timeout(Duration::from_secs(8), server_task).await;
+        assert!(result.is_ok(), "server failed to shut down after rebind");
+        assert!(result.unwrap().unwrap().is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
     async fn test_pipeline_picks_up_rewrite_change_without_restart() {
         use arc_swap::ArcSwap;
 
@@ -575,7 +942,9 @@ mod tests {
                 exception_clients: vec![],
             }],
         };
-        rewrites.store(Arc::new(RewriteTable::new(new_rewrites)));
+        pipeline
+            .runtime()
+            .set_rewrites(RewriteTable::new(new_rewrites));
 
         // After update: query resolves immediately without pipeline restart!
         let resp2 = pipeline.handle(query, client).await.unwrap();
@@ -662,15 +1031,15 @@ mod tests {
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
 
         let pipeline = DnsPipeline::new(
-            Arc::new(config.clone()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(config.clone()))),
             filter,
             cache.clone(),
             upstream,
             dnssec,
-            clients,
+            Arc::new(arc_swap::ArcSwap::new(clients.clone())),
             parental,
             services,
-            rewrites,
+            Arc::new(arc_swap::ArcSwap::new(rewrites.clone())),
             in_flight,
         );
 

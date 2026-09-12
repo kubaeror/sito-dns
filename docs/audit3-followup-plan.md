@@ -468,20 +468,20 @@ integration point and should land last in its wave to avoid merge churn in
 
 ## Tracking checklist
 
-- [ ] WP-1 DNSSEC DS/DNSKEY chain validation
-- [ ] WP-2 Native DoH/DoQ upstream transports
-- [ ] WP-3 Persistent sessions and API tokens
-- [ ] WP-4 Per-list `refresh_hours` scheduling
-- [ ] WP-5 Per-client upstreams and `ignore_stats`
-- [ ] WP-6 Atomic runtime snapshot + live reload of restart-only settings
-- [ ] WP-7 Maintained parental/service lists
-- [ ] WP-8 DoH dedicated hostname + ACME HTTP-01 on port 80
-- [ ] WP-9 HA heartbeat watchdog, protocol role, `ca` validation
+- [x] WP-1 DNSSEC DS/DNSKEY chain validation — in-response DS/DNSKEY chain walk (KSK→ZSK, signed DS delegation), bounded upstream key fetching (`DnssecKeyFetcher`/`UpstreamKeyFetcher`), validated-only key cache with TTL/signature-expiry bounds, additional-section RRSIGs, NSEC denial proofs, RFC 5155 NSEC3 closest-encloser/opt-out enumeration (opt-out NXDOMAIN downgraded to insecure), Prometheus key-cache counters and `fuzz_dnssec_response`
+- [x] WP-2 Native DoH/DoQ upstream transports (`crates/sito-upstream/src/{doh,doq}.rs`, manager `https://`/`quic://` support, UI probes)
+- [x] WP-3 Persistent sessions and API tokens
+- [x] WP-4 Per-list `refresh_hours` scheduling
+- [x] WP-5 Per-client upstreams and `ignore_stats`
+- [x] WP-6 Atomic runtime snapshot + live reload of restart-only settings — `RuntimeSnapshot`/`RuntimeState` (no torn state per query), cache `size_mb` resize with carry-over, per-cycle retention, log-level reload, hot rate limits, in-process listener rebind with revert, and restart-only API signalling for the truly immutable settings (server identity/format, web, tls, acme, ha)
+- [x] WP-7 Maintained parental/service lists — versioned manifest with source/license/BLAKE3 checks, expanded built-in data (adult/gambling/services incl. ads), `[integrations.lists]` runtime refresh with per-category schedules and hot registry swap, and Filtering-page display of state, source and last refresh
+- [x] WP-8 DoH dedicated hostname + ACME HTTP-01 on port 80
+- [x] WP-9 HA heartbeat watchdog, protocol role, `ca` validation
 - [x] WP-10 Updater artifact signature verification
-- [ ] WP-11 Architecture cleanup (pipeline, shutdown, dead code, precedence)
-- [ ] WP-12 Supply chain & installer ops
-- [ ] WP-13 Test-suite quality
-- [ ] WP-14 Docs/OpenAPI automation
+- [x] WP-11 Architecture cleanup — cert-watcher lifetime fix, shutdown joins, dead-code sweep, allocation-free domain matching, deterministic precedence with shuffled-order test, `handle` helper extraction (blocked builders, anti-DoH checks, filter stages) and `IntoArcSwap` removal
+- [x] WP-12 Supply chain & installer ops — `--uninstall`, `SITO_VERSION` pin, `SITO_REQUIRE_SIGNATURE`, armv7 image, SBOM, SHA-pinned Actions, `deny.toml` tightened (`multiple-versions = "deny"` with explicit known-duplicate skips, `unused-allowed-license = "deny"`), shellcheck raised to `warning`, Docker ownership and release-verification/reproducibility documented; advisories are covered by the `cargo-deny` CI job
+- [x] WP-13 Test-suite quality — wall-clock gating, `SITO_BENCH_TESTS`, ephemeral HA ports, chaos/promotion tightening, broadcast/monotonic/pubkey tests, plaintext/push-policy/duplicate-instance coverage, reconnect/backoff E2E, behavioral config/systemd checks and the nightly `--release` job all done
+- [x] WP-14 Docs/OpenAPI automation — CI drift checks for `docs/openapi.json` and `docs/configuration-reference.md` (bidirectional struct-vs-doc validator), `--write` scaffolding with Rust doc-comment descriptions; only fields without doc comments need manual wording
 
 When a WP lands, update `docs/audit3.md` (move the item out of "Explicitly
 deferred") and check it off here.

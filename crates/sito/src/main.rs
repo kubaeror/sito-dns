@@ -5,6 +5,8 @@ use sito::cli::{Cli, Commands, run_backup, run_check_config, run_healthcheck_or_
 use sito::server::run_server_full;
 use sito_core::config::Config;
 use std::net::SocketAddr;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -120,6 +122,14 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
+            Commands::ResetSessions { config } => {
+                let config_path = config.unwrap_or(cli.config);
+                if let Err(e) = sito::cli::run_reset_sessions(&config_path) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
         }
     }
 
@@ -148,20 +158,30 @@ async fn main() -> anyhow::Result<()> {
         (Config::default(), true)
     };
 
-    // Initialize tracing subscriber per configuration
+    // Initialize tracing subscriber per configuration. The filter layer is
+    // installable via `sito::logging` so `server.log_level` hot-reloads.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.server.log_level));
+    let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
 
     if config.server.log_format == "pretty" {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .pretty()
+        tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(tracing_subscriber::fmt::layer().pretty())
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .json()
+        tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(tracing_subscriber::fmt::layer().json())
             .init();
+    }
+
+    if !sito::logging::install_reload_fn(move |level| {
+        reload_handle
+            .reload(tracing_subscriber::EnvFilter::new(level))
+            .map_err(|e| e.to_string())
+    }) {
+        tracing::debug!("Log-level reload callback already installed");
     }
 
     if setup_pending {

@@ -152,7 +152,10 @@ impl RuleSetBuilder {
         for (prefix, rule_id) in self.prefixes {
             prefix_map.entry(prefix).or_default().push(rule_id);
         }
-        let prefixes: Vec<(String, Vec<u32>)> = prefix_map.into_iter().collect();
+        // Deterministic order (by lowest rule id) so candidate precedence does
+        // not depend on hash iteration order.
+        let mut prefixes: Vec<(String, Vec<u32>)> = prefix_map.into_iter().collect();
+        prefixes.sort_by_key(|(_, rules)| rules.iter().copied().min().unwrap_or(u32::MAX));
 
         // 3. Aho-Corasick for substrings
         let (ac, ac_pattern_to_rules) = if self.substrings.is_empty() {
@@ -162,9 +165,11 @@ impl RuleSetBuilder {
             for (sub, rule_id) in self.substrings {
                 unique_subs.entry(sub).or_default().push(rule_id);
             }
-            let mut pat_strings = Vec::with_capacity(unique_subs.len());
-            let mut pat_to_rules = Vec::with_capacity(unique_subs.len());
-            for (sub, rules) in unique_subs {
+            let mut entries: Vec<(String, Vec<u32>)> = unique_subs.into_iter().collect();
+            entries.sort_by_key(|(_, rules)| rules.iter().copied().min().unwrap_or(u32::MAX));
+            let mut pat_strings = Vec::with_capacity(entries.len());
+            let mut pat_to_rules = Vec::with_capacity(entries.len());
+            for (sub, rules) in entries {
                 pat_strings.push(sub);
                 pat_to_rules.push(rules);
             }
@@ -196,9 +201,11 @@ impl RuleSetBuilder {
             for (pattern, rule_id) in self.regexes {
                 unique_re.entry(pattern).or_default().push(rule_id);
             }
-            let mut pat_strings = Vec::with_capacity(unique_re.len());
-            let mut pat_to_rules = Vec::with_capacity(unique_re.len());
-            for (pat, rules) in unique_re {
+            let mut regex_entries: Vec<(String, Vec<u32>)> = unique_re.into_iter().collect();
+            regex_entries.sort_by_key(|(_, rules)| rules.iter().copied().min().unwrap_or(u32::MAX));
+            let mut pat_strings = Vec::with_capacity(regex_entries.len());
+            let mut pat_to_rules = Vec::with_capacity(regex_entries.len());
+            for (pat, rules) in regex_entries {
                 pat_strings.push(pat);
                 pat_to_rules.push(rules);
             }
@@ -338,5 +345,45 @@ mod tests {
         candidates.clear();
         compiled.collect_candidates("google.com", &interner, &mut candidates);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_candidate_order_is_deterministic_across_insertion_order() {
+        fn build(indices: [usize; 3]) -> (CompiledRuleSet, LabelInterner) {
+            let mut interner = LabelInterner::new();
+            let mut builder = RuleSetBuilder::new();
+            // Three rules with distinct ids that all match "ads.tracker.example".
+            let rules: Vec<(&str, u32)> = vec![
+                ("ads.", 10),
+                ("tracker", 20),
+                (r"^ads\.tracker\.example$", 30),
+            ];
+            // Insert the same rules in the caller-provided order.
+            for index in indices {
+                match index {
+                    0 => builder.add_prefix(rules[0].0.to_string(), rules[0].1),
+                    1 => builder.add_substring(rules[1].0.to_string(), rules[1].1),
+                    2 => builder.add_regex(rules[2].0.to_string(), rules[2].1),
+                    _ => unreachable!(),
+                }
+            }
+            (builder.build(&mut interner), interner)
+        }
+
+        let mut results = Vec::new();
+        for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0], [2, 0, 1]] {
+            let (compiled, interner) = build(order);
+            let mut candidates = Vec::new();
+            compiled.collect_candidates("ads.tracker.example", &interner, &mut candidates);
+            assert_eq!(candidates.len(), 3, "all three rules must match");
+            results.push(candidates);
+        }
+
+        // Precedence may not depend on the hash-map iteration order.
+        for candidates in &results {
+            assert_eq!(candidates, &results[0]);
+        }
+        // Within each source the lowest rule id wins first.
+        assert_eq!(results[0][0], 10);
     }
 }

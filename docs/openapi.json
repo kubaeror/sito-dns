@@ -2572,6 +2572,14 @@
             "type": "integer",
             "format": "int64"
           },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix timestamp after which the token is rejected (`None` = no expiry)."
+          },
           "hash": {
             "type": "string"
           },
@@ -2775,6 +2783,25 @@
         "properties": {
           "config_toml": {
             "type": "string"
+          }
+        }
+      },
+      "ConfigUpdateResponse": {
+        "type": "object",
+        "description": "Result of a configuration update, including restart requirements.",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "restart_required": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Settings that changed but only take effect after a process restart."
           }
         }
       },
@@ -3175,18 +3202,6 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
-          }
-        }
-      },
-      "HaStubResponse": {
-        "type": "object",
-        "description": "Stub response for HA endpoints returning 501 Not Implemented.",
-        "required": [
-          "message"
-        ],
-        "properties": {
-          "message": {
-            "type": "string"
           }
         }
       },

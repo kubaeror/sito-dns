@@ -254,4 +254,79 @@ mod tests {
         let cached = cache.get(&qname, RecordType::A, DNSClass::IN).await;
         assert!(cached.is_some());
     }
+
+    async fn insert_answer(cache: &DnsCache, id: u16, name: &str) {
+        let qname = Name::from_str(name).unwrap();
+        let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+        query
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+        let mut response = Message::response(id, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.answers.push(Record::from_rdata(
+            qname,
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(203, 0, 113, id as u8))),
+        ));
+        cache.insert(&query, &response).await;
+    }
+
+    #[tokio::test]
+    async fn test_resize_carries_over_live_entries() {
+        let mut config = make_test_config(10, 3600, 3600);
+        config.size_mb = 64;
+        let cache = DnsCache::new(config.clone());
+
+        for (id, name) in [(1, "one.test."), (2, "two.test."), (3, "three.test.")] {
+            insert_answer(&cache, id, name).await;
+        }
+
+        // Sanity: all three answers are cached before the resize.
+        for name in ["one.test.", "two.test.", "three.test."] {
+            let qname = Name::from_str(name).unwrap();
+            assert!(
+                cache
+                    .get(&qname, RecordType::A, DNSClass::IN)
+                    .await
+                    .is_some()
+            );
+        }
+
+        // Shrink and grow again; cached answers must survive the rebuild.
+        config.size_mb = 1;
+        cache.update_config(config.clone()).await;
+
+        for name in ["one.test.", "two.test.", "three.test."] {
+            let qname = Name::from_str(name).unwrap();
+            let hit = cache.get(&qname, RecordType::A, DNSClass::IN).await;
+            assert!(hit.is_some(), "entry {name} lost after resize");
+        }
+
+        config.size_mb = 64;
+        cache.update_config(config).await;
+        let qname = Name::from_str("one.test.").unwrap();
+        assert!(
+            cache
+                .get(&qname, RecordType::A, DNSClass::IN)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_config_without_size_change_keeps_cache() {
+        let config = make_test_config(10, 3600, 3600);
+        let cache = DnsCache::new(config.clone());
+        insert_answer(&cache, 7, "keep.test.").await;
+
+        cache.update_config(config).await;
+
+        let qname = Name::from_str("keep.test.").unwrap();
+        assert!(
+            cache
+                .get(&qname, RecordType::A, DNSClass::IN)
+                .await
+                .is_some()
+        );
+    }
 }

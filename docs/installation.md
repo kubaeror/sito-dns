@@ -157,6 +157,12 @@ docker run -d \
   ghcr.io/kubaeror/sito-dns:latest
 ```
 
+> **Config directory permissions.** The image runs as UID/GID `65532`
+> (non-root). When bind-mounting a host directory for `/etc/sito`, hand it to
+> that user once: `sudo chown -R 65532:65532 /opt/sito/config`. Alternatively
+> keep configuration in a named volume (as the Compose example below does),
+> which Docker initialises with the correct ownership.
+
 ---
 
 ## 4. Docker Compose Deployment
@@ -249,3 +255,48 @@ curl -fsSL http://127.0.0.1:8080/api/v1/status | jq .
 ```
 
 Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard. If the wizard is skipped with `--no-setup`, the bootstrap credentials are `admin` / `adminadmin` and **must be changed immediately** (Settings -> Administrator).
+
+---
+
+## 6. Verifying Releases
+
+Every release archive is published with a `.sha256` checksum, a cosign keyless
+signature (`.sig` + `.pem`), and a `SHA256SUMS` file covering the archives and
+the SPDX SBOM (`sito.spdx.json`).
+
+### 6.1 Checksums
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+### 6.2 cosign signature (keyless)
+
+```bash
+cosign verify-blob \
+  --certificate sito-v1.4.0-x86_64-unknown-linux-gnu.tar.gz.pem \
+  --signature   sito-v1.4.0-x86_64-unknown-linux-gnu.tar.gz.sig \
+  --certificate-identity-regexp \
+      '^https://github.com/kubaeror/sito-dns/.github/workflows/release.yml@refs/.*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  sito-v1.4.0-x86_64-unknown-linux-gnu.tar.gz
+```
+
+The identity pins the artifact to this repository's release workflow and the
+OIDC issuer pins it to GitHub Actions. `SITO_REQUIRE_SIGNATURE=1|0` controls
+whether `install.sh` enforces signature verification.
+
+### 6.3 SBOM
+
+The SPDX 2.3 document `sito.spdx.json` is attached to every release and is
+covered by `SHA256SUMS`.
+
+### 6.4 Reproducibility
+
+Release binaries are built in GitHub Actions with `cargo build --release
+--locked`, so the dependency graph is exactly the committed `Cargo.lock`,
+using the pinned Rust toolchain in `rust-toolchain.toml` and the release
+profile (`lto = "fat"`, `codegen-units = 1`, `strip = true`). Rebuilding the
+same tag locally with the same toolchain produces a functionally identical
+binary; bit-for-bit identity is not guaranteed across host toolchains or
+archive timestamps.

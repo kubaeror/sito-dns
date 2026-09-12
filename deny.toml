@@ -20,28 +20,44 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "MPL-2.0",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "ISC",
     "CC0-1.0",
     "GPL-3.0-only",
-    "GPL-3.0-or-later",
     "CDLA-Permissive-2.0",
     "Zlib",
 ]
 confidence-threshold = 0.8
-unused-allowed-license = "allow"
+unused-allowed-license = "deny"
 
 [licenses.private]
 ignore = false
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
+# Known transitive version skew accepted for now. New duplicates of any other
+# crate fail the build; remove entries once the ecosystem converges.
+skip = [
+    { name = "base64" },            # hickory (0.22) vs reqwest/rustls (0.21)
+    { name = "block-buffer" },      # sha1 vs sha2 generations
+    { name = "cpufeatures" },       # sha1/sha2 vs blake3
+    { name = "crypto-common" },     # digest families
+    { name = "digest" },            # sha1 vs sha2 generations
+    { name = "getrandom" },         # rand 0.8 vs 0.9
+    { name = "hashbrown" },         # indexmap vs std collections
+    { name = "miniz_oxide" },       # flate2 backends
+    { name = "rand" },              # rand 0.8 vs 0.9
+    { name = "rand_core" },         # rand 0.8 vs 0.9
+    { name = "sha1" },              # legacy transitive use
+    { name = "sha2" },              # 0.10 vs 0.11
+    { name = "syn" },               # proc-macro ecosystem (1.x vs 2.x)
+    { name = "tokio-tungstenite" }, # axum 0.29 vs sito-ha 0.30
+    { name = "tungstenite" },       # axum 0.29 vs sito-ha 0.30
+]
 allow = []
 deny = []
 

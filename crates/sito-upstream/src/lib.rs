@@ -4,15 +4,21 @@
 //! bootstrap resolver, and health-aware failover manager.
 
 pub mod bootstrap;
+pub mod doh;
+pub mod doq;
 pub mod dot;
 pub mod health;
+pub mod key_fetch;
 pub mod manager;
 pub mod plain;
 pub mod upstream;
 
 pub use bootstrap::BootstrapResolver;
+pub use doh::HttpsUpstream;
+pub use doq::QuicUpstream;
 pub use dot::DotUpstream;
 pub use health::{HealthStatus, UpstreamHealth};
+pub use key_fetch::UpstreamKeyFetcher;
 pub use manager::UpstreamManager;
 pub use plain::PlainUpstream;
 pub use upstream::Upstream;
