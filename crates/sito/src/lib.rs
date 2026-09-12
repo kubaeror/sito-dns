@@ -3,6 +3,7 @@
 //! Fast, memory-efficient, filtering DNS resolver server and CLI.
 
 pub mod cli;
+pub mod logging;
 pub mod pipeline;
 pub mod server;
 

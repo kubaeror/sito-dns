@@ -2786,6 +2786,25 @@
           }
         }
       },
+      "ConfigUpdateResponse": {
+        "type": "object",
+        "description": "Result of a configuration update, including restart requirements.",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "restart_required": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Settings that changed but only take effect after a process restart."
+          }
+        }
+      },
       "CreateTokenRequest": {
         "type": "object",
         "description": "Request to create an API token.",

@@ -18,8 +18,8 @@ use crate::auth::rbac::RequireAdmin;
 use crate::config_writer::save_config_atomic;
 use crate::error::ProblemDetails;
 use crate::models::{
-    BackupMetadata, ConfigResponse, GenericMessageResponse, RestoreConfirmRequest,
-    RestorePreparedResponse, UpdateConfigRequest,
+    BackupMetadata, ConfigResponse, ConfigUpdateResponse, GenericMessageResponse,
+    RestoreConfirmRequest, RestorePreparedResponse, UpdateConfigRequest,
 };
 use crate::state::ServerContext;
 
@@ -124,7 +124,7 @@ pub async fn update_config(
     _admin: RequireAdmin,
     State(ctx): State<ServerContext>,
     Json(req): Json<UpdateConfigRequest>,
-) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
+) -> Result<Json<ConfigUpdateResponse>, ProblemDetails> {
     let current_toml = tokio::fs::read_to_string(&ctx.config_path)
         .await
         .unwrap_or_default();
@@ -135,6 +135,8 @@ pub async fn update_config(
     let parsed: Config = Config::from_toml_str(&unmasked_toml)
         .map_err(|e| ProblemDetails::bad_request(format!("Configuration error: {e}")))?;
 
+    let restart_required = restart_required_fields(&ctx.config.load(), &parsed);
+
     // Atomic write
     save_config_atomic(&ctx.config_path, &parsed).await?;
     ctx.querylog_sender
@@ -142,9 +144,78 @@ pub async fn update_config(
     ctx.set_config(parsed);
     crate::publish_bundle(&ctx);
 
-    Ok(Json(GenericMessageResponse {
+    Ok(Json(ConfigUpdateResponse {
         message: "Configuration successfully updated".to_string(),
+        restart_required,
     }))
+}
+
+/// Settings that are only read at process start; changing them needs a restart.
+fn restart_required_fields(old: &Config, new: &Config) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mark = |changed: bool, name: &str, fields: &mut Vec<String>| {
+        if changed {
+            fields.push(name.to_string());
+        }
+    };
+
+    mark(
+        old.server.role != new.server.role,
+        "server.role",
+        &mut fields,
+    );
+    mark(
+        old.server.instance_name != new.server.instance_name,
+        "server.instance_name",
+        &mut fields,
+    );
+    mark(
+        old.server.data_dir != new.server.data_dir,
+        "server.data_dir",
+        &mut fields,
+    );
+    mark(
+        old.server.log_format != new.server.log_format,
+        "server.log_format",
+        &mut fields,
+    );
+    mark(old.dns.bind != new.dns.bind, "dns.bind", &mut fields);
+    mark(old.dns.port != new.dns.port, "dns.port", &mut fields);
+    mark(
+        old.dns.dot_port != new.dns.dot_port,
+        "dns.dot_port",
+        &mut fields,
+    );
+    mark(
+        old.dns.doh_port != new.dns.doh_port,
+        "dns.doh_port",
+        &mut fields,
+    );
+    mark(
+        old.dns.doq_port != new.dns.doq_port,
+        "dns.doq_port",
+        &mut fields,
+    );
+    mark(
+        old.dns.doh3_port != new.dns.doh3_port,
+        "dns.doh3_port",
+        &mut fields,
+    );
+    mark(
+        old.dns.doh_dedicated_hostname != new.dns.doh_dedicated_hostname,
+        "dns.doh_dedicated_hostname",
+        &mut fields,
+    );
+    mark(
+        old.dns.rate_limit_per_ip != new.dns.rate_limit_per_ip,
+        "dns.rate_limit_per_ip",
+        &mut fields,
+    );
+    mark(old.web != new.web, "web", &mut fields);
+    mark(old.tls != new.tls, "tls", &mut fields);
+    mark(old.acme != new.acme, "acme", &mut fields);
+    mark(old.ha != new.ha, "ha", &mut fields);
+    fields
 }
 
 /// Reload configuration from disk without server restart.
@@ -162,7 +233,7 @@ pub async fn update_config(
 pub async fn reload_config(
     _admin: RequireAdmin,
     State(ctx): State<ServerContext>,
-) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
+) -> Result<Json<ConfigUpdateResponse>, ProblemDetails> {
     let raw = tokio::fs::read_to_string(&ctx.config_path)
         .await
         .map_err(|e| ProblemDetails::internal_error(format!("Failed to read config file: {e}")))?;
@@ -170,13 +241,16 @@ pub async fn reload_config(
     let parsed = Config::from_toml_str(&raw)
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid configuration on disk: {e}")))?;
 
+    let restart_required = restart_required_fields(&ctx.config.load(), &parsed);
+
     ctx.querylog_sender
         .set_anonymize(parsed.privacy.anonymize_querylog);
     ctx.set_config(parsed);
     crate::publish_bundle(&ctx);
 
-    Ok(Json(GenericMessageResponse {
+    Ok(Json(ConfigUpdateResponse {
         message: "Configuration reloaded successfully from disk".to_string(),
+        restart_required,
     }))
 }
 

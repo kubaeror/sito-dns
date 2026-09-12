@@ -82,6 +82,7 @@ use utoipa::OpenApi;
             crate::models::UpstreamTestItem,
             crate::models::UpstreamTestResponse,
             crate::models::InvalidateCacheQuery,
+            crate::models::ConfigUpdateResponse,
             crate::models::GenericMessageResponse,
             crate::models::ConfigResponse,
             crate::models::UpdateConfigRequest,

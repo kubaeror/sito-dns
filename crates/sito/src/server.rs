@@ -485,6 +485,12 @@ pub async fn run_server_full(
                         Ok(content) => match Config::from_toml_str(&content) {
                             Ok(new_cfg) => {
                                 info!("Detected configuration file change, hot-reloading");
+                                if crate::logging::reload_level(&new_cfg.server.log_level) {
+                                    info!(
+                                        level = %new_cfg.server.log_level,
+                                        "Applied hot-reloaded log level"
+                                    );
+                                }
                                 let _ = watcher_filter.reload_with_config(&new_cfg.filtering).await;
                                 let new_rewrites_cfg: sito_rewrites::RewritesConfig = new_cfg
                                     .rewrites
