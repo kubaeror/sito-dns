@@ -5,6 +5,8 @@
 //! and validation metrics.
 
 use std::collections::HashSet;
+pub mod nsec3;
+
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +20,7 @@ use hickory_proto::dnssec::{PublicKeyBuf, TrustAnchors, Verifier};
 use hickory_proto::op::{Edns, Message, ResponseCode};
 use hickory_proto::rr::rdata::opt::EdnsOption;
 use hickory_proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
+use nsec3::{Nsec3Denial, Nsec3Record, evaluate_nsec3_denial};
 use sito_core::DnssecKeyFetcher;
 use sito_core::config::DnssecConfig;
 
@@ -237,6 +240,18 @@ impl KeyCache {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+}
+
+/// Whether a response is negative (NXDOMAIN or a NODATA empty answer).
+fn is_negative_response(response: &Message, qname: &Name, qtype: RecordType) -> bool {
+    if response.metadata.response_code == ResponseCode::NXDomain {
+        return true;
+    }
+    response.metadata.response_code == ResponseCode::NoError
+        && response
+            .answers
+            .iter()
+            .all(|record| !(record.name == *qname && record.record_type() == qtype))
 }
 
 /// Unique signer zones referenced by RRSIG records in a message.
@@ -874,6 +889,57 @@ impl DnssecValidator {
         }
 
         if has_secure_validation {
+            // RFC 5155: a negative answer proven only by an opt-out NSEC3 may
+            // hide an unsigned delegation; treat it as insecure instead of AD.
+            if let Some(query) = response.queries.first()
+                && is_negative_response(response, query.name(), query.query_type())
+            {
+                let mut nsec3_records: Vec<Nsec3Record<'_>> = Vec::new();
+                for record in response
+                    .authorities
+                    .iter()
+                    .chain(response.additionals.iter())
+                {
+                    let RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) = &record.data else {
+                        continue;
+                    };
+                    let signed_by_validated = rrsigs.iter().any(|(sig_owner, sig)| {
+                        sig_owner == &record.name
+                            && sig.input().type_covered == RecordType::NSEC3
+                            && validated_keys.contains(&(
+                                LowerName::from(&sig.input().signer_name),
+                                sig.input().key_tag,
+                            ))
+                            && response_dnskeys.iter().any(|(key_owner, key)| {
+                                key_owner == &sig.input().signer_name
+                                    && key.calculate_key_tag().ok() == Some(sig.input().key_tag)
+                                    && verify_rrsig_covered(response, &record.name, sig, key)
+                            })
+                    });
+                    if signed_by_validated {
+                        nsec3_records.push(Nsec3Record {
+                            owner: &record.name,
+                            rdata: nsec3,
+                        });
+                    }
+                }
+
+                if !nsec3_records.is_empty()
+                    && evaluate_nsec3_denial(
+                        &nsec3_records,
+                        query.name(),
+                        query.query_type(),
+                        response.metadata.response_code == ResponseCode::NXDomain,
+                    ) == Nsec3Denial::OptOut
+                {
+                    debug!("NSEC3 opt-out proof found; negative response treated as insecure");
+                    response.metadata.authentic_data = false;
+                    let outcome = ValidationOutcome::Insecure;
+                    self.metrics.record_validation(&outcome);
+                    return outcome;
+                }
+            }
+
             response.metadata.authentic_data = true;
             let outcome = ValidationOutcome::Secure;
             self.metrics.record_validation(&outcome);
@@ -1310,6 +1376,97 @@ mod tests {
 
         assert_eq!(outcome, ValidationOutcome::Indeterminate);
         assert!(!msg.metadata.authentic_data);
+    }
+
+    fn signed_optout_nxdomain(
+        origin: &Name,
+        qname: &Name,
+        dnskey: &DNSKEY,
+        signer: &hickory_proto::dnssec::DnssecSigner,
+        opt_out: bool,
+    ) -> Message {
+        use data_encoding::BASE32_DNSSEC;
+        use hickory_proto::dnssec::Nsec3HashAlgorithm;
+        use hickory_proto::dnssec::rdata::NSEC3;
+        use hickory_proto::rr::RecordSet;
+
+        let alg = Nsec3HashAlgorithm::SHA1;
+        let encloser_hash = alg.hash(&[], origin, 0).unwrap().as_ref().to_vec();
+        let qname_hash = alg.hash(&[], qname, 0).unwrap().as_ref().to_vec();
+        let mut next = qname_hash.clone();
+        for byte in next.iter_mut().rev() {
+            *byte = byte.wrapping_add(1);
+            if *byte != 0 {
+                break;
+            }
+        }
+        let nsec3 = NSEC3::new(
+            alg,
+            opt_out,
+            0,
+            Vec::new(),
+            next,
+            [RecordType::SOA, RecordType::RRSIG, RecordType::NSEC3],
+        );
+        let owner = Name::from_ascii(format!(
+            "{}.{}",
+            BASE32_DNSSEC.encode(&encloser_hash),
+            origin.to_ascii()
+        ))
+        .unwrap();
+        let nsec3_record =
+            Record::from_rdata(owner.clone(), 300, RData::DNSSEC(DNSSECRData::NSEC3(nsec3)));
+        let mut set = RecordSet::new(owner, RecordType::NSEC3, 0);
+        set.insert(nsec3_record.clone(), 0);
+        let signature = sign_test_rrset(&set, signer);
+
+        let mut msg = Message::new(25, MessageType::Response, OpCode::Query);
+        msg.queries.push(Query::query(qname.clone(), RecordType::A));
+        msg.metadata.response_code = ResponseCode::NXDomain;
+        msg.authorities.push(nsec3_record);
+        msg.authorities.push(signature);
+        msg.additionals.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+        ));
+        msg
+    }
+
+    #[test]
+    fn test_nxdomain_optout_nsec3_is_insecure() {
+        let (origin, dnskey, signer) = create_test_signer("example.");
+        let qname = Name::from_str("missing.example.").unwrap();
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let mut msg = signed_optout_nxdomain(&origin, &qname, &dnskey, &signer, true);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("test"), now);
+
+        assert_eq!(outcome, ValidationOutcome::Insecure);
+        assert!(!msg.metadata.authentic_data);
+    }
+
+    #[test]
+    fn test_nxdomain_nsec3_without_optout_stays_secure() {
+        let (origin, dnskey, signer) = create_test_signer("example.");
+        let qname = Name::from_str("missing.example.").unwrap();
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let mut msg = signed_optout_nxdomain(&origin, &qname, &dnskey, &signer, false);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("test"), now);
+
+        assert_eq!(outcome, ValidationOutcome::Secure);
+        assert!(msg.metadata.authentic_data);
     }
 
     #[test]

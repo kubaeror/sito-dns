@@ -327,13 +327,11 @@ ignoring the configured `dns.bind`.
 > quality, nightly release job), WP-14 (OpenAPI/config-reference drift
 > gates with doc-comment-driven `--write`).
 >
-> **Partial:** WP-1 — in-response DS/DNSKEY chain walk, bounded upstream key
-> fetching (`DnssecKeyFetcher`), validated-only key cache with Prometheus
-> hit/miss counters, fuzz target, and NSEC denial tests are done; explicit
-> NSEC3 opt-out/closest-encloser enumeration remains future work.
+> **Complete:** all fourteen work packages, including WP-1 — in-response
+> DS/DNSKEY chain walk, bounded upstream key fetching (`DnssecKeyFetcher`),
+> validated-only key cache with Prometheus hit/miss counters, NSEC denial
+> proofs and RFC 5155 NSEC3 opt-out enumeration, plus the fuzz target.
 
-- **Explicit NSEC3 opt-out/closest-encloser enumeration** is the remaining
-  DNSSEC follow-up; NSEC denial proofs and the DS/DNSKEY chain are validated.
 - Restart-only settings are now limited to server identity/format, web, tls,
   acme and ha; the API reports them through `ConfigUpdateResponse` instead of
   pretending they were applied.

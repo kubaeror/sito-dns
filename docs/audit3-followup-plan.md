@@ -468,7 +468,7 @@ integration point and should land last in its wave to avoid merge churn in
 
 ## Tracking checklist
 
-- [ ] WP-1 DNSSEC DS/DNSKEY chain validation — partial: in-response DS/DNSKEY chain walk (KSK→ZSK, signed DS delegation), validated-only key cache with TTL/signature-expiry bounds, additional-section RRSIGs; remaining: explicit NSEC3 opt-out/closest-encloser enumeration (NSEC denial proofs are validated through the chain path and covered by tests)
+- [x] WP-1 DNSSEC DS/DNSKEY chain validation — in-response DS/DNSKEY chain walk (KSK→ZSK, signed DS delegation), bounded upstream key fetching (`DnssecKeyFetcher`/`UpstreamKeyFetcher`), validated-only key cache with TTL/signature-expiry bounds, additional-section RRSIGs, NSEC denial proofs, RFC 5155 NSEC3 closest-encloser/opt-out enumeration (opt-out NXDOMAIN downgraded to insecure), Prometheus key-cache counters and `fuzz_dnssec_response`
 - [x] WP-2 Native DoH/DoQ upstream transports (`crates/sito-upstream/src/{doh,doq}.rs`, manager `https://`/`quic://` support, UI probes)
 - [x] WP-3 Persistent sessions and API tokens
 - [x] WP-4 Per-list `refresh_hours` scheduling

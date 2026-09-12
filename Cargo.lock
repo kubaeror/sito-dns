@@ -3121,6 +3121,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "dashmap",
+ "data-encoding",
  "hickory-proto",
  "sito-core",
  "sito-proto",
