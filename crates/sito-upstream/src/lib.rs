@@ -4,6 +4,7 @@
 //! bootstrap resolver, and health-aware failover manager.
 
 pub mod bootstrap;
+pub mod doh;
 pub mod dot;
 pub mod health;
 pub mod manager;
@@ -11,6 +12,7 @@ pub mod plain;
 pub mod upstream;
 
 pub use bootstrap::BootstrapResolver;
+pub use doh::HttpsUpstream;
 pub use dot::DotUpstream;
 pub use health::{HealthStatus, UpstreamHealth};
 pub use manager::UpstreamManager;

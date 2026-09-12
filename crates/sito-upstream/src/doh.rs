@@ -1,0 +1,337 @@
+//! DNS-over-HTTPS (DoH, RFC 8484) upstream transport.
+//!
+//! Sends `application/dns-message` requests over HTTP/2 (falling back to the
+//! HTTP/1.1 GET form when the server rejects POST) and validates that the
+//! response answers the outgoing query.
+
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use tracing::trace;
+
+use crate::upstream::{Upstream, validate_response};
+use sito_core::error::UpstreamError;
+use sito_proto::{Message, decode_message, encode_message};
+
+/// Maximum accepted DoH response body (DNS-over-TCP size ceiling).
+const MAX_DOH_RESPONSE_BYTES: usize = 65_535;
+
+/// A DNS-over-HTTPS upstream (RFC 8484).
+pub struct HttpsUpstream {
+    url: reqwest::Url,
+    client: reqwest::Client,
+}
+
+impl std::fmt::Debug for HttpsUpstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpsUpstream")
+            .field("url", &self.url.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpsUpstream {
+    /// Creates a DoH upstream that connects to `resolved_ips` while preserving
+    /// the URL hostname for TLS SNI/Host validation.
+    pub fn new(
+        url: &str,
+        resolved_ips: &[IpAddr],
+        timeout_duration: Duration,
+    ) -> Result<Self, UpstreamError> {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| UpstreamError::BadResponse(format!("invalid DoH URL '{url}': {e}")))?;
+        if parsed.scheme() != "https" {
+            return Err(UpstreamError::BadResponse(format!(
+                "DoH upstream URL must use https:// (got '{}')",
+                parsed.scheme()
+            )));
+        }
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| UpstreamError::BadResponse(format!("DoH URL '{url}' has no host")))?
+            .to_string();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+
+        let mut builder = reqwest::Client::builder()
+            .timeout(timeout_duration)
+            .user_agent(concat!("sito/", env!("CARGO_PKG_VERSION")))
+            .pool_max_idle_per_host(4);
+        if !resolved_ips.is_empty() {
+            let addrs: Vec<SocketAddr> = resolved_ips
+                .iter()
+                .map(|ip| SocketAddr::new(*ip, port))
+                .collect();
+            builder = builder.resolve_to_addrs(&host, &addrs);
+        }
+        let client = builder
+            .build()
+            .map_err(|e| UpstreamError::BadResponse(format!("failed to build DoH client: {e}")))?;
+
+        Ok(Self {
+            url: parsed,
+            client,
+        })
+    }
+
+    /// Constructs an upstream from a caller-provided HTTP client (used by tests
+    /// and custom TLS configurations).
+    #[must_use]
+    pub fn with_client(url: &str, client: reqwest::Client, _timeout_duration: Duration) -> Self {
+        Self {
+            url: reqwest::Url::parse(url).expect("valid DoH URL"),
+            client,
+        }
+    }
+
+    async fn post(&self, msg: &Message) -> Result<Message, UpstreamError> {
+        let encoded = encode_message(msg).map_err(|e| UpstreamError::BadResponse(e.to_string()))?;
+        let response = self
+            .client
+            .post(self.url.clone())
+            .header(CONTENT_TYPE, "application/dns-message")
+            .header(ACCEPT, "application/dns-message")
+            .body(encoded)
+            .send()
+            .await
+            .map_err(|e| UpstreamError::Io(e.to_string()))?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+            || status == reqwest::StatusCode::NOT_IMPLEMENTED
+        {
+            return Err(UpstreamError::Unsupported);
+        }
+        if !status.is_success() {
+            return Err(UpstreamError::BadResponse(format!(
+                "DoH upstream returned HTTP {status}"
+            )));
+        }
+
+        Self::decode_response(response, msg).await
+    }
+
+    async fn get(&self, msg: &Message) -> Result<Message, UpstreamError> {
+        // RFC 8484 section 4.1: GET queries are sent with ID 0.
+        let mut query = msg.clone();
+        query.metadata.id = 0;
+        let encoded =
+            encode_message(&query).map_err(|e| UpstreamError::BadResponse(e.to_string()))?;
+        let dns_param = URL_SAFE_NO_PAD.encode(encoded);
+        let mut url = self.url.clone();
+        url.query_pairs_mut().append_pair("dns", &dns_param);
+
+        let response = self
+            .client
+            .get(url)
+            .header(ACCEPT, "application/dns-message")
+            .send()
+            .await
+            .map_err(|e| UpstreamError::Io(e.to_string()))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(UpstreamError::BadResponse(format!(
+                "DoH upstream returned HTTP {status} for GET"
+            )));
+        }
+
+        let mut decoded = Self::decode_response(response, msg).await?;
+        // GET responses carry ID 0; restore the original ID for the caller.
+        decoded.metadata.id = msg.metadata.id;
+        Ok(decoded)
+    }
+
+    async fn decode_response(
+        response: reqwest::Response,
+        query: &Message,
+    ) -> Result<Message, UpstreamError> {
+        if let Some(content_type) = response.headers().get(CONTENT_TYPE) {
+            let content_type = content_type.to_str().unwrap_or("");
+            let mime = content_type.split(';').next().unwrap_or("").trim();
+            if !mime.eq_ignore_ascii_case("application/dns-message") {
+                return Err(UpstreamError::BadResponse(format!(
+                    "DoH upstream returned unexpected Content-Type '{mime}'"
+                )));
+            }
+        }
+
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| UpstreamError::Io(e.to_string()))?;
+        if body.len() > MAX_DOH_RESPONSE_BYTES {
+            return Err(UpstreamError::BadResponse(format!(
+                "DoH response body of {} bytes exceeds the {} byte limit",
+                body.len(),
+                MAX_DOH_RESPONSE_BYTES
+            )));
+        }
+
+        let message = decode_message(&body)
+            .map_err(|e| UpstreamError::BadResponse(format!("invalid DoH response: {e}")))?;
+        validate_response(query, &message)?;
+        Ok(message)
+    }
+}
+
+#[async_trait::async_trait]
+impl Upstream for HttpsUpstream {
+    async fn resolve(&self, msg: &Message) -> Result<Message, UpstreamError> {
+        trace!(url = %self.url, "Sending DNS query over DoH");
+        match self.post(msg).await {
+            Ok(response) => Ok(response),
+            Err(UpstreamError::Unsupported) => {
+                trace!(url = %self.url, "DoH POST unsupported; retrying with GET");
+                self.get(msg).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sito_proto::{MessageType, OpCode, Query, RecordType};
+    use std::str::FromStr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn make_query(id: u16) -> Message {
+        let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            sito_proto::Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        query
+    }
+
+    /// Minimal HTTP/1.1 server: POST returns an echo response, GET returns 405.
+    async fn spawn_post_only_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    let header_end;
+                    loop {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = pos + 4;
+                            break;
+                        }
+                    }
+
+                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let content_length: usize = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    let mut body = buf[header_end..].to_vec();
+                    while body.len() < content_length {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        body.extend_from_slice(&tmp[..n]);
+                    }
+
+                    let query = decode_message(&body).expect("valid query");
+                    let mut resp =
+                        Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                    resp.metadata.response_code = sito_proto::ResponseCode::NoError;
+                    resp.queries = query.queries.clone();
+                    let encoded = encode_message(&resp).unwrap();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        encoded.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&encoded).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_doh_post_success_and_validation() {
+        let addr = spawn_post_only_server().await;
+        let upstream = HttpsUpstream::with_client(
+            &format!("http://{addr}/dns-query"),
+            reqwest::Client::new(),
+            Duration::from_secs(2),
+        );
+
+        let query = make_query(0x1234);
+        let resp = upstream
+            .resolve(&query)
+            .await
+            .expect("DoH POST should succeed");
+        assert_eq!(resp.metadata.id, 0x1234);
+        assert_eq!(resp.queries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_doh_response_id_mismatch_rejected() {
+        // Server responds with a different ID than requested.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let Ok(n) = stream.read(&mut tmp).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let query = make_query(0x1234);
+            let mut resp = Message::new(0x9999, MessageType::Response, OpCode::Query);
+            resp.queries = query.queries.clone();
+            let encoded = encode_message(&resp).unwrap();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                encoded.len()
+            );
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.write_all(&encoded).await;
+        });
+
+        let upstream = HttpsUpstream::with_client(
+            &format!("http://{addr}/dns-query"),
+            reqwest::Client::new(),
+            Duration::from_secs(2),
+        );
+        let err = upstream.resolve(&make_query(0x1234)).await.unwrap_err();
+        assert!(matches!(err, UpstreamError::BadResponse(_)));
+    }
+}

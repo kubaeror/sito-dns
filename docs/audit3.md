@@ -321,14 +321,17 @@ ignoring the configured `dns.bind`.
 > **WP-4 (per-list refresh) — done** (nearest-due scheduler, partial list
 > reload keeping other lists' rules); **WP-5 (per-client upstreams) — done**
 > (scoped `UpstreamManager` per client upstream list, cache bypass, and
-> `ignore_stats` suppressing Prometheus counters).
+> `ignore_stats` suppressing Prometheus counters); **WP-2 (DoH upstream) —
+> done** (RFC 8484 POST + GET fallback, response validation, size caps;
+> DoQ remains deferred).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated
   cache data to DNSSEC-aware clients is blocked. Chain-of-trust validation
   beyond the direct anchor remains future work (P1-2).
-- **Native DoH/DoQ upstream transports** are still not implemented; unsupported
-  schemes are now rejected with a clear error instead of being misparsed (P1-4).
+- **Native DoQ upstream transports** (`quic://`) are still not implemented;
+  native DoH (`https://`) landed in follow-up WP-2, and remaining unsupported
+  schemes are rejected with a clear error instead of being misparsed (P1-4).
 - **Persistent sessions/API tokens.** Sessions and tokens remain memory-only;
   this PR adds revocation on password/TOTP changes (P1-10).
 - **Per-list `refresh_hours` scheduling** remains deprecated; the global

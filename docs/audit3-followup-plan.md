@@ -469,7 +469,7 @@ integration point and should land last in its wave to avoid merge churn in
 ## Tracking checklist
 
 - [ ] WP-1 DNSSEC DS/DNSKEY chain validation
-- [ ] WP-2 Native DoH/DoQ upstream transports
+- [ ] WP-2 Native DoH/DoQ upstream transports — **DoH done** (`crates/sito-upstream/src/doh.rs`, manager `https://` support); DoQ (`quic://`) remains
 - [x] WP-3 Persistent sessions and API tokens
 - [x] WP-4 Per-list `refresh_hours` scheduling
 - [x] WP-5 Per-client upstreams and `ignore_stats`

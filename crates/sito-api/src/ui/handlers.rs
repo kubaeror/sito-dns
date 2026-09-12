@@ -1064,10 +1064,10 @@ pub async fn upstreams_add_handler(
 
     let mut new_cfg = (**ctx.config.load()).clone();
     let clean = form.address.trim().to_string();
-    if clean.starts_with("https://") || clean.starts_with("quic://") {
+    if clean.starts_with("quic://") {
         return (
             StatusCode::BAD_REQUEST,
-            "DoH and DoQ upstreams are not supported in v1.2.x; use tls:// or UDP",
+            "DoQ (quic://) upstreams are not supported yet; use https:// (DoH), tls:// (DoT) or plain UDP",
         )
             .into_response();
     }
