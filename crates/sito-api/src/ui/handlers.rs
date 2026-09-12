@@ -27,6 +27,7 @@ use crate::ui::templates::{
 use sito_core::FilterEngine;
 use sito_core::config::{BlockingMode, Config, FilterListConfig, UpstreamStrategy};
 use sito_stats::QueryLogFilter;
+use sito_upstream::Upstream as _;
 
 pub fn format_duration(secs: u64) -> String {
     let days = secs / 86400;
@@ -1064,13 +1065,6 @@ pub async fn upstreams_add_handler(
 
     let mut new_cfg = (**ctx.config.load()).clone();
     let clean = form.address.trim().to_string();
-    if clean.starts_with("quic://") {
-        return (
-            StatusCode::BAD_REQUEST,
-            "DoQ (quic://) upstreams are not supported yet; use https:// (DoH), tls:// (DoT) or plain UDP",
-        )
-            .into_response();
-    }
     if !clean.is_empty() && !new_cfg.upstream.servers.contains(&clean) {
         new_cfg.upstream.servers.push(clean);
         if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
@@ -1094,6 +1088,28 @@ pub async fn upstreams_add_handler(
 #[derive(Deserialize)]
 pub struct TestUpstreamForm {
     pub address: String,
+}
+
+fn split_probe_host_port(addr_str: &str, scheme: &str, default_port: u16) -> (String, u16) {
+    let rest = addr_str
+        .strip_prefix(&format!("{scheme}://"))
+        .unwrap_or(addr_str);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if let Some(inner) = authority.strip_prefix('[')
+        && let Some((host, tail)) = inner.split_once(']')
+    {
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default_port);
+        return (host.to_string(), port);
+    }
+    if let Some((host, port)) = authority.rsplit_once(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return (host.to_string(), port);
+    }
+    (authority.to_string(), default_port)
 }
 
 async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result<f64, String> {
@@ -1128,10 +1144,48 @@ async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result<f64
         return Ok(elapsed);
     }
 
-    if addr_str.starts_with("https://") || addr_str.starts_with("quic://") {
-        return Err(
-            "DoH (https://) and DoQ (quic://) upstreams are not supported in v1.2.x; use tls:// or UDP".to_string(),
-        );
+    if addr_str.starts_with("https://") {
+        let (host, port) = split_probe_host_port(addr_str, "https", 443);
+        let mut addrs = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|e| format!("DNS resolution of {host} failed: {e}"))?;
+        let ip = addrs
+            .next()
+            .map(|sa| sa.ip())
+            .ok_or_else(|| format!("Could not resolve {host}"))?;
+        let doh =
+            sito_upstream::HttpsUpstream::new(addr_str, &[ip], std::time::Duration::from_secs(3))
+                .map_err(|e| format!("Invalid DoH upstream: {e}"))?;
+        let mut query =
+            sito_proto::Message::new(0, sito_proto::MessageType::Query, sito_proto::OpCode::Query);
+        query
+            .queries
+            .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
+        doh.resolve(&query)
+            .await
+            .map_err(|e| format!("DoH query failed: {e}"))?;
+        return Ok(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    if addr_str.starts_with("quic://") {
+        let (host, port) = split_probe_host_port(addr_str, "quic", 853);
+        let mut addrs = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|e| format!("DNS resolution of {host} failed: {e}"))?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| format!("Could not resolve {host}"))?;
+        let doq = sito_upstream::QuicUpstream::new(&host, addr, std::time::Duration::from_secs(3))
+            .map_err(|e| format!("Invalid DoQ upstream: {e}"))?;
+        let mut query =
+            sito_proto::Message::new(0, sito_proto::MessageType::Query, sito_proto::OpCode::Query);
+        query
+            .queries
+            .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
+        doq.resolve(&query)
+            .await
+            .map_err(|e| format!("DoQ query failed: {e}"))?;
+        return Ok(start.elapsed().as_secs_f64() * 1000.0);
     }
 
     // Standard UDP probe

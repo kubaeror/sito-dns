@@ -15,6 +15,7 @@ use sito_proto::{Message, MessageType, Name, OpCode, Query, RecordType};
 
 use crate::bootstrap::BootstrapResolver;
 use crate::doh::HttpsUpstream;
+use crate::doq::QuicUpstream;
 use crate::dot::DotUpstream;
 use crate::health::{HealthStatus, UpstreamHealth};
 use crate::plain::PlainUpstream;
@@ -110,7 +111,7 @@ async fn create_managed_entry(
         let dot = DotUpstream::new(socket_addr, host, timeout_duration, pool_size)?;
         (server_str.to_string(), Arc::new(dot))
     } else if server_str.starts_with("https://") {
-        let (host, _port, _path) = parse_https_target(server_str)?;
+        let (host, _port, _path) = parse_scheme_target(server_str, "https", 443)?;
         // DoH uses the URL host for SNI/Host and all resolved addresses for failover.
         let resolved_ips = bootstrap.resolve_hostname(&host).await?;
         if resolved_ips.is_empty() {
@@ -120,6 +121,14 @@ async fn create_managed_entry(
         }
         let doh = HttpsUpstream::new(server_str, &resolved_ips, timeout_duration)?;
         (server_str.to_string(), Arc::new(doh))
+    } else if server_str.starts_with("quic://") {
+        let (host, port, _path) = parse_scheme_target(server_str, "quic", 853)?;
+        let resolved_ips = bootstrap.resolve_hostname(&host).await?;
+        let target_ip = resolved_ips.first().copied().ok_or_else(|| {
+            UpstreamError::BadResponse(format!("no IP addresses resolved for '{host}'"))
+        })?;
+        let doq = QuicUpstream::new(&host, SocketAddr::new(target_ip, port), timeout_duration)?;
+        (server_str.to_string(), Arc::new(doq))
     } else {
         let target_str = server_str.strip_prefix("udp://").unwrap_or(server_str);
         if let Some(scheme) = unsupported_scheme(target_str) {
@@ -150,17 +159,22 @@ async fn create_managed_entry(
     })
 }
 
-/// Parses an `https://host[:port][/path]` DoH target.
-fn parse_https_target(url: &str) -> Result<(String, u16, String), UpstreamError> {
-    let rest = url.strip_prefix("https://").unwrap_or(url);
+/// Parses a `scheme://host[:port][/path]` upstream target.
+fn parse_scheme_target(
+    url: &str,
+    scheme: &str,
+    default_port: u16,
+) -> Result<(String, u16, String), UpstreamError> {
+    let prefix = format!("{scheme}://");
+    let rest = url.strip_prefix(prefix.as_str()).unwrap_or(url);
     let (authority, path) = match rest.split_once('/') {
         Some((authority, path)) => (authority, format!("/{path}")),
         None => (rest, "/dns-query".to_string()),
     };
-    let (host, port) = split_host_port(authority, 443);
+    let (host, port) = split_host_port(authority, default_port);
     if host.is_empty() {
         return Err(UpstreamError::BadResponse(format!(
-            "invalid DoH URL '{url}': missing host"
+            "invalid upstream URL '{url}': missing host"
         )));
     }
     Ok((host, port, path))
@@ -172,6 +186,7 @@ fn unsupported_scheme(target: &str) -> Option<String> {
     if scheme.is_empty()
         || scheme.eq_ignore_ascii_case("tls")
         || scheme.eq_ignore_ascii_case("https")
+        || scheme.eq_ignore_ascii_case("quic")
         || scheme.eq_ignore_ascii_case("udp")
     {
         None
@@ -771,34 +786,41 @@ mod tests {
     #[test]
     fn test_parse_https_target() {
         assert_eq!(
-            parse_https_target("https://dns.quad9.net/dns-query").unwrap(),
+            parse_scheme_target("https://dns.quad9.net/dns-query", "https", 443).unwrap(),
             ("dns.quad9.net".to_string(), 443, "/dns-query".to_string())
         );
         assert_eq!(
-            parse_https_target("https://dns.google:8443/dns-query")
+            parse_scheme_target("https://dns.google:8443/dns-query", "https", 443)
                 .unwrap()
                 .1,
             8443
         );
         assert_eq!(
-            parse_https_target("https://[2606:4700:4700::1111]/dns-query")
+            parse_scheme_target("https://[2606:4700:4700::1111]/dns-query", "https", 443)
                 .unwrap()
                 .0,
             "2606:4700:4700::1111"
         );
         assert_eq!(
-            parse_https_target("https://cloudflare-dns.com").unwrap().2,
+            parse_scheme_target("https://cloudflare-dns.com", "https", 443)
+                .unwrap()
+                .2,
             "/dns-query"
         );
-        assert!(parse_https_target("https:///dns-query").is_err());
+        assert!(parse_scheme_target("https:///dns-query", "https", 443).is_err());
+        assert_eq!(
+            parse_scheme_target("quic://dns.adguard.com", "quic", 853).unwrap(),
+            ("dns.adguard.com".to_string(), 853, "/dns-query".to_string())
+        );
     }
 
     #[test]
     fn test_unsupported_scheme_detection() {
         assert_eq!(
-            unsupported_scheme("quic://dns.quad9.net").as_deref(),
-            Some("quic")
+            unsupported_scheme("sdns://AQcAAAAAAAA").as_deref(),
+            Some("sdns")
         );
+        assert_eq!(unsupported_scheme("quic://dns.quad9.net"), None);
         assert_eq!(unsupported_scheme("tls://dns.quad9.net"), None);
         assert_eq!(unsupported_scheme("https://dns.quad9.net/dns-query"), None);
         assert_eq!(unsupported_scheme("udp://1.1.1.1"), None);

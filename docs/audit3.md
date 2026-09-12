@@ -322,8 +322,7 @@ ignoring the configured `dns.bind`.
 > reload keeping other lists' rules); **WP-5 (per-client upstreams) — done**
 > (scoped `UpstreamManager` per client upstream list, cache bypass, and
 > `ignore_stats` suppressing Prometheus counters); **WP-2 (DoH upstream) —
-> done** (RFC 8484 POST + GET fallback, response validation, size caps;
-> DoQ remains deferred); **WP-8 (ACME HTTP-01 + DoH hostname) — done**
+> done** (RFC 8484 DoH and RFC 9250 DoQ, response validation, size caps); **WP-8 (ACME HTTP-01 + DoH hostname) — done**
 > (dedicated port-80 challenge listener, `doh_dedicated_hostname` enforced
 > with 421 on DoH/DoH3); **WP-14 (OpenAPI drift check) — partial** (CI gate
 > added; config-reference generation pending); **WP-12 — partial**
@@ -336,9 +335,9 @@ ignoring the configured `dns.bind`.
   configured trust anchors and forces the DO bit upstream; serving unvalidated
   cache data to DNSSEC-aware clients is blocked. Chain-of-trust validation
   beyond the direct anchor remains future work (P1-2).
-- **Native DoQ upstream transports** (`quic://`) are still not implemented;
-  native DoH (`https://`) landed in follow-up WP-2, and remaining unsupported
-  schemes are rejected with a clear error instead of being misparsed (P1-4).
+- Native DoH/DoQ upstream transports landed in follow-up WP-2; remaining
+  unsupported schemes are rejected with a clear error instead of being
+  misparsed (P1-4).
 - **Persistent sessions/API tokens.** Sessions and tokens remain memory-only;
   this PR adds revocation on password/TOTP changes (P1-10).
 - **Per-list `refresh_hours` scheduling** remains deprecated; the global

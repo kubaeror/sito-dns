@@ -5,6 +5,7 @@
 
 pub mod bootstrap;
 pub mod doh;
+pub mod doq;
 pub mod dot;
 pub mod health;
 pub mod manager;
@@ -13,6 +14,7 @@ pub mod upstream;
 
 pub use bootstrap::BootstrapResolver;
 pub use doh::HttpsUpstream;
+pub use doq::QuicUpstream;
 pub use dot::DotUpstream;
 pub use health::{HealthStatus, UpstreamHealth};
 pub use manager::UpstreamManager;

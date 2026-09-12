@@ -153,6 +153,7 @@ staging = false
 servers = [
     "tls://dns.quad9.net",
     "https://cloudflare-dns.com/dns-query",
+    "quic://dns.adguard-dns.com",
     "udp://1.1.1.1:53"
 ]
 bootstrap = ["9.9.9.9", "1.1.1.1"]
@@ -168,7 +169,7 @@ servers = ["udp://192.168.1.1:53"]
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `servers` | array of strings | `["tls://..."]` | Upstream resolvers. Schemes: `udp://` or `host:port` (UDP with TCP fallback), `tls://` (DoT), `https://host[:port]/dns-query` (DoH, RFC 8484 with GET fallback). `quic://` (DoQ) is not supported yet. |
+| `servers` | array of strings | `["tls://..."]` | Upstream resolvers. Schemes: `udp://` or `host:port` (UDP with TCP fallback), `tls://` (DoT), `https://host[:port]/dns-query` (DoH, RFC 8484 with GET fallback), `quic://host[:port]` (DoQ, RFC 9250, default port 853). |
 | `bootstrap` | array of IPs | `["9.9.9.9"]` | Plain IP addresses used to bootstrap resolution of encrypted upstream domain names. |
 | `strategy` | string | `"failover"` | Forwarding strategy: `"parallel"` (fastest answer wins), `"failover"` (sequential fallback), or `"load_balance"`. |
 | `timeout_ms` | integer | `5000` | Request timeout per upstream query in milliseconds. |

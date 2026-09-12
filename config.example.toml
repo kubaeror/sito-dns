@@ -37,8 +37,8 @@ validate = false
 ntp = []
 
 [upstream]
-# Upstream schemes supported: tls:// (DoT), https:// (DoH) and plain host/IP
-# (udp:// optional). DoQ (quic://) upstreams are not implemented yet.
+# Upstream schemes supported: tls:// (DoT), https:// (DoH), quic:// (DoQ)
+# and plain host/IP (udp:// optional).
 servers = ["tls://dns.quad9.net", "https://cloudflare-dns.com/dns-query"]
 bootstrap = ["9.9.9.9", "149.112.112.112"]
 strategy = "failover"
