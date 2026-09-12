@@ -473,7 +473,7 @@ integration point and should land last in its wave to avoid merge churn in
 - [x] WP-3 Persistent sessions and API tokens
 - [x] WP-4 Per-list `refresh_hours` scheduling
 - [x] WP-5 Per-client upstreams and `ignore_stats`
-- [ ] WP-6 Atomic runtime snapshot + live reload of restart-only settings — partial: cache `size_mb` resize with entry carry-over and per-cycle retention reads done; `RuntimeSnapshot` + `RuntimeState` landed (no torn config/clients/rewrites per query); remaining: listener rebind on bind/port changes
+- [x] WP-6 Atomic runtime snapshot + live reload of restart-only settings — `RuntimeSnapshot`/`RuntimeState` (no torn state per query), cache `size_mb` resize with carry-over, per-cycle retention, log-level reload, hot rate limits, in-process listener rebind with revert, and restart-only API signalling for the truly immutable settings (server identity/format, web, tls, acme, ha)
 - [ ] WP-7 Maintained parental/service lists — partial: versioned manifest with source/license/BLAKE3 checks, verified at load and exposed to callers; remaining: curated data expansion + runtime refresh via the subscription downloader, `[integrations.lists]` category config
 - [x] WP-8 DoH dedicated hostname + ACME HTTP-01 on port 80
 - [x] WP-9 HA heartbeat watchdog, protocol role, `ca` validation

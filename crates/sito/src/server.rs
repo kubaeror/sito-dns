@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use arc_swap::ArcSwap;
 use sito_cache::DnsCache;
@@ -429,11 +429,20 @@ pub async fn run_server_full(
     // Rate limiters created by listeners; shared so the watcher can hot-update.
     let rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Listener generation and TLS acceptors, shared with the config watcher so
+    // bind/port changes can be applied in-process.
+    let listener_manager: Arc<tokio::sync::Mutex<Option<DnsListenerManager>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let listener_acceptors: Arc<tokio::sync::Mutex<Option<ListenerAcceptors>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
 
     // Spawn config file watcher for hot-reload
     let watcher_config_path = config_path_buf.clone();
     let watcher_runtime = runtime.clone();
     let watcher_rate_limiters = rate_limiters.clone();
+    let watcher_listener_manager = listener_manager.clone();
+    let watcher_listener_acceptors = listener_acceptors.clone();
+    let watcher_pipeline = pipeline.clone();
     let watcher_filter = filter_engine.clone();
     let watcher_coordinator = master_coordinator.clone();
     let watcher_upstream = upstream_manager.clone();
@@ -535,6 +544,44 @@ pub async fn run_server_full(
                                     clients: Arc::new(new_clients),
                                     rewrites: Arc::new(new_rewrites),
                                 });
+
+                                // Rebind listeners when bind/port/related settings change.
+                                let current_manager =
+                                    watcher_listener_manager.lock().await.take();
+                                if let Some(manager) = current_manager {
+                                    if manager.needs_restart(&new_cfg) {
+                                        let acceptors =
+                                            watcher_listener_acceptors.lock().await.clone();
+                                        if let Some(acceptors) = acceptors {
+                                            info!("DNS listener bindings changed; rebinding in-process");
+                                            match manager
+                                                .restart(
+                                                    &new_cfg,
+                                                    watcher_pipeline.clone(),
+                                                    acceptors,
+                                                    watcher_rate_limiters.clone(),
+                                                )
+                                                .await
+                                            {
+                                                Ok(new_manager) => {
+                                                    *watcher_listener_manager.lock().await =
+                                                        Some(new_manager);
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to rebind DNS listeners: {e}");
+                                                }
+                                            }
+                                        } else {
+                                            warn!(
+                                                "Listener TLS acceptors unavailable; keeping current listeners"
+                                            );
+                                            *watcher_listener_manager.lock().await =
+                                                Some(manager);
+                                        }
+                                    } else {
+                                        *watcher_listener_manager.lock().await = Some(manager);
+                                    }
+                                }
 
                                 if let Some(ref coord) = watcher_coordinator {
                                     let next_version = coord.get_current_version() + 1;
@@ -710,6 +757,14 @@ pub async fn run_server_full(
             (None, None, None, None)
         };
 
+    // Share TLS acceptors with the config watcher for in-process listener rebinds.
+    *listener_acceptors.lock().await = Some(ListenerAcceptors {
+        dot: dot_acceptor_mgr.clone(),
+        doh: doh_acceptor_mgr.clone(),
+        doq: doq_acceptor_mgr.clone(),
+        doh3: doh3_acceptor_mgr.clone(),
+    });
+
     // If ACME is enabled, start ACME renewal background manager
     if let Some(acme) = acme_cfg
         && acme.enabled
@@ -763,8 +818,6 @@ pub async fn run_server_full(
         );
     }
 
-    let mut all_handles = Vec::new();
-
     if setup_pending {
         info!(
             "Server running in setup-pending mode: DNS listeners (ports 53/853/443) are not bound until setup completes via web panel"
@@ -776,20 +829,19 @@ pub async fn run_server_full(
             Some(()) = dns_start_rx.recv() => {
                 info!("Setup wizard completed: binding and starting DNS listeners in-process...");
                 let current_cfg = config_arc.load();
-                let (dns_handles, dns_limiters) = start_dns_listeners(
+                let manager = DnsListenerManager::start(
                     &current_cfg,
                     pipeline.clone(),
-                    shutdown_rx.clone(),
-                    dot_acceptor_mgr.clone(),
-                    doh_acceptor_mgr.clone(),
-                    doq_acceptor_mgr.clone(),
-                    doh3_acceptor_mgr.clone(),
-                ).await?;
-                all_handles.extend(dns_handles);
-                rate_limiters
-                    .lock()
-                    .expect("rate limiter registry poisoned")
-                    .extend(dns_limiters);
+                    ListenerAcceptors {
+                        dot: dot_acceptor_mgr.clone(),
+                        doh: doh_acceptor_mgr.clone(),
+                        doq: doq_acceptor_mgr.clone(),
+                        doh3: doh3_acceptor_mgr.clone(),
+                    },
+                    rate_limiters.clone(),
+                )
+                .await?;
+                *listener_manager.lock().await = Some(manager);
 
                 info!(
                     port = current_cfg.dns.port,
@@ -801,21 +853,19 @@ pub async fn run_server_full(
             }
         }
     } else {
-        let (dns_handles, dns_limiters) = start_dns_listeners(
+        let manager = DnsListenerManager::start(
             &config,
             pipeline.clone(),
-            shutdown_rx.clone(),
-            dot_acceptor_mgr.clone(),
-            doh_acceptor_mgr.clone(),
-            doq_acceptor_mgr.clone(),
-            doh3_acceptor_mgr.clone(),
+            ListenerAcceptors {
+                dot: dot_acceptor_mgr.clone(),
+                doh: doh_acceptor_mgr.clone(),
+                doq: doq_acceptor_mgr.clone(),
+                doh3: doh3_acceptor_mgr.clone(),
+            },
+            rate_limiters.clone(),
         )
         .await?;
-        all_handles.extend(dns_handles);
-        rate_limiters
-            .lock()
-            .expect("rate limiter registry poisoned")
-            .extend(dns_limiters);
+        *listener_manager.lock().await = Some(manager);
 
         info!(
             port = config.dns.port,
@@ -829,6 +879,10 @@ pub async fn run_server_full(
 
     info!("Initiating graceful shutdown (stopping listeners)...");
     let _ = shutdown_tx.send(true);
+    let current_manager = listener_manager.lock().await.take();
+    if let Some(manager) = current_manager {
+        manager.stop().await;
+    }
 
     // Wait for in-flight queries to finish (5 s timeout per plan section 3.5)
     let shutdown_deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -846,16 +900,145 @@ pub async fn run_server_full(
     info!("Flushing and shutting down query log writer...");
     querylog_writer.shutdown().await;
 
-    // Join listener tasks so sockets/tasks are fully released before exit.
-    for handle in all_handles {
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
-    }
-
     // Stop certificate watchers after listeners have drained.
     drop(cert_watchers);
 
     info!("Graceful shutdown complete, exiting");
     Ok(())
+}
+
+/// TLS acceptor managers shared with the config watcher so listeners can be
+/// rebound without restarting the process.
+#[derive(Clone)]
+struct ListenerAcceptors {
+    dot: Option<TlsAcceptorManager>,
+    doh: Option<TlsAcceptorManager>,
+    doq: Option<TlsAcceptorManager>,
+    doh3: Option<TlsAcceptorManager>,
+}
+
+/// Settings that determine how the DNS listeners are constructed. Changing
+/// any of them requires stopping and rebinding the affected listeners.
+#[derive(Clone, PartialEq, Eq)]
+struct ListenerPlan {
+    bind: Vec<std::net::IpAddr>,
+    port: u16,
+    dot_port: u16,
+    doh_port: u16,
+    doq_port: u16,
+    doh3_port: u16,
+    doh_dedicated_hostname: String,
+    allow_plaintext_doh: bool,
+    edns_udp_size: u16,
+    max_tcp_connections: usize,
+    dot_padding: bool,
+}
+
+impl ListenerPlan {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            bind: config.dns.bind.clone(),
+            port: config.dns.port,
+            dot_port: config.dns.dot_port,
+            doh_port: config.dns.doh_port,
+            doq_port: config.dns.doq_port,
+            doh3_port: config.dns.doh3_port,
+            doh_dedicated_hostname: config.dns.doh_dedicated_hostname.clone(),
+            allow_plaintext_doh: config.dns.allow_plaintext_doh,
+            edns_udp_size: config.dns.edns_udp_size,
+            max_tcp_connections: config.dns.max_tcp_connections,
+            dot_padding: config.dns.dot_padding,
+        }
+    }
+}
+
+/// Owns one generation of DNS listener tasks and supports rebinding.
+struct DnsListenerManager {
+    shutdown_tx: watch::Sender<bool>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
+    plan: ListenerPlan,
+    config: Config,
+}
+
+impl DnsListenerManager {
+    async fn start(
+        config: &Config,
+        pipeline: Arc<DnsPipeline>,
+        acceptors: ListenerAcceptors,
+        rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
+    ) -> anyhow::Result<Self> {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (handles, limiters) = start_dns_listeners(
+            config,
+            pipeline,
+            shutdown_rx,
+            acceptors.dot,
+            acceptors.doh,
+            acceptors.doq,
+            acceptors.doh3,
+        )
+        .await?;
+
+        if let Ok(mut registry) = rate_limiters.lock() {
+            registry.clear();
+            registry.extend(limiters);
+        }
+
+        Ok(Self {
+            shutdown_tx,
+            handles,
+            rate_limiters,
+            plan: ListenerPlan::from_config(config),
+            config: config.clone(),
+        })
+    }
+
+    fn needs_restart(&self, config: &Config) -> bool {
+        self.plan != ListenerPlan::from_config(config)
+    }
+
+    async fn stop(mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Ok(mut registry) = self.rate_limiters.lock() {
+            registry.clear();
+        }
+        for handle in self.handles.drain(..) {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        }
+    }
+
+    /// Stops the current listeners and binds a new generation. If the new
+    /// bindings cannot be established, the previous configuration is restored.
+    async fn restart(
+        self,
+        config: &Config,
+        pipeline: Arc<DnsPipeline>,
+        acceptors: ListenerAcceptors,
+        rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
+    ) -> anyhow::Result<Self> {
+        let previous = self.config.clone();
+        self.stop().await;
+
+        match Self::start(
+            config,
+            pipeline.clone(),
+            acceptors.clone(),
+            rate_limiters.clone(),
+        )
+        .await
+        {
+            Ok(manager) => Ok(manager),
+            Err(e) => {
+                warn!(
+                    "Failed to bind new DNS listener configuration ({e}); restoring previous bindings"
+                );
+                Self::start(&previous, pipeline, acceptors, rate_limiters)
+                    .await
+                    .map_err(|revert| anyhow::anyhow!("{e}; revert failed: {revert}"))
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

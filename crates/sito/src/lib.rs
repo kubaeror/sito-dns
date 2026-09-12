@@ -680,6 +680,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dns_listener_rebinds_on_port_change() {
+        let reserve_udp_port = || {
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            port
+        };
+        let first_port = reserve_udp_port();
+        let second_port = reserve_udp_port();
+        let probe_web = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let web_port = probe_web.local_addr().unwrap().port();
+        drop(probe_web);
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_rebind_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut config = Config::default();
+        config.server.data_dir = temp_dir.clone();
+        config.dns.bind = vec!["127.0.0.1".parse().unwrap()];
+        config.dns.port = first_port;
+        let mut web_cfg = config.get_web_config();
+        web_cfg.bind = "127.0.0.1".parse().unwrap();
+        web_cfg.port = web_port;
+        config.set_web_config(web_cfg);
+        config.upstream.servers = vec!["127.0.0.1:1".to_string()];
+
+        // The config file is written only after startup: the watcher must pick
+        // up a newly created file and rebind to its port.
+        let config_path = temp_dir.join("config.toml");
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_config = config.clone();
+        let server_task = tokio::spawn(async move {
+            run_server_with_shutdown(server_config, Some(shutdown_rx)).await
+        });
+
+        async fn query_port(port: u16) -> bool {
+            let sock = match tokio::net::UdpSocket::bind("127.0.0.1:0").await {
+                Ok(sock) => sock,
+                Err(_) => return false,
+            };
+            if sock
+                .connect(SocketAddr::new("127.0.0.1".parse().unwrap(), port))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            let mut query = Message::new(1001, MessageType::Query, OpCode::Query);
+            query.queries.push(Query::query(
+                Name::from_str("blocked.test.").unwrap(),
+                RecordType::A,
+            ));
+            let Ok(wire) = sito_proto::encode_message(&query) else {
+                return false;
+            };
+            if sock.send(&wire).await.is_err() {
+                return false;
+            }
+            let mut buf = [0u8; 512];
+            matches!(
+                tokio::time::timeout(Duration::from_millis(200), sock.recv(&mut buf)).await,
+                Ok(Ok(len)) if len > 0
+            )
+        }
+
+        // Wait for the initial listener to come up.
+        let mut up = false;
+        for _ in 0..100 {
+            if server_task.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if query_port(first_port).await {
+                up = true;
+                break;
+            }
+        }
+        if !up && server_task.is_finished() {
+            panic!("server exited early: {:?}", server_task.await);
+        }
+        assert!(up, "server did not start listening on the initial port");
+
+        // Change the DNS port; the watcher must rebind without a restart.
+        config.dns.port = second_port;
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&config).expect("serialize config"),
+        )
+        .unwrap();
+
+        let mut rebound = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if query_port(second_port).await {
+                rebound = true;
+                break;
+            }
+        }
+        assert!(rebound, "server did not rebind to the new DNS port");
+
+        let _ = shutdown_tx.send(());
+        let result = tokio::time::timeout(Duration::from_secs(8), server_task).await;
+        assert!(result.is_ok(), "server failed to shut down after rebind");
+        assert!(result.unwrap().unwrap().is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
     async fn test_pipeline_picks_up_rewrite_change_without_restart() {
         use arc_swap::ArcSwap;
 
