@@ -309,6 +309,10 @@ ignoring the configured `dns.bind`.
 
 > Implementation plan for all deferred items: **[docs/audit3-followup-plan.md](audit3-followup-plan.md)**
 > (work packages, dependencies, estimates, acceptance criteria, PR sequencing).
+>
+> Follow-up progress: **WP-10 (updater artifact signature verification) — done**
+> (`server.update_require_signature`, cosign verification of `.sig`/`.pem`,
+> `SITO_REQUIRE_SIGNATURE=1` installer support).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated

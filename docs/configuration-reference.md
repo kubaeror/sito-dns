@@ -26,6 +26,7 @@ instance_name = "sito-main"            # Unique identifier in cluster
 data_dir = "/var/lib/sito"             # Base path for database, caches, and state
 log_level = "info"                     # "trace" | "debug" | "info" | "warn" | "error"
 log_format = "json"                    # "pretty" | "json"
+update_require_signature = false       # require cosign-verified release signatures for self-update
 ```
 
 | Key | Type | Default | Description |
@@ -35,6 +36,7 @@ log_format = "json"                    # "pretty" | "json"
 | `data_dir` | string | `"/var/lib/sito"` | Directory where the persistent SQLite DB (`stats.db`), list caches, and TLS state are stored. |
 | `log_level` | string | `"info"` | Logging verbosity: `"trace"`, `"debug"`, `"info"`, `"warn"`, or `"error"`. |
 | `log_format` | string | `"json"` | Formatting for stdout logs: `"pretty"` (human readable with colors) or `"json"` (structured). |
+| `update_require_signature` | boolean | `false` | When `true`, in-app updates and `sito update` require a valid cosign signature (`.sig`/`.pem` assets). A signature that is present is always verified even when this is `false`; when `true`, a missing signature or missing `cosign` binary aborts the update. |
 
 ---
 

@@ -27,7 +27,10 @@ Full findings and remediation mapping: `docs/audit3.md`.
 - **Ops/release**: HA compose env-var overrides removed (configuration comes from `config.toml` only); container health check passes during setup-wizard mode; `443/udp` exposed; cosign keyless signing added to the release workflow; `latest` container tag published on tag builds; fuzz workspace fixed.
 - **Docs/config**: configuration reference corrected (web bind type, clients group map, stats/privacy split, DNSSEC modes, ACME `domains`), README/GHCR image names, Swagger path, AdGuard migration script now emits valid config and maps DoH/DoQ upstreams to `tls://`.
 
-#### Deferred (tracked in `docs/audit3.md`)
+#### Follow-ups (deferred work plan)
+- **Updater signature verification (WP-10)**: `apply_update`/`sito update` now verify cosign keyless signatures (`<archive>.sig` + `<archive>.pem`) when present; a present signature must always verify. New `server.update_require_signature` (default `false`) makes signatures mandatory and aborts when assets or the `cosign` binary are missing. Installer honors `SITO_REQUIRE_SIGNATURE=1`. Full plan: `docs/audit3-followup-plan.md`.
+
+#### Deferred (tracked in `docs/audit3-followup-plan.md`)
 - Full DNSSEC DS/DNSKEY chain walking (validation currently verifies against configured trust anchors only).
 - Native DoH/DoQ upstream transports.
 - Persistent sessions/API tokens across restarts (tokens remain memory-only, but are revoked on credential change).

@@ -104,7 +104,9 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
             Commands::Update { check, force, repo } => {
-                if let Err(e) = sito::cli::run_update(check, force, repo.as_deref()).await {
+                if let Err(e) =
+                    sito::cli::run_update(check, force, repo.as_deref(), &cli.config).await
+                {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }
