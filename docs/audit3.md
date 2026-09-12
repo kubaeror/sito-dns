@@ -310,71 +310,32 @@ ignoring the configured `dns.bind`.
 > Implementation plan for all deferred items: **[docs/audit3-followup-plan.md](audit3-followup-plan.md)**
 > (work packages, dependencies, estimates, acceptance criteria, PR sequencing).
 >
-> Follow-up progress: **WP-10 (updater artifact signature verification) — done**
-> (`server.update_require_signature`, cosign verification of `.sig`/`.pem`,
-> `SITO_REQUIRE_SIGNATURE=1` installer support);
-> **WP-3 (persistent sessions/tokens) — done** (`auth.session_persist`,
-> `sessions.toml`/`tokens.toml` 0600, `auth.token_default_ttl_days`,
-> `sito reset-sessions`); **WP-9 (HA leftovers) — done** (`Hello` role +
-> protocol version, `stats-v1` capability check, heartbeat watchdog,
-> `ca` chain validation, mandatory slave `master_pubkey`);
-> **WP-4 (per-list refresh) — done** (nearest-due scheduler, partial list
-> reload keeping other lists' rules); **WP-5 (per-client upstreams) — done**
-> (scoped `UpstreamManager` per client upstream list, cache bypass, and
-> `ignore_stats` suppressing Prometheus counters); **WP-2 (DoH upstream) —
-> done** (RFC 8484 DoH and RFC 9250 DoQ, response validation, size caps); **WP-8 (ACME HTTP-01 + DoH hostname) — done**
-> (dedicated port-80 challenge listener, `doh_dedicated_hostname` enforced
-> with 421 on DoH/DoH3); **WP-14 (OpenAPI drift check) — partial** (CI gate
-> added; config-reference generation pending); **WP-12 — partial**
-> (`--uninstall`, `SITO_VERSION` pin, armv7 image; SHA-pinned Actions
-> pending); **WP-13 (test quality) — partial** (perf budgets behind
-> `SITO_BENCH_TESTS`, ephemeral HA ports, real mid-push chaos test,
-> monotonic/broadcast/pubkey tests; remaining items tracked in the plan);
-> **WP-11 (architecture cleanup) — partial** (certificate watcher lifetime bug
-> fix, shutdown joins, dead-code removal, allocation-free suffix matching,
-> deterministic pattern order; pipeline helper extraction pending);
-> **WP-12 — partial** (SHA-pinned GitHub Actions in addition to the earlier
-> installer/armv7 work; `deny.toml` tightening pending);
-> **WP-14 — partial** (bidirectional config-reference drift validator in CI,
-> which fixed several undocumented settings; table generation pending);
-> **WP-1 — partial** (in-response DS/DNSKEY chain walk plus bounded upstream
-> key fetching via `DnssecKeyFetcher`, validated-only key cache with Prometheus
-> hit/miss counters and a fuzz target; NSEC denial proofs validated with tests,
-> explicit NSEC3 opt-out handling pending);
-> **WP-7 — partial** (versioned bundled-list manifest with source, license and
-> BLAKE3 integrity checks exposed by the registries; curated expansion and
-> runtime refresh pending);
-> **WP-12 — complete** (installer uninstall/pinning, SHA-pinned Actions, armv7
-> image, SBOM, tightened `deny.toml`, shellcheck `warning`, Docker ownership
-> and release-verification/reproducibility docs);
-> **WP-13 — complete** (wall-clock gating, ephemeral HA ports, rewrite/chaos
-> tests, plaintext/push-policy/duplicate-instance/reconnect coverage,
-> behavioral config and systemd checks, nightly release job);
-> **WP-11 — partial** (`IntoArcSwap` removed in favour of explicit `ArcSwap`,
-> shuffled-order precedence test; `handle` helper extraction pending);
-> **WP-6 — complete** (atomic `RuntimeSnapshot`, hot cache resize, retention,
-> log level, rate limits and in-process listener rebind with revert; truly
-> immutable settings signalled through the API).
+> Follow-up progress (plan: [docs/audit3-followup-plan.md](audit3-followup-plan.md)):
+>
+> **Complete:** WP-2 (native DoH + DoQ upstreams), WP-3 (persistent
+> sessions/tokens), WP-4 (per-list `refresh_hours` scheduling), WP-5
+> (per-client upstreams + `ignore_stats`), WP-6 (atomic `RuntimeSnapshot`,
+> hot cache resize/retention/log level/rate limits, in-process listener
+> rebind with revert, restart signalling), WP-7 (versioned bundled-list
+> manifest, expanded curated data, `[integrations.lists]` runtime refresh,
+> Filtering-page status), WP-8 (ACME HTTP-01 listener + DoH hostname),
+> WP-9 (HA role/version/capabilities/heartbeat/`ca`), WP-10 (updater cosign
+> signature policy), WP-11 (dead-code sweep, cert-watcher lifetime, shutdown
+> joins, allocation-free matching, deterministic precedence, `handle`
+> helper extraction), WP-12 (installer ops, SHA-pinned Actions, SBOM,
+> tightened `deny.toml`, release verification docs), WP-13 (test-suite
+> quality, nightly release job), WP-14 (OpenAPI/config-reference drift
+> gates with doc-comment-driven `--write`).
+>
+> **Partial:** WP-1 — in-response DS/DNSKEY chain walk, bounded upstream key
+> fetching (`DnssecKeyFetcher`), validated-only key cache with Prometheus
+> hit/miss counters, fuzz target, and NSEC denial tests are done; explicit
+> NSEC3 opt-out/closest-encloser enumeration remains future work.
 
-- **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
-  configured trust anchors and forces the DO bit upstream; serving unvalidated
-  cache data to DNSSEC-aware clients is blocked. Chain-of-trust validation
-  beyond the direct anchor remains future work (P1-2).
-- Native DoH/DoQ upstream transports landed in follow-up WP-2; remaining
-  unsupported schemes are rejected with a clear error instead of being
-  misparsed (P1-4).
-- **Persistent sessions/API tokens.** Sessions and tokens remain memory-only;
-  this PR adds revocation on password/TOTP changes (P1-10).
-- **Per-list `refresh_hours` scheduling** remains deprecated; the global
-  `filtering.refresh_interval_hours` is used (P2-10).
-- **Per-client upstream overrides / `ignore_stats` / `use_global_upstreams`**
-  are still not wired into the pipeline (P2-6).
-- **Restart-only settings:** cache `size_mb`, listener ports/binds, rate
-  limits, `stats.retention_days` and log settings still require a restart;
-  cache enable/prefetch/stale and filter/upstream settings now hot-reload
-  (P1-14).
-- **Parental/service category lists** remain the small bundled sets shipped in
-  the binary (P2-5).
-- **`doh_dedicated_hostname`** and `acme.http_port` are documented as
-  reserved/ignored (`acme.http_port` is fixed at the internal HTTP-01 mount)
-  (P2-10).
+- **Explicit NSEC3 opt-out/closest-encloser enumeration** is the remaining
+  DNSSEC follow-up; NSEC denial proofs and the DS/DNSKEY chain are validated.
+- Restart-only settings are now limited to server identity/format, web, tls,
+  acme and ha; the API reports them through `ConfigUpdateResponse` instead of
+  pretending they were applied.
+- Parental/service data is refreshed at runtime from `[integrations.lists]`;
+  the bundled sets remain the verified minimal fallback.
