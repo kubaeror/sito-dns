@@ -297,6 +297,81 @@ querylog:
 }
 
 #[test]
+fn test_m9_example_config_is_valid() {
+    let candidates = [
+        Path::new("../../config.example.toml"),
+        Path::new("config.example.toml"),
+    ];
+    let path = candidates
+        .iter()
+        .find(|p| p.exists())
+        .expect("config.example.toml must exist");
+    let content = fs::read_to_string(path).expect("read config.example.toml");
+    let config = Config::from_toml_str(&content).expect("example config must parse");
+    config
+        .validate()
+        .expect("example config must pass validation");
+}
+
+#[test]
+fn test_m9_systemd_unit_verifies() {
+    let candidates = [
+        Path::new("../../contrib/systemd/sito.service"),
+        Path::new("contrib/systemd/sito.service"),
+    ];
+    let path = candidates
+        .iter()
+        .find(|p| p.exists())
+        .expect("contrib/systemd/sito.service must exist");
+
+    // Skip when systemd tooling is unavailable (containers, macOS).
+    let available = Command::new("systemd-analyze")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !available {
+        eprintln!("systemd-analyze unavailable; skipping unit verification");
+        return;
+    }
+
+    // Verify the unit itself, substituting a harmless ExecStart so the check
+    // does not depend on the binary being installed.
+    let content = fs::read_to_string(path).expect("read sito.service");
+    let rendered: String = content
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("ExecStart=") {
+                "ExecStart=/bin/true".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+
+    let temp_dir = std::env::temp_dir().join(format!("sito_unit_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    let unit_path = temp_dir.join("sito.service");
+    fs::write(&unit_path, rendered).expect("write rendered unit");
+
+    let output = Command::new("systemd-analyze")
+        .arg("verify")
+        .arg(&unit_path)
+        .output()
+        .expect("run systemd-analyze verify");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "systemd-analyze verify rejected the unit: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
 fn test_m9_release_configuration_and_systemd() {
     let manifest_path = Path::new("../../Cargo.toml");
     let cargo_toml_path = if manifest_path.exists() {

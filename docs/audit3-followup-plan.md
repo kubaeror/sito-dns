@@ -480,7 +480,7 @@ integration point and should land last in its wave to avoid merge churn in
 - [x] WP-10 Updater artifact signature verification
 - [ ] WP-11 Architecture cleanup — partial: cert-watcher lifetime fix, shutdown joins, dead-code sweep, allocation-free domain matching, deterministic pattern ordering done; remaining: `handle` helper extraction
 - [x] WP-12 Supply chain & installer ops — `--uninstall`, `SITO_VERSION` pin, `SITO_REQUIRE_SIGNATURE`, armv7 image, SBOM, SHA-pinned Actions, `deny.toml` tightened (`multiple-versions = "deny"` with explicit known-duplicate skips, `unused-allowed-license = "deny"`), shellcheck raised to `warning`, Docker ownership and release-verification/reproducibility documented; advisories are covered by the `cargo-deny` CI job
-- [ ] WP-13 Test-suite quality — partial: wall-clock gating, `SITO_BENCH_TESTS`, ephemeral HA ports, chaos/promotion tightening, broadcast/monotonic/pubkey tests done; remaining: m9 grep-based checks, master-restart reconnect E2E
+- [ ] WP-13 Test-suite quality — partial: wall-clock gating, `SITO_BENCH_TESTS`, ephemeral HA ports, chaos/promotion tightening, broadcast/monotonic/pubkey tests done; remaining: master-restart reconnect E2E
 - [ ] WP-14 Docs/OpenAPI automation — partial: CI drift checks for `docs/openapi.json` and `docs/configuration-reference.md` (bidirectional struct-vs-doc validator) done; full table generation from structs still pending
 
 When a WP lands, update `docs/audit3.md` (move the item out of "Explicitly
