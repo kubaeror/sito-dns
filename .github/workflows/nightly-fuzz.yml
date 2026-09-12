@@ -31,16 +31,16 @@ jobs:
           - fuzz_client_id
           - fuzz_dns_wire
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4 # v4
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly # nightly
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2 # v2
         with:
           key: fuzz-${{ matrix.target }}
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz # cargo-fuzz
 
       - name: Run fuzzer on ${{ matrix.target }}
         run: |
@@ -50,7 +50,7 @@ jobs:
 
       - name: Upload artifacts on crash
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4 # v4
         with:
           name: crash-reproducer-${{ matrix.target }}
           path: |

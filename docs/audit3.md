@@ -332,7 +332,9 @@ ignoring the configured `dns.bind`.
 > monotonic/broadcast/pubkey tests; remaining items tracked in the plan);
 > **WP-11 (architecture cleanup) — partial** (certificate watcher lifetime bug
 > fix, shutdown joins, dead-code removal, allocation-free suffix matching,
-> deterministic pattern order; pipeline helper extraction pending).
+> deterministic pattern order; pipeline helper extraction pending);
+> **WP-12 — partial** (SHA-pinned GitHub Actions in addition to the earlier
+> installer/armv7 work; `deny.toml` tightening pending).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated

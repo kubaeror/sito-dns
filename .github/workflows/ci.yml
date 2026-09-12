@@ -19,8 +19,8 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4 # v4
+      - uses: dtolnay/rust-toolchain@stable # stable
         with:
           components: rustfmt
       - name: Check code formatting
@@ -30,11 +30,11 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4 # v4
+      - uses: dtolnay/rust-toolchain@stable # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2 # v2
       - name: Run clippy
         run: cargo clippy --workspace --all-features -- -D warnings
 
@@ -42,9 +42,9 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v4 # v4
+      - uses: dtolnay/rust-toolchain@stable # stable
+      - uses: Swatinem/rust-cache@v2 # v2
       - name: Run tests
         run: cargo test --workspace --all-features
       - name: Verify docs/openapi.json is up to date
@@ -54,8 +54,8 @@ jobs:
     name: deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@v4 # v4
+      - uses: EmbarkStudios/cargo-deny-action@v2 # v2
         with:
           command: check
 
@@ -63,7 +63,7 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4 # v4
       - name: Install shellcheck if missing
         run: command -v shellcheck >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y shellcheck)
       - name: Run shellcheck
@@ -83,16 +83,16 @@ jobs:
           - target: armv7-unknown-linux-gnueabihf
             use_cross: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4 # v4
+      - uses: dtolnay/rust-toolchain@stable # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2 # v2
         with:
           key: ${{ matrix.target }}
       - name: Install cross
         if: matrix.use_cross
-        uses: taiki-e/install-action@cross
+        uses: taiki-e/install-action@cross # cross
       - name: Build binary for ${{ matrix.target }}
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
