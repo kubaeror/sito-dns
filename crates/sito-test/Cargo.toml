@@ -13,6 +13,7 @@ sito-proto.workspace = true
 sito-transport.workspace = true
 sito-upstream.workspace = true
 sito-cache.workspace = true
+sito-runtime.workspace = true
 sito-filter.workspace = true
 sito-dnssec.workspace = true
 sito-clients.workspace = true

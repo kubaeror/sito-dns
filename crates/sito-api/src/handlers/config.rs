@@ -11,7 +11,6 @@ use flate2::write::GzEncoder;
 use rand::RngExt;
 use sito_core::config::Config;
 use std::io::Read;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tar::{Archive, Builder, Header};
 
@@ -140,7 +139,7 @@ pub async fn update_config(
     save_config_atomic(&ctx.config_path, &parsed).await?;
     ctx.querylog_sender
         .set_anonymize(parsed.privacy.anonymize_querylog);
-    ctx.config.store(Arc::new(parsed));
+    ctx.set_config(parsed);
     crate::publish_bundle(&ctx);
 
     Ok(Json(GenericMessageResponse {
@@ -173,7 +172,7 @@ pub async fn reload_config(
 
     ctx.querylog_sender
         .set_anonymize(parsed.privacy.anonymize_querylog);
-    ctx.config.store(Arc::new(parsed));
+    ctx.set_config(parsed);
     crate::publish_bundle(&ctx);
 
     Ok(Json(GenericMessageResponse {
@@ -384,7 +383,7 @@ pub async fn confirm_restore(
     save_config_atomic(&ctx.config_path, &parsed).await?;
     ctx.querylog_sender
         .set_anonymize(parsed.privacy.anonymize_querylog);
-    ctx.config.store(Arc::new(parsed));
+    ctx.set_config(parsed);
     crate::publish_bundle(&ctx);
 
     Ok(Json(GenericMessageResponse {

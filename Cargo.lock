@@ -3018,6 +3018,7 @@ dependencies = [
  "sito-ha",
  "sito-proto",
  "sito-rewrites",
+ "sito-runtime",
  "sito-stats",
  "sito-transport",
  "sito-upstream",
@@ -3055,6 +3056,7 @@ dependencies = [
  "sito-ha",
  "sito-proto",
  "sito-rewrites",
+ "sito-runtime",
  "sito-stats",
  "sito-upstream",
  "subtle",
@@ -3200,6 +3202,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sito-runtime"
+version = "1.4.0"
+dependencies = [
+ "arc-swap",
+ "sito-clients",
+ "sito-core",
+ "sito-rewrites",
+]
+
+[[package]]
 name = "sito-stats"
 version = "1.4.0"
 dependencies = [
@@ -3249,6 +3261,7 @@ dependencies = [
  "sito-ha",
  "sito-proto",
  "sito-rewrites",
+ "sito-runtime",
  "sito-stats",
  "sito-transport",
  "sito-upstream",

@@ -22,6 +22,7 @@ ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sito-cache.workspace = true
+sito-runtime.workspace = true
 sito-clients.workspace = true
 sito-core.workspace = true
 sito-filter.workspace = true

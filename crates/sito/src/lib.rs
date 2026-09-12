@@ -752,7 +752,9 @@ mod tests {
                 exception_clients: vec![],
             }],
         };
-        rewrites.store(Arc::new(RewriteTable::new(new_rewrites)));
+        pipeline
+            .runtime()
+            .set_rewrites(RewriteTable::new(new_rewrites));
 
         // After update: query resolves immediately without pipeline restart!
         let resp2 = pipeline.handle(query, client).await.unwrap();

@@ -349,7 +349,8 @@ ignoring the configured `dns.bind`.
 > **WP-11 — partial** (`IntoArcSwap` removed in favour of explicit `ArcSwap`,
 > shuffled-order precedence test; `handle` helper extraction pending);
 > **WP-6 — partial** (hot cache resize with carry-over, retention read per
-> cycle; atomic `RuntimeSnapshot` and listener/rate/log reload pending).
+> cycle, atomic `RuntimeSnapshot` via the new `sito-runtime` crate; listener
+> rebind, rate-limiter/log-level reload and restart signalling pending).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated

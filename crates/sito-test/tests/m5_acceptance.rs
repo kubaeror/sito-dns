@@ -60,8 +60,14 @@ async fn create_test_context(temp_dir: &Path) -> (ServerContext, PathBuf, QueryL
 
     let auth_mgr = Arc::new(AuthManager::new());
 
+    let runtime = Arc::new(sito_runtime::RuntimeState::new(
+        config_arc.clone(),
+        clients.clone(),
+        rewrites.clone(),
+    ));
     let ctx = ServerContext {
         config: config_arc,
+        runtime,
         config_path: config_path.clone(),
         auth_mgr,
         stats_db,
@@ -800,7 +806,7 @@ async fn test_acceptance_m5_metrics_auth() {
         })
         .unwrap(),
     );
-    ctx.config.store(Arc::new(cfg));
+    ctx.set_config(cfg);
 
     let req = Request::builder()
         .uri("/metrics")

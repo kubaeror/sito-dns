@@ -15,6 +15,7 @@ members = [
     "crates/sito-stats",
     "crates/sito-ha",
     "crates/sito-test",
+    "crates/sito-runtime",
 ]
 
 [workspace.package]
@@ -96,6 +97,7 @@ sito-clients = { path = "crates/sito-clients", version = "1.4.0" }
 sito-rewrites = { path = "crates/sito-rewrites", version = "1.4.0" }
 sito-api = { path = "crates/sito-api", version = "1.4.0" }
 sito-stats = { path = "crates/sito-stats", version = "1.4.0" }
+sito-runtime = { path = "crates/sito-runtime", version = "1.4.0" }
 sito-ha = { path = "crates/sito-ha", version = "1.4.0" }
 sito-test = { path = "crates/sito-test", version = "1.4.0" }
 

@@ -15,6 +15,7 @@ use sito_filter::{AntiBypassRegistry, HostsFilterEngine};
 use sito_proto::synthesize_blocked_response;
 use sito_proto::wire::{synthesize_cname_response, synthesize_records_response};
 use sito_rewrites::RewriteTable;
+use sito_runtime::RuntimeState;
 use sito_transport::QueryHandler;
 use sito_upstream::UpstreamManager;
 use std::collections::HashMap;
@@ -210,16 +211,14 @@ fn answers_contain_bypass_ip(
 
 /// The core DNS query resolution pipeline.
 pub struct DnsPipeline {
-    config: Arc<ArcSwap<Config>>,
+    runtime: Arc<RuntimeState>,
     filter: Arc<HostsFilterEngine>,
     anti_bypass: Arc<AntiBypassRegistry>,
     cache: Arc<DnsCache>,
     upstream: Arc<UpstreamManager>,
     dnssec: Arc<DnssecValidator>,
-    clients: Arc<ArcSwap<ClientRegistry>>,
     parental: Arc<ParentalRegistry>,
     services: Arc<ServiceRegistry>,
-    rewrites: Arc<ArcSwap<RewriteTable>>,
     in_flight: Arc<AtomicUsize>,
     prefetch_semaphore: Arc<tokio::sync::Semaphore>,
     querylog: Option<sito_stats::QueryLogSender>,
@@ -242,23 +241,36 @@ impl DnsPipeline {
         rewrites: Arc<ArcSwap<RewriteTable>>,
         in_flight: Arc<AtomicUsize>,
     ) -> Self {
+        let runtime = Arc::new(RuntimeState::new(config, clients, rewrites));
         Self {
-            config,
+            runtime,
             filter,
             anti_bypass: Arc::new(AntiBypassRegistry::bundled()),
             cache,
             upstream,
             dnssec,
-            clients,
             parental,
             services,
-            rewrites,
             in_flight,
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             querylog: None,
             metrics: None,
             scoped_upstreams: Arc::new(HashMap::new()),
         }
+    }
+
+    /// The runtime snapshot holder in use by this pipeline.
+    #[must_use]
+    pub fn runtime(&self) -> &Arc<RuntimeState> {
+        &self.runtime
+    }
+
+    /// Shares a runtime snapshot holder with the server so config, clients and
+    /// rewrites are observed atomically by each query.
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: Arc<RuntimeState>) -> Self {
+        self.runtime = runtime;
+        self
     }
 
     /// Registers per-client upstream managers used when a client opts out of
@@ -295,9 +307,12 @@ impl QueryHandler for DnsPipeline {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         let _guard = InFlightGuard(Arc::clone(&self.in_flight));
 
-        let config = self.config.load();
-        let clients = self.clients.load();
-        let rewrites = self.rewrites.load();
+        // One snapshot per query: config, clients and rewrites cannot be torn
+        // apart by a concurrent hot reload.
+        let runtime_snapshot = self.runtime.snapshot();
+        let config = &runtime_snapshot.config;
+        let clients = &runtime_snapshot.clients;
+        let rewrites = &runtime_snapshot.rewrites;
 
         let mut client = client;
         let now = chrono::Utc::now();

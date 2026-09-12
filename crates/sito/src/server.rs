@@ -196,10 +196,15 @@ pub async fn run_server_full(
         );
     }
 
-    // Setup ArcSwaps for hot-reloadable components
+    // Setup ArcSwaps for hot-reloadable components and a coherent runtime view
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config.clone())));
     let clients_arc = Arc::new(ArcSwap::new(client_registry.clone()));
     let rewrites_arc = Arc::new(ArcSwap::new(rewrite_table.clone()));
+    let runtime = Arc::new(sito_runtime::RuntimeState::new(
+        config_arc.clone(),
+        clients_arc.clone(),
+        rewrites_arc.clone(),
+    ));
 
     // Construct pipeline with query logging and Prometheus metrics
     let pipeline = Arc::new(
@@ -215,6 +220,7 @@ pub async fn run_server_full(
             rewrites_arc.clone(),
             in_flight.clone(),
         )
+        .with_runtime(runtime.clone())
         .with_scoped_upstreams(scoped_upstreams)
         .with_stats(querylog_sender.clone(), metrics.clone()),
     );
@@ -346,6 +352,7 @@ pub async fn run_server_full(
 
     let server_ctx = sito_api::ServerContext {
         config: config_arc.clone(),
+        runtime: runtime.clone(),
         config_path: config_path_buf.clone(),
         auth_mgr,
         stats_db: stats_db.clone(),
@@ -421,9 +428,7 @@ pub async fn run_server_full(
 
     // Spawn config file watcher for hot-reload
     let watcher_config_path = config_path_buf.clone();
-    let watcher_config_arc = config_arc.clone();
-    let watcher_clients_arc = clients_arc.clone();
-    let watcher_rewrites_arc = rewrites_arc.clone();
+    let watcher_runtime = runtime.clone();
     let watcher_filter = filter_engine.clone();
     let watcher_coordinator = master_coordinator.clone();
     let watcher_upstream = upstream_manager.clone();
@@ -486,16 +491,16 @@ pub async fn run_server_full(
                                     .as_ref()
                                     .and_then(|v| v.clone().try_into().ok())
                                     .unwrap_or_default();
-                                watcher_rewrites_arc
-                                    .store(Arc::new(sito_rewrites::RewriteTable::new(new_rewrites_cfg)));
+                                let new_rewrites =
+                                    sito_rewrites::RewriteTable::new(new_rewrites_cfg);
 
                                 let new_clients_cfg: sito_clients::ClientsConfig = new_cfg
                                     .clients
                                     .as_ref()
                                     .and_then(|v| v.clone().try_into().ok())
                                     .unwrap_or_default();
-                                watcher_clients_arc
-                                    .store(Arc::new(sito_clients::ClientRegistry::new(new_clients_cfg)));
+                                let new_clients =
+                                    sito_clients::ClientRegistry::new(new_clients_cfg);
 
                                 if let Err(e) = watcher_upstream
                                     .reload(&new_cfg.upstream, &watcher_bootstrap)
@@ -507,7 +512,13 @@ pub async fn run_server_full(
                                     .set_anonymize(new_cfg.privacy.anonymize_querylog);
                                 watcher_cache.update_config(new_cfg.dns.cache.clone()).await;
 
-                                watcher_config_arc.store(Arc::new(new_cfg.clone()));
+                                // Publish config, clients and rewrites together so a
+                                // query cannot observe a half-applied reload.
+                                watcher_runtime.replace(sito_runtime::RuntimeSnapshot {
+                                    config: Arc::new(new_cfg.clone()),
+                                    clients: Arc::new(new_clients),
+                                    rewrites: Arc::new(new_rewrites),
+                                });
 
                                 if let Some(ref coord) = watcher_coordinator {
                                     let next_version = coord.get_current_version() + 1;

@@ -8,7 +8,6 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::Arc;
 
 use crate::auth::manager::LoginResult;
 use crate::auth::rbac::AuthUser;
@@ -567,7 +566,7 @@ pub async fn filtering_toggle_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg.clone()));
+        ctx.set_config(new_cfg.clone());
         let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
         crate::publish_bundle(&ctx);
     }
@@ -605,7 +604,7 @@ pub async fn filtering_add_handler(
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    ctx.config.store(Arc::new(new_cfg.clone()));
+    ctx.set_config(new_cfg.clone());
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     crate::publish_bundle(&ctx);
 
@@ -631,7 +630,7 @@ pub async fn filtering_delete_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg.clone()));
+        ctx.set_config(new_cfg.clone());
         let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
         crate::publish_bundle(&ctx);
     }
@@ -668,7 +667,7 @@ pub async fn filtering_custom_rules_handler(
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    ctx.config.store(Arc::new(new_cfg.clone()));
+    ctx.set_config(new_cfg.clone());
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     crate::publish_bundle(&ctx);
 
@@ -826,9 +825,9 @@ pub async fn rewrites_add_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg));
+        ctx.set_config(new_cfg);
         let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg);
-        ctx.rewrites.store(Arc::new(new_table));
+        ctx.set_rewrites(new_table);
         crate::publish_bundle(&ctx);
     }
 
@@ -879,9 +878,9 @@ pub async fn rewrites_delete_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg));
+        ctx.set_config(new_cfg);
         let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg);
-        ctx.rewrites.store(Arc::new(new_table));
+        ctx.set_rewrites(new_table);
         crate::publish_bundle(&ctx);
     }
 
@@ -978,9 +977,9 @@ pub async fn clients_add_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg));
+        ctx.set_config(new_cfg);
         let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
-        ctx.clients.store(Arc::new(new_reg));
+        ctx.set_clients(new_reg);
         crate::publish_bundle(&ctx);
     }
 
@@ -1014,9 +1013,9 @@ pub async fn clients_delete_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg));
+        ctx.set_config(new_cfg);
         let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
-        ctx.clients.store(Arc::new(new_reg));
+        ctx.set_clients(new_reg);
         crate::publish_bundle(&ctx);
     }
 
@@ -1071,7 +1070,7 @@ pub async fn upstreams_add_handler(
             tracing::error!("Failed to persist configuration to disk: {e:?}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        ctx.config.store(Arc::new(new_cfg.clone()));
+        ctx.set_config(new_cfg.clone());
         let bootstrap = sito_upstream::BootstrapResolver::new(
             new_cfg.upstream.bootstrap.clone(),
             std::time::Duration::from_millis(new_cfg.upstream.timeout_ms),
@@ -1333,7 +1332,7 @@ pub async fn settings_save_handler(
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    ctx.config.store(Arc::new(new_cfg));
+    ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);
 
     Redirect::to("/settings").into_response()
@@ -1377,7 +1376,7 @@ pub async fn system_reload_handler(
     if let Ok(toml_str) = tokio::fs::read_to_string(&ctx.config_path).await
         && let Ok(cfg) = sito_core::config::Config::from_toml_str(&toml_str)
     {
-        ctx.config.store(Arc::new(cfg));
+        ctx.set_config(cfg);
         crate::publish_bundle(&ctx);
     }
     Redirect::to("/system").into_response()
@@ -2014,7 +2013,7 @@ pub async fn wizard_complete_handler(
         }
     }
 
-    ctx.config.store(Arc::new(new_cfg.clone()));
+    ctx.set_config(new_cfg.clone());
     let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     let bootstrap = sito_upstream::BootstrapResolver::new(
         new_cfg.upstream.bootstrap.clone(),
@@ -2040,6 +2039,7 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode};
     use sito_core::config::Config;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::Instant;
 
@@ -2072,8 +2072,15 @@ mod tests {
             Default::default(),
         ))));
 
+        let runtime = Arc::new(sito_runtime::RuntimeState::new(
+            config_arc.clone(),
+            clients.clone(),
+            rewrites.clone(),
+        ));
+
         ServerContext {
             config: config_arc,
+            runtime,
             config_path: temp_dir.join("config.toml"),
             auth_mgr,
             stats_db,

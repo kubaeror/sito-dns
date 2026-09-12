@@ -86,8 +86,14 @@ async fn create_test_context(
     let (_meta, token_resp) = auth_mgr.create_token("admin", sito_api::auth::Role::Admin);
     let admin_token = token_resp.token;
 
+    let runtime = Arc::new(sito_runtime::RuntimeState::new(
+        config_arc.clone(),
+        clients.clone(),
+        rewrites.clone(),
+    ));
     let ctx = ServerContext {
         config: config_arc,
+        runtime,
         config_path,
         auth_mgr,
         stats_db,
