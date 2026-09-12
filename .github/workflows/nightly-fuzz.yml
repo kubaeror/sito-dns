@@ -19,6 +19,23 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  release-tests:
+    name: release-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: nightly-release-tests
+
+      - name: Run full test suite in release mode
+        env:
+          SITO_BENCH_TESTS: "1"
+        run: cargo test --workspace --release --all-features
+
   fuzz:
     name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest

@@ -309,4 +309,300 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    async fn test_slave_handles(temp_dir: &std::path::Path) -> SlaveAppHandles {
+        let base_config = sito_core::config::Config::default();
+        let config_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(base_config.clone())));
+        let filter_engine = Arc::new(
+            sito_filter::HostsFilterEngine::init(
+                base_config.filtering.clone(),
+                temp_dir.to_path_buf(),
+            )
+            .await,
+        );
+        let rewrites_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            sito_rewrites::RewriteTable::new(Default::default()),
+        )));
+        let clients_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            sito_clients::ClientRegistry::new(Default::default()),
+        )));
+        SlaveAppHandles {
+            config: config_arc,
+            filter: filter_engine,
+            rewrites: rewrites_arc,
+            clients: clients_arc,
+            metrics: sito_stats::MetricsRegistry::new("0.1.0", "slave"),
+            config_path: None,
+        }
+    }
+
+    fn reserve_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        port
+    }
+
+    async fn wait_until(timeout_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..(timeout_ms / 50) {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        cond()
+    }
+
+    #[tokio::test]
+    async fn test_plaintext_ws_with_token_end_to_end() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ha_plaintext_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        let port = reserve_port();
+
+        let coordinator = MasterCoordinator::new(
+            "master-plain".to_string(),
+            1,
+            signing_key.clone(),
+            sito_stats::MetricsRegistry::new("0.1.0", "test"),
+        )
+        .with_token(Some("plain-token".to_string()));
+
+        let master_cfg = HaConfig {
+            replication_port: port,
+            listen_addr: "127.0.0.1".to_string(),
+            allow_insecure_ws: true,
+            slave_token: Some("plain-token".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            master_cfg.validate("master").is_ok(),
+            "explicit plaintext master with token must validate"
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let _server = spawn_master_server(master_cfg, coordinator.clone(), shutdown_rx);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let slave_cfg = HaConfig {
+            master_url: Some(format!("ws://127.0.0.1:{port}")),
+            master_fingerprint: None,
+            master_pubkey: Some(signing_key.public_key_hex()),
+            allow_insecure_ws: true,
+            slave_token: Some("plain-token".to_string()),
+            stats_interval_secs: 1,
+            ..Default::default()
+        };
+        assert!(slave_cfg.validate("slave").is_ok());
+
+        let tracker = SlaveStatusTracker::new(
+            "plain-slave".to_string(),
+            0,
+            Some(format!("ws://127.0.0.1:{port}")),
+        );
+        coordinator
+            .update_bundle(ConfigBundle {
+                version: 2,
+                timestamp: 1,
+                config_toml: "config_version = 1\n".to_string(),
+                custom_rules: vec![],
+                rewrites: None,
+                clients: None,
+                lists: vec![],
+            })
+            .unwrap();
+
+        let (_resync_tx, resync_rx) = tokio::sync::mpsc::channel(1);
+        let _worker = spawn_slave_worker(
+            slave_cfg,
+            tracker.clone(),
+            test_slave_handles(&temp_dir).await,
+            resync_rx,
+            shutdown_tx.subscribe(),
+        );
+
+        let synced = wait_until(5000, || {
+            tracker.get_version() == 2 && tracker.get_state() == SlaveState::Synced
+        })
+        .await;
+        assert!(synced, "plaintext slave should sync without TLS");
+        assert_eq!(coordinator.connected_slave_count(), 1);
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_missing_master_pubkey_rejects_pushes() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ha_nopubkey_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        let port = reserve_port();
+
+        let coordinator = MasterCoordinator::new(
+            "master-nopk".to_string(),
+            1,
+            signing_key.clone(),
+            sito_stats::MetricsRegistry::new("0.1.0", "test"),
+        )
+        .with_token(Some("tok".to_string()));
+
+        let master_cfg = HaConfig {
+            replication_port: port,
+            listen_addr: "127.0.0.1".to_string(),
+            allow_insecure_ws: true,
+            slave_token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let _server = spawn_master_server(master_cfg, coordinator.clone(), shutdown_rx);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let slave_cfg = HaConfig {
+            master_url: Some(format!("ws://127.0.0.1:{port}")),
+            master_pubkey: None,
+            allow_insecure_ws: true,
+            slave_token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            slave_cfg.validate("slave").is_err(),
+            "slave role must require master_pubkey"
+        );
+
+        let tracker = SlaveStatusTracker::new(
+            "nopk-slave".to_string(),
+            0,
+            Some(format!("ws://127.0.0.1:{port}")),
+        );
+        coordinator
+            .update_bundle(ConfigBundle {
+                version: 2,
+                timestamp: 1,
+                config_toml: "config_version = 1\n".to_string(),
+                custom_rules: vec![],
+                rewrites: None,
+                clients: None,
+                lists: vec![],
+            })
+            .unwrap();
+
+        let (_resync_tx, resync_rx) = tokio::sync::mpsc::channel(1);
+        let _worker = spawn_slave_worker(
+            slave_cfg,
+            tracker.clone(),
+            test_slave_handles(&temp_dir).await,
+            resync_rx,
+            shutdown_tx.subscribe(),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        assert_ne!(tracker.get_state(), SlaveState::Synced);
+        assert_eq!(
+            tracker.get_version(),
+            0,
+            "unsigned or unverifiable push must never be applied"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_instance_replaces_tracker_entry() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ha_dup_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        let port = reserve_port();
+
+        let coordinator = MasterCoordinator::new(
+            "master-dup".to_string(),
+            1,
+            signing_key.clone(),
+            sito_stats::MetricsRegistry::new("0.1.0", "test"),
+        )
+        .with_token(Some("tok".to_string()));
+
+        let master_cfg = HaConfig {
+            replication_port: port,
+            listen_addr: "127.0.0.1".to_string(),
+            allow_insecure_ws: true,
+            slave_token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let _server = spawn_master_server(master_cfg, coordinator.clone(), shutdown_rx);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let slave_cfg = HaConfig {
+            master_url: Some(format!("ws://127.0.0.1:{port}")),
+            master_pubkey: Some(signing_key.public_key_hex()),
+            allow_insecure_ws: true,
+            slave_token: Some("tok".to_string()),
+            ..Default::default()
+        };
+
+        coordinator
+            .update_bundle(ConfigBundle {
+                version: 2,
+                timestamp: 1,
+                config_toml: "config_version = 1\n".to_string(),
+                custom_rules: vec![],
+                rewrites: None,
+                clients: None,
+                lists: vec![],
+            })
+            .unwrap();
+
+        let first = SlaveStatusTracker::new(
+            "dup-instance".to_string(),
+            0,
+            Some(format!("ws://127.0.0.1:{port}")),
+        );
+        let (_tx1, rx1) = tokio::sync::mpsc::channel(1);
+        let _w1 = spawn_slave_worker(
+            slave_cfg.clone(),
+            first.clone(),
+            test_slave_handles(&temp_dir).await,
+            rx1,
+            shutdown_tx.subscribe(),
+        );
+        let synced = wait_until(5000, || first.get_state() == SlaveState::Synced).await;
+        assert!(synced, "first instance should sync");
+        assert_eq!(coordinator.connected_slave_count(), 1);
+
+        let second = SlaveStatusTracker::new(
+            "dup-instance".to_string(),
+            0,
+            Some(format!("ws://127.0.0.1:{port}")),
+        );
+        let (_tx2, rx2) = tokio::sync::mpsc::channel(1);
+        let _w2 = spawn_slave_worker(
+            slave_cfg,
+            second.clone(),
+            test_slave_handles(&temp_dir).await,
+            rx2,
+            shutdown_tx.subscribe(),
+        );
+        let synced = wait_until(5000, || second.get_state() == SlaveState::Synced).await;
+        assert!(synced, "second instance should sync");
+        assert_eq!(
+            coordinator.connected_slave_count(),
+            1,
+            "reconnecting with the same instance name must replace the old entry"
+        );
+        assert_eq!(coordinator.list_slaves()[0].instance, "dup-instance");
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
