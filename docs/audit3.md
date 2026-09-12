@@ -346,6 +346,9 @@ ignoring the configured `dns.bind`.
 > **WP-12 — complete** (installer uninstall/pinning, SHA-pinned Actions, armv7
 > image, SBOM, tightened `deny.toml`, shellcheck `warning`, Docker ownership
 > and release-verification/reproducibility docs);
+> **WP-13 — complete** (wall-clock gating, ephemeral HA ports, rewrite/chaos
+> tests, plaintext/push-policy/duplicate-instance/reconnect coverage,
+> behavioral config and systemd checks, nightly release job);
 > **WP-11 — partial** (`IntoArcSwap` removed in favour of explicit `ArcSwap`,
 > shuffled-order precedence test; `handle` helper extraction pending);
 > **WP-6 — partial** (hot cache resize with carry-over, retention read per

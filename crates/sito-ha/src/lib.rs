@@ -515,6 +515,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_slave_retries_until_master_is_available() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ha_reconnect_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        let port = reserve_port();
+
+        // Slave starts first, while no master listener exists on the port.
+        let slave_cfg = HaConfig {
+            master_url: Some(format!("ws://127.0.0.1:{port}")),
+            master_pubkey: Some(signing_key.public_key_hex()),
+            allow_insecure_ws: true,
+            slave_token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        let tracker = SlaveStatusTracker::new(
+            "retry-slave".to_string(),
+            0,
+            Some(format!("ws://127.0.0.1:{port}")),
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_resync_tx, resync_rx) = tokio::sync::mpsc::channel(1);
+        let _worker = spawn_slave_worker(
+            slave_cfg,
+            tracker.clone(),
+            test_slave_handles(&temp_dir).await,
+            resync_rx,
+            shutdown_rx,
+        );
+
+        // Give the worker time to hit the closed port and enter backoff.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_ne!(tracker.get_state(), SlaveState::Synced);
+
+        // Now bring the master up; the worker must reconnect and sync.
+        let coordinator = MasterCoordinator::new(
+            "master-late".to_string(),
+            1,
+            signing_key.clone(),
+            sito_stats::MetricsRegistry::new("0.1.0", "test"),
+        )
+        .with_token(Some("tok".to_string()));
+        coordinator
+            .update_bundle(ConfigBundle {
+                version: 2,
+                timestamp: 1,
+                config_toml: "config_version = 1\n".to_string(),
+                custom_rules: vec![],
+                rewrites: None,
+                clients: None,
+                lists: vec![],
+            })
+            .unwrap();
+
+        let master_cfg = HaConfig {
+            replication_port: port,
+            listen_addr: "127.0.0.1".to_string(),
+            allow_insecure_ws: true,
+            slave_token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        let (master_shutdown_tx, master_shutdown_rx) = watch::channel(false);
+        let _server = spawn_master_server(master_cfg, coordinator.clone(), master_shutdown_rx);
+
+        let synced = wait_until(10_000, || tracker.get_state() == SlaveState::Synced).await;
+        assert!(
+            synced,
+            "slave should reconnect once the master becomes reachable (state: {:?})",
+            tracker.get_state()
+        );
+        assert_eq!(tracker.get_version(), 2);
+        assert_eq!(coordinator.connected_slave_count(), 1);
+
+        let _ = master_shutdown_tx.send(true);
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
     async fn test_duplicate_instance_replaces_tracker_entry() {
         let temp_dir = std::env::temp_dir().join(format!(
             "sito_ha_dup_test_{}_{}",
