@@ -5,7 +5,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased]
+## [1.5.0] - 2026-09-12
 
 ### Audit 3 Remediation (security, correctness, ops)
 
