@@ -4,6 +4,7 @@
 //! root trust anchors, negative trust anchors (NTA), key caching, RFC 8914 extended DNS errors (EDE),
 //! and validation metrics.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,11 +13,11 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use tracing::{debug, warn};
 
-use hickory_proto::dnssec::rdata::{DNSKEY, DNSSECRData, RRSIG};
+use hickory_proto::dnssec::rdata::{DNSKEY, DNSSECRData, DS, RRSIG, SIG};
 use hickory_proto::dnssec::{PublicKeyBuf, TrustAnchors, Verifier};
 use hickory_proto::op::{Edns, Message, ResponseCode};
 use hickory_proto::rr::rdata::opt::EdnsOption;
-use hickory_proto::rr::{DNSClass, LowerName, Name, RData, Record};
+use hickory_proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use sito_core::config::DnssecConfig;
 
 /// DNSSEC validation mode.
@@ -153,9 +154,13 @@ impl DnssecMetrics {
 }
 
 /// Cache for validated DNSKEY records.
+///
+/// Entries track whether the key was linked to a trust anchor (directly, via a
+/// DS record or via a validated DNSKEY RRset). Only validated entries may be
+/// used to mark a response `Secure`.
 #[derive(Default)]
 pub struct KeyCache {
-    keys: DashMap<(LowerName, u16), (DNSKEY, u32)>,
+    keys: DashMap<(LowerName, u16), (DNSKEY, u32, bool)>,
 }
 
 impl KeyCache {
@@ -163,9 +168,10 @@ impl KeyCache {
         Self::default()
     }
 
+    /// Returns any cached key, validated or not (used for signature checks).
     pub fn get(&self, name: &LowerName, key_tag: u16, now: u32) -> Option<DNSKEY> {
         if let Some(entry) = self.keys.get(&(name.clone(), key_tag)) {
-            let (key, expires_at) = entry.value();
+            let (key, expires_at, _) = entry.value();
             if now <= *expires_at {
                 return Some(key.clone());
             }
@@ -173,9 +179,56 @@ impl KeyCache {
         None
     }
 
-    pub fn insert(&self, name: LowerName, key_tag: u16, key: DNSKEY, expires_at: u32) {
-        self.keys.insert((name, key_tag), (key, expires_at));
+    /// Returns a cached key only when it is part of a validated chain.
+    pub fn get_validated(&self, name: &LowerName, key_tag: u16, now: u32) -> Option<DNSKEY> {
+        if let Some(entry) = self.keys.get(&(name.clone(), key_tag)) {
+            let (key, expires_at, validated) = entry.value();
+            if *validated && now <= *expires_at {
+                return Some(key.clone());
+            }
+        }
+        None
     }
+
+    /// Stores a key that has not (yet) been linked to a trust anchor.
+    pub fn insert(&self, name: LowerName, key_tag: u16, key: DNSKEY, expires_at: u32) {
+        self.keys.insert((name, key_tag), (key, expires_at, false));
+    }
+
+    /// Stores a key that has been linked to a trust anchor by the chain walk.
+    pub fn insert_validated(&self, name: LowerName, key_tag: u16, key: DNSKEY, expires_at: u32) {
+        self.keys.insert((name, key_tag), (key, expires_at, true));
+    }
+
+    /// Number of cached keys (validated and unvalidated). Test/diagnostics helper.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether the cache holds no keys.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+/// Verifies `rrsig` over the RRset it covers using `key`.
+fn verify_rrsig_covered(response: &Message, owner: &Name, rrsig: &SIG, key: &DNSKEY) -> bool {
+    let type_covered = rrsig.input().type_covered;
+    let covered: Vec<&Record> = response
+        .answers
+        .iter()
+        .chain(response.authorities.iter())
+        .chain(response.additionals.iter())
+        .filter(|record| record.record_type() == type_covered && record.name == *owner)
+        .collect();
+    if covered.is_empty() {
+        return false;
+    }
+    let rrsig_rdata = RRSIG::from_sig(rrsig.input().clone(), rrsig.sig().to_vec());
+    key.verify_rrsig(owner, DNSClass::IN, &rrsig_rdata, covered.into_iter())
+        .is_ok()
 }
 
 /// DNSSEC validation engine.
@@ -295,6 +348,148 @@ impl DnssecValidator {
         })
     }
 
+    /// Walks DS/DNSKEY links present in the response to extend trust from the
+    /// configured anchors to zone signing keys.
+    ///
+    /// Supports two linkage forms without extra network round-trips:
+    /// - a DNSKEY RRset self-signed by an anchored/validated key (KSK -> ZSK);
+    /// - a DS RRset signed by a validated parent key whose digest matches a
+    ///   child DNSKEY (delegation).
+    ///
+    /// The fixpoint is bounded and newly validated keys are cached with the
+    /// minimum of the record TTL and the matching signature expiration.
+    fn build_validated_key_set(
+        &self,
+        response: &Message,
+        dnskeys: &[(Name, DNSKEY)],
+        rrsigs: &[(Name, SIG)],
+        now: u32,
+    ) -> HashSet<(LowerName, u16)> {
+        let mut validated: HashSet<(LowerName, u16)> = HashSet::new();
+        let anchors = self.trust_anchors.load();
+
+        for (owner, key) in dnskeys {
+            let Ok(tag) = key.calculate_key_tag() else {
+                continue;
+            };
+            let lower = LowerName::from(owner);
+            let anchored = anchors.contains(key.public_key())
+                || anchors.contains_with_name(key.public_key(), &lower);
+            if anchored || self.key_cache.get_validated(&lower, tag, now).is_some() {
+                validated.insert((lower, tag));
+            }
+        }
+
+        let ds_records: Vec<(&Name, &DS)> = response
+            .authorities
+            .iter()
+            .chain(response.additionals.iter())
+            .filter_map(|record| match &record.data {
+                RData::DNSSEC(DNSSECRData::DS(ds)) => Some((&record.name, ds)),
+                _ => None,
+            })
+            .collect();
+
+        let mut changed = true;
+        let mut rounds = 0u8;
+        while changed && rounds < 16 {
+            changed = false;
+            rounds += 1;
+
+            for (ds_owner, ds) in &ds_records {
+                for (parent_owner, parent_key) in dnskeys {
+                    let Ok(parent_tag) = parent_key.calculate_key_tag() else {
+                        continue;
+                    };
+                    let lower_parent = LowerName::from(parent_owner);
+                    if !validated.contains(&(lower_parent.clone(), parent_tag)) {
+                        continue;
+                    }
+                    let ds_signed = rrsigs.iter().any(|(owner, sig)| {
+                        owner == *ds_owner
+                            && sig.input().type_covered == RecordType::DS
+                            && LowerName::from(&sig.input().signer_name) == lower_parent
+                            && sig.input().key_tag == parent_tag
+                            && verify_rrsig_covered(response, ds_owner, sig, parent_key)
+                    });
+                    if !ds_signed {
+                        continue;
+                    }
+                    for (child_owner, child_key) in dnskeys {
+                        if child_owner != *ds_owner || child_key.algorithm() != ds.algorithm() {
+                            continue;
+                        }
+                        if !ds.covers(child_owner, child_key).unwrap_or(false) {
+                            continue;
+                        }
+                        if let Ok(tag) = child_key.calculate_key_tag()
+                            && validated.insert((LowerName::from(child_owner), tag))
+                        {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            for (owner, signer_key) in dnskeys {
+                let Ok(tag) = signer_key.calculate_key_tag() else {
+                    continue;
+                };
+                let lower = LowerName::from(owner);
+                if !validated.contains(&(lower, tag)) {
+                    continue;
+                }
+                let rrset_signed = rrsigs.iter().any(|(sig_owner, sig)| {
+                    sig_owner == owner
+                        && sig.input().type_covered == RecordType::DNSKEY
+                        && verify_rrsig_covered(response, owner, sig, signer_key)
+                });
+                if !rrset_signed {
+                    continue;
+                }
+                for (other_owner, other_key) in dnskeys {
+                    if other_owner != owner {
+                        continue;
+                    }
+                    if let Ok(other_tag) = other_key.calculate_key_tag()
+                        && validated.insert((LowerName::from(other_owner), other_tag))
+                    {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        for (lower, tag) in &validated {
+            let Some((owner, key)) = dnskeys.iter().find(|(owner, key)| {
+                LowerName::from(owner) == *lower && key.calculate_key_tag().ok() == Some(*tag)
+            }) else {
+                continue;
+            };
+            let ttl = response
+                .answers
+                .iter()
+                .chain(response.authorities.iter())
+                .chain(response.additionals.iter())
+                .find(|record| {
+                    record.name == *owner
+                        && matches!(record.data, RData::DNSSEC(DNSSECRData::DNSKEY(_)))
+                })
+                .map_or(3600, |record| record.ttl);
+            let ttl_expiry = now.saturating_add(ttl);
+            let sig_expiry = rrsigs
+                .iter()
+                .filter(|(_, sig)| LowerName::from(&sig.input().signer_name) == *lower)
+                .map(|(_, sig)| sig.input().sig_expiration.get())
+                .min();
+            let expiry = sig_expiry.map_or(ttl_expiry, |e| e.min(ttl_expiry));
+            self.key_cache
+                .insert_validated(lower.clone(), *tag, key.clone(), expiry);
+        }
+
+        validated
+    }
+
     /// Validate a response against DNSSEC rules.
     pub fn validate_response(
         &self,
@@ -338,7 +533,12 @@ impl DnssecValidator {
 
         // Collect RRSIG records
         let mut rrsigs = Vec::new();
-        for record in response.answers.iter().chain(response.authorities.iter()) {
+        for record in response
+            .answers
+            .iter()
+            .chain(response.authorities.iter())
+            .chain(response.additionals.iter())
+        {
             match &record.data {
                 RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
                     rrsigs.push((record.name.clone(), (**rrsig).clone()));
@@ -357,6 +557,10 @@ impl DnssecValidator {
             self.metrics.record_validation(&outcome);
             return outcome;
         }
+
+        // Extend trust from anchors to derived keys (DS delegation, KSK->ZSK).
+        let validated_keys =
+            self.build_validated_key_set(response, &response_dnskeys, &rrsigs, now);
 
         // Validate each RRSIG. A response is bogus only if every candidate
         // signature fails; a single valid signature (even if another is
@@ -433,10 +637,15 @@ impl DnssecValidator {
                     }
                 }
 
-                // Check if DNSKEY is trusted (in root anchors or trusted zone)
+                // Check if DNSKEY is trusted (anchor, validated chain, or cache)
                 let anchors = self.trust_anchors.load();
                 let is_trusted = anchors.contains(dnskey.public_key())
-                    || anchors.contains_with_name(dnskey.public_key(), &lower_signer);
+                    || anchors.contains_with_name(dnskey.public_key(), &lower_signer)
+                    || validated_keys.contains(&(lower_signer.clone(), key_tag))
+                    || self
+                        .key_cache
+                        .get_validated(&lower_signer, key_tag, now)
+                        .is_some();
 
                 if is_trusted {
                     has_secure_validation = true;
@@ -505,6 +714,31 @@ pub mod test_util {
     use std::net::Ipv4Addr;
     use std::str::FromStr;
     use std::time::Duration;
+
+    /// Creates an ECDSA P-256 signing key and DNSKEY for *origin_str*.
+    pub fn create_test_signer(origin_str: &str) -> (Name, DNSKEY, DnssecSigner) {
+        let origin = Name::from_str(origin_str).expect("parse origin");
+        let pkcs8 =
+            EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256).expect("generate pkcs8");
+        let key = EcdsaSigningKey::from_pkcs8(&pkcs8, Algorithm::ECDSAP256SHA256)
+            .expect("key from pkcs8");
+        let pub_key = key.to_public_key().expect("pub key");
+        let dnskey = DNSKEY::from_key(&pub_key);
+        let signer = DnssecSigner::new(
+            dnskey.clone(),
+            Box::new(key),
+            origin.clone(),
+            Duration::from_secs(3600),
+        );
+        (origin, dnskey, signer)
+    }
+
+    /// Signs an entire RRset (or DNSKEY RRset) and returns the RRSIG record.
+    pub fn sign_test_rrset(set: &RecordSet, signer: &DnssecSigner) -> Record {
+        let now_utc = time::OffsetDateTime::now_utc();
+        let rrsig = RRSIG::from_rrset(set, DNSClass::IN, now_utc, signer).expect("sign test rrset");
+        Record::from_rdata(set.name().clone(), 300, rrsig.into_rdata())
+    }
 
     /// Helper that generates a signed test domain with DNSKEY, A record, and matching RRSIG.
     pub fn create_test_signed_domain(
@@ -734,5 +968,143 @@ mod tests {
         let outcome2 = validator.validate_response(&mut msg, None, now);
         assert_eq!(outcome2, ValidationOutcome::Insecure);
         assert_eq!(validator.metrics.get_validations("insecure"), 1);
+    }
+
+    #[test]
+    fn test_ds_digest_match_and_mismatch() {
+        use hickory_proto::dnssec::DigestType;
+
+        let (origin, dnskey, _signer) = create_test_signer("child.example.");
+        let ds = DS::from_key(dnskey.public_key(), &origin, DigestType::SHA256).unwrap();
+
+        assert_eq!(ds.key_tag(), dnskey.calculate_key_tag().unwrap());
+        assert!(ds.covers(&origin, &dnskey).unwrap());
+
+        let tampered = DS::new(
+            ds.key_tag(),
+            ds.algorithm(),
+            ds.digest_type(),
+            vec![0u8; ds.digest().len()],
+        );
+        assert!(!tampered.covers(&origin, &dnskey).unwrap());
+    }
+
+    #[test]
+    fn test_dnssec_ksk_zsk_chain() {
+        use hickory_proto::rr::RecordSet;
+
+        let (origin, ksk, ksk_signer) = create_test_signer("chain.example.");
+        let (_zsk_name, zsk, zsk_signer) = create_test_signer("chain.example.");
+
+        let a_record = Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 10))),
+        );
+        let mut a_set = RecordSet::new(origin.clone(), RecordType::A, 0);
+        a_set.insert(a_record.clone(), 0);
+        let a_sig = sign_test_rrset(&a_set, &zsk_signer);
+
+        let mut key_set = RecordSet::new(origin.clone(), RecordType::DNSKEY, 0);
+        key_set.insert(
+            Record::from_rdata(
+                origin.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(ksk.clone())),
+            ),
+            0,
+        );
+        key_set.insert(
+            Record::from_rdata(
+                origin.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(zsk.clone())),
+            ),
+            0,
+        );
+        let key_sig = sign_test_rrset(&key_set, &ksk_signer);
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(ksk.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let mut msg = Message::new(10, MessageType::Response, OpCode::Query);
+        msg.queries
+            .push(Query::query(origin.clone(), RecordType::A));
+        msg.answers.push(a_record);
+        msg.answers.push(a_sig);
+        msg.additionals.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(ksk)),
+        ));
+        msg.additionals.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(zsk)),
+        ));
+        msg.additionals.push(key_sig);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("chain-test"), now);
+
+        assert_eq!(outcome, ValidationOutcome::Secure);
+        assert!(msg.metadata.authentic_data);
+        assert!(!validator.key_cache.is_empty());
+    }
+
+    #[test]
+    fn test_dnssec_ds_delegation_chain() {
+        use hickory_proto::dnssec::DigestType;
+        use hickory_proto::rr::RecordSet;
+
+        let (parent, parent_key, parent_signer) = create_test_signer("example.");
+        let (child, child_key, child_signer) = create_test_signer("sub.example.");
+
+        // DS record at the child, signed by the parent KSK.
+        let ds = DS::from_key(child_key.public_key(), &child, DigestType::SHA256).unwrap();
+        let ds_record = Record::from_rdata(child.clone(), 300, RData::DNSSEC(DNSSECRData::DS(ds)));
+        let mut ds_set = RecordSet::new(child.clone(), RecordType::DS, 0);
+        ds_set.insert(ds_record.clone(), 0);
+        let ds_sig = sign_test_rrset(&ds_set, &parent_signer);
+
+        // Child A record signed by the child ZSK.
+        let a_record = Record::from_rdata(
+            child.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(198, 51, 100, 7))),
+        );
+        let mut a_set = RecordSet::new(child.clone(), RecordType::A, 0);
+        a_set.insert(a_record.clone(), 0);
+        let a_sig = sign_test_rrset(&a_set, &child_signer);
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(parent_key.public_key(), LowerName::from(&parent));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let mut msg = Message::new(11, MessageType::Response, OpCode::Query);
+        msg.queries.push(Query::query(child.clone(), RecordType::A));
+        msg.answers.push(a_record);
+        msg.answers.push(a_sig);
+        msg.authorities.push(ds_record);
+        msg.authorities.push(ds_sig);
+        msg.additionals.push(Record::from_rdata(
+            parent.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(parent_key)),
+        ));
+        msg.additionals.push(Record::from_rdata(
+            child.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(child_key)),
+        ));
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("ds-test"), now);
+
+        assert_eq!(outcome, ValidationOutcome::Secure);
+        assert!(msg.metadata.authentic_data);
     }
 }

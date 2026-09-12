@@ -336,7 +336,10 @@ ignoring the configured `dns.bind`.
 > **WP-12 — partial** (SHA-pinned GitHub Actions in addition to the earlier
 > installer/armv7 work; `deny.toml` tightening pending);
 > **WP-14 — partial** (bidirectional config-reference drift validator in CI,
-> which fixed several undocumented settings; table generation pending).
+> which fixed several undocumented settings; table generation pending);
+> **WP-1 — partial** (in-response DS/DNSKEY chain walk: KSK→ZSK and signed DS
+> delegation, validated-only key cache, additional-section RRSIGs; async
+> fetcher and NSEC/NSEC3 proofs pending).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated
