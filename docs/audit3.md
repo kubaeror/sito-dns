@@ -345,7 +345,9 @@ ignoring the configured `dns.bind`.
 > runtime refresh pending);
 > **WP-12 — complete** (installer uninstall/pinning, SHA-pinned Actions, armv7
 > image, SBOM, tightened `deny.toml`, shellcheck `warning`, Docker ownership
-> and release-verification/reproducibility docs).
+> and release-verification/reproducibility docs);
+> **WP-11 — partial** (`IntoArcSwap` removed in favour of explicit `ArcSwap`,
+> shuffled-order precedence test; `handle` helper extraction pending).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated

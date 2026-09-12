@@ -24,23 +24,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{Instrument, debug, info, trace, warn};
 
-/// Helper trait to accept either `Arc<T>` or `Arc<ArcSwap<T>>`.
-pub trait IntoArcSwap<T> {
-    fn into_arc_swap(self) -> Arc<ArcSwap<T>>;
-}
-
-impl<T> IntoArcSwap<T> for Arc<ArcSwap<T>> {
-    fn into_arc_swap(self) -> Arc<ArcSwap<T>> {
-        self
-    }
-}
-
-impl<T> IntoArcSwap<T> for Arc<T> {
-    fn into_arc_swap(self) -> Arc<ArcSwap<T>> {
-        Arc::new(ArcSwap::new(self))
-    }
-}
-
 /// Tracks in-flight queries using RAII.
 struct InFlightGuard(Arc<AtomicUsize>);
 
@@ -248,28 +231,28 @@ pub struct DnsPipeline {
 impl DnsPipeline {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        config: impl IntoArcSwap<Config>,
+        config: Arc<ArcSwap<Config>>,
         filter: Arc<HostsFilterEngine>,
         cache: Arc<DnsCache>,
         upstream: Arc<UpstreamManager>,
         dnssec: Arc<DnssecValidator>,
-        clients: impl IntoArcSwap<ClientRegistry>,
+        clients: Arc<ArcSwap<ClientRegistry>>,
         parental: Arc<ParentalRegistry>,
         services: Arc<ServiceRegistry>,
-        rewrites: impl IntoArcSwap<RewriteTable>,
+        rewrites: Arc<ArcSwap<RewriteTable>>,
         in_flight: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            config: config.into_arc_swap(),
+            config,
             filter,
             anti_bypass: Arc::new(AntiBypassRegistry::bundled()),
             cache,
             upstream,
             dnssec,
-            clients: clients.into_arc_swap(),
+            clients,
             parental,
             services,
-            rewrites: rewrites.into_arc_swap(),
+            rewrites,
             in_flight,
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             querylog: None,

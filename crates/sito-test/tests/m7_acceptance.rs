@@ -2,6 +2,7 @@
 
 #![allow(clippy::pedantic)]
 
+use arc_swap::ArcSwap;
 use bytes::{Buf, Bytes};
 use http::header;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -389,15 +390,15 @@ async fn test_m7_anti_doh_bypass_filter_and_pipeline() {
 
     let pipeline = Arc::new(
         sito::pipeline::DnsPipeline::new(
-            Arc::new(config_block_all),
+            Arc::new(ArcSwap::new(Arc::new(config_block_all))),
             filter_engine.clone(),
             cache.clone(),
             upstream.clone(),
             dnssec.clone(),
-            client_registry.clone(),
+            Arc::new(ArcSwap::new(client_registry.clone())),
             parental.clone(),
             service.clone(),
-            rewrites.clone(),
+            Arc::new(ArcSwap::new(rewrites.clone())),
             in_flight.clone(),
         )
         .with_stats(querylog_writer.sender(), metrics.clone()),
@@ -429,15 +430,15 @@ async fn test_m7_anti_doh_bypass_filter_and_pipeline() {
 
     let pipeline_trusted = Arc::new(
         sito::pipeline::DnsPipeline::new(
-            Arc::new(config_trusted_only),
+            Arc::new(ArcSwap::new(Arc::new(config_trusted_only))),
             filter_engine.clone(),
             cache.clone(),
             upstream.clone(),
             dnssec.clone(),
-            client_registry.clone(),
+            Arc::new(ArcSwap::new(client_registry.clone())),
             parental.clone(),
             service.clone(),
-            rewrites.clone(),
+            Arc::new(ArcSwap::new(rewrites.clone())),
             in_flight.clone(),
         )
         .with_stats(querylog_writer.sender(), metrics.clone()),

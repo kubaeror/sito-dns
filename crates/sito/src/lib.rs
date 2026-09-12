@@ -119,15 +119,15 @@ mod tests {
         let metrics = sito_stats::MetricsRegistry::new("1.2.1", "test");
 
         let pipeline = DnsPipeline::new(
-            Arc::new(config.clone()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(config.clone()))),
             filter,
             cache.clone(),
             upstream,
             dnssec,
-            clients,
+            Arc::new(arc_swap::ArcSwap::new(clients.clone())),
             parental,
             services,
-            rewrites,
+            Arc::new(arc_swap::ArcSwap::new(rewrites.clone())),
             in_flight,
         )
         .with_stats(querylog_writer.sender(), metrics);
@@ -263,15 +263,15 @@ mod tests {
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
 
         let pipeline = DnsPipeline::new(
-            Arc::new(config.clone()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(config.clone()))),
             filter,
             cache,
             upstream,
             dnssec,
-            clients,
+            Arc::new(arc_swap::ArcSwap::new(clients.clone())),
             parental,
             services,
-            rewrites,
+            Arc::new(arc_swap::ArcSwap::new(rewrites.clone())),
             in_flight,
         );
 
@@ -423,15 +423,15 @@ mod tests {
         let metrics = sito_stats::MetricsRegistry::new("test", "test");
 
         let pipeline = DnsPipeline::new(
-            Arc::new(base.clone()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(base.clone()))),
             filter,
             cache,
             global_upstream,
             dnssec,
-            clients,
+            Arc::new(arc_swap::ArcSwap::new(clients.clone())),
             parental,
             services,
-            rewrites,
+            Arc::new(arc_swap::ArcSwap::new(rewrites.clone())),
             Arc::new(AtomicUsize::new(0)),
         )
         .with_scoped_upstreams(Arc::new(scoped))
@@ -555,15 +555,15 @@ mod tests {
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
 
         let pipeline = DnsPipeline::new(
-            Arc::new(config.clone()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(config.clone()))),
             filter,
             cache,
             upstream,
             dnssec,
-            clients,
+            Arc::new(arc_swap::ArcSwap::new(clients.clone())),
             parental,
             services,
-            rewrites,
+            Arc::new(arc_swap::ArcSwap::new(rewrites.clone())),
             in_flight,
         );
 
@@ -839,15 +839,15 @@ mod tests {
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
 
         let pipeline = DnsPipeline::new(
-            Arc::new(config.clone()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(config.clone()))),
             filter,
             cache.clone(),
             upstream,
             dnssec,
-            clients,
+            Arc::new(arc_swap::ArcSwap::new(clients.clone())),
             parental,
             services,
-            rewrites,
+            Arc::new(arc_swap::ArcSwap::new(rewrites.clone())),
             in_flight,
         );
 

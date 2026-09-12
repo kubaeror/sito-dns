@@ -346,4 +346,44 @@ mod tests {
         compiled.collect_candidates("google.com", &interner, &mut candidates);
         assert!(candidates.is_empty());
     }
+
+    #[test]
+    fn test_candidate_order_is_deterministic_across_insertion_order() {
+        fn build(indices: [usize; 3]) -> (CompiledRuleSet, LabelInterner) {
+            let mut interner = LabelInterner::new();
+            let mut builder = RuleSetBuilder::new();
+            // Three rules with distinct ids that all match "ads.tracker.example".
+            let rules: Vec<(&str, u32)> = vec![
+                ("ads.", 10),
+                ("tracker", 20),
+                (r"^ads\.tracker\.example$", 30),
+            ];
+            // Insert the same rules in the caller-provided order.
+            for index in indices {
+                match index {
+                    0 => builder.add_prefix(rules[0].0.to_string(), rules[0].1),
+                    1 => builder.add_substring(rules[1].0.to_string(), rules[1].1),
+                    2 => builder.add_regex(rules[2].0.to_string(), rules[2].1),
+                    _ => unreachable!(),
+                }
+            }
+            (builder.build(&mut interner), interner)
+        }
+
+        let mut results = Vec::new();
+        for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0], [2, 0, 1]] {
+            let (compiled, interner) = build(order);
+            let mut candidates = Vec::new();
+            compiled.collect_candidates("ads.tracker.example", &interner, &mut candidates);
+            assert_eq!(candidates.len(), 3, "all three rules must match");
+            results.push(candidates);
+        }
+
+        // Precedence may not depend on the hash-map iteration order.
+        for candidates in &results {
+            assert_eq!(candidates, &results[0]);
+        }
+        // Within each source the lowest rule id wins first.
+        assert_eq!(results[0][0], 10);
+    }
 }
