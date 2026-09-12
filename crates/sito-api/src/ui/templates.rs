@@ -128,6 +128,8 @@ pub struct FilteringTemplate<'a> {
     pub version: &'a str,
     pub lists: &'a [FilterListDto],
     pub custom_rules: &'a str,
+    /// Metadata of the curated lists bundled into the binary.
+    pub bundled_lists: Vec<sito_clients::BundledList>,
 }
 
 #[derive(Template)]

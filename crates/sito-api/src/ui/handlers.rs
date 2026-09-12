@@ -535,6 +535,16 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
 
     let custom_rules = cfg.filtering.custom_rules.join("\n");
 
+    // Curated lists bundled into the binary (parental categories + services).
+    let mut bundled_lists = sito_clients::ParentalRegistry::bundled().lists().to_vec();
+    bundled_lists.extend(
+        sito_clients::ServiceRegistry::bundled()
+            .lists()
+            .iter()
+            .cloned(),
+    );
+    bundled_lists.sort_by(|a, b| a.id.cmp(&b.id));
+
     HtmlTemplate(FilteringTemplate {
         is_authenticated: true,
         username: &user.username,
@@ -543,6 +553,7 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
         version: env!("CARGO_PKG_VERSION"),
         lists: &lists,
         custom_rules: &custom_rules,
+        bundled_lists,
     })
     .into_response()
 }

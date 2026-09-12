@@ -94,6 +94,43 @@
   </div>
 </div>
 
+<!-- Built-in curated lists -->
+<div class="card" style="margin-bottom: 24px;">
+  <div class="card-header">
+    <div class="card-title">Built-in Curated Lists</div>
+    <span class="badge badge-neutral">built-in (minimal)</span>
+  </div>
+  <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 16px;">
+    Versioned fallback data for parental controls and service blocking, verified against the bundled manifest at startup. Subscribe to a full blocklist above for broader coverage.
+  </p>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>List</th>
+          <th>Version</th>
+          <th style="text-align: right;">Entries</th>
+          <th>License</th>
+          <th>Source</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for list in bundled_lists %}
+        <tr>
+          <td class="td-strong">{{ list.id }}</td>
+          <td class="mono" style="font-size: 0.8rem;">{{ list.version }}</td>
+          <td style="text-align: right; font-weight: 600;">{{ list.entries }}</td>
+          <td>{{ list.license }}</td>
+          <td class="mono" style="font-size: 0.8rem; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+            <a href="{{ list.source }}" target="_blank" rel="noopener">{{ list.source }}</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
 <!-- Custom Rules & Simulation -->
 <div class="grid-2">
   <div class="card">

@@ -193,8 +193,12 @@ mod tests {
             version: "1.2.1",
             lists: &[],
             custom_rules: "||ad.com^",
+            bundled_lists: sito_clients::ParentalRegistry::bundled().lists().to_vec(),
         };
-        assert!(filter_tmpl.render().is_ok());
+        let filtering_html = filter_tmpl.render().expect("render filtering page");
+        assert!(filtering_html.contains("built-in (minimal)"));
+        assert!(filtering_html.contains("adult"));
+        assert!(filtering_html.contains("CC0-1.0"));
 
         let rewrites_tmpl = RewritesTemplate {
             is_authenticated: true,
