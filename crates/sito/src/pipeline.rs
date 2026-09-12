@@ -5,7 +5,9 @@ use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use sito_cache::DnsCache;
-use sito_clients::{ClientRegistry, ParentalRegistry, ServiceRegistry, match_safe_search};
+use sito_clients::{
+    ClientRegistry, EffectivePolicy, ParentalRegistry, ServiceRegistry, match_safe_search,
+};
 use sito_core::FilterEngine;
 use sito_core::client::ClientContext;
 use sito_core::config::Config;
@@ -66,16 +68,6 @@ impl QueryOutcome {
             qtype,
             dnssec: None,
         }
-    }
-
-    fn anti_doh_blocked(response: Message, domain_str: String, qtype: RecordType) -> Self {
-        Self::blocked(
-            response,
-            Some("anti_doh_bypass".to_string()),
-            Some("anti_doh_bypass".to_string()),
-            domain_str,
-            qtype,
-        )
     }
 
     fn rewritten(response: Message, domain_str: String, qtype: RecordType) -> Self {
@@ -302,6 +294,178 @@ impl DnsPipeline {
     }
 }
 
+impl DnsPipeline {
+    /// Builds a blocked response for the configured blocking mode.
+    fn blocked_outcome(
+        query: &Message,
+        config: &Config,
+        query_id: u16,
+        domain_str: &str,
+        qtype: RecordType,
+        rule: Option<&str>,
+        source: Option<&str>,
+    ) -> QueryOutcome {
+        let resp = make_blocked_response(
+            query,
+            &config.filtering.blocking_mode,
+            config.filtering.blocking_ttl,
+            query_id,
+        );
+        QueryOutcome::blocked(
+            resp,
+            rule.map(str::to_string),
+            source.map(str::to_string),
+            domain_str.to_string(),
+            qtype,
+        )
+    }
+
+    /// Anti-DoH bypass check by requested domain name.
+    fn anti_doh_blocked_by_domain(
+        &self,
+        query: &Message,
+        config: &Config,
+        query_id: u16,
+        domain_str: &str,
+        qtype: RecordType,
+    ) -> Option<QueryOutcome> {
+        if !self.anti_bypass.matches_domain(domain_str) {
+            return None;
+        }
+        info!(
+            qname = %domain_str,
+            "Query blocked by Anti-DoH bypass rule (resolver domain)"
+        );
+        if let Some(ref m) = self.metrics {
+            m.inc_doh_bypass_blocked();
+        }
+        Some(Self::blocked_outcome(
+            query,
+            config,
+            query_id,
+            domain_str,
+            qtype,
+            Some("anti_doh_bypass"),
+            Some("anti_doh_bypass"),
+        ))
+    }
+
+    /// Anti-DoH bypass check by resolved A/AAAA addresses.
+    #[allow(clippy::too_many_arguments)]
+    fn anti_doh_blocked_by_answers(
+        &self,
+        query: &Message,
+        config: &Config,
+        answers: &[Record],
+        query_id: u16,
+        domain_str: &str,
+        qtype: RecordType,
+        origin: &'static str,
+    ) -> Option<QueryOutcome> {
+        if !answers_contain_bypass_ip(&self.anti_bypass, answers) {
+            return None;
+        }
+        info!(
+            qname = %domain_str,
+            origin,
+            "Query blocked by Anti-DoH bypass (resolved IP)"
+        );
+        if let Some(ref m) = self.metrics {
+            m.inc_doh_bypass_blocked();
+        }
+        Some(Self::blocked_outcome(
+            query,
+            config,
+            query_id,
+            domain_str,
+            qtype,
+            Some("anti_doh_bypass"),
+            Some("anti_doh_bypass"),
+        ))
+    }
+
+    /// Parental, service and standard filter stages (ADR-0007 stage 3).
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_filter_stages(
+        &self,
+        query: &Message,
+        config: &Config,
+        client: &ClientContext,
+        policy: &EffectivePolicy,
+        domain_str: &str,
+        qtype: RecordType,
+        query_id: u16,
+    ) -> Option<QueryOutcome> {
+        if policy.parental
+            && self.parental.matches_any_category(
+                policy.parental_categories.iter().map(String::as_str),
+                domain_str,
+            )
+        {
+            info!(
+                qname = %domain_str,
+                qtype = ?qtype,
+                "Query blocked by parental control category"
+            );
+            return Some(Self::blocked_outcome(
+                query,
+                config,
+                query_id,
+                domain_str,
+                qtype,
+                Some("parental"),
+                None,
+            ));
+        }
+
+        if !policy.active_blocked_services.is_empty()
+            && self
+                .services
+                .matches_any_service(
+                    policy.active_blocked_services.iter().map(String::as_str),
+                    domain_str,
+                )
+                .is_some()
+        {
+            info!(
+                qname = %domain_str,
+                qtype = ?qtype,
+                "Query blocked by service blocking policy"
+            );
+            return Some(Self::blocked_outcome(
+                query,
+                config,
+                query_id,
+                domain_str,
+                qtype,
+                Some("service"),
+                None,
+            ));
+        }
+
+        let qname = Name::from_str(domain_str).ok()?;
+        match self.filter.evaluate_standard(&qname, qtype, client) {
+            Verdict::Block(verdict) => {
+                info!(
+                    qname = %domain_str,
+                    qtype = ?qtype,
+                    verdict = ?verdict,
+                    "Query blocked by standard filter"
+                );
+                Some(Self::blocked_outcome(
+                    query, config, query_id, domain_str, qtype, None, None,
+                ))
+            }
+            Verdict::Rewrite(action) => {
+                debug!(qname = %domain_str, "Query rewritten by standard filter rule");
+                let resp = make_rewrite_response(query, &action, query_id);
+                Some(QueryOutcome::rewritten(resp, domain_str.to_string(), qtype))
+            }
+            Verdict::Allow(_) => None,
+        }
+    }
+}
+
 impl QueryHandler for DnsPipeline {
     async fn handle(&self, query: Message, client: ClientContext) -> Option<Message> {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
@@ -378,21 +542,11 @@ impl QueryHandler for DnsPipeline {
             };
 
             // Anti-DoH bypass: check if domain matches known public resolver
-            if bypass_check_needed && self.anti_bypass.matches_domain(&domain_str) {
-                info!(
-                    qname = %qname,
-                    "Query blocked by Anti-DoH bypass rule (resolver domain)"
-                );
-                if let Some(ref m) = self.metrics {
-                    m.inc_doh_bypass_blocked();
-                }
-                let resp = make_blocked_response(
-                    &query,
-                    &config.filtering.blocking_mode,
-                    config.filtering.blocking_ttl,
-                    query_id,
-                );
-                return QueryOutcome::anti_doh_blocked(resp, domain_str, qtype);
+            if bypass_check_needed
+                && let Some(outcome) =
+                    self.anti_doh_blocked_by_domain(&query, config, query_id, &domain_str, qtype)
+            {
+                return outcome;
             }
 
             // ADR-0007 Stage 1: $important filter rules (takes precedence over local rewrites)
@@ -408,13 +562,15 @@ impl QueryHandler for DnsPipeline {
                             verdict = ?verdict,
                             "Query blocked by $important filter rule"
                         );
-                        let resp = make_blocked_response(
+                        return Self::blocked_outcome(
                             &query,
-                            &config.filtering.blocking_mode,
-                            config.filtering.blocking_ttl,
+                            config,
                             query_id,
+                            &domain_str,
+                            qtype,
+                            None,
+                            None,
                         );
-                        return QueryOutcome::blocked(resp, None, None, domain_str, qtype);
                     }
                     Verdict::Rewrite(action) => {
                         debug!(qname = %qname, "Query rewritten by $important rule");
@@ -442,89 +598,19 @@ impl QueryHandler for DnsPipeline {
             }
 
             // ADR-0007 Stage 3: Standard filtering, Parental Control, and Service Blocking
-            if policy.is_filtering_enabled && !important_allowed {
-                // 3a. Parental Control categories (adult, gambling)
-                if policy.parental
-                    && self.parental.matches_any_category(
-                        policy.parental_categories.iter().map(String::as_str),
-                        &domain_str,
-                    )
-                {
-                    info!(
-                        qname = %qname,
-                        qtype = ?qtype,
-                        "Query blocked by parental control category"
-                    );
-                    let resp = make_blocked_response(
-                        &query,
-                        &config.filtering.blocking_mode,
-                        config.filtering.blocking_ttl,
-                        query_id,
-                    );
-                    return QueryOutcome::blocked(
-                        resp,
-                        Some("parental".to_string()),
-                        None,
-                        domain_str,
-                        qtype,
-                    );
-                }
-
-                // 3b. Blocked services (e.g. TikTok, YouTube, etc.)
-                if !policy.active_blocked_services.is_empty()
-                    && self
-                        .services
-                        .matches_any_service(
-                            policy.active_blocked_services.iter().map(String::as_str),
-                            &domain_str,
-                        )
-                        .is_some()
-                {
-                    info!(
-                        qname = %qname,
-                        qtype = ?qtype,
-                        "Query blocked by service blocking policy"
-                    );
-                    let resp = make_blocked_response(
-                        &query,
-                        &config.filtering.blocking_mode,
-                        config.filtering.blocking_ttl,
-                        query_id,
-                    );
-                    return QueryOutcome::blocked(
-                        resp,
-                        Some("service".to_string()),
-                        None,
-                        domain_str,
-                        qtype,
-                    );
-                }
-
-                // 3c. Standard filter rules
-                let verdict = self.filter.evaluate_standard(qname, qtype, &client);
-                match verdict {
-                    Verdict::Block(_) => {
-                        info!(
-                            qname = %qname,
-                            qtype = ?qtype,
-                            verdict = ?verdict,
-                            "Query blocked by standard filter"
-                        );
-                        let resp = make_blocked_response(
-                            &query,
-                            &config.filtering.blocking_mode,
-                            config.filtering.blocking_ttl,
-                            query_id,
-                        );
-                        return QueryOutcome::blocked(resp, None, None, domain_str, qtype);
-                    }
-                    Verdict::Rewrite(action) => {
-                        debug!(qname = %qname, "Query rewritten by standard filter rule");
-                        let resp = make_rewrite_response(&query, &action, query_id);
-                        return QueryOutcome::rewritten(resp, domain_str, qtype);
-                    }
-                    Verdict::Allow(_) => {}
-                }
+            if policy.is_filtering_enabled
+                && !important_allowed
+                && let Some(outcome) = self.evaluate_filter_stages(
+                    &query,
+                    config,
+                    &client,
+                    &policy,
+                    &domain_str,
+                    qtype,
+                    query_id,
+                )
+            {
+                return outcome;
             }
 
             // ADR-0007 Stage 4: Safe Search CNAME rewrites (Google, Bing, YouTube, DuckDuckGo)
@@ -564,22 +650,17 @@ impl QueryHandler for DnsPipeline {
                 };
                 if let Some(mut cached_resp) = cached {
                     if bypass_check_needed
-                        && answers_contain_bypass_ip(&self.anti_bypass, &cached_resp.answers)
-                    {
-                        info!(
-                            qname = %qname,
-                            "Cached query blocked by Anti-DoH bypass (resolved IP)"
-                        );
-                        if let Some(ref m) = self.metrics {
-                            m.inc_doh_bypass_blocked();
-                        }
-                        let resp = make_blocked_response(
+                        && let Some(outcome) = self.anti_doh_blocked_by_answers(
                             &query,
-                            &config.filtering.blocking_mode,
-                            config.filtering.blocking_ttl,
+                            config,
+                            &cached_resp.answers,
                             query_id,
-                        );
-                        return QueryOutcome::anti_doh_blocked(resp, domain_str, qtype);
+                            &domain_str,
+                            qtype,
+                            "cache",
+                        )
+                    {
+                        return outcome;
                     }
 
                     debug!(qname = %qname, qtype = ?qtype, "Cache hit");
@@ -655,22 +736,17 @@ impl QueryHandler for DnsPipeline {
 
                     // Anti-DoH bypass: inspect resolved A and AAAA records for known resolver IPs
                     if bypass_check_needed
-                        && answers_contain_bypass_ip(&self.anti_bypass, &upstream_resp.answers)
-                    {
-                        info!(
-                            qname = %qname,
-                            "Upstream query blocked by Anti-DoH bypass (resolved IP)"
-                        );
-                        if let Some(ref m) = self.metrics {
-                            m.inc_doh_bypass_blocked();
-                        }
-                        let resp = make_blocked_response(
+                        && let Some(outcome) = self.anti_doh_blocked_by_answers(
                             &query,
-                            &config.filtering.blocking_mode,
-                            config.filtering.blocking_ttl,
+                            config,
+                            &upstream_resp.answers,
                             query_id,
-                        );
-                        return QueryOutcome::anti_doh_blocked(resp, domain_str, qtype);
+                            &domain_str,
+                            qtype,
+                            "upstream",
+                        )
+                    {
+                        return outcome;
                     }
 
                     // 7. CNAME uncloaking: inspect any CNAME targets against FilterEngine
@@ -690,18 +766,14 @@ impl QueryHandler for DnsPipeline {
                                         via_cname = true,
                                         "Query blocked via CNAME uncloaking"
                                     );
-                                    let resp = make_blocked_response(
+                                    return Self::blocked_outcome(
                                         &query,
-                                        &config.filtering.blocking_mode,
-                                        config.filtering.blocking_ttl,
+                                        config,
                                         query_id,
-                                    );
-                                    return QueryOutcome::blocked(
-                                        resp,
-                                        Some("cname_uncloaking".to_string()),
-                                        None,
-                                        domain_str,
+                                        &domain_str,
                                         qtype,
+                                        Some("cname_uncloaking"),
+                                        None,
                                     );
                                 }
                             }
