@@ -17,6 +17,12 @@ doh_port = 443
 # DoQ is disabled by default because its default port (853/udp) conflicts
 # with DoT when bound on the same wildcard address.
 doq_port = 0
+# DNS-over-HTTP/3 uses UDP; 0 disables it.
+doh3_port = 443
+# Restrict DoH/DoH3 to one Host/SNI (empty accepts any hostname).
+# doh_dedicated_hostname = "dns.example.com"
+# RFC 7830/8467 padding on DoT responses.
+dot_padding = false
 edns_udp_size = 1232
 rate_limit_per_ip = 20
 max_tcp_connections = 256
@@ -33,8 +39,14 @@ prefetch = false
 serve_stale_hours = 0
 
 [dns.dnssec]
+# "validate" (bogus -> SERVFAIL), "log_only" (log and clear AD) or "off".
+mode = "validate"
 validate = false
-ntp = []
+# Negative Trust Anchors: domains exempt from validation (RFC 7646).
+nta = []
+# Optional explicit trust anchors ("zone:algorithm:base64key"); empty uses
+# the built-in root anchors.
+trust_anchors = []
 
 [upstream]
 # Upstream schemes supported: tls:// (DoT), https:// (DoH), quic:// (DoQ)
@@ -59,8 +71,41 @@ custom_rules = [
     "127.0.0.1 tracker.bad.net"
 ]
 
+[auth]
+session_ttl_hours = 24
+login_rate_limit = 5
+# Persist sessions/tokens (0600 files in data_dir) across restarts.
+session_persist = true
+# Default API-token lifetime in days; 0 = no expiry.
+token_default_ttl_days = 0
+
+[stats]
+retention_days = 90
+
 [privacy]
 anonymize_querylog = false
+
+# High availability (slave role connects to the master over mTLS WebSocket).
+# [ha]
+# replication_port = 8953
+# listen_addr = "0.0.0.0"
+# master_url = "wss://192.168.1.10:8953"
+# master_fingerprint = "blake3:..."
+# master_pubkey = "<ed25519 hex>"   # required on slaves
+# cert = "/etc/sito/ha.crt"
+# key = "/etc/sito/ha.key"
+# ca = "/etc/sito/ha-ca.crt"
+# ping_interval_secs = 15
+# stats_interval_secs = 30
+# slave_token = "change-me"          # required for plaintext ws:// only
+
+# RouterOS DHCP lease discovery for client identification.
+# [integrations.mikrotik]
+# enabled = false
+# url = "https://192.168.1.1"
+# username = "api"
+# password_env = "MIKROTIK_PASSWORD"
+# interval_s = 300
 
 [web]
 enabled = true
