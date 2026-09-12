@@ -6,7 +6,8 @@ use hickory_proto::rr::rdata::{A, AAAA, CNAME};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use sito_cache::DnsCache;
 use sito_clients::{
-    ClientRegistry, EffectivePolicy, ParentalRegistry, ServiceRegistry, match_safe_search,
+    ClientRegistry, EffectivePolicy, ParentalRegistry, RuntimeLists, ServiceRegistry,
+    match_safe_search,
 };
 use sito_core::FilterEngine;
 use sito_core::client::ClientContext;
@@ -209,8 +210,7 @@ pub struct DnsPipeline {
     cache: Arc<DnsCache>,
     upstream: Arc<UpstreamManager>,
     dnssec: Arc<DnssecValidator>,
-    parental: Arc<ParentalRegistry>,
-    services: Arc<ServiceRegistry>,
+    lists: Arc<RuntimeLists>,
     in_flight: Arc<AtomicUsize>,
     prefetch_semaphore: Arc<tokio::sync::Semaphore>,
     querylog: Option<sito_stats::QueryLogSender>,
@@ -234,6 +234,7 @@ impl DnsPipeline {
         in_flight: Arc<AtomicUsize>,
     ) -> Self {
         let runtime = Arc::new(RuntimeState::new(config, clients, rewrites));
+        let lists = Arc::new(RuntimeLists::from_arcs(parental, services));
         Self {
             runtime,
             filter,
@@ -241,8 +242,7 @@ impl DnsPipeline {
             cache,
             upstream,
             dnssec,
-            parental,
-            services,
+            lists,
             in_flight,
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             querylog: None,
@@ -262,6 +262,13 @@ impl DnsPipeline {
     #[must_use]
     pub fn with_runtime(mut self, runtime: Arc<RuntimeState>) -> Self {
         self.runtime = runtime;
+        self
+    }
+
+    /// Shares runtime-refreshable parental/service registries with the server.
+    #[must_use]
+    pub fn with_runtime_lists(mut self, lists: Arc<RuntimeLists>) -> Self {
+        self.lists = lists;
         self
     }
 
@@ -396,8 +403,9 @@ impl DnsPipeline {
         qtype: RecordType,
         query_id: u16,
     ) -> Option<QueryOutcome> {
+        let parental = self.lists.parental();
         if policy.parental
-            && self.parental.matches_any_category(
+            && parental.matches_any_category(
                 policy.parental_categories.iter().map(String::as_str),
                 domain_str,
             )
@@ -418,9 +426,9 @@ impl DnsPipeline {
             ));
         }
 
+        let services = self.lists.services();
         if !policy.active_blocked_services.is_empty()
-            && self
-                .services
+            && services
                 .matches_any_service(
                     policy.active_blocked_services.iter().map(String::as_str),
                     domain_str,

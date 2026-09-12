@@ -58,6 +58,10 @@ SECTIONS: dict[int, tuple[str, list[tuple[str, str]]]] = {
     ),
     13: ("`[ha]`", [("crates/sito-ha/src/config.rs", "HaConfig")]),
     14: ("`[integrations.mikrotik]`", [("crates/sito-clients/src/routeros.rs", "RouterOsConfig")]),
+    15: (
+        "`[integrations.lists]`",
+        [("crates/sito-clients/src/runtime_lists.rs", "ListCategoriesConfig")],
+    ),
 }
 
 # Fields that are containers for other documented sections or documented

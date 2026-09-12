@@ -99,6 +99,15 @@ anonymize_querylog = false
 # stats_interval_secs = 30
 # slave_token = "change-me"          # required for plaintext ws:// only
 
+# Curated parental/service list updates (bundled data is the fallback).
+# [integrations.lists]
+# refresh_hours = 24
+# [integrations.lists.categories.adult]
+# url = "https://lists.example.com/adult.txt"
+# license = "CC0-1.0"
+# [integrations.lists.categories.services]
+# url = "https://lists.example.com/services.json"
+
 # RouterOS DHCP lease discovery for client identification.
 # [integrations.mikrotik]
 # enabled = false

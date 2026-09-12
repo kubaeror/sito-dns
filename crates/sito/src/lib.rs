@@ -680,6 +680,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_curated_list_refresh_replaces_bundled_data() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_list_refresh_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let source_path = temp_dir.join("adult.txt");
+        std::fs::write(&source_path, "refreshed.example\nsub.refreshed.example\n").unwrap();
+
+        let mut lists_cfg = sito_clients::ListCategoriesConfig::default();
+        lists_cfg.categories.insert(
+            "adult".to_string(),
+            sito_clients::ListSourceConfig {
+                url: format!("file://{}", source_path.display()),
+                refresh_hours: None,
+                license: Some("CC0-1.0".to_string()),
+            },
+        );
+        lists_cfg.validate().unwrap();
+
+        let store = Arc::new(sito_clients::RuntimeLists::from_arcs(
+            Arc::new(ParentalRegistry::bundled()),
+            Arc::new(ServiceRegistry::bundled()),
+        ));
+        assert!(store.parental().matches_category("adult", "pornhub.com"));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let refresh_handle = tokio::spawn(crate::server::run_list_refresh(
+            lists_cfg,
+            store.clone(),
+            temp_dir.clone(),
+            shutdown_rx,
+        ));
+
+        let mut refreshed = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if store
+                .parental()
+                .matches_category("adult", "sub.refreshed.example")
+            {
+                refreshed = true;
+                break;
+            }
+        }
+        assert!(refreshed, "curated list refresh did not apply");
+        assert!(
+            store
+                .parental()
+                .matches_category("adult", "refreshed.example")
+        );
+        assert!(
+            !store.parental().matches_category("adult", "pornhub.com"),
+            "refreshed list must replace the bundled fallback"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), refresh_handle).await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
     async fn test_dns_listener_rebinds_on_port_change() {
         let reserve_udp_port = || {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();

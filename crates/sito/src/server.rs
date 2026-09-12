@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,6 +29,7 @@ use crate::pipeline::DnsPipeline;
 #[derive(serde::Deserialize, Default)]
 struct IntegrationsConfig {
     mikrotik: Option<sito_clients::RouterOsConfig>,
+    lists: Option<sito_clients::ListCategoriesConfig>,
 }
 
 /// Runs the complete sito DNS server with graceful shutdown handling.
@@ -174,6 +175,25 @@ pub async fn run_server_full(
     // Initialize parental and service registries
     let parental_registry = Arc::new(sito_clients::ParentalRegistry::bundled());
     let service_registry = Arc::new(sito_clients::ServiceRegistry::bundled());
+    let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
+        parental_registry.clone(),
+        service_registry.clone(),
+    ));
+    if let Some(ref int_val) = config.integrations
+        && let Ok(integrations) = int_val.clone().try_into::<IntegrationsConfig>()
+        && let Some(lists_cfg) = integrations.lists
+    {
+        if let Err(e) = lists_cfg.validate() {
+            warn!("Ignoring invalid [integrations.lists] configuration: {e}");
+        } else if !lists_cfg.categories.is_empty() {
+            let lists_store = runtime_lists.clone();
+            let lists_data_dir = config.server.data_dir.clone();
+            let lists_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                run_list_refresh(lists_cfg, lists_store, lists_data_dir, lists_shutdown).await;
+            });
+        }
+    }
 
     // Initialize local rewrites table
     let rewrites_config: sito_rewrites::RewritesConfig = config
@@ -221,6 +241,7 @@ pub async fn run_server_full(
             in_flight.clone(),
         )
         .with_runtime(runtime.clone())
+        .with_runtime_lists(runtime_lists.clone())
         .with_scoped_upstreams(scoped_upstreams)
         .with_stats(querylog_sender.clone(), metrics.clone()),
     );
@@ -905,6 +926,74 @@ pub async fn run_server_full(
 
     info!("Graceful shutdown complete, exiting");
     Ok(())
+}
+
+/// Periodically refreshes `[integrations.lists]` categories through the
+/// shared subscription downloader (ETag/disk cache/size caps) and swaps the
+/// runtime registries on success.
+pub(crate) async fn run_list_refresh(
+    config: sito_clients::ListCategoriesConfig,
+    store: Arc<sito_clients::RuntimeLists>,
+    data_dir: PathBuf,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let fetcher = sito_filter::subscription::SubscriptionFetcher::default();
+    let default_hours = config.refresh_hours.max(1);
+    let mut entries: Vec<(String, String, Duration, tokio::time::Instant)> = config
+        .categories
+        .into_iter()
+        .map(|(name, source)| {
+            let hours = source.refresh_hours.unwrap_or(default_hours).max(1);
+            (
+                name,
+                source.url,
+                Duration::from_secs(hours.saturating_mul(3600)),
+                tokio::time::Instant::now(),
+            )
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+
+    while let Some((next_idx, _)) = entries.iter().enumerate().min_by_key(|(_, entry)| entry.3) {
+        let wait = entries[next_idx]
+            .3
+            .saturating_duration_since(tokio::time::Instant::now());
+
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            () = tokio::time::sleep(wait) => {
+                let name = entries[next_idx].0.clone();
+                let url = entries[next_idx].1.clone();
+                let cache_name = format!("integration-{name}");
+                match fetcher.fetch_or_cached(&cache_name, &url, &data_dir).await {
+                    Ok(content) => match store.apply_content(&name, &content) {
+                        Ok(()) => info!(
+                            category = %name,
+                            url = %url,
+                            "Refreshed curated list category"
+                        ),
+                        Err(e) => warn!(
+                            category = %name,
+                            "Ignoring invalid refreshed curated list: {e}"
+                        ),
+                    },
+                    Err(e) => warn!(
+                        category = %name,
+                        url = %url,
+                        "Failed to refresh curated list: {e}"
+                    ),
+                }
+                entries[next_idx].3 =
+                    tokio::time::Instant::now() + entries[next_idx].2;
+            }
+        }
+    }
 }
 
 /// TLS acceptor managers shared with the config watcher so listeners can be

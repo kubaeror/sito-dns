@@ -46,6 +46,12 @@ impl ParentalRegistry {
         &self.lists
     }
 
+    /// Replaces the content of a category with a newline-delimited text list.
+    pub fn set_category_list(&mut self, category: &str, content: &str) {
+        self.categories.remove(&category.to_ascii_lowercase());
+        self.add_category_list(category, content);
+    }
+
     /// Add or append domains from a newline-delimited text list to a category.
     pub fn add_category_list(&mut self, category: &str, content: &str) {
         let cat_set = self

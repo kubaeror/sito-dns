@@ -3086,6 +3086,7 @@ dependencies = [
 name = "sito-clients"
 version = "1.4.0"
 dependencies = [
+ "arc-swap",
  "blake3",
  "chrono",
  "croner",

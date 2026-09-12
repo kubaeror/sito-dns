@@ -379,3 +379,31 @@ interval_s = 300
 | `password_env` | string | `None` | Environment variable containing the RouterOS password. |
 | `allow_invalid_certs` | boolean | `false` | Accept untrusted/self-signed RouterOS TLS certificates (insecure; lab use only). |
 | `interval_s` | integer | `300` | Polling interval in seconds to refresh active DHCP lease table. |
+
+---
+
+## 15. `[integrations.lists]` — Curated List Updates
+
+Point the bundled parental/service categories at maintained sources; a
+background task downloads them through the shared subscription downloader
+(ETag/If-Modified-Since, disk cache under `data_dir`, size caps) and swaps the
+runtime registries without a restart. The bundled data remains the fallback
+until the first successful refresh.
+
+```toml
+[integrations.lists]
+refresh_hours = 24
+
+[integrations.lists.categories.adult]
+url = "https://lists.example.com/adult.txt"
+license = "CC0-1.0"
+# refresh_hours = 12
+
+[integrations.lists.categories.services]
+url = "https://lists.example.com/services.json"
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `refresh_hours` | integer | `24` | Default refresh interval in hours for categories without an override (must be greater than 0). |
+| `categories` | table (map of category → source) | `{}` | Sources keyed by category id (`adult`, `gambling`, `services`, or any custom parental category). Each entry has a required `url` (`https://`, `http://` or `file://`), an optional `refresh_hours` override and an optional `license` string for operator reference. Refreshed domain lists replace the bundled content of that category; `services` expects service JSON. |
