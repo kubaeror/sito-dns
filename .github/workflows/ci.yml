@@ -69,7 +69,7 @@ jobs:
       - name: Install shellcheck if missing
         run: command -v shellcheck >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y shellcheck)
       - name: Run shellcheck
-        run: shellcheck -S error contrib/install.sh
+        run: shellcheck -S warning contrib/install.sh
 
   build:
     name: build (${{ matrix.target }})

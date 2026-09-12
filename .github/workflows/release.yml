@@ -63,7 +63,7 @@ jobs:
       - name: Verify installer script with shellcheck
         run: |
           command -v shellcheck >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y shellcheck)
-          shellcheck -S error contrib/install.sh
+          shellcheck -S warning contrib/install.sh
 
       - name: Package release archive
         run: |
