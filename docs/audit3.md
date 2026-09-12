@@ -339,7 +339,8 @@ ignoring the configured `dns.bind`.
 > which fixed several undocumented settings; table generation pending);
 > **WP-1 — partial** (in-response DS/DNSKEY chain walk plus bounded upstream
 > key fetching via `DnssecKeyFetcher`, validated-only key cache with Prometheus
-> hit/miss counters and a fuzz target; NSEC/NSEC3 negative proofs pending);
+> hit/miss counters and a fuzz target; NSEC denial proofs validated with tests,
+> explicit NSEC3 opt-out handling pending);
 > **WP-7 — partial** (versioned bundled-list manifest with source, license and
 > BLAKE3 integrity checks exposed by the registries; curated expansion and
 > runtime refresh pending);

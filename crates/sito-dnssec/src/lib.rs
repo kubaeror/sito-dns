@@ -1226,6 +1226,92 @@ mod tests {
         (answer, sign_test_rrset(&set, signer))
     }
 
+    fn signed_nsec_response(
+        origin: &Name,
+        qname: &Name,
+        dnskey: &DNSKEY,
+        signer: &hickory_proto::dnssec::DnssecSigner,
+        response_code: ResponseCode,
+    ) -> Message {
+        use hickory_proto::dnssec::rdata::NSEC;
+        use hickory_proto::rr::RecordSet;
+
+        let next = Name::from_str("zzz.nsec.example.").unwrap();
+        let nsec = NSEC::new(next, [RecordType::A, RecordType::NSEC, RecordType::RRSIG]);
+        let nsec_record =
+            Record::from_rdata(origin.clone(), 300, RData::DNSSEC(DNSSECRData::NSEC(nsec)));
+        let mut set = RecordSet::new(origin.clone(), RecordType::NSEC, 0);
+        set.insert(nsec_record.clone(), 0);
+        let nsec_sig = sign_test_rrset(&set, signer);
+
+        let mut msg = Message::new(24, MessageType::Response, OpCode::Query);
+        msg.queries.push(Query::query(qname.clone(), RecordType::A));
+        msg.metadata.response_code = response_code;
+        msg.authorities.push(nsec_record);
+        msg.authorities.push(nsec_sig);
+        msg.additionals.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+        ));
+        msg
+    }
+
+    #[test]
+    fn test_nxdomain_with_nsec_is_secure() {
+        let (origin, dnskey, signer) = create_test_signer("nsec.example.");
+        let qname = Name::from_str("missing.nsec.example.").unwrap();
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let mut msg =
+            signed_nsec_response(&origin, &qname, &dnskey, &signer, ResponseCode::NXDomain);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("test"), now);
+
+        assert_eq!(outcome, ValidationOutcome::Secure);
+        assert!(msg.metadata.authentic_data);
+    }
+
+    #[test]
+    fn test_nodata_with_nsec_is_secure() {
+        let (origin, dnskey, signer) = create_test_signer("nsec.example.");
+        let qname = Name::from_str("empty.nsec.example.").unwrap();
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let mut msg =
+            signed_nsec_response(&origin, &qname, &dnskey, &signer, ResponseCode::NoError);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("test"), now);
+
+        assert_eq!(outcome, ValidationOutcome::Secure);
+    }
+
+    #[test]
+    fn test_negative_response_with_untrusted_nsec_is_not_secure() {
+        let (origin, dnskey, signer) = create_test_signer("nsec.example.");
+        let qname = Name::from_str("missing.nsec.example.").unwrap();
+
+        // No anchors: the denial signature verifies cryptographically but the
+        // covering zone is not linked to a trust anchor.
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+
+        let mut msg =
+            signed_nsec_response(&origin, &qname, &dnskey, &signer, ResponseCode::NXDomain);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("test"), now);
+
+        assert_eq!(outcome, ValidationOutcome::Indeterminate);
+        assert!(!msg.metadata.authentic_data);
+    }
+
     #[test]
     fn test_key_cache_metrics_across_validations() {
         let (origin, dnskey, a_record, rrsig_record, _) =
