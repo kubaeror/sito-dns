@@ -394,9 +394,10 @@ pub async fn run_server_full(
         info!("sito admin REST API listening on http://{bound_addr}");
     }
 
-    // Periodic stats retention cleanup task (every 24h)
+    // Periodic stats retention cleanup task (every 24h).
+    // `retention_days` is read on every cycle so config hot-reload applies.
     let retention_db = stats_db.clone();
-    let retention_days = config_arc.load().get_stats_config().retention_days;
+    let retention_config = config_arc.clone();
     let mut retention_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_hours(24));
@@ -409,6 +410,7 @@ pub async fn run_server_full(
                     }
                 }
                 _ = interval.tick() => {
+                    let retention_days = retention_config.load().get_stats_config().retention_days;
                     if let Err(e) = retention_db.cleanup_retention(retention_days).await {
                         warn!("Error during stats retention cleanup: {e}");
                     }
@@ -503,7 +505,7 @@ pub async fn run_server_full(
                                 }
                                 watcher_querylog
                                     .set_anonymize(new_cfg.privacy.anonymize_querylog);
-                                watcher_cache.update_config(new_cfg.dns.cache.clone());
+                                watcher_cache.update_config(new_cfg.dns.cache.clone()).await;
 
                                 watcher_config_arc.store(Arc::new(new_cfg.clone()));
 

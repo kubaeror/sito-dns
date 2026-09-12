@@ -347,7 +347,9 @@ ignoring the configured `dns.bind`.
 > image, SBOM, tightened `deny.toml`, shellcheck `warning`, Docker ownership
 > and release-verification/reproducibility docs);
 > **WP-11 — partial** (`IntoArcSwap` removed in favour of explicit `ArcSwap`,
-> shuffled-order precedence test; `handle` helper extraction pending).
+> shuffled-order precedence test; `handle` helper extraction pending);
+> **WP-6 — partial** (hot cache resize with carry-over, retention read per
+> cycle; atomic `RuntimeSnapshot` and listener/rate/log reload pending).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated

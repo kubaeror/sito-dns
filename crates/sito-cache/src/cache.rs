@@ -14,32 +14,72 @@ use sito_proto::{DNSClass, Message, Name, RData, RecordType, ResponseCode, encod
 use crate::entry::CacheEntry;
 use crate::key::CacheKey;
 
+/// Builds a moka cache with the given capacity in megabytes.
+fn build_cache(size_mb: u64) -> Cache<CacheKey, CacheEntry> {
+    Cache::builder()
+        .weigher(|_key: &CacheKey, value: &CacheEntry| -> u32 { value.estimated_bytes })
+        .max_capacity(size_mb.saturating_mul(1024 * 1024))
+        .build()
+}
+
 /// High-performance concurrent DNS response cache.
+///
+/// The moka cache instance itself sits behind an `ArcSwap` so `size_mb` can be
+/// hot-reloaded: a resize rebuilds the cache and carries over entries that
+/// still fit the new capacity. During the swap both generations briefly
+/// coexist, so peak memory is old + new size.
 pub struct DnsCache {
-    cache: Cache<CacheKey, CacheEntry>,
+    cache: ArcSwap<Cache<CacheKey, CacheEntry>>,
     config: ArcSwap<CacheConfig>,
 }
 
 impl DnsCache {
     /// Create a new DnsCache from configuration.
     pub fn new(config: CacheConfig) -> Self {
-        let max_capacity_bytes = (config.size_mb as u64) * 1024 * 1024;
-
-        let cache = Cache::builder()
-            .weigher(|_key: &CacheKey, value: &CacheEntry| -> u32 { value.estimated_bytes })
-            .max_capacity(max_capacity_bytes)
-            .build();
+        let cache = build_cache(config.size_mb as u64);
 
         Self {
-            cache,
+            cache: ArcSwap::from_pointee(cache),
             config: ArcSwap::new(Arc::new(config)),
         }
     }
 
-    /// Applies hot-reloaded cache settings. Note: `size_mb` changes require a
-    /// restart because the underlying capacity cannot be resized at runtime.
-    pub fn update_config(&self, config: CacheConfig) {
+    /// Applies hot-reloaded cache settings, rebuilding the cache when
+    /// `size_mb` changes.
+    pub async fn update_config(&self, config: CacheConfig) {
+        if self.config.load().size_mb != config.size_mb {
+            self.resize(config.size_mb as u64).await;
+        }
         self.config.store(Arc::new(config));
+    }
+
+    /// Rebuilds the underlying cache with a new capacity in megabytes,
+    /// carrying over live entries on a best-effort basis.
+    ///
+    /// Entries are copied oldest-first in moka iteration order until the new
+    /// capacity is exhausted; anything that does not fit is dropped.
+    pub async fn resize(&self, size_mb: u64) {
+        let capacity_bytes = size_mb.saturating_mul(1024 * 1024);
+        let old = self.cache.load_full();
+        let new_cache = build_cache(size_mb);
+
+        let mut carried = 0u64;
+        let mut carried_bytes = 0u64;
+        for (key, entry) in old.iter() {
+            let weight = u64::from(entry.estimated_bytes.max(1));
+            if carried > 0 && carried_bytes.saturating_add(weight) > capacity_bytes {
+                break;
+            }
+            new_cache.insert((*key).clone(), entry).await;
+            carried += 1;
+            carried_bytes = carried_bytes.saturating_add(weight);
+        }
+        new_cache.run_pending_tasks().await;
+        self.cache.store(Arc::new(new_cache));
+        debug!(
+            "Cache resized to {} MiB (carried over {carried} entries, ~{carried_bytes} bytes)",
+            size_mb
+        );
     }
 
     /// Retrieve a response for the given query from cache, adjusting TTLs according to elapsed time.
@@ -49,8 +89,9 @@ impl DnsCache {
             return None;
         }
 
+        let cache = self.cache.load_full();
         let key = CacheKey::new(name, qtype, qclass);
-        let entry = self.cache.get(&key).await?;
+        let entry = cache.get(&key).await?;
 
         let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
         let max_stale_secs = entry
@@ -62,7 +103,7 @@ impl DnsCache {
                 "Cache entry for {} completely expired (elapsed: {}s, max_stale: {}s)",
                 key.qname, elapsed_secs, max_stale_secs
             );
-            self.cache.invalidate(&key).await;
+            cache.invalidate(&key).await;
             return None;
         }
 
@@ -121,8 +162,9 @@ impl DnsCache {
             return None;
         }
 
+        let cache = self.cache.load_full();
         let key = CacheKey::new(name, qtype, qclass);
-        let entry = self.cache.get(&key).await?;
+        let entry = cache.get(&key).await?;
 
         let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
         let max_stale_secs = entry
@@ -130,7 +172,7 @@ impl DnsCache {
             .saturating_add(config.serve_stale_hours.saturating_mul(3600));
 
         if elapsed_secs >= max_stale_secs {
-            self.cache.invalidate(&key).await;
+            cache.invalidate(&key).await;
             return None;
         }
 
@@ -162,8 +204,9 @@ impl DnsCache {
             return false;
         }
 
+        let cache = self.cache.load_full();
         let key = CacheKey::new(name, qtype, qclass);
-        if let Some(entry) = self.cache.get(&key).await {
+        if let Some(entry) = cache.get(&key).await {
             let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
             if elapsed_secs < entry.max_lifespan_secs {
                 let remaining = entry.max_lifespan_secs - elapsed_secs;
@@ -265,12 +308,12 @@ impl DnsCache {
             "Caching response for {} with lifespan {}s (weight: {}B)",
             key.qname, max_lifespan_secs, estimated_bytes
         );
-        self.cache.insert(key, entry).await;
+        self.cache.load_full().insert(key, entry).await;
     }
 
     /// Invalidate all entries in the cache.
     pub fn flush(&self) {
-        self.cache.invalidate_all();
+        self.cache.load().invalidate_all();
     }
 
     /// Invalidate entries matching the specified domain.
@@ -278,13 +321,14 @@ impl DnsCache {
         let normalized =
             sito_proto::normalize_domain(domain).unwrap_or_else(|_| domain.to_ascii_lowercase());
         let norm_clone = normalized.clone();
-        let _ = self.cache.invalidate_entries_if(move |k, _v| {
+        let cache = self.cache.load();
+        let _ = cache.invalidate_entries_if(move |k, _v| {
             k.qname == norm_clone || k.qname.ends_with(&format!(".{norm_clone}"))
         });
     }
 
     /// Approximate memory weight of cached items in bytes.
     pub fn weighted_size(&self) -> u64 {
-        self.cache.weighted_size()
+        self.cache.load().weighted_size()
     }
 }
