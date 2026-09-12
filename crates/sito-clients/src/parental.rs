@@ -1,14 +1,13 @@
 //! Parental control category blocklists (adult, gambling, etc.).
 
+use crate::bundled::{BundledList, BundledManifest, verified_content};
 use std::collections::{HashMap, HashSet};
-
-const BUNDLED_ADULT: &str = include_str!("bundled/adult.txt");
-const BUNDLED_GAMBLING: &str = include_str!("bundled/gambling.txt");
 
 /// Repository of parental category blocklists.
 #[derive(Debug, Clone)]
 pub struct ParentalRegistry {
     categories: HashMap<String, HashSet<String>>,
+    lists: Vec<BundledList>,
 }
 
 impl Default for ParentalRegistry {
@@ -18,14 +17,33 @@ impl Default for ParentalRegistry {
 }
 
 impl ParentalRegistry {
-    /// Initialize with bundled category lists.
+    /// Initialize with the bundled category lists after verifying their
+    /// manifest checksums.
+    ///
+    /// # Panics
+    /// Panics when the embedded manifest or a bundled file fails its integrity
+    /// check; both are covered by unit tests.
     pub fn bundled() -> Self {
+        let manifest = BundledManifest::bundled();
         let mut reg = Self {
             categories: HashMap::new(),
+            lists: manifest.lists.clone(),
         };
-        reg.add_category_list("adult", BUNDLED_ADULT);
-        reg.add_category_list("gambling", BUNDLED_GAMBLING);
+        for list in &manifest.lists {
+            if list.kind != "domains" {
+                continue;
+            }
+            let content = verified_content(list)
+                .unwrap_or_else(|e| panic!("bundled list integrity check failed: {e}"));
+            reg.add_category_list(&list.id, content);
+        }
         reg
+    }
+
+    /// Metadata (version, source, license, checksum) of the bundled lists.
+    #[must_use]
+    pub fn lists(&self) -> &[BundledList] {
+        &self.lists
     }
 
     /// Add or append domains from a newline-delimited text list to a category.
@@ -116,5 +134,20 @@ mod tests {
         assert!(reg.matches_any_category(cats, "betfair.com"));
         assert!(reg.matches_any_category(cats, "chaturbate.com"));
         assert!(!reg.matches_any_category(cats, "wikipedia.org"));
+    }
+
+    #[test]
+    fn test_bundled_list_metadata_exposed() {
+        let reg = ParentalRegistry::bundled();
+        let adult = reg
+            .lists()
+            .iter()
+            .find(|l| l.id == "adult")
+            .expect("adult list metadata");
+        assert_eq!(adult.kind, "domains");
+        assert!(!adult.version.is_empty());
+        assert!(!adult.source.is_empty());
+        assert_eq!(adult.license, "CC0-1.0");
+        assert_eq!(adult.checksum_blake3.len(), 64);
     }
 }

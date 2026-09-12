@@ -1,14 +1,15 @@
 //! Service blocking engine using bundled `services.json` (compatible with AdGuard format).
 
+use crate::bundled::{BundledList, BundledManifest, verified_content};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-const BUNDLED_SERVICES_JSON: &str = include_str!("bundled/services.json");
 
 /// Service blocking database mapping service IDs to domain patterns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceRegistry {
     services: HashMap<String, Vec<String>>,
+    #[serde(skip)]
+    lists: Vec<BundledList>,
 }
 
 impl Default for ServiceRegistry {
@@ -25,10 +26,29 @@ struct ServiceEntry {
 }
 
 impl ServiceRegistry {
-    /// Load the bundled service definitions.
+    /// Load the bundled service definitions after verifying the manifest
+    /// checksum.
+    ///
+    /// # Panics
+    /// Panics when the embedded manifest or `services.json` fails its integrity
+    /// check; both are covered by unit tests.
     pub fn bundled() -> Self {
-        Self::from_json(BUNDLED_SERVICES_JSON)
-            .unwrap_or_else(|e| panic!("invalid bundled services.json: {e}"))
+        let manifest = BundledManifest::bundled();
+        let list = manifest
+            .list("services")
+            .expect("bundled manifest must contain the services list");
+        let content = verified_content(list)
+            .unwrap_or_else(|e| panic!("bundled list integrity check failed: {e}"));
+        let mut registry = Self::from_json(content)
+            .unwrap_or_else(|e| panic!("invalid bundled services.json: {e}"));
+        registry.lists = vec![list.clone()];
+        registry
+    }
+
+    /// Metadata (version, source, license, checksum) of the loaded bundled list.
+    #[must_use]
+    pub fn lists(&self) -> &[BundledList] {
+        &self.lists
     }
 
     /// Parse service definitions from a JSON string.
@@ -45,6 +65,7 @@ impl ServiceRegistry {
             }
             return Ok(Self {
                 services: normalized,
+                lists: Vec::new(),
             });
         }
 
@@ -59,7 +80,10 @@ impl ServiceRegistry {
             services.insert(entry.id.to_ascii_lowercase(), cleaned);
         }
 
-        Ok(Self { services })
+        Ok(Self {
+            services,
+            lists: Vec::new(),
+        })
     }
 
     /// Check if a domain belongs to the given service.
@@ -152,5 +176,17 @@ mod tests {
         assert!(reg.is_service_domain("custom_app", "sub.custom-app.com"));
         assert!(reg.is_service_domain("custom_app", "cdn.custom.net"));
         assert!(!reg.is_service_domain("custom_app", "other.custom.net"));
+
+        // Ad-hoc registries carry no bundled metadata.
+        assert!(reg.lists().is_empty());
+    }
+
+    #[test]
+    fn test_bundled_service_metadata_exposed() {
+        let reg = ServiceRegistry::bundled();
+        let list = reg.lists().first().expect("services list metadata");
+        assert_eq!(list.id, "services");
+        assert_eq!(list.kind, "services");
+        assert_eq!(list.license, "CC0-1.0");
     }
 }

@@ -474,7 +474,7 @@ integration point and should land last in its wave to avoid merge churn in
 - [x] WP-4 Per-list `refresh_hours` scheduling
 - [x] WP-5 Per-client upstreams and `ignore_stats`
 - [ ] WP-6 Atomic runtime snapshot + live reload of restart-only settings
-- [ ] WP-7 Maintained parental/service lists
+- [ ] WP-7 Maintained parental/service lists — partial: versioned manifest with source/license/BLAKE3 checks, verified at load and exposed to callers; remaining: curated data expansion + runtime refresh via the subscription downloader, UI metadata display, category config
 - [x] WP-8 DoH dedicated hostname + ACME HTTP-01 on port 80
 - [x] WP-9 HA heartbeat watchdog, protocol role, `ca` validation
 - [x] WP-10 Updater artifact signature verification

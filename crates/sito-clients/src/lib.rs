@@ -6,6 +6,7 @@
 //! - Scheduled access policies and category-based blocking
 //! - Router integration (e.g. MikroTik RouterOS DHCP lease synchronization)
 
+pub mod bundled;
 pub mod config;
 pub mod mac;
 pub mod parental;
@@ -16,6 +17,7 @@ pub mod safe_search;
 pub mod schedule;
 pub mod services;
 
+pub use bundled::{BundledList, BundledListError, BundledManifest};
 pub use config::{BlockedServiceConfig, ClientEntryConfig, ClientGroupConfig, ClientsConfig};
 pub use mac::{MacResolver, normalize_mac};
 pub use parental::ParentalRegistry;

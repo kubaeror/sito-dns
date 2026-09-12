@@ -1,0 +1,36 @@
+{
+  "format_version": 1,
+  "generated": "2026-09-12",
+  "lists": [
+    {
+      "id": "adult",
+      "kind": "domains",
+      "file": "adult.txt",
+      "version": "2026.09.1",
+      "source": "https://github.com/kubaeror/sito-dns/blob/main/crates/sito-clients/src/bundled/adult.txt",
+      "license": "CC0-1.0",
+      "entries": 20,
+      "checksum_blake3": "45d6e9f6801f7f0a72513e3781c71624ef3e3b3008236d6d7a1942be07529bb1"
+    },
+    {
+      "id": "gambling",
+      "kind": "domains",
+      "file": "gambling.txt",
+      "version": "2026.09.1",
+      "source": "https://github.com/kubaeror/sito-dns/blob/main/crates/sito-clients/src/bundled/gambling.txt",
+      "license": "CC0-1.0",
+      "entries": 12,
+      "checksum_blake3": "144963e362958552695255c39764d2da324aa5843f01cf16d8436aec4d34fed8"
+    },
+    {
+      "id": "services",
+      "kind": "services",
+      "file": "services.json",
+      "version": "2026.09.1",
+      "source": "https://github.com/kubaeror/sito-dns/blob/main/crates/sito-clients/src/bundled/services.json",
+      "license": "CC0-1.0",
+      "entries": 23,
+      "checksum_blake3": "65c9cd0124d3836b60ac7f4f7a3da149c21d02f19ec78daabf8d05777619f7b9"
+    }
+  ]
+}

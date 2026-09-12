@@ -17,6 +17,7 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sito-core.workspace = true
+blake3.workspace = true
 
 [lints]
 workspace = true

@@ -3084,6 +3084,7 @@ dependencies = [
 name = "sito-clients"
 version = "1.4.0"
 dependencies = [
+ "blake3",
  "chrono",
  "croner",
  "reqwest",

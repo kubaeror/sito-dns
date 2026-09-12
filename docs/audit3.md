@@ -339,7 +339,10 @@ ignoring the configured `dns.bind`.
 > which fixed several undocumented settings; table generation pending);
 > **WP-1 — partial** (in-response DS/DNSKEY chain walk: KSK→ZSK and signed DS
 > delegation, validated-only key cache, additional-section RRSIGs; async
-> fetcher and NSEC/NSEC3 proofs pending).
+> fetcher and NSEC/NSEC3 proofs pending);
+> **WP-7 — partial** (versioned bundled-list manifest with source, license and
+> BLAKE3 integrity checks exposed by the registries; curated expansion and
+> runtime refresh pending).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated
