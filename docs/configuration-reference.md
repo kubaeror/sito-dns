@@ -240,7 +240,7 @@ schedule = "0 0 15-21 * * MON-FRI"
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `entries` | array of tables | `[]` | Client definitions mapping IP addresses, Hostnames (DoT SNI / DoH ClientID) and MAC addresses to groups. Available entry keys: `name`, `ids`, `group`, `ignore_query_log`, `ignore_stats`, `use_global_upstreams`, `upstreams`, `trusted`. |
+| `entries` | array of tables | `[]` | Client definitions mapping IP addresses, Hostnames (DoT SNI / DoH ClientID) and MAC addresses to groups. Available entry keys: `name`, `ids`, `group`, `ignore_query_log`, `ignore_stats` (skip Prometheus counters), `use_global_upstreams`, `upstreams` (when `use_global_upstreams = false`, the client resolves through these servers only and its answers bypass the shared cache), `trusted`. |
 | `groups` | table (map of name → group) | `{}` | Policy groups keyed by group name, e.g. `[clients.groups.kids]`, with optional `[[clients.groups.<name>.blocked_services]]` entries. |
 
 ---

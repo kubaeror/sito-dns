@@ -17,6 +17,7 @@ use sito_proto::wire::{synthesize_cname_response, synthesize_records_response};
 use sito_rewrites::RewriteTable;
 use sito_transport::QueryHandler;
 use sito_upstream::UpstreamManager;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -240,6 +241,8 @@ pub struct DnsPipeline {
     prefetch_semaphore: Arc<tokio::sync::Semaphore>,
     querylog: Option<sito_stats::QueryLogSender>,
     metrics: Option<sito_stats::MetricsRegistry>,
+    /// Per-client upstream managers keyed by `servers.join(",")`.
+    scoped_upstreams: Arc<HashMap<String, Arc<UpstreamManager>>>,
 }
 
 impl DnsPipeline {
@@ -271,7 +274,19 @@ impl DnsPipeline {
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             querylog: None,
             metrics: None,
+            scoped_upstreams: Arc::new(HashMap::new()),
         }
+    }
+
+    /// Registers per-client upstream managers used when a client opts out of
+    /// the global upstreams (`use_global_upstreams = false`).
+    #[must_use]
+    pub fn with_scoped_upstreams(
+        mut self,
+        scoped: Arc<HashMap<String, Arc<UpstreamManager>>>,
+    ) -> Self {
+        self.scoped_upstreams = scoped;
+        self
     }
 
     #[must_use]
@@ -304,6 +319,22 @@ impl QueryHandler for DnsPipeline {
         let mut client = client;
         let now = chrono::Utc::now();
         let policy = clients.resolve(&mut client, now);
+
+        // Per-client upstream scope (falls back to the global manager).
+        let scoped_upstream = if policy.use_global_upstreams {
+            None
+        } else {
+            policy
+                .upstreams
+                .as_ref()
+                .and_then(|servers| self.scoped_upstreams.get(&servers.join(",")).cloned())
+        };
+        let effective_upstream = scoped_upstream
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.upstream));
+        // Answers from per-client upstreams must not be shared via the global cache.
+        let cache_enabled = config.dns.cache.enabled && scoped_upstream.is_none();
+
         if let Some(ref m) = self.metrics {
             m.inc_clients_identified(if client.client_name.is_some() {
                 "identified"
@@ -516,7 +547,7 @@ impl QueryHandler for DnsPipeline {
             }
 
             // 5. Cache lookup
-            if config.dns.cache.enabled {
+            if cache_enabled {
                 // Never serve an unvalidated cached answer to a DNSSEC-aware
                 // client while validation is enabled: force an upstream lookup.
                 let cached = match self.cache.get(qname, qtype, qclass).await {
@@ -557,7 +588,7 @@ impl QueryHandler for DnsPipeline {
                     if self.cache.should_prefetch(qname, qtype, qclass).await
                         && let Ok(permit) = Arc::clone(&self.prefetch_semaphore).try_acquire_owned()
                     {
-                        let bg_upstream = Arc::clone(&self.upstream);
+                        let bg_upstream = Arc::clone(&effective_upstream);
                         let bg_cache = Arc::clone(&self.cache);
                         let bg_query = query.clone();
                         tokio::spawn(async move {
@@ -610,7 +641,10 @@ impl QueryHandler for DnsPipeline {
                 q
             };
             let upstream_start = std::time::Instant::now();
-            match self.upstream.resolve_with_upstream(&upstream_query).await {
+            match effective_upstream
+                .resolve_with_upstream(&upstream_query)
+                .await
+            {
                 Ok((mut upstream_resp, upstream_name)) => {
                     if let Some(ref m) = self.metrics {
                         m.observe_upstream_rtt(
@@ -697,7 +731,7 @@ impl QueryHandler for DnsPipeline {
                         Some(dnssec_outcome.as_str().to_string())
                     };
 
-                    if config.dns.cache.enabled
+                    if cache_enabled
                         && (upstream_resp.metadata.response_code == ResponseCode::NoError
                             || upstream_resp.metadata.response_code == ResponseCode::NXDomain)
                     {
@@ -731,7 +765,7 @@ impl QueryHandler for DnsPipeline {
                         m.inc_upstream_errors("all", &e.to_string());
                     }
 
-                    if config.dns.cache.enabled
+                    if cache_enabled
                         && config.dns.cache.serve_stale_hours > 0
                         && let Some(mut stale_resp) =
                             self.cache.get_stale(qname, qtype, qclass).await
@@ -769,7 +803,9 @@ impl QueryHandler for DnsPipeline {
         let elapsed_secs = elapsed.as_secs_f64();
         let qtype_num = u16::from(outcome.qtype);
 
-        if let Some(ref m) = self.metrics {
+        if let Some(ref m) = self.metrics
+            && !policy.ignore_stats
+        {
             m.inc_queries(&client.proto, qtype_num, outcome.verdict);
             m.observe_query_duration(outcome.verdict, elapsed_secs);
             if outcome.from_cache {

@@ -128,6 +128,46 @@ pub async fn run_server_full(
         .as_ref()
         .and_then(|v| v.clone().try_into().ok())
         .unwrap_or_default();
+
+    // Build per-client upstream managers for entries that opt out of the globals.
+    let scoped_upstreams: Arc<HashMap<String, Arc<UpstreamManager>>> = {
+        let mut scoped: HashMap<String, Arc<UpstreamManager>> = HashMap::new();
+        for entry in &clients_config.entries {
+            if entry.use_global_upstreams {
+                continue;
+            }
+            let Some(ref servers) = entry.upstreams else {
+                continue;
+            };
+            if servers.is_empty() {
+                continue;
+            }
+            let key = servers.join(",");
+            if scoped.contains_key(&key) {
+                continue;
+            }
+            let mut upstream_cfg = config.upstream.clone();
+            upstream_cfg.servers.clone_from(servers);
+            upstream_cfg.per_domain.clear();
+            match UpstreamManager::from_config(&upstream_cfg, &bootstrap).await {
+                Ok(manager) => {
+                    info!(
+                        client = %entry.name,
+                        servers = ?servers,
+                        "Initialized per-client upstream scope"
+                    );
+                    scoped.insert(key, Arc::new(manager));
+                }
+                Err(e) => warn!(
+                    client = %entry.name,
+                    error = %e,
+                    "Failed to initialize per-client upstreams; this client falls back to global upstreams"
+                ),
+            }
+        }
+        Arc::new(scoped)
+    };
+
     let client_registry = Arc::new(sito_clients::ClientRegistry::new(clients_config));
 
     // Initialize parental and service registries
@@ -174,6 +214,7 @@ pub async fn run_server_full(
             rewrites_arc.clone(),
             in_flight.clone(),
         )
+        .with_scoped_upstreams(scoped_upstreams)
         .with_stats(querylog_sender.clone(), metrics.clone()),
     );
 

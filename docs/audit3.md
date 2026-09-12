@@ -319,7 +319,9 @@ ignoring the configured `dns.bind`.
 > protocol version, `stats-v1` capability check, heartbeat watchdog,
 > `ca` chain validation, mandatory slave `master_pubkey`);
 > **WP-4 (per-list refresh) — done** (nearest-due scheduler, partial list
-> reload keeping other lists' rules).
+> reload keeping other lists' rules); **WP-5 (per-client upstreams) — done**
+> (scoped `UpstreamManager` per client upstream list, cache bypass, and
+> `ignore_stats` suppressing Prometheus counters).
 
 - **Full DNSSEC DS/DNSKEY chain walking.** Validation verifies RRSIGs against
   configured trust anchors and forces the DO bit upstream; serving unvalidated

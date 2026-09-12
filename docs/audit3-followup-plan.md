@@ -472,7 +472,7 @@ integration point and should land last in its wave to avoid merge churn in
 - [ ] WP-2 Native DoH/DoQ upstream transports
 - [x] WP-3 Persistent sessions and API tokens
 - [x] WP-4 Per-list `refresh_hours` scheduling
-- [ ] WP-5 Per-client upstreams and `ignore_stats`
+- [x] WP-5 Per-client upstreams and `ignore_stats`
 - [ ] WP-6 Atomic runtime snapshot + live reload of restart-only settings
 - [ ] WP-7 Maintained parental/service lists
 - [ ] WP-8 DoH dedicated hostname + ACME HTTP-01 on port 80
