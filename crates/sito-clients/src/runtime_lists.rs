@@ -9,7 +9,9 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use tracing::info;
 
+use crate::bundled::BundledListError;
 use crate::parental::ParentalRegistry;
 use crate::services::ServiceRegistry;
 
@@ -97,6 +99,15 @@ pub struct RuntimeLists {
 }
 
 impl RuntimeLists {
+    /// Builds the registries from bundled data, returning an error instead of
+    /// panicking when embedded content is corrupt.
+    pub fn try_new() -> Result<Self, BundledListError> {
+        Ok(Self::from_arcs(
+            Arc::new(ParentalRegistry::try_bundled()?),
+            Arc::new(ServiceRegistry::try_bundled()?),
+        ))
+    }
+
     /// Wraps existing registries.
     #[must_use]
     pub fn from_arcs(parental: Arc<ParentalRegistry>, services: Arc<ServiceRegistry>) -> Self {
@@ -125,13 +136,27 @@ impl RuntimeLists {
                 },
             );
         }
+
+        let mut bundled: Vec<&str> = statuses
+            .values()
+            .filter(|status| status.bundled)
+            .map(|status| status.category.as_str())
+            .collect();
+        if !bundled.is_empty() {
+            bundled.sort_unstable();
+            info!(
+                categories = ?bundled,
+                "Curated parental/service categories are serving the bundled fallback; \
+                 configure [integrations.lists] to refresh them from maintained sources"
+            );
+        }
+
         Self {
             parental: ArcSwap::from(parental),
             services: ArcSwap::from(services),
             statuses: RwLock::new(statuses),
         }
     }
-
     /// Refresh state of every known category, sorted by id.
     #[must_use]
     pub fn statuses(&self) -> Vec<RuntimeListStatus> {
@@ -142,6 +167,21 @@ impl RuntimeLists {
             .unwrap_or_default();
         statuses.sort_by(|a, b| a.category.cmp(&b.category));
         statuses
+    }
+
+    /// Categories still served by the bundled fallback (no successful
+    /// external refresh yet), sorted by id.
+    ///
+    /// This mirrors the filter engine's observable list status: operators and
+    /// `/metrics`/status consumers can see that a category is running on the
+    /// minimal bundled data instead of a maintained upstream list.
+    #[must_use]
+    pub fn bundled_fallback_categories(&self) -> Vec<String> {
+        self.statuses()
+            .into_iter()
+            .filter(|status| status.bundled)
+            .map(|status| status.category)
+            .collect()
     }
 
     /// Marks a category as refreshed from `source_url` at the current time.
@@ -182,12 +222,31 @@ impl RuntimeLists {
     /// The category `services` expects service JSON; every other category is
     /// parsed as a domain list (ABP `||domain^` and hosts syntax accepted) and
     /// replaces the previous content of that parental category.
+    ///
+    /// Applies a >50% truncation guard: after a category has been refreshed
+    /// from an external source, content with fewer than half of the previous
+    /// entries is rejected to protect against partial/corrupted downloads.
+    /// Use [`RuntimeLists::apply_content_forced`] to accept an intentional
+    /// shrink.
     pub fn apply_content(&self, category: &str, content: &str) -> Result<u64, String> {
-        let entries = if category.eq_ignore_ascii_case("services") {
+        self.apply_content_inner(category, content, false)
+    }
+
+    /// Like [`RuntimeLists::apply_content`] but bypasses the >50% drop guard.
+    pub fn apply_content_forced(&self, category: &str, content: &str) -> Result<u64, String> {
+        self.apply_content_inner(category, content, true)
+    }
+
+    fn apply_content_inner(
+        &self,
+        category: &str,
+        content: &str,
+        force: bool,
+    ) -> Result<u64, String> {
+        let (entries, new_parental, new_services) = if category.eq_ignore_ascii_case("services") {
             let registry = ServiceRegistry::from_json(content).map_err(|e| e.to_string())?;
             let entries = registry.service_count() as u64;
-            self.services.store(Arc::new(registry));
-            entries
+            (entries, None, Some(Arc::new(registry)))
         } else {
             let entries = content
                 .lines()
@@ -198,9 +257,41 @@ impl RuntimeLists {
                 .count() as u64;
             let mut parental = (*self.parental.load_full()).clone();
             parental.set_category_list(category, content);
-            self.parental.store(Arc::new(parental));
-            entries
+            (entries, Some(Arc::new(parental)), None)
         };
+
+        // Guard refreshes that replace previously downloaded content; the
+        // bundled fallback may legitimately be replaced by a smaller list.
+        // An empty response is always rejected while any content is active so
+        // a broken first fetch cannot silently disable protection.
+        let category_key = category.to_ascii_lowercase();
+        let previous_status = self.statuses.read().ok().and_then(|statuses| {
+            statuses
+                .get(category)
+                .or_else(|| statuses.get(&category_key))
+                .cloned()
+        });
+        let previous = previous_status.as_ref().map_or(0, |status| status.entries);
+        let was_bundled = previous_status.as_ref().is_none_or(|status| status.bundled);
+        let truncating = entries == 0 || entries.saturating_mul(2) < previous;
+        if !force && previous > 0 && truncating && (!was_bundled || entries == 0) {
+            let detail = if entries == 0 {
+                "empty content".to_string()
+            } else {
+                format!("{entries} entries after {previous} (>50% shrink)")
+            };
+            return Err(format!(
+                "refusing to replace category '{category}' with {detail}; \
+                 use a forced refresh to accept the truncation"
+            ));
+        }
+
+        if let Some(services) = new_services {
+            self.services.store(services);
+        }
+        if let Some(parental) = new_parental {
+            self.parental.store(parental);
+        }
 
         if let Ok(mut statuses) = self.statuses.write() {
             let entry = statuses
@@ -272,6 +363,13 @@ mod tests {
         let store = store();
         let bundled = store.statuses();
         assert!(bundled.iter().any(|s| s.category == "adult" && s.bundled));
+        assert!(
+            store
+                .bundled_fallback_categories()
+                .iter()
+                .any(|c| c == "adult"),
+            "bundled fallback status must be observable"
+        );
 
         let entries = store
             .apply_content("adult", "a.example\nb.example\n# comment\n")
@@ -291,6 +389,13 @@ mod tests {
             Some("https://lists.example.com/adult.txt")
         );
         assert!(status.last_refresh_unix.is_some());
+        assert!(
+            !store
+                .bundled_fallback_categories()
+                .iter()
+                .any(|c| c == "adult"),
+            "refreshed categories must no longer report as bundled fallback"
+        );
     }
 
     #[test]
@@ -316,5 +421,69 @@ mod tests {
         config.categories.get_mut("adult").unwrap().url =
             "https://example.com/adult.txt".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_drop_guard_rejects_large_shrink_after_refresh() {
+        let store = store();
+        // First refresh replaces the bundled fallback without a guard.
+        store
+            .apply_content("adult", "a.example\nb.example\nc.example\nd.example\n")
+            .unwrap();
+
+        // A second refresh shrinking to below half is rejected.
+        let err = store.apply_content("adult", "only.example\n").unwrap_err();
+        assert!(err.contains(">50% shrink"), "unexpected error: {err}");
+        assert!(
+            store.parental().matches_category("adult", "a.example"),
+            "previous content must be retained after a rejected shrink"
+        );
+        assert!(!store.parental().matches_category("adult", "only.example"));
+
+        // An intentional operator shrink can be forced.
+        store
+            .apply_content_forced("adult", "only.example\n")
+            .unwrap();
+        assert!(store.parental().matches_category("adult", "only.example"));
+        assert!(!store.parental().matches_category("adult", "a.example"));
+    }
+
+    #[test]
+    fn test_hosts_format_lines_are_parsed_as_domains() {
+        let store = store();
+        store
+            .apply_content(
+                "adult",
+                "0.0.0.0 hosts-blocked.example\n127.0.0.1 first.example second.example\n\
+                 # comment\n! abp comment\n||abp-blocked.example^\n",
+            )
+            .unwrap();
+
+        let parental = store.parental();
+        assert!(parental.matches_category("adult", "hosts-blocked.example"));
+        assert!(parental.matches_category("adult", "first.example"));
+        assert!(parental.matches_category("adult", "second.example"));
+        assert!(parental.matches_category("adult", "abp-blocked.example"));
+        assert!(
+            !parental.matches_category("adult", "0.0.0.0"),
+            "IP addresses must never be stored as blocking domains"
+        );
+    }
+
+    #[test]
+    fn test_empty_refresh_cannot_wipe_bundled_fallback() {
+        let store = store();
+        let err = store.apply_content("adult", "\n# nothing\n").unwrap_err();
+        assert!(err.contains("empty content"), "unexpected error: {err}");
+        assert!(
+            store.parental().matches_category("adult", "pornhub.com"),
+            "bundled fallback must survive an empty first refresh"
+        );
+    }
+
+    #[test]
+    fn test_try_new_is_non_panicking() {
+        let store = RuntimeLists::try_new().expect("bundled data must load");
+        assert!(store.parental().matches_category("adult", "pornhub.com"));
     }
 }
