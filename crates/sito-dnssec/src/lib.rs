@@ -484,8 +484,11 @@ fn evaluate_denial(
     trusted_sigs: &[TrustedSignature],
 ) -> DenialResult {
     let nxdomain = response.metadata.response_code == ResponseCode::NXDomain;
-    let mut secure = false;
     let mut opt_out = false;
+    // NSEC/NSEC3 records grouped by signer zone: a complete denial proof can
+    // span several records (e.g. qname cover plus wildcard cover), so the
+    // whole signed set must be evaluated together.
+    let mut nsec_groups: HashMap<LowerName, (Name, Vec<NsecRecord<'_>>)> = HashMap::new();
     let mut nsec3_groups: HashMap<LowerName, Vec<Nsec3Record<'_>>> = HashMap::new();
 
     for record in response
@@ -508,19 +511,14 @@ fn evaluate_denial(
             }
             match (nsec_rdata, nsec3_rdata) {
                 (Some(nsec), _) if trusted.covered == RecordType::NSEC => {
-                    let proof = evaluate_nsec_denial(
-                        &[NsecRecord {
+                    nsec_groups
+                        .entry(trusted.signer.clone())
+                        .or_insert_with(|| (trusted.signer_name.clone(), Vec::new()))
+                        .1
+                        .push(NsecRecord {
                             owner: &record.name,
                             rdata: nsec,
-                        }],
-                        negative_name,
-                        qtype,
-                        nxdomain,
-                        &trusted.signer_name,
-                    );
-                    if proof == NsecDenial::Secure {
-                        secure = true;
-                    }
+                        });
                 }
                 (_, Some(nsec3)) if trusted.covered == RecordType::NSEC3 => {
                     nsec3_groups
@@ -536,8 +534,12 @@ fn evaluate_denial(
         }
     }
 
-    if secure {
-        return DenialResult::Secure;
+    for (signer, records) in nsec_groups.values() {
+        if evaluate_nsec_denial(records, negative_name, qtype, nxdomain, signer)
+            == NsecDenial::Secure
+        {
+            return DenialResult::Secure;
+        }
     }
     for records in nsec3_groups.values() {
         match evaluate_nsec3_denial(records, negative_name, qtype, nxdomain) {
@@ -1911,24 +1913,43 @@ mod tests {
         signer: &hickory_proto::dnssec::DnssecSigner,
         response_code: ResponseCode,
     ) -> Message {
+        signed_nsec_response_records(
+            origin,
+            &[(nsec_owner.clone(), next.clone(), bitmap.to_vec())],
+            qname,
+            dnskey,
+            signer,
+            response_code,
+        )
+    }
+
+    /// Builds a signed negative response containing one or more NSEC RRsets.
+    fn signed_nsec_response_records(
+        origin: &Name,
+        nsecs: &[(Name, Name, Vec<RecordType>)],
+        qname: &Name,
+        dnskey: &DNSKEY,
+        signer: &hickory_proto::dnssec::DnssecSigner,
+        response_code: ResponseCode,
+    ) -> Message {
         use hickory_proto::dnssec::rdata::NSEC;
         use hickory_proto::rr::RecordSet;
-
-        let nsec = NSEC::new(next.clone(), bitmap.iter().copied());
-        let nsec_record = Record::from_rdata(
-            nsec_owner.clone(),
-            300,
-            RData::DNSSEC(DNSSECRData::NSEC(nsec)),
-        );
-        let mut set = RecordSet::new(nsec_owner.clone(), RecordType::NSEC, 0);
-        set.insert(nsec_record.clone(), 0);
-        let nsec_sig = sign_test_rrset(&set, signer);
 
         let mut msg = Message::new(24, MessageType::Response, OpCode::Query);
         msg.queries.push(Query::query(qname.clone(), RecordType::A));
         msg.metadata.response_code = response_code;
-        msg.authorities.push(nsec_record);
-        msg.authorities.push(nsec_sig);
+
+        for (owner, next, bitmap) in nsecs {
+            let nsec = NSEC::new(next.clone(), bitmap.iter().copied());
+            let nsec_record =
+                Record::from_rdata(owner.clone(), 300, RData::DNSSEC(DNSSECRData::NSEC(nsec)));
+            let mut set = RecordSet::new(owner.clone(), RecordType::NSEC, 0);
+            set.insert(nsec_record.clone(), 0);
+            let nsec_sig = sign_test_rrset(&set, signer);
+            msg.authorities.push(nsec_record);
+            msg.authorities.push(nsec_sig);
+        }
+
         msg.additionals.push(Record::from_rdata(
             origin.clone(),
             300,
@@ -1951,11 +1972,24 @@ mod tests {
         let validator =
             DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
 
-        let mut msg = signed_nsec_response(
+        // A complete NXDOMAIN proof: one NSEC covers the qname and another
+        // covers the wildcard `*.nsec.example`, so no wildcard could have
+        // synthesized the name.
+        let bitmap = vec![RecordType::A, RecordType::NSEC, RecordType::RRSIG];
+        let mut msg = signed_nsec_response_records(
             &origin,
-            &origin,
-            &nsec_next(&origin),
-            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+            &[
+                (
+                    origin.clone(),
+                    Name::from_str("a.nsec.example.").unwrap(),
+                    bitmap.clone(),
+                ),
+                (
+                    Name::from_str("a.nsec.example.").unwrap(),
+                    nsec_next(&origin),
+                    bitmap,
+                ),
+            ],
             &qname,
             &dnskey,
             &signer,
@@ -1966,6 +2000,38 @@ mod tests {
 
         assert_eq!(outcome, ValidationOutcome::Secure);
         assert!(msg.metadata.authentic_data);
+    }
+
+    #[test]
+    fn test_nxdomain_without_wildcard_denial_is_bogus() {
+        let (origin, dnskey, signer) = create_test_signer("nsec.example.");
+        let qname = Name::from_str("missing.nsec.example.").unwrap();
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        // Only the qname is covered; nothing proves that `*.nsec.example` does
+        // not exist, so the NXDOMAIN must not be authenticated.
+        let mut msg = signed_nsec_response(
+            &origin,
+            &Name::from_str("a.nsec.example.").unwrap(),
+            &nsec_next(&origin),
+            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+            &qname,
+            &dnskey,
+            &signer,
+            ResponseCode::NXDomain,
+        );
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("test"), now);
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "missing wildcard denial must be Bogus, got {outcome:?}"
+        );
+        assert!(!msg.metadata.authentic_data);
     }
 
     #[test]
