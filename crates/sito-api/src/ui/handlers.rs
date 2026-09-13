@@ -1174,7 +1174,10 @@ pub async fn clients_add_handler(
         );
     }
     ctx.set_config(new_cfg);
-    let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
+    let new_reg = sito_clients::ClientRegistry::with_routeros_leases(
+        clients_cfg,
+        ctx.clients.load().routeros_leases_store(),
+    );
     ctx.set_clients(new_reg);
     crate::publish_bundle(&ctx);
 
@@ -1224,7 +1227,10 @@ pub async fn clients_delete_handler(
         );
     }
     ctx.set_config(new_cfg);
-    let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
+    let new_reg = sito_clients::ClientRegistry::with_routeros_leases(
+        clients_cfg,
+        ctx.clients.load().routeros_leases_store(),
+    );
     ctx.set_clients(new_reg);
     crate::publish_bundle(&ctx);
 

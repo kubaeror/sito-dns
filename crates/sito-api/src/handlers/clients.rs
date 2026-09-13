@@ -38,8 +38,11 @@ async fn save_clients_config(
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
     ctx.set_config(new_cfg);
 
-    // Update active registry
-    let new_reg = sito_clients::ClientRegistry::new(clients_cfg.clone());
+    // Update active registry, keeping the RouterOS lease store shared.
+    let new_reg = sito_clients::ClientRegistry::with_routeros_leases(
+        clients_cfg.clone(),
+        ctx.clients.load().routeros_leases_store(),
+    );
     ctx.set_clients(new_reg);
     crate::publish_bundle(ctx);
     Ok(())

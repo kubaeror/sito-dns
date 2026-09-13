@@ -567,8 +567,16 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
                                     continue;
                                 }
                             };
-                            let new_clients =
-                                sito_clients::ClientRegistry::new(new_clients_cfg.clone());
+                            // Carry the RouterOS lease store across the reload so
+                            // the running sync task keeps feeding the new registry.
+                            let leases = watcher_runtime
+                                .snapshot()
+                                .clients
+                                .routeros_leases_store();
+                            let new_clients = sito_clients::ClientRegistry::with_routeros_leases(
+                                new_clients_cfg.clone(),
+                                leases,
+                            );
 
                             // DNSSEC settings are not read through the config
                             // snapshot at query time; swap the validator so

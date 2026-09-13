@@ -455,7 +455,10 @@ async fn apply_hot_config(ctx: &ServerContext, cfg: Config) -> Result<(), Proble
     ctx.cache.update_config(cfg.dns.cache.clone()).await;
     ctx.runtime.replace(sito_runtime::RuntimeSnapshot {
         config: std::sync::Arc::new(cfg),
-        clients: std::sync::Arc::new(sito_clients::ClientRegistry::new(clients)),
+        clients: std::sync::Arc::new(sito_clients::ClientRegistry::with_routeros_leases(
+            clients,
+            ctx.clients.load().routeros_leases_store(),
+        )),
         rewrites: std::sync::Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
     });
     Ok(())

@@ -70,14 +70,35 @@ pub struct ClientRegistry {
 impl ClientRegistry {
     /// Create a new client registry from configuration.
     pub fn new(config: ClientsConfig) -> Self {
+        Self::with_routeros_leases(config, Arc::new(RwLock::new(Vec::new())))
+    }
+
+    /// Creates a registry that shares an existing RouterOS lease store.
+    ///
+    /// Hot reloads replace the whole registry; carrying the store over keeps
+    /// the running lease-sync task visible to every registry generation.
+    #[must_use]
+    pub fn with_routeros_leases(
+        config: ClientsConfig,
+        routeros_leases: Arc<RwLock<Vec<RouterOsLease>>>,
+    ) -> Self {
         let index = Arc::new(build_client_index(&config));
         Self {
             config,
             index,
             mac_resolver: MacResolver::new(),
-            routeros_leases: Arc::new(RwLock::new(Vec::new())),
+            routeros_leases,
             unidentified_clients: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Returns the shared RouterOS lease store of this registry.
+    ///
+    /// Pass the result to [`ClientRegistry::with_routeros_leases`] when
+    /// replacing the registry so leases survive the reload.
+    #[must_use]
+    pub fn routeros_leases_store(&self) -> Arc<RwLock<Vec<RouterOsLease>>> {
+        Arc::clone(&self.routeros_leases)
     }
 
     /// Access the internal MacResolver (e.g. to inject mock ARP entries in tests).
@@ -771,6 +792,27 @@ group = "known"
 
         // The orphan secret is not attached to any entry.
         assert_eq!(reg.resolve(&mut ctx, Utc::now()).group_name, "default");
+    }
+
+    #[test]
+    fn test_routeros_lease_store_is_shared_across_registry_generations() {
+        let old = ClientRegistry::new(sample_config());
+        let new =
+            ClientRegistry::with_routeros_leases(sample_config(), old.routeros_leases_store());
+
+        old.update_routeros_leases(vec![RouterOsLease {
+            mac: "AA:BB:CC:DD:EE:01".to_string(),
+            ip: None,
+            hostname: Some("leased-host".to_string()),
+            comment: None,
+        }]);
+
+        // A lease written through the pre-reload registry is visible to the
+        // replacement registry (the sync task keeps using the old handle).
+        let leases = new.routeros_leases_store();
+        let leases = leases.read().unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].hostname.as_deref(), Some("leased-host"));
     }
 
     #[test]

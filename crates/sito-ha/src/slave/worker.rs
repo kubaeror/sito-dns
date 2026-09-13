@@ -148,7 +148,12 @@ pub async fn apply_config_push(
         config: Arc::new(staging_config),
         clients: staging_clients.map_or_else(
             || current.clients.clone(),
-            |cfg| Arc::new(ClientRegistry::new(cfg)),
+            |cfg| {
+                Arc::new(ClientRegistry::with_routeros_leases(
+                    cfg,
+                    current.clients.routeros_leases_store(),
+                ))
+            },
         ),
         rewrites: staging_rewrites.map_or_else(
             || current.rewrites.clone(),
