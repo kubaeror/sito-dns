@@ -55,14 +55,14 @@ skip = [
     { name = "sha1" },              # legacy transitive use
     { name = "sha2" },              # 0.10 vs 0.11
     { name = "syn" },               # proc-macro ecosystem (1.x vs 2.x)
-    { name = "tokio-tungstenite" }, # axum 0.29 vs sito-ha 0.30
-    { name = "tungstenite" },       # axum 0.29 vs sito-ha 0.30
+    { name = "tokio-tungstenite" }, # axum 0.8 (0.29) vs sito-ha/sito-test (0.30)
+    { name = "tungstenite" },       # axum 0.8 (0.29) vs sito-ha/sito-test (0.30)
 ]
 allow = []
 deny = []
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+unknown-registry = "deny"
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
