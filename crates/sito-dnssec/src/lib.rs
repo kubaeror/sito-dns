@@ -1273,6 +1273,7 @@ impl DnssecValidator {
         // relevant to the question (or a complete denial proof) is covered by a
         // signature that verified with a chain-validated key.
         let anchors = self.trust_anchors.load();
+        let relevant_keys = relevant_answer_keys(response, &qname, qtype);
         let mut first_failure: Option<(&'static str, u16)> = None;
         let mut policy_violation = false;
         let mut has_trusted_sig = false;
@@ -1283,19 +1284,29 @@ impl DnssecValidator {
         for (rrsig_owner, rrsig) in &rrsigs {
             let inception = rrsig.input().sig_inception.get();
             let expiration = rrsig.input().sig_expiration.get();
+            let type_covered = rrsig.input().type_covered;
+
+            // Failures on signatures for RRsets that are not relevant to the
+            // question (e.g. stale RRSIGs in the authority section of an
+            // otherwise valid answer) must not turn the response Bogus.
+            let rrsig_relevant =
+                relevant_keys.contains(&(LowerName::from(rrsig_owner), type_covered));
 
             // RFC 4035 5.3.1 with a bounded clock skew: a signature is usable
             // within +/- 300 s of its validity window.
             if now.saturating_add(MAX_CLOCK_SKEW) < inception {
-                first_failure.get_or_insert(("Signature not yet valid", EDE_DNSSEC_BOGUS));
+                if rrsig_relevant {
+                    first_failure.get_or_insert(("Signature not yet valid", EDE_DNSSEC_BOGUS));
+                }
                 continue;
             }
             if now > expiration.saturating_add(MAX_CLOCK_SKEW) {
-                first_failure.get_or_insert(("Signature expired", EDE_SIGNATURE_EXPIRED));
+                if rrsig_relevant {
+                    first_failure.get_or_insert(("Signature expired", EDE_SIGNATURE_EXPIRED));
+                }
                 continue;
             }
 
-            let type_covered = rrsig.input().type_covered;
             let signer_name = &rrsig.input().signer_name;
             let key_tag = rrsig.input().key_tag;
 
@@ -1332,7 +1343,9 @@ impl DnssecValidator {
             if !dnskey_policy_ok(&dnskey) {
                 // Signatures exist but every usable key was rejected by
                 // policy; this must not silently downgrade to Insecure.
-                policy_violation = true;
+                if rrsig_relevant {
+                    policy_violation = true;
+                }
                 continue;
             }
 
@@ -1347,10 +1360,12 @@ impl DnssecValidator {
             // An RRSIG that covers nothing in the response cannot authenticate
             // anything and is a validation failure.
             if covered_records.is_empty() {
-                first_failure.get_or_insert((
-                    "RRSIG does not cover any records in the response",
-                    EDE_DNSSEC_BOGUS,
-                ));
+                if rrsig_relevant {
+                    first_failure.get_or_insert((
+                        "RRSIG does not cover any records in the response",
+                        EDE_DNSSEC_BOGUS,
+                    ));
+                }
                 continue;
             }
 
@@ -1364,10 +1379,26 @@ impl DnssecValidator {
                 )
                 .is_err()
             {
-                first_failure.get_or_insert((
-                    "Cryptographic signature verification failed",
-                    EDE_DNSSEC_BOGUS,
-                ));
+                if rrsig_relevant {
+                    first_failure.get_or_insert((
+                        "Cryptographic signature verification failed",
+                        EDE_DNSSEC_BOGUS,
+                    ));
+                }
+                continue;
+            }
+
+            // RFC 4035 5.3.1: the RRSIG signer must be the zone containing the
+            // RRset owner. Without this containment check, any key validated
+            // for one domain could authenticate records owned by any other
+            // name (cross-zone signature forgery granting AD=1).
+            if !lower_signer.zone_of(&LowerName::from(rrsig_owner)) {
+                if rrsig_relevant {
+                    first_failure.get_or_insert((
+                        "RRSIG signer does not contain the RRset owner",
+                        EDE_DNSSEC_BOGUS,
+                    ));
+                }
                 continue;
             }
 
@@ -1401,7 +1432,7 @@ impl DnssecValidator {
         // Secure/AD is granted only for the positive answer RRset(s) relevant
         // to the question (including a CNAME chain) or for a complete
         // NSEC/NSEC3 denial proof. Unrelated signatures never grant AD.
-        let relevant = relevant_answer_keys(response, &qname, qtype);
+        let relevant = &relevant_keys;
         let present_relevant: HashSet<(LowerName, RecordType)> = response
             .answers
             .iter()
@@ -2746,6 +2777,41 @@ mod tests {
         let outcome = validator.validate_response(&mut msg, Some("rel"), now);
 
         assert!(matches!(outcome, ValidationOutcome::Bogus { .. }));
+        assert!(!msg.metadata.authentic_data);
+    }
+
+    #[test]
+    fn test_cross_zone_rrsig_does_not_grant_ad() {
+        // A validated attacker zone signs an RRset owned by the victim zone.
+        // RFC 4035 5.3.1 requires the signer to contain the owner; without the
+        // containment check this granted AD=1 for arbitrary names.
+        let (attacker, attacker_key, attacker_signer) = create_test_signer("attacker.example.");
+        let (victim, _victim_key, _victim_signer) = create_test_signer("victim.example.");
+        let (answer, answer_sig) = signed_a_response(&victim, &attacker_signer);
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(attacker_key.public_key(), LowerName::from(&attacker));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let mut msg = Message::new(37, MessageType::Response, OpCode::Query);
+        msg.queries
+            .push(Query::query(victim.clone(), RecordType::A));
+        msg.answers.push(answer);
+        msg.answers.push(answer_sig);
+        msg.additionals.push(Record::from_rdata(
+            attacker,
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(attacker_key)),
+        ));
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("xzone"), now);
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "cross-zone RRSIG must be Bogus, got {outcome:?}"
+        );
         assert!(!msg.metadata.authentic_data);
     }
 
