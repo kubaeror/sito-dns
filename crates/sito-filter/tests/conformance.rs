@@ -332,9 +332,15 @@ fn test_conformance_client_modifier() {
     let client_cidr_matched = ClientContext::new("10.0.0.42".parse().unwrap());
     let client_cidr_unmatched = ClientContext::new("10.0.1.42".parse().unwrap());
     let client_named_matched =
-        ClientContext::with_id("192.168.1.10".parse().unwrap(), "laptop-charlie");
+        ClientContext::new("192.168.1.10".parse().unwrap()).with_client_name("laptop-charlie");
     let client_named_unmatched =
-        ClientContext::with_id("192.168.1.10".parse().unwrap(), "desktop-alice");
+        ClientContext::new("192.168.1.10".parse().unwrap()).with_client_name("desktop-alice");
+    // Wire-claimed identity must not satisfy `$client=`: only the registry's
+    // resolved name/group/MAC are trusted.
+    let client_spoofed_by_id =
+        ClientContext::with_id("192.168.1.10".parse().unwrap(), "laptop-charlie");
+    let client_spoofed_by_sni =
+        ClientContext::with_sni("192.168.1.10".parse().unwrap(), "laptop-charlie");
     let client_inv_excluded = ClientContext::new("192.168.1.99".parse().unwrap());
     let client_inv_included = ClientContext::new("192.168.1.88".parse().unwrap());
 
@@ -380,6 +386,22 @@ fn test_conformance_client_modifier() {
             "named-client-block.com",
             RecordType::A,
             &client_named_unmatched
+        ),
+        Verdict::Allow(None)
+    ));
+    assert!(matches!(
+        snapshot.evaluate(
+            "named-client-block.com",
+            RecordType::A,
+            &client_spoofed_by_id
+        ),
+        Verdict::Allow(None)
+    ));
+    assert!(matches!(
+        snapshot.evaluate(
+            "named-client-block.com",
+            RecordType::A,
+            &client_spoofed_by_sni
         ),
         Verdict::Allow(None)
     ));

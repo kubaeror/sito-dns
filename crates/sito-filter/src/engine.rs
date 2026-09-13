@@ -942,7 +942,9 @@ mod tests {
         // $client test
         let client1 = ClientContext::new("192.168.1.100".parse().unwrap());
         let client2 = ClientContext::new("192.168.1.200".parse().unwrap());
-        let client3 = ClientContext::with_id("192.168.1.200".parse().unwrap(), "laptop");
+        let client3 =
+            ClientContext::new("192.168.1.200".parse().unwrap()).with_client_name("laptop");
+        let client_spoofed = ClientContext::with_id("192.168.1.200".parse().unwrap(), "laptop");
         let q_client = Name::from_str("client-only.com.").unwrap();
 
         assert!(
@@ -959,6 +961,12 @@ mod tests {
             engine
                 .evaluate(&q_client, RecordType::A, &client3)
                 .is_blocked()
+        );
+        // A wire-claimed id must not satisfy `$client=`.
+        assert!(
+            engine
+                .evaluate(&q_client, RecordType::A, &client_spoofed)
+                .is_allowed()
         );
 
         // $dnstype test
