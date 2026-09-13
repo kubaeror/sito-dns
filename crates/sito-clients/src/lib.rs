@@ -20,7 +20,7 @@ pub mod services;
 
 pub use bundled::{BundledList, BundledListError, BundledManifest};
 pub use config::{BlockedServiceConfig, ClientEntryConfig, ClientGroupConfig, ClientsConfig};
-pub use mac::{MacResolver, normalize_mac};
+pub use mac::{MacResolver, normalize_mac, normalize_mac_id};
 pub use parental::ParentalRegistry;
 pub use policy::EffectivePolicy;
 pub use registry::{ClientRegistry, RouterOsLease, UnidentifiedClient};

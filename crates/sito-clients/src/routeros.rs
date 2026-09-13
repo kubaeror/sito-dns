@@ -58,6 +58,11 @@ impl Default for RouterOsConfig {
     }
 }
 
+/// Maximum accepted RouterOS REST response size (1 MiB). Lease tables for
+/// even large networks fit comfortably; a larger body is treated as an error
+/// instead of being buffered into memory.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// Errors occurring during RouterOS lease synchronization.
 #[derive(Debug, Error)]
 pub enum RouterOsError {
@@ -66,6 +71,9 @@ pub enum RouterOsError {
 
     #[error("RouterOS returned HTTP status {0}: {1}")]
     BadStatus(StatusCode, String),
+
+    #[error("RouterOS response exceeds the {limit}-byte limit")]
+    ResponseTooLarge { limit: usize },
 
     #[error("JSON deserialization error: {0}")]
     JsonError(#[from] serde_json::Error),
@@ -161,14 +169,40 @@ pub async fn fetch_routeros_leases(
         return Err(RouterOsError::BadStatus(status, text));
     }
 
-    let body = response.text().await?;
-    let raw_leases: Vec<RawRouterOsLease> = serde_json::from_str(&body)?;
+    let body = read_capped_body(response, MAX_RESPONSE_BYTES).await?;
+    let raw_leases: Vec<RawRouterOsLease> = serde_json::from_slice(&body)?;
     let leases = raw_leases
         .into_iter()
         .filter_map(RawRouterOsLease::into_lease)
         .collect();
 
     Ok(leases)
+}
+
+/// Streams an HTTP body into memory while enforcing a hard byte cap.
+///
+/// `Content-Length` is checked up front and chunked/streamed bodies are
+/// counted as they arrive, so neither a lied-about length nor a chunked
+/// response can exhaust memory.
+async fn read_capped_body(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, RouterOsError> {
+    if let Some(length) = response.content_length()
+        && length > limit as u64
+    {
+        return Err(RouterOsError::ResponseTooLarge { limit });
+    }
+
+    let mut body = Vec::new();
+    let mut response = response;
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(RouterOsError::ResponseTooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Background task synchronizing RouterOS DHCP leases periodically.
@@ -318,9 +352,10 @@ mod tests {
         let mut ctx = ClientContext::new(IpAddr::from_str("192.168.1.150").unwrap());
         let _policy = registry.resolve(&mut ctx, chrono::Utc::now());
 
-        // Context should have populated MAC and client name from RouterOS
+        // The MAC learned from the lease is populated, but the client-chosen
+        // DHCP hostname is not trusted for identity by default.
         assert_eq!(ctx.mac.as_deref(), Some("aa:bb:cc:dd:ee:01"));
-        assert_eq!(ctx.client_name.as_deref(), Some("alice-laptop"));
+        assert_eq!(ctx.client_name, None);
 
         // Second request should fail with 500 BadStatus (graceful degradation)
         let err = fetch_routeros_leases(&client, &config)
@@ -337,6 +372,54 @@ mod tests {
         let mut ctx2 = ClientContext::new(IpAddr::from_str("192.168.1.151").unwrap());
         let _policy2 = registry.resolve(&mut ctx2, chrono::Utc::now());
         assert_eq!(ctx2.mac.as_deref(), Some("aa:bb:cc:dd:ee:02"));
-        assert_eq!(ctx2.client_name.as_deref(), Some("bob-phone"));
+        assert_eq!(ctx2.client_name, None);
+    }
+
+    #[test]
+    fn test_routeros_tls_verification_is_on_by_default() {
+        let config = RouterOsConfig::default();
+        assert!(
+            !config.allow_invalid_certs,
+            "TLS verification must be enabled unless explicitly opted out"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_routeros_oversized_response_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                // Announce a body larger than the cap but never send it; the
+                // client must reject based on Content-Length alone.
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    MAX_RESPONSE_BYTES + 1
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let config = RouterOsConfig {
+            enabled: true,
+            url: format!("http://127.0.0.1:{port}"),
+            token_env: None,
+            username: None,
+            password: None,
+            password_env: None,
+            interval_s: 300,
+            allow_invalid_certs: false,
+        };
+
+        let err = fetch_routeros_leases(&reqwest::Client::new(), &config)
+            .await
+            .expect_err("oversized body must be rejected");
+        assert!(
+            matches!(err, RouterOsError::ResponseTooLarge { limit } if limit == MAX_RESPONSE_BYTES),
+            "unexpected error: {err:?}"
+        );
     }
 }
