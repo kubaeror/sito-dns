@@ -80,13 +80,22 @@ items are fixed with regression tests; deferred items are listed in the audit.
 - Concurrent runtime-list updates are serialized; config-watcher failures log
   the hot-reload impact at error level.
 
-#### Deferred (documented in `docs/audit5.md`)
-- Strict NSEC wildcard-denial proofs (fail-closed today) and NSEC3 opt-out
-  hardening.
-- Duplicate-instance HA session cleanup and master accept-loop timeouts.
-- Wizard-triggered TLS acceptor rebuild and RouterOS registry rebinding on
-  client reload.
-- Docs truth pass for legacy pages and Docker `/etc/sito` ownership.
+#### Follow-ups (previously deferred, now fixed)
+- **DNSSEC**: NSEC NXDOMAIN proofs now require a wildcard denial at the
+  closest encloser (RFC 4035 §5.4) and wildcard NODATA proofs are accepted;
+  records are grouped per signer so multi-record proofs validate together.
+- **HA**: reconnecting slave sessions carry a connection id so superseded
+  connections cannot evict or mutate live entries; the master listener bounds
+  handshakes at 10 s and concurrent sessions at 64.
+- **Setup/ops**: wizard-completed setup rebuilds TLS/ACME acceptors before
+  binding listeners; Docker images ship a writable `/etc/sito` owned by the
+  nonroot uid; client-registry generations share the RouterOS lease store so
+  sync survives hot reloads; a failed listener rebind leaves a retryable
+  manager instead of orphaning the server; release assets include the
+  documented per-archive `.sha256` files.
+- **Docs**: security review rewritten to the implemented controls,
+  `SECURITY.md` version corrected, HA runbook/benchmarks/first-time-setup
+  claims reconciled with the tree.
 
 ---
 

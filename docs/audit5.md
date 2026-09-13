@@ -68,48 +68,61 @@ finding marked *Fixed* has a regression test that fails without the fix
 - **Ops**: ACME bootstrap key written 0600 with errors logged; watcher
   initialization failures log the hot-reload impact at error level.
 
-## Deferred / remaining (explicitly)
+## Follow-ups completed after the first remediation pass
 
-1. **NSEC wildcard denial proofs** (`nsec.rs`): NXDOMAIN still accepts a
-   qname-covering NSEC without proving no wildcard could synthesize;
-   wildcard NODATA is `Incomplete` (fail-closed → SERVFAIL). Fixing strictly
-   requires reworking the shared DNSSEC test fixtures; behavior is fail-closed
-   and never grants AD. NSEC3 handling is closer to RFC 5155 already.
-2. **HA duplicate-instance cleanup race**: a lingering old session can remove
-   the live `ActiveSlave` entry for the same instance name.
-3. **HA master accept loop**: no TLS/WebSocket handshake timeout or accept
-   concurrency cap (slowloris can pin tasks/sockets).
-4. **Wizard TLS acceptors**: listeners started by the wizard use acceptors
-   built from the initial config; TLS/cert settings changed in the wizard need
-   a restart.
-5. **RouterOS sync registry**: the sync task captures the startup registry
-   Arc, so client reloads leave it updating a stale registry.
-6. **Listener rebind failure**: if both the new start and the revert fail, the
-   watcher logs an error but the manager slot stays empty (no listeners).
-7. **Docs truth pass** for legacy pages (`security-audit.md`,
-   `first-time-setup.md`, `benchmarks.md`, runbook links) and Docker
-   `/etc/sito` ownership ergonomics.
-8. **`?token=`** remains accepted only on WebSocket upgrades without an
-   `Authorization` header (deprecated for 2.0).
+1. **NSEC wildcard denial proofs** (`nsec.rs`): NXDOMAIN now requires both an
+   NSEC covering the qname and an NSEC covering the wildcard at the closest
+   encloser (RFC 4035 §5.4); wildcard NODATA (NSEC at `*.<ancestor>` denying
+   the type plus a cover of the exact name) is accepted instead of failing
+   closed. NSEC records are grouped per signer so multi-record proofs are
+   evaluated together. Tests cover the secure, missing-wildcard-denial and
+   wildcard-NODATA cases, and the existing Bogus/Indeterminate cases.
+2. **HA duplicate-instance cleanup race**: each connection carries a monotonic
+   id in its `ActiveSlave`; cleanup, watchdog, ACK/stats/pong handling and
+   resync only act while the session owns the entry. Unit test covers the
+   unregister race.
+3. **HA master accept loop**: TLS + WebSocket upgrades are bounded by a 10 s
+   handshake timeout and connections by a 64-session semaphore; a stalled
+   socket is closed (regression test).
+4. **Wizard TLS acceptors**: the setup-complete path re-runs TLS/ACME
+   initialization against the updated config before binding listeners; a unit
+   test proves acceptors populate from a config that appeared after startup.
+5. **RouterOS sync registry**: registry generations share the RouterOS lease
+   store, so the running sync task keeps updating the live identification
+   data across reloads (unit test).
+6. **Listener rebind failure**: `restart()` no longer consumes the manager and
+   always leaves a usable manager in the slot; the rebind test now covers a
+   failed bind followed by a successful rebind to a third port.
+7. **Docs/ops truth pass**: `security-audit.md` rewritten to the implemented
+   controls, `SECURITY.md` version corrected, HA runbook dead links/false
+   metrics/log paths fixed, benchmarks marked as a reference-hardware run with
+   the phantom `target-cpu` and conflicting RSS numbers resolved,
+   `first-time-setup.md` marked historical, README Compose example completed,
+   and Docker images now create `/etc/sito` owned by the nonroot uid;
+   per-archive `.sha256` files are published as documented.
 
-## Production-readiness snapshot (post-remediation)
+**Accepted limitation (unchanged):** the deprecated `?token=` query parameter
+is accepted only on the WebSocket upgrade when no `Authorization` header is
+present, logs a warning, and is scheduled for removal in 2.0.
+
+## Production-readiness snapshot (post follow-ups)
 
 | Area | Before | After |
 |---|---:|---:|
-| DNSSEC | 3 | 7 (NSEC wildcards deferred) |
+| DNSSEC | 3 | 8 |
 | Upstream | 4 | 8 |
 | Filter engine | 5 | 7.5 |
 | API/UI/auth | 4.5 | 7 |
-| HA | 4 | 6.5 |
+| HA | 4 | 7.5 |
 | Transport | 5 | 7 |
-| Binary/pipeline | 4 | 7 |
+| Binary/pipeline | 4 | 7.5 |
 | Cache | 7 | 8 |
 | Stats | 7 | 8 |
 | CI/CD | 4 | 7 |
-| Overall | 4.5 | ~7.5 |
+| Overall | 4.5 | ~8 |
 
 Conclusions: the three P0s were release-blocking and are fixed with tests; the
-P1 set (auth bypass, panic, fail-open, HA state, supply chain, CI) is closed.
-Remaining risk is concentrated in deferred DNSSEC denial-proof strictness and
-HA edge cases (documented above), none of which weakens a fail-closed
-security decision.
+entire P1 set (auth bypass, panic, fail-open, HA state, supply chain, CI) and
+all deferred P2 follow-ups in the list above are closed. The only intentional
+departure from strictness is the documented `?token=` WebSocket deprecation,
+which fails closed for every other endpoint.
