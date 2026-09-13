@@ -232,10 +232,8 @@ fn init_ha(
     config: &Config,
     config_path: &Path,
     metrics: &sito_stats::MetricsRegistry,
-    config_arc: &Arc<ArcSwap<Config>>,
+    runtime: &Arc<sito_runtime::RuntimeState>,
     filter_engine: &Arc<HostsFilterEngine>,
-    rewrites_arc: &Arc<ArcSwap<sito_rewrites::RewriteTable>>,
-    clients_arc: &Arc<ArcSwap<sito_clients::ClientRegistry>>,
     shutdown_rx: &watch::Receiver<bool>,
 ) -> anyhow::Result<HaRuntime> {
     let ha_config: sito_ha::HaConfig = config
@@ -333,10 +331,8 @@ fn init_ha(
         );
 
         let slave_handles = sito_ha::SlaveAppHandles {
-            config: config_arc.clone(),
+            runtime: runtime.clone(),
             filter: filter_engine.clone(),
-            rewrites: rewrites_arc.clone(),
-            clients: clients_arc.clone(),
             metrics: metrics.clone(),
             config_path: Some(config_path.to_path_buf()),
         };
@@ -839,10 +835,8 @@ pub async fn run_server_full(
         &config,
         &config_path_buf,
         &metrics,
-        &config_arc,
+        &runtime,
         &filter_engine,
-        &rewrites_arc,
-        &clients_arc,
         &shutdown_rx,
     )?;
     let _ha_config = ha_runtime.config;

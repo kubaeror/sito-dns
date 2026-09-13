@@ -3173,6 +3173,7 @@ dependencies = [
  "sito-core",
  "sito-filter",
  "sito-rewrites",
+ "sito-runtime",
  "sito-stats",
  "subtle",
  "thiserror",

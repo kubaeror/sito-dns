@@ -1,6 +1,5 @@
 //! Background slave replication worker and state apply coordinator.
 
-use arc_swap::ArcSwap;
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::ServerName;
 use std::collections::HashMap;
@@ -28,12 +27,14 @@ use crate::slave::state::{SlaveState, SlaveStatusTracker};
 use crate::transport::{ExponentialBackoff, build_client_tls_config};
 
 /// Active server handles that the slave atomically updates when a new bundle is applied.
+///
+/// Config/clients/rewrites are published through [`RuntimeState`] so the query
+/// pipeline observes them in the same coherent snapshot as the file watcher
+/// and API paths do; the individual handles must not be written directly.
 #[derive(Clone)]
 pub struct SlaveAppHandles {
-    pub config: Arc<ArcSwap<Config>>,
+    pub runtime: Arc<sito_runtime::RuntimeState>,
     pub filter: Arc<HostsFilterEngine>,
-    pub rewrites: Arc<ArcSwap<RewriteTable>>,
-    pub clients: Arc<ArcSwap<ClientRegistry>>,
     pub metrics: MetricsRegistry,
     pub config_path: Option<PathBuf>,
 }
@@ -133,21 +134,22 @@ pub async fn apply_config_push(
         return Err(HaError::Rollback(reason));
     }
 
-    // 5. Atomic swap into active runtime handles
-    if let Some(rewrites_cfg) = staging_rewrites {
-        handles
-            .rewrites
-            .store(Arc::new(RewriteTable::new(rewrites_cfg)));
-    }
-
-    if let Some(clients_cfg) = staging_clients {
-        handles
-            .clients
-            .store(Arc::new(ClientRegistry::new(clients_cfg)));
-    }
-
-    // Atomic swap of configuration
-    handles.config.store(Arc::new(staging_config));
+    // 5. Atomic swap into the coherent runtime snapshot. Publishing through
+    // `RuntimeState::replace` keeps the pipeline from observing a torn mix of
+    // old and new components (direct handle stores bypassed the snapshot).
+    let current = handles.runtime.snapshot();
+    let snapshot = sito_runtime::RuntimeSnapshot {
+        config: Arc::new(staging_config),
+        clients: staging_clients.map_or_else(
+            || current.clients.clone(),
+            |cfg| Arc::new(ClientRegistry::new(cfg)),
+        ),
+        rewrites: staging_rewrites.map_or_else(
+            || current.rewrites.clone(),
+            |cfg| Arc::new(RewriteTable::new(cfg)),
+        ),
+    };
+    handles.runtime.replace(snapshot);
 
     // Persist configuration to disk if path is provided. The pushed TOML can
     // contain substituted credentials, so write atomically with 0600.

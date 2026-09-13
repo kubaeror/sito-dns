@@ -99,11 +99,14 @@ mod tests {
         )));
 
         let slave_metrics = sito_stats::MetricsRegistry::new("0.1.0", "slave");
+        let runtime = Arc::new(sito_runtime::RuntimeState::new(
+            config_arc.clone(),
+            clients_arc.clone(),
+            rewrites_arc.clone(),
+        ));
         let handles = SlaveAppHandles {
-            config: config_arc.clone(),
+            runtime,
             filter: filter_engine.clone(),
-            rewrites: rewrites_arc.clone(),
-            clients: clients_arc.clone(),
             metrics: slave_metrics.clone(),
             config_path: None,
         };
@@ -130,6 +133,7 @@ mod tests {
         };
         coordinator.update_bundle(bundle).unwrap();
 
+        let runtime_for_assert = handles.runtime.clone();
         let (_resync_tx, resync_rx) = tokio::sync::mpsc::channel(1);
         let _worker_handle = spawn_slave_worker(
             slave_ha_cfg,
@@ -151,6 +155,15 @@ mod tests {
 
         assert!(synced, "Slave should synchronize version 2 in < 3s");
         assert_eq!(coordinator.connected_slave_count(), 1);
+
+        // Regression: the pushed configuration must be visible through the
+        // RuntimeState snapshot the query pipeline reads, not only through the
+        // raw config handle.
+        let snapshot = runtime_for_assert.snapshot();
+        assert_eq!(
+            snapshot.config.server.role, "slave",
+            "HA push must publish config through RuntimeState::replace"
+        );
 
         let slaves = coordinator.list_slaves();
         assert_eq!(slaves.len(), 1);
@@ -272,11 +285,14 @@ mod tests {
             sito_clients::ClientRegistry::new(Default::default()),
         )));
 
+        let runtime = Arc::new(sito_runtime::RuntimeState::new(
+            config_arc,
+            clients_arc,
+            rewrites_arc,
+        ));
         let handles = SlaveAppHandles {
-            config: config_arc,
+            runtime,
             filter: filter_engine,
-            rewrites: rewrites_arc,
-            clients: clients_arc,
             metrics: metrics.clone(),
             config_path: None,
         };
@@ -326,11 +342,14 @@ mod tests {
         let clients_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(
             sito_clients::ClientRegistry::new(Default::default()),
         )));
+        let runtime = Arc::new(sito_runtime::RuntimeState::new(
+            config_arc,
+            clients_arc,
+            rewrites_arc,
+        ));
         SlaveAppHandles {
-            config: config_arc,
+            runtime,
             filter: filter_engine,
-            rewrites: rewrites_arc,
-            clients: clients_arc,
             metrics: sito_stats::MetricsRegistry::new("0.1.0", "slave"),
             config_path: None,
         }
