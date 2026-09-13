@@ -741,7 +741,10 @@ impl QueryHandler for DnsPipeline {
 
             let qname = first_query.name();
             let qtype = first_query.query_type();
-            let domain_str = qname.to_utf8();
+            // ASCII/punycode form: parental/service lists, safe-search and
+            // per-domain routing are all stored as punycode. `to_utf8` would
+            // UTS46-decode `xn--` labels and never match an IDN rule.
+            let domain_str = qname.to_ascii().to_lowercase();
 
             // Collect filter candidates once for both the `$important`
             // (stage 1) and standard (stage 3) passes. The snapshot is loaded

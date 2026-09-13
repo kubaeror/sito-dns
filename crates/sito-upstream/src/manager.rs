@@ -415,7 +415,10 @@ fn split_host_port(target: &str, default_port: u16) -> (String, u16) {
 fn clean_rule_domain(d: &str) -> String {
     let s = d.trim().to_lowercase();
     let s = s.trim_start_matches('*').trim_start_matches('.');
-    s.trim_end_matches('.').to_string()
+    let s = s.trim_end_matches('.');
+    // Accept raw IDN in configuration and store the punycode form so it
+    // matches the wire-format query name.
+    sito_proto::normalize_domain_or_idna(s).unwrap_or_else(|_| s.to_string())
 }
 
 impl UpstreamManager {
@@ -581,7 +584,9 @@ impl UpstreamManager {
     ) -> Result<(Message, String), UpstreamError> {
         let inner = self.inner.load();
         if let Some(query) = msg.queries.first() {
-            let qname_str = query.name.to_utf8().to_lowercase();
+            // ASCII/punycode form: per-domain rules are normalized to
+            // punycode, so a UTS46-decoded IDN would never match them.
+            let qname_str = query.name.to_ascii().to_lowercase();
             let qname_clean = qname_str.trim_end_matches('.');
             for (domains, group) in &inner.per_domain_rules {
                 for d in domains {

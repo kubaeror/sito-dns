@@ -2,6 +2,25 @@
 
 use crate::error::ProtoError;
 
+/// Converts a domain that may contain raw Unicode characters (IDN) into its
+/// normalized ASCII/punycode form.
+///
+/// Configuration and list files written by humans may use `münchen.de`; wire
+/// names and compiled matching structures are always punycode. Normalizing
+/// both sides through this function keeps matching and cache invalidation
+/// working for IDNs.
+pub fn normalize_domain_or_idna(raw: &str) -> Result<String, ProtoError> {
+    match normalize_domain(raw) {
+        Ok(normalized) => Ok(normalized),
+        Err(ProtoError::InvalidIdn(_)) => {
+            let ascii = idna::domain_to_ascii(raw.trim())
+                .map_err(|_| ProtoError::InvalidIdn(raw.to_string()))?;
+            normalize_domain(&ascii)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Normalize and validate a domain name string:
 /// - Lowercase all ASCII characters
 /// - Strip trailing dot (root)
@@ -142,6 +161,23 @@ mod tests {
             normalize_domain("."),
             Err(ProtoError::EmptyLabel(_))
         ));
+    }
+
+    #[test]
+    fn test_normalize_domain_or_idna_converts_unicode() {
+        assert_eq!(
+            normalize_domain_or_idna("MÜNCHEN.de.").unwrap(),
+            "xn--mnchen-3ya.de"
+        );
+        assert_eq!(
+            normalize_domain_or_idna("Example.COM").unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            normalize_domain_or_idna("xn--mnchen-3ya.de").unwrap(),
+            "xn--mnchen-3ya.de"
+        );
+        assert!(normalize_domain_or_idna("bad domain.com").is_err());
     }
 
     #[test]
