@@ -47,9 +47,15 @@ impl DotUpstream {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let mut client_config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        // Select the ring provider explicitly: the workspace feature graph
+        // enables both `ring` and `aws_lc_rs` (reqwest/hyper-rustls), so the
+        // ambiguous `ClientConfig::builder()` panics at runtime.
+        let mut client_config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| UpstreamError::Tls(format!("unsupported TLS protocol versions: {e}")))?
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
 
         client_config.alpn_protocols = vec![b"dot".to_vec()];
 
@@ -300,6 +306,21 @@ mod tests {
         });
 
         (addr, cert_der)
+    }
+
+    #[test]
+    fn test_dot_upstream_new_does_not_panic_on_ambiguous_crypto_providers() {
+        // Regression: the workspace enables both rustls `ring` and `aws_lc_rs`
+        // (pulled in by reqwest). `ClientConfig::builder()` aborts the process
+        // in that configuration; construction must select the ring provider.
+        let upstream = DotUpstream::new(
+            "127.0.0.1:853".parse().unwrap(),
+            "dns.example.com".to_string(),
+            Duration::from_secs(2),
+            4,
+        )
+        .expect("DotUpstream::new must succeed with both providers enabled");
+        assert_eq!(upstream.server_name(), "dns.example.com");
     }
 
     #[tokio::test]
