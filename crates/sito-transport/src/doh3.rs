@@ -21,6 +21,10 @@ use crate::tls::TlsAcceptorManager;
 /// Maximum accepted DoH request body: 65535 bytes (the DNS-over-TCP size ceiling).
 const MAX_DOH3_BODY_BYTES: usize = 65_535;
 
+/// Upper bound on a single stream step (request setup, each body chunk): a
+/// client that opens a stream and stalls must not pin a task forever.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Configuration options for the DoH3 listener.
 #[derive(Clone)]
 pub struct Doh3Config {
@@ -211,13 +215,23 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                     return;
                                 }
 
-                                let (req, mut stream) = match resolver.resolve_request().await {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        debug!("DoH3 failed resolving request from {}: {}", peer_addr, e);
-                                        return;
-                                    }
-                                };
+                                let (req, mut stream) =
+                                    match tokio::time::timeout(
+                                        STREAM_TIMEOUT,
+                                        resolver.resolve_request(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(r)) => r,
+                                        Ok(Err(e)) => {
+                                            debug!("DoH3 failed resolving request from {}: {}", peer_addr, e);
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            debug!("DoH3 request setup timed out for {}", peer_addr);
+                                            return;
+                                        }
+                                    };
 
                                 if let Some(ref expected) = dedicated_hostname {
                                     let host = req
@@ -293,7 +307,32 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                         }
 
                                         let mut body_bytes = Vec::new();
-                                        while let Ok(Some(mut chunk)) = stream.recv_data().await {
+                                        loop {
+                                            let mut chunk = match tokio::time::timeout(
+                                                STREAM_TIMEOUT,
+                                                stream.recv_data(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(Some(chunk))) => chunk,
+                                                Ok(Ok(None)) => break,
+                                                Ok(Err(e)) => {
+                                                    // A mid-body error must never be
+                                                    // treated as a complete message.
+                                                    debug!(
+                                                        "DoH3 body receive error from {}: {}",
+                                                        peer_addr, e
+                                                    );
+                                                    return;
+                                                }
+                                                Err(_) => {
+                                                    debug!(
+                                                        "DoH3 body receive timed out for {}",
+                                                        peer_addr
+                                                    );
+                                                    return;
+                                                }
+                                            };
                                             let remaining = chunk.remaining();
                                             if body_bytes.len().saturating_add(remaining)
                                                 > MAX_DOH3_BODY_BYTES
@@ -347,16 +386,27 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                             return;
                                         };
 
-                                        let Ok(b) = decode_base64url(param) else {
-                                            let resp = http::Response::builder()
-                                                .status(http::StatusCode::BAD_REQUEST)
-                                                .body(())
-                                                .unwrap();
-                                            let _ = stream.send_response(resp).await;
-                                            let _ = stream.finish().await;
-                                            return;
-                                        };
-                                        b
+                                        match decode_base64url(param) {
+                                            Ok(b) if b.len() <= MAX_DOH3_BODY_BYTES => b,
+                                            Ok(_) => {
+                                                let resp = http::Response::builder()
+                                                    .status(http::StatusCode::PAYLOAD_TOO_LARGE)
+                                                    .body(())
+                                                    .unwrap();
+                                                let _ = stream.send_response(resp).await;
+                                                let _ = stream.finish().await;
+                                                return;
+                                            }
+                                            Err(_) => {
+                                                let resp = http::Response::builder()
+                                                    .status(http::StatusCode::BAD_REQUEST)
+                                                    .body(())
+                                                    .unwrap();
+                                                let _ = stream.send_response(resp).await;
+                                                let _ = stream.finish().await;
+                                                return;
+                                            }
+                                        }
                                     }
                                     _ => {
                                         let resp = http::Response::builder()

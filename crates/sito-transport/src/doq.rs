@@ -22,6 +22,10 @@ use crate::tls::TlsAcceptorManager;
 /// length prefix; the DNS-over-TCP ceiling is 65535 bytes).
 const MAX_DOQ_MESSAGE_BYTES: usize = 65_535;
 
+/// Upper bound on handling a single QUIC stream: a client that opens a stream
+/// and never completes the length prefix/body must not pin a task forever.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Configuration options for the DoQ listener.
 #[derive(Clone)]
 pub struct DoqConfig {
@@ -174,6 +178,9 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                             let stream_limiter = Arc::clone(&rate_limiter);
 
                             tokio::spawn(async move {
+                              let timed = tokio::time::timeout(
+                                STREAM_TIMEOUT,
+                                async move {
                                 // RFC 9250: Each stream carries a single query preceded by a 2-octet length prefix
                                 let mut len_buf = [0u8; 2];
                                 if let Err(e) = recv.read_exact(&mut len_buf).await {
@@ -242,6 +249,12 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                         }
                                     }
                                 }
+                                },
+                              )
+                              .await;
+                              if timed.is_err() {
+                                  debug!("DoQ stream from {} timed out", peer_addr);
+                              }
                             });
                         }
                     });
