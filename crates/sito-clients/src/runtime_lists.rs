@@ -96,6 +96,9 @@ pub struct RuntimeLists {
     parental: ArcSwap<ParentalRegistry>,
     services: ArcSwap<ServiceRegistry>,
     statuses: RwLock<HashMap<String, RuntimeListStatus>>,
+    /// Serializes read-modify-write refreshes so two concurrent category
+    /// updates cannot publish registries that each miss the other's change.
+    apply_lock: std::sync::Mutex<()>,
 }
 
 impl RuntimeLists {
@@ -155,6 +158,7 @@ impl RuntimeLists {
             parental: ArcSwap::from(parental),
             services: ArcSwap::from(services),
             statuses: RwLock::new(statuses),
+            apply_lock: std::sync::Mutex::new(()),
         }
     }
     /// Refresh state of every known category, sorted by id.
@@ -243,6 +247,14 @@ impl RuntimeLists {
         content: &str,
         force: bool,
     ) -> Result<u64, String> {
+        // Serialize the clone-modify-store sequence: concurrent refreshes of
+        // different categories would otherwise publish registries missing each
+        // other's update (lost update).
+        let _apply_guard = self
+            .apply_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let (entries, new_parental, new_services) = if category.eq_ignore_ascii_case("services") {
             let registry = ServiceRegistry::from_json(content).map_err(|e| e.to_string())?;
             let entries = registry.service_count() as u64;
@@ -319,6 +331,28 @@ mod tests {
             Arc::new(ParentalRegistry::bundled()),
             Arc::new(ServiceRegistry::bundled()),
         )
+    }
+
+    #[test]
+    fn test_concurrent_category_updates_do_not_lose_entries() {
+        let store = std::sync::Arc::new(store());
+        let first = std::sync::Arc::clone(&store);
+        let second = std::sync::Arc::clone(&store);
+
+        let t1 = std::thread::spawn(move || first.apply_content("alpha", "alpha-blocked.com\n"));
+        let t2 = std::thread::spawn(move || second.apply_content("beta", "beta-blocked.com\n"));
+        t1.join().unwrap().unwrap();
+        t2.join().unwrap().unwrap();
+
+        let parental = store.parental.load_full();
+        assert!(
+            parental.matches_category("alpha", "alpha-blocked.com"),
+            "concurrent update to `beta` must not drop `alpha`"
+        );
+        assert!(
+            parental.matches_category("beta", "beta-blocked.com"),
+            "concurrent update to `alpha` must not drop `beta`"
+        );
     }
 
     #[test]

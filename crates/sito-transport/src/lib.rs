@@ -21,7 +21,7 @@ pub mod udp;
 
 pub use acme::{
     AcmeServiceConfig, days_until_expiration, generate_tls_alpn_01_cert,
-    obtain_or_renew_certificate, start_acme_manager,
+    obtain_or_renew_certificate, start_acme_manager, write_secret_file,
 };
 pub use acme_http::start_acme_http01_listener;
 pub use doh::{DohConfig, start_doh_listener};

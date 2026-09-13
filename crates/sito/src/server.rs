@@ -482,7 +482,10 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
     }) {
         Ok(w) => w,
         Err(e) => {
-            warn!("Failed to initialize config file watcher: {e}");
+            error!(
+                error = %e,
+                "Failed to initialize config file watcher; hot reload is DISABLED until restart"
+            );
             return;
         }
     };
@@ -493,9 +496,10 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
         .parent()
         .map_or_else(|| watcher_config_path.clone(), std::path::Path::to_path_buf);
     if let Err(e) = watcher.watch(&watch_target, RecursiveMode::NonRecursive) {
-        warn!(
-            "Failed to watch config directory {}: {e}",
-            watch_target.display()
+        error!(
+            error = %e,
+            path = %watch_target.display(),
+            "Failed to watch config directory; hot reload is DISABLED until restart"
         );
         return;
     }
@@ -1119,12 +1123,29 @@ async fn init_tls_and_acme(
                 let _ = tokio::fs::create_dir_all(&storage_dir).await;
                 match generate_self_signed_cert(&acme.domains) {
                     Ok((cert_pem, key_pem)) => {
-                        let _ = tokio::fs::write(&cert_path, cert_pem).await;
-                        let _ = tokio::fs::write(&key_path, key_pem).await;
-                        info!(
-                            "Generated bootstrap self-signed certificate in {:?}",
-                            storage_dir
-                        );
+                        let cert_target = cert_path.clone();
+                        let key_target = key_path.clone();
+                        let written =
+                            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                                std::fs::write(&cert_target, cert_pem)?;
+                                // The bootstrap private key must be 0600: local
+                                // users must not read it before ACME replaces it.
+                                sito_transport::write_secret_file(&key_target, key_pem.as_bytes())?;
+                                Ok(())
+                            })
+                            .await;
+                        match written {
+                            Ok(Ok(())) => info!(
+                                "Generated bootstrap self-signed certificate in {:?}",
+                                storage_dir
+                            ),
+                            Ok(Err(e)) => {
+                                warn!("Failed to write bootstrap self-signed certificate: {e}");
+                            }
+                            Err(e) => {
+                                warn!("Bootstrap certificate task failed: {e}");
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!("Failed to generate bootstrap self-signed certificate: {e}");
