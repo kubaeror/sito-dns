@@ -143,4 +143,60 @@ mod tests {
             Err(ProtoError::EmptyLabel(_))
         ));
     }
+
+    #[test]
+    fn test_normalize_domain_randomized_invariants() {
+        // Deterministic pseudo-random strings over a hostile alphabet
+        // (separators, unicode, punycode prefixes).
+        let chars: Vec<char> =
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_/ é中xn--"
+                .chars()
+                .collect();
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_1234;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+
+        for _ in 0..3000 {
+            let len = (next() % 80) as usize;
+            let raw: String = (0..len)
+                .map(|_| chars[(next() as usize) % chars.len()])
+                .collect();
+
+            if let Ok(normalized) = normalize_domain(&raw) {
+                assert!(
+                    normalized.is_ascii(),
+                    "normalized output must be ASCII: {normalized:?}"
+                );
+                assert!(
+                    normalized.chars().all(|c| !c.is_ascii_uppercase()),
+                    "normalized output must be lowercase: {normalized:?}"
+                );
+                assert!(
+                    !normalized.starts_with('.') && !normalized.ends_with('.'),
+                    "normalized output must not have edge dots: {normalized:?}"
+                );
+                assert!(
+                    !normalized.split('.').any(str::is_empty),
+                    "normalized output must not contain empty labels: {normalized:?}"
+                );
+                assert!(
+                    normalized.split('.').all(|label| label.len() <= 63),
+                    "labels must be at most 63 bytes: {normalized:?}"
+                );
+                assert!(
+                    normalized.len() <= 253,
+                    "names must be at most 253 bytes: {normalized:?}"
+                );
+                assert_eq!(
+                    normalize_domain(&normalized).expect("normalized output must re-validate"),
+                    normalized,
+                    "normalization must be idempotent"
+                );
+            }
+        }
+    }
 }

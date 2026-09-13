@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v1.5.0**.
+This document is the exhaustive configuration reference for **sito v1.6.0**.
 
 `sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. Only `DNSD_SECRET_<NAME>` variables are used to resolve HA secret placeholders.
 
@@ -246,12 +246,18 @@ schedule = "0 0 15-21 * * MON-FRI"
 [[clients.groups.kids.blocked_services]]
 service = "tiktok"
 schedule = "0 0 15-21 * * MON-FRI"
+
+# Shared secrets for DoH path / DoT SNI identification. Keys are entry names.
+[clients.client_id_secrets]
+"kids-tablet" = "change-me-shared-secret"
 ```
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `entries` | array of tables | `[]` | Client definitions mapping IP addresses, Hostnames (DoT SNI / DoH ClientID) and MAC addresses to groups. Available entry keys: `name`, `ids`, `group`, `ignore_query_log`, `ignore_stats` (skip Prometheus counters), `use_global_upstreams`, `upstreams` (when `use_global_upstreams = false`, the client resolves through these servers only and its answers bypass the shared cache), `trusted`. |
+| `entries` | array of tables | `[]` | Client definitions mapping IP addresses, plus shared-secret DoT SNI / DoH path identifiers and MAC addresses, to groups. Available entry keys: `name`, `ids`, `group`, `ignore_query_log`, `ignore_stats` (skip Prometheus counters), `use_global_upstreams`, `upstreams` (when `use_global_upstreams = false`, the client resolves through these servers only and its answers bypass the shared cache), `trusted`. Display names and `ids` never authenticate a client on their own. |
 | `groups` | table (map of name → group) | `{}` | Policy groups keyed by group name, e.g. `[clients.groups.kids]`, with optional `[[clients.groups.<name>.blocked_services]]` entries. |
+| `client_id_secrets` | table (map of entry name → secret) | `{}` | Shared secrets accepted as the first DoT SNI label (`<secret>.dns.example.com`) or the DoH path segment (`/dns-query/<secret>`). Empty disables path/SNI identification. |
+| `trust_routeros_lease_names` | boolean | `false` | Trust RouterOS DHCP lease host names/comments for client identification. Off by default because lease data is client-controlled. |
 
 ---
 
@@ -260,6 +266,7 @@ schedule = "0 0 15-21 * * MON-FRI"
 ```toml
 [rewrites]
 auto_ptr = true
+ttl = 60
 
 [[rewrites.entries]]
 domain = "*.home.arpa"
@@ -271,6 +278,7 @@ exception_clients = ["admin-laptop"]
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `auto_ptr` | boolean | `true` | Automatically synthesize reverse PTR records (`in-addr.arpa` / `ip6.arpa`) for local A/AAAA rewrites in RFC 1918 / ULA ranges. |
+| `ttl` | integer | `60` | TTL for synthesized rewrite records. |
 | `entries` | array of tables | `[]` | Local record rewrites (`domain`, `type` (`A`/`AAAA`/`CNAME`/`PTR`/`TXT`), `answer`, and optional `exception_clients`). |
 
 ---

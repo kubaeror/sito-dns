@@ -11,25 +11,42 @@ struct Bucket {
     last_replenished: Instant,
 }
 
+/// Default maximum number of source IP buckets tracked at once.
+pub const DEFAULT_MAX_BUCKETS: usize = 100_000;
+
 /// Token-bucket based rate limiter keyed by client IP address.
 ///
 /// The configured rate lives in atomics so `dns.rate_limit_per_ip` can be
 /// hot-reloaded without rebinding listeners.
+///
+/// Semantics are per source IP: every source gets an independent bucket so one
+/// client cannot consume another's budget. The bucket table is bounded
+/// ([`DEFAULT_MAX_BUCKETS`] by default) so spoofed/sprayed source addresses
+/// cannot grow memory without limit; when the table is full an arbitrary
+/// (typically stale) entry is evicted, and a source whose bucket was evicted
+/// simply starts again with a full burst allowance.
 #[derive(Debug)]
 pub struct RateLimiter {
     rate_per_sec: AtomicU32,
     burst: AtomicU32,
     buckets: DashMap<IpAddr, Bucket>,
+    max_buckets: usize,
 }
 
 impl RateLimiter {
-    /// Create a new RateLimiter.
+    /// Create a new RateLimiter with the default bucket bound.
     /// A `rate_per_sec` of 0 disables rate limiting (always permits requests).
     pub fn new(rate_per_sec: u32, burst: u32) -> Self {
+        Self::with_max_buckets(rate_per_sec, burst, DEFAULT_MAX_BUCKETS)
+    }
+
+    /// Create a new RateLimiter with an explicit bound on tracked source IPs.
+    pub fn with_max_buckets(rate_per_sec: u32, burst: u32, max_buckets: usize) -> Self {
         Self {
             rate_per_sec: AtomicU32::new(rate_per_sec),
             burst: AtomicU32::new(burst.max(1)),
             buckets: DashMap::new(),
+            max_buckets: max_buckets.max(1),
         }
     }
 
@@ -52,6 +69,10 @@ impl RateLimiter {
         let max_tokens = f64::from(self.burst.load(Ordering::Relaxed));
         let refill_rate = f64::from(rate_per_sec);
 
+        if !self.buckets.contains_key(&ip) {
+            self.evict_for_capacity();
+        }
+
         let mut entry = self.buckets.entry(ip).or_insert_with(|| Bucket {
             tokens: max_tokens,
             last_replenished: now,
@@ -67,6 +88,29 @@ impl RateLimiter {
         } else {
             false
         }
+    }
+
+    /// Evict a single bucket when the table is at capacity. Uses an arbitrary
+    /// entry so the cost stays O(1) under a spoofed-source flood; `prune`
+    /// still removes genuinely idle entries on its periodic sweep.
+    fn evict_for_capacity(&self) {
+        if self.buckets.len() < self.max_buckets {
+            return;
+        }
+        // Collect the key in its own scope so the DashMap iterator (and its
+        // shard guard) is dropped before taking a write lock for removal.
+        let victim = {
+            let mut iter = self.buckets.iter();
+            iter.next().map(|entry| *entry.key())
+        };
+        if let Some(victim) = victim {
+            self.buckets.remove(&victim);
+        }
+    }
+
+    /// Number of currently tracked source IP buckets.
+    pub fn tracked_buckets(&self) -> usize {
+        self.buckets.len()
     }
 
     /// Prune old buckets that have been inactive for more than 60 seconds.
@@ -149,5 +193,39 @@ mod tests {
         for _ in 0..100 {
             assert!(limiter.check(ip));
         }
+    }
+
+    #[test]
+    fn test_rate_limiter_bounds_bucket_table() {
+        let max = 8;
+        let limiter = RateLimiter::with_max_buckets(10, 5, max);
+
+        // More distinct (spoofed) sources than the table can hold.
+        for i in 0..255u8 {
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, i));
+            assert!(limiter.check(ip), "first request from a new source allowed");
+        }
+
+        assert!(
+            limiter.tracked_buckets() <= max,
+            "bucket table must stay bounded (got {})",
+            limiter.tracked_buckets()
+        );
+    }
+
+    #[test]
+    fn test_rate_limiter_eviction_keeps_serving() {
+        let limiter = RateLimiter::with_max_buckets(2, 2, 2);
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let c = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3));
+
+        assert!(limiter.check(a));
+        assert!(limiter.check(a));
+        assert!(!limiter.check(a), "burst exhausted");
+        assert!(limiter.check(b));
+        // Third source forces an eviction but must still be served.
+        assert!(limiter.check(c));
+        assert!(limiter.tracked_buckets() <= 2);
     }
 }

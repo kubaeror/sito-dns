@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO="kubaeror/sito-dns"
-SITO_VERSION="${SITO_VERSION:-1.4.0}"
+SITO_VERSION="${SITO_VERSION:-latest}"
 INSTALL_BIN="/usr/local/bin/sito"
 CONFIG_DIR="/etc/sito"
 DATA_DIR="/var/lib/sito"
@@ -18,15 +18,11 @@ for arg in "$@"; do
         -h|--help)
             echo "Usage: install.sh [--uninstall]"
             echo "  --uninstall  Remove the sito binary and systemd unit (keeps config/data)"
-            echo "  SITO_VERSION=<version>  Pin a specific release version (default: ${SITO_VERSION})"
+            echo "  SITO_VERSION=<version>  Pin a specific release version (default: latest)"
             exit 0
             ;;
     esac
 done
-
-echo "=================================================="
-echo "    sito DNS Server Installer — v${SITO_VERSION}"
-echo "=================================================="
 
 # 1. Root check
 if [ "$(id -u)" -ne 0 ]; then
@@ -47,6 +43,78 @@ if [ "${UNINSTALL}" -eq 1 ]; then
     echo "Configuration (${CONFIG_DIR}) and data (${DATA_DIR}) were kept."
     exit 0
 fi
+
+# Resolve the concrete release version. `latest` is resolved through the
+# GitHub releases API so the installer never pins a stale hardcoded version.
+resolve_latest_version() {
+    local api_url="https://api.github.com/repos/${REPO}/releases/latest"
+    local response tag
+
+    if command -v curl >/dev/null 2>&1; then
+        response="$(curl -fsSL -H 'Accept: application/vnd.github+json' "${api_url}")" || {
+            echo "Error: Failed to resolve the latest release from ${api_url}." >&2
+            echo "Check network connectivity or set SITO_VERSION=<version> to install a specific release." >&2
+            exit 1
+        }
+    elif command -v wget >/dev/null 2>&1; then
+        response="$(wget -q -O - --header='Accept: application/vnd.github+json' "${api_url}")" || {
+            echo "Error: Failed to resolve the latest release from ${api_url}." >&2
+            echo "Check network connectivity or set SITO_VERSION=<version> to install a specific release." >&2
+            exit 1
+        }
+    else
+        echo "Error: Neither curl nor wget was found; cannot resolve the latest release." >&2
+        echo "Set SITO_VERSION=<version> to install a specific release without tag resolution." >&2
+        exit 1
+    fi
+
+    tag="$(printf '%s\n' "${response}" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    if [ -z "${tag}" ]; then
+        echo "Error: Could not determine the latest release tag from ${api_url}." >&2
+        echo "Set SITO_VERSION=<version> to install a specific release." >&2
+        exit 1
+    fi
+    printf '%s\n' "${tag#v}"
+}
+
+# A locally built binary can be installed without any network access, in which
+# case the version is read from the binary itself.
+USE_LOCAL_BINARY=0
+if [ "${SITO_INSTALL_LOCAL_BINARY:-0}" = "1" ] && [ -f "target/release/sito" ]; then
+    USE_LOCAL_BINARY=1
+fi
+
+if [ "${SITO_VERSION}" = "latest" ]; then
+    if [ "${USE_LOCAL_BINARY}" -eq 1 ]; then
+        LOCAL_VERSION="$(./target/release/sito --version 2>/dev/null | awk '{print $2}' || true)"
+        SITO_VERSION="${LOCAL_VERSION:-local}"
+    else
+        SITO_VERSION="$(resolve_latest_version)"
+    fi
+fi
+SITO_VERSION="${SITO_VERSION#v}"
+
+# Reject characters that could escape the release URL paths.
+case "${SITO_VERSION}" in
+    ""|*[!0-9A-Za-z._+-]*)
+        echo "Error: Invalid release version '${SITO_VERSION}'." >&2
+        exit 1
+        ;;
+esac
+
+# Directory containing this script, when executed from a real file (e.g. an
+# extracted release archive). Used to install the packaged systemd unit instead
+# of the embedded fallback. Piped execution (`curl | bash`) has no script file
+# and uses the fallback.
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
+else
+    SCRIPT_DIR=""
+fi
+
+echo "=================================================="
+echo "    sito DNS Server Installer — v${SITO_VERSION}"
+echo "=================================================="
 
 # 2. Architecture detection
 ARCH="$(uname -m)"
@@ -145,7 +213,7 @@ download_file() {
 
 # Support installing a locally built binary only when explicitly requested
 # (verification cannot be performed for local builds).
-if [ "${SITO_INSTALL_LOCAL_BINARY:-0}" = "1" ] && [ -f "target/release/sito" ]; then
+if [ "${USE_LOCAL_BINARY}" -eq 1 ]; then
     echo "Using existing local release binary target/release/sito (verification skipped)..."
     cp -f "target/release/sito" "${INSTALL_BIN}"
 else
@@ -235,10 +303,26 @@ if [ -f "${INSTALL_BIN}" ]; then
     fi
 fi
 
-# 7. Install systemd service
+# 7. Install systemd service. Prefer the unit shipped in the release archive
+# (contrib/systemd/sito.service) so it cannot drift from the source of truth;
+# fall back to the embedded copy below when running via `curl | bash`.
 if command -v systemctl >/dev/null 2>&1; then
-    echo "Installing systemd service unit to ${SERVICE_PATH}..."
-    cat > "${SERVICE_PATH}" << 'EOF'
+    UNIT_SRC=""
+    if [ -n "${SCRIPT_DIR}" ]; then
+        for candidate in "${SCRIPT_DIR}/systemd/sito.service" "${SCRIPT_DIR}/contrib/systemd/sito.service"; do
+            if [ -f "${candidate}" ]; then
+                UNIT_SRC="${candidate}"
+                break
+            fi
+        done
+    fi
+
+    if [ -n "${UNIT_SRC}" ]; then
+        echo "Installing packaged systemd service unit from ${UNIT_SRC}..."
+        install -m 0644 "${UNIT_SRC}" "${SERVICE_PATH}"
+    else
+        echo "Installing embedded systemd service unit to ${SERVICE_PATH}..."
+        cat > "${SERVICE_PATH}" << 'EOF'
 [Unit]
 Description=sito high-performance filtering DNS server
 Documentation=https://github.com/kubaeror/sito-dns
@@ -250,6 +334,10 @@ Type=simple
 User=sito
 Group=sito
 ExecStart=/usr/local/bin/sito --config /etc/sito/config.toml
+# The service runs unprivileged with ProtectSystem=strict, so in-app updates
+# cannot replace the binary in /usr/local/bin. Updates must be applied as root
+# while the service is stopped: sudo systemctl stop sito && sudo sito update
+# (or re-run this installer). See docs/installation.md "Updating sito".
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -268,6 +356,7 @@ RestartSec=2s
 [Install]
 WantedBy=multi-user.target
 EOF
+    fi
 
     systemctl daemon-reload
     systemctl enable sito || true

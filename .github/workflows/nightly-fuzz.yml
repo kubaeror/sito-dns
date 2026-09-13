@@ -14,6 +14,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: fuzzing only reads the repository contents.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -36,6 +40,28 @@ jobs:
           SITO_BENCH_TESTS: "1"
         run: cargo test --workspace --release --all-features
 
+  perf:
+    name: perf-benches
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: nightly-perf
+
+      - name: Run criterion benchmarks
+        run: cargo bench --workspace --all-features
+
+      - name: Upload benchmark estimates
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: perf-estimates-${{ github.run_id }}
+          path: target/criterion/**/new/estimates.json
+          if-no-files-found: warn
+
   fuzz:
     name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
@@ -48,6 +74,7 @@ jobs:
           - fuzz_client_id
           - fuzz_dns_wire
           - fuzz_dnssec_response
+          - fuzz_ha_bundle
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -61,10 +88,14 @@ jobs:
         uses: taiki-e/install-action@82fc405565b9cf90abfe700ba43b4751ce2fe422 # cargo-fuzz
 
       - name: Run fuzzer on ${{ matrix.target }}
+        env:
+          # Untrusted workflow_dispatch input is passed via env, never
+          # interpolated directly into the shell.
+          FUZZ_DURATION: ${{ github.event.inputs.duration_seconds || '600' }}
         run: |
-          DURATION="${{ github.event.inputs.duration_seconds || '600' }}"
+          DURATION="${FUZZ_DURATION}"
           echo "Starting fuzzing session for ${{ matrix.target }} (duration: ${DURATION}s)..."
-          cargo fuzz run ${{ matrix.target }} -- -max_total_time=${DURATION} -rss_limit_mb=2048
+          cargo fuzz run ${{ matrix.target }} -- -max_total_time="${DURATION}" -rss_limit_mb=2048
 
       - name: Upload artifacts on crash
         if: failure()

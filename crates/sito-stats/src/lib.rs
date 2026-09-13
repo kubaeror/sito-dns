@@ -655,4 +655,290 @@ mod tests {
         assert!(u2.0.abs() < 1e-6);
         assert_eq!(u2.1, 1);
     }
+
+    fn retention_entry(ts: i64, qname: &str, verdict: &str, rule: Option<&str>) -> QueryLogEntry {
+        QueryLogEntry {
+            id: None,
+            ts,
+            client_ip: "10.0.0.1".into(),
+            client_name: None,
+            qname: qname.into(),
+            qtype: 1,
+            rcode: Some(0),
+            verdict: verdict.into(),
+            rule: rule.map(str::to_string),
+            list_source: None,
+            upstream: None,
+            elapsed_us: None,
+            dnssec: None,
+            proto: "udp".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retention_aggregates_backdated_rows_after_watermark() {
+        let db = StatsDb::in_memory().await.unwrap();
+
+        let hour_ts = 1_000_000_000_000i64;
+        db.insert_batch(&[
+            retention_entry(hour_ts, "double1.com", "allowed", None),
+            retention_entry(hour_ts + 100, "double2.com", "blocked", None),
+        ])
+        .await
+        .unwrap();
+
+        let rep1 = db.cleanup_retention(90).await.unwrap();
+        assert_eq!(rep1.aggregated_hours, 1);
+        assert_eq!(rep1.deleted_records, 2);
+
+        // Simulate a watermark recorded from an out-of-order producer: the
+        // stored `last_id` is higher than any id a later backdated insert can
+        // receive. The old `id > watermark` filter skipped such rows and then
+        // deleted them unaggregated.
+        sqlx::query(
+            "UPDATE stats_watermark SET last_id = 1000000 WHERE key = 'hourly_aggregation'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        // Backdated row: new id, timestamp older than the previous watermark ts.
+        db.insert_batch(&[retention_entry(
+            hour_ts + 50,
+            "double3.com",
+            "allowed",
+            None,
+        )])
+        .await
+        .unwrap();
+
+        let rep2 = db.cleanup_retention(90).await.unwrap();
+        assert_eq!(rep2.aggregated_hours, 1);
+        assert_eq!(rep2.deleted_records, 1);
+
+        let (queries, blocked): (i64, i64) = sqlx::query_as(
+            "SELECT queries, blocked FROM stats_hourly WHERE hour = (1000000000000 / 3600000) * 3600000",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(queries, 3, "backdated row must not be lost");
+        assert_eq!(blocked, 1);
+
+        // The row was aggregated and pruned, not silently deleted.
+        let remaining = db.query_logs(&QueryLogFilter::default()).await.unwrap();
+        assert!(remaining.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_retention_rolls_back_when_aggregation_fails() {
+        let db = StatsDb::in_memory().await.unwrap();
+        db.insert_batch(&[retention_entry(
+            1_000_000_000_000i64,
+            "rollback.test",
+            "allowed",
+            None,
+        )])
+        .await
+        .unwrap();
+
+        // Force the rollup upsert to fail after the aggregate read.
+        sqlx::query("DROP TABLE stats_hourly")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let err = db.cleanup_retention(90).await;
+        assert!(err.is_err(), "cleanup must surface the aggregation failure");
+
+        // Aggregate, watermark update and delete share one transaction, so the
+        // row must survive the failed cleanup.
+        let page = db.query_logs(&QueryLogFilter::default()).await.unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].qname, "rollback.test");
+    }
+
+    #[tokio::test]
+    async fn test_hourly_activity_merges_archived_and_live_hour() {
+        let db = StatsDb::in_memory().await.unwrap();
+
+        let current_hour_sec = (chrono::Utc::now().timestamp() / 3600) * 3600;
+        let target_hour_sec = current_hour_sec - 2 * 3600;
+        let target_hour_ms = target_hour_sec * 1000;
+
+        // Archived rollup for a partially-pruned hour.
+        sqlx::query(
+            "INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients) \
+             VALUES (?, 5, 2, 0, '[]', '[]')",
+        )
+        .bind(target_hour_ms)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        // Live rows still inside retention for the same hour.
+        db.insert_batch(&[retention_entry(
+            target_hour_ms + 1000,
+            "live.test",
+            "allowed",
+            None,
+        )])
+        .await
+        .unwrap();
+
+        let activity = db.get_hourly_activity(24).await.unwrap();
+        let bucket = activity
+            .iter()
+            .find(|a| a.timestamp_sec == target_hour_sec)
+            .expect("target hour bucket");
+        assert_eq!(
+            bucket.total_queries, 6,
+            "archived counts must not be dropped"
+        );
+        assert_eq!(bucket.blocked_queries, 2);
+    }
+
+    #[tokio::test]
+    async fn test_cached_counter_counts_cache_and_stale_cache_rules() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let old_ts = 1_000_000_000_000i64;
+        db.insert_batch(&[
+            retention_entry(old_ts, "hit.test", "allowed", Some("cache")),
+            retention_entry(old_ts + 1, "stale.test", "allowed", Some("stale_cache")),
+            retention_entry(old_ts + 2, "plain.test", "allowed", None),
+            retention_entry(old_ts + 3, "blocked.test", "blocked", None),
+        ])
+        .await
+        .unwrap();
+
+        let stats = db.get_global_stats(86_400_000 * 365 * 100).await.unwrap();
+        assert_eq!(stats.total_queries, 4);
+        assert_eq!(stats.cached_queries, 2);
+        assert_eq!(stats.blocked_queries, 1);
+
+        let report = db.cleanup_retention(90).await.unwrap();
+        assert_eq!(report.aggregated_hours, 1);
+        let (cached, blocked): (i64, i64) = sqlx::query_as(
+            "SELECT cached, blocked FROM stats_hourly WHERE hour = (1000000000000 / 3600000) * 3600000",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(cached, 2, "stale_cache rule must count as cached");
+        assert_eq!(blocked, 1);
+    }
+
+    #[tokio::test]
+    async fn test_global_stats_top_domains_and_clients() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut entries = Vec::new();
+        for i in 0..3 {
+            let mut entry = retention_entry(now + i, "popular.example", "allowed", None);
+            entry.client_ip = "192.168.1.10".into();
+            entries.push(entry);
+        }
+        let mut entry = retention_entry(now + 10, "blocked.example", "blocked", None);
+        entry.client_ip = "192.168.1.20".into();
+        entries.push(entry);
+        db.insert_batch(&entries).await.unwrap();
+
+        let stats = db.get_global_stats(86_400_000).await.unwrap();
+        assert_eq!(
+            stats.top_domains.first(),
+            Some(&("popular.example".to_string(), 3))
+        );
+        assert_eq!(
+            stats.top_blocked_domains.first(),
+            Some(&("blocked.example".to_string(), 1))
+        );
+        assert_eq!(
+            stats.top_clients.first(),
+            Some(&("192.168.1.10".to_string(), 3))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_ip_ts_index_exists() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_ql_client_ip_ts'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "(client_ip, ts) index must be created by migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_db_size_includes_wal_and_shm_sidecars() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito-size-db-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db_path = temp_dir.join("stats.db");
+        let db = StatsDb::open(&db_path).await.unwrap();
+        db.insert_batch(&[retention_entry(
+            1_700_000_000_000,
+            "size.test",
+            "allowed",
+            None,
+        )])
+        .await
+        .unwrap();
+
+        let main = tokio::fs::metadata(&db_path).await.unwrap().len();
+        let wal = match tokio::fs::metadata(format!("{}-wal", db_path.display())).await {
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        };
+        let shm = match tokio::fs::metadata(format!("{}-shm", db_path.display())).await {
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        };
+
+        let total = db.db_size_bytes().await.unwrap();
+        assert_eq!(total, main + wal + shm);
+        assert!(total >= main);
+
+        // In-memory databases have no on-disk footprint.
+        let memory = StatsDb::in_memory().await.unwrap();
+        assert_eq!(memory.db_size_bytes().await.unwrap(), 0);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_writer_counts_batches_dropped_after_flush_failure() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let writer = QueryLogWriter::spawn(db.clone(), 10);
+        let sender = writer.sender();
+
+        // Simulate a persistent storage failure: every insert fails.
+        sqlx::query("DROP TABLE query_log")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert!(sender.try_send(retention_entry(
+            1_700_000_000_000,
+            "lost.test",
+            "allowed",
+            None
+        )));
+        sender.flush().await;
+
+        assert!(
+            sender.dropped_total() >= 1,
+            "failed flush must be counted instead of silently discarded"
+        );
+
+        sender.shutdown().await;
+    }
 }

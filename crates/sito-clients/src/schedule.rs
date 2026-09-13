@@ -3,6 +3,16 @@
 //! Supports 6-field (seconds-level) and 5-field (standard) cron expressions,
 //! with descriptive error messages pinpointing invalid field numbers, and
 //! deterministic window boundary evaluation.
+//!
+//! # Single-instant semantics
+//!
+//! A plain instant expression such as `0 9 * * *` matches exactly one second
+//! per day (09:00:00), because `croner` defaults the omitted seconds field to
+//! `0`. Since queries are evaluated at arbitrary seconds, such an expression
+//! is active for roughly one second per day — not for the whole 09:00 minute.
+//! Expressions containing ranges/lists/steps in the hour or minute fields are
+//! widened to the matching window (e.g. `0 0 15-21 * * MON-FRI` is active all
+//! through 15:00-21:59). Use `0 0 9-17 * * *`-style ranges for time windows.
 
 use chrono::{DateTime, Utc};
 use croner::Cron;
@@ -10,6 +20,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
+use tracing::warn;
 
 /// Error encountered while parsing or validating a cron schedule.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -99,6 +110,11 @@ impl Schedule {
     }
 
     /// Check if the schedule is active at the specified timestamp.
+    ///
+    /// Evaluation fails closed: if `croner` cannot evaluate the expression at
+    /// this instant (e.g. due to a clock/date edge case), the schedule is
+    /// treated as active so filtering/safe-search policy remains enforced and
+    /// a warning is logged. This never silently disables a policy.
     pub fn is_active(&self, timestamp: &DateTime<Utc>) -> bool {
         if let Some(ref window) = self.window_cron
             && let Ok(matching) = window.is_time_matching(timestamp)
@@ -107,13 +123,32 @@ impl Schedule {
             return true;
         }
 
-        self.cron.is_time_matching(timestamp).unwrap_or(false)
+        match self.cron.is_time_matching(timestamp) {
+            Ok(matching) => matching,
+            Err(error) => {
+                warn!(
+                    schedule = %self.raw,
+                    timestamp = %timestamp,
+                    error = %error,
+                    "Schedule evaluation failed; treating the schedule as active (fail closed)"
+                );
+                fail_closed_on_error(error)
+            }
+        }
     }
 
     /// Get the original raw cron string.
     pub fn as_str(&self) -> &str {
         &self.raw
     }
+}
+
+/// Maps a schedule evaluation failure to the fail-closed state.
+///
+/// Whenever the cron engine cannot answer whether the schedule is active, the
+/// schedule is treated as active so filtering/safe-search policy stays on.
+fn fail_closed_on_error(_error: croner::errors::CronError) -> bool {
+    true
 }
 
 impl FromStr for Schedule {
@@ -168,7 +203,7 @@ fn validate_cron_fields(expr: &str) -> Result<(), ScheduleError> {
     }
 
     // Determine field semantics
-    let (sec_idx, min_idx, hour_idx, dom_idx, mon_idx, _dow_idx) = if num_fields == 5 {
+    let (sec_idx, min_idx, hour_idx, dom_idx, mon_idx, dow_idx) = if num_fields == 5 {
         (None, 0, 1, 2, 3, 4)
     } else {
         (Some(0), 1, 2, 3, 4, 5)
@@ -181,7 +216,81 @@ fn validate_cron_fields(expr: &str) -> Result<(), ScheduleError> {
     validate_numeric_field(expr, fields[hour_idx], hour_idx + 1, "hours", 0, 23)?;
     validate_numeric_field(expr, fields[dom_idx], dom_idx + 1, "day of month", 1, 31)?;
     validate_numeric_field(expr, fields[mon_idx], mon_idx + 1, "month", 1, 12)?;
+    validate_dow_field(expr, fields[dow_idx], dow_idx + 1)?;
 
+    Ok(())
+}
+
+/// Validates the day-of-week field.
+///
+/// Cron day-of-week values are `0-7` (`0` and `7` are Sunday). Named values
+/// (`MON`, `MON-FRI`, ...) are left to `croner`, which also understands the
+/// `L`/`#` extensions; only numeric out-of-range values are rejected here so
+/// they produce a field-attributed error message.
+fn validate_dow_field(
+    full_expr: &str,
+    field_text: &str,
+    field_num: usize,
+) -> Result<(), ScheduleError> {
+    for part in field_text.split(',') {
+        let clean = part.trim();
+        if clean.is_empty() || clean == "*" || clean == "?" {
+            continue;
+        }
+
+        let (range_part, _step) = match clean.split_once('/') {
+            Some((l, r)) => {
+                if let Ok(step_val) = r.parse::<u32>()
+                    && step_val == 0
+                {
+                    return Err(ScheduleError::field_error(
+                        full_expr,
+                        field_num,
+                        "day of week",
+                        "step value cannot be zero",
+                    ));
+                }
+                (l, Some(r))
+            }
+            None => (clean, None),
+        };
+
+        if range_part == "*" {
+            continue;
+        }
+
+        if let Some((start_str, end_str)) = range_part.split_once('-') {
+            validate_dow_value(full_expr, start_str, field_num)?;
+            validate_dow_value(full_expr, end_str, field_num)?;
+        } else {
+            validate_dow_value(full_expr, range_part, field_num)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_dow_value(full_expr: &str, value: &str, field_num: usize) -> Result<(), ScheduleError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ScheduleError::field_error(
+            full_expr,
+            field_num,
+            "day of week",
+            "empty value",
+        ));
+    }
+    // Numeric day-of-week values must be 0-7 (0/7 = Sunday). Alphabetic
+    // values (`MON`, `MON-FRI`, `5L`, `5#2`, ...) are validated by croner.
+    if let Ok(num) = value.parse::<u32>()
+        && num > 7
+    {
+        return Err(ScheduleError::field_error(
+            full_expr,
+            field_num,
+            "day of week",
+            format!("value {num} is out of bounds (0-7)"),
+        ));
+    }
     Ok(())
 }
 
@@ -487,5 +596,73 @@ mod tests {
     #[test]
     fn test_seven_field_cron_rejected() {
         assert!(Schedule::parse("0 0 0 0 0 0 2026").is_err());
+    }
+
+    #[test]
+    fn test_day_of_week_out_of_bounds_rejected() {
+        // 5-field: `8` is not a valid day-of-week value (0-7).
+        let err = Schedule::parse("0 0 * * 8").unwrap_err();
+        match err {
+            ScheduleError::InvalidSyntax {
+                field_number,
+                message,
+                ..
+            } => {
+                assert_eq!(field_number, Some(5));
+                assert!(message.contains("day of week"));
+                assert!(message.contains("out of bounds (0-7)"));
+            }
+        }
+
+        // 6-field: day-of-week is field 6.
+        let err6 = Schedule::parse("0 0 0 * * 9").unwrap_err();
+        match err6 {
+            ScheduleError::InvalidSyntax {
+                field_number,
+                message,
+                ..
+            } => {
+                assert_eq!(field_number, Some(6));
+                assert!(message.contains("day of week"));
+            }
+        }
+
+        // Range endpoints are validated too.
+        assert!(Schedule::parse("0 0 * * 1-8").is_err());
+
+        // Names and the 0/7 Sunday aliases stay valid.
+        assert!(Schedule::parse("0 0 15-21 * * MON-FRI").is_ok());
+        assert!(Schedule::parse("0 0 * * 7").is_ok());
+        assert!(Schedule::parse("0 0 * * SUN").is_ok());
+    }
+
+    #[test]
+    fn test_single_instant_semantics() {
+        // A plain instant matches exactly one second per day and is not
+        // widened to the whole minute (documented pitfall).
+        let schedule = Schedule::parse("0 9 * * *").unwrap();
+        let at_instant = Utc.with_ymd_and_hms(2026, 9, 7, 9, 0, 0).unwrap();
+        let later_in_minute = Utc.with_ymd_and_hms(2026, 9, 7, 9, 0, 59).unwrap();
+        assert!(schedule.is_active(&at_instant));
+        assert!(
+            !schedule.is_active(&later_in_minute),
+            "instant crons match a single second, not the whole minute"
+        );
+
+        // Ranges still widen to a window so they are usable in practice.
+        let window = Schedule::parse("0 0 9-17 * * *").unwrap();
+        let mid_window = Utc.with_ymd_and_hms(2026, 9, 7, 13, 30, 0).unwrap();
+        assert!(window.is_active(&mid_window));
+    }
+
+    #[test]
+    fn test_evaluation_errors_fail_closed() {
+        use croner::errors::CronError;
+        // Any evaluation error must keep the schedule active (filtering on).
+        assert!(fail_closed_on_error(CronError::InvalidDate));
+        assert!(fail_closed_on_error(CronError::TimeSearchLimitExceeded));
+        assert!(fail_closed_on_error(CronError::InvalidPattern(
+            "unreachable".to_string()
+        )));
     }
 }

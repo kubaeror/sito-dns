@@ -22,12 +22,31 @@ use tracing::{debug, error, info, warn};
 
 use crate::tls::{TlsAcceptorManager, create_certified_key, load_server_config_with_challenges};
 
+/// Enforce owner-only permissions (0600) on an existing secret file.
+///
+/// `OpenOptions::mode` only applies when a file is created, so files that
+/// already exist (e.g. account credentials written by an older version) need
+/// this explicit fix-up.
+#[cfg(unix)]
+fn enforce_secret_file_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        warn!(
+            "Failed to restrict permissions on secret file {}: {e}",
+            path.display()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn enforce_secret_file_permissions(_path: &Path) {}
+
 /// Writes a file containing key material with owner-only permissions (0600).
 fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -36,6 +55,10 @@ fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
             .open(path)?;
         file.write_all(contents)?;
         file.sync_all()?;
+        drop(file);
+        // `mode` only applies at creation; fail closed if existing perms
+        // cannot be restricted.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
     #[cfg(not(unix))]
@@ -162,6 +185,8 @@ async fn load_or_create_account(
             "Loading existing ACME account credentials from {:?}",
             creds_file
         );
+        // Existing credentials may predate the 0600 creation mode; fix in place.
+        enforce_secret_file_permissions(&creds_file);
         let creds_data = std::fs::read_to_string(&creds_file)
             .map_err(|e| format!("Failed to read account credentials file: {e}"))?;
         let creds: AccountCredentials = serde_json::from_str(&creds_data)
@@ -244,6 +269,43 @@ pub fn certificate_needs_renewal(config: &AcmeServiceConfig) -> bool {
     }
 }
 
+/// RAII cleanup for challenge state registered during an ACME order.
+///
+/// Ensures TLS-ALPN-01 and HTTP-01 challenge material is removed even when
+/// order processing fails early (previously challenges remained registered
+/// until the next successful renewal).
+struct ChallengeCleanup<'a> {
+    mgr: Option<&'a TlsAcceptorManager>,
+    alpn_domains: Vec<String>,
+    http01: Option<&'a Arc<dashmap::DashMap<String, String>>>,
+    http_tokens: Vec<String>,
+}
+
+impl ChallengeCleanup<'_> {
+    fn register_alpn(&mut self, domain: &str) {
+        self.alpn_domains.push(domain.to_string());
+    }
+
+    fn register_http(&mut self, token: &str) {
+        self.http_tokens.push(token.to_string());
+    }
+}
+
+impl Drop for ChallengeCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(mgr) = self.mgr {
+            for domain in &self.alpn_domains {
+                mgr.unregister_challenge(domain);
+            }
+        }
+        if let Some(challenges_map) = self.http01 {
+            for token in &self.http_tokens {
+                challenges_map.remove(token);
+            }
+        }
+    }
+}
+
 /// Obtain a new certificate or renew an existing certificate via ACME protocol.
 ///
 /// Returns `Ok(true)` if a certificate was issued/renewed and reloaded,
@@ -278,8 +340,14 @@ pub async fn obtain_or_renew_certificate(
         .await
         .map_err(|e| format!("Failed to create ACME order: {e}"))?;
 
-    let mut registered_alpn_challenges = Vec::new();
-    let mut registered_http_challenges = Vec::new();
+    // Challenge registrations are cleaned up on every exit path (including
+    // early errors) by this RAII guard.
+    let mut challenges = ChallengeCleanup {
+        mgr: acceptor_mgr,
+        alpn_domains: Vec::new(),
+        http01: http01_challenges,
+        http_tokens: Vec::new(),
+    };
 
     // Process authorizations and set up challenge responses
     {
@@ -327,7 +395,7 @@ pub async fn obtain_or_renew_certificate(
                         .map_err(|e| format!("Failed to create challenge CertifiedKey: {e}"))?;
 
                     mgr.register_challenge(&domain, certified_key);
-                    registered_alpn_challenges.push(domain.clone());
+                    challenges.register_alpn(&domain);
 
                     challenge
                         .set_ready()
@@ -345,7 +413,7 @@ pub async fn obtain_or_renew_certificate(
                     let token = challenge.token.clone();
 
                     challenges_map.insert(token.clone(), key_auth.as_str().to_string());
-                    registered_http_challenges.push(token);
+                    challenges.register_http(&token);
 
                     challenge
                         .set_ready()
@@ -358,24 +426,15 @@ pub async fn obtain_or_renew_certificate(
         }
     }
 
-    // Wait for the order to transition to Ready
+    // Wait for the order to transition to Ready. `poll_ready` drives the CA
+    // validations, so challenge state must stay registered until it returns;
+    // dropping the guard releases it on success and on error alike.
     let retry_policy = RetryPolicy::default().timeout(Duration::from_secs(90));
     let order_status = order
         .poll_ready(&retry_policy)
         .await
         .map_err(|e| format!("Error waiting for ACME order to become ready: {e}"))?;
-
-    // Cleanup challenge state
-    if let Some(mgr) = acceptor_mgr {
-        for domain in &registered_alpn_challenges {
-            mgr.unregister_challenge(domain);
-        }
-    }
-    if let Some(challenges_map) = http01_challenges {
-        for token in &registered_http_challenges {
-            challenges_map.remove(token);
-        }
-    }
+    drop(challenges);
 
     if order_status != instant_acme::OrderStatus::Ready {
         return Err(format!(
@@ -414,12 +473,14 @@ pub async fn obtain_or_renew_certificate(
 
     // Reload the running server TLS config if acceptor_mgr is provided.
     // Reuse the manager's shared challenge-key map so in-flight ACME
-    // TLS-ALPN-01 challenges survive the reload.
+    // TLS-ALPN-01 challenges survive the reload, and carry over the SNI
+    // virtual-host certificates so they are not dropped.
     if let Some(mgr) = acceptor_mgr {
+        let sni_certs = mgr.sni_certs();
         match load_server_config_with_challenges(
             &cert_path,
             &key_path,
-            &[],
+            sni_certs.as_slice(),
             alpn_protocols.to_vec(),
             mgr.challenge_keys(),
         ) {
@@ -444,14 +505,22 @@ pub fn start_acme_manager(
     alpn_protocols: Vec<Vec<u8>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
+    /// Steady-state check cadence once renewal is not immediately required.
+    const ACME_CHECK_INTERVAL: Duration = Duration::from_hours(12);
+    /// First retry delay after a failed attempt.
+    const ACME_RETRY_INITIAL: Duration = Duration::from_secs(300);
+    /// Upper bound for the failure backoff.
+    const ACME_RETRY_MAX: Duration = Duration::from_hours(6);
+
     tokio::spawn(async move {
         info!(
             "ACME background manager started for domains: {:?}",
             config.domains
         );
 
-        // Initial acquisition/renewal check on startup
-        if let Err(e) = obtain_or_renew_certificate(
+        // Initial acquisition/renewal check on startup. Failures retry with a
+        // bounded backoff instead of waiting the full steady-state interval.
+        let initial_ok = match obtain_or_renew_certificate(
             &config,
             acceptor_mgr.as_ref(),
             http01_challenges.as_ref(),
@@ -459,11 +528,23 @@ pub fn start_acme_manager(
         )
         .await
         {
-            warn!("Initial ACME certificate check failed: {e}");
-        }
+            Ok(_) => true,
+            Err(e) => {
+                warn!("Initial ACME certificate check failed: {e}");
+                false
+            }
+        };
+        let mut next_delay = if initial_ok {
+            ACME_CHECK_INTERVAL
+        } else {
+            ACME_RETRY_INITIAL
+        };
+        let mut retry_delay = if initial_ok {
+            ACME_RETRY_INITIAL
+        } else {
+            ACME_RETRY_INITIAL * 2
+        };
 
-        // Periodic renewal loop (check every 12 hours)
-        let check_interval = Duration::from_hours(12);
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -472,15 +553,23 @@ pub fn start_acme_manager(
                         break;
                     }
                 }
-                () = tokio::time::sleep(check_interval) => {
+                () = tokio::time::sleep(next_delay) => {
                     debug!("Running periodic ACME renewal check...");
-                    if let Err(e) = obtain_or_renew_certificate(
+                    match obtain_or_renew_certificate(
                         &config,
                         acceptor_mgr.as_ref(),
                         http01_challenges.as_ref(),
                         &alpn_protocols,
                     ).await {
-                        warn!("Periodic ACME renewal failed: {e}");
+                        Ok(_) => {
+                            next_delay = ACME_CHECK_INTERVAL;
+                            retry_delay = ACME_RETRY_INITIAL;
+                        }
+                        Err(e) => {
+                            warn!("Periodic ACME renewal failed: {e}; retrying in {:?}", retry_delay);
+                            next_delay = retry_delay;
+                            retry_delay = (retry_delay * 2).min(ACME_RETRY_MAX);
+                        }
                     }
                 }
             }

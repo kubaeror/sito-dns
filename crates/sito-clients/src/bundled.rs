@@ -53,12 +53,21 @@ impl BundledManifest {
 
     /// Parses the embedded manifest.
     ///
+    /// Returns an error instead of panicking so callers can degrade to a
+    /// loaded/error state at runtime.
+    pub fn try_bundled() -> Result<Self, serde_json::Error> {
+        Self::parse(MANIFEST_JSON)
+    }
+
+    /// Parses the embedded manifest.
+    ///
     /// # Panics
     /// Panics when the embedded manifest is invalid; this is a build-time
-    /// invariant covered by unit tests.
+    /// invariant covered by unit tests. Prefer [`BundledManifest::try_bundled`]
+    /// on non-fatal paths.
     #[must_use]
     pub fn bundled() -> Self {
-        Self::parse(MANIFEST_JSON).expect("embedded bundled manifest must be valid JSON")
+        Self::try_bundled().expect("embedded bundled manifest must be valid JSON")
     }
 
     /// Returns the list with the given id.
@@ -84,6 +93,9 @@ pub enum BundledListError {
         expected: String,
         actual: String,
     },
+    /// The bundled content could not be parsed.
+    #[error("bundled list '{id}' content is invalid: {reason}")]
+    InvalidContent { id: String, reason: String },
 }
 
 /// Returns the embedded content for a manifest entry, if known.

@@ -47,7 +47,7 @@ futures-util = "0.3"
 serde_json.workspace = true
 sito-api.workspace = true
 sito-stats.workspace = true
-tokio-tungstenite = "0.29"
+tokio-tungstenite.workspace = true
 tower = { version = "0.5", features = ["util"] }
 utoipa = "5.3"
 subtle.workspace = true

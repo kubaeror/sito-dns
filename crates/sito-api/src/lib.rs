@@ -13,6 +13,7 @@ pub mod error;
 pub mod handlers;
 pub mod models;
 pub mod openapi;
+pub mod probe;
 pub mod router;
 pub mod security;
 pub mod state;
@@ -44,6 +45,12 @@ mod tests {
         let openapi = ApiDoc::openapi();
         let json_str = openapi.to_pretty_json().expect("valid JSON");
         assert!(!json_str.is_empty());
+        // Keep the exposed spec version in lockstep with the crate version.
+        assert_eq!(
+            openapi.info.version,
+            env!("CARGO_PKG_VERSION"),
+            "OpenAPI info.version must match the crate version"
+        );
         // Write out docs/openapi.json relative to crate root or workspace
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()

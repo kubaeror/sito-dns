@@ -9,6 +9,7 @@
     <strong>Note on Hot-Reloading:</strong> Changes to rewrites, custom filtering rules, and client groups take effect immediately. Changes to network bind addresses/ports and cache buffer sizing require a daemon restart.
   </div>
   <form action="/ui/settings/save" method="POST">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <div style="margin-bottom: 24px;">
       <h3 style="margin-bottom: 12px; font-size: 1.1rem;">DNS Caching & Performance</h3>
       <div class="grid-2">

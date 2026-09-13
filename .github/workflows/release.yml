@@ -11,10 +11,9 @@ on:
         required: true
         default: 'v1.0.0'
 
+# Least privilege by default; jobs grant the narrow permissions they need.
 permissions:
-  contents: write
-  packages: write
-  id-token: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -66,8 +65,12 @@ jobs:
           shellcheck -S warning contrib/install.sh
 
       - name: Package release archive
+        env:
+          # workflow_dispatch input is passed via env, never interpolated
+          # directly into the shell.
+          RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
         run: |
-          VERSION="${{ github.event.inputs.tag_name || github.ref_name }}"
+          VERSION="${RELEASE_TAG}"
           ARCHIVE_DIR="sito-${VERSION}-${{ matrix.target }}"
           mkdir -p "${ARCHIVE_DIR}"
           cp "target/${{ matrix.target }}/release/sito" "${ARCHIVE_DIR}/"
@@ -91,6 +94,9 @@ jobs:
     name: Generate SBOM & Publish Release
     needs: [build-binaries]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release
+      id-token: write # cosign keyless signing via GitHub OIDC
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -145,6 +151,9 @@ jobs:
   docker-build-push:
     name: Build and Push Multi-Arch Container Image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push the image to GHCR
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -181,5 +190,11 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Supply-chain attestations: BuildKit provenance and an SPDX SBOM
+          # attestation are attached to the pushed image index. Verify with:
+          #   docker buildx imagetools inspect <image>@<digest> --format '{{json .Provenance}}'
+          #   cosign verify-attestation --type spdxjson <image>@<digest> ...
+          provenance: true
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max

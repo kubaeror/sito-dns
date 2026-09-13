@@ -76,6 +76,11 @@ pub struct UpdateInfo {
     pub is_docker: bool,
     /// Environment-specific upgrade instructions (e.g. docker compose command).
     pub instructions: Option<String>,
+    /// True when the version comparison could not be performed because one of
+    /// the version strings is not valid semver. Callers must not interpret
+    /// `update_available = false` as "up to date" in that case.
+    #[serde(default)]
+    pub version_comparison_unknown: bool,
 }
 
 /// Detects whether the current process is running inside a Docker or OCI container.
@@ -110,35 +115,39 @@ pub fn current_target_triple() -> &'static str {
     }
 }
 
-/// Parses a version string into a (major, minor, patch) tuple.
+/// Parses a strict `major.minor.patch` semver core (optionally `v`-prefixed,
+/// optional pre-release/build metadata after `-`/`+`). Returns `None` for any
+/// other shape so callers never claim "newer" based on a loose comparison.
 pub fn parse_version_tuple(v: &str) -> Option<(u64, u64, u64)> {
     let clean = v.trim().trim_start_matches('v');
-    let parts: Vec<&str> = clean.split('.').collect();
-    if parts.is_empty() {
+    let core = clean.split(['-', '+']).next().unwrap_or(clean);
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
         return None;
     }
-
-    let major = parts[0].parse::<u64>().ok()?;
-    let minor = parts
-        .get(1)
-        .and_then(|p| p.parse::<u64>().ok())
-        .unwrap_or(0);
-    let patch_raw = parts.get(2).copied().unwrap_or("0");
-    let patch_clean = patch_raw
-        .split(|c: char| !c.is_ascii_digit())
-        .next()
-        .unwrap_or("0");
-    let patch = patch_clean.parse::<u64>().unwrap_or(0);
-
     Some((major, minor, patch))
 }
 
-/// Returns true if `latest` is strictly newer than `current`.
+/// Compares two versions. `None` means at least one side is unparseable
+/// (unknown outcome) and no ordering can be asserted.
+pub fn compare_versions(latest: &str, current: &str) -> Option<std::cmp::Ordering> {
+    let latest = parse_version_tuple(latest)?;
+    let current = parse_version_tuple(current)?;
+    Some(latest.cmp(&current))
+}
+
+/// Returns true only when both versions parse and `latest` is strictly newer
+/// than `current`. Unparseable versions are never reported as newer.
 pub fn is_version_newer(latest: &str, current: &str) -> bool {
-    match (parse_version_tuple(latest), parse_version_tuple(current)) {
-        (Some(l), Some(c)) => l > c,
-        _ => latest.trim_start_matches('v') != current.trim_start_matches('v'),
-    }
+    compare_versions(latest, current) == Some(std::cmp::Ordering::Greater)
+}
+
+/// True when both versions parse as semver.
+pub fn versions_comparable(latest: &str, current: &str) -> bool {
+    parse_version_tuple(latest).is_some() && parse_version_tuple(current).is_some()
 }
 
 /// Queries GitHub Releases for the latest release information.
@@ -171,6 +180,7 @@ pub async fn check_for_update(repo: Option<&str>) -> Result<UpdateInfo, UpdateEr
             published_at: None,
             is_docker,
             instructions: None,
+            version_comparison_unknown: false,
         });
     }
 
@@ -196,6 +206,14 @@ pub async fn check_for_update(repo: Option<&str>) -> Result<UpdateInfo, UpdateEr
     let published_at = release["published_at"].as_str().map(ToString::to_string);
 
     let is_docker = is_running_in_docker();
+    let version_comparison_unknown = !versions_comparable(&latest_version, &current_version);
+    if version_comparison_unknown {
+        tracing::warn!(
+            latest = %latest_version,
+            current = %current_version,
+            "Release tag is not strict semver; update availability is unknown"
+        );
+    }
     let update_available = is_version_newer(&latest_version, &current_version);
 
     let instructions = if is_docker {
@@ -218,6 +236,7 @@ pub async fn check_for_update(repo: Option<&str>) -> Result<UpdateInfo, UpdateEr
         published_at,
         is_docker,
         instructions,
+        version_comparison_unknown,
     })
 }
 
@@ -275,6 +294,9 @@ const MAX_UPDATE_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Maximum accepted signature/certificate asset size.
 const MAX_SIGNATURE_ASSET_BYTES: u64 = 1024 * 1024;
+
+/// Maximum decompressed size accepted for the extracted executable entry.
+const MAX_EXTRACTED_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Outcome of release signature verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,6 +533,56 @@ async fn apply_signature_policy(
     result
 }
 
+/// Extracts the `sito` executable from a gzipped release tarball, enforcing a
+/// per-entry decompression cap so a tar bomb cannot exhaust memory even when
+/// the compressed archive passed the download-size check.
+pub fn extract_binary_from_archive(archive_bytes: &[u8]) -> Result<Vec<u8>, UpdateError> {
+    let gz = GzDecoder::new(archive_bytes);
+    let mut tar = tar::Archive::new(gz);
+    let mut binary_content = Vec::new();
+    let mut found = false;
+
+    let entries = tar
+        .entries()
+        .map_err(|e| UpdateError::Archive(format!("Failed to read tar entries: {e}")))?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|e| UpdateError::Archive(format!("Failed entry: {e}")))?;
+        let path = entry
+            .path()
+            .map_err(|e| UpdateError::Archive(format!("Invalid path: {e}")))?;
+
+        if let Some(file_name) = path.file_name()
+            && file_name == "sito"
+        {
+            if entry.size() > MAX_EXTRACTED_BINARY_BYTES {
+                return Err(UpdateError::Archive(format!(
+                    "Binary entry 'sito' is too large ({} bytes)",
+                    entry.size()
+                )));
+            }
+            let mut limited = (&mut entry).take(MAX_EXTRACTED_BINARY_BYTES + 1);
+            limited
+                .read_to_end(&mut binary_content)
+                .map_err(|e| UpdateError::Archive(format!("Failed to read binary: {e}")))?;
+            if binary_content.len() as u64 > MAX_EXTRACTED_BINARY_BYTES {
+                return Err(UpdateError::Archive(
+                    "Binary entry exceeded the decompression cap".to_string(),
+                ));
+            }
+            found = true;
+            break;
+        }
+    }
+
+    if !found || binary_content.is_empty() {
+        return Err(UpdateError::Archive(
+            "Could not find executable binary 'sito' in the downloaded release archive".to_string(),
+        ));
+    }
+    Ok(binary_content)
+}
+
 /// Downloads the latest release archive, verifies the release signature (when
 /// present) and SHA-256 checksum, extracts the binary, and replaces the running
 /// executable.
@@ -643,37 +715,7 @@ pub async fn apply_update(
     info!(asset = %archive.name, "SHA256 checksum verified successfully");
 
     // 4. Extract 'sito' executable from tarball
-    let gz = GzDecoder::new(&archive_bytes[..]);
-    let mut tar = tar::Archive::new(gz);
-    let mut binary_content = Vec::new();
-    let mut found = false;
-
-    let entries = tar
-        .entries()
-        .map_err(|e| UpdateError::Archive(format!("Failed to read tar entries: {e}")))?;
-
-    for entry in entries {
-        let mut entry = entry.map_err(|e| UpdateError::Archive(format!("Failed entry: {e}")))?;
-        let path = entry
-            .path()
-            .map_err(|e| UpdateError::Archive(format!("Invalid path: {e}")))?;
-
-        if let Some(file_name) = path.file_name()
-            && file_name == "sito"
-        {
-            entry
-                .read_to_end(&mut binary_content)
-                .map_err(|e| UpdateError::Archive(format!("Failed to read binary: {e}")))?;
-            found = true;
-            break;
-        }
-    }
-
-    if !found || binary_content.is_empty() {
-        return Err(UpdateError::Archive(
-            "Could not find executable binary 'sito' in the downloaded release archive".to_string(),
-        ));
-    }
+    let binary_content = extract_binary_from_archive(archive_bytes.as_ref())?;
 
     // 5. Replace current executable atomically
     let current_exe = std::env::current_exe()?;
@@ -715,9 +757,16 @@ mod tests {
         assert!(is_version_newer("1.2.0", "1.1.1"));
         assert!(is_version_newer("v2.0.0", "1.9.9"));
         assert!(is_version_newer("1.1.2", "1.1.1"));
+        assert!(is_version_newer("1.1.2-rc.1", "1.1.1"));
         assert!(!is_version_newer("1.1.1", "1.1.1"));
         assert!(!is_version_newer("1.0.0", "1.1.1"));
         assert!(!is_version_newer("v1.1.1", "1.1.1"));
+        // Unparseable versions must never be claimed as newer.
+        assert!(!is_version_newer("garbage", "1.0.0"));
+        assert!(!is_version_newer("1.0.0", "garbage"));
+        assert!(!is_version_newer("1.0", "0.9"));
+        assert!(versions_comparable("1.6.0", "1.5.0"));
+        assert!(!versions_comparable("nightly", "1.5.0"));
     }
 
     #[test]
@@ -771,6 +820,43 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
             hex::encode(ring::digest::digest(&ring::digest::SHA256, fake_archive).as_ref());
         let sums_valid = format!("{valid_hash}  {fake_name}\n");
         assert!(verify_archive_checksum(fake_archive, fake_name, Some(&sums_valid)).is_ok());
+    }
+
+    fn build_tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        for (name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append_data(&mut header, *name, *data).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn test_extract_binary_from_archive() {
+        let archive = build_tar_gz(&[("README.md", b"docs"), ("sito", b"binary-bytes")]);
+        assert_eq!(
+            extract_binary_from_archive(&archive).unwrap(),
+            b"binary-bytes"
+        );
+
+        // A tar bomb whose declared entry size exceeds the cap must be rejected
+        // before decompression.
+        let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(MAX_EXTRACTED_BINARY_BYTES + 1);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "sito", std::io::empty())
+            .unwrap();
+        let bomb = builder.into_inner().unwrap().finish().unwrap();
+        let err = extract_binary_from_archive(&bomb).unwrap_err();
+        assert!(matches!(err, UpdateError::Archive(_)));
     }
 
     #[test]

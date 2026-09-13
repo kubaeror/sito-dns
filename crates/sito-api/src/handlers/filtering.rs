@@ -17,6 +17,22 @@ use sito_proto::{Name, RecordType};
 use std::net::IpAddr;
 use std::str::FromStr;
 
+/// True when a filter-list name is safe to use as a URL path segment/key.
+pub(crate) fn valid_filter_list_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '?', '#', '%']) && !name.chars().any(char::is_control)
+}
+
+/// Resolves a filter-list id: the stable key is the (unique) list name, while
+/// numeric indices from older clients keep working.
+fn resolve_filter_list_index(cfg: &sito_core::config::Config, id: &str) -> Option<usize> {
+    if let Some(idx) = cfg.filtering.lists.iter().position(|list| list.name == id) {
+        return Some(idx);
+    }
+    id.parse::<usize>()
+        .ok()
+        .filter(|idx| *idx < cfg.filtering.lists.len())
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/filtering/lists",
@@ -36,9 +52,8 @@ pub async fn get_filter_lists(
         .filtering
         .lists
         .iter()
-        .enumerate()
-        .map(|(idx, list)| FilterListDto {
-            id: idx,
+        .map(|list| FilterListDto {
+            id: list.name.clone(),
             name: list.name.clone(),
             url: list.url.clone(),
             enabled: list.enabled,
@@ -68,23 +83,40 @@ pub async fn add_filter_list(
     Json(payload): Json<AddFilterListRequest>,
 ) -> Result<Json<FilterListDto>, ProblemDetails> {
     let mut new_cfg = (**ctx.config.load()).clone();
+    let name = payload.name.trim().to_string();
+    if !valid_filter_list_name(&name) || payload.url.trim().is_empty() {
+        return Err(ProblemDetails::bad_request(
+            "Filter list name must be non-empty and must not contain /, ?, # or % (URL is required)",
+        ));
+    }
+    if new_cfg.filtering.lists.iter().any(|list| list.name == name) {
+        return Err(ProblemDetails::conflict(format!(
+            "Filter list '{name}' already exists"
+        )));
+    }
     let new_list = FilterListConfig {
-        name: payload.name.clone(),
+        name: name.clone(),
         url: payload.url.clone(),
         enabled: payload.enabled,
         refresh_hours: Some(u64::from(payload.refresh_hours)),
     };
 
-    let idx = new_cfg.filtering.lists.len();
     new_cfg.filtering.lists.push(new_list.clone());
 
+    // Compile before persisting so a broken list does not get written as
+    // successfully applied.
+    ctx.filter
+        .reload_with_config(&new_cfg.filtering)
+        .await
+        .map_err(|e| {
+            ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
+        })?;
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
-    let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);
 
     Ok(Json(FilterListDto {
-        id: idx,
+        id: name,
         name: new_list.name,
         url: new_list.url,
         enabled: new_list.enabled,
@@ -110,17 +142,33 @@ pub async fn add_filter_list(
 pub async fn update_filter_list(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
-    Path(id): Path<usize>,
+    Path(id): Path<String>,
     Json(payload): Json<UpdateFilterListRequest>,
 ) -> Result<Json<FilterListDto>, ProblemDetails> {
     let mut new_cfg = (**ctx.config.load()).clone();
-    if id >= new_cfg.filtering.lists.len() {
-        return Err(ProblemDetails::not_found(format!(
-            "Filter list with ID {id} not found"
-        )));
+    let idx = resolve_filter_list_index(&new_cfg, &id)
+        .ok_or_else(|| ProblemDetails::not_found(format!("Filter list with ID {id} not found")))?;
+
+    if let Some(ref new_name) = payload.name {
+        if !valid_filter_list_name(new_name.trim()) {
+            return Err(ProblemDetails::bad_request(
+                "Filter list name must be non-empty and must not contain /, ?, # or %",
+            ));
+        }
+        if new_cfg
+            .filtering
+            .lists
+            .iter()
+            .enumerate()
+            .any(|(i, list)| i != idx && list.name == *new_name)
+        {
+            return Err(ProblemDetails::conflict(format!(
+                "Filter list '{new_name}' already exists"
+            )));
+        }
     }
 
-    let list = &mut new_cfg.filtering.lists[id];
+    let list = &mut new_cfg.filtering.lists[idx];
     if let Some(name) = payload.name {
         list.name = name;
     }
@@ -135,7 +183,7 @@ pub async fn update_filter_list(
     }
 
     let updated_dto = FilterListDto {
-        id,
+        id: list.name.clone(),
         name: list.name.clone(),
         url: list.url.clone(),
         enabled: list.enabled,
@@ -144,8 +192,13 @@ pub async fn update_filter_list(
         last_updated: None,
     };
 
+    ctx.filter
+        .reload_with_config(&new_cfg.filtering)
+        .await
+        .map_err(|e| {
+            ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
+        })?;
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
-    let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);
 
@@ -167,18 +220,20 @@ pub async fn update_filter_list(
 pub async fn delete_filter_list(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
-    Path(id): Path<usize>,
+    Path(id): Path<String>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
     let mut new_cfg = (**ctx.config.load()).clone();
-    if id >= new_cfg.filtering.lists.len() {
-        return Err(ProblemDetails::not_found(format!(
-            "Filter list with ID {id} not found"
-        )));
-    }
+    let idx = resolve_filter_list_index(&new_cfg, &id)
+        .ok_or_else(|| ProblemDetails::not_found(format!("Filter list with ID {id} not found")))?;
 
-    let removed = new_cfg.filtering.lists.remove(id);
+    let removed = new_cfg.filtering.lists.remove(idx);
+    ctx.filter
+        .reload_with_config(&new_cfg.filtering)
+        .await
+        .map_err(|e| {
+            ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
+        })?;
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
-    let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);
 
@@ -251,8 +306,13 @@ pub async fn set_filtering_rules(
     let mut new_cfg = (**ctx.config.load()).clone();
     new_cfg.filtering.custom_rules = payload.rules.clone();
 
+    ctx.filter
+        .reload_with_config(&new_cfg.filtering)
+        .await
+        .map_err(|e| {
+            ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
+        })?;
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
-    let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);
 

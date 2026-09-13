@@ -61,6 +61,7 @@
       </button>
 
       <form action="/api/v1/querylog/clear" method="POST" hx-post="/api/v1/querylog/clear" hx-confirm="Are you sure you want to clear all query logs?" hx-target="#query-table-body" hx-swap="innerHTML" style="margin:0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <button type="submit" class="btn btn-outline btn-sm" style="color: var(--accent-danger);" title="Clear query history">
           Clear Logs
         </button>

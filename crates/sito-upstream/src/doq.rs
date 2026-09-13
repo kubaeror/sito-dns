@@ -128,11 +128,14 @@ impl Upstream for QuicUpstream {
         wire_query.metadata.id = 0;
         let encoded =
             encode_message(&wire_query).map_err(|e| UpstreamError::BadResponse(e.to_string()))?;
-        if encoded.len() > MAX_DOQ_MESSAGE_BYTES {
-            return Err(UpstreamError::BadResponse(
-                "DoQ query exceeds the maximum DNS message size".to_string(),
-            ));
-        }
+        // The 2-octet length prefix caps the message at 65535 bytes; reject
+        // instead of truncating the cast.
+        let Ok(encoded_len) = u16::try_from(encoded.len()) else {
+            return Err(UpstreamError::BadResponse(format!(
+                "DoQ query of {} bytes exceeds the {MAX_DOQ_MESSAGE_BYTES} byte limit",
+                encoded.len()
+            )));
+        };
 
         let conn = self.get_connection().await?;
         let (mut send, mut recv) = tokio::time::timeout(self.timeout, conn.open_bi())
@@ -141,7 +144,7 @@ impl Upstream for QuicUpstream {
             .map_err(|e| UpstreamError::Io(format!("failed to open DoQ stream: {e}")))?;
 
         let write = async {
-            send.write_all(&(encoded.len() as u16).to_be_bytes())
+            send.write_all(&encoded_len.to_be_bytes())
                 .await
                 .map_err(|e| UpstreamError::Io(format!("DoQ stream write failed: {e}")))?;
             send.write_all(&encoded)
@@ -175,7 +178,14 @@ impl Upstream for QuicUpstream {
 
         let mut response = decode_message(&resp_buf)
             .map_err(|e| UpstreamError::BadResponse(format!("invalid DoQ response: {e}")))?;
-        // Responses are expected with ID 0; restore the caller's ID and validate.
+        // RFC 9250 section 4.2.1: responses MUST use DNS message ID 0. Check the
+        // wire ID before rewriting it, otherwise the mismatch check is vacuous.
+        if response.metadata.id != 0 {
+            return Err(UpstreamError::BadResponse(format!(
+                "DoQ response ID must be 0 on the wire, got {}",
+                response.metadata.id
+            )));
+        }
         response.metadata.id = msg.metadata.id;
         validate_response(msg, &response)?;
         Ok(response)
@@ -197,8 +207,11 @@ mod tests {
         query
     }
 
-    /// Starts a minimal RFC 9250 echo server with a fresh self-signed certificate.
-    async fn spawn_doq_server() -> (SocketAddr, rustls::pki_types::CertificateDer<'static>) {
+    /// Starts a minimal RFC 9250 echo server with a fresh self-signed
+    /// certificate, replying with the given wire DNS message ID.
+    fn spawn_doq_server(
+        response_id: u16,
+    ) -> (SocketAddr, rustls::pki_types::CertificateDer<'static>) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
         let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
@@ -240,7 +253,7 @@ mod tests {
                     let query = decode_message(&query_buf).unwrap();
                     // RFC 9250: queries use ID 0.
                     assert_eq!(query.metadata.id, 0);
-                    let mut resp = Message::new(0, MessageType::Response, OpCode::Query);
+                    let mut resp = Message::new(response_id, MessageType::Response, OpCode::Query);
                     resp.metadata.response_code = sito_proto::ResponseCode::NoError;
                     resp.queries = query.queries.clone();
                     let encoded = encode_message(&resp).unwrap();
@@ -273,7 +286,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_doq_query_roundtrip_uses_id_zero_on_wire() {
-        let (addr, cert) = spawn_doq_server().await;
+        let (addr, cert) = spawn_doq_server(0);
         let upstream = QuicUpstream::with_client_config(
             "localhost",
             addr,
@@ -293,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_doq_untrusted_certificate_rejected() {
-        let (addr, _cert) = spawn_doq_server().await;
+        let (addr, _cert) = spawn_doq_server(0);
         // Trust a different self-signed certificate than the server presents.
         let other = rcgen::generate_simple_self_signed(vec!["other.local".to_string()]).unwrap();
         let other_der = rustls::pki_types::CertificateDer::from(other.cert);
@@ -308,6 +321,27 @@ mod tests {
         let err = upstream.resolve(&make_query(1)).await.unwrap_err();
         assert!(
             matches!(err, UpstreamError::Io(_) | UpstreamError::Timeout),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_doq_rejects_nonzero_wire_id() {
+        // RFC 9250: responses MUST carry DNS message ID 0. A server echoing a
+        // non-zero ID must be rejected (previously the check was vacuous
+        // because the ID was overwritten before validation).
+        let (addr, cert) = spawn_doq_server(0x1234);
+        let upstream = QuicUpstream::with_client_config(
+            "localhost",
+            addr,
+            Duration::from_secs(3),
+            client_config_trusting(&cert),
+        )
+        .unwrap();
+
+        let err = upstream.resolve(&make_query(0x4242)).await.unwrap_err();
+        assert!(
+            matches!(err, UpstreamError::BadResponse(ref msg) if msg.contains("must be 0")),
             "unexpected error: {err:?}"
         );
     }

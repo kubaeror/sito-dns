@@ -11,5 +11,6 @@ pub mod table;
 
 pub use config::{RewriteEntryConfig, RewritesConfig};
 pub use table::{
-    LocalRecordData, RewriteTable, ipv4_to_in_addr_arpa, ipv6_to_ip6_arpa, is_rfc1918, is_ula,
+    LocalRecordData, RewriteTable, ipv4_to_in_addr_arpa, ipv6_to_ip6_arpa,
+    is_auto_ptr_candidate_v4, is_rfc1918, is_ula,
 };

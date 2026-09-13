@@ -2,7 +2,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
+use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RecordType};
 use rustls_pki_types::ServerName;
 use sito_proto::{decode_message, encode_message};
@@ -172,6 +172,68 @@ impl TestDnsClient {
         query
             .queries
             .push(Query::query(Name::from_str(&fqdn)?, qtype));
+
+        let wire = encode_message(&query)?;
+        socket.send(&wire).await?;
+
+        let mut buf = [0u8; 4096];
+        let len = tokio::time::timeout(self.timeout, socket.recv(&mut buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("UDP query timed out after {:?}", self.timeout))??;
+
+        let response = decode_message(&buf[..len])?;
+        Ok(response)
+    }
+
+    /// Sends a DNS query over UDP with EDNS DO=1 (DNSSEC awareness).
+    pub async fn query_udp_dnssec(
+        &self,
+        name: &str,
+        qtype: RecordType,
+    ) -> Result<Message, anyhow::Error> {
+        self.query_udp_flags(name, qtype, true, false).await
+    }
+
+    /// Sends a DNS query over UDP with CD=1 (checking disabled) and DO=1.
+    pub async fn query_udp_cd(
+        &self,
+        name: &str,
+        qtype: RecordType,
+    ) -> Result<Message, anyhow::Error> {
+        self.query_udp_flags(name, qtype, true, true).await
+    }
+
+    /// Sends a DNS query over UDP with explicit DO/CD flags.
+    pub async fn query_udp_flags(
+        &self,
+        name: &str,
+        qtype: RecordType,
+        dnssec_ok: bool,
+        checking_disabled: bool,
+    ) -> Result<Message, anyhow::Error> {
+        let bind_addr = if self.server_addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let socket = UdpSocket::bind(bind_addr).await?;
+        socket.connect(self.server_addr).await?;
+
+        let fqdn = if name.ends_with('.') {
+            name.to_string()
+        } else {
+            format!("{name}.")
+        };
+
+        let mut query = Message::new(rand::random(), MessageType::Query, OpCode::Query);
+        query.metadata.recursion_desired = true;
+        query.metadata.checking_disabled = checking_disabled;
+        query
+            .queries
+            .push(Query::query(Name::from_str(&fqdn)?, qtype));
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(dnssec_ok).set_max_payload(1232);
+        query.set_edns(edns);
 
         let wire = encode_message(&query)?;
         socket.send(&wire).await?;

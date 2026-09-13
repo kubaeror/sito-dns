@@ -69,6 +69,7 @@ mod tests {
         assert!(StaticAssets::get("uplot.min.js").is_some());
         assert!(StaticAssets::get("uplot.min.css").is_some());
         assert!(StaticAssets::get("app.css").is_some());
+        assert!(StaticAssets::get("app.js").is_some());
         assert!(StaticAssets::get("logo.svg").is_some());
     }
 
@@ -81,6 +82,7 @@ mod tests {
             active_tab: "login",
             version: "1.2.1",
             error_message: "Invalid credentials test",
+            csrf_token: "",
         };
         let html = tmpl.render().expect("render login template");
         assert!(html.contains("sito DNS"));
@@ -122,6 +124,7 @@ mod tests {
 
         // Full Dashboard
         let dash = DashboardTemplate {
+            csrf_token: "",
             is_authenticated: true,
             username: "admin",
             user_role: "admin",
@@ -171,6 +174,7 @@ mod tests {
         assert!(partial_html.contains("1.2 ms"));
 
         let full = QueryLogTemplate {
+            csrf_token: "",
             is_authenticated: true,
             username: "admin",
             user_role: "admin",
@@ -186,6 +190,7 @@ mod tests {
     #[test]
     fn test_render_all_views() {
         let filter_tmpl = FilteringTemplate {
+            csrf_token: "",
             is_authenticated: true,
             username: "admin",
             user_role: "admin",
@@ -210,12 +215,14 @@ mod tests {
         assert!(filtering_html.contains("CC0-1.0"));
 
         let rewrites_tmpl = RewritesTemplate {
+            csrf_token: "",
             is_authenticated: true,
             username: "admin",
             user_role: "admin",
             active_tab: "rewrites",
             version: "1.2.1",
             rewrites: vec![RewriteViewItem {
+                id: "rw_test".to_string(),
                 domain: "nas.lan".to_string(),
                 record_type: "A".to_string(),
                 answer: "192.168.1.50".to_string(),
@@ -224,6 +231,7 @@ mod tests {
         assert!(rewrites_tmpl.render().unwrap().contains("nas.lan"));
 
         let clients_tmpl = ClientsTemplate {
+            csrf_token: "",
             is_authenticated: true,
             username: "admin",
             user_role: "admin",
@@ -238,6 +246,7 @@ mod tests {
         assert!(clients_tmpl.render().unwrap().contains("Work PC"));
 
         let upstreams_tmpl = UpstreamsTemplate {
+            csrf_token: "",
             is_authenticated: true,
             username: "admin",
             user_role: "admin",
@@ -248,6 +257,7 @@ mod tests {
         assert!(upstreams_tmpl.render().is_ok());
 
         let settings_tmpl = SettingsTemplate {
+            csrf_token: "",
             is_authenticated: true,
             username: "admin",
             user_role: "admin",
@@ -267,6 +277,7 @@ mod tests {
             listeners: vec![],
         };
         let sys_tmpl = SystemTemplate {
+            csrf_token: "",
             is_authenticated: true,
             username: "admin",
             user_role: "admin",
@@ -288,6 +299,9 @@ mod tests {
             user_role: "",
             active_tab: "wizard",
             version: "1.2.1",
+            csrf_token: "",
+            setup_required: true,
+            setup_token: "test-token",
         };
         assert!(wiz_tmpl.render().unwrap().contains("Welcome to sito DNS"));
     }

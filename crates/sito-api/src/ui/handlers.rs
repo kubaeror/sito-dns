@@ -12,10 +12,13 @@ use std::str::FromStr;
 use crate::auth::manager::LoginResult;
 use crate::auth::rbac::AuthUser;
 use crate::auth::resolve_client_ip;
-use crate::auth::session::{build_clear_session_cookie, extract_session_cookie};
+use crate::auth::session::{
+    build_clear_csrf_cookie, build_clear_session_cookie, build_csrf_cookie, extract_session_cookie,
+};
 use crate::auth::token::Role;
 use crate::config_writer::save_config_atomic;
 use crate::models::{FilterListDto, StatusResponse};
+use crate::probe::probe_upstream_target;
 use crate::state::ServerContext;
 use crate::ui::templates::{
     ClientViewItem, ClientsTemplate, DashboardStatsPartialTemplate, DashboardTemplate,
@@ -26,7 +29,6 @@ use crate::ui::templates::{
 use sito_core::FilterEngine;
 use sito_core::config::{BlockingMode, Config, FilterListConfig, UpstreamStrategy};
 use sito_stats::QueryLogFilter;
-use sito_upstream::Upstream as _;
 
 pub fn format_duration(secs: u64) -> String {
     let days = secs / 86400;
@@ -81,6 +83,29 @@ pub fn get_session_user(ctx: &ServerContext, headers: &HeaderMap) -> Option<Auth
     None
 }
 
+/// Returns the CSRF token bound to the caller's session (empty when not
+/// authenticated) for embedding in Askama forms.
+pub fn get_csrf_token(ctx: &ServerContext, headers: &HeaderMap) -> String {
+    headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_session_cookie)
+        .and_then(|id| ctx.auth_mgr.validate_session(&id))
+        .map(|session| session.csrf_token)
+        .unwrap_or_default()
+}
+
+/// Appends a `Set-Cookie` header without clobbering an existing one.
+fn append_cookie(response: &mut Response, value: &str) {
+    if let Ok(cookie_val) = value.parse() {
+        response.headers_mut().append(SET_COOKIE, cookie_val);
+    }
+}
+
+fn error_response(status: StatusCode, message: &str) -> Response {
+    (status, message.to_string()).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Root, Login & Logout
 // ---------------------------------------------------------------------------
@@ -104,6 +129,7 @@ pub async fn login_page(State(ctx): State<ServerContext>, headers: HeaderMap) ->
         active_tab: "login",
         version: env!("CARGO_PKG_VERSION"),
         error_message: "",
+        csrf_token: "",
     })
     .into_response()
 }
@@ -129,15 +155,21 @@ pub async fn login_submit(
     let client_ip = resolve_client_ip(peer_addr, &headers, &trusted_proxies);
     let result = ctx
         .auth_mgr
-        .login(&form.username, &form.password, &client_ip);
+        .login(&form.username, &form.password, &client_ip)
+        .await;
 
     match result {
         LoginResult::Success(session) => {
-            let cookie_header = session.to_cookie_header_secure(is_secure);
             let mut resp = Redirect::to("/dashboard").into_response();
-            if let Ok(val) = cookie_header.parse() {
-                resp.headers_mut().insert(SET_COOKIE, val);
-            }
+            let max_age = (session.expires_at - Utc::now().timestamp()).max(0);
+            append_cookie(
+                &mut resp,
+                &crate::auth::session::build_session_cookie(&session.id, max_age, is_secure),
+            );
+            append_cookie(
+                &mut resp,
+                &build_csrf_cookie(&session.csrf_token, max_age, is_secure),
+            );
             resp
         }
         LoginResult::TotpRequired { partial_token } => {
@@ -147,13 +179,23 @@ pub async fn login_submit(
                 match ctx
                     .auth_mgr
                     .verify_totp(&partial_token, code.trim(), &client_ip)
+                    .await
                 {
                     crate::auth::manager::TotpVerifyResult::Success(session) => {
-                        let cookie_header = session.to_cookie_header_secure(is_secure);
                         let mut resp = Redirect::to("/dashboard").into_response();
-                        if let Ok(val) = cookie_header.parse() {
-                            resp.headers_mut().insert(SET_COOKIE, val);
-                        }
+                        let max_age = (session.expires_at - Utc::now().timestamp()).max(0);
+                        append_cookie(
+                            &mut resp,
+                            &crate::auth::session::build_session_cookie(
+                                &session.id,
+                                max_age,
+                                is_secure,
+                            ),
+                        );
+                        append_cookie(
+                            &mut resp,
+                            &build_csrf_cookie(&session.csrf_token, max_age, is_secure),
+                        );
                         return resp;
                     }
                     crate::auth::manager::TotpVerifyResult::LockedOut { .. } => {
@@ -164,6 +206,7 @@ pub async fn login_submit(
                             active_tab: "login",
                             version: env!("CARGO_PKG_VERSION"),
                             error_message: "Account locked out due to failed attempts. Try again later.",
+                            csrf_token: "",
                         })
                         .into_response();
                     }
@@ -175,6 +218,7 @@ pub async fn login_submit(
                             active_tab: "login",
                             version: env!("CARGO_PKG_VERSION"),
                             error_message: "Too many attempts. Please wait and try again.",
+                            csrf_token: "",
                         })
                         .into_response();
                     }
@@ -189,6 +233,7 @@ pub async fn login_submit(
                 active_tab: "login",
                 version: env!("CARGO_PKG_VERSION"),
                 error_message: "2FA TOTP code required or code is invalid.",
+                csrf_token: "",
             })
             .into_response()
         }
@@ -199,6 +244,7 @@ pub async fn login_submit(
             active_tab: "login",
             version: env!("CARGO_PKG_VERSION"),
             error_message: "Account locked out due to failed attempts. Try again later.",
+            csrf_token: "",
         })
         .into_response(),
         LoginResult::RateLimited => HtmlTemplate(LoginTemplate {
@@ -208,6 +254,7 @@ pub async fn login_submit(
             active_tab: "login",
             version: env!("CARGO_PKG_VERSION"),
             error_message: "Too many attempts from this IP address. Please wait.",
+            csrf_token: "",
         })
         .into_response(),
         LoginResult::InvalidCredentials { .. } => HtmlTemplate(LoginTemplate {
@@ -217,6 +264,7 @@ pub async fn login_submit(
             active_tab: "login",
             version: env!("CARGO_PKG_VERSION"),
             error_message: "Invalid username or password.",
+            csrf_token: "",
         })
         .into_response(),
     }
@@ -238,11 +286,9 @@ pub async fn logout_handler(
     let tls_enabled = config.get_tls_config().is_some();
     let is_secure =
         crate::auth::is_https_request(peer_addr, &headers, &trusted_proxies, tls_enabled);
-    let clear_cookie = build_clear_session_cookie(is_secure);
     let mut resp = Redirect::to("/login").into_response();
-    if let Ok(val) = clear_cookie.parse() {
-        resp.headers_mut().insert(SET_COOKIE, val);
-    }
+    append_cookie(&mut resp, &build_clear_session_cookie(is_secure));
+    append_cookie(&mut resp, &build_clear_csrf_cookie(is_secure));
     resp
 }
 
@@ -321,6 +367,7 @@ pub async fn dashboard_page(State(ctx): State<ServerContext>, headers: HeaderMap
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
     };
+    let csrf = get_csrf_token(&ctx, &headers);
 
     let stats = ctx
         .stats_db
@@ -346,6 +393,7 @@ pub async fn dashboard_page(State(ctx): State<ServerContext>, headers: HeaderMap
     let hourly_blocked_json = serde_json::to_string(&blocked).unwrap_or_else(|_| "[]".to_string());
 
     HtmlTemplate(DashboardTemplate {
+        csrf_token: &csrf,
         is_authenticated: true,
         username: &user.username,
         user_role: &user.role.to_string(),
@@ -471,8 +519,10 @@ pub async fn querylog_page(
     };
 
     let entries = fetch_query_rows(&ctx, &params).await;
+    let csrf = get_csrf_token(&ctx, &headers);
 
     HtmlTemplate(QueryLogTemplate {
+        csrf_token: &csrf,
         is_authenticated: true,
         username: &user.username,
         user_role: &user.role.to_string(),
@@ -503,6 +553,7 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
     };
+    let csrf = get_csrf_token(&ctx, &headers);
 
     let cfg = ctx.config.load();
     let snapshot = ctx.filter.snapshot();
@@ -510,8 +561,7 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
         .filtering
         .lists
         .iter()
-        .enumerate()
-        .map(|(idx, list)| {
+        .map(|list| {
             let count = if list.enabled {
                 snapshot
                     .rules
@@ -522,7 +572,7 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
                 0
             };
             FilterListDto {
-                id: idx,
+                id: list.name.clone(),
                 name: list.name.clone(),
                 url: list.url.clone(),
                 enabled: list.enabled,
@@ -596,6 +646,7 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
     bundled_lists.sort_by(|a, b| a.id.cmp(&b.id));
 
     HtmlTemplate(FilteringTemplate {
+        csrf_token: &csrf,
         is_authenticated: true,
         username: &user.username,
         user_role: &user.role.to_string(),
@@ -608,10 +659,21 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
     .into_response()
 }
 
+/// Resolves a filter-list id: preferred key is the (unique) list name;
+/// numeric indices from older clients keep working.
+fn find_filter_list_index(cfg: &Config, id: &str) -> Option<usize> {
+    if let Some(idx) = cfg.filtering.lists.iter().position(|list| list.name == id) {
+        return Some(idx);
+    }
+    id.parse::<usize>()
+        .ok()
+        .filter(|idx| *idx < cfg.filtering.lists.len())
+}
+
 pub async fn filtering_toggle_handler(
     State(ctx): State<ServerContext>,
     headers: HeaderMap,
-    Path(id): Path<usize>,
+    Path(id): Path<String>,
 ) -> Response {
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
@@ -621,16 +683,26 @@ pub async fn filtering_toggle_handler(
     }
 
     let mut new_cfg = (**ctx.config.load()).clone();
-    if let Some(item) = new_cfg.filtering.lists.get_mut(id) {
-        item.enabled = !item.enabled;
-        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-            tracing::error!("Failed to persist configuration to disk: {e:?}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        ctx.set_config(new_cfg.clone());
-        let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
-        crate::publish_bundle(&ctx);
+    let Some(idx) = find_filter_list_index(&new_cfg, &id) else {
+        return error_response(StatusCode::NOT_FOUND, "Filter list not found");
+    };
+    new_cfg.filtering.lists[idx].enabled = !new_cfg.filtering.lists[idx].enabled;
+    if let Err(e) = ctx.filter.reload_with_config(&new_cfg.filtering).await {
+        tracing::error!("Failed to apply filter configuration: {e}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to apply filter configuration: {e}"),
+        );
     }
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to persist configuration to disk: {e:?}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to persist configuration",
+        );
+    }
+    ctx.set_config(new_cfg.clone());
+    crate::publish_bundle(&ctx);
     Redirect::to("/filtering").into_response()
 }
 
@@ -654,19 +726,40 @@ pub async fn filtering_add_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let name = form.name.trim().to_string();
+    let url = form.url.trim().to_string();
+    if !crate::handlers::filtering::valid_filter_list_name(&name) || url.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "List name must be non-empty and must not contain /, ?, # or % (URL is required)",
+        );
+    }
+
     let mut new_cfg = (**ctx.config.load()).clone();
+    if new_cfg.filtering.lists.iter().any(|list| list.name == name) {
+        return error_response(StatusCode::CONFLICT, "A list with that name already exists");
+    }
     new_cfg.filtering.lists.push(FilterListConfig {
-        name: form.name,
-        url: form.url,
+        name,
+        url,
         enabled: true,
         refresh_hours: form.refresh_hours.map(u64::from),
     });
+    if let Err(e) = ctx.filter.reload_with_config(&new_cfg.filtering).await {
+        tracing::error!("Failed to apply filter configuration: {e}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to apply filter configuration: {e}"),
+        );
+    }
     if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
         tracing::error!("Failed to persist configuration to disk: {e:?}");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to persist configuration",
+        );
     }
     ctx.set_config(new_cfg.clone());
-    let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     crate::publish_bundle(&ctx);
 
     Redirect::to("/filtering").into_response()
@@ -675,7 +768,7 @@ pub async fn filtering_add_handler(
 pub async fn filtering_delete_handler(
     State(ctx): State<ServerContext>,
     headers: HeaderMap,
-    Path(id): Path<usize>,
+    Path(id): Path<String>,
 ) -> Response {
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
@@ -685,16 +778,26 @@ pub async fn filtering_delete_handler(
     }
 
     let mut new_cfg = (**ctx.config.load()).clone();
-    if id < new_cfg.filtering.lists.len() {
-        new_cfg.filtering.lists.remove(id);
-        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-            tracing::error!("Failed to persist configuration to disk: {e:?}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        ctx.set_config(new_cfg.clone());
-        let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
-        crate::publish_bundle(&ctx);
+    let Some(idx) = find_filter_list_index(&new_cfg, &id) else {
+        return error_response(StatusCode::NOT_FOUND, "Filter list not found");
+    };
+    new_cfg.filtering.lists.remove(idx);
+    if let Err(e) = ctx.filter.reload_with_config(&new_cfg.filtering).await {
+        tracing::error!("Failed to apply filter configuration: {e}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to apply filter configuration: {e}"),
+        );
     }
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to persist configuration to disk: {e:?}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to persist configuration",
+        );
+    }
+    ctx.set_config(new_cfg.clone());
+    crate::publish_bundle(&ctx);
     Redirect::to("/filtering").into_response()
 }
 
@@ -724,12 +827,21 @@ pub async fn filtering_custom_rules_handler(
         .map(String::from)
         .collect();
 
+    if let Err(e) = ctx.filter.reload_with_config(&new_cfg.filtering).await {
+        tracing::error!("Failed to apply filter configuration: {e}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to apply filter configuration: {e}"),
+        );
+    }
     if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
         tracing::error!("Failed to persist configuration to disk: {e:?}");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to persist configuration",
+        );
     }
     ctx.set_config(new_cfg.clone());
-    let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
     crate::publish_bundle(&ctx);
 
     Redirect::to("/filtering").into_response()
@@ -805,7 +917,13 @@ pub async fn filtering_update_all_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
     let cfg = ctx.config.load();
-    let _ = ctx.filter.reload_with_config(&cfg.filtering).await;
+    if let Err(e) = ctx.filter.reload_with_config(&cfg.filtering).await {
+        tracing::error!("Failed to refresh filter lists: {e}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to refresh filter lists: {e}"),
+        );
+    }
     Redirect::to("/filtering").into_response()
 }
 
@@ -813,25 +931,19 @@ pub async fn filtering_update_all_handler(
 // DNS Rewrites
 // ---------------------------------------------------------------------------
 
-fn load_rewrites_config(ctx: &ServerContext) -> sito_rewrites::RewritesConfig {
-    ctx.config
-        .load()
-        .rewrites
-        .as_ref()
-        .and_then(|v| v.clone().try_into().ok())
-        .unwrap_or_default()
-}
-
 pub async fn rewrites_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
     };
+    let csrf = get_csrf_token(&ctx, &headers);
 
-    let rewrites_cfg = load_rewrites_config(&ctx);
-    let rewrites: Vec<RewriteViewItem> = rewrites_cfg
-        .entries
+    let store = crate::handlers::rewrites::load_rewrite_store(&ctx);
+    let rewrites: Vec<RewriteViewItem> = store
+        .ids
         .into_iter()
-        .map(|r| RewriteViewItem {
+        .zip(store.cfg.entries)
+        .map(|(id, r)| RewriteViewItem {
+            id,
             domain: r.domain,
             record_type: r.r#type,
             answer: r.answer,
@@ -839,6 +951,7 @@ pub async fn rewrites_page(State(ctx): State<ServerContext>, headers: HeaderMap)
         .collect();
 
     HtmlTemplate(RewritesTemplate {
+        csrf_token: &csrf,
         is_authenticated: true,
         username: &user.username,
         user_role: &user.role.to_string(),
@@ -868,28 +981,21 @@ pub async fn rewrites_add_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let mut rewrites_cfg = load_rewrites_config(&ctx);
+    let mut store = crate::handlers::rewrites::load_rewrite_store(&ctx);
+    store.cfg.entries.push(sito_rewrites::RewriteEntryConfig {
+        domain: form.domain,
+        r#type: form.record_type,
+        answer: form.answer,
+        exception_clients: Vec::new(),
+    });
+    store.ids.push(crate::handlers::rewrites::new_rewrite_id());
 
-    rewrites_cfg
-        .entries
-        .push(sito_rewrites::RewriteEntryConfig {
-            domain: form.domain,
-            r#type: form.record_type,
-            answer: form.answer,
-            exception_clients: Vec::new(),
-        });
-
-    let mut new_cfg = (**ctx.config.load()).clone();
-    if let Ok(val) = toml::Value::try_from(&rewrites_cfg) {
-        new_cfg.rewrites = Some(val);
-        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-            tracing::error!("Failed to persist configuration to disk: {e:?}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        ctx.set_config(new_cfg);
-        let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg);
-        ctx.set_rewrites(new_table);
-        crate::publish_bundle(&ctx);
+    if let Err(e) = crate::handlers::rewrites::save_rewrite_store(&ctx, &store).await {
+        tracing::error!("Failed to persist rewrites: {e:?}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to persist rewrites: {}", e.detail),
+        );
     }
 
     Redirect::to("/rewrites").into_response()
@@ -897,8 +1003,13 @@ pub async fn rewrites_add_handler(
 
 #[derive(Deserialize)]
 pub struct DeleteRewriteForm {
-    pub domain: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default)]
     pub record_type: Option<String>,
+    #[serde(default)]
     pub answer: Option<String>,
 }
 
@@ -914,35 +1025,28 @@ pub async fn rewrites_delete_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let mut rewrites_cfg = load_rewrites_config(&ctx);
-    rewrites_cfg.entries.retain(|e| {
-        if e.domain != form.domain {
-            return true;
-        }
-        if let Some(ref rt) = form.record_type
-            && &e.r#type != rt
-        {
-            return true;
-        }
-        if let Some(ref ans) = form.answer
-            && &e.answer != ans
-        {
-            return true;
-        }
-        false
-    });
+    let mut store = crate::handlers::rewrites::load_rewrite_store(&ctx);
+    let idx = if let Some(ref id) = form.id {
+        crate::handlers::rewrites::resolve_rewrite_index(&store, id)
+    } else {
+        store.cfg.entries.iter().position(|e| {
+            form.domain.as_deref().is_none_or(|d| e.domain == d)
+                && form.record_type.as_deref().is_none_or(|t| e.r#type == t)
+                && form.answer.as_deref().is_none_or(|a| e.answer == a)
+        })
+    };
+    let Some(idx) = idx else {
+        return error_response(StatusCode::NOT_FOUND, "Rewrite not found");
+    };
+    store.cfg.entries.remove(idx);
+    store.ids.remove(idx);
 
-    let mut new_cfg = (**ctx.config.load()).clone();
-    if let Ok(val) = toml::Value::try_from(&rewrites_cfg) {
-        new_cfg.rewrites = Some(val);
-        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-            tracing::error!("Failed to persist configuration to disk: {e:?}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        ctx.set_config(new_cfg);
-        let new_table = sito_rewrites::RewriteTable::new(rewrites_cfg);
-        ctx.set_rewrites(new_table);
-        crate::publish_bundle(&ctx);
+    if let Err(e) = crate::handlers::rewrites::save_rewrite_store(&ctx, &store).await {
+        tracing::error!("Failed to persist rewrites: {e:?}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to persist rewrites: {}", e.detail),
+        );
     }
 
     Redirect::to("/rewrites").into_response()
@@ -965,6 +1069,7 @@ pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
     };
+    let csrf = get_csrf_token(&ctx, &headers);
 
     let clients_cfg = load_clients_config(&ctx);
     let clients: Vec<ClientViewItem> = clients_cfg
@@ -978,6 +1083,7 @@ pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
         .collect();
 
     HtmlTemplate(ClientsTemplate {
+        csrf_token: &csrf,
         is_authenticated: true,
         username: &user.username,
         user_role: &user.role.to_string(),
@@ -1008,6 +1114,12 @@ pub async fn clients_add_handler(
     }
 
     let mut clients_cfg = load_clients_config(&ctx);
+    if clients_cfg.entries.iter().any(|c| c.name == form.name) {
+        return error_response(
+            StatusCode::CONFLICT,
+            "A client with that name already exists",
+        );
+    }
     let ids: Vec<String> = form
         .ids
         .split(',')
@@ -1031,18 +1143,28 @@ pub async fn clients_add_handler(
         trusted: false,
     });
 
-    let mut new_cfg = (**ctx.config.load()).clone();
-    if let Ok(val) = toml::Value::try_from(&clients_cfg) {
-        new_cfg.clients = Some(val);
-        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-            tracing::error!("Failed to persist configuration to disk: {e:?}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let val = match toml::Value::try_from(&clients_cfg) {
+        Ok(val) => val,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to serialize clients: {e}"),
+            );
         }
-        ctx.set_config(new_cfg);
-        let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
-        ctx.set_clients(new_reg);
-        crate::publish_bundle(&ctx);
+    };
+    let mut new_cfg = (**ctx.config.load()).clone();
+    new_cfg.clients = Some(val);
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to persist configuration to disk: {e:?}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to persist clients",
+        );
     }
+    ctx.set_config(new_cfg);
+    let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
+    ctx.set_clients(new_reg);
+    crate::publish_bundle(&ctx);
 
     Redirect::to("/clients").into_response()
 }
@@ -1065,20 +1187,34 @@ pub async fn clients_delete_handler(
     }
 
     let mut clients_cfg = load_clients_config(&ctx);
+    let before = clients_cfg.entries.len();
     clients_cfg.entries.retain(|c| c.name != form.name);
-
-    let mut new_cfg = (**ctx.config.load()).clone();
-    if let Ok(val) = toml::Value::try_from(&clients_cfg) {
-        new_cfg.clients = Some(val);
-        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-            tracing::error!("Failed to persist configuration to disk: {e:?}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        ctx.set_config(new_cfg);
-        let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
-        ctx.set_clients(new_reg);
-        crate::publish_bundle(&ctx);
+    if clients_cfg.entries.len() == before {
+        return error_response(StatusCode::NOT_FOUND, "Client not found");
     }
+
+    let val = match toml::Value::try_from(&clients_cfg) {
+        Ok(val) => val,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to serialize clients: {e}"),
+            );
+        }
+    };
+    let mut new_cfg = (**ctx.config.load()).clone();
+    new_cfg.clients = Some(val);
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to persist configuration to disk: {e:?}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to persist clients",
+        );
+    }
+    ctx.set_config(new_cfg);
+    let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
+    ctx.set_clients(new_reg);
+    crate::publish_bundle(&ctx);
 
     Redirect::to("/clients").into_response()
 }
@@ -1091,10 +1227,12 @@ pub async fn upstreams_page(State(ctx): State<ServerContext>, headers: HeaderMap
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
     };
+    let csrf = get_csrf_token(&ctx, &headers);
 
     let upstreams = get_upstreams_list(&ctx).await;
 
     HtmlTemplate(UpstreamsTemplate {
+        csrf_token: &csrf,
         is_authenticated: true,
         username: &user.username,
         user_role: &user.role.to_string(),
@@ -1125,22 +1263,33 @@ pub async fn upstreams_add_handler(
 
     let mut new_cfg = (**ctx.config.load()).clone();
     let clean = form.address.trim().to_string();
-    if !clean.is_empty() && !new_cfg.upstream.servers.contains(&clean) {
-        new_cfg.upstream.servers.push(clean);
-        if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-            tracing::error!("Failed to persist configuration to disk: {e:?}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        ctx.set_config(new_cfg.clone());
-        let bootstrap = sito_upstream::BootstrapResolver::new(
-            new_cfg.upstream.bootstrap.clone(),
-            std::time::Duration::from_millis(new_cfg.upstream.timeout_ms),
-        );
-        if let Err(e) = ctx.upstream.reload(&new_cfg.upstream, &bootstrap).await {
-            tracing::error!("Failed to reload upstream manager: {e:?}");
-        }
-        crate::publish_bundle(&ctx);
+    if clean.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "Upstream address is required");
     }
+    if new_cfg.upstream.servers.contains(&clean) {
+        return error_response(StatusCode::CONFLICT, "Upstream is already configured");
+    }
+    new_cfg.upstream.servers.push(clean);
+    let bootstrap = sito_upstream::BootstrapResolver::new(
+        new_cfg.upstream.bootstrap.clone(),
+        std::time::Duration::from_millis(new_cfg.upstream.timeout_ms),
+    );
+    if let Err(e) = ctx.upstream.reload(&new_cfg.upstream, &bootstrap).await {
+        tracing::error!("Failed to reload upstream manager: {e:?}");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("Invalid upstream configuration: {e}"),
+        );
+    }
+    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
+        tracing::error!("Failed to persist configuration to disk: {e:?}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to persist configuration",
+        );
+    }
+    ctx.set_config(new_cfg.clone());
+    crate::publish_bundle(&ctx);
 
     Redirect::to("/upstreams").into_response()
 }
@@ -1148,172 +1297,65 @@ pub async fn upstreams_add_handler(
 #[derive(Deserialize)]
 pub struct TestUpstreamForm {
     pub address: String,
-}
-
-fn split_probe_host_port(addr_str: &str, scheme: &str, default_port: u16) -> (String, u16) {
-    let rest = addr_str
-        .strip_prefix(&format!("{scheme}://"))
-        .unwrap_or(addr_str);
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if let Some(inner) = authority.strip_prefix('[')
-        && let Some((host, tail)) = inner.split_once(']')
-    {
-        let port = tail
-            .strip_prefix(':')
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(default_port);
-        return (host.to_string(), port);
-    }
-    if let Some((host, port)) = authority.rsplit_once(':')
-        && let Ok(port) = port.parse::<u16>()
-    {
-        return (host.to_string(), port);
-    }
-    (authority.to_string(), default_port)
-}
-
-async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result<f64, String> {
-    let start = std::time::Instant::now();
-    let qname = sito_proto::Name::from_str(probe_domain)
-        .unwrap_or_else(|_| sito_proto::Name::from_str("example.com").unwrap());
-
-    if let Some(target) = addr_str.strip_prefix("tls://") {
-        let parts: Vec<&str> = target.split(':').collect();
-        let host = parts[0];
-        let port: u16 = if parts.len() > 1 {
-            parts[1].parse().unwrap_or(853)
-        } else {
-            853
-        };
-        let mut addrs = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|e| format!("DNS resolution of {host} failed: {e}"))?;
-        let addr = addrs
-            .next()
-            .ok_or_else(|| format!("Could not resolve {host}"))?;
-
-        let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            tokio::net::TcpStream::connect(addr),
-        )
-        .await
-        .map_err(|_| "Connection timed out".to_string())?
-        .map_err(|e| format!("TCP connection failed: {e}"))?;
-        drop(stream);
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        return Ok(elapsed);
-    }
-
-    if addr_str.starts_with("https://") {
-        let (host, port) = split_probe_host_port(addr_str, "https", 443);
-        let mut addrs = tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map_err(|e| format!("DNS resolution of {host} failed: {e}"))?;
-        let ip = addrs
-            .next()
-            .map(|sa| sa.ip())
-            .ok_or_else(|| format!("Could not resolve {host}"))?;
-        let doh =
-            sito_upstream::HttpsUpstream::new(addr_str, &[ip], std::time::Duration::from_secs(3))
-                .map_err(|e| format!("Invalid DoH upstream: {e}"))?;
-        let mut query =
-            sito_proto::Message::new(0, sito_proto::MessageType::Query, sito_proto::OpCode::Query);
-        query
-            .queries
-            .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
-        doh.resolve(&query)
-            .await
-            .map_err(|e| format!("DoH query failed: {e}"))?;
-        return Ok(start.elapsed().as_secs_f64() * 1000.0);
-    }
-
-    if addr_str.starts_with("quic://") {
-        let (host, port) = split_probe_host_port(addr_str, "quic", 853);
-        let mut addrs = tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map_err(|e| format!("DNS resolution of {host} failed: {e}"))?;
-        let addr = addrs
-            .next()
-            .ok_or_else(|| format!("Could not resolve {host}"))?;
-        let doq = sito_upstream::QuicUpstream::new(&host, addr, std::time::Duration::from_secs(3))
-            .map_err(|e| format!("Invalid DoQ upstream: {e}"))?;
-        let mut query =
-            sito_proto::Message::new(0, sito_proto::MessageType::Query, sito_proto::OpCode::Query);
-        query
-            .queries
-            .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
-        doq.resolve(&query)
-            .await
-            .map_err(|e| format!("DoQ query failed: {e}"))?;
-        return Ok(start.elapsed().as_secs_f64() * 1000.0);
-    }
-
-    // Standard UDP probe
-    let target = addr_str.strip_prefix("udp://").unwrap_or(addr_str);
-    let target_addr: std::net::SocketAddr = if let Ok(sa) = target.parse() {
-        sa
-    } else {
-        let parts: Vec<&str> = target.split(':').collect();
-        let host = parts[0];
-        let port: u16 = if parts.len() > 1 {
-            parts[1].parse().unwrap_or(53)
-        } else {
-            53
-        };
-        let mut addrs = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|e| format!("Lookup of {host} failed: {e}"))?;
-        addrs
-            .next()
-            .ok_or_else(|| format!("Could not resolve {host}"))?
-    };
-
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
-        .await
-        .map_err(|e| format!("Failed to bind local UDP socket: {e}"))?;
-
-    let mut query_msg = sito_proto::Message::new(
-        rand::random(),
-        sito_proto::MessageType::Query,
-        sito_proto::OpCode::Query,
-    );
-    query_msg.metadata.recursion_desired = true;
-    query_msg
-        .queries
-        .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
-    let wire = sito_proto::encode_message(&query_msg)
-        .map_err(|e| format!("Failed to encode DNS probe message: {e}"))?;
-
-    socket
-        .send_to(&wire, target_addr)
-        .await
-        .map_err(|e| format!("UDP send failed: {e}"))?;
-
-    let mut buf = [0u8; 512];
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        socket.recv_from(&mut buf),
-    )
-    .await
-    .map_err(|_| "Probe query timed out after 2s".to_string())?
-    .map_err(|e| format!("UDP recv failed: {e}"))?;
-
-    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-    Ok(elapsed)
+    /// Accepted for first-boot setup requests (the wizard embeds it as a
+    /// hidden form field in addition to the `X-Setup-Token` header).
+    #[serde(default)]
+    pub setup_token: Option<String>,
 }
 
 pub async fn upstreams_test_handler(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Form(form): Form<TestUpstreamForm>,
 ) -> Response {
-    if get_session_user(&ctx, &headers).is_none()
-        && !ctx.is_setup_pending()
-        && !ctx.auth_mgr.is_first_run()
-    {
-        return StatusCode::UNAUTHORIZED.into_response();
+    // Auth: a valid session wins; otherwise first-boot setup requires the
+    // one-time setup token (or legacy setup-pending mode for in-memory tests).
+    if get_session_user(&ctx, &headers).is_none() {
+        let config = ctx.config.load();
+        let trusted_proxies = config.get_web_config().trusted_proxies.clone();
+        let probe_domain = config.upstream.probe_domain.clone();
+        drop(config);
+        let client_ip = resolve_client_ip(peer_addr, &headers, &trusted_proxies);
+
+        if ctx.auth_mgr.setup_token_required() {
+            let candidate = headers
+                .get(crate::router::SETUP_TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .or(form.setup_token.as_deref().map(str::trim));
+            match ctx.auth_mgr.validate_setup_token(candidate, &client_ip) {
+                crate::auth::SetupTokenStatus::Valid => {}
+                crate::auth::SetupTokenStatus::RateLimited => {
+                    return error_response(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Too many invalid setup token attempts. Try again later.",
+                    );
+                }
+                _ => {
+                    return error_response(
+                        StatusCode::FORBIDDEN,
+                        "First-boot setup token required (see server logs).",
+                    );
+                }
+            }
+        } else if !ctx.is_setup_pending() && !ctx.auth_mgr.is_first_run() {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+
+        return run_upstream_probe(clean_address(&form.address), &probe_domain).await;
     }
-    let clean = form.address.trim();
+
+    let probe_domain = ctx.config.load().upstream.probe_domain.clone();
+    run_upstream_probe(clean_address(&form.address), &probe_domain).await
+}
+
+fn clean_address(address: &str) -> &str {
+    address.trim()
+}
+
+async fn run_upstream_probe(clean: &str, probe_domain: &str) -> Response {
     if clean.is_empty() {
         return axum::response::Html(
             "<div class='badge badge-danger' style='font-size:0.9rem; padding: 6px 12px;'>Invalid upstream address</div>",
@@ -1321,18 +1363,27 @@ pub async fn upstreams_test_handler(
         .into_response();
     }
 
-    let probe_domain = ctx.config.load().upstream.probe_domain.clone();
-    match probe_upstream_target(clean, &probe_domain).await {
-        Ok(elapsed) => axum::response::Html(format!(
+    let result = tokio::time::timeout(
+        crate::probe::PROBE_TIMEOUT,
+        probe_upstream_target(clean, probe_domain),
+    )
+    .await;
+    match result {
+        Ok(Ok(elapsed)) => axum::response::Html(format!(
             "<div class='badge badge-success' style='font-size:0.9rem; padding: 6px 12px;'>Resolver {} is reachable (RTT: {:.1} ms)</div>",
             escape_html(clean),
             elapsed
         ))
         .into_response(),
-        Err(e) => axum::response::Html(format!(
+        Ok(Err(e)) => axum::response::Html(format!(
             "<div class='badge badge-danger' style='font-size:0.9rem; padding: 6px 12px;'>Resolver {} error: {}</div>",
             escape_html(clean),
             escape_html(&e)
+        ))
+        .into_response(),
+        Err(_) => axum::response::Html(format!(
+            "<div class='badge badge-danger' style='font-size:0.9rem; padding: 6px 12px;'>Resolver {} error: probe timed out</div>",
+            escape_html(clean)
         ))
         .into_response(),
     }
@@ -1346,10 +1397,12 @@ pub async fn settings_page(State(ctx): State<ServerContext>, headers: HeaderMap)
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
     };
+    let csrf = get_csrf_token(&ctx, &headers);
 
     let cfg = ctx.config.load();
 
     HtmlTemplate(SettingsTemplate {
+        csrf_token: &csrf,
         is_authenticated: true,
         username: &user.username,
         user_role: &user.role.to_string(),
@@ -1407,11 +1460,13 @@ pub async fn system_page(State(ctx): State<ServerContext>, headers: HeaderMap) -
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
     };
+    let csrf = get_csrf_token(&ctx, &headers);
 
     let status = get_status_response(&ctx);
     let uptime_str = format_duration(status.uptime_seconds);
 
     HtmlTemplate(SystemTemplate {
+        csrf_token: &csrf,
         is_authenticated: true,
         username: &user.username,
         user_role: &user.role.to_string(),
@@ -1434,12 +1489,44 @@ pub async fn system_reload_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    if let Ok(toml_str) = tokio::fs::read_to_string(&ctx.config_path).await
-        && let Ok(cfg) = sito_core::config::Config::from_toml_str(&toml_str)
-    {
-        ctx.set_config(cfg);
-        crate::publish_bundle(&ctx);
+    let toml_str = match tokio::fs::read_to_string(&ctx.config_path).await {
+        Ok(content) => content,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to read configuration file: {e}"),
+            );
+        }
+    };
+    let cfg = match sito_core::config::Config::from_toml_str(&toml_str) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid configuration on disk: {e}"),
+            );
+        }
+    };
+    if let Err(e) = ctx.filter.reload_with_config(&cfg.filtering).await {
+        tracing::error!("Failed to apply filter configuration: {e}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to apply filter configuration: {e}"),
+        );
     }
+    let bootstrap = sito_upstream::BootstrapResolver::new(
+        cfg.upstream.bootstrap.clone(),
+        std::time::Duration::from_millis(cfg.upstream.timeout_ms),
+    );
+    if let Err(e) = ctx.upstream.reload(&cfg.upstream, &bootstrap).await {
+        tracing::error!("Failed to apply upstream configuration: {e}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to apply upstream configuration: {e}"),
+        );
+    }
+    ctx.set_config(cfg);
+    crate::publish_bundle(&ctx);
     Redirect::to("/system").into_response()
 }
 
@@ -1465,12 +1552,12 @@ pub async fn system_update_check_handler(
                 } else {
                     format!(
                         r##"<form hx-post="/ui/system/update/apply" hx-target="#update-container" hx-swap="innerHTML" style="margin-top: 14px;">
-                            <button type="submit" class="btn btn-primary" onclick="this.disabled=true; this.innerText=&quot;Updating...&quot;; this.form.submit();">
+                            <button type="submit" class="btn btn-primary" @click="this.disabled=true; this.innerText='Updating...'; this.form.submit();">
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
                                 Download & Install v{}
                             </button>
                         </form>"##,
-                        info.latest_version
+                        escape_html(&info.latest_version)
                     )
                 };
 
@@ -1486,9 +1573,9 @@ pub async fn system_update_check_handler(
                         <div style="background: var(--bg-base); padding: 12px; border-radius: 6px; font-size: 0.85rem; max-height: 150px; overflow-y: auto; white-space: pre-wrap; font-family: monospace;">{}</div>
                         {}
                     </div>"#,
-                    info.latest_version,
-                    info.current_version,
-                    info.release_url,
+                    escape_html(&info.latest_version),
+                    escape_html(&info.current_version),
+                    escape_html(&info.release_url),
                     escape_html(&info.release_notes),
                     install_or_docker
                 )).into_response()
@@ -1503,7 +1590,7 @@ pub async fn system_update_check_handler(
                             Check Again
                         </button>
                     </div>"##,
-                    info.current_version
+                    escape_html(&info.current_version)
                 )).into_response()
             }
         }
@@ -1566,7 +1653,17 @@ pub async fn system_update_apply_handler(
 // Setup Wizard
 // ---------------------------------------------------------------------------
 
-pub async fn wizard_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
+#[derive(Deserialize, Default)]
+pub struct SetupTokenQuery {
+    #[serde(default)]
+    pub setup_token: Option<String>,
+}
+
+pub async fn wizard_page(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Query(params): Query<SetupTokenQuery>,
+) -> Response {
     let auth_user = get_session_user(&ctx, &headers);
     let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
 
@@ -1574,18 +1671,30 @@ pub async fn wizard_page(State(ctx): State<ServerContext>, headers: HeaderMap) -
         return Redirect::to("/login").into_response();
     }
 
+    let csrf = get_csrf_token(&ctx, &headers);
+    let setup_required = ctx.auth_mgr.setup_token_required();
+    // Only echo a token the requester already supplied; never reveal the
+    // stored setup token in the rendered page on its own.
+    let setup_token = params.setup_token.unwrap_or_default();
+
     HtmlTemplate(WizardTemplate {
         is_authenticated: auth_user.is_some(),
         username: auth_user.as_ref().map_or("admin", |u| &u.username),
         user_role: auth_user.as_ref().map_or("", |u| u.role.as_str()),
         active_tab: "wizard",
         version: env!("CARGO_PKG_VERSION"),
+        csrf_token: &csrf,
+        setup_required,
+        setup_token: &setup_token,
     })
     .into_response()
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct WizardCompleteForm {
+    /// One-time first-boot setup token (required while setup is pending).
+    pub setup_token: Option<String>,
+
     // 1. Administrator account
     pub admin_user: Option<String>,
     pub admin_password: Option<String>,
@@ -1927,9 +2036,9 @@ impl WizardCompleteForm {
                 .parse::<u32>()
                 .map_err(|_| format!("Invalid retention_days: '{s}'"))?;
         }
-        if let Ok(val) = toml::Value::try_from(stats) {
-            cfg.stats = Some(val);
-        }
+        let stats_value = toml::Value::try_from(stats)
+            .map_err(|e| format!("Failed to serialize stats configuration: {e}"))?;
+        cfg.stats = Some(stats_value);
 
         // Validate final configuration
         cfg.validate()
@@ -1941,19 +2050,59 @@ impl WizardCompleteForm {
 
 pub async fn wizard_complete_handler(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Form(form): Form<WizardCompleteForm>,
 ) -> Response {
-    let is_first_run = ctx.is_setup_pending() || ctx.auth_mgr.is_first_run();
+    let first_run = ctx.auth_mgr.is_first_run();
+    let is_first_run = ctx.is_setup_pending() || first_run;
     let auth_user = get_session_user(&ctx, &headers);
     let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
 
     if !is_first_run && !is_admin {
-        return (
+        return error_response(
             StatusCode::FORBIDDEN,
             "Setup wizard is disabled. Admin session required.",
-        )
-            .into_response();
+        );
+    }
+
+    // Setup-pending with an already-configured admin account but no setup
+    // token: an authenticated admin is required to change credentials.
+    if !first_run && !is_admin && !ctx.auth_mgr.setup_token_required() {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "Setup wizard is disabled. Admin session required.",
+        );
+    }
+
+    // First-boot completion requires the one-time setup token (authenticated
+    // admins and in-memory test managers without a provisioned token are
+    // exempt).
+    if ctx.auth_mgr.setup_token_required() && !is_admin {
+        let config = ctx.config.load();
+        let trusted_proxies = config.get_web_config().trusted_proxies.clone();
+        drop(config);
+        let client_ip = resolve_client_ip(peer_addr, &headers, &trusted_proxies);
+        let candidate = form
+            .setup_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        match ctx.auth_mgr.validate_setup_token(candidate, &client_ip) {
+            crate::auth::SetupTokenStatus::Valid => {}
+            crate::auth::SetupTokenStatus::RateLimited => {
+                return error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Too many invalid setup token attempts. Try again later.",
+                );
+            }
+            _ => {
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    "First-boot setup token required (see server logs).",
+                );
+            }
+        }
     }
 
     let admin_user = match form.admin_user.as_deref().map(str::trim) {
@@ -2026,13 +2175,14 @@ pub async fn wizard_complete_handler(
         }
     };
 
+    // Persist the configuration before applying it so a failed apply does not
+    // leave an unapplied file behind silently.
     if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
         tracing::error!("Failed to save config in wizard: {e:?}");
-        return (
+        return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to save configuration",
-        )
-            .into_response();
+        );
     }
 
     if is_first_run {
@@ -2040,17 +2190,18 @@ pub async fn wizard_complete_handler(
             if !ctx
                 .auth_mgr
                 .update_user_password(admin_user, effective_password)
+                .await
             {
-                return (
+                return error_response(
                     StatusCode::BAD_REQUEST,
                     "Failed to update administrator password.",
-                )
-                    .into_response();
+                );
             }
         } else {
             // Nonexistent user: create as admin
             ctx.auth_mgr
-                .create_user(admin_user, effective_password, Role::Admin);
+                .create_user(admin_user, effective_password, Role::Admin)
+                .await;
             // If custom admin username chosen, remove default 'admin' account if still on bootstrap password
             if admin_user != "admin" && ctx.auth_mgr.is_default_admin_active() {
                 ctx.auth_mgr.delete_user("admin");
@@ -2060,32 +2211,48 @@ pub async fn wizard_complete_handler(
     } else {
         // Not first run: must be authenticated admin updating existing admin credentials
         if !ctx.auth_mgr.has_user(admin_user) {
-            return (StatusCode::BAD_REQUEST, "Username does not exist.").into_response();
+            return error_response(StatusCode::BAD_REQUEST, "Username does not exist.");
         }
         if !ctx
             .auth_mgr
             .update_user_password(admin_user, effective_password)
+            .await
         {
-            return (
+            return error_response(
                 StatusCode::BAD_REQUEST,
                 "Failed to update administrator password.",
-            )
-                .into_response();
+            );
         }
     }
 
-    ctx.set_config(new_cfg.clone());
-    let _ = ctx.filter.reload_with_config(&new_cfg.filtering).await;
+    if let Err(e) = ctx.filter.reload_with_config(&new_cfg.filtering).await {
+        tracing::error!("Failed to apply filter configuration in wizard: {e}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to apply filter configuration: {e}"),
+        );
+    }
     let bootstrap = sito_upstream::BootstrapResolver::new(
         new_cfg.upstream.bootstrap.clone(),
         std::time::Duration::from_millis(new_cfg.upstream.timeout_ms),
     );
-    let _ = ctx.upstream.reload(&new_cfg.upstream, &bootstrap).await;
+    if let Err(e) = ctx.upstream.reload(&new_cfg.upstream, &bootstrap).await {
+        tracing::error!("Failed to apply upstream configuration in wizard: {e}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to apply upstream configuration: {e}"),
+        );
+    }
+
+    ctx.set_config(new_cfg.clone());
     crate::publish_bundle(&ctx);
 
+    ctx.auth_mgr.consume_setup_token();
     ctx.set_setup_pending(false);
-    if let Some(ref starter) = ctx.dns_starter {
-        let _ = starter.send(());
+    if let Some(ref starter) = ctx.dns_starter
+        && let Err(e) = starter.send(())
+    {
+        tracing::warn!("Failed to notify DNS listener starter after setup: {e}");
     }
 
     Redirect::to("/login").into_response()
@@ -2187,17 +2354,20 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
         // Create Viewer and Operator users
-        ctx.auth_mgr.create_user("view_user", "pass", Role::Viewer);
         ctx.auth_mgr
-            .create_user("oper_user", "pass", Role::Operator);
+            .create_user("view_user", "pass", Role::Viewer)
+            .await;
+        ctx.auth_mgr
+            .create_user("oper_user", "pass", Role::Operator)
+            .await;
 
         let LoginResult::Success(view_session) =
-            ctx.auth_mgr.login("view_user", "pass", "127.0.0.1")
+            ctx.auth_mgr.login("view_user", "pass", "127.0.0.1").await
         else {
             panic!("login failed");
         };
         let LoginResult::Success(oper_session) =
-            ctx.auth_mgr.login("oper_user", "pass", "127.0.0.1")
+            ctx.auth_mgr.login("oper_user", "pass", "127.0.0.1").await
         else {
             panic!("login failed");
         };
@@ -2278,9 +2448,13 @@ mod tests {
             upstream: Some("1.1.1.1:53".to_string()),
             ..Default::default()
         };
-        let resp =
-            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(empty_user_form))
-                .await;
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(empty_user_form),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(ctx.auth_mgr.is_first_run());
 
@@ -2291,9 +2465,13 @@ mod tests {
             upstream: Some("1.1.1.1:53".to_string()),
             ..Default::default()
         };
-        let resp =
-            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(space_user_form))
-                .await;
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(space_user_form),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(ctx.auth_mgr.is_first_run());
 
@@ -2304,9 +2482,13 @@ mod tests {
             upstream: Some("1.1.1.1:53".to_string()),
             ..Default::default()
         };
-        let resp =
-            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(short_pass_form))
-                .await;
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(short_pass_form),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(ctx.auth_mgr.is_first_run());
 
@@ -2320,6 +2502,7 @@ mod tests {
         };
         let resp = wizard_complete_handler(
             State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
             HeaderMap::new(),
             Form(nonexistent_user_form),
         )
@@ -2332,7 +2515,8 @@ mod tests {
         // Login as new admin succeeds
         let login_res = ctx
             .auth_mgr
-            .login("superadmin", "SuperSecretPassword123!", "127.0.0.1");
+            .login("superadmin", "SuperSecretPassword123!", "127.0.0.1")
+            .await;
         assert!(matches!(login_res, crate::auth::LoginResult::Success(_)));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -2347,8 +2531,13 @@ mod tests {
 
         // Empty password must not complete setup with bootstrap credentials.
         let empty_form = WizardCompleteForm::default();
-        let resp =
-            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(empty_form)).await;
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(empty_form),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(ctx.auth_mgr.is_first_run());
         assert!(!ctx.auth_mgr.has_user("admin") || ctx.auth_mgr.is_default_admin_active());
@@ -2361,6 +2550,7 @@ mod tests {
         };
         let resp = wizard_complete_handler(
             State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
             HeaderMap::new(),
             Form(default_pass_form),
         )
@@ -2399,9 +2589,13 @@ mod tests {
             confirm_password: Some("Mismatch123!".to_string()),
             ..Default::default()
         };
-        let resp =
-            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(mismatch_form))
-                .await;
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(mismatch_form),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -2415,6 +2609,7 @@ mod tests {
         let ctx = mock_context(&temp_dir).await;
 
         let custom_form = WizardCompleteForm {
+            setup_token: None,
             admin_user: Some("customadmin".to_string()),
             admin_password: Some("custompassword123".to_string()),
             confirm_password: Some("custompassword123".to_string()),
@@ -2446,8 +2641,13 @@ mod tests {
             retention_days: Some("30".to_string()),
         };
 
-        let resp =
-            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(custom_form)).await;
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(custom_form),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
 
         let cfg = ctx.config.load();
@@ -2496,9 +2696,13 @@ mod tests {
             port: Some("not_a_port".to_string()),
             ..Default::default()
         };
-        let resp =
-            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(bad_port_form))
-                .await;
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(bad_port_form),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         // Invalid web bind IP
@@ -2508,8 +2712,13 @@ mod tests {
             web_bind: Some("not_an_ip".to_string()),
             ..Default::default()
         };
-        let resp =
-            wizard_complete_handler(State(ctx.clone()), HeaderMap::new(), Form(bad_ip_form)).await;
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(bad_ip_form),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -2522,7 +2731,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&temp_dir);
         let mut ctx = mock_context(&temp_dir).await;
 
-        let login_res = ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1");
+        let login_res = ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await;
         let crate::auth::LoginResult::Success(session) = login_res else {
             panic!("admin login failed");
         };
@@ -2577,7 +2786,125 @@ mod tests {
         .await;
         assert_eq!(rewrite_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         // Verify in-memory rewrites table was NOT mutated
-        assert!(load_rewrites_config(&ctx).entries.is_empty());
+        assert!(
+            crate::handlers::rewrites::load_rewrite_store(&ctx)
+                .cfg
+                .entries
+                .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_disable_totp_requires_password_and_second_factor() {
+        use crate::auth::rbac::RequireAdmin;
+        use crate::handlers::auth_handlers::disable_totp;
+        use crate::models::DisableTotpRequest;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_totp_off_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let setup = ctx.auth_mgr.init_totp_setup("admin").await.expect("setup");
+        assert!(
+            ctx.auth_mgr
+                .confirm_totp_setup("admin", &setup.backup_codes[0])
+                .await
+        );
+        assert!(ctx.auth_mgr.totp_enabled("admin"));
+
+        let admin = RequireAdmin(crate::auth::AuthUser {
+            username: "admin".to_string(),
+            role: Role::Admin,
+            token_id: None,
+        });
+
+        // Wrong password rejected even with a valid code.
+        let err = disable_totp(
+            admin.clone(),
+            State(ctx.clone()),
+            axum::Json(DisableTotpRequest {
+                password: "wrong-password".to_string(),
+                code: Some(setup.backup_codes[1].clone()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 401);
+        assert!(ctx.auth_mgr.totp_enabled("admin"));
+
+        // Correct password but missing second factor rejected.
+        let err = disable_totp(
+            admin.clone(),
+            State(ctx.clone()),
+            axum::Json(DisableTotpRequest {
+                password: "adminadmin".to_string(),
+                code: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 400);
+        assert!(ctx.auth_mgr.totp_enabled("admin"));
+
+        // Correct password + valid backup code disables 2FA.
+        let ok = disable_totp(
+            admin,
+            State(ctx.clone()),
+            axum::Json(DisableTotpRequest {
+                password: "adminadmin".to_string(),
+                code: Some(setup.backup_codes[1].clone()),
+            }),
+        )
+        .await;
+        assert!(ok.is_ok());
+        assert!(!ctx.auth_mgr.totp_enabled("admin"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_wizard_completion_requires_setup_token_when_provisioned() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_setup_tok_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let mut ctx = mock_context(&temp_dir).await;
+        ctx.auth_mgr = Arc::new(crate::auth::AuthManager::with_storage(&temp_dir, 24, 5).unwrap());
+        assert!(ctx.auth_mgr.setup_token_required());
+        let token = ctx.auth_mgr.setup_token().expect("token provisioned");
+
+        let form = || WizardCompleteForm {
+            setup_token: None,
+            admin_user: Some("admin".to_string()),
+            admin_password: Some("Str0ngPassword!".to_string()),
+            ..Default::default()
+        };
+
+        // Without the token -> 403 and setup stays pending.
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(form()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(ctx.auth_mgr.setup_token_required());
+
+        // With the token -> completes and the token is consumed.
+        let mut with_token = form();
+        with_token.setup_token = Some(token);
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(with_token),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(!ctx.auth_mgr.setup_token_required());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

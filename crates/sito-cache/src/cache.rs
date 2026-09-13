@@ -2,24 +2,39 @@
 
 use arc_swap::ArcSwap;
 use moka::future::Cache;
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use sito_core::config::CacheConfig;
 use sito_proto::rdata::SOA;
-use sito_proto::{DNSClass, Message, Name, RData, RecordType, ResponseCode, encode_message};
+use sito_proto::{
+    DNSClass, Message, MessageType, Name, RData, RecordType, ResponseCode, encode_message,
+};
 
 use crate::entry::CacheEntry;
 use crate::key::CacheKey;
 
+/// TTL (seconds) clamped onto records served from stale cache per RFC 8767 §5.
+const STALE_SERVE_TTL: u32 = 30;
+
 /// Builds a moka cache with the given capacity in megabytes.
-fn build_cache(size_mb: u64) -> Cache<CacheKey, CacheEntry> {
+fn build_cache(size_mb: u64) -> Cache<CacheKey, Arc<CacheEntry>> {
     Cache::builder()
-        .weigher(|_key: &CacheKey, value: &CacheEntry| -> u32 { value.estimated_bytes })
+        .weigher(|_key: &CacheKey, value: &Arc<CacheEntry>| -> u32 { value.estimated_bytes })
         .max_capacity(size_mb.saturating_mul(1024 * 1024))
         .build()
+}
+
+/// RAII guard for a per-key single-flight slot.
+///
+/// Held across the upstream resolution and the cache insert so only one
+/// concurrent query per key populates the entry; dropping it releases the slot.
+#[must_use = "the single-flight slot is released when the guard is dropped"]
+pub struct SingleFlightGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 /// High-performance concurrent DNS response cache.
@@ -28,9 +43,21 @@ fn build_cache(size_mb: u64) -> Cache<CacheKey, CacheEntry> {
 /// hot-reloaded: a resize rebuilds the cache and carries over entries that
 /// still fit the new capacity. During the swap both generations briefly
 /// coexist, so peak memory is old + new size.
+///
+/// Eviction semantics:
+/// * moka evicts by weighted size (approximately; eviction is asynchronous).
+/// * [`DnsCache::resize`] carries over only entries that have not passed their
+///   stale window; entries inserted into the old generation while a resize is
+///   in progress are not carried over.
+/// * [`DnsCache::flush`] invalidates the generation that is current at call
+///   time. Do not call it concurrently with a resize: entries an in-progress
+///   resize already copied can survive the flush.
 pub struct DnsCache {
-    cache: ArcSwap<Cache<CacheKey, CacheEntry>>,
+    cache: ArcSwap<Cache<CacheKey, Arc<CacheEntry>>>,
     config: ArcSwap<CacheConfig>,
+    /// Per-key single-flight locks. Weak references let finished keys be
+    /// replaced lazily; waiters keep their strong reference alive.
+    flights: Arc<Mutex<HashMap<CacheKey, Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 impl DnsCache {
@@ -41,6 +68,7 @@ impl DnsCache {
         Self {
             cache: ArcSwap::from_pointee(cache),
             config: ArcSwap::new(Arc::new(config)),
+            flights: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -57,15 +85,28 @@ impl DnsCache {
     /// carrying over live entries on a best-effort basis.
     ///
     /// Entries are copied oldest-first in moka iteration order until the new
-    /// capacity is exhausted; anything that does not fit is dropped.
+    /// capacity is exhausted; entries that have already passed their stale
+    /// window are dropped instead of being copied. Entries inserted into the
+    /// old generation after iteration starts are not carried over. Peak memory
+    /// during the rebuild is old + new capacity.
     pub async fn resize(&self, size_mb: u64) {
         let capacity_bytes = size_mb.saturating_mul(1024 * 1024);
+        let stale_window_secs = self.config.load().serve_stale_hours.saturating_mul(3600);
         let old = self.cache.load_full();
         let new_cache = build_cache(size_mb);
 
         let mut carried = 0u64;
         let mut carried_bytes = 0u64;
+        let mut skipped_expired = 0u64;
         for (key, entry) in old.iter() {
+            let elapsed_secs = entry.stored_at.elapsed().as_secs();
+            let fully_expired =
+                u64::from(entry.max_lifespan_secs).saturating_add(u64::from(stale_window_secs));
+            if elapsed_secs >= fully_expired {
+                skipped_expired += 1;
+                continue;
+            }
+
             let weight = u64::from(entry.estimated_bytes.max(1));
             if carried > 0 && carried_bytes.saturating_add(weight) > capacity_bytes {
                 break;
@@ -77,21 +118,63 @@ impl DnsCache {
         new_cache.run_pending_tasks().await;
         self.cache.store(Arc::new(new_cache));
         debug!(
-            "Cache resized to {} MiB (carried over {carried} entries, ~{carried_bytes} bytes)",
+            "Cache resized to {} MiB (carried over {carried} entries, ~{carried_bytes} bytes, \
+             dropped {skipped_expired} fully expired entries)",
             size_mb
         );
     }
 
+    /// Acquires the single-flight slot for `key`.
+    ///
+    /// Concurrent callers with the same key wait until the first caller drops
+    /// the returned guard. To be effective, callers should re-check the cache
+    /// after acquiring (the slot holder may already have populated it).
+    pub async fn single_flight(&self, key: CacheKey) -> SingleFlightGuard {
+        let lock = {
+            let mut flights = self
+                .flights
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if flights.len() > 1024 {
+                flights.retain(|_, weak| weak.strong_count() > 0);
+            }
+            if let Some(existing) = flights.get(&key).and_then(Weak::upgrade) {
+                existing
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                flights.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        SingleFlightGuard {
+            _guard: lock.lock_owned().await,
+        }
+    }
+
+    /// Acquires the single-flight slot for the query's cache key.
+    pub async fn single_flight_for_query(&self, query: &Message) -> Option<SingleFlightGuard> {
+        let key = CacheKey::from_query(query)?;
+        Some(self.single_flight(key).await)
+    }
+
     /// Retrieve a response for the given query from cache, adjusting TTLs according to elapsed time.
     pub async fn get(&self, name: &Name, qtype: RecordType, qclass: DNSClass) -> Option<Message> {
+        self.get_by_key(&CacheKey::new(name, qtype, qclass)).await
+    }
+
+    /// Retrieve a response for `query`, honouring its DO/CD/ECS cache key.
+    pub async fn get_for_query(&self, query: &Message) -> Option<Message> {
+        self.get_by_key(&CacheKey::from_query(query)?).await
+    }
+
+    async fn get_by_key(&self, key: &CacheKey) -> Option<Message> {
         let config = self.config.load();
         if !config.enabled {
             return None;
         }
 
         let cache = self.cache.load_full();
-        let key = CacheKey::new(name, qtype, qclass);
-        let entry = cache.get(&key).await?;
+        let entry = cache.get(key).await?;
 
         let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
         let max_stale_secs = entry
@@ -103,7 +186,7 @@ impl DnsCache {
                 "Cache entry for {} completely expired (elapsed: {}s, max_stale: {}s)",
                 key.qname, elapsed_secs, max_stale_secs
             );
-            cache.invalidate(&key).await;
+            cache.invalidate(key).await;
             return None;
         }
 
@@ -148,6 +231,10 @@ impl DnsCache {
     }
 
     /// Retrieve a stale cached response according to RFC 8767 when upstreams fail.
+    ///
+    /// DNSSEC material is removed before serving: a stale entry is not
+    /// revalidated, so it must never claim `AD` and must not carry RRSIGs that
+    /// would let a client treat it as authentic.
     /// TTLs are clamped to 30 seconds as recommended by RFC 8767 section 5.
     pub async fn get_stale(
         &self,
@@ -155,16 +242,23 @@ impl DnsCache {
         qtype: RecordType,
         qclass: DNSClass,
     ) -> Option<Message> {
-        const STALE_SERVE_TTL: u32 = 30;
+        self.get_stale_by_key(&CacheKey::new(name, qtype, qclass))
+            .await
+    }
 
+    /// Retrieve a stale response for `query`, honouring its DO/CD/ECS cache key.
+    pub async fn get_stale_for_query(&self, query: &Message) -> Option<Message> {
+        self.get_stale_by_key(&CacheKey::from_query(query)?).await
+    }
+
+    async fn get_stale_by_key(&self, key: &CacheKey) -> Option<Message> {
         let config = self.config.load();
         if !config.enabled || config.serve_stale_hours == 0 {
             return None;
         }
 
         let cache = self.cache.load_full();
-        let key = CacheKey::new(name, qtype, qclass);
-        let entry = cache.get(&key).await?;
+        let entry = cache.get(key).await?;
 
         let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
         let max_stale_secs = entry
@@ -172,12 +266,15 @@ impl DnsCache {
             .saturating_add(config.serve_stale_hours.saturating_mul(3600));
 
         if elapsed_secs >= max_stale_secs {
-            cache.invalidate(&key).await;
+            cache.invalidate(key).await;
             return None;
         }
 
         entry.hits.fetch_add(1, Ordering::Relaxed);
         let mut response = entry.message.clone();
+
+        // Never serve stale data as authenticated (RFC 8767 §5.1 / RFC 6840).
+        clear_dnssec_material(&mut response);
 
         for record in &mut response.answers {
             record.ttl = STALE_SERVE_TTL;
@@ -199,14 +296,26 @@ impl DnsCache {
     /// Check whether a cached entry is eligible for background prefetch
     /// (prefetch enabled, hits >= 2, and remaining TTL <= 10% of lifespan or <= 10 seconds).
     pub async fn should_prefetch(&self, name: &Name, qtype: RecordType, qclass: DNSClass) -> bool {
+        self.should_prefetch_by_key(&CacheKey::new(name, qtype, qclass))
+            .await
+    }
+
+    /// Prefetch check for `query`, honouring its DO/CD/ECS cache key.
+    pub async fn should_prefetch_for_query(&self, query: &Message) -> bool {
+        match CacheKey::from_query(query) {
+            Some(key) => self.should_prefetch_by_key(&key).await,
+            None => false,
+        }
+    }
+
+    async fn should_prefetch_by_key(&self, key: &CacheKey) -> bool {
         let config = self.config.load();
         if !config.enabled || !config.prefetch {
             return false;
         }
 
         let cache = self.cache.load_full();
-        let key = CacheKey::new(name, qtype, qclass);
-        if let Some(entry) = cache.get(&key).await {
+        if let Some(entry) = cache.get(key).await {
             let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
             if elapsed_secs < entry.max_lifespan_secs {
                 let remaining = entry.max_lifespan_secs - elapsed_secs;
@@ -218,7 +327,20 @@ impl DnsCache {
     }
 
     /// Insert a response into the cache, calculating clamped TTLs and entry weight.
+    ///
+    /// Only well-formed positive or negative answers are cached:
+    /// * the response must be a response message whose question section is
+    ///   present and matches the query,
+    /// * truncated (TC=1) responses and RCODEs other than NoError/NXDOMAIN are
+    ///   never cached,
+    /// * NoError responses without an RRset of the queried type are treated as
+    ///   NODATA and require an SOA in the authority section (RFC 2308);
+    ///   negative answers without an SOA are not cached.
     pub async fn insert(&self, query: &Message, response: &Message) {
+        let Some(key) = CacheKey::from_query(query) else {
+            return;
+        };
+
         let config = self.config.load();
         if !config.enabled {
             return;
@@ -228,15 +350,58 @@ impl DnsCache {
             return;
         };
 
-        let key = CacheKey::new(
-            first_query.name(),
-            first_query.query_type(),
-            first_query.query_class(),
-        );
+        if response.metadata.message_type != MessageType::Response {
+            return;
+        }
+        if response.metadata.truncation {
+            trace!("Not caching truncated response for {}", key.qname);
+            return;
+        }
 
-        let is_nxdomain = response.metadata.response_code == ResponseCode::NXDomain;
-        let is_nodata =
-            response.metadata.response_code == ResponseCode::NoError && response.answers.is_empty();
+        let rcode = response.metadata.response_code;
+        if rcode != ResponseCode::NoError && rcode != ResponseCode::NXDomain {
+            trace!(
+                "Not caching {} response for {} (only NoError/NXDomain are cacheable)",
+                rcode, key.qname
+            );
+            return;
+        }
+
+        // A response whose question does not match the query must never be
+        // stored, or a mismatched/spoofed upstream reply could be served for
+        // the query name later. A response without a question section cannot
+        // be verified and is rejected as well (upstream transports already
+        // enforce this via `validate_response`).
+        let Some(response_question) = response.queries.first() else {
+            trace!(
+                "Not caching response without a question section for {}",
+                key.qname
+            );
+            return;
+        };
+        let matches = response_question.name() == first_query.name()
+            && response_question.query_type() == first_query.query_type()
+            && response_question.query_class() == first_query.query_class();
+        if !matches {
+            warn!(
+                qname = %key.qname,
+                "Refusing to cache response with a mismatched question section"
+            );
+            return;
+        }
+
+        // NODATA detection (RFC 2308): a NoError answer without an RRset of
+        // the queried type is negative, including CNAME-only chains that never
+        // reach the requested type.
+        let query_type = first_query.query_type();
+        let has_answer_for_query_type = (query_type == RecordType::ANY
+            && !response.answers.is_empty())
+            || response
+                .answers
+                .iter()
+                .any(|record| record.record_type() == query_type);
+        let is_nxdomain = rcode == ResponseCode::NXDomain;
+        let is_nodata = rcode == ResponseCode::NoError && !has_answer_for_query_type;
         let is_negative = is_nxdomain || is_nodata;
 
         let mut answer_ttls = Vec::new();
@@ -244,19 +409,17 @@ impl DnsCache {
         let mut additional_ttls = Vec::new();
 
         let max_lifespan_secs = if is_negative {
-            // Find SOA record in authority section
-            let mut soa_ttl = None;
-            for auth in &response.authorities {
-                if let RData::SOA(SOA { minimum, .. }) = &auth.data {
-                    let effective = auth.ttl.min(*minimum);
-                    soa_ttl = Some(effective);
-                    break;
-                }
-            }
-
-            let raw_negative_ttl = soa_ttl.unwrap_or(300);
+            // RFC 2308 requires a SOA record to derive the negative TTL.
+            // Without one the answer is not cacheable.
+            let Some(soa_ttl) = negative_ttl_from_soa(&response.authorities) else {
+                trace!(
+                    "Not caching negative response for {} without a SOA record",
+                    key.qname
+                );
+                return;
+            };
             let clamped_ttl =
-                raw_negative_ttl.clamp(config.min_ttl, config.negative_ttl_max.max(config.min_ttl));
+                soa_ttl.clamp(config.min_ttl, config.negative_ttl_max.max(config.min_ttl));
             for auth in &response.authorities {
                 authority_ttls.push(auth.ttl.min(clamped_ttl));
             }
@@ -308,22 +471,30 @@ impl DnsCache {
             "Caching response for {} with lifespan {}s (weight: {}B)",
             key.qname, max_lifespan_secs, estimated_bytes
         );
-        self.cache.load_full().insert(key, entry).await;
+        self.cache.load_full().insert(key, Arc::new(entry)).await;
     }
 
-    /// Invalidate all entries in the cache.
+    /// Invalidate all entries in the current cache generation.
+    ///
+    /// Entries copied into a generation created by a concurrent [`DnsCache::resize`]
+    /// are not affected; see the type-level eviction notes.
     pub fn flush(&self) {
         self.cache.load().invalidate_all();
     }
 
-    /// Invalidate entries matching the specified domain.
+    /// Invalidate entries matching the specified domain (the name itself and
+    /// all strict subdomains).
+    ///
+    /// This is an O(n) scan of the live cache because moka has no secondary
+    /// index; the suffix string is precomputed so the scan performs no
+    /// per-entry formatting.
     pub fn invalidate_domain(&self, domain: &str) {
         let normalized =
             sito_proto::normalize_domain(domain).unwrap_or_else(|_| domain.to_ascii_lowercase());
-        let norm_clone = normalized.clone();
+        let subdomain_suffix = format!(".{normalized}");
         let cache = self.cache.load();
         let _ = cache.invalidate_entries_if(move |k, _v| {
-            k.qname == norm_clone || k.qname.ends_with(&format!(".{norm_clone}"))
+            k.qname == normalized || k.qname.ends_with(&subdomain_suffix)
         });
     }
 
@@ -331,4 +502,29 @@ impl DnsCache {
     pub fn weighted_size(&self) -> u64 {
         self.cache.load().weighted_size()
     }
+}
+
+/// Removes DNSSEC records and the AD flag from a response.
+fn clear_dnssec_material(response: &mut Message) {
+    response.metadata.authentic_data = false;
+    response
+        .answers
+        .retain(|record| record.record_type() != RecordType::RRSIG);
+    response
+        .authorities
+        .retain(|record| record.record_type() != RecordType::RRSIG);
+    response
+        .additionals
+        .retain(|record| record.record_type() != RecordType::RRSIG);
+}
+
+/// Derives the RFC 2308 negative TTL from the SOA record in `authorities`
+/// (`min(SOA TTL, SOA MINIMUM)`), or `None` when no SOA is present.
+fn negative_ttl_from_soa(authorities: &[sito_proto::Record]) -> Option<u32> {
+    for auth in authorities {
+        if let RData::SOA(SOA { minimum, .. }) = &auth.data {
+            return Some(auth.ttl.min(*minimum));
+        }
+    }
+    None
 }

@@ -15,7 +15,12 @@ use sito_proto::{decode_message, encode_message};
 
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
+use crate::tcp::frame_prefix;
 use crate::tls::TlsAcceptorManager;
+
+/// Maximum DNS message size accepted over a DoQ stream (RFC 9250, 2-octet
+/// length prefix; the DNS-over-TCP ceiling is 65535 bytes).
+const MAX_DOQ_MESSAGE_BYTES: usize = 65_535;
 
 /// Configuration options for the DoQ listener.
 #[derive(Clone)]
@@ -180,7 +185,7 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                 }
 
                                 let query_len = u16::from_be_bytes(len_buf) as usize;
-                                if query_len == 0 || query_len > 4096 {
+                                if query_len == 0 || query_len > MAX_DOQ_MESSAGE_BYTES {
                                     warn!("DoQ invalid query length {} from {}", query_len, peer_addr);
                                     return;
                                 }
@@ -207,7 +212,13 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                 if let Some(response) = handler.handle(query, client_ctx).await {
                                     match encode_message(&response) {
                                         Ok(encoded) => {
-                                            let resp_len = (encoded.len() as u16).to_be_bytes();
+                                            let Some(resp_len) = frame_prefix(encoded.len()) else {
+                                                warn!(
+                                                    "DoQ response of {} bytes exceeds the 65535-byte DNS message limit; dropping",
+                                                    encoded.len()
+                                                );
+                                                return;
+                                            };
                                             if let Err(e) = send.write_all(&resp_len).await {
                                                 trace!("DoQ write length error to {}: {}", peer_addr, e);
                                                 return;
@@ -372,6 +383,105 @@ mod tests {
             dns_resp.answers[0].data,
             RData::A(A(std::net::Ipv4Addr::new(9, 9, 9, 9)))
         );
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_doq_accepts_queries_larger_than_4096_bytes() {
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_doq_large_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        std::fs::write(&cert_file, &cert_pem).unwrap();
+        std::fs::write(&key_file, &key_pem).unwrap();
+
+        let server_config =
+            crate::tls::load_server_config(&cert_file, &key_file, &[], vec![b"doq".to_vec()])
+                .unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = udp_socket.local_addr().unwrap().port();
+        drop(udp_socket);
+
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::NoError;
+            Some(resp)
+        });
+
+        let _handle = start_doq_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
+        root_store.add(cert_der).unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"doq".to_vec()];
+
+        let quic_client_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls)).unwrap();
+        let client_cfg = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
+
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_cfg);
+
+        let conn = client_endpoint
+            .connect(actual_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+
+        // RFC 9250 permits DNS messages up to 65535 bytes; build a query well
+        // above the previous 4096-byte server cap.
+        let mut query = Message::new(4242, MessageType::Query, OpCode::Query);
+        for i in 0..300 {
+            query.queries.push(Query::query(
+                Name::from_str(&format!("q{i}.example.com.")).unwrap(),
+                RecordType::A,
+            ));
+        }
+        let wire = encode_message(&query).unwrap();
+        assert!(
+            wire.len() > 4096,
+            "test query must exceed the old 4096-byte cap (got {} bytes)",
+            wire.len()
+        );
+
+        // The query ID is rewritten to 0 on the wire per RFC 9250.
+        send.write_all(&(wire.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        send.write_all(&wire).await.unwrap();
+        send.finish().unwrap();
+
+        let mut resp_len_buf = [0u8; 2];
+        recv.read_exact(&mut resp_len_buf).await.unwrap();
+        let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        recv.read_exact(&mut resp_buf).await.unwrap();
+
+        let dns_resp = decode_message(&resp_buf).unwrap();
+        assert_eq!(dns_resp.queries.len(), query.queries.len());
 
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&temp_dir);

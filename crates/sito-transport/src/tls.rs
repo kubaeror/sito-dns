@@ -315,6 +315,7 @@ pub fn load_server_config_with_challenges(
 pub struct TlsAcceptorManager {
     server_config: Arc<ArcSwap<ServerConfig>>,
     challenge_keys: Arc<dashmap::DashMap<String, Arc<CertifiedKey>>>,
+    sni_certs: Arc<ArcSwap<Vec<(String, PathBuf, PathBuf)>>>,
 }
 
 impl TlsAcceptorManager {
@@ -323,6 +324,7 @@ impl TlsAcceptorManager {
         Self {
             server_config: Arc::new(ArcSwap::from_pointee(config)),
             challenge_keys: Arc::new(dashmap::DashMap::new()),
+            sni_certs: Arc::new(ArcSwap::from_pointee(Vec::new())),
         }
     }
 
@@ -334,7 +336,19 @@ impl TlsAcceptorManager {
         Self {
             server_config: Arc::new(ArcSwap::from_pointee(config)),
             challenge_keys,
+            sni_certs: Arc::new(ArcSwap::from_pointee(Vec::new())),
         }
+    }
+
+    /// Record the SNI certificate pairs this manager was built with so later
+    /// in-process reloads (ACME rotation, config changes) can preserve them.
+    pub fn set_sni_certs(&self, sni_certs: Vec<(String, PathBuf, PathBuf)>) {
+        self.sni_certs.store(Arc::new(sni_certs));
+    }
+
+    /// Snapshot of the SNI certificate pairs associated with this manager.
+    pub fn sni_certs(&self) -> Arc<Vec<(String, PathBuf, PathBuf)>> {
+        self.sni_certs.load_full()
     }
 
     /// Access the shared challenge keys map.
@@ -383,6 +397,10 @@ impl CertWatcher {
         alpn_protocols: &[Vec<u8>],
         acceptor_mgr: TlsAcceptorManager,
     ) -> Result<Self, TlsError> {
+        // Remember the SNI pairs so reloads triggered by other components
+        // (e.g. ACME renewal) do not silently drop virtual-host certificates.
+        acceptor_mgr.set_sni_certs(sni_certs.to_vec());
+
         let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(16);
 
         let mut watcher = RecommendedWatcher::new(

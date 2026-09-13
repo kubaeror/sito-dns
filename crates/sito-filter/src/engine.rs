@@ -3,7 +3,9 @@
 use crate::downloader::ListDownloader;
 use crate::error::FilterError;
 use crate::parser::{Pattern, Rule, RuleKind, parse_rules};
-use crate::structures::{CompiledRuleSet, LabelInterner, RuleSetBuilder};
+use crate::structures::{
+    CompiledRuleSet, LabelInterner, MAX_REGEX_PATTERN_BYTES, MAX_REGEX_PATTERNS, RuleSetBuilder,
+};
 use arc_swap::ArcSwap;
 use fnv::{FnvHashMap, FnvHashSet};
 use hickory_proto::rr::{Name, RecordType};
@@ -16,6 +18,35 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
+
+/// Lifecycle state of the filter engine's active snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilterState {
+    /// `filtering.enabled = false`: filtering is intentionally disabled.
+    Disabled,
+    /// The initial (or first) rule load has not produced a snapshot yet.
+    #[default]
+    Loading,
+    /// A snapshot is active (possibly empty when nothing is configured).
+    Ready,
+    /// Every configured source failed and no rules are active.
+    Failed,
+}
+
+/// Observable status of the filter engine.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FilterStatus {
+    /// Current lifecycle state.
+    pub state: FilterState,
+    /// Number of active rules in the current snapshot.
+    pub rule_count: usize,
+    /// Number of configured lists that loaded successfully in the last reload.
+    pub loaded_lists: usize,
+    /// Names of configured lists that failed to load in the last reload.
+    pub failed_lists: Vec<String>,
+    /// Most recent reload error, if any.
+    pub last_error: Option<String>,
+}
 
 /// In-memory snapshot of compiled filter rules.
 #[derive(Default, Debug, Clone)]
@@ -362,6 +393,62 @@ fn refresh_schedule(
     (sleep_for, due)
 }
 
+/// Returns a reason when a parsed list's regex/wildcard load exceeds the
+/// per-set compilation limits; the list must then be rejected instead of
+/// letting a hostile list consume unbounded DFA compile resources.
+fn regex_load_exceeds_limits(rules: &[Rule]) -> Option<String> {
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for rule in rules {
+        match &rule.pattern {
+            Pattern::Regex(pattern) => {
+                count += 1;
+                bytes += pattern.len();
+            }
+            Pattern::Wildcard(pattern) => {
+                count += 1;
+                // Count the expanded regex size so the engine-side limit
+                // matches what the DFA builder would have to compile.
+                bytes += crate::structures::wildcard_to_regex(pattern).len();
+            }
+            _ => {}
+        }
+    }
+    if count > MAX_REGEX_PATTERNS {
+        return Some(format!(
+            "{count} regex/wildcard patterns exceed the limit of {MAX_REGEX_PATTERNS}"
+        ));
+    }
+    if bytes > MAX_REGEX_PATTERN_BYTES {
+        return Some(format!(
+            "{bytes} regex/wildcard pattern bytes exceed the limit of {MAX_REGEX_PATTERN_BYTES}"
+        ));
+    }
+    None
+}
+
+/// Normalizes a query name to its ASCII/punycode, lowercased form.
+///
+/// `Name::to_utf8()` decodes IDNA labels (`xn--`), which are then rejected by
+/// [`normalize_domain`] and silently failed open. The wire/ASCII form keeps
+/// IDN queries matchable (e.g. `münchen.de` -> `xn--mnchen-3ya.de`). If the
+/// name still cannot be normalized (escaped wire bytes, malformed punycode),
+/// fall back to the lowercased ASCII text so the query is still evaluated
+/// against substring/regex rules rather than bypassing filtering entirely.
+fn normalized_query_domain(qname: &Name) -> String {
+    let ascii = qname.to_ascii();
+    normalize_domain(&ascii).unwrap_or_else(|_| {
+        let fallback = ascii.trim_end_matches('.').to_ascii_lowercase();
+        if fallback.is_empty() {
+            // Root: keep a non-empty placeholder so substring/regex rules
+            // cannot accidentally match the empty string.
+            ".".to_string()
+        } else {
+            fallback
+        }
+    })
+}
+
 /// Thread-safe filtering engine implementing AdGuard ABP and hosts blocking.
 pub struct HostsFilterEngine {
     snapshot: ArcSwap<FilterSnapshot>,
@@ -370,24 +457,49 @@ pub struct HostsFilterEngine {
     downloader: ListDownloader,
     /// Parsed rules per list, used to refresh individual lists without refetching all.
     list_rules: std::sync::Mutex<FnvHashMap<String, Vec<Rule>>>,
+    /// Serializes reload/refresh cycles so concurrent scheduled and API-driven
+    /// reloads cannot interleave their list-state reads and writes.
+    reload_lock: tokio::sync::Mutex<()>,
+    /// Observability state (loading/ready/failed, per-list failures).
+    status: ArcSwap<FilterStatus>,
 }
 
 impl HostsFilterEngine {
     /// Creates a new `HostsFilterEngine` with an empty snapshot.
     pub fn new(config: FilteringConfig, data_dir: PathBuf) -> Self {
+        let status = FilterStatus {
+            state: if config.enabled {
+                FilterState::Loading
+            } else {
+                FilterState::Disabled
+            },
+            ..FilterStatus::default()
+        };
         Self {
             snapshot: ArcSwap::new(Arc::new(FilterSnapshot::default())),
             config: ArcSwap::new(Arc::new(config)),
             data_dir,
             downloader: ListDownloader::default(),
             list_rules: std::sync::Mutex::new(FnvHashMap::default()),
+            reload_lock: tokio::sync::Mutex::new(()),
+            status: ArcSwap::new(Arc::new(status)),
         }
     }
 
     /// Initializes and loads lists immediately (from download or disk cache).
+    ///
+    /// Failures are logged and reflected in [`HostsFilterEngine::status`];
+    /// the engine keeps a `Failed` state instead of silently advertising an
+    /// enabled-but-empty filter snapshot.
     pub async fn init(config: FilteringConfig, data_dir: PathBuf) -> Self {
         let engine = Self::new(config, data_dir);
-        let _ = engine.reload().await;
+        match engine.reload().await {
+            Ok(count) => info!(rule_count = count, "Filter engine initialized"),
+            Err(e) => error!(
+                error = %e,
+                "Initial filter list load failed; no filter rules are active until a later reload succeeds"
+            ),
+        }
         engine
     }
 
@@ -399,6 +511,20 @@ impl HostsFilterEngine {
     /// Current number of active loaded blocking rules.
     pub fn rule_count(&self) -> usize {
         self.snapshot.load().rule_count
+    }
+
+    /// Current observable status of the filter engine.
+    pub fn status(&self) -> FilterStatus {
+        (*self.status.load_full()).clone()
+    }
+
+    /// Current lifecycle state of the filter engine.
+    pub fn state(&self) -> FilterState {
+        self.status.load().state
+    }
+
+    fn set_status(&self, status: FilterStatus) {
+        self.status.store(Arc::new(status));
     }
 
     /// Reloads all configured blocklists and custom rules, updating snapshot atomically.
@@ -428,13 +554,24 @@ impl HostsFilterEngine {
         apply_drop_guard: bool,
         only_lists: Option<&[String]>,
     ) -> Result<usize, FilterError> {
+        // Serialize the whole fetch/merge/store cycle: a concurrent scheduled
+        // refresh and API reload previously raced on `list_rules` and could
+        // overwrite freshly merged lists with a stale map.
+        let _reload_guard = self.reload_lock.lock().await;
+
         if !config.enabled {
             self.snapshot.store(Arc::new(FilterSnapshot::default()));
             self.list_rules.lock().unwrap().clear();
+            self.set_status(FilterStatus {
+                state: FilterState::Disabled,
+                ..FilterStatus::default()
+            });
             return Ok(0);
         }
 
         let mut list_contents = Vec::new();
+        let mut loaded_lists = 0usize;
+        let mut failed_lists = Vec::new();
 
         for list in &config.lists {
             if !list.enabled {
@@ -453,9 +590,11 @@ impl HostsFilterEngine {
                 .await
             {
                 Ok(content) => {
+                    loaded_lists += 1;
                     list_contents.push((list.name.clone(), content));
                 }
                 Err(e) => {
+                    failed_lists.push(list.name.clone());
                     warn!(
                         list = %list.name,
                         url = %list.url,
@@ -467,7 +606,6 @@ impl HostsFilterEngine {
         }
 
         let custom_rules = config.custom_rules.clone();
-        let full_refresh = only_lists.is_none();
         let base_rules = self.list_rules.lock().unwrap().clone();
         let enabled_names: FnvHashSet<String> = config
             .lists
@@ -477,50 +615,130 @@ impl HostsFilterEngine {
             .collect();
 
         // Compile rules in blocking task to avoid stalling the tokio async runtime
-        let (new_snapshot, count, new_list_rules) = tokio::task::spawn_blocking(move || {
-            let mut map = if full_refresh {
-                FnvHashMap::default()
-            } else {
-                base_rules
-            };
-            // Drop rules for lists that are no longer enabled/configured.
-            map.retain(|name, _| enabled_names.contains(name));
+        let (new_snapshot, count, new_list_rules, rejected_lists) =
+            tokio::task::spawn_blocking(move || {
+                // Merge instead of overwriting: rules from lists that failed to
+                // fetch in this cycle (or that are not part of a partial refresh)
+                // are retained so a transient failure cannot drop protection.
+                let mut map = base_rules;
+                // Drop rules for lists that are no longer enabled/configured.
+                map.retain(|name, _| enabled_names.contains(name));
 
-            for (name, content) in list_contents {
-                let (rules, _) = parse_rules(&content, &name);
-                map.insert(name, rules);
-            }
+                let mut rejected = Vec::new();
+                for (name, content) in list_contents {
+                    let (rules, _) = parse_rules(&content, &name);
+                    if let Some(reason) = regex_load_exceeds_limits(&rules) {
+                        error!(
+                            list = %name,
+                            reason = %reason,
+                            "Rejecting blocklist with excessive regex pattern load"
+                        );
+                        rejected.push(name);
+                        continue;
+                    }
+                    map.insert(name, rules);
+                }
 
-            let mut all_rules = Vec::new();
-            for rules in map.values() {
-                all_rules.extend(rules.iter().cloned());
-            }
-            for rule_text in &custom_rules {
-                let (rules, _) = parse_rules(rule_text, "custom");
-                all_rules.extend(rules);
-            }
-            let snapshot = FilterSnapshot::compile(all_rules);
-            let count = snapshot.rule_count;
-            (snapshot, count, map)
-        })
-        .await
-        .map_err(|e| {
-            error!("Filter rule compilation task failed: {e}");
-            FilterError::CompileTaskFailed(e.to_string())
-        })?;
+                // Deterministic rule-id assignment: lists sorted by name, rule
+                // order preserved within each list, custom rules last (config
+                // order). Candidate precedence (first match wins) therefore stays
+                // stable across reloads and hash-map iteration order changes.
+                let mut names: Vec<&String> = map.keys().collect();
+                names.sort_unstable();
+                let total_rules: usize = map.values().map(Vec::len).sum();
+                let mut all_rules = Vec::with_capacity(total_rules + custom_rules.len());
+                for name in names {
+                    all_rules.extend(map[name].iter().cloned());
+                }
+                for rule_text in &custom_rules {
+                    let (rules, _) = parse_rules(rule_text, "custom");
+                    all_rules.extend(rules);
+                }
+                let snapshot = FilterSnapshot::compile(all_rules);
+                let count = snapshot.rule_count;
+                (snapshot, count, map, rejected)
+            })
+            .await
+            .map_err(|e| {
+                error!("Filter rule compilation task failed: {e}");
+                self.set_status(FilterStatus {
+                    state: FilterState::Failed,
+                    rule_count: self.snapshot.load().rule_count,
+                    failed_lists: failed_lists.clone(),
+                    last_error: Some(e.to_string()),
+                    ..FilterStatus::default()
+                });
+                FilterError::CompileTaskFailed(e.to_string())
+            })?;
+
+        failed_lists.extend(rejected_lists);
 
         let prev_count = self.snapshot.load().rule_count;
-        if apply_drop_guard && prev_count > 0 && count < prev_count / 2 {
+        if apply_drop_guard
+            && prev_count > 0
+            && (count == 0 || count.saturating_mul(2) < prev_count)
+        {
+            // retain the previous snapshot; the reload failure is observable
+            // through the status instead of being silently swallowed.
+            let reason = format!(
+                "rule count dropped from {prev_count} to {count} (>50%); retained previous snapshot"
+            );
             warn!(
                 previous_count = prev_count,
                 new_count = count,
                 "Rule count dropped by >50%, retaining previous filter snapshot to protect against corrupted source"
             );
+            self.set_status(FilterStatus {
+                state: FilterState::Ready,
+                rule_count: prev_count,
+                loaded_lists,
+                failed_lists,
+                last_error: Some(reason),
+            });
             return Ok(prev_count);
+        }
+
+        if count == 0 && !failed_lists.is_empty() && prev_count == 0 {
+            let details = format!(
+                "all {} configured filter source(s) failed to load: {}",
+                failed_lists.len(),
+                failed_lists.join(", ")
+            );
+            error!(
+                lists = ?failed_lists,
+                "No filter rules could be loaded; refusing to advertise an enabled empty snapshot"
+            );
+            self.set_status(FilterStatus {
+                state: FilterState::Failed,
+                rule_count: 0,
+                loaded_lists,
+                failed_lists: failed_lists.clone(),
+                last_error: Some(details.clone()),
+            });
+            return Err(FilterError::NoSourcesLoaded {
+                failed: failed_lists.len(),
+                details,
+            });
         }
 
         self.snapshot.store(Arc::new(new_snapshot));
         *self.list_rules.lock().unwrap() = new_list_rules;
+        let last_error = if failed_lists.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "{} list(s) failed to load: {}",
+                failed_lists.len(),
+                failed_lists.join(", ")
+            ))
+        };
+        self.set_status(FilterStatus {
+            state: FilterState::Ready,
+            rule_count: count,
+            loaded_lists,
+            failed_lists,
+            last_error,
+        });
         info!(rule_count = count, "Filter snapshot compiled and loaded");
         Ok(count)
     }
@@ -587,10 +805,7 @@ impl HostsFilterEngine {
             return None;
         }
 
-        let raw_domain = qname.to_utf8();
-        let Ok(normalized) = normalize_domain(&raw_domain) else {
-            return None;
-        };
+        let normalized = normalized_query_domain(qname);
 
         let snapshot = self.snapshot.load();
         snapshot.evaluate_important(&normalized, qtype, client)
@@ -607,10 +822,7 @@ impl HostsFilterEngine {
             return Verdict::Allow(None);
         }
 
-        let raw_domain = qname.to_utf8();
-        let Ok(normalized) = normalize_domain(&raw_domain) else {
-            return Verdict::Allow(None);
-        };
+        let normalized = normalized_query_domain(qname);
 
         let snapshot = self.snapshot.load();
         snapshot.evaluate_standard(&normalized, qtype, client)
@@ -623,10 +835,7 @@ impl FilterEngine for HostsFilterEngine {
             return Verdict::Allow(None);
         }
 
-        let raw_domain = qname.to_utf8();
-        let Ok(normalized) = normalize_domain(&raw_domain) else {
-            return Verdict::Allow(None);
-        };
+        let normalized = normalized_query_domain(qname);
 
         let snapshot = self.snapshot.load();
         snapshot.evaluate(&normalized, qtype, client)
@@ -810,11 +1019,11 @@ mod tests {
     async fn test_disk_cache_offline_fallback() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_offline_test_{}", std::process::id()));
-        tokio::fs::create_dir_all(&temp_dir.join("lists"))
+        let cached_file = crate::downloader::cache_path_for_list(&temp_dir, "offline_list");
+        tokio::fs::create_dir_all(cached_file.parent().unwrap())
             .await
             .unwrap();
 
-        let cached_file = temp_dir.join("lists").join("offline_list.txt");
         tokio::fs::write(&cached_file, "0.0.0.0 cached-ad.com\n")
             .await
             .unwrap();
@@ -976,5 +1185,327 @@ mod tests {
         // Disabled lists are never scheduled.
         assert!(!next_due.contains_key("off"));
         assert!(next_due.contains_key("slow"));
+    }
+
+    #[tokio::test]
+    async fn test_idn_punycode_queries_match_ascii_rules() {
+        let temp_dir = std::env::temp_dir().join(format!("sito_idn_test_{}", std::process::id()));
+        let config = FilteringConfig {
+            custom_rules: vec!["||xn--mnchen-3ya.de^".to_string()],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+        // `Name::from_utf8` stores IDNA labels; the engine must evaluate the
+        // ASCII/punycode form, not the decoded Unicode form.
+        let idn = Name::from_utf8("münchen.de.").unwrap();
+        assert!(
+            idn.to_utf8().contains("münchen"),
+            "test precondition: the name must carry IDNA labels"
+        );
+        assert!(
+            engine.evaluate(&idn, RecordType::A, &client).is_blocked(),
+            "IDN query must not bypass the ASCII punycode rule"
+        );
+
+        // The punycode form matches directly as well.
+        let ascii = Name::from_str("xn--mnchen-3ya.de.").unwrap();
+        assert!(engine.evaluate(&ascii, RecordType::A, &client).is_blocked());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_cross_list_precedence_is_deterministic() {
+        let temp_dir = std::env::temp_dir().join(format!("sito_order_test_{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let a_path = temp_dir.join("a-list.txt");
+        let b_path = temp_dir.join("b-list.txt");
+        tokio::fs::write(&a_path, "||same.example^\n")
+            .await
+            .unwrap();
+        tokio::fs::write(&b_path, "||same.example^\n")
+            .await
+            .unwrap();
+
+        // "b-list" is configured first but "a-list" must win (sorted by name)
+        // regardless of configuration or hash-map iteration order.
+        let config = FilteringConfig {
+            lists: vec![
+                FilterListConfig {
+                    name: "b-list".to_string(),
+                    url: format!("file://{}", b_path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+                FilterListConfig {
+                    name: "a-list".to_string(),
+                    url: format!("file://{}", a_path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let qname = Name::from_str("same.example.").unwrap();
+
+        let source =
+            |engine: &HostsFilterEngine| match engine.evaluate(&qname, RecordType::A, &client) {
+                Verdict::Block(BlockReason::Rule(rule)) => rule.list_name.clone(),
+                other => panic!("expected rule block, got {other:?}"),
+            };
+        assert_eq!(source(&engine).as_deref(), Some("a-list"));
+
+        // Recompiling must not change the winner.
+        engine.reload().await.unwrap();
+        assert_eq!(source(&engine).as_deref(), Some("a-list"));
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_drop_guard_keeps_last_remaining_rule() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_drop_single_test_{}", std::process::id()));
+        let config = FilteringConfig {
+            custom_rules: vec!["0.0.0.0 only.com".to_string()],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(config.clone(), temp_dir.clone()).await;
+        assert_eq!(engine.rule_count(), 1);
+
+        // Dropping the last rule is a 100% loss and must be guarded.
+        let mut dropped = config;
+        dropped.custom_rules.clear();
+        engine.config.store(Arc::new(dropped));
+        let count = engine.reload().await.unwrap();
+        assert_eq!(count, 1, "the last rule must survive the drop guard");
+        assert_eq!(engine.rule_count(), 1);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_all_list_failure_is_observable_and_not_advertised_ready() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_all_fail_test_{}", std::process::id()));
+        let config = FilteringConfig {
+            lists: vec![FilterListConfig {
+                name: "dead".to_string(),
+                url: "http://127.0.0.1:1/list.txt".to_string(),
+                enabled: true,
+                refresh_hours: None,
+            }],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+
+        assert_eq!(engine.state(), FilterState::Failed);
+        let status = engine.status();
+        assert_eq!(status.failed_lists, vec!["dead".to_string()]);
+        assert!(status.last_error.is_some());
+        assert_eq!(engine.rule_count(), 0);
+        assert!(
+            engine.reload().await.is_err(),
+            "an enabled engine with zero loadable sources must not report success"
+        );
+
+        // A later successful reload transitions back to Ready.
+        let good = FilteringConfig {
+            custom_rules: vec!["0.0.0.0 ok.example".to_string()],
+            ..Default::default()
+        };
+        engine.reload_with_config(&good).await.unwrap();
+        assert_eq!(engine.state(), FilterState::Ready);
+        assert_eq!(engine.rule_count(), 1);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_reload_retains_rules_from_failed_lists() {
+        let temp_dir = std::env::temp_dir().join(format!("sito_merge_test_{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let a_path = temp_dir.join("a.txt");
+        let b_path = temp_dir.join("b.txt");
+        tokio::fs::write(&a_path, "||a-blocked.example^\n")
+            .await
+            .unwrap();
+        tokio::fs::write(&b_path, "||b-blocked.example^\n")
+            .await
+            .unwrap();
+
+        let config = FilteringConfig {
+            lists: vec![
+                FilterListConfig {
+                    name: "a".to_string(),
+                    url: format!("file://{}", a_path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+                FilterListConfig {
+                    name: "b".to_string(),
+                    url: format!("file://{}", b_path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+        assert_eq!(engine.rule_count(), 2);
+
+        // b's source disappears; a full reload must merge (keep b's last good
+        // rules) instead of overwriting the map with only the fetched list.
+        tokio::fs::remove_file(&b_path).await.unwrap();
+        let count = engine.reload().await.unwrap();
+        assert_eq!(count, 2, "rules from the failed list must be retained");
+        assert_eq!(engine.rule_count(), 2);
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            engine
+                .evaluate(
+                    &Name::from_str("b-blocked.example.").unwrap(),
+                    RecordType::A,
+                    &client
+                )
+                .is_blocked()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_reloads_do_not_lose_lists() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_concurrent_test_{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let a_path = temp_dir.join("a.txt");
+        let b_path = temp_dir.join("b.txt");
+        tokio::fs::write(&a_path, "||a-one.example^\n||a-two.example^\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &b_path,
+            "||b-one.example^\n||b-two.example^\n||b-three.example^\n",
+        )
+        .await
+        .unwrap();
+
+        let config = FilteringConfig {
+            lists: vec![
+                FilterListConfig {
+                    name: "a".to_string(),
+                    url: format!("file://{}", a_path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+                FilterListConfig {
+                    name: "b".to_string(),
+                    url: format!("file://{}", b_path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let engine = Arc::new(HostsFilterEngine::init(config.clone(), temp_dir.clone()).await);
+        assert_eq!(engine.rule_count(), 5);
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let partial = engine.clone();
+            handles.push(tokio::spawn(async move {
+                partial.reload_lists(&["a".to_string()]).await.map(|_| ())
+            }));
+            let full = engine.clone();
+            let cfg = config.clone();
+            handles.push(tokio::spawn(async move {
+                full.reload_with_config(&cfg).await.map(|_| ())
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+
+        // The final state must contain both lists; serialization prevents a
+        // stale partial reload from overwriting the merged map.
+        let count = engine.reload().await.unwrap();
+        assert_eq!(count, 5);
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        for domain in ["a-one.example", "b-three.example"] {
+            assert!(
+                engine
+                    .evaluate(
+                        &Name::from_str(&format!("{domain}.")).unwrap(),
+                        RecordType::A,
+                        &client
+                    )
+                    .is_blocked(),
+                "{domain} must remain blocked after concurrent reloads"
+            );
+        }
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_with_excessive_regex_patterns_is_rejected() {
+        use std::fmt::Write as _;
+        let temp_dir = std::env::temp_dir().join(format!("sito_regex_cap_{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let huge_path = temp_dir.join("huge.txt");
+        let good_path = temp_dir.join("good.txt");
+
+        let mut huge = String::new();
+        for i in 0..=MAX_REGEX_PATTERNS {
+            let _ = writeln!(huge, "/^r{i}\\.example$/");
+        }
+        tokio::fs::write(&huge_path, huge).await.unwrap();
+        tokio::fs::write(&good_path, "||good.example^\n")
+            .await
+            .unwrap();
+
+        let config = FilteringConfig {
+            lists: vec![
+                FilterListConfig {
+                    name: "good".to_string(),
+                    url: format!("file://{}", good_path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+                FilterListConfig {
+                    name: "huge".to_string(),
+                    url: format!("file://{}", huge_path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+        let status = engine.status();
+        assert_eq!(status.state, FilterState::Ready);
+        assert_eq!(status.failed_lists, vec!["huge".to_string()]);
+        assert_eq!(engine.rule_count(), 1, "good list still loads");
+
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            engine
+                .evaluate(
+                    &Name::from_str("good.example.").unwrap(),
+                    RecordType::A,
+                    &client
+                )
+                .is_blocked()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

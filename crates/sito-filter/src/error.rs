@@ -33,4 +33,7 @@ pub enum FilterError {
 
     #[error("Rule compilation task failed: {0}")]
     CompileTaskFailed(String),
+
+    #[error("No filter list sources could be loaded ({failed} failed): {details}")]
+    NoSourcesLoaded { failed: usize, details: String },
 }

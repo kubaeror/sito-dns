@@ -1,6 +1,12 @@
 //! Downloader and disk-cache manager for blocklists.
+//!
+//! The actual fetch logic (schemes, SSRF guards, conditional HTTP, retries,
+//! streaming size cap, disk fallback) lives in [`crate::subscription::SubscriptionFetcher`];
+//! [`ListDownloader`] is a thin configuration holder that delegates to it so
+//! there is a single downloader implementation.
 
 use crate::error::FilterError;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,7 +16,7 @@ pub const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 /// Manages fetching blocklists over HTTP(S) and falling back to disk cache.
 #[derive(Clone, Debug)]
 pub struct ListDownloader {
-    client: reqwest::Client,
+    timeout: Duration,
     max_bytes: usize,
 }
 
@@ -23,13 +29,7 @@ impl Default for ListDownloader {
 impl ListDownloader {
     /// Creates a new `ListDownloader` with specified timeout and byte limit.
     pub fn new(timeout: Duration, max_bytes: usize) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .user_agent("sito-dns/0.1.0")
-            .build()
-            .unwrap_or_default();
-
-        Self { client, max_bytes }
+        Self { timeout, max_bytes }
     }
 
     /// Fetches a list from URL or file:// URI, falling back to disk cache if download fails.
@@ -41,85 +41,28 @@ impl ListDownloader {
         data_dir: &Path,
     ) -> Result<String, FilterError> {
         let fetcher = crate::subscription::SubscriptionFetcher::new(
-            Duration::from_secs(60),
+            self.timeout,
             self.max_bytes,
             3,
             Duration::from_millis(50),
-        );
+        )
+        .with_file_root(data_dir);
         fetcher.fetch_or_cached(list_name, url, data_dir).await
-    }
-
-    /// Downloads a blocklist over HTTP/HTTPS with size checking.
-    pub async fn download(&self, list_name: &str, url: &str) -> Result<String, FilterError> {
-        let url_lower = url.trim().to_ascii_lowercase();
-        if !url_lower.starts_with("http://") && !url_lower.starts_with("https://") {
-            return Err(FilterError::InvalidUrl {
-                url: url.to_string(),
-                reason:
-                    "unsupported scheme: only http and https are permitted for network downloads"
-                        .to_string(),
-            });
-        }
-
-        let resp = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| FilterError::DownloadFailed {
-                list: list_name.to_string(),
-                url: url.to_string(),
-                source: e,
-            })?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let req_err = resp.error_for_status().unwrap_err();
-            return Err(FilterError::DownloadFailed {
-                list: list_name.to_string(),
-                url: url.to_string(),
-                source: req_err,
-            });
-        }
-
-        if let Some(content_length) = resp.content_length()
-            && content_length as usize > self.max_bytes
-        {
-            return Err(FilterError::ListTooLarge {
-                list: list_name.to_string(),
-                size: content_length as usize,
-                limit: self.max_bytes,
-            });
-        }
-
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| FilterError::DownloadFailed {
-                list: list_name.to_string(),
-                url: url.to_string(),
-                source: e,
-            })?;
-
-        if bytes.len() > self.max_bytes {
-            return Err(FilterError::ListTooLarge {
-                list: list_name.to_string(),
-                size: bytes.len(),
-                limit: self.max_bytes,
-            });
-        }
-
-        String::from_utf8(bytes.to_vec()).map_err(|_| FilterError::InvalidUrl {
-            url: url.to_string(),
-            reason: "Blocklist content is not valid UTF-8".to_string(),
-        })
     }
 }
 
-/// Generates a sanitized file path for caching a list on disk.
-pub fn cache_path_for_list(data_dir: &Path, list_name: &str) -> PathBuf {
+/// Builds the deterministic disk-cache key for a list name.
+///
+/// The sanitized name is kept as a readable prefix, while a stable FNV-1a hash
+/// suffix guarantees that distinct list names mapping to the same sanitized
+/// form (e.g. `a/b` and `a_b`) never collide on one cache file.
+pub(crate) fn cache_key_for_list(list_name: &str) -> String {
+    let mut hasher = fnv::FnvHasher::default();
+    list_name.hash(&mut hasher);
+    let digest = hasher.finish();
     let sanitized: String = list_name
         .chars()
+        .take(64)
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                 c
@@ -128,7 +71,18 @@ pub fn cache_path_for_list(data_dir: &Path, list_name: &str) -> PathBuf {
             }
         })
         .collect();
-    data_dir.join("lists").join(format!("{sanitized}.txt"))
+    if sanitized.is_empty() {
+        format!("{digest:016x}")
+    } else {
+        format!("{sanitized}-{digest:016x}")
+    }
+}
+
+/// Generates a sanitized file path for caching a list on disk.
+pub fn cache_path_for_list(data_dir: &Path, list_name: &str) -> PathBuf {
+    data_dir
+        .join("lists")
+        .join(format!("{}.txt", cache_key_for_list(list_name)))
 }
 
 /// Reads list content from disk cache.
@@ -178,8 +132,23 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
+    #[test]
+    fn test_cache_paths_do_not_collide_for_similar_names() {
+        // These previously sanitized to the same file name.
+        let a = cache_path_for_list(Path::new("/tmp/sito"), "a/b");
+        let b = cache_path_for_list(Path::new("/tmp/sito"), "a_b");
+        assert_ne!(a, b);
+        assert_ne!(a.file_name(), b.file_name());
+
+        // The same name always maps to the same path (stable across calls).
+        assert_eq!(
+            cache_path_for_list(Path::new("/tmp/sito"), "same"),
+            cache_path_for_list(Path::new("/tmp/sito"), "same")
+        );
+    }
+
     #[tokio::test]
-    async fn test_fetch_file_uri() {
+    async fn test_fetch_file_uri_inside_data_dir() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_file_uri_test_{}", std::process::id()));
         tokio::fs::create_dir_all(&temp_dir).await.unwrap();

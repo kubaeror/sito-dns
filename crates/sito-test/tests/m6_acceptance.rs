@@ -141,7 +141,7 @@ async fn test_embedded_ui_spa_routing_fallback() {
     let (ctx, temp_dir) = create_test_context().await;
 
     // Login with default admin credentials to obtain real session cookie
-    let login_res = ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1");
+    let login_res = ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await;
     let cookie_val = match login_res {
         sito_api::auth::LoginResult::Success(session) => session.to_cookie_header(),
         other => panic!("expected login success, got {other:?}"),

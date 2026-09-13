@@ -68,6 +68,7 @@
         <button class="btn-icon" @click="showModal = false">&times;</button>
       </div>
       <form action="/ui/upstreams/add" method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <div class="modal-body">
           <div class="form-group">
             <label class="form-label" for="up-addr">Resolver Address or URL</label>

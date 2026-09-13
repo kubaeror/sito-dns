@@ -342,18 +342,6 @@ mod tests {
             addr
         }
 
-        let temp_dir = std::env::temp_dir().join(format!("sito_scoped_up_{}", std::process::id()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-
-        let addr_a = spawn_mock(Ipv4Addr::new(1, 1, 1, 1)).await;
-        let addr_b = spawn_mock(Ipv4Addr::new(2, 2, 2, 2)).await;
-        let addr_global = spawn_mock(Ipv4Addr::new(9, 9, 9, 9)).await;
-
-        let mut base = Config::default();
-        base.server.data_dir = temp_dir.clone();
-        base.upstream.servers = vec![addr_global.to_string()];
-        let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
-
         async fn scoped_manager(
             base: &Config,
             bootstrap: &BootstrapResolver,
@@ -367,6 +355,33 @@ mod tests {
                     .unwrap(),
             )
         }
+
+        async fn resolve_ip(pipeline: &DnsPipeline, name: &str, client_ip: &str) -> Ipv4Addr {
+            let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+            query
+                .queries
+                .push(Query::query(Name::from_str(name).unwrap(), RecordType::A));
+            let resp = pipeline
+                .handle(query, ClientContext::new(client_ip.parse().unwrap()))
+                .await
+                .unwrap();
+            match resp.answers[0].data {
+                RData::A(a) => a.0,
+                ref other => panic!("expected A record, got {other:?}"),
+            }
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!("sito_scoped_up_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let addr_a = spawn_mock(Ipv4Addr::new(1, 1, 1, 1)).await;
+        let addr_b = spawn_mock(Ipv4Addr::new(2, 2, 2, 2)).await;
+        let addr_global = spawn_mock(Ipv4Addr::new(9, 9, 9, 9)).await;
+
+        let mut base = Config::default();
+        base.server.data_dir = temp_dir.clone();
+        base.upstream.servers = vec![addr_global.to_string()];
+        let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
 
         let global_upstream = Arc::new(
             UpstreamManager::from_config(&base.upstream, &bootstrap)
@@ -437,21 +452,6 @@ mod tests {
         )
         .with_scoped_upstreams(Arc::new(scoped))
         .with_stats(writer.sender(), metrics.clone());
-
-        async fn resolve_ip(pipeline: &DnsPipeline, name: &str, client_ip: &str) -> Ipv4Addr {
-            let mut query = Message::new(7, MessageType::Query, OpCode::Query);
-            query
-                .queries
-                .push(Query::query(Name::from_str(name).unwrap(), RecordType::A));
-            let resp = pipeline
-                .handle(query, ClientContext::new(client_ip.parse().unwrap()))
-                .await
-                .unwrap();
-            match resp.answers[0].data {
-                RData::A(a) => a.0,
-                ref other => panic!("expected A record, got {other:?}"),
-            }
-        }
 
         assert_eq!(
             resolve_ip(&pipeline, "a.test.", "10.0.0.1").await,
@@ -756,6 +756,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_dns_listener_rebinds_on_port_change() {
+        async fn query_port(port: u16) -> bool {
+            let Ok(sock) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else {
+                return false;
+            };
+            if sock
+                .connect(SocketAddr::new("127.0.0.1".parse().unwrap(), port))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            let mut query = Message::new(1001, MessageType::Query, OpCode::Query);
+            query.queries.push(Query::query(
+                Name::from_str("blocked.test.").unwrap(),
+                RecordType::A,
+            ));
+            let Ok(wire) = sito_proto::encode_message(&query) else {
+                return false;
+            };
+            if sock.send(&wire).await.is_err() {
+                return false;
+            }
+            let mut buf = [0u8; 512];
+            matches!(
+                tokio::time::timeout(Duration::from_millis(200), sock.recv(&mut buf)).await,
+                Ok(Ok(len)) if len > 0
+            )
+        }
+
         let reserve_udp_port = || {
             let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let port = probe.local_addr().unwrap().port();
@@ -795,36 +824,6 @@ mod tests {
             run_server_with_shutdown(server_config, Some(shutdown_rx)).await
         });
 
-        async fn query_port(port: u16) -> bool {
-            let sock = match tokio::net::UdpSocket::bind("127.0.0.1:0").await {
-                Ok(sock) => sock,
-                Err(_) => return false,
-            };
-            if sock
-                .connect(SocketAddr::new("127.0.0.1".parse().unwrap(), port))
-                .await
-                .is_err()
-            {
-                return false;
-            }
-            let mut query = Message::new(1001, MessageType::Query, OpCode::Query);
-            query.queries.push(Query::query(
-                Name::from_str("blocked.test.").unwrap(),
-                RecordType::A,
-            ));
-            let Ok(wire) = sito_proto::encode_message(&query) else {
-                return false;
-            };
-            if sock.send(&wire).await.is_err() {
-                return false;
-            }
-            let mut buf = [0u8; 512];
-            matches!(
-                tokio::time::timeout(Duration::from_millis(200), sock.recv(&mut buf)).await,
-                Ok(Ok(len)) if len > 0
-            )
-        }
-
         // Wait for the initial listener to come up.
         let mut up = false;
         for _ in 0..100 {
@@ -838,7 +837,8 @@ mod tests {
             }
         }
         if !up && server_task.is_finished() {
-            panic!("server exited early: {:?}", server_task.await);
+            let result = server_task.await;
+            panic!("server exited early: {result:?}");
         }
         assert!(up, "server did not start listening on the initial port");
 
@@ -941,6 +941,7 @@ mod tests {
                 answer: "192.168.1.1".to_string(),
                 exception_clients: vec![],
             }],
+            ..Default::default()
         };
         pipeline
             .runtime()

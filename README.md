@@ -15,7 +15,7 @@
 
 ## 📊 Feature Comparison: sito vs. AdGuard Home vs. Pi-hole
 
-| Feature / Capability | **sito** (v1.4) | **AdGuard Home** | **Pi-hole (FTL)** |
+| Feature / Capability | **sito** (v1.6) | **AdGuard Home** | **Pi-hole (FTL)** |
 |---|---|---|---|
 | **Language & Runtime** | **Rust (edition 2024, zero GC, zero Node.js)** | Go (GC overhead under load) | C (FTL) + PHP Web UI |
 | **Max Cache Throughput** | **≥ 500,000 QPS** (measured 584k) | ~100,000 QPS | ~50,000 QPS |
@@ -153,7 +153,7 @@ Swagger UI / OpenAPI documentation is available at `http://localhost:8080/api/do
 * **[Security Review & Threat Model](docs/security-audit.md):** Security vectors, SSRF allowlists, ReDoS DFA bounds, and constant-time auth.
 * **[Migrating from AdGuard Home](docs/migration-adguard.md):** Migration instructions and automated converter script (`contrib/adguard_to_sito.py`).
 * **[High-Availability Runbook](docs/runbook-ha.md):** Deployment architectures, mTLS certificates, failover, and slave promotion.
-* **[Changelog](CHANGELOG.md):** Release notes for v1.0.0 and complete history of phases M0 through M9.
+* **[Changelog](CHANGELOG.md):** Release notes for v1.6.0 and complete history of phases M0 through M9.
 
 ---
 

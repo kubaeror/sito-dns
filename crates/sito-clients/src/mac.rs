@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Normalizes a MAC address string into standard lowercase `aa:bb:cc:dd:ee:ff`.
+///
+/// This accepts bare 12-character hex strings too (e.g. RouterOS/ARP values);
+/// use [`normalize_mac_id`] when parsing operator-supplied client identifiers,
+/// where a bare hex string must not be mistaken for a MAC address.
 pub fn normalize_mac(s: &str) -> Option<String> {
     let clean: String = s
         .chars()
@@ -28,6 +32,29 @@ pub fn normalize_mac(s: &str) -> Option<String> {
     }
 
     Some(formatted)
+}
+
+/// Parses a MAC address written in an explicit MAC form from a client `id`.
+///
+/// Unlike [`normalize_mac`], a bare 12-character hex string (for example a
+/// hostname or client name that happens to be all hex digits) is rejected:
+/// the value must use `:`, `-` or `.` separators, or carry the explicit
+/// `mac:` prefix. This prevents a misclassification where `ids = ["aabbccddeeff"]`
+/// silently becomes a MAC-based identity rule.
+pub fn normalize_mac_id(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let (candidate, explicit) = match trimmed.get(..4) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("mac:") => (&trimmed[4..], true),
+        _ => (trimmed, false),
+    };
+
+    let has_separators =
+        candidate.contains(':') || candidate.contains('-') || candidate.contains('.');
+    if !explicit && !has_separators {
+        return None;
+    }
+
+    normalize_mac(candidate)
 }
 
 /// Cache entry for a resolved MAC address.
@@ -155,6 +182,27 @@ mod tests {
             Some("aa:bb:cc:dd:ee:ff".to_string())
         );
         assert_eq!(normalize_mac("invalid"), None);
+    }
+
+    #[test]
+    fn test_mac_id_requires_explicit_mac_format() {
+        // Separators or the `mac:` prefix make the intent explicit.
+        assert_eq!(
+            normalize_mac_id("AA:BB:CC:DD:EE:FF"),
+            Some("aa:bb:cc:dd:ee:ff".to_string())
+        );
+        assert_eq!(
+            normalize_mac_id("aa-bb-cc-dd-ee-ff"),
+            Some("aa:bb:cc:dd:ee:ff".to_string())
+        );
+        assert_eq!(
+            normalize_mac_id("mac:aabbccddeeff"),
+            Some("aa:bb:cc:dd:ee:ff".to_string())
+        );
+        // A bare 12-hex string is a hostname/client name, not a MAC.
+        assert_eq!(normalize_mac_id("aabbccddeeff"), None);
+        assert_eq!(normalize_mac_id("deadbeefcafe"), None);
+        assert_eq!(normalize_mac_id("janes-phone"), None);
     }
 
     #[test]

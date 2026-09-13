@@ -39,9 +39,11 @@ prefetch = false
 serve_stale_hours = 0
 
 [dns.dnssec]
-# "validate" (bogus -> SERVFAIL), "log_only" (log and clear AD) or "off".
+# "validate"/"strict" (bogus -> SERVFAIL), "permissive"/"log_only" (log and
+# clear AD) or "off".
 mode = "validate"
-validate = false
+# Validation is on by default; disable only for debugging.
+validate = true
 # Negative Trust Anchors: domains exempt from validation (RFC 7646).
 nta = []
 # Optional explicit trust anchors ("zone:algorithm:base64key"); empty uses
@@ -85,6 +87,26 @@ retention_days = 90
 [privacy]
 anonymize_querylog = false
 
+# Per-client identification and policies.
+# Display names and `ids` are never trusted for identity by themselves; DoH
+# path / DoT SNI identification requires a shared secret per entry.
+# [clients]
+# trust_routeros_lease_names = false
+# [clients.client_id_secrets]
+# "phone" = "change-me-shared-secret"
+# [clients.groups.kids]
+# filtering = true
+# safe_search = true
+# parental = true
+# [[clients.entries]]
+# name = "phone"
+# ids = ["192.168.1.20"]
+# group = "kids"
+
+# Local DNS rewrites (TTL applies to synthesized records).
+# [rewrites]
+# ttl = 60
+
 # High availability (slave role connects to the master over mTLS WebSocket).
 # [ha]
 # replication_port = 8953
@@ -95,9 +117,12 @@ anonymize_querylog = false
 # cert = "/etc/sito/ha.crt"
 # key = "/etc/sito/ha.key"
 # ca = "/etc/sito/ha-ca.crt"
+# pinned_slave_fingerprints = ["blake3:..."]  # or configure ca
 # ping_interval_secs = 15
 # stats_interval_secs = 30
 # slave_token = "change-me"          # required for plaintext ws:// only
+# allow_insecure_ws = false          # plaintext ws:// (token still required)
+# allow_unpinned_tls = false         # accept any server cert (testing only)
 
 # Curated parental/service list updates (bundled data is the fallback).
 # [integrations.lists]

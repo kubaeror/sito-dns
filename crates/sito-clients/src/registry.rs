@@ -1,11 +1,15 @@
 //! Client identification registry and effective policy resolution.
 //!
-//! Evaluates the 5-step identification chain:
-//! 1. ClientID from DoH path or DoT SNI subdomain
-//! 2. Static IP / CIDR
+//! Evaluates the identification chain:
+//! 1. Shared-secret ClientID from DoH path or DoT/DoQ SNI subdomain
+//! 2. Static IP / CIDR (longest-prefix match)
 //! 3. Local MAC address
-//! 4. RouterOS DHCP lease table
+//! 4. RouterOS DHCP lease table (hostname/comment matching is opt-in)
 //! 5. Fallback to "default" / unknown client
+//!
+//! Steps 1 and 4 never trust values a client can choose for itself unless the
+//! operator has explicitly enabled them: display `name`s, DoH path segments
+//! and DHCP hostnames are not credentials.
 
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -15,7 +19,7 @@ use std::sync::{Arc, RwLock};
 use sito_core::client::{ClientContext, ClientId};
 
 use crate::config::{ClientEntryConfig, ClientsConfig};
-use crate::mac::{MacResolver, normalize_mac};
+use crate::mac::{MacResolver, normalize_mac_id};
 use crate::policy::EffectivePolicy;
 use crate::safe_search::YouTubeSafeSearchMode;
 
@@ -37,10 +41,27 @@ pub struct RouterOsLease {
     pub comment: Option<String>,
 }
 
+/// Precomputed lookup tables for the static parts of the identification chain.
+///
+/// Built once per registry snapshot so per-query identification does not parse
+/// every configured `id` on each request.
+#[derive(Debug, Default)]
+struct ClientIndex {
+    /// Exact IP address -> entry position.
+    exact_ips: HashMap<IpAddr, usize>,
+    /// CIDR blocks -> entry position, in configuration order.
+    subnets: Vec<(IpAddr, u8, usize)>,
+    /// Normalized MAC -> entry position (explicit MAC format only).
+    macs: HashMap<String, usize>,
+    /// Shared client-id secret -> entry position.
+    secrets: HashMap<String, usize>,
+}
+
 /// Registry managing clients, groups, and identification resolution.
 #[derive(Clone)]
 pub struct ClientRegistry {
     config: ClientsConfig,
+    index: Arc<ClientIndex>,
     mac_resolver: MacResolver,
     routeros_leases: Arc<RwLock<Vec<RouterOsLease>>>,
     unidentified_clients: Arc<RwLock<HashMap<IpAddr, UnidentifiedClient>>>,
@@ -49,8 +70,10 @@ pub struct ClientRegistry {
 impl ClientRegistry {
     /// Create a new client registry from configuration.
     pub fn new(config: ClientsConfig) -> Self {
+        let index = Arc::new(build_client_index(&config));
         Self {
             config,
+            index,
             mac_resolver: MacResolver::new(),
             routeros_leases: Arc::new(RwLock::new(Vec::new())),
             unidentified_clients: Arc::new(RwLock::new(HashMap::new())),
@@ -78,20 +101,22 @@ impl ClientRegistry {
                 ctx.id = Some(ClientId::new(&entry.name));
             }
 
-            return self.build_effective_policy(Some(&entry), now);
+            return self.build_effective_policy(Some(entry), now);
         }
 
         // 2. Unknown client fallback
         self.build_effective_policy(None, now)
     }
 
-    fn identify(&self, ctx: &mut ClientContext) -> Option<ClientEntryConfig> {
-        // 1. ClientID from DoH path or DoT SNI subdomain
+    fn identify(&self, ctx: &mut ClientContext) -> Option<&ClientEntryConfig> {
+        // 1. Shared-secret ClientID from DoH path or DoT/DoQ SNI subdomain.
+        //    Only secrets configured in `clients.client_id_secrets` count;
+        //    display names and arbitrary SNI labels never identify a client.
         if let Some(matched) = self.match_by_client_id_or_sni(ctx) {
             return Some(matched);
         }
 
-        // 2. Static IP / CIDR matching
+        // 2. Static IP / CIDR matching (most specific prefix wins)
         if let Some(matched) = self.match_by_ip_or_cidr(ctx.ip) {
             return Some(matched);
         }
@@ -112,81 +137,74 @@ impl ClientRegistry {
         None
     }
 
-    fn match_by_client_id_or_sni(&self, ctx: &ClientContext) -> Option<ClientEntryConfig> {
-        // Direct ClientID match
-        if let Some(ref cid) = ctx.id {
-            let id_str = cid.as_str();
-            for entry in &self.config.entries {
-                if entry.name.eq_ignore_ascii_case(id_str) {
-                    return Some(entry.clone());
-                }
-                for id in &entry.ids {
-                    if id.eq_ignore_ascii_case(id_str) {
-                        return Some(entry.clone());
-                    }
-                }
-            }
+    fn entry_for_secret(&self, secret: &str) -> Option<&ClientEntryConfig> {
+        self.index
+            .secrets
+            .get(secret)
+            .and_then(|&idx| self.config.entries.get(idx))
+    }
+
+    fn match_by_client_id_or_sni(&self, ctx: &ClientContext) -> Option<&ClientEntryConfig> {
+        if self.index.secrets.is_empty() {
+            // Path/SNI identity is disabled (safe default).
+            return None;
         }
 
-        // SNI match: exact or subdomain {id}.dns.domain
+        // Direct shared-secret ClientID (DoH path, or full SNI set by DoQ).
+        if let Some(ref cid) = ctx.id
+            && let Some(entry) = self.entry_for_secret(cid.as_str())
+        {
+            return Some(entry);
+        }
+
+        // SNI match: {secret}.dns.domain or {secret}.sub.domain. The candidate
+        // must be the configured secret itself.
         if let Some(ref sni) = ctx.sni {
             let sni_lower = sni.to_ascii_lowercase();
-
-            // Extract candidate ID from {id}.dns.domain or {id}.sub.domain
-            let candidate_id = extract_id_from_sni(&sni_lower);
-
-            for entry in &self.config.entries {
-                if entry.name.eq_ignore_ascii_case(&sni_lower) {
-                    return Some(entry.clone());
-                }
-                for id in &entry.ids {
-                    if id.eq_ignore_ascii_case(&sni_lower) {
-                        return Some(entry.clone());
-                    }
-                    if let Some(cand) = candidate_id
-                        && id.eq_ignore_ascii_case(cand)
-                    {
-                        return Some(entry.clone());
-                    }
-                }
+            if let Some(candidate) = extract_id_from_sni(&sni_lower)
+                && let Some(entry) = self.entry_for_secret(candidate)
+            {
+                return Some(entry);
             }
         }
 
         None
     }
 
-    fn match_by_ip_or_cidr(&self, client_ip: IpAddr) -> Option<ClientEntryConfig> {
-        for entry in &self.config.entries {
-            for id in &entry.ids {
-                // Exact IP
-                if let Ok(ip) = id.parse::<IpAddr>()
-                    && ip == client_ip
-                {
-                    return Some(entry.clone());
-                }
-                // CIDR subnet
-                if id.contains('/') && cidr_matches(id, client_ip) {
-                    return Some(entry.clone());
-                }
+    fn match_by_ip_or_cidr(&self, client_ip: IpAddr) -> Option<&ClientEntryConfig> {
+        // An exact host address is the most specific match possible.
+        if let Some(&idx) = self.index.exact_ips.get(&client_ip) {
+            return self.config.entries.get(idx);
+        }
+
+        // Otherwise use the longest matching prefix; ties keep the first
+        // configured entry so behavior is deterministic.
+        let mut best: Option<(u8, usize)> = None;
+        for &(network, prefix, idx) in &self.index.subnets {
+            if !ip_in_subnet(network, prefix, client_ip) {
+                continue;
+            }
+            match best {
+                Some((best_prefix, _)) if best_prefix >= prefix => {}
+                _ => best = Some((prefix, idx)),
             }
         }
-        None
+        best.and_then(|(_, idx)| self.config.entries.get(idx))
     }
 
-    fn match_by_mac(&self, mac: &str) -> Option<ClientEntryConfig> {
-        for entry in &self.config.entries {
-            for id in &entry.ids {
-                if let Some(entry_mac) = normalize_mac(id)
-                    && entry_mac.eq_ignore_ascii_case(mac)
-                {
-                    return Some(entry.clone());
-                }
-            }
-        }
-        None
+    fn match_by_mac(&self, mac: &str) -> Option<&ClientEntryConfig> {
+        let normalized = mac.to_ascii_lowercase();
+        self.index
+            .macs
+            .get(&normalized)
+            .and_then(|&idx| self.config.entries.get(idx))
     }
 
-    fn match_by_routeros(&self, ctx: &mut ClientContext) -> Option<ClientEntryConfig> {
+    fn match_by_routeros(&self, ctx: &mut ClientContext) -> Option<&ClientEntryConfig> {
+        // DHCP hostnames/comments are client-controlled. They only participate
+        // in identification when the operator explicitly opts in; MAC/IP lease
+        // matching stays active either way.
+        let trust_names = self.config.trust_routeros_lease_names;
         let leases = self.routeros_leases.read().unwrap();
 
         for lease in leases.iter() {
@@ -203,24 +221,29 @@ impl ClientRegistry {
 
                 // Check if this lease matches any client entry
                 for entry in &self.config.entries {
-                    if let Some(ref h) = lease.hostname
+                    if trust_names
+                        && let Some(ref h) = lease.hostname
                         && entry.name.eq_ignore_ascii_case(h)
                     {
-                        return Some(entry.clone());
+                        return Some(entry);
                     }
                     for id in &entry.ids {
-                        if normalize_mac(id).is_some_and(|m| m.eq_ignore_ascii_case(&lease.mac)) {
-                            return Some(entry.clone());
+                        if normalize_mac_id(id).is_some_and(|m| m.eq_ignore_ascii_case(&lease.mac))
+                        {
+                            return Some(entry);
+                        }
+                        if !trust_names {
+                            continue;
                         }
                         if let Some(ref h) = lease.hostname
                             && id.eq_ignore_ascii_case(h)
                         {
-                            return Some(entry.clone());
+                            return Some(entry);
                         }
                         if let Some(ref c) = lease.comment
                             && id.eq_ignore_ascii_case(c)
                         {
-                            return Some(entry.clone());
+                            return Some(entry);
                         }
                     }
                 }
@@ -237,7 +260,7 @@ impl ClientRegistry {
                     },
                 );
 
-                if ctx.client_name.is_none() {
+                if trust_names && ctx.client_name.is_none() {
                     ctx.client_name.clone_from(&lease.hostname);
                 }
             }
@@ -343,27 +366,75 @@ pub fn extract_id_from_url_path(path: &str) -> Option<&str> {
     Some(segment)
 }
 
-/// Check if target_ip is contained within a CIDR subnet block.
-fn cidr_matches(cidr_str: &str, target_ip: IpAddr) -> bool {
-    let Some((ip_str, prefix_str)) = cidr_str.split_once('/') else {
-        return false;
-    };
-    let Ok(net_ip) = ip_str.parse::<IpAddr>() else {
-        return false;
-    };
-    let Ok(prefix) = prefix_str.parse::<u8>() else {
-        return false;
-    };
+/// Builds the static identification index for a client configuration.
+fn build_client_index(config: &ClientsConfig) -> ClientIndex {
+    let mut index = ClientIndex::default();
 
-    match (net_ip, target_ip) {
-        (IpAddr::V4(net), IpAddr::V4(tgt)) => {
-            if prefix > 32 {
-                return false;
+    for (entry_idx, entry) in config.entries.iter().enumerate() {
+        for id in &entry.ids {
+            if let Ok(ip) = id.trim().parse::<IpAddr>() {
+                index.exact_ips.entry(ip).or_insert(entry_idx);
+            } else if let Some((network, prefix)) = parse_cidr(id) {
+                index.subnets.push((network, prefix, entry_idx));
             }
+            if let Some(mac) = normalize_mac_id(id) {
+                index.macs.entry(mac).or_insert(entry_idx);
+            }
+        }
+
+        // Iterate entries (not the hash map) so duplicate secrets resolve
+        // deterministically to the first configured entry.
+        if let Some(secret) = config.client_id_secrets.get(&entry.name)
+            && !secret.is_empty()
+        {
+            if let Some(&existing) = index.secrets.get(secret) {
+                tracing::warn!(
+                    entry = %entry.name,
+                    other = %config.entries[existing].name,
+                    "Duplicate clients.client_id_secrets value; the first entry wins"
+                );
+            } else {
+                index.secrets.insert(secret.clone(), entry_idx);
+            }
+        }
+    }
+
+    for name in config.client_id_secrets.keys() {
+        if !config.entries.iter().any(|entry| &entry.name == name) {
+            tracing::warn!(
+                entry = %name,
+                "clients.client_id_secrets references an unknown client entry; \
+                 the secret is ignored"
+            );
+        }
+    }
+
+    index
+}
+
+/// Parses `address/prefix` CIDR notation into an IP address and prefix length.
+fn parse_cidr(cidr_str: &str) -> Option<(IpAddr, u8)> {
+    let (ip_str, prefix_str) = cidr_str.split_once('/')?;
+    let net_ip = ip_str.trim().parse::<IpAddr>().ok()?;
+    let prefix = prefix_str.trim().parse::<u8>().ok()?;
+    let max_prefix = match net_ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max_prefix {
+        return None;
+    }
+    Some((net_ip, prefix))
+}
+
+/// Checks if `target_ip` is contained within `network/prefix`.
+fn ip_in_subnet(network: IpAddr, prefix: u8, target_ip: IpAddr) -> bool {
+    match (network, target_ip) {
+        (IpAddr::V4(net), IpAddr::V4(tgt)) => {
             if prefix == 0 {
                 return true;
             }
-            let mask = if prefix == 32 {
+            let mask = if prefix >= 32 {
                 u32::MAX
             } else {
                 u32::MAX << (32 - prefix)
@@ -371,13 +442,10 @@ fn cidr_matches(cidr_str: &str, target_ip: IpAddr) -> bool {
             (u32::from(net) & mask) == (u32::from(tgt) & mask)
         }
         (IpAddr::V6(net), IpAddr::V6(tgt)) => {
-            if prefix > 128 {
-                return false;
-            }
             if prefix == 0 {
                 return true;
             }
-            let mask = if prefix == 128 {
+            let mask = if prefix >= 128 {
                 u128::MAX
             } else {
                 u128::MAX << (128 - prefix)
@@ -412,6 +480,10 @@ ids = ["admin-laptop"]
 group = "admin"
 trusted = true
 
+[client_id_secrets]
+"Jane's Phone" = "jane-secret-a1"
+"Admin Laptop" = "admin-secret-b2"
+
 [groups.kids]
 lists = ["OISD"]
 safe_search = true
@@ -429,7 +501,7 @@ lists = ["GlobalList"]
     fn test_id_by_doh_path() {
         let reg = ClientRegistry::new(sample_config());
         let ip = IpAddr::from_str("172.16.0.5").unwrap();
-        let mut ctx = ClientContext::with_id(ip, "janes-phone");
+        let mut ctx = ClientContext::with_id(ip, "jane-secret-a1");
 
         let policy = reg.resolve(&mut ctx, Utc::now());
         assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
@@ -445,11 +517,47 @@ lists = ["GlobalList"]
     fn test_id_by_dot_sni() {
         let reg = ClientRegistry::new(sample_config());
         let ip = IpAddr::from_str("172.16.0.6").unwrap();
-        let mut ctx = ClientContext::with_sni(ip, "janes-phone.dns.home.arpa");
+        let mut ctx = ClientContext::with_sni(ip, "jane-secret-a1.dns.home.arpa");
 
         let policy = reg.resolve(&mut ctx, Utc::now());
         assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
         assert_eq!(policy.group_name, "kids");
+    }
+
+    #[test]
+    fn test_display_name_and_ids_do_not_grant_identity_by_path() {
+        let reg = ClientRegistry::new(sample_config());
+        let ip = IpAddr::from_str("8.8.8.8").unwrap();
+
+        // The entry's display name must never authenticate the client.
+        let mut ctx = ClientContext::with_id(ip, "Admin Laptop");
+        let policy = reg.resolve(&mut ctx, Utc::now());
+        assert_eq!(policy.group_name, "default");
+        assert!(!policy.trusted);
+
+        // Neither may a guessable value from `ids` (hostname, IP or MAC).
+        let mut ctx = ClientContext::with_id(ip, "admin-laptop");
+        let policy = reg.resolve(&mut ctx, Utc::now());
+        assert_eq!(policy.group_name, "default");
+        assert!(!policy.trusted);
+
+        // A configured shared secret does authenticate.
+        let mut ctx = ClientContext::with_id(ip, "admin-secret-b2");
+        let policy = reg.resolve(&mut ctx, Utc::now());
+        assert_eq!(policy.client_name.as_deref(), Some("Admin Laptop"));
+        assert_eq!(policy.group_name, "admin");
+        assert!(policy.trusted);
+    }
+
+    #[test]
+    fn test_guessable_sni_label_does_not_grant_identity() {
+        let reg = ClientRegistry::new(sample_config());
+        let ip = IpAddr::from_str("8.8.8.8").unwrap();
+        let mut ctx = ClientContext::with_sni(ip, "admin.dns.home.arpa");
+
+        let policy = reg.resolve(&mut ctx, Utc::now());
+        assert_eq!(policy.group_name, "default");
+        assert!(!policy.trusted);
     }
 
     #[test]
@@ -475,6 +583,39 @@ lists = ["GlobalList"]
     }
 
     #[test]
+    fn test_cidr_longest_prefix_wins() {
+        let toml_str = r#"
+[[entries]]
+name = "Wide"
+ids = ["10.0.0.0/8"]
+group = "wide"
+
+[[entries]]
+name = "Narrow"
+ids = ["10.1.2.0/24"]
+group = "narrow"
+
+[groups.wide]
+[groups.narrow]
+"#;
+        let cfg: ClientsConfig = toml::from_str(toml_str).unwrap();
+        let reg = ClientRegistry::new(cfg);
+
+        // Both subnets match; the /24 must win over the /8 regardless of
+        // configuration order.
+        let mut ctx = ClientContext::new(IpAddr::from_str("10.1.2.3").unwrap());
+        assert_eq!(reg.resolve(&mut ctx, Utc::now()).group_name, "narrow");
+
+        let mut ctx = ClientContext::new(IpAddr::from_str("10.9.9.9").unwrap());
+        assert_eq!(reg.resolve(&mut ctx, Utc::now()).group_name, "wide");
+
+        // An exact host address beats every CIDR block.
+        let mut ctx = ClientContext::new(IpAddr::from_str("10.1.2.3").unwrap());
+        let policy = reg.resolve(&mut ctx, Utc::now());
+        assert_eq!(policy.group_name, "narrow");
+    }
+
+    #[test]
     fn test_id_by_mac() {
         let reg = ClientRegistry::new(sample_config());
         let ip = IpAddr::from_str("192.168.1.99").unwrap();
@@ -490,8 +631,80 @@ lists = ["GlobalList"]
     }
 
     #[test]
-    fn test_id_by_routeros() {
+    fn test_bare_hex_id_is_not_treated_as_mac() {
+        let toml_str = r#"
+[[entries]]
+name = "Hex Named"
+ids = ["deadbeefcafe"]
+group = "hex"
+
+[groups.hex]
+"#;
+        let cfg: ClientsConfig = toml::from_str(toml_str).unwrap();
+        let reg = ClientRegistry::new(cfg);
+        let ip = IpAddr::from_str("192.168.1.77").unwrap();
+        let mut arp = HashMap::new();
+        arp.insert(ip, "de:ad:be:ef:ca:fe".to_string());
+        reg.mac_resolver().set_mock_arp(arp);
+
+        let mut ctx = ClientContext::new(ip);
+        let policy = reg.resolve(&mut ctx, Utc::now());
+        assert_eq!(
+            policy.group_name, "default",
+            "a 12-hex-char id is a name, not a MAC address"
+        );
+        assert_eq!(policy.client_name, None);
+
+        // The explicit form is still accepted.
+        let mut mac_cfg: ClientsConfig = toml::from_str(
+            r#"
+[[entries]]
+name = "Mac Named"
+ids = ["mac:deadbeefcafe"]
+group = "hex"
+[groups.hex]
+"#,
+        )
+        .unwrap();
+        mac_cfg.entries[0].ids = vec!["mac:deadbeefcafe".to_string()];
+        let reg = ClientRegistry::new(mac_cfg);
+        let ip = IpAddr::from_str("192.168.1.78").unwrap();
+        let mut arp = HashMap::new();
+        arp.insert(ip, "de:ad:be:ef:ca:fe".to_string());
+        reg.mac_resolver().set_mock_arp(arp);
+        let mut ctx = ClientContext::new(ip);
+        assert_eq!(reg.resolve(&mut ctx, Utc::now()).group_name, "hex");
+    }
+
+    #[test]
+    fn test_routeros_lease_name_not_trusted_by_default() {
         let reg = ClientRegistry::new(sample_config());
+        let ip = IpAddr::from_str("192.168.1.150").unwrap();
+
+        let lease = RouterOsLease {
+            mac: "11:22:33:44:55:66".to_string(),
+            ip: Some(ip),
+            hostname: Some("admin-laptop".to_string()),
+            comment: Some("Director laptop".to_string()),
+        };
+        reg.update_routeros_leases(vec![lease]);
+
+        // A client-controlled DHCP hostname must not grant the entry's
+        // group/trusted policy unless explicitly enabled.
+        let mut ctx = ClientContext::new(ip);
+        let policy = reg.resolve(&mut ctx, Utc::now());
+        assert_eq!(policy.group_name, "default");
+        assert!(!policy.trusted);
+        assert_eq!(policy.client_name, None);
+        // The MAC learned from the lease is still exposed.
+        assert_eq!(ctx.mac.as_deref(), Some("11:22:33:44:55:66"));
+    }
+
+    #[test]
+    fn test_routeros_lease_name_trusted_when_enabled() {
+        let mut cfg = sample_config();
+        cfg.trust_routeros_lease_names = true;
+        let reg = ClientRegistry::new(cfg);
         let ip = IpAddr::from_str("192.168.1.150").unwrap();
 
         let lease = RouterOsLease {
@@ -507,19 +720,57 @@ lists = ["GlobalList"]
         assert_eq!(policy.client_name.as_deref(), Some("Admin Laptop"));
         assert_eq!(policy.group_name, "admin");
         assert!(policy.trusted);
+        assert_eq!(ctx.client_name.as_deref(), Some("Admin Laptop"));
     }
 
     #[test]
-    fn test_client_id_beats_ip() {
+    fn test_routeros_mac_match_still_works_without_name_trust() {
+        let toml_str = r#"
+[[entries]]
+name = "Known Mac"
+ids = ["11:22:33:44:55:66"]
+group = "known"
+
+[groups.known]
+"#;
+        let cfg: ClientsConfig = toml::from_str(toml_str).unwrap();
+        let reg = ClientRegistry::new(cfg);
+        let ip = IpAddr::from_str("192.168.1.151").unwrap();
+        reg.update_routeros_leases(vec![RouterOsLease {
+            mac: "11:22:33:44:55:66".to_string(),
+            ip: Some(ip),
+            hostname: Some("attacker-chosen".to_string()),
+            comment: None,
+        }]);
+
+        let mut ctx = ClientContext::new(ip);
+        assert_eq!(reg.resolve(&mut ctx, Utc::now()).group_name, "known");
+    }
+
+    #[test]
+    fn test_client_id_secret_beats_ip() {
         let reg = ClientRegistry::new(sample_config());
-        // IP matches Jane's Phone, but ClientID matches Admin Laptop
+        // IP matches Jane's Phone, but the shared secret matches Admin Laptop.
         let ip = IpAddr::from_str("192.168.1.20").unwrap();
-        let mut ctx = ClientContext::with_id(ip, "admin-laptop");
+        let mut ctx = ClientContext::with_id(ip, "admin-secret-b2");
 
         let policy = reg.resolve(&mut ctx, Utc::now());
         assert_eq!(policy.client_name.as_deref(), Some("Admin Laptop"));
         assert_eq!(policy.group_name, "admin");
         assert!(policy.trusted);
+    }
+
+    #[test]
+    fn test_unknown_secret_references_are_ignored() {
+        let mut cfg = sample_config();
+        cfg.client_id_secrets
+            .insert("Nobody".to_string(), "orphan-secret".to_string());
+        let reg = ClientRegistry::new(cfg);
+        let ip = IpAddr::from_str("8.8.8.8").unwrap();
+        let mut ctx = ClientContext::with_id(ip, "orphan-secret");
+
+        // The orphan secret is not attached to any entry.
+        assert_eq!(reg.resolve(&mut ctx, Utc::now()).group_name, "default");
     }
 
     #[test]

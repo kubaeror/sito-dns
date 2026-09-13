@@ -41,20 +41,22 @@ impl Drop for InFlightGuard {
 struct QueryOutcome {
     response: Option<Message>,
     verdict: &'static str,
-    rule: Option<String>,
-    source: Option<String>,
+    /// Matched rule/list identifiers are static labels; the query-log entry
+    /// materializes them only when logging is enabled.
+    rule: Option<&'static str>,
+    source: Option<&'static str>,
     upstream: Option<String>,
     from_cache: bool,
     domain_str: String,
     qtype: RecordType,
-    dnssec: Option<String>,
+    dnssec: Option<&'static str>,
 }
 
 impl QueryOutcome {
     fn blocked(
         response: Message,
-        rule: Option<String>,
-        source: Option<String>,
+        rule: Option<&'static str>,
+        source: Option<&'static str>,
         domain_str: String,
         qtype: RecordType,
     ) -> Self {
@@ -202,6 +204,38 @@ fn answers_contain_bypass_ip(
     })
 }
 
+/// Candidate rule ids collected once per query and shared by the `$important`
+/// (stage 1) and standard (stage 3) filter passes.
+///
+/// ADR-0007 requires local rewrites between the two passes, so a single
+/// combined `evaluate` call cannot be used; collecting the candidates once
+/// keeps the compiled structures from being walked twice without changing
+/// precedence.
+#[derive(Default)]
+struct FilterCandidates {
+    allow: Vec<u32>,
+    block: Vec<u32>,
+}
+
+/// Normalizes a query name to its ASCII/punycode, lowercased form.
+///
+/// Mirrors `sito_filter`'s private `normalized_query_domain` exactly so the
+/// candidate lists collected here address the same compiled structures as the
+/// engine's own `evaluate*` methods, including the malformed-punycode fallback.
+fn normalized_query_domain(qname: &Name) -> String {
+    let ascii = qname.to_ascii();
+    sito_proto::normalize_domain(&ascii).unwrap_or_else(|_| {
+        let fallback = ascii.trim_end_matches('.').to_ascii_lowercase();
+        if fallback.is_empty() {
+            // Root: keep a non-empty placeholder so substring/regex rules
+            // cannot accidentally match the empty string.
+            ".".to_string()
+        } else {
+            fallback
+        }
+    })
+}
+
 /// The core DNS query resolution pipeline.
 pub struct DnsPipeline {
     runtime: Arc<RuntimeState>,
@@ -209,14 +243,16 @@ pub struct DnsPipeline {
     anti_bypass: Arc<AntiBypassRegistry>,
     cache: Arc<DnsCache>,
     upstream: Arc<UpstreamManager>,
-    dnssec: Arc<DnssecValidator>,
+    /// Swappable so DNSSEC settings (mode, anchors, NTAs) hot-reload.
+    dnssec: Arc<ArcSwap<DnssecValidator>>,
     lists: Arc<RuntimeLists>,
     in_flight: Arc<AtomicUsize>,
     prefetch_semaphore: Arc<tokio::sync::Semaphore>,
     querylog: Option<sito_stats::QueryLogSender>,
     metrics: Option<sito_stats::MetricsRegistry>,
-    /// Per-client upstream managers keyed by `servers.join(",")`.
-    scoped_upstreams: Arc<HashMap<String, Arc<UpstreamManager>>>,
+    /// Per-client upstream managers keyed by `servers.join(",")`; swappable so
+    /// client upstream changes hot-reload.
+    scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>>,
 }
 
 impl DnsPipeline {
@@ -241,13 +277,13 @@ impl DnsPipeline {
             anti_bypass: Arc::new(AntiBypassRegistry::bundled()),
             cache,
             upstream,
-            dnssec,
+            dnssec: Arc::new(ArcSwap::from(dnssec)),
             lists,
             in_flight,
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             querylog: None,
             metrics: None,
-            scoped_upstreams: Arc::new(HashMap::new()),
+            scoped_upstreams: Arc::new(ArcSwap::from(Arc::new(HashMap::new()))),
         }
     }
 
@@ -279,6 +315,24 @@ impl DnsPipeline {
         mut self,
         scoped: Arc<HashMap<String, Arc<UpstreamManager>>>,
     ) -> Self {
+        self.scoped_upstreams = Arc::new(ArcSwap::from(scoped));
+        self
+    }
+
+    /// Shares the swappable DNSSEC validator handle with the server so config
+    /// changes can replace it without a restart.
+    #[must_use]
+    pub fn with_shared_dnssec(mut self, dnssec: Arc<ArcSwap<DnssecValidator>>) -> Self {
+        self.dnssec = dnssec;
+        self
+    }
+
+    /// Shares the swappable per-client upstream map with the server.
+    #[must_use]
+    pub fn with_shared_scoped_upstreams(
+        mut self,
+        scoped: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>>,
+    ) -> Self {
         self.scoped_upstreams = scoped;
         self
     }
@@ -309,8 +363,8 @@ impl DnsPipeline {
         query_id: u16,
         domain_str: &str,
         qtype: RecordType,
-        rule: Option<&str>,
-        source: Option<&str>,
+        rule: Option<&'static str>,
+        source: Option<&'static str>,
     ) -> QueryOutcome {
         let resp = make_blocked_response(
             query,
@@ -318,13 +372,7 @@ impl DnsPipeline {
             config.filtering.blocking_ttl,
             query_id,
         );
-        QueryOutcome::blocked(
-            resp,
-            rule.map(str::to_string),
-            source.map(str::to_string),
-            domain_str.to_string(),
-            qtype,
-        )
+        QueryOutcome::blocked(resp, rule, source, domain_str.to_string(), qtype)
     }
 
     /// Anti-DoH bypass check by requested domain name.
@@ -392,6 +440,11 @@ impl DnsPipeline {
     }
 
     /// Parental, service and standard filter stages (ADR-0007 stage 3).
+    ///
+    /// `snapshot` and `candidates` are collected once per query by the caller
+    /// so the standard pass reuses the candidate walk already performed for the
+    /// `$important` pass; the local `qname` is also no longer re-parsed from
+    /// the human-readable domain string.
     #[allow(clippy::too_many_arguments)]
     fn evaluate_filter_stages(
         &self,
@@ -400,6 +453,9 @@ impl DnsPipeline {
         client: &ClientContext,
         policy: &EffectivePolicy,
         domain_str: &str,
+        normalized_domain: &str,
+        snapshot: &sito_filter::FilterSnapshot,
+        candidates: &FilterCandidates,
         qtype: RecordType,
         query_id: u16,
     ) -> Option<QueryOutcome> {
@@ -451,8 +507,13 @@ impl DnsPipeline {
             ));
         }
 
-        let qname = Name::from_str(domain_str).ok()?;
-        match self.filter.evaluate_standard(&qname, qtype, client) {
+        match snapshot.evaluate_standard_candidates(
+            normalized_domain,
+            qtype,
+            client,
+            &candidates.allow,
+            &candidates.block,
+        ) {
             Verdict::Block(verdict) => {
                 info!(
                     qname = %domain_str,
@@ -470,6 +531,103 @@ impl DnsPipeline {
                 Some(QueryOutcome::rewritten(resp, domain_str.to_string(), qtype))
             }
             Verdict::Allow(_) => None,
+        }
+    }
+
+    /// Cache lookup honouring the DNSSEC-aware client guard.
+    ///
+    /// A DNSSEC-aware client must never be served an unvalidated entry while
+    /// validation is enabled: such a lookup is treated as a miss so the query
+    /// is re-resolved upstream.
+    async fn cached_response(&self, query: &Message, client_wants_dnssec: bool) -> Option<Message> {
+        let response = self.cache.get_for_query(query).await?;
+        if client_wants_dnssec
+            && self.dnssec.load().mode != sito_dnssec::DnssecMode::Disabled
+            && !response.metadata.authentic_data
+        {
+            debug!("Ignoring non-validated cache entry for DNSSEC-aware client");
+            return None;
+        }
+        Some(response)
+    }
+
+    /// Builds the query outcome for a cache hit, including anti-bypass answer
+    /// checks and the background prefetch refresh.
+    #[allow(clippy::too_many_arguments)]
+    async fn cache_hit_outcome(
+        &self,
+        query: &Message,
+        mut cached_resp: Message,
+        qname: &Name,
+        qtype: RecordType,
+        query_id: u16,
+        domain_str: String,
+        bypass_check_needed: bool,
+        config: &Config,
+        effective_upstream: &Arc<UpstreamManager>,
+    ) -> QueryOutcome {
+        if bypass_check_needed
+            && let Some(outcome) = self.anti_doh_blocked_by_answers(
+                query,
+                config,
+                &cached_resp.answers,
+                query_id,
+                &domain_str,
+                qtype,
+                "cache",
+            )
+        {
+            return outcome;
+        }
+
+        debug!(qname = %qname, qtype = ?qtype, "Cache hit");
+        if self.cache.should_prefetch_for_query(query).await
+            && let Ok(permit) = Arc::clone(&self.prefetch_semaphore).try_acquire_owned()
+        {
+            let bg_upstream = Arc::clone(effective_upstream);
+            let bg_cache = Arc::clone(&self.cache);
+            let bg_query = query.clone();
+            // Refresh with the same DNSSEC shape as the primary resolution:
+            // when validation is enabled force DO so the refreshed entry
+            // carries RRSIGs even for DO=0 clients.
+            let bg_resolve_query = if self.dnssec.load().mode == sito_dnssec::DnssecMode::Disabled {
+                bg_query.clone()
+            } else {
+                let mut q = bg_query.clone();
+                let mut edns = q.edns.clone().unwrap_or_default();
+                edns.set_dnssec_ok(true);
+                edns.set_max_payload(config.dns.edns_udp_size.max(1232));
+                q.set_edns(edns);
+                q
+            };
+            tokio::spawn(async move {
+                let _permit = permit;
+                if let Ok(resp) = bg_upstream.resolve(&bg_resolve_query).await
+                    && (resp.metadata.response_code == ResponseCode::NoError
+                        || resp.metadata.response_code == ResponseCode::NXDomain)
+                {
+                    bg_cache.insert(&bg_query, &resp).await;
+                }
+            });
+        }
+        cached_resp.metadata.id = query_id;
+        let cached_dnssec = if self.dnssec.load().mode == sito_dnssec::DnssecMode::Disabled
+            || !cached_resp.metadata.authentic_data
+        {
+            None
+        } else {
+            Some("secure")
+        };
+        QueryOutcome {
+            response: Some(cached_resp),
+            verdict: "allowed",
+            rule: Some("cache"),
+            source: None,
+            upstream: None,
+            from_cache: true,
+            domain_str,
+            qtype,
+            dnssec: cached_dnssec,
         }
     }
 }
@@ -494,10 +652,12 @@ impl QueryHandler for DnsPipeline {
         let scoped_upstream = if policy.use_global_upstreams {
             None
         } else {
-            policy
-                .upstreams
-                .as_ref()
-                .and_then(|servers| self.scoped_upstreams.get(&servers.join(",")).cloned())
+            policy.upstreams.as_ref().and_then(|servers| {
+                self.scoped_upstreams
+                    .load()
+                    .get(&servers.join(","))
+                    .cloned()
+            })
         };
         let effective_upstream = scoped_upstream
             .clone()
@@ -527,6 +687,14 @@ impl QueryHandler for DnsPipeline {
 
         let start = std::time::Instant::now();
 
+        // The client must signal DNSSEC awareness (DO bit or AD bit) before we
+        // may assert AD on the response (RFC 6840 section 5.7).
+        let client_wants_dnssec = query
+            .edns
+            .as_ref()
+            .is_some_and(|edns| edns.flags().dnssec_ok);
+        let client_accepts_ad = client_wants_dnssec || query.metadata.authentic_data;
+
         let outcome = async {
             let Some(first_query) = query.queries.first() else {
                 return QueryOutcome::formerr(query_id);
@@ -534,12 +702,32 @@ impl QueryHandler for DnsPipeline {
 
             let qname = first_query.name();
             let qtype = first_query.query_type();
-            let qclass = first_query.query_class();
             let domain_str = qname.to_utf8();
-            let client_wants_dnssec = query
-                .edns
-                .as_ref()
-                .is_some_and(|edns| edns.flags().dnssec_ok);
+
+            // Collect filter candidates once for both the `$important`
+            // (stage 1) and standard (stage 3) passes. The snapshot is loaded
+            // once so both passes see the same compiled rule set, and the
+            // candidate walk is not repeated. Clients with filtering disabled
+            // skip the work entirely.
+            let (normalized_domain, filter_snapshot, filter_candidates) =
+                if policy.is_filtering_enabled {
+                    let normalized = normalized_query_domain(qname);
+                    let snapshot = self.filter.snapshot();
+                    let mut candidates = FilterCandidates::default();
+                    snapshot.allowlist.collect_candidates(
+                        &normalized,
+                        &snapshot.interner,
+                        &mut candidates.allow,
+                    );
+                    snapshot.blocklist.collect_candidates(
+                        &normalized,
+                        &snapshot.interner,
+                        &mut candidates.block,
+                    );
+                    (normalized, Some(snapshot), candidates)
+                } else {
+                    (String::new(), None, FilterCandidates::default())
+                };
 
             trace!(qname = %qname, qtype = ?qtype, "Processing DNS query");
 
@@ -559,8 +747,14 @@ impl QueryHandler for DnsPipeline {
 
             // ADR-0007 Stage 1: $important filter rules (takes precedence over local rewrites)
             let mut important_allowed = false;
-            if policy.is_filtering_enabled
-                && let Some(verdict) = self.filter.evaluate_important(qname, qtype, &client)
+            if let Some(filter_snapshot) = filter_snapshot.as_ref()
+                && let Some(verdict) = filter_snapshot.evaluate_important_candidates(
+                    &normalized_domain,
+                    qtype,
+                    &client,
+                    &filter_candidates.allow,
+                    &filter_candidates.block,
+                )
             {
                 match verdict {
                     Verdict::Block(_) => {
@@ -606,14 +800,17 @@ impl QueryHandler for DnsPipeline {
             }
 
             // ADR-0007 Stage 3: Standard filtering, Parental Control, and Service Blocking
-            if policy.is_filtering_enabled
-                && !important_allowed
+            if !important_allowed
+                && let Some(filter_snapshot) = filter_snapshot.as_ref()
                 && let Some(outcome) = self.evaluate_filter_stages(
                     &query,
                     config,
                     &client,
                     &policy,
                     &domain_str,
+                    &normalized_domain,
+                    filter_snapshot,
+                    &filter_candidates,
                     qtype,
                     query_id,
                 )
@@ -639,85 +836,58 @@ impl QueryHandler for DnsPipeline {
             }
 
             // 5. Cache lookup
-            if cache_enabled {
-                // Never serve an unvalidated cached answer to a DNSSEC-aware
-                // client while validation is enabled: force an upstream lookup.
-                let cached = match self.cache.get(qname, qtype, qclass).await {
-                    Some(resp)
-                        if client_wants_dnssec
-                            && self.dnssec.mode != sito_dnssec::DnssecMode::Disabled
-                            && !resp.metadata.authentic_data =>
-                    {
-                        debug!(
-                            qname = %qname,
-                            "Ignoring non-validated cache entry for DNSSEC-aware client"
-                        );
-                        None
-                    }
-                    other => other,
-                };
-                if let Some(mut cached_resp) = cached {
-                    if bypass_check_needed
-                        && let Some(outcome) = self.anti_doh_blocked_by_answers(
+            // The single-flight guard (when acquired) is held until this async
+            // block finishes, i.e. across the upstream resolution and the
+            // cache insert below.
+            let _cache_single_flight: Option<sito_cache::SingleFlightGuard> = if cache_enabled {
+                if let Some(cached_resp) = self.cached_response(&query, client_wants_dnssec).await {
+                    return self
+                        .cache_hit_outcome(
                             &query,
-                            config,
-                            &cached_resp.answers,
-                            query_id,
-                            &domain_str,
+                            cached_resp,
+                            qname,
                             qtype,
-                            "cache",
+                            query_id,
+                            domain_str,
+                            bypass_check_needed,
+                            config,
+                            &effective_upstream,
                         )
-                    {
-                        return outcome;
-                    }
-
-                    debug!(qname = %qname, qtype = ?qtype, "Cache hit");
-                    if self.cache.should_prefetch(qname, qtype, qclass).await
-                        && let Ok(permit) = Arc::clone(&self.prefetch_semaphore).try_acquire_owned()
-                    {
-                        let bg_upstream = Arc::clone(&effective_upstream);
-                        let bg_cache = Arc::clone(&self.cache);
-                        let bg_query = query.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            if let Ok(resp) = bg_upstream.resolve(&bg_query).await
-                                && (resp.metadata.response_code == ResponseCode::NoError
-                                    || resp.metadata.response_code == ResponseCode::NXDomain)
-                            {
-                                bg_cache.insert(&bg_query, &resp).await;
-                            }
-                        });
-                    }
-                    cached_resp.metadata.id = query_id;
-                    let cached_dnssec = if self.dnssec.mode == sito_dnssec::DnssecMode::Disabled
-                        || !cached_resp.metadata.authentic_data
-                    {
-                        None
-                    } else {
-                        Some("secure".to_string())
-                    };
-                    return QueryOutcome {
-                        response: Some(cached_resp),
-                        verdict: "allowed",
-                        rule: Some("cache".to_string()),
-                        source: None,
-                        upstream: None,
-                        from_cache: true,
-                        domain_str,
-                        qtype,
-                        dnssec: cached_dnssec,
-                    };
+                        .await;
                 }
                 debug!(qname = %qname, qtype = ?qtype, "Cache miss");
                 if let Some(ref m) = self.metrics {
                     m.inc_cache_misses();
                 }
-            }
+
+                // Single-flight: serialize concurrent misses for the same key
+                // so only one query goes upstream (anti-stampede).
+                let flight = self.cache.single_flight_for_query(&query).await;
+                if let Some(cached_resp) = self.cached_response(&query, client_wants_dnssec).await {
+                    // A concurrent query populated the entry while we waited.
+                    return self
+                        .cache_hit_outcome(
+                            &query,
+                            cached_resp,
+                            qname,
+                            qtype,
+                            query_id,
+                            domain_str,
+                            bypass_check_needed,
+                            config,
+                            &effective_upstream,
+                        )
+                        .await;
+                }
+                flight
+            } else {
+                None
+            };
 
             // 6. Upstream resolution
             // Force the DNSSEC OK bit when validation is enabled so upstreams
             // return RRSIGs even for non-DO clients.
-            let upstream_query = if self.dnssec.mode == sito_dnssec::DnssecMode::Disabled {
+            let upstream_query = if self.dnssec.load().mode == sito_dnssec::DnssecMode::Disabled {
                 query.clone()
             } else {
                 let mut q = query.clone();
@@ -789,35 +959,46 @@ impl QueryHandler for DnsPipeline {
                     }
 
                     // 8. DNSSEC validation
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as u32;
-                    let key_fetcher =
-                        sito_upstream::UpstreamKeyFetcher::new(Arc::clone(&effective_upstream));
-                    let dnssec_outcome = self
-                        .dnssec
-                        .validate_with_key_fetcher(
-                            &mut upstream_resp,
-                            Some(upstream_name.as_str()),
-                            now,
-                            &key_fetcher,
-                        )
-                        .await;
-                    if let Some(ref m) = self.metrics {
-                        if matches!(dnssec_outcome, sito_dnssec::ValidationOutcome::Bogus { .. }) {
-                            m.inc_dnssec_bogus(&upstream_name);
-                        }
-                        m.set_dnssec_key_cache(
-                            self.dnssec.metrics.key_cache_hits(),
-                            self.dnssec.metrics.key_cache_misses(),
-                        );
-                    }
-                    let dnssec_str = if self.dnssec.mode == sito_dnssec::DnssecMode::Disabled {
+                    // CD=1 means the client takes responsibility for
+                    // validation: never SERVFAIL on DNSSEC grounds and never
+                    // assert AD. The same applies when validation is disabled.
+                    let dnssec_outcome = if query.metadata.checking_disabled
+                        || self.dnssec.load().mode == sito_dnssec::DnssecMode::Disabled
+                    {
+                        upstream_resp.metadata.authentic_data = false;
                         None
                     } else {
-                        Some(dnssec_outcome.as_str().to_string())
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as u32;
+                        let key_fetcher =
+                            sito_upstream::UpstreamKeyFetcher::new(Arc::clone(&effective_upstream));
+                        // Clone the validator for the awaited call so no ArcSwap
+                        // guard is held across the await.
+                        let validator = self.dnssec.load_full();
+                        let outcome = validator
+                            .validate_with_key_fetcher(
+                                &mut upstream_resp,
+                                Some(upstream_name.as_str()),
+                                now,
+                                &key_fetcher,
+                            )
+                            .await;
+                        if let Some(ref m) = self.metrics {
+                            if matches!(outcome, sito_dnssec::ValidationOutcome::Bogus { .. }) {
+                                m.inc_dnssec_bogus(&upstream_name);
+                            }
+                            m.set_dnssec_key_cache(
+                                validator.metrics.key_cache_hits(),
+                                validator.metrics.key_cache_misses(),
+                            );
+                        }
+                        Some(outcome)
                     };
+                    let dnssec_str = dnssec_outcome
+                        .as_ref()
+                        .map(sito_dnssec::ValidationOutcome::as_str);
 
                     if cache_enabled
                         && (upstream_resp.metadata.response_code == ResponseCode::NoError
@@ -855,8 +1036,7 @@ impl QueryHandler for DnsPipeline {
 
                     if cache_enabled
                         && config.dns.cache.serve_stale_hours > 0
-                        && let Some(mut stale_resp) =
-                            self.cache.get_stale(qname, qtype, qclass).await
+                        && let Some(mut stale_resp) = self.cache.get_stale_for_query(&query).await
                     {
                         debug!(
                             qname = %qname,
@@ -869,7 +1049,7 @@ impl QueryHandler for DnsPipeline {
                         return QueryOutcome {
                             response: Some(stale_resp),
                             verdict: "allowed",
-                            rule: Some("stale_cache".to_string()),
+                            rule: Some("stale_cache"),
                             source: None,
                             upstream: None,
                             from_cache: true,
@@ -909,25 +1089,188 @@ impl QueryHandler for DnsPipeline {
                 .response
                 .as_ref()
                 .map(|r| u16::from(r.metadata.response_code) as u8);
+            // Reuse the owned domain string rather than cloning it; the stored
+            // query-log qname has no trailing root dot.
+            let mut qname = outcome.domain_str;
+            if qname.ends_with('.') {
+                qname.pop();
+            }
             let entry = sito_stats::QueryLogEntry {
                 id: None,
                 ts: chrono::Utc::now().timestamp_millis(),
                 client_ip: client.ip.to_string(),
                 client_name: client.client_name.clone(),
-                qname: outcome.domain_str.trim_end_matches('.').to_string(),
+                qname,
                 qtype: qtype_num,
                 rcode,
                 verdict: outcome.verdict.to_string(),
-                rule: outcome.rule,
-                list_source: outcome.source,
+                rule: outcome.rule.map(str::to_string),
+                list_source: outcome.source.map(str::to_string),
                 upstream: outcome.upstream,
                 elapsed_us: Some(elapsed_us),
-                dnssec: outcome.dnssec,
+                dnssec: outcome.dnssec.map(str::to_string),
                 proto: client.proto.clone(),
             };
             let _ = ql.try_send(entry);
         }
 
-        outcome.response
+        // Never assert AD for a client that did not signal DNSSEC awareness.
+        let mut response = outcome.response;
+        if !client_accepts_ad && let Some(resp) = response.as_mut() {
+            resp.metadata.authentic_data = false;
+        }
+        response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sito_core::client::ClientContext;
+    use sito_core::config::FilteringConfig;
+
+    /// Collects candidates exactly like [`DnsPipeline::handle`] does and
+    /// compares the resulting verdicts with the engine's own `evaluate*`
+    /// wrappers. This guards the WP-18 single-collection refactor against
+    /// normalization drift and ADR-0007 precedence changes.
+    #[tokio::test]
+    async fn test_candidate_path_matches_engine_and_preserves_precedence() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-pipeline-filter-test-{}", std::process::id()));
+        let config = FilteringConfig {
+            custom_rules: vec![
+                "||blocked.example^".to_string(),
+                "@@||sub.blocked.example^".to_string(),
+                "||important.sub.blocked.example^$important".to_string(),
+                "@@||special.important.sub.blocked.example^$important".to_string(),
+                "||xn--mnchen-3ya.de^".to_string(),
+            ],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+        for domain in [
+            "blocked.example.",
+            "sub.blocked.example.",
+            "important.sub.blocked.example.",
+            "special.important.sub.blocked.example.",
+            "allowed.example.",
+        ] {
+            let qname = Name::from_str(domain).unwrap();
+            let snapshot = engine.snapshot();
+            let normalized = normalized_query_domain(&qname);
+            let mut candidates = FilterCandidates::default();
+            snapshot.allowlist.collect_candidates(
+                &normalized,
+                &snapshot.interner,
+                &mut candidates.allow,
+            );
+            snapshot.blocklist.collect_candidates(
+                &normalized,
+                &snapshot.interner,
+                &mut candidates.block,
+            );
+
+            let expected_important = engine.evaluate_important(&qname, RecordType::A, &client);
+            let actual_important = snapshot.evaluate_important_candidates(
+                &normalized,
+                RecordType::A,
+                &client,
+                &candidates.allow,
+                &candidates.block,
+            );
+            assert_eq!(
+                expected_important.is_some(),
+                actual_important.is_some(),
+                "{domain}: important outcome presence"
+            );
+            if let (Some(expected), Some(actual)) = (&expected_important, &actual_important) {
+                assert_eq!(expected.is_blocked(), actual.is_blocked(), "{domain}");
+                assert_eq!(expected.is_allowed(), actual.is_allowed(), "{domain}");
+            }
+
+            let expected_standard = engine.evaluate_standard(&qname, RecordType::A, &client);
+            let actual_standard = snapshot.evaluate_standard_candidates(
+                &normalized,
+                RecordType::A,
+                &client,
+                &candidates.allow,
+                &candidates.block,
+            );
+            assert_eq!(
+                expected_standard.is_blocked(),
+                actual_standard.is_blocked(),
+                "{domain}"
+            );
+            assert_eq!(
+                expected_standard.is_allowed(),
+                actual_standard.is_allowed(),
+                "{domain}"
+            );
+        }
+
+        // ADR-0007 precedence spot checks.
+        let standard_block = Name::from_str("blocked.example.").unwrap();
+        assert!(
+            engine
+                .evaluate_standard(&standard_block, RecordType::A, &client)
+                .is_blocked()
+        );
+        let important_allow = Name::from_str("special.important.sub.blocked.example.").unwrap();
+        let snapshot = engine.snapshot();
+        let normalized = normalized_query_domain(&important_allow);
+        let mut candidates = FilterCandidates::default();
+        snapshot.allowlist.collect_candidates(
+            &normalized,
+            &snapshot.interner,
+            &mut candidates.allow,
+        );
+        snapshot.blocklist.collect_candidates(
+            &normalized,
+            &snapshot.interner,
+            &mut candidates.block,
+        );
+        let important = snapshot
+            .evaluate_important_candidates(
+                &normalized,
+                RecordType::A,
+                &client,
+                &candidates.allow,
+                &candidates.block,
+            )
+            .expect("important allow must match");
+        assert!(important.is_allowed());
+
+        // IDNA/punycode names must normalize exactly like the engine does.
+        let idn = Name::from_utf8("münchen.de").unwrap();
+        assert_eq!(normalized_query_domain(&idn), "xn--mnchen-3ya.de");
+        let snapshot = engine.snapshot();
+        let normalized = normalized_query_domain(&idn);
+        let mut candidates = FilterCandidates::default();
+        snapshot.allowlist.collect_candidates(
+            &normalized,
+            &snapshot.interner,
+            &mut candidates.allow,
+        );
+        snapshot.blocklist.collect_candidates(
+            &normalized,
+            &snapshot.interner,
+            &mut candidates.block,
+        );
+        assert!(
+            snapshot
+                .evaluate_standard_candidates(
+                    &normalized,
+                    RecordType::A,
+                    &client,
+                    &candidates.allow,
+                    &candidates.block,
+                )
+                .is_blocked(),
+            "IDN query must match the punycode rule"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

@@ -6,7 +6,7 @@ use sito_proto::normalize_domain;
 use std::collections::HashSet;
 use std::fmt;
 use std::hash::BuildHasher;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use tracing::warn;
 
@@ -343,10 +343,14 @@ pub fn compute_canonical(kind: RuleKind, pattern: &Pattern, modifiers: &RuleModi
     s
 }
 
-/// Parses a `$client` modifier string (e.g. `192.168.1.1|~laptop|10.0.0.0/8`).
+/// Parses a `$client` modifier value (e.g. `192.168.1.1|~laptop|10.0.0.0/8`).
+///
+/// Values are separated with `|`; the enclosing modifier list uses commas.
+/// Returns `None` when any token cannot be parsed so the caller can skip the
+/// whole rule instead of silently dropping the client restriction.
 fn parse_client_filter(value: &str) -> Option<ClientFilter> {
     let mut filter = ClientFilter::default();
-    for token in value.split(['|', ',']) {
+    for token in value.split('|') {
         let token = token.trim();
         if token.is_empty() {
             continue;
@@ -362,8 +366,18 @@ fn parse_client_filter(value: &str) -> Option<ClientFilter> {
             let mut parts = item.split('/');
             let ip_str = parts.next()?;
             let prefix_str = parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
             let ip = ip_str.parse::<IpAddr>().ok()?;
             let prefix = prefix_str.parse::<u8>().ok()?;
+            let max_prefix = match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            if prefix > max_prefix {
+                return None;
+            }
             ClientMatcher::Cidr { ip, prefix }
         } else if let Ok(ip) = item.parse::<IpAddr>() {
             ClientMatcher::Ip(ip)
@@ -385,10 +399,12 @@ fn parse_client_filter(value: &str) -> Option<ClientFilter> {
     }
 }
 
-/// Parses a `$dnstype` modifier string (e.g. `A|AAAA` or `~HTTPS,65`).
+/// Parses a `$dnstype` modifier value (e.g. `A|AAAA` or `~HTTPS|65`).
+///
+/// Values are separated with `|`; the enclosing modifier list uses commas.
 fn parse_dnstype_filter(value: &str) -> Option<DnstypeFilter> {
     let mut filter = DnstypeFilter::default();
-    for token in value.split(['|', ',']) {
+    for token in value.split('|') {
         let token = token.trim();
         if token.is_empty() {
             continue;
@@ -424,10 +440,12 @@ fn parse_dnstype_filter(value: &str) -> Option<DnstypeFilter> {
     }
 }
 
-/// Parses a `$denyallow` modifier string (e.g. `sub.example.com|other.com`).
+/// Parses a `$denyallow` modifier value (e.g. `sub.example.com|other.com`).
+///
+/// Values are separated with `|`; the enclosing modifier list uses commas.
 fn parse_denyallow(value: &str) -> Option<Vec<String>> {
     let mut domains = Vec::new();
-    for item in value.split(['|', ',']) {
+    for item in value.split('|') {
         let item = item.trim();
         if item.is_empty() {
             continue;
@@ -443,7 +461,89 @@ fn parse_denyallow(value: &str) -> Option<Vec<String>> {
     }
 }
 
+/// Response codes accepted in `$dnsrewrite` rules (AdGuard-compatible).
+const VALID_DNSREWRITE_RCODES: &[&str] = &[
+    "NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED",
+];
+
+fn is_valid_rcode(rcode: &str) -> bool {
+    VALID_DNSREWRITE_RCODES.contains(&rcode.to_ascii_uppercase().as_str())
+}
+
+/// Infers `(rtype, value)` from a shorthand `$dnsrewrite` value.
+///
+/// IP literals become `A`/`AAAA`; anything else must be a valid domain to be
+/// accepted as a `CNAME` target.
+fn infer_rewrite_type(value: &str) -> Option<(String, String)> {
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        let rtype = match ip {
+            IpAddr::V4(_) => "A",
+            IpAddr::V6(_) => "AAAA",
+        };
+        return Some((rtype.to_string(), value.to_string()));
+    }
+    // A CNAME target must be a syntactically valid domain; never emit a
+    // bogus CNAME for arbitrary junk.
+    normalize_domain(value).ok()?;
+    Some(("CNAME".to_string(), value.to_string()))
+}
+
+/// Validates an explicit `rcode;rtype;value` combination.
+fn validate_rewrite(
+    rcode: String,
+    rtype: Option<String>,
+    value: Option<String>,
+) -> Option<DnsRewriteRule> {
+    match (rtype, value) {
+        (None, None) => Some(DnsRewriteRule {
+            rcode,
+            rtype: None,
+            value: None,
+        }),
+        (None, Some(v)) => {
+            let (rtype, value) = infer_rewrite_type(&v)?;
+            Some(DnsRewriteRule {
+                rcode,
+                rtype: Some(rtype),
+                value: Some(value),
+            })
+        }
+        (Some(_), None) => None,
+        (Some(rtype), Some(value)) => {
+            if RecordType::from_str(rtype.as_str()).is_err() {
+                return None;
+            }
+            match rtype.as_str() {
+                "A" => {
+                    value.parse::<Ipv4Addr>().ok()?;
+                }
+                "AAAA" => {
+                    value.parse::<Ipv6Addr>().ok()?;
+                }
+                "CNAME" | "PTR" | "NS" => {
+                    normalize_domain(&value).ok()?;
+                }
+                _ => {
+                    if value.trim().is_empty() {
+                        return None;
+                    }
+                }
+            }
+            Some(DnsRewriteRule {
+                rcode,
+                rtype: Some(rtype),
+                value: Some(value),
+            })
+        }
+    }
+}
+
 /// Parses a `$dnsrewrite` modifier value.
+///
+/// Supports the standard `rcode;rtype;value` form and the shorthand forms
+/// (`NXDOMAIN`, an IP literal, or a CNAME target). Invalid rcodes, record
+/// types and values are rejected with `None` so the caller skips the rule
+/// instead of synthesizing a bogus CNAME.
 fn parse_dnsrewrite(value: &str) -> Option<DnsRewriteRule> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -453,47 +553,38 @@ fn parse_dnsrewrite(value: &str) -> Option<DnsRewriteRule> {
     if trimmed.contains(';') {
         // Standard syntax: rcode;rtype;value
         let parts: Vec<&str> = trimmed.split(';').map(str::trim).collect();
-        let rcode = parts[0].to_ascii_uppercase();
-        let rtype = if parts.len() > 1 && !parts[1].is_empty() {
-            Some(parts[1].to_ascii_uppercase())
-        } else {
+        let rcode = parts.first()?.to_ascii_uppercase();
+        if !is_valid_rcode(&rcode) {
+            return None;
+        }
+        let rtype_raw = parts.get(1).copied().unwrap_or("");
+        let value_raw = parts.get(2).copied().unwrap_or("");
+        let rtype = if rtype_raw.is_empty() {
             None
-        };
-        let val = if parts.len() > 2 && !parts[2].is_empty() {
-            Some(parts[2].to_string())
         } else {
-            None
+            Some(rtype_raw.to_ascii_uppercase())
         };
-        Some(DnsRewriteRule {
-            rcode,
-            rtype,
-            value: val,
-        })
+        let val = if value_raw.is_empty() {
+            None
+        } else {
+            Some(value_raw.to_string())
+        };
+        validate_rewrite(rcode, rtype, val)
     } else {
         // Shorthand syntax
         let upper = trimmed.to_ascii_uppercase();
-        if upper == "NXDOMAIN" || upper == "REFUSED" || upper == "SERVFAIL" {
+        if is_valid_rcode(&upper) {
             Some(DnsRewriteRule {
                 rcode: upper,
                 rtype: None,
                 value: None,
             })
-        } else if let Ok(ip) = trimmed.parse::<IpAddr>() {
-            let rtype = match ip {
-                IpAddr::V4(_) => "A".to_string(),
-                IpAddr::V6(_) => "AAAA".to_string(),
-            };
+        } else {
+            let (rtype, value) = infer_rewrite_type(trimmed)?;
             Some(DnsRewriteRule {
                 rcode: "NOERROR".to_string(),
                 rtype: Some(rtype),
-                value: Some(trimmed.to_string()),
-            })
-        } else {
-            // CNAME shorthand
-            Some(DnsRewriteRule {
-                rcode: "NOERROR".to_string(),
-                rtype: Some("CNAME".to_string()),
-                value: Some(trimmed.to_string()),
+                value: Some(value),
             })
         }
     }
@@ -501,9 +592,11 @@ fn parse_dnsrewrite(value: &str) -> Option<DnsRewriteRule> {
 
 /// Parses options following `$` in an adblock rule.
 ///
-/// If any option is an unknown/unsupported modifier (e.g. browser cosmetics like `$image`),
-/// logs a warning and returns `None`, skipping the rule.
-fn parse_modifiers(options_str: &str) -> Option<RuleModifiers> {
+/// Modifiers are comma-separated. Unknown/unsupported modifiers (e.g. browser
+/// cosmetics like `$image`) or unparsable modifier values produce an error so
+/// the caller skips the whole rule: a rule must never be widened (for example
+/// a client-scoped block becoming global) because one modifier failed.
+fn parse_modifiers(options_str: &str) -> Result<RuleModifiers, String> {
     let mut modifiers = RuleModifiers::default();
 
     for opt in options_str.split(',') {
@@ -512,26 +605,72 @@ fn parse_modifiers(options_str: &str) -> Option<RuleModifiers> {
             continue;
         }
 
-        if opt.eq_ignore_ascii_case("important") {
+        let (key, value) = match opt.split_once('=') {
+            Some((key, value)) => (key.trim(), Some(value.trim())),
+            None => (opt, None),
+        };
+        let require_value = |value: Option<&str>| {
+            value
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| format!("modifier '{key}' requires a value"))
+        };
+
+        if key.eq_ignore_ascii_case("important") {
             modifiers.important = true;
-        } else if opt.eq_ignore_ascii_case("badfilter") {
+        } else if key.eq_ignore_ascii_case("badfilter") {
             modifiers.badfilter = true;
-        } else if let Some(val) = opt.strip_prefix("client=") {
-            modifiers.client = parse_client_filter(val);
-        } else if let Some(val) = opt.strip_prefix("dnstype=") {
-            modifiers.dnstype = parse_dnstype_filter(val);
-        } else if let Some(val) = opt.strip_prefix("denyallow=") {
-            modifiers.denyallow = parse_denyallow(val);
-        } else if let Some(val) = opt.strip_prefix("dnsrewrite=") {
-            modifiers.dnsrewrite = parse_dnsrewrite(val);
+        } else if key.eq_ignore_ascii_case("client") {
+            let val = require_value(value)?;
+            modifiers.client = Some(
+                parse_client_filter(&val)
+                    .ok_or_else(|| format!("invalid $client value '{val}'"))?,
+            );
+        } else if key.eq_ignore_ascii_case("dnstype") {
+            let val = require_value(value)?;
+            modifiers.dnstype = Some(
+                parse_dnstype_filter(&val)
+                    .ok_or_else(|| format!("invalid $dnstype value '{val}'"))?,
+            );
+        } else if key.eq_ignore_ascii_case("denyallow") {
+            let val = require_value(value)?;
+            modifiers.denyallow = Some(
+                parse_denyallow(&val).ok_or_else(|| format!("invalid $denyallow value '{val}'"))?,
+            );
+        } else if key.eq_ignore_ascii_case("dnsrewrite") {
+            let val = require_value(value)?;
+            modifiers.dnsrewrite = Some(
+                parse_dnsrewrite(&val)
+                    .ok_or_else(|| format!("invalid $dnsrewrite value '{val}'"))?,
+            );
         } else {
             // Unknown or unsupported browser modifier (e.g. $script, $image, $third-party)
-            warn!(modifier = %opt, "Unsupported or unknown modifier in rule; skipping rule");
-            return None;
+            return Err(format!("unsupported or unknown modifier '{opt}'"));
         }
     }
 
-    Some(modifiers)
+    Ok(modifiers)
+}
+
+/// Finds the index of the closing `/` of an ABP regex, skipping escaped
+/// slashes (`\/`) and slashes inside character classes (`[/]`).
+fn find_regex_terminator(inner: &str) -> Option<usize> {
+    let mut escaped = false;
+    let mut in_class = false;
+    for (idx, ch) in inner.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '/' if !in_class => return Some(idx),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parses a single line from a filter list or configuration.
@@ -590,8 +729,8 @@ pub fn parse_line(line: &str, source: &str, line_number: u32) -> Option<Rule> {
 
     // Extract pattern and options
     let (pattern_part, options_part) = if let Some(inner) = rest.strip_prefix('/') {
-        // Regex pattern: find closing '/'
-        let close_idx = inner.find('/')?;
+        // Regex pattern: find the first unescaped closing '/'
+        let close_idx = find_regex_terminator(inner)?;
         let actual_close = close_idx + 1;
         let regex_pat = &rest[..=actual_close];
         let after = rest[actual_close + 1..].trim();
@@ -606,7 +745,19 @@ pub fn parse_line(line: &str, source: &str, line_number: u32) -> Option<Rule> {
     };
 
     let modifiers = if let Some(opts) = options_part {
-        parse_modifiers(opts)?
+        match parse_modifiers(opts) {
+            Ok(modifiers) => modifiers,
+            Err(reason) => {
+                warn!(
+                    source = %source,
+                    line = line_number,
+                    rule = %trimmed,
+                    reason = %reason,
+                    "Skipping filter rule with unparsable modifiers"
+                );
+                return None;
+            }
+        }
     } else {
         RuleModifiers::default()
     };
@@ -655,7 +806,9 @@ fn parse_pattern(raw_pattern: &str) -> Option<Pattern> {
             .unwrap_or(domain_part)
             .trim_end_matches('/');
         if domain_cleaned.contains('*') {
-            return Some(Pattern::Wildcard(domain_cleaned.to_string()));
+            // Query domains are lowercased; keep wildcard anchors in the same
+            // case space so matching stays case-insensitive.
+            return Some(Pattern::Wildcard(domain_cleaned.to_ascii_lowercase()));
         }
         let normalized = normalize_domain(domain_cleaned).ok()?;
         return Some(Pattern::Domain(normalized));
@@ -663,7 +816,7 @@ fn parse_pattern(raw_pattern: &str) -> Option<Pattern> {
 
     // Prefix anchor: `|prefix`
     if let Some(prefix_part) = p.strip_prefix('|') {
-        return Some(Pattern::Prefix(prefix_part.to_string()));
+        return Some(Pattern::Prefix(prefix_part.to_ascii_lowercase()));
     }
 
     // Wildcard: contains `*`
@@ -985,6 +1138,116 @@ plain-ad.com
     }
 
     #[test]
+    fn test_regex_escaped_slash_is_not_treated_as_terminator() {
+        let line = r"/a\/b\.com/";
+        let rule = parse_line(line, "test", 1).unwrap();
+        assert_eq!(rule.pattern, Pattern::Regex(r"a\/b\.com".to_string()));
+
+        // Options after an escaped slash must still be parsed.
+        let line_with_opts = r"/a\/b\.com/$important";
+        let rule = parse_line(line_with_opts, "test", 2).unwrap();
+        assert_eq!(rule.pattern, Pattern::Regex(r"a\/b\.com".to_string()));
+        assert!(rule.modifiers.important);
+
+        // A slash inside a character class does not terminate the regex.
+        let line_class = r"/[/]ad\.com/";
+        let rule = parse_line(line_class, "test", 3).unwrap();
+        assert_eq!(rule.pattern, Pattern::Regex(r"[/]ad\.com".to_string()));
+    }
+
+    #[test]
+    fn test_prefix_and_wildcard_patterns_are_lowercased() {
+        // Prefix anchors must be matched against the lowercased query domain.
+        let prefix = parse_line("|Ads.Example.", "test", 1).unwrap();
+        assert_eq!(prefix.pattern, Pattern::Prefix("ads.example.".to_string()));
+
+        // `||*.example.com^` wildcard anchors are lowercased too.
+        let wildcard = parse_line("||*.Example.COM^", "test", 2).unwrap();
+        assert_eq!(
+            wildcard.pattern,
+            Pattern::Wildcard("*.example.com".to_string())
+        );
+
+        // Plain wildcards keep their existing lowercasing.
+        let plain = parse_line("Bad*.Evil.*", "test", 3).unwrap();
+        assert_eq!(plain.pattern, Pattern::Wildcard("bad*.evil.*".to_string()));
+    }
+
+    #[test]
+    fn test_modifier_values_split_on_pipe_not_comma() {
+        // A pipe-separated client value plus a following comma modifier.
+        let rule = parse_line("||ad.com^$client=192.168.1.1|laptop,important", "test", 1).unwrap();
+        let client = rule.modifiers.client.unwrap();
+        assert_eq!(client.positive.len(), 2);
+        assert!(rule.modifiers.important);
+
+        // Pipe-separated denyallow values reach the value parser intact.
+        let deny = parse_line("||ad.com^$denyallow=a.com|b.com", "test", 2).unwrap();
+        let domains = deny.modifiers.denyallow.unwrap();
+        assert_eq!(domains, vec!["a.com".to_string(), "b.com".to_string()]);
+
+        // A comma inside a value would have been split as a modifier; the
+        // unknown fragment must make the whole rule fail safe (skip), never
+        // silently drop only the client restriction.
+        assert!(parse_line("||ad.com^$client=1.2.3.4,8.8.8.8", "test", 3).is_none());
+    }
+
+    #[test]
+    fn test_invalid_client_modifier_skips_rule_instead_of_widening() {
+        // A malformed CIDR must not degrade to "matches all clients".
+        assert!(parse_line("||ad.com^$client=not-an-ip/24", "test", 1).is_none());
+        assert!(parse_line("||ad.com^$client=10.0.0.0/99", "test", 2).is_none());
+        assert!(parse_line("||ad.com^$client=", "test", 3).is_none());
+        // Empty values for other modifiers are rejected as well.
+        assert!(parse_line("||ad.com^$dnstype=", "test", 4).is_none());
+        assert!(parse_line("||ad.com^$denyallow=", "test", 5).is_none());
+        assert!(parse_line("||ad.com^$dnsrewrite=", "test", 6).is_none());
+    }
+
+    #[test]
+    fn test_dnsrewrite_validation_rejects_bogus_values() {
+        // `NOERROR` is an rcode, not a CNAME target.
+        let rcode_only = parse_line("||e.com^$dnsrewrite=NOERROR", "test", 1).unwrap();
+        assert_eq!(
+            rcode_only.modifiers.dnsrewrite,
+            Some(DnsRewriteRule {
+                rcode: "NOERROR".to_string(),
+                rtype: None,
+                value: None,
+            })
+        );
+
+        // Unknown rcode / record type / mismatched value are rejected.
+        assert!(parse_line("||e.com^$dnsrewrite=BOGUS;A;1.2.3.4", "test", 2).is_none());
+        assert!(parse_line("||e.com^$dnsrewrite=NOERROR;NOPE;1.2.3.4", "test", 3).is_none());
+        assert!(parse_line("||e.com^$dnsrewrite=NOERROR;A;not-an-ip", "test", 4).is_none());
+        assert!(parse_line("||e.com^$dnsrewrite=NOERROR;AAAA;1.2.3.4", "test", 5).is_none());
+        assert!(parse_line("||e.com^$dnsrewrite=NOERROR;A;", "test", 6).is_none());
+        // Junk shorthand must not become a bogus CNAME.
+        assert!(parse_line("||e.com^$dnsrewrite=garbage!!", "test", 7).is_none());
+
+        // Valid explicit A/AAAA/CNAME forms still parse.
+        let explicit = parse_line("||e.com^$dnsrewrite=NOERROR;AAAA;::1", "test", 8).unwrap();
+        assert_eq!(
+            explicit.modifiers.dnsrewrite,
+            Some(DnsRewriteRule {
+                rcode: "NOERROR".to_string(),
+                rtype: Some("AAAA".to_string()),
+                value: Some("::1".to_string()),
+            })
+        );
+        let cname = parse_line("||e.com^$dnsrewrite=cname.example.net", "test", 9).unwrap();
+        assert_eq!(
+            cname.modifiers.dnsrewrite,
+            Some(DnsRewriteRule {
+                rcode: "NOERROR".to_string(),
+                rtype: Some("CNAME".to_string()),
+                value: Some("cname.example.net".to_string()),
+            })
+        );
+    }
+
+    #[test]
     fn test_canonical_rule_representation_dedup() {
         let r1 = "||example.com^$important,client=laptop";
         let r2 = "||example.com^$client=laptop,important";
@@ -996,5 +1259,59 @@ plain-ad.com
 
         assert_eq!(rule1.canonical, rule2.canonical);
         assert_eq!(rule1.canonical, rule3.canonical);
+    }
+
+    #[test]
+    fn test_parser_fuzz_sanity_never_panics() {
+        let chars = "abcdefghijklmnopqrstuvwxyz0123456789.-_/*|~@$^,=[]{}()!#";
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            state
+        };
+
+        for _ in 0..2000 {
+            let len = (next() % 128) as usize;
+            let mut line = String::with_capacity(len);
+            for _ in 0..len {
+                line.push(chars.as_bytes()[(next() as usize) % chars.len()] as char);
+            }
+            let _ = parse_line(&line, "fuzz", 1);
+            let _ = parse_rules(&line, "fuzz");
+        }
+    }
+
+    #[test]
+    fn test_parser_randomized_determinism() {
+        // Same pseudo-random input stream as the fuzz-sanity test, but now
+        // asserting invariants on successful parses.
+        let chars = "abcdefghijklmnopqrstuvwxyz0123456789.-_/*|~@$^,=[]{}()!#";
+        let mut state: u64 = 0x0BAD_C0DE_F00D_1234;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            state
+        };
+
+        for _ in 0..3000 {
+            let len = (next() % 128) as usize;
+            let mut line = String::with_capacity(len);
+            for _ in 0..len {
+                line.push(chars.as_bytes()[(next() as usize) % chars.len()] as char);
+            }
+
+            let first = parse_line(&line, "prop", 1).map(|r| r.canonical.clone());
+            let second = parse_line(&line, "prop", 1).map(|r| r.canonical.clone());
+            assert_eq!(first, second, "parsing must be deterministic for {line:?}");
+            if let Some(canonical) = first {
+                assert!(
+                    !canonical.is_empty(),
+                    "parsed rules must have a canonical form: {line:?}"
+                );
+            }
+        }
     }
 }

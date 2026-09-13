@@ -83,7 +83,9 @@ impl ServerContext {
         {
             return url.clone();
         }
-        "wss://master.local:8953".to_string()
+        // No configured master URL: return empty and let callers omit the
+        // header rather than pointing clients at a placeholder host.
+        String::new()
     }
 
     /// Publishes an updated HA configuration bundle to all connected replica slaves,
@@ -108,6 +110,17 @@ impl ServerContext {
                 refresh_hours: l.refresh_hours,
             })
             .collect();
+
+        // Defense in depth: refuse to broadcast a bundle that embeds a known
+        // secret in plaintext.
+        if let Some(ref ha_val) = self.config.load().ha
+            && let Ok(ha_cfg) = sito_ha::HaConfig::from_toml_value(ha_val)
+            && let Some(ref token) = ha_cfg.slave_token
+            && let Err(e) = sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])
+        {
+            tracing::error!("Refusing to publish HA bundle: {e}");
+            return;
+        }
 
         let new_version = coordinator.get_current_version().saturating_add(1);
         #[allow(clippy::cast_sign_loss)]

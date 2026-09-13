@@ -37,6 +37,7 @@ pub struct UpstreamViewItem {
 
 #[derive(Debug, Clone)]
 pub struct RewriteViewItem {
+    pub id: String,
     pub domain: String,
     pub record_type: String,
     pub answer: String,
@@ -66,6 +67,7 @@ pub struct QueryLogRowItem {
 #[derive(Template)]
 #[template(path = "login.html")]
 pub struct LoginTemplate<'a> {
+    pub csrf_token: &'a str,
     pub is_authenticated: bool,
     pub username: &'a str,
     pub user_role: &'a str,
@@ -77,6 +79,7 @@ pub struct LoginTemplate<'a> {
 #[derive(Template)]
 #[template(path = "dashboard.html")]
 pub struct DashboardTemplate<'a> {
+    pub csrf_token: &'a str,
     pub is_authenticated: bool,
     pub username: &'a str,
     pub user_role: &'a str,
@@ -104,6 +107,7 @@ pub struct DashboardStatsPartialTemplate<'a> {
 #[derive(Template)]
 #[template(path = "querylog.html")]
 pub struct QueryLogTemplate<'a> {
+    pub csrf_token: &'a str,
     pub is_authenticated: bool,
     pub username: &'a str,
     pub user_role: &'a str,
@@ -135,6 +139,7 @@ pub struct BundledListView {
 #[derive(Template)]
 #[template(path = "filtering.html")]
 pub struct FilteringTemplate<'a> {
+    pub csrf_token: &'a str,
     pub is_authenticated: bool,
     pub username: &'a str,
     pub user_role: &'a str,
@@ -149,6 +154,7 @@ pub struct FilteringTemplate<'a> {
 #[derive(Template)]
 #[template(path = "rewrites.html")]
 pub struct RewritesTemplate<'a> {
+    pub csrf_token: &'a str,
     pub is_authenticated: bool,
     pub username: &'a str,
     pub user_role: &'a str,
@@ -160,6 +166,7 @@ pub struct RewritesTemplate<'a> {
 #[derive(Template)]
 #[template(path = "clients.html")]
 pub struct ClientsTemplate<'a> {
+    pub csrf_token: &'a str,
     pub is_authenticated: bool,
     pub username: &'a str,
     pub user_role: &'a str,
@@ -171,6 +178,7 @@ pub struct ClientsTemplate<'a> {
 #[derive(Template)]
 #[template(path = "upstreams.html")]
 pub struct UpstreamsTemplate<'a> {
+    pub csrf_token: &'a str,
     pub is_authenticated: bool,
     pub username: &'a str,
     pub user_role: &'a str,
@@ -182,6 +190,7 @@ pub struct UpstreamsTemplate<'a> {
 #[derive(Template)]
 #[template(path = "settings.html")]
 pub struct SettingsTemplate<'a> {
+    pub csrf_token: &'a str,
     pub is_authenticated: bool,
     pub username: &'a str,
     pub user_role: &'a str,
@@ -196,6 +205,7 @@ pub struct SettingsTemplate<'a> {
 #[derive(Template)]
 #[template(path = "system.html")]
 pub struct SystemTemplate<'a> {
+    pub csrf_token: &'a str,
     pub is_authenticated: bool,
     pub username: &'a str,
     pub user_role: &'a str,
@@ -213,4 +223,9 @@ pub struct WizardTemplate<'a> {
     pub user_role: &'a str,
     pub active_tab: &'a str,
     pub version: &'a str,
+    pub csrf_token: &'a str,
+    /// True while a one-time setup token is active.
+    pub setup_required: bool,
+    /// Setup token supplied by the requester (never revealed on its own).
+    pub setup_token: &'a str,
 }

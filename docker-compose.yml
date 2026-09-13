@@ -18,6 +18,9 @@ services:
       # NOTE: the container runs as uid 65532 (distroless nonroot) and must be
       # able to write config.toml during the setup wizard:
       #   sudo chown -R 65532:65532 ./config
+      # The named data volume below is initialized by the image with uid/gid
+      # 65532 ownership. Only bind-mounted data directories need:
+      #   sudo chown -R 65532:65532 ./data
       - "./config:/etc/sito"
       - "sito-data:/var/lib/sito"
     restart: unless-stopped
@@ -29,6 +32,7 @@ services:
           "--config",
           "/etc/sito/config.toml",
           "healthcheck",
+          "--setup-fallback",
         ]
       interval: 30s
       timeout: 5s

@@ -22,7 +22,7 @@ pub use bundle::{
 pub use config::HaConfig;
 pub use crypto::{
     Ed25519SigningKey, GeneratedCerts, compute_blake3_fingerprint, compute_blake3_raw_hex,
-    generate_ha_certs, parse_public_key, verify_ed25519_signature,
+    generate_ha_certs, generate_ha_certs_with_sans, parse_public_key, verify_ed25519_signature,
 };
 pub use error::HaError;
 pub use master::{MasterCoordinator, SlaveSummary, spawn_master_server};

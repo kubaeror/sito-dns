@@ -9,6 +9,13 @@ use sito_proto::{Message, MessageType};
 pub trait Upstream: Send + Sync {
     /// Resolve a DNS query against the upstream.
     async fn resolve(&self, msg: &Message) -> Result<Message, UpstreamError>;
+
+    /// Optional periodic maintenance hook, called by the health prober for
+    /// multi-address upstreams that need to re-resolve their hostname.
+    /// The default implementation is a no-op and never fails.
+    async fn refresh(&self) -> Result<(), UpstreamError> {
+        Ok(())
+    }
 }
 
 /// Validates that a decoded upstream response actually answers the query that

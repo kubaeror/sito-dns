@@ -8,16 +8,36 @@ use std::str::FromStr;
 
 use crate::auth::manager::{LoginResult, TotpVerifyResult};
 use crate::auth::rbac::RequireAdmin;
-use crate::auth::session::{SESSION_COOKIE_NAME, build_clear_session_cookie};
+use crate::auth::session::{
+    Session, build_clear_csrf_cookie, build_clear_session_cookie, build_csrf_cookie,
+};
 use crate::auth::token::{ApiTokenMeta, CreateTokenResponse, Role};
 use crate::auth::totp::TotpSetupResponse;
 use crate::auth::{MaybeConnectInfo, is_https_request, resolve_client_ip};
 use crate::error::ProblemDetails;
 use crate::models::{
-    CreateTokenRequest, GenericMessageResponse, LoginRequest, LoginResponse, TotpConfirmRequest,
-    TotpVerifyRequest,
+    CreateTokenRequest, DisableTotpRequest, GenericMessageResponse, LoginRequest, LoginResponse,
+    TotpConfirmRequest, TotpVerifyRequest,
 };
 use crate::state::ServerContext;
+
+fn append_set_cookie(response: &mut Response, value: &str) {
+    if let Ok(cookie_val) = value.parse() {
+        response.headers_mut().append(SET_COOKIE, cookie_val);
+    }
+}
+
+fn append_session_cookies(response: &mut Response, session: &Session, secure: bool) {
+    let max_age = (session.expires_at - chrono::Utc::now().timestamp()).max(0);
+    append_set_cookie(
+        response,
+        &crate::auth::session::build_session_cookie(&session.id, max_age, secure),
+    );
+    append_set_cookie(
+        response,
+        &build_csrf_cookie(&session.csrf_token, max_age, secure),
+    );
+}
 
 /// User login endpoint.
 #[utoipa::path(
@@ -41,22 +61,19 @@ pub async fn login(
     let tls_enabled = config.get_tls_config().is_some();
     let is_secure = is_https_request(peer_addr, &headers, &trusted_proxies, tls_enabled);
     let client_ip = resolve_client_ip(peer_addr, &headers, &trusted_proxies);
-    let result = ctx.auth_mgr.login(&req.user, &req.pass, &client_ip);
+    let result = ctx.auth_mgr.login(&req.user, &req.pass, &client_ip).await;
 
     match result {
         LoginResult::Success(session) => {
-            let cookie_header = session.to_cookie_header_secure(is_secure);
             let body = Json(LoginResponse {
-                session_id: Some(session.id),
-                username: Some(session.username),
+                session_id: Some(session.id.clone()),
+                username: Some(session.username.clone()),
                 role: Some(session.role.to_string()),
                 totp_required: false,
                 partial_token: None,
             });
             let mut response = body.into_response();
-            if let Ok(cookie_val) = cookie_header.parse() {
-                response.headers_mut().insert(SET_COOKIE, cookie_val);
-            }
+            append_session_cookies(&mut response, &session, is_secure);
             Ok(response)
         }
         LoginResult::TotpRequired { partial_token } => {
@@ -108,6 +125,7 @@ pub async fn verify_totp(
     let session = match ctx
         .auth_mgr
         .verify_totp(&req.partial_token, &req.code, &client_ip)
+        .await
     {
         TotpVerifyResult::Success(session) => session,
         TotpVerifyResult::LockedOut { remaining_seconds } => {
@@ -130,18 +148,15 @@ pub async fn verify_totp(
     let tls_enabled = config.get_tls_config().is_some();
     let is_secure = is_https_request(peer_addr, &headers, &trusted_proxies, tls_enabled);
 
-    let cookie_header = session.to_cookie_header_secure(is_secure);
     let body = Json(LoginResponse {
-        session_id: Some(session.id),
-        username: Some(session.username),
+        session_id: Some(session.id.clone()),
+        username: Some(session.username.clone()),
         role: Some(session.role.to_string()),
         totp_required: false,
         partial_token: None,
     });
     let mut response = body.into_response();
-    if let Ok(cookie_val) = cookie_header.parse() {
-        response.headers_mut().insert(SET_COOKIE, cookie_val);
-    }
+    append_session_cookies(&mut response, &session, is_secure);
     Ok(response)
 }
 
@@ -160,30 +175,22 @@ pub async fn logout(
 ) -> Response {
     if let Some(cookie_header) = headers.get("cookie")
         && let Ok(cookie_str) = cookie_header.to_str()
+        && let Some(session_id) = crate::auth::session::extract_session_cookie(cookie_str)
     {
-        for pair in cookie_str.split(';') {
-            let mut parts = pair.splitn(2, '=');
-            if let (Some(k), Some(v)) = (parts.next(), parts.next())
-                && k.trim() == SESSION_COOKIE_NAME
-            {
-                ctx.auth_mgr.logout(v.trim());
-            }
-        }
+        ctx.auth_mgr.logout(&session_id);
     }
 
     let config = ctx.config.load();
     let trusted_proxies = config.get_web_config().trusted_proxies;
     let tls_enabled = config.get_tls_config().is_some();
     let is_secure = is_https_request(peer_addr, &headers, &trusted_proxies, tls_enabled);
-    let expired_cookie = build_clear_session_cookie(is_secure);
     let mut resp = Json(GenericMessageResponse {
         message: "Logged out successfully".to_string(),
     })
     .into_response();
 
-    if let Ok(cookie_val) = expired_cookie.parse() {
-        resp.headers_mut().insert(SET_COOKIE, cookie_val);
-    }
+    append_set_cookie(&mut resp, &build_clear_session_cookie(is_secure));
+    append_set_cookie(&mut resp, &build_clear_csrf_cookie(is_secure));
     resp
 }
 
@@ -206,6 +213,7 @@ pub async fn get_totp_setup(
     let setup = ctx
         .auth_mgr
         .init_totp_setup(username)
+        .await
         .ok_or_else(|| ProblemDetails::internal_error("Failed to generate TOTP credentials"))?;
 
     Ok(Json(setup))
@@ -230,7 +238,7 @@ pub async fn enable_totp(
     Json(req): Json<TotpConfirmRequest>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
     let username = session_username(&admin)?;
-    if ctx.auth_mgr.confirm_totp_setup(username, &req.code) {
+    if ctx.auth_mgr.confirm_totp_setup(username, &req.code).await {
         Ok(Json(GenericMessageResponse {
             message: "TOTP 2FA enabled successfully".to_string(),
         }))
@@ -241,13 +249,16 @@ pub async fn enable_totp(
     }
 }
 
-/// Disable TOTP 2FA.
+/// Disable TOTP 2FA. Requires the account password and, when TOTP is enabled,
+/// a valid TOTP or backup code.
 #[utoipa::path(
     post,
     path = "/api/v1/auth/totp/disable",
+    request_body = DisableTotpRequest,
     responses(
         (status = 200, description = "TOTP disabled successfully", body = GenericMessageResponse),
-        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 400, description = "Missing second-factor code", body = ProblemDetails),
+        (status = 401, description = "Invalid password or code", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = []))
@@ -255,9 +266,39 @@ pub async fn enable_totp(
 pub async fn disable_totp(
     admin: RequireAdmin,
     State(ctx): State<ServerContext>,
+    Json(req): Json<DisableTotpRequest>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
-    let username = session_username(&admin)?;
-    ctx.auth_mgr.disable_totp(username);
+    let username = session_username(&admin)?.to_string();
+
+    if !ctx
+        .auth_mgr
+        .verify_user_password(&username, &req.password)
+        .await
+    {
+        return Err(ProblemDetails::unauthorized(
+            "Re-authentication failed: invalid password",
+        ));
+    }
+
+    if ctx.auth_mgr.totp_enabled(&username) {
+        let code = req
+            .code
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| {
+                ProblemDetails::bad_request("A TOTP or backup code is required to disable 2FA")
+            })?;
+        if !ctx.auth_mgr.verify_second_factor(&username, code).await {
+            return Err(ProblemDetails::unauthorized(
+                "Re-authentication failed: invalid TOTP or backup code",
+            ));
+        }
+    }
+
+    if !ctx.auth_mgr.disable_totp(&username) {
+        return Err(ProblemDetails::not_found("User account not found"));
+    }
     Ok(Json(GenericMessageResponse {
         message: "TOTP 2FA disabled successfully".to_string(),
     }))

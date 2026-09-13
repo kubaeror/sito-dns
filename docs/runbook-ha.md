@@ -107,11 +107,21 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
 ### Step 1: Generate a New Certificate Suite
 Run the built-in certificate generator:
 ```bash
-sito ha gen-certs \
-  --dir /etc/sito/certs/next \
-  --master 192.168.1.10 \
-  --slave 192.168.1.11
+sito ha gen-certs --dir /etc/sito/certs/next --master --slave \
+  --san 192.168.1.10 --san dns-master.lan
 ```
+`--master` and `--slave` are boolean selectors for which certificate pairs to
+generate; omitting both generates the complete set (CA + master + slave).
+`--san` is repeatable and adds a hostname or IP address to both certificates
+(in addition to `localhost`, `sito-master` / `sito-slave`, `127.0.0.1` and
+`::1`). Replication to LAN addresses such as `wss://192.168.1.10:8953` is
+authenticated by the BLAKE3 fingerprint pinning (`master_fingerprint` /
+`pinned_slave_fingerprints`) described below, which is independent of the
+certificate SAN. If you disable pinning with `allow_unpinned_tls = true` and
+rely on `ca` chain validation instead, the hostname you connect to must match
+one of the certificate SANs; use `--san <LAN_IP_OR_HOST>` to make LAN-IP URLs
+pass hostname verification.
+
 Note down the new fingerprints printed by the command:
 - Master cert BLAKE3 fingerprint: `a1b2c3...`
 - Slave cert BLAKE3 fingerprint: `d4e5f6...`

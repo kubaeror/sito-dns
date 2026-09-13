@@ -1,7 +1,7 @@
 //! Axum router configuration binding handlers, middleware, and documentation.
 
-use axum::extract::Request;
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
+use axum::extract::{Request, State};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -9,6 +9,9 @@ use axum::{Json, Router};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::auth::client_ip::resolve_client_ip;
+use crate::auth::session::extract_session_cookie;
+use crate::auth::token::Role;
 use crate::error::ProblemDetails;
 use crate::handlers::{
     auth_handlers, cache, clients, config, filtering, ha, metrics, querylog, rewrites, stats,
@@ -16,6 +19,9 @@ use crate::handlers::{
 };
 use crate::openapi::ApiDoc;
 use crate::state::ServerContext;
+
+/// Header accepted for first-boot setup authorization.
+pub const SETUP_TOKEN_HEADER: &str = "x-setup-token";
 
 /// Middleware that enforces read-only access on replica slave nodes.
 /// Mutating methods (POST, PUT, DELETE, PATCH) outside auth and resync return 409 Conflict with X-Dnsd-Master header.
@@ -51,7 +57,9 @@ pub async fn slave_read_only_middleware(
             problem.instance = Some(path.to_string());
 
             let mut resp = (StatusCode::CONFLICT, Json(problem)).into_response();
-            if let Ok(val) = HeaderValue::from_str(&master_url) {
+            if !master_url.is_empty()
+                && let Ok(val) = HeaderValue::from_str(&master_url)
+            {
                 resp.headers_mut()
                     .insert(HeaderName::from_static("x-dnsd-master"), val);
             }
@@ -62,18 +70,117 @@ pub async fn slave_read_only_middleware(
     next.run(request).await
 }
 
-/// Middleware that enforces setup-pending route restrictions during bootstrap mode.
-/// When `setup_pending == true`:
-/// - Allows: `/wizard`, `/ui/wizard/*`, `/static/*`, `/assets/*`, `/ui/upstreams/test`, `/health`, `/status`.
-/// - Returns 503 Service Unavailable with body "Setup not completed" for `/api/v1/*`.
-/// - Redirects all other UI routes (including `/login`, `/`, `/dashboard`) to `/wizard` with HTTP 302 Found.
+/// Extracts the setup token from the `X-Setup-Token` header or the
+/// `setup_token` query parameter.
+fn setup_token_from_request(request: &Request) -> Option<String> {
+    if let Some(value) = request
+        .headers()
+        .get(SETUP_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return Some(value.to_string());
+    }
+    let query = request.uri().query()?;
+    for param in query.split('&') {
+        let (key, value) = param.split_once('=').unwrap_or((param, ""));
+        if key == "setup_token" && !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// Middleware that gates setup-only routes.
+///
+/// While a first-boot setup token is active, `/wizard`, `/ui/wizard/*` and
+/// `/ui/upstreams/test` require either an authenticated session with
+/// sufficient privileges or the one-time setup token. When `setup_pending` is
+/// true the remaining bootstrapping behavior is preserved:
+/// - Allows: `/static/*`, `/assets/*`, `/health`, `/status`.
+/// - Returns 503 for `/api/v1/*`.
+/// - Redirects all other UI routes to `/wizard`.
 pub async fn setup_pending_middleware(
-    axum::extract::State(ctx): axum::extract::State<ServerContext>,
+    State(ctx): State<ServerContext>,
     request: Request,
     next: Next,
 ) -> Response {
-    if ctx.is_setup_pending() {
-        let path = request.uri().path();
+    let setup_pending = ctx.is_setup_pending();
+    let token_required = ctx.auth_mgr.setup_token_required();
+
+    if !setup_pending && !token_required {
+        return next.run(request).await;
+    }
+
+    let path = request.uri().path();
+    let is_wizard = path == "/wizard" || path.starts_with("/ui/wizard");
+    let is_probe = path == "/ui/upstreams/test";
+    if is_wizard || is_probe {
+        let authenticated_role = request
+            .headers()
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(extract_session_cookie)
+            .and_then(|id| ctx.auth_mgr.validate_session(&id))
+            .map(|session| session.role);
+        let privileged = if is_probe {
+            authenticated_role.is_some_and(|role| role >= Role::Operator)
+        } else {
+            authenticated_role == Some(Role::Admin)
+        };
+
+        if !privileged {
+            // The wizard completion form carries the token in its body, which
+            // would require buffering the request here; the handler performs
+            // the same constant-time validation and rate limiting instead.
+            if path == "/ui/wizard/complete" {
+                return next.run(request).await;
+            }
+            if token_required {
+                let config = ctx.config.load();
+                let trusted_proxies = config.get_web_config().trusted_proxies.clone();
+                let peer = request
+                    .extensions()
+                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                    .map(|ci| ci.0);
+                let client_ip = resolve_client_ip(peer, request.headers(), &trusted_proxies);
+                drop(config);
+                let candidate = setup_token_from_request(&request);
+                match ctx
+                    .auth_mgr
+                    .validate_setup_token(candidate.as_deref(), &client_ip)
+                {
+                    crate::auth::SetupTokenStatus::Valid => {}
+                    crate::auth::SetupTokenStatus::RateLimited => {
+                        return ProblemDetails::too_many_requests(
+                            "Too many invalid setup token attempts. Try again later.",
+                        )
+                        .into_response();
+                    }
+                    _ => {
+                        return ProblemDetails::forbidden(
+                            "First-boot setup token required (see server logs).",
+                        )
+                        .into_response();
+                    }
+                }
+            } else if !setup_pending && !ctx.auth_mgr.is_first_run() {
+                // No token provisioned and not in a bootstrap state: let the
+                // normal auth layer decide.
+                return next.run(request).await;
+            } else if !ctx.auth_mgr.is_first_run() {
+                // Setup-pending with an already-configured admin account but
+                // no setup token: require an authenticated admin session.
+                return ProblemDetails::forbidden(
+                    "Setup wizard is disabled. Admin session required.",
+                )
+                .into_response();
+            }
+        }
+    }
+
+    if setup_pending {
         if path.starts_with("/wizard")
             || path.starts_with("/ui/wizard")
             || path.starts_with("/static/")
@@ -99,6 +206,18 @@ pub async fn setup_pending_middleware(
     next.run(request).await
 }
 
+/// Unauthenticated liveness probe that also reports whether the first-run
+/// setup wizard is still pending (used by the container healthcheck).
+async fn health_handler(State(ctx): State<ServerContext>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "setup_pending": ctx.is_setup_pending(),
+        })),
+    )
+}
+
 async fn not_found_handler() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
@@ -106,6 +225,15 @@ async fn not_found_handler() -> impl IntoResponse {
             "The requested endpoint does not exist",
         )),
     )
+}
+
+/// Legacy alias for `GET|PUT /api/v1/upstream`; kept as a permanent redirect.
+async fn redirect_upstream_config() -> Response {
+    (
+        StatusCode::PERMANENT_REDIRECT,
+        [(axum::http::header::LOCATION, "/api/v1/upstream")],
+    )
+        .into_response()
 }
 
 /// Constructs the complete administrative HTTP router.
@@ -169,14 +297,14 @@ pub fn create_router(ctx: ServerContext) -> Router {
             "/rewrites/{id}",
             put(rewrites::update_rewrite).delete(rewrites::delete_rewrite),
         )
-        // Upstream
+        // Upstream: `/upstream` is canonical, `/upstream/config` redirects to it.
         .route(
             "/upstream",
             get(upstream::get_upstream_config).put(upstream::update_upstream_config),
         )
         .route(
             "/upstream/config",
-            get(upstream::get_upstream_config).put(upstream::update_upstream_config),
+            get(redirect_upstream_config).put(redirect_upstream_config),
         )
         .route("/upstream/test", post(upstream::test_upstream_servers))
         // Cache
@@ -221,6 +349,7 @@ pub fn create_router(ctx: ServerContext) -> Router {
     let app = Router::new()
         .nest("/api/v1", api_v1)
         .route("/metrics", get(metrics::get_metrics))
+        .route("/health", get(health_handler))
         .merge(SwaggerUi::new("/api/docs").url("/api/docs/openapi.json", ApiDoc::openapi()))
         .merge(
             crate::ui::ui_router().layer(axum::middleware::from_fn_with_state(
@@ -233,24 +362,27 @@ pub fn create_router(ctx: ServerContext) -> Router {
             ctx.clone(),
             setup_pending_middleware,
         ))
-        .with_state(ctx);
+        .with_state(ctx.clone());
 
     #[cfg(not(feature = "embed-ui"))]
     let app = Router::new()
         .nest("/api/v1", api_v1)
         .route("/metrics", get(metrics::get_metrics))
+        .route("/health", get(health_handler))
         .merge(SwaggerUi::new("/api/docs").url("/api/docs/openapi.json", ApiDoc::openapi()))
         .fallback(not_found_handler)
         .layer(axum::middleware::from_fn_with_state(
             ctx.clone(),
             setup_pending_middleware,
         ))
-        .with_state(ctx);
+        .with_state(ctx.clone());
 
-    app.layer(axum::middleware::from_fn(
-        crate::security::csrf_origin_middleware,
+    app.layer(axum::middleware::from_fn_with_state(
+        ctx.clone(),
+        crate::security::csrf_protection_middleware,
     ))
-    .layer(axum::middleware::from_fn(
+    .layer(axum::middleware::from_fn_with_state(
+        ctx,
         crate::security::security_headers_middleware,
     ))
 }

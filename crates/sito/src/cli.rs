@@ -45,6 +45,12 @@ pub enum Commands {
         /// Probe timeout in milliseconds
         #[arg(short, long, default_value = "2000")]
         timeout_ms: u64,
+        /// Accept the admin web interface as healthy only while the server
+        /// reports first-boot setup pending (DNS listeners are not bound yet).
+        /// Disabled by default: without a confirmed setup-pending status a
+        /// failed DNS probe stays a failure.
+        #[arg(long)]
+        setup_fallback: bool,
     },
     /// Create a tar.gz backup archive of configuration and metadata
     Backup {
@@ -114,6 +120,10 @@ pub enum HaCommands {
         /// Generate slave client certificate
         #[arg(long)]
         slave: bool,
+        /// Additional subject alternative name for the generated certificates
+        /// (hostname or IP address). Repeatable.
+        #[arg(long = "san", value_name = "HOST_OR_IP", action = clap::ArgAction::Append)]
+        san: Vec<String>,
     },
 }
 
@@ -154,6 +164,16 @@ pub fn run_check_config(path: &Path) -> Result<(), anyhow::Error> {
             )
         })?;
     }
+
+    // Validate every remaining TOML-valued section (web/auth/stats/ha/
+    // integrations) so check-config catches what startup would reject.
+    crate::server::validate_typed_sections(&config).map_err(|e| {
+        anyhow::anyhow!(
+            "Configuration validation failed for '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
 
     if let Some(tls) = config.get_tls_config() {
         if let (Some(cert_path), Some(key_path)) = (&tls.cert, &tls.key) {
@@ -208,14 +228,18 @@ pub async fn run_healthcheck(addr: SocketAddr, timeout_ms: u64) -> Result<(), an
     probe_dns(addr, timeout_ms).await
 }
 
-/// Healthcheck that also accepts a reachable admin web interface as healthy.
+/// Healthcheck that may accept the admin web interface while the server is
+/// still in first-boot setup-pending mode.
 ///
-/// This keeps container healthchecks green while the first-run setup wizard is
-/// active (DNS listeners are intentionally unbound until setup completes).
+/// The web fallback is only considered when `setup_fallback` is enabled and
+/// the admin API explicitly reports that setup is pending. Once setup has
+/// completed (or when the API cannot confirm setup-pending), a failing DNS
+/// probe stays a healthcheck failure so a broken DNS listener is never masked.
 pub async fn run_healthcheck_or_web(
     dns_addr: Option<SocketAddr>,
     web_addr: SocketAddr,
     timeout_ms: u64,
+    setup_fallback: bool,
 ) -> Result<(), anyhow::Error> {
     let dns_error = if let Some(addr) = dns_addr {
         match probe_dns(addr, timeout_ms).await {
@@ -226,27 +250,120 @@ pub async fn run_healthcheck_or_web(
         None
     };
 
-    let connect = tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        tokio::net::TcpStream::connect(web_addr),
-    );
-    if let Ok(Ok(_stream)) = connect.await {
-        if let Some(e) = dns_error {
-            println!(
-                "Healthcheck OK: DNS probe failed ({e}), but admin web interface {web_addr} is reachable (likely setup wizard mode)"
-            );
-        } else {
-            println!("Healthcheck OK: admin web interface {web_addr} is reachable");
-        }
-        return Ok(());
+    if !setup_fallback {
+        return Err(dns_error.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "Healthcheck failed: no DNS target is configured and the setup web fallback is disabled"
+            )
+        }));
     }
 
-    match dns_error {
-        Some(e) => Err(e),
-        None => Err(anyhow::anyhow!(
-            "Healthcheck failed: neither DNS nor the admin web interface at {web_addr} responded within {timeout_ms}ms"
-        )),
+    match probe_setup_pending(web_addr, timeout_ms).await {
+        Ok(true) => {
+            if let Some(e) = &dns_error {
+                println!(
+                    "Healthcheck OK: DNS probe failed ({e}), but admin web interface {web_addr} reports setup pending"
+                );
+            } else {
+                println!("Healthcheck OK: admin web interface {web_addr} reports setup pending");
+            }
+            Ok(())
+        }
+        Ok(false) => Err(dns_error.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "Healthcheck failed: admin web interface {web_addr} is not reporting setup pending"
+            )
+        })),
+        Err(status_error) => Err(match dns_error {
+            Some(dns_err) => dns_err.context(format!(
+                "setup status check against {web_addr} failed: {status_error}"
+            )),
+            None => status_error,
+        }),
     }
+}
+
+/// Reports whether the admin API is in first-boot setup-pending mode.
+///
+/// `/health` and `/status` are preferred when they expose a JSON
+/// `setup_pending` boolean. Otherwise the setup-gating middleware signal is
+/// used: while setup is pending, `/api/v1/*` is short-circuited with
+/// `503 Setup not completed`; once an admin account exists the normal auth
+/// layer answers instead (typically `401`).
+async fn probe_setup_pending(web_addr: SocketAddr, timeout_ms: u64) -> Result<bool, anyhow::Error> {
+    for path in ["/health", "/status"] {
+        if let Ok((200, body)) = http_get(web_addr, path, timeout_ms).await
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(pending) = value
+                .get("setup_pending")
+                .and_then(serde_json::Value::as_bool)
+        {
+            return Ok(pending);
+        }
+    }
+
+    match http_get(web_addr, "/api/v1/status", timeout_ms).await {
+        Ok((503, body)) if body.contains("Setup not completed") => Ok(true),
+        Ok(_) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Minimal HTTP/1.1 `GET` helper used only for setup-pending detection.
+///
+/// Uses a raw TCP stream to avoid adding a full HTTP client dependency to the
+/// server binary. Responses are capped and parsed loosely; the caller only
+/// relies on the status code and a substring of the body.
+async fn http_get(
+    addr: SocketAddr,
+    path: &str,
+    timeout_ms: u64,
+) -> Result<(u16, String), anyhow::Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let timeout = Duration::from_millis(timeout_ms);
+    let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out connecting to {addr}"))??;
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    );
+    tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out sending request to {addr}"))??;
+
+    let mut response = Vec::with_capacity(1024);
+    let mut buf = [0u8; 1024];
+    loop {
+        let read = tokio::time::timeout(timeout, stream.read(&mut buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out reading response from {addr}"))??;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..read]);
+        if response.len() > 64 * 1024 {
+            break;
+        }
+    }
+
+    let text = String::from_utf8_lossy(&response);
+    let status_line = text
+        .split("\r\n")
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty HTTP response from {addr}"))?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid HTTP status line from {addr}: {status_line}"))?;
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    Ok((status, body))
 }
 
 async fn probe_dns(addr: SocketAddr, timeout_ms: u64) -> Result<(), anyhow::Error> {
@@ -285,11 +402,11 @@ async fn probe_dns(addr: SocketAddr, timeout_ms: u64) -> Result<(), anyhow::Erro
     if resp.metadata.message_type != MessageType::Response {
         anyhow::bail!("Healthcheck failed: received a non-response DNS message");
     }
-    match resp.metadata.response_code {
-        ResponseCode::NoError | ResponseCode::NXDomain => {}
-        other => {
-            anyhow::bail!("Healthcheck failed: resolver returned {other:?}");
-        }
+    if resp.metadata.response_code != ResponseCode::NoError {
+        anyhow::bail!(
+            "Healthcheck failed: resolver returned {:?} (expected NOERROR)",
+            resp.metadata.response_code
+        );
     }
 
     println!(
@@ -378,8 +495,13 @@ pub fn run_restore(
 }
 
 /// Executes the `ha gen-certs` subcommand.
-pub fn run_ha_gen_certs(dir: &Path, master: bool, slave: bool) -> Result<(), anyhow::Error> {
-    let certs = sito_ha::generate_ha_certs(dir, master, slave)
+pub fn run_ha_gen_certs(
+    dir: &Path,
+    master: bool,
+    slave: bool,
+    san: &[String],
+) -> Result<(), anyhow::Error> {
+    let certs = sito_ha::generate_ha_certs_with_sans(dir, master, slave, san)
         .map_err(|e| anyhow::anyhow!("Failed to generate HA certificates: {e}"))?;
     print!("{}", certs.summary());
     Ok(())
@@ -519,6 +641,7 @@ pub fn run_reset_sessions(config_path: &Path) -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_cli_no_setup_flag() {
@@ -535,5 +658,182 @@ mod tests {
         let cli_custom = Cli::try_parse_from(args_custom).expect("parse args");
         assert!(cli_custom.no_setup);
         assert_eq!(cli_custom.config, PathBuf::from("/etc/sito/custom.toml"));
+    }
+
+    #[test]
+    fn test_cli_healthcheck_setup_fallback_defaults_off() {
+        let cli = Cli::try_parse_from(["sito", "healthcheck"]).expect("parse args");
+        match cli.command {
+            Some(Commands::Healthcheck { setup_fallback, .. }) => assert!(!setup_fallback),
+            other => panic!("expected healthcheck command, got {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["sito", "healthcheck", "--setup-fallback"]).expect("parse args");
+        match cli.command {
+            Some(Commands::Healthcheck { setup_fallback, .. }) => assert!(setup_fallback),
+            other => panic!("expected healthcheck command, got {other:?}"),
+        }
+    }
+
+    /// Single-shot UDP responder that echoes a pre-built DNS message.
+    async fn spawn_udp_responder(response: Message) -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind responder");
+        let addr = socket.local_addr().expect("responder addr");
+        let wire = sito_proto::encode_message(&response).expect("encode response");
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            if let Ok((_, peer)) = socket.recv_from(&mut buf).await {
+                let _ = socket.send_to(&wire, peer).await;
+            }
+        });
+        addr
+    }
+
+    fn dns_response(id: u16, rcode: ResponseCode) -> Message {
+        let mut resp = Message::new(id, MessageType::Response, OpCode::Query);
+        resp.metadata.response_code = rcode;
+        resp
+    }
+
+    /// Held-open UDP socket that never answers, forcing a deterministic timeout.
+    async fn spawn_silent_udp() -> (SocketAddr, tokio::net::UdpSocket) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent socket");
+        let addr = socket.local_addr().expect("silent addr");
+        (addr, socket)
+    }
+
+    /// Minimal HTTP responder keyed by request path.
+    async fn spawn_http_router(routes: Vec<(&'static str, u16, &'static str)>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind http responder");
+        let addr = listener.local_addr().expect("http responder addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let Ok(read) = stream.read(&mut buf).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buf[..read]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let (status, body) = routes
+                    .iter()
+                    .find(|(route, _, _)| *route == path)
+                    .map_or((404, "Not Found"), |(_, status, body)| (*status, *body));
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_probe_dns_accepts_matching_noerror_response() {
+        let addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
+        probe_dns(addr, 2_000)
+            .await
+            .expect("NOERROR response with matching ID must be accepted");
+    }
+
+    #[tokio::test]
+    async fn test_probe_dns_rejects_message_id_mismatch() {
+        let addr = spawn_udp_responder(dns_response(0x1337, ResponseCode::NoError)).await;
+        let err = probe_dns(addr, 2_000)
+            .await
+            .expect_err("mismatched message ID must fail");
+        assert!(
+            err.to_string().contains("ID mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probe_dns_rejects_servfail() {
+        let addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::ServFail)).await;
+        let err = probe_dns(addr, 2_000)
+            .await
+            .expect_err("SERVFAIL must fail the healthcheck");
+        assert!(
+            err.to_string().contains("ServFail"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probe_dns_rejects_refused() {
+        let addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::Refused)).await;
+        let err = probe_dns(addr, 2_000)
+            .await
+            .expect_err("REFUSED must fail the healthcheck");
+        assert!(
+            err.to_string().contains("Refused"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probe_dns_rejects_nxdomain() {
+        let addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NXDomain)).await;
+        let err = probe_dns(addr, 2_000)
+            .await
+            .expect_err("only NOERROR is a healthy response");
+        assert!(
+            err.to_string().contains("NXDomain"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_healthcheck_without_fallback_rejects_reachable_web_only() {
+        let (dns_addr, _silent) = spawn_silent_udp().await;
+        let web_addr =
+            spawn_http_router(vec![("/api/v1/status", 503, "Setup not completed")]).await;
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, false)
+            .await
+            .expect_err("web reachability must not mask a broken DNS listener by default");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_healthcheck_setup_fallback_accepts_pending_health_json() {
+        let (dns_addr, _silent) = spawn_silent_udp().await;
+        let web_addr = spawn_http_router(vec![("/health", 200, "{\"setup_pending\": true}")]).await;
+        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true)
+            .await
+            .expect("setup-pending web interface must satisfy the setup fallback");
+    }
+
+    #[tokio::test]
+    async fn test_healthcheck_setup_fallback_accepts_503_middleware_signal() {
+        let (dns_addr, _silent) = spawn_silent_udp().await;
+        let web_addr =
+            spawn_http_router(vec![("/api/v1/status", 503, "Setup not completed")]).await;
+        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true)
+            .await
+            .expect("503 setup-pending signal must satisfy the setup fallback");
+    }
+
+    #[tokio::test]
+    async fn test_healthcheck_setup_fallback_rejects_completed_setup() {
+        let (dns_addr, _silent) = spawn_silent_udp().await;
+        let web_addr = spawn_http_router(vec![("/api/v1/status", 401, "Unauthorized")]).await;
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true)
+            .await
+            .expect_err("completed setup must not mask a broken DNS listener");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
     }
 }

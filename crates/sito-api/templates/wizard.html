@@ -12,9 +12,20 @@
       <div style="margin-top: 12px; font-size: 0.825rem; color: var(--text-muted); background: var(--bg-tertiary); padding: 8px 14px; border-radius: var(--radius-md); display: inline-block;">
         All settings are pre-configured with secure defaults. You may fine-tune them below or change them anytime later.
       </div>
+      {% if setup_required %}
+      <div style="margin-top: 14px; font-size: 0.85rem; color: var(--accent-danger); background: rgba(239, 68, 68, 0.1); border: 1px solid var(--accent-danger); padding: 10px 14px; border-radius: var(--radius-md);">
+        <strong>One-time setup token required.</strong> Find the token printed in the server console/logs and open
+        <code>/wizard?setup_token=&lt;token&gt;</code> to continue.
+      </div>
+      {% endif %}
     </div>
 
-    <form action="/ui/wizard/complete" method="POST">
+    <form action="/ui/wizard/complete" method="POST"
+          hx-headers='{"X-Setup-Token": "{{ setup_token }}", "X-CSRF-Token": "{{ csrf_token }}"}'
+          @submit="if (!confirm($el.dataset.confirm)) { $event.preventDefault(); }"
+          data-confirm="Complete setup and apply the configuration?">
+      <input type="hidden" name="setup_token" value="{{ setup_token }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <!-- Section 1: Administrator Account -->
       <div style="margin-bottom: 24px;">
         <h3 style="font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text-primary);">
@@ -29,8 +40,8 @@
         <div class="grid-2" style="margin-bottom: 0;">
           <div class="form-group">
             <label class="form-label" for="wiz-pass">Admin Password</label>
-            <input type="password" id="wiz-pass" name="admin_password" class="form-input" minlength="8" placeholder="Default: adminadmin">
-            <div class="form-help">Minimum 8 characters (or leave empty for default: <code>adminadmin</code>).</div>
+            <input type="password" id="wiz-pass" name="admin_password" class="form-input" minlength="8" required autocomplete="new-password">
+            <div class="form-help">Minimum 8 characters. The default <code>adminadmin</code> password is not accepted.</div>
           </div>
           <div class="form-group">
             <label class="form-label" for="wiz-pass-confirm">Confirm Password</label>
@@ -91,11 +102,11 @@
           <textarea id="wiz-upstreams" name="upstreams" class="form-textarea mono" rows="3" placeholder="1.1.1.1&#10;1.0.0.1">1.1.1.1&#10;1.0.0.1</textarea>
           <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center;">
             <span style="font-size: 0.75rem; color: var(--text-muted); margin-right: 4px;">Presets:</span>
-            <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('wiz-upstreams').value = '1.1.1.1\n1.0.0.1';">Cloudflare</button>
-            <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('wiz-upstreams').value = '9.9.9.9\n149.112.112.112';">Quad9</button>
-            <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('wiz-upstreams').value = '8.8.8.8\n8.8.4.4';">Google</button>
-            <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('wiz-upstreams').value = 'tls://1.1.1.1:853\ntls://1.0.0.1:853';">Cloudflare DoT</button>
-            <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('wiz-upstreams').value = 'https://dns.quad9.net/dns-query';">Quad9 DoH</button>
+            <button type="button" class="btn btn-secondary btn-sm" @click="document.getElementById('wiz-upstreams').value = '1.1.1.1\n1.0.0.1';">Cloudflare</button>
+            <button type="button" class="btn btn-secondary btn-sm" @click="document.getElementById('wiz-upstreams').value = '9.9.9.9\n149.112.112.112';">Quad9</button>
+            <button type="button" class="btn btn-secondary btn-sm" @click="document.getElementById('wiz-upstreams').value = '8.8.8.8\n8.8.4.4';">Google</button>
+            <button type="button" class="btn btn-secondary btn-sm" @click="document.getElementById('wiz-upstreams').value = 'tls://1.1.1.1:853\ntls://1.0.0.1:853';">Cloudflare DoT</button>
+            <button type="button" class="btn btn-secondary btn-sm" @click="document.getElementById('wiz-upstreams').value = 'https://dns.quad9.net/dns-query';">Quad9 DoH</button>
           </div>
         </div>
 

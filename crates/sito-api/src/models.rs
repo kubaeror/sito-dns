@@ -19,10 +19,11 @@ pub struct StatsQuery {
     pub window: Option<String>,
 }
 
-/// Filter list subscription details.
+/// Filter list subscription details. `id` is the stable list name (numeric
+/// indices from older clients are still accepted on update/delete).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FilterListDto {
-    pub id: usize,
+    pub id: String,
     pub name: String,
     pub url: String,
     pub enabled: bool,
@@ -105,10 +106,79 @@ pub struct ClientDto {
     pub ignore_query_log: bool,
     #[serde(default)]
     pub ignore_stats: bool,
+    /// Per-client upstream toggle; only changed when present in an update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_global_upstreams: Option<bool>,
+    /// Per-client upstream server list; only changed when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstreams: Option<Vec<String>>,
+    /// Whether the client is a trusted resolver; only changed when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted: Option<bool>,
+}
+
+/// Partial update for a client. Fields that are absent keep their current
+/// values; identifier lists are only replaced when at least one is supplied.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct UpdateClientRequest {
+    /// New client name. Renaming onto an existing client name is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ip: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mac: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subnet: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doh_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dot_sni: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_query_log: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_stats: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_global_upstreams: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstreams: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted: Option<bool>,
 }
 
 fn default_group() -> String {
     "default".to_string()
+}
+
+/// Partial update for a client policy group. Fields that are absent keep their
+/// current values (lists, custom rules, YouTube safe search, schedules and
+/// per-service schedules are always preserved).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct UpdateClientGroupRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filtering_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parental_control: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe_search: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_services: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parental_categories: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lists: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_rules: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe_search_youtube: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_enabled: Option<bool>,
 }
 
 /// Client policy group.
@@ -275,6 +345,15 @@ pub struct TotpVerifyRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TotpConfirmRequest {
     pub code: String,
+}
+
+/// Request to disable TOTP. Requires the current password and, when 2FA is
+/// enabled, a valid TOTP or backup code.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DisableTotpRequest {
+    pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 /// Request to create an API token.

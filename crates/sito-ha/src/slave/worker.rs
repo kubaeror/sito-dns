@@ -62,7 +62,9 @@ pub async fn apply_config_push(
 
     // 2. Secret substitution
     let local_secrets = tracker.local_secrets.lock().unwrap().clone();
-    let substituted_toml = match substitute_secrets(&bundle.config_toml, &local_secrets, true) {
+    // Fail closed: a push referencing a secret this slave does not have must be
+    // rejected rather than silently replacing credentials with empty strings.
+    let substituted_toml = match substitute_secrets(&bundle.config_toml, &local_secrets, false) {
         Ok(s) => s,
         Err(e) => {
             tracker.mark_degraded(format!("Secret substitution failed: {e}"));
@@ -147,12 +149,16 @@ pub async fn apply_config_push(
     // Atomic swap of configuration
     handles.config.store(Arc::new(staging_config));
 
-    // Persist configuration to disk if path is provided
-    if let Some(ref path) = handles.config_path {
-        let tmp_path = path.with_extension("tmp");
-        if let Ok(()) = std::fs::write(&tmp_path, &substituted_toml) {
-            let _ = std::fs::rename(&tmp_path, path);
-        }
+    // Persist configuration to disk if path is provided. The pushed TOML can
+    // contain substituted credentials, so write atomically with 0600.
+    if let Some(ref path) = handles.config_path
+        && let Err(e) = write_private_atomic(path, &substituted_toml)
+    {
+        error!(
+            error = %e,
+            path = %path.display(),
+            "Failed to persist applied configuration to disk"
+        );
     }
 
     // Mark tracker as synced
@@ -169,6 +175,30 @@ pub async fn apply_config_push(
     );
 
     Ok(bundle.version)
+}
+
+/// Atomically writes `contents` to `path`, restricting permissions to the
+/// owner on Unix. Used for pushed configuration that may embed credentials.
+fn write_private_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp_path, contents)?;
+    }
+    std::fs::rename(&tmp_path, path)
 }
 
 /// Spawns the slave replication worker loop.
@@ -192,6 +222,9 @@ pub fn spawn_slave_worker(
         });
 
         let mut backoff = ExponentialBackoff::default();
+        // Tracks whether the resync channel still has senders; a closed channel
+        // returns `None` immediately and would otherwise busy-spin the select.
+        let mut resync_open = true;
 
         loop {
             if *shutdown_rx.borrow() {
@@ -219,8 +252,12 @@ pub fn spawn_slave_worker(
                     // immediately closes the connection.
                     tokio::select! {
                         () = tokio::time::sleep(Duration::from_secs(1)) => {}
-                        _ = resync_rx.recv() => {
-                            info!("Manual resync triggered; reconnecting immediately");
+                        msg = resync_rx.recv(), if resync_open => {
+                            if msg.is_none() {
+                                resync_open = false;
+                            } else {
+                                info!("Manual resync triggered; reconnecting immediately");
+                            }
                         }
                         _ = shutdown_rx.changed() => {
                             if *shutdown_rx.borrow() {
@@ -235,9 +272,13 @@ pub fn spawn_slave_worker(
                     info!("Backing off for {:?} before reconnecting", delay);
                     tokio::select! {
                         () = tokio::time::sleep(delay) => {}
-                        _ = resync_rx.recv() => {
-                            info!("Manual resync triggered during backoff; reconnecting immediately");
-                            backoff.reset();
+                        msg = resync_rx.recv(), if resync_open => {
+                            if msg.is_none() {
+                                resync_open = false;
+                            } else {
+                                info!("Manual resync triggered during backoff; reconnecting immediately");
+                                backoff.reset();
+                            }
                         }
                         _ = shutdown_rx.changed() => {
                             if *shutdown_rx.borrow() {
@@ -410,6 +451,9 @@ where
     );
     stats_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let (mut last_queries, mut last_blocked) = handles.metrics.get_queries_and_blocked();
+    // See `spawn_slave_worker`: a closed channel must disable the branch
+    // instead of resolving `None` forever.
+    let mut resync_open = true;
 
     loop {
         tokio::select! {
@@ -419,7 +463,11 @@ where
                 }
             }
 
-            _ = resync_rx.recv() => {
+            msg = resync_rx.recv(), if resync_open => {
+                if msg.is_none() {
+                    resync_open = false;
+                    continue;
+                }
                 info!("Manual resync triggered; re-sending Hello with current version");
                 let cur_v = tracker.get_version();
                 let hello = HaMessage::Hello {

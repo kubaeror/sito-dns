@@ -220,6 +220,6 @@ mod tests {
         // latest writes are visible.
         assert_eq!(counter.load(Ordering::Relaxed), 100);
         assert_eq!(state.snapshot().config.dns.port, 5349);
-        assert!(state.config_handle().load().dns.port == 5349);
+        assert_eq!(state.config_handle().load().dns.port, 5349);
     }
 }

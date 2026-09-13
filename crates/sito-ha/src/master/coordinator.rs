@@ -2,8 +2,9 @@
 
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -37,6 +38,12 @@ pub struct MasterCoordinator {
     pub slave_token: Option<String>,
     /// Heartbeat interval in seconds (watchdog removes slaves silent for 3× this).
     pub ping_interval_secs: u64,
+    /// Path where the active version/bundle are persisted across restarts.
+    state_path: Arc<Mutex<Option<PathBuf>>>,
+    /// Slaves with an asynchronous fallback delivery already scheduled.
+    pending_fallbacks: Arc<Mutex<HashSet<String>>>,
+    /// Last stale version for which a catch-up push was already attempted per slave.
+    stale_repushes: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl MasterCoordinator {
@@ -64,7 +71,124 @@ impl MasterCoordinator {
             metrics,
             slave_token: None,
             ping_interval_secs: 15,
+            state_path: Arc::new(Mutex::new(None)),
+            pending_fallbacks: Arc::new(Mutex::new(HashSet::new())),
+            stale_repushes: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Enables persistence of the active configuration version/bundle to `path`.
+    #[must_use]
+    pub fn with_state_path(mut self, path: PathBuf) -> Self {
+        self.state_path = Arc::new(Mutex::new(Some(path)));
+        self
+    }
+
+    /// Persists the active bundle and version so a restart continues the
+    /// monotonic sequence instead of resetting to 1 (which slaves reject).
+    fn persist_state(&self) {
+        let path = self.state_path.lock().unwrap().clone();
+        let Some(path) = path else {
+            return;
+        };
+        let Some(bundle) = self.active_bundle.lock().unwrap().clone() else {
+            return;
+        };
+        let payload = match serde_json::to_vec_pretty(&bundle) {
+            Ok(payload) => payload,
+            Err(e) => {
+                error!(error = %e, "Failed to serialize HA master state");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            error!(error = %e, path = %parent.display(), "Failed to create HA state directory");
+            return;
+        }
+        let tmp = path.with_extension("tmp");
+        let write_result = {
+            #[cfg(unix)]
+            {
+                use std::io::Write as _;
+                use std::os::unix::fs::OpenOptionsExt as _;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp)
+                    .and_then(|mut file| file.write_all(&payload))
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(&tmp, &payload)
+            }
+        };
+        if let Err(e) = write_result {
+            error!(error = %e, path = %tmp.display(), "Failed to persist HA master state");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            error!(error = %e, path = %path.display(), "Failed to atomically commit HA master state");
+        }
+    }
+
+    /// Restores the persisted version/bundle, if any.
+    ///
+    /// A corrupt state file is moved aside and treated as absent so a master
+    /// never silently publishes a rollback; the sequence then restarts from a
+    /// fresh v1 only when no state can be recovered.
+    pub fn restore_state(&self) -> Result<Option<u64>, HaError> {
+        let path = self.state_path.lock().unwrap().clone();
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        let data = match std::fs::read_to_string(&path) {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(HaError::Validation {
+                    field: "ha_state".to_string(),
+                    reason: format!("Failed to read {}: {e}", path.display()),
+                });
+            }
+        };
+        let bundle: ConfigBundle = match serde_json::from_str(&data) {
+            Ok(bundle) => bundle,
+            Err(e) => {
+                let backup = path.with_extension(format!("corrupt.{}", Utc::now().timestamp()));
+                if let Err(rename_err) = std::fs::rename(&path, &backup) {
+                    warn!(error = %rename_err, "Failed to move corrupt HA state aside");
+                }
+                warn!(
+                    error = %e,
+                    backup = %backup.display(),
+                    "Corrupt HA state detected; backing up and starting fresh"
+                );
+                return Ok(None);
+            }
+        };
+        if bundle.version == 0 {
+            return Ok(None);
+        }
+        let push = build_and_sign_push(&bundle, &self.signing_key)?;
+        self.current_version.store(bundle.version, Ordering::SeqCst);
+        *self.active_bundle.lock().unwrap() = Some(bundle.clone());
+        *self.active_push.lock().unwrap() = Some(push);
+        #[allow(clippy::cast_precision_loss)]
+        {
+            self.metrics
+                .set_ha_config_version("local", bundle.version as f64);
+            self.metrics
+                .set_ha_config_version(&self.instance_name, bundle.version as f64);
+        }
+        info!(
+            version = bundle.version,
+            "Restored persisted HA master state"
+        );
+        Ok(Some(bundle.version))
     }
 
     /// Sets the heartbeat ping interval (used for the liveness watchdog).
@@ -104,6 +228,7 @@ impl MasterCoordinator {
 
         *self.active_bundle.lock().unwrap() = Some(bundle);
         *self.active_push.lock().unwrap() = Some(push_msg.clone());
+        self.persist_state();
 
         #[allow(clippy::cast_precision_loss)]
         {
@@ -130,23 +255,74 @@ impl MasterCoordinator {
             match slave.sender.try_send(msg.clone()) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Queue is full: do not silently drop the update. Fall back to
-                    // an async send so the message is delivered once there is room.
+                    // Queue is full: do not silently drop the update. Coalesce
+                    // fallback deliveries per slave so a slow or stalled replica
+                    // cannot spawn unbounded tasks; the task sends the latest
+                    // active bundle when the channel has room.
+                    let instance = slave.instance.clone();
+                    let first_schedule = self
+                        .pending_fallbacks
+                        .lock()
+                        .unwrap()
+                        .insert(instance.clone());
+                    if !first_schedule {
+                        debug!(
+                            instance = %instance,
+                            "HA fallback delivery already pending; coalescing push"
+                        );
+                        continue;
+                    }
                     warn!(
-                        instance = %slave.instance,
-                        "HA push queue full; scheduling asynchronous delivery"
+                        instance = %instance,
+                        "HA push queue full; scheduling coalesced asynchronous delivery"
                     );
+                    let coordinator = self.clone();
                     let sender = slave.sender.clone();
-                    let queued = msg.clone();
+                    let fallback = msg.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = sender.send(queued).await {
-                            warn!("Failed to deliver queued HA push: {e}");
+                        // Prefer the latest active bundle; fall back to the
+                        // message that could not be enqueued.
+                        let latest = coordinator
+                            .active_push
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .or(Some(fallback));
+                        if let Some(latest) = latest
+                            && let Err(e) = sender.send(latest).await
+                        {
+                            warn!(instance = %instance, "Failed to deliver queued HA push: {e}");
                         }
+                        coordinator
+                            .pending_fallbacks
+                            .lock()
+                            .unwrap()
+                            .remove(&instance);
                     });
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     debug!(instance = %slave.instance, "HA push channel closed");
                 }
+            }
+        }
+    }
+
+    /// Re-pushes the active bundle to one slave that acknowledged a stale
+    /// version, at most once per acknowledged version to avoid retry loops.
+    fn maybe_repush(&self, instance: &str, stale_version: u64) {
+        let mut repushed = self.stale_repushes.lock().unwrap();
+        if repushed.get(instance) == Some(&stale_version) {
+            return;
+        }
+        repushed.insert(instance.to_string(), stale_version);
+        drop(repushed);
+
+        if let Some(push) = self.active_push.lock().unwrap().clone() {
+            let slaves = self.slaves.lock().unwrap();
+            if let Some(slave) = slaves.get(instance)
+                && let Err(e) = slave.sender.try_send(push)
+            {
+                warn!(instance = %instance, "Catch-up push could not be queued: {e}");
             }
         }
     }
@@ -441,7 +617,8 @@ impl MasterCoordinator {
                 applied,
                 error,
             } => {
-                if applied {
+                let current = self.get_current_version();
+                if applied && version == current {
                     info!(
                         instance = %slave_instance,
                         version,
@@ -454,6 +631,22 @@ impl MasterCoordinator {
                     #[allow(clippy::cast_precision_loss)]
                     self.metrics
                         .set_ha_config_version(slave_instance, version as f64);
+                    self.stale_repushes.lock().unwrap().remove(slave_instance);
+                } else if applied && version < current {
+                    warn!(
+                        instance = %slave_instance,
+                        acked_version = version,
+                        current,
+                        "Slave acknowledged a stale configuration version; re-pushing the active bundle"
+                    );
+                    self.maybe_repush(slave_instance, version);
+                } else if applied {
+                    warn!(
+                        instance = %slave_instance,
+                        acked_version = version,
+                        current,
+                        "Slave acknowledged a configuration version from the future; ignoring"
+                    );
                 } else {
                     warn!(
                         instance = %slave_instance,
@@ -659,6 +852,53 @@ mod tests {
         assert_eq!(coordinator.update_bundle(test_bundle(3)).unwrap(), 3);
     }
 
+    #[test]
+    fn test_state_persists_and_restores_across_restart() {
+        let dir = std::env::temp_dir().join(format!("sito_ha_state_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("ha_state.toml");
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+
+        let first = MasterCoordinator::new(
+            "test-master".to_string(),
+            0,
+            key.clone(),
+            sito_stats::MetricsRegistry::new("test", "test"),
+        )
+        .with_state_path(state_path.clone());
+        assert_eq!(first.restore_state().unwrap(), None);
+        assert_eq!(first.update_bundle(test_bundle(1)).unwrap(), 1);
+        assert_eq!(first.update_bundle(test_bundle(2)).unwrap(), 2);
+
+        // Simulate a restart: the same signing key and state path must resume
+        // at v2 instead of resetting to v1 (which slaves reject as a rollback).
+        let second = MasterCoordinator::new(
+            "test-master".to_string(),
+            0,
+            key,
+            sito_stats::MetricsRegistry::new("test", "test"),
+        )
+        .with_state_path(state_path.clone());
+        assert_eq!(second.restore_state().unwrap(), Some(2));
+        assert_eq!(second.get_current_version(), 2);
+        assert!(second.update_bundle(test_bundle(2)).is_err());
+        assert_eq!(second.update_bundle(test_bundle(3)).unwrap(), 3);
+
+        // Corrupt state is moved aside and treated as absent.
+        std::fs::write(&state_path, "not-json").unwrap();
+        let third = MasterCoordinator::new(
+            "test-master".to_string(),
+            0,
+            Arc::new(Ed25519SigningKey::generate().unwrap()),
+            sito_stats::MetricsRegistry::new("test", "test"),
+        )
+        .with_state_path(state_path.clone());
+        assert_eq!(third.restore_state().unwrap(), None);
+        assert_eq!(third.update_bundle(test_bundle(1)).unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn test_broadcast_falls_back_to_async_delivery_when_queue_full() {
         let coordinator = test_coordinator();
@@ -683,13 +923,14 @@ mod tests {
 
         coordinator.broadcast(&HaMessage::Ping { ts: 2 });
 
-        // First message drains the queue; the queued fallback push follows.
+        // First message drains the queue; the coalesced fallback delivers the
+        // latest active configuration bundle (not the superseded broadcast).
         assert!(rx.recv().await.is_some());
         let delivered = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("fallback delivery timed out")
             .expect("channel closed");
-        assert!(matches!(delivered, HaMessage::Ping { ts: 2 }));
+        assert!(matches!(delivered, HaMessage::ConfigPush { .. }));
 
         // Cleanup removes the per-instance metric label.
         coordinator.metrics.set_ha_config_version("slave-1", 1.0);

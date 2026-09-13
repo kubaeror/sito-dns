@@ -26,6 +26,7 @@ use sito_ha::{
     verify_and_unpack_push,
 };
 use sito_stats::{MetricsRegistry, QueryLogWriter, StatsDb};
+use sito_test::wait_until;
 use sito_upstream::UpstreamManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -185,7 +186,13 @@ async fn test_m8_mtls_handshake_rejects_foreign_cert() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let _server_handle = spawn_master_server(master_ha_cfg, coordinator.clone(), shutdown_rx);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let master_ready = wait_until(Duration::from_secs(3), || async {
+        tokio::net::TcpStream::connect(("127.0.0.1", replication_port))
+            .await
+            .is_ok()
+    })
+    .await;
+    assert!(master_ready, "master replication listener did not start");
 
     // Connect with foreign cert/key (signed by different CA or unpinned fingerprint)
     let foreign_slave_cfg = HaConfig {
@@ -228,9 +235,17 @@ async fn test_m8_mtls_handshake_rejects_foreign_cert() {
         foreign_shutdown_rx,
     );
 
-    // Wait a brief moment and verify that foreign slave could NOT sync
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_ne!(foreign_tracker.get_state(), SlaveState::Synced);
+    // Give the foreign slave a bounded window to (incorrectly) sync; it must
+    // never reach Synced.
+    let synced = wait_until(Duration::from_millis(600), || {
+        let tracker = foreign_tracker.clone();
+        async move { tracker.get_state() == SlaveState::Synced }
+    })
+    .await;
+    assert!(
+        !synced,
+        "foreign slave with an unpinned certificate must not sync"
+    );
     assert_eq!(coordinator.connected_slave_count(), 0);
 
     let _ = foreign_shutdown_tx.send(true);
@@ -646,7 +661,13 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let _server = spawn_master_server(master_ha_cfg, coordinator.clone(), shutdown_rx);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let master_ready = wait_until(Duration::from_secs(3), || async {
+        tokio::net::TcpStream::connect(("127.0.0.1", replication_port))
+            .await
+            .is_ok()
+    })
+    .await;
+    assert!(master_ready, "master replication listener did not start");
 
     // Slave 1
     let slave1_tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None);
@@ -721,16 +742,15 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
     );
 
     // Wait for both slaves to connect
-    for _ in 0..30 {
-        if coordinator.connected_slave_count() == 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let connected = wait_until(Duration::from_secs(3), || {
+        let coordinator = coordinator.clone();
+        async move { coordinator.connected_slave_count() == 2 }
+    })
+    .await;
+    assert!(connected, "both slaves must connect");
     assert_eq!(coordinator.connected_slave_count(), 2);
 
     // Now update bundle on master: add a new custom rule
-    let start_time = Instant::now();
     let bundle = ConfigBundle {
         version: 2,
         timestamp: 12345,
@@ -749,15 +769,12 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
     } else {
         Duration::from_secs(15)
     };
-    let mut both_synced = false;
-    while start_time.elapsed() < sync_deadline {
-        if slave1_tracker.get_version() == 2 && slave2_tracker.get_version() == 2 {
-            both_synced = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
+    let both_synced = wait_until(sync_deadline, || {
+        let s1 = slave1_tracker.clone();
+        let s2 = slave2_tracker.clone();
+        async move { s1.get_version() == 2 && s2.get_version() == 2 }
+    })
+    .await;
     assert!(
         both_synced,
         "Both slaves must apply change before the sync deadline"
@@ -814,7 +831,13 @@ async fn test_m8_chaos_master_mid_push_kill() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let _server = spawn_master_server(master_ha_cfg, coordinator.clone(), shutdown_rx);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let master_ready = wait_until(Duration::from_secs(3), || async {
+        tokio::net::TcpStream::connect(("127.0.0.1", replication_port))
+            .await
+            .is_ok()
+    })
+    .await;
+    assert!(master_ready, "master replication listener did not start");
 
     let slave_tracker = SlaveStatusTracker::new("slave-chaos".to_string(), 1, None);
     let slave_cfg = Config::default();
@@ -851,12 +874,12 @@ async fn test_m8_chaos_master_mid_push_kill() {
         shutdown_tx.subscribe(),
     );
 
-    for _ in 0..30 {
-        if coordinator.connected_slave_count() == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let connected = wait_until(Duration::from_secs(3), || {
+        let coordinator = coordinator.clone();
+        async move { coordinator.connected_slave_count() == 1 }
+    })
+    .await;
+    assert!(connected, "chaos slave must connect");
 
     // Publish a bundle and kill the master while the push is in flight.
     let bundle = ConfigBundle {

@@ -13,6 +13,28 @@ pub struct ClientsConfig {
     pub entries: Vec<ClientEntryConfig>,
     #[serde(default)]
     pub groups: HashMap<String, ClientGroupConfig>,
+    /// Shared secrets enabling DoH path / DoT SNI client authentication,
+    /// keyed by the client entry `name`.
+    ///
+    /// Empty by default ("off"): DoH path and DoT SNI values never grant a
+    /// client entry's group/upstreams/trusted policy on their own, because
+    /// those values are attacker-controlled (any client may present
+    /// `/dns-query/<name>` or `<name>.dns.example.com`) and usually guessable.
+    /// When an entry is listed here, a client presenting the exact secret as
+    /// its DoH path segment or as the first label of the DoT/DoQ SNI is
+    /// identified as that entry. Secrets are compared byte-for-byte; use
+    /// lowercase values for SNI authentication (DNS names are lowercased).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub client_id_secrets: HashMap<String, String>,
+    /// Trust RouterOS DHCP lease `host-name`/`comment` values as client
+    /// identity (default `false`).
+    ///
+    /// Lease names are client-controlled (a DHCP client picks its own
+    /// hostname), so by default they are informational only and never map to
+    /// a client entry's group/trusted policy. Enable only on a trusted LAN
+    /// where DHCP leases are managed by the operator.
+    #[serde(default)]
+    pub trust_routeros_lease_names: bool,
 }
 
 fn default_group() -> String {
@@ -133,5 +155,31 @@ schedule = "0 0 15-21 * * MON-FRI"
         assert!(kids_group.schedule_enabled);
         assert_eq!(kids_group.blocked_services.len(), 1);
         assert_eq!(kids_group.blocked_services[0].service, "tiktok");
+    }
+
+    #[test]
+    fn test_client_id_secrets_and_routeros_trust_default_off() {
+        let toml_str = r#"
+            client_id_secrets = { "Jane's Phone" = "jane-shared-secret" }
+            trust_routeros_lease_names = true
+
+            [[entries]]
+            name = "Jane's Phone"
+            ids = ["192.168.1.20"]
+        "#;
+        let cfg: ClientsConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.client_id_secrets
+                .get("Jane's Phone")
+                .map(String::as_str),
+            Some("jane-shared-secret")
+        );
+        assert!(cfg.trust_routeros_lease_names);
+
+        // Both settings are opt-in: absent means path/SNI identity off and
+        // RouterOS lease names untrusted.
+        let defaults: ClientsConfig = toml::from_str("").unwrap();
+        assert!(defaults.client_id_secrets.is_empty());
+        assert!(!defaults.trust_routeros_lease_names);
     }
 }

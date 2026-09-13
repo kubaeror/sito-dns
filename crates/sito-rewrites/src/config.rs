@@ -6,13 +6,33 @@ fn default_true() -> bool {
     true
 }
 
+fn default_ttl() -> u32 {
+    60
+}
+
 /// Rewrites configuration table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RewritesConfig {
     #[serde(default = "default_true")]
     pub auto_ptr: bool,
+    /// TTL (seconds) applied to synthesized local rewrite records.
+    ///
+    /// Defaults to 60. Values are passed through to clients as-is; the local
+    /// records are not cached by this resolver.
+    #[serde(default = "default_ttl")]
+    pub ttl: u32,
     #[serde(default)]
     pub entries: Vec<RewriteEntryConfig>,
+}
+
+impl Default for RewritesConfig {
+    fn default() -> Self {
+        Self {
+            auto_ptr: false,
+            ttl: default_ttl(),
+            entries: Vec::new(),
+        }
+    }
 }
 
 /// A single local DNS rewrite rule.

@@ -4,13 +4,19 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
+
+/// Bounded wait for the TLS handshake; slowloris clients must not hold a
+/// connection permit indefinitely.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Extension, Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
@@ -204,7 +210,7 @@ async fn handle_doh_request<H: QueryHandler>(
 
 async fn doh_route<H: QueryHandler>(
     State(state): State<Arc<DohState<H>>>,
-    Extension(peer_addr): Extension<SocketAddr>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     method: Method,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
@@ -215,7 +221,7 @@ async fn doh_route<H: QueryHandler>(
 
 async fn doh_route_with_client<H: QueryHandler>(
     State(state): State<Arc<DohState<H>>>,
-    Extension(peer_addr): Extension<SocketAddr>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Path(client_id): Path<String>,
     method: Method,
     headers: HeaderMap,
@@ -232,6 +238,32 @@ async fn doh_route_with_client<H: QueryHandler>(
         body,
     )
     .await
+}
+
+/// Inserts the connection's peer address into every request as a
+/// [`ConnectInfo`] extension.
+///
+/// The router is built once at listener startup; this wrapper is the only
+/// per-connection state, so accepted connections no longer rebuild a
+/// middleware layer around the whole stack.
+#[derive(Clone, Copy)]
+struct InsertPeerAddr<S> {
+    inner: S,
+    peer_addr: SocketAddr,
+}
+
+impl<S, B> hyper::service::Service<hyper::Request<B>> for InsertPeerAddr<S>
+where
+    S: hyper::service::Service<hyper::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn call(&self, mut req: hyper::Request<B>) -> Self::Future {
+        req.extensions_mut().insert(ConnectInfo(self.peer_addr));
+        self.inner.call(req)
+    }
 }
 
 /// Start the DNS over HTTPS listener.
@@ -267,6 +299,10 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
         .route("/dns-query/{client_id}", any(doh_route_with_client::<H>))
         .with_state(state);
 
+    // Built once: `TowerToHyperService` is `Copy` and the router clone is
+    // `Arc`-cheap, so no per-connection stack construction is needed.
+    let router_service = TowerToHyperService::new(app);
+
     let semaphore = Arc::new(Semaphore::new(config.max_connections));
     let acceptor_mgr = config.acceptor_mgr;
 
@@ -296,33 +332,34 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
                         continue;
                     };
 
-                    let app = app.clone();
+                    let hyper_service = InsertPeerAddr {
+                        inner: router_service.clone(),
+                        peer_addr,
+                    };
                     let maybe_mgr = acceptor_mgr.clone();
 
                     tokio::spawn(async move {
                         let _permit = permit;
 
-                        let connection_app = app.clone().layer(axum::middleware::from_fn(
-                            move |mut req: axum::extract::Request, next: axum::middleware::Next| {
-                                req.extensions_mut().insert(peer_addr);
-                                next.run(req)
-                            },
-                        ));
-
-                        let hyper_service = TowerToHyperService::new(connection_app);
-
                         if let Some(mgr) = maybe_mgr {
                             let acceptor = mgr.acceptor();
-                            match acceptor.accept(tcp_stream).await {
-                                Ok(tls_stream) => {
+                            match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp_stream)).await {
+                                Ok(Ok(tls_stream)) => {
                                     let io = TokioIo::new(tls_stream);
                                     let conn_builder = ConnBuilder::new(TokioExecutor::new());
                                     if let Err(e) = conn_builder.serve_connection_with_upgrades(io, hyper_service).await {
                                         trace!("DoH TLS connection error for {}: {}", peer_addr, e);
                                     }
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     debug!("DoH TLS handshake error for {}: {}", peer_addr, e);
+                                }
+                                Err(_) => {
+                                    debug!(
+                                        "DoH TLS handshake timed out after {}s for {}",
+                                        TLS_HANDSHAKE_TIMEOUT.as_secs(),
+                                        peer_addr
+                                    );
                                 }
                             }
                         } else {
@@ -358,5 +395,62 @@ mod tests {
 
         let empty = HeaderMap::new();
         assert!(!host_matches(&empty, "dns.example.com"));
+    }
+
+    /// The per-connection `ConnectInfo` extension must reach the route
+    /// handlers as the peer address (replacing the per-connection middleware
+    /// layer built by the previous implementation).
+    #[tokio::test]
+    async fn test_doh_connect_info_peer_addr_reaches_handler() {
+        use sito_proto::{Message, MessageType, Name, OpCode, Query, RecordType};
+        use std::str::FromStr;
+        use std::sync::Mutex;
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let seen: Arc<Mutex<Option<ClientContext>>> = Arc::new(Mutex::new(None));
+        let seen_handler = Arc::clone(&seen);
+        let handler = move |query: Message, client: ClientContext| {
+            let seen = Arc::clone(&seen_handler);
+            async move {
+                *seen.lock().unwrap() = Some(client);
+                let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                resp.queries = query.queries.clone();
+                Some(resp)
+            }
+        };
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = start_doh_listener(DohConfig::new(addr, None), Arc::new(handler), shutdown_rx)
+            .await
+            .unwrap();
+
+        let mut query = Message::new(7001, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("connect-info.example.").unwrap(),
+            RecordType::A,
+        ));
+        let wire = encode_message(&query).unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/dns-query"))
+            .header("Content-Type", "application/dns-message")
+            .body(wire)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body = resp.bytes().await.unwrap();
+        let dns_resp = decode_message(&body).unwrap();
+        assert_eq!(dns_resp.metadata.id, 7001);
+
+        let observed = seen.lock().unwrap().clone().expect("handler must run");
+        assert_eq!(observed.ip, std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(observed.proto, "doh");
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
     }
 }

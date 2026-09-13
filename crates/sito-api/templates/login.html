@@ -30,7 +30,7 @@
 
       <div class="form-group">
         <label class="form-label" for="totp">TOTP 2FA Code <span style="font-weight: 400; color: var(--text-muted);">(if enabled)</span></label>
-        <input class="form-input" type="text" id="totp" name="totp" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" placeholder="123456">
+        <input class="form-input" type="text" id="totp" name="totp" inputmode="numeric" pattern="[A-Za-z0-9 -]*" maxlength="64" autocomplete="one-time-code" placeholder="123456 or backup code">
       </div>
 
       <button type="submit" class="btn btn-primary" style="width: 100%; margin-top: 8px; padding: 10px;">

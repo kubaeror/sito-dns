@@ -1,12 +1,13 @@
 //! DNS rewrite table implementation supporting exact, wildcard, CNAME chains, and auto-PTR.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, PTR, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use sito_core::client::ClientContext;
+use tracing::warn;
 
 use crate::config::RewritesConfig;
 
@@ -34,11 +35,23 @@ struct StoredRule {
 }
 
 /// In-memory table of local DNS rewrites.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RewriteTable {
     exact: HashMap<(String, RecordType), Vec<StoredRule>>,
     wildcards: Vec<StoredRule>,
     auto_ptr: HashMap<String, StoredRule>,
+    ttl: u32,
+}
+
+impl Default for RewriteTable {
+    fn default() -> Self {
+        Self {
+            exact: HashMap::new(),
+            wildcards: Vec::new(),
+            auto_ptr: HashMap::new(),
+            ttl: DEFAULT_REWRITE_TTL,
+        }
+    }
 }
 
 impl RewriteTable {
@@ -46,6 +59,9 @@ impl RewriteTable {
         let mut exact: HashMap<(String, RecordType), Vec<StoredRule>> = HashMap::new();
         let mut wildcards = Vec::new();
         let mut auto_ptr_candidates = Vec::new();
+        // A TTL of zero would make records uncacheable; keep the historical
+        // 60s floor so a misconfigured `ttl = 0` degrades gracefully.
+        let ttl = config.ttl.max(1);
 
         for entry in config.entries {
             let Some((record_type, rdata)) = parse_entry_record(&entry.r#type, &entry.answer)
@@ -76,9 +92,10 @@ impl RewriteTable {
                     .push(rule.clone());
 
                 if config.auto_ptr {
-                    // Check if candidate for auto-PTR (non-wildcard A or AAAA to RFC1918/ULA)
+                    // Check if candidate for auto-PTR (non-wildcard A or AAAA
+                    // to a non-globally-routable address).
                     if let LocalRecordData::A(ipv4) = rdata {
-                        if is_rfc1918(&ipv4) {
+                        if is_auto_ptr_candidate_v4(&ipv4) {
                             let ptr_name = ipv4_to_in_addr_arpa(&ipv4);
                             if let Ok(target_name) = Name::from_str(&format!("{norm_domain}.")) {
                                 auto_ptr_candidates.push((
@@ -124,6 +141,7 @@ impl RewriteTable {
             exact,
             wildcards,
             auto_ptr,
+            ttl,
         }
     }
 
@@ -157,12 +175,16 @@ impl RewriteTable {
         }
         visited.push(qname_str.clone());
 
-        // 1. Check exact match
+        // 1. Exact match: return every non-excepted rule for (qname, qtype)
+        //    in configuration order.
         if let Some(rules) = self.exact.get(&(qname_str.clone(), qtype)) {
-            for rule in rules {
-                if !is_client_excepted(client, &rule.exception_clients) {
-                    return Some(vec![build_record(qname, &rule.data)]);
-                }
+            let answers: Vec<Record> = rules
+                .iter()
+                .filter(|rule| !is_client_excepted(client, &rule.exception_clients))
+                .map(|rule| self.build_record(qname, &rule.data))
+                .collect();
+            if !answers.is_empty() {
+                return Some(answers);
             }
         }
 
@@ -174,14 +196,7 @@ impl RewriteTable {
                 if !is_client_excepted(client, &rule.exception_clients)
                     && let LocalRecordData::Cname(ref target) = rule.data
                 {
-                    let mut answers = vec![build_record(qname, &rule.data)];
-                    // Chain resolution: check if target is also in our rewrite table
-                    if let Some(target_answers) =
-                        self.lookup_inner(target, qtype, client, visited, depth + 1)
-                    {
-                        answers.extend(target_answers);
-                    }
-                    return Some(answers);
+                    return self.resolve_cname(qname, target, qtype, client, visited, depth);
                 }
             }
         }
@@ -191,10 +206,15 @@ impl RewriteTable {
             && let Some(rule) = self.auto_ptr.get(&qname_str)
             && !is_client_excepted(client, &rule.exception_clients)
         {
-            return Some(vec![build_record(qname, &rule.data)]);
+            return Some(vec![self.build_record(qname, &rule.data)]);
         }
 
-        // 4. Check wildcard rules
+        // 4. Check wildcard rules. The most specific (longest) matching suffix
+        //    wins deterministically, independent of configuration order; all
+        //    rules for the queried type at that specificity are returned in
+        //    configuration order.
+        let mut best_suffix_len: Option<usize> = None;
+        let mut matched: Vec<&StoredRule> = Vec::new();
         for rule in &self.wildcards {
             if is_client_excepted(client, &rule.exception_clients) {
                 continue;
@@ -204,25 +224,90 @@ impl RewriteTable {
                 continue;
             }
 
-            if let Some(ref suffix) = rule.wildcard_suffix
-                && matches_wildcard(&qname_str, suffix)
-            {
-                if rule.record_type == RecordType::CNAME
-                    && let LocalRecordData::Cname(ref target) = rule.data
-                {
-                    let mut answers = vec![build_record(qname, &rule.data)];
-                    if let Some(target_answers) =
-                        self.lookup_inner(target, qtype, client, visited, depth + 1)
-                    {
-                        answers.extend(target_answers);
-                    }
-                    return Some(answers);
-                }
-                return Some(vec![build_record(qname, &rule.data)]);
+            let Some(ref suffix) = rule.wildcard_suffix else {
+                continue;
+            };
+            if !matches_wildcard(&qname_str, suffix) {
+                continue;
             }
+
+            match best_suffix_len {
+                Some(len) if suffix.len() < len => continue,
+                Some(len) if suffix.len() == len => {}
+                _ => {
+                    best_suffix_len = Some(suffix.len());
+                    matched.clear();
+                }
+            }
+            matched.push(rule);
+        }
+
+        let preferred: Vec<&StoredRule> = matched
+            .iter()
+            .copied()
+            .filter(|rule| rule.record_type == qtype)
+            .collect();
+        if !preferred.is_empty() {
+            return Some(
+                preferred
+                    .iter()
+                    .map(|rule| self.build_record(qname, &rule.data))
+                    .collect(),
+            );
+        }
+        if let Some(rule) = matched
+            .iter()
+            .copied()
+            .find(|rule| rule.record_type == RecordType::CNAME)
+            && let LocalRecordData::Cname(ref target) = rule.data
+        {
+            return self.resolve_cname(qname, target, qtype, client, visited, depth);
         }
 
         None
+    }
+
+    /// Builds the CNAME answer for `qname -> target` and follows the chain.
+    ///
+    /// When `target` is already on the resolution path the closing CNAME is
+    /// suppressed (and logged) so a cycle in the table never reaches clients;
+    /// only the valid prefix of the chain is returned.
+    fn resolve_cname(
+        &self,
+        qname: &Name,
+        target: &Name,
+        qtype: RecordType,
+        client: &ClientContext,
+        visited: &mut Vec<String>,
+        depth: usize,
+    ) -> Option<Vec<Record>> {
+        let target_key = normalize_domain_key(&target.to_string());
+        if visited.iter().any(|seen| seen == &target_key) {
+            warn!(
+                qname = %qname,
+                target = %target,
+                "CNAME cycle detected in rewrite table; suppressing closing record"
+            );
+            return None;
+        }
+
+        let mut answers = vec![self.build_record(qname, &LocalRecordData::Cname(target.clone()))];
+        if let Some(target_answers) = self.lookup_inner(target, qtype, client, visited, depth + 1) {
+            answers.extend(target_answers);
+        }
+        Some(answers)
+    }
+
+    fn build_record(&self, qname: &Name, data: &LocalRecordData) -> Record {
+        let rdata = match data {
+            LocalRecordData::A(ip) => RData::A(A(*ip)),
+            LocalRecordData::AAAA(ip) => RData::AAAA(AAAA(*ip)),
+            LocalRecordData::Cname(target) => RData::CNAME(CNAME(target.clone())),
+            LocalRecordData::Ptr(target) => RData::PTR(PTR(target.clone())),
+            LocalRecordData::Txt(strings) => RData::TXT(TXT::new(strings.clone())),
+        };
+
+        Record::from_rdata(qname.clone(), self.ttl, rdata)
     }
 }
 
@@ -234,6 +319,13 @@ fn is_client_excepted(client: &ClientContext, exceptions: &[String]) -> bool {
     let client_ip_str = client.ip.to_string();
 
     for exc in exceptions {
+        // CIDR exceptions (e.g. `10.0.0.0/8`, `fd00::/8`) match by address
+        // range; they are checked before the exact-string comparisons.
+        if let Some((network, prefix)) = parse_cidr(exc)
+            && ip_in_cidr(network, prefix, client.ip)
+        {
+            return true;
+        }
         if exc.eq_ignore_ascii_case(&client_ip_str) {
             return true;
         }
@@ -242,7 +334,13 @@ fn is_client_excepted(client: &ClientContext, exceptions: &[String]) -> bool {
         {
             return true;
         }
-        if let Some(ref id) = client.id
+        // `client.id` may carry a client-supplied DoH path segment or SNI
+        // label when the client was NOT identified, so only honour it for
+        // clients that resolved to an entry (mirrors the Secret gate in the
+        // client registry). Otherwise `/dns-query/<exception>` could bypass a
+        // rewrite exception without authenticating.
+        if client.client_name.is_some()
+            && let Some(ref id) = client.id
             && exc.eq_ignore_ascii_case(id.as_str())
         {
             return true;
@@ -262,16 +360,48 @@ fn is_client_excepted(client: &ClientContext, exceptions: &[String]) -> bool {
     false
 }
 
-fn build_record(qname: &Name, data: &LocalRecordData) -> Record {
-    let rdata = match data {
-        LocalRecordData::A(ip) => RData::A(A(*ip)),
-        LocalRecordData::AAAA(ip) => RData::AAAA(AAAA(*ip)),
-        LocalRecordData::Cname(target) => RData::CNAME(CNAME(target.clone())),
-        LocalRecordData::Ptr(target) => RData::PTR(PTR(target.clone())),
-        LocalRecordData::Txt(strings) => RData::TXT(TXT::new(strings.clone())),
+/// Parses `address/prefix` CIDR notation into an IP address and prefix length.
+fn parse_cidr(value: &str) -> Option<(IpAddr, u8)> {
+    let (addr, prefix) = value.split_once('/')?;
+    let addr = addr.trim().parse::<IpAddr>().ok()?;
+    let prefix = prefix.trim().parse::<u8>().ok()?;
+    let max_prefix = match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
     };
+    if prefix > max_prefix {
+        return None;
+    }
+    Some((addr, prefix))
+}
 
-    Record::from_rdata(qname.clone(), DEFAULT_REWRITE_TTL, rdata)
+/// Checks whether `target` falls inside `network/prefix`.
+fn ip_in_cidr(network: IpAddr, prefix: u8, target: IpAddr) -> bool {
+    match (network, target) {
+        (IpAddr::V4(net), IpAddr::V4(tgt)) => {
+            if prefix == 0 {
+                return true;
+            }
+            let mask = if prefix >= 32 {
+                u32::MAX
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (u32::from(net) & mask) == (u32::from(tgt) & mask)
+        }
+        (IpAddr::V6(net), IpAddr::V6(tgt)) => {
+            if prefix == 0 {
+                return true;
+            }
+            let mask = if prefix >= 128 {
+                u128::MAX
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (u128::from(net) & mask) == (u128::from(tgt) & mask)
+        }
+        _ => false,
+    }
 }
 
 fn normalize_domain_key(domain: &str) -> String {
@@ -322,6 +452,33 @@ pub fn is_rfc1918(ip: &Ipv4Addr) -> bool {
     }
     // 192.168.0.0/16
     if octets[0] == 192 && octets[1] == 168 {
+        return true;
+    }
+    false
+}
+
+/// Checks whether an IPv4 address is a non-globally-routable address that
+/// deserves an auto-generated reverse (PTR) record.
+///
+/// Beyond RFC1918 space this covers loopback (`127.0.0.0/8`), link-local
+/// (`169.254.0.0/16`) and carrier-grade NAT (`100.64.0.0/10`, RFC 6598),
+/// which are the ranges typically used by home/office LANs that configure
+/// local rewrites.
+pub fn is_auto_ptr_candidate_v4(ip: &Ipv4Addr) -> bool {
+    if is_rfc1918(ip) {
+        return true;
+    }
+    let octets = ip.octets();
+    // 127.0.0.0/8 loopback
+    if octets[0] == 127 {
+        return true;
+    }
+    // 169.254.0.0/16 link-local
+    if octets[0] == 169 && octets[1] == 254 {
+        return true;
+    }
+    // 100.64.0.0/10 CGNAT (RFC 6598)
+    if octets[0] == 100 && (64..=127).contains(&octets[1]) {
         return true;
     }
     false
@@ -422,7 +579,7 @@ entries = [
     }
 
     #[test]
-    fn test_cname_cycle_does_not_overflow() {
+    fn test_cname_cycle_returns_valid_prefix_only() {
         let toml_str = r#"
 auto_ptr = false
 entries = [
@@ -433,18 +590,205 @@ entries = [
         let cfg: RewritesConfig = toml::from_str(toml_str).unwrap();
         let table = RewriteTable::new(cfg);
         let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
-        let qname = Name::from_str("a.lan.").unwrap();
 
-        // Must terminate (loop protection) instead of recursing until stack overflow.
-        let answers = table.lookup(&qname, RecordType::A, &client);
-        assert!(answers.is_some());
-        assert!(
-            answers
-                .unwrap()
-                .iter()
-                .all(|r| r.record_type() == RecordType::CNAME),
-            "cycle resolution should stop at the CNAME chain limit"
+        // From `a.lan` only the first (valid) CNAME may be returned; the
+        // closing `b.lan -> a.lan` record must be suppressed.
+        let answers = table
+            .lookup(&Name::from_str("a.lan.").unwrap(), RecordType::A, &client)
+            .expect("valid prefix must be returned");
+        assert_eq!(answers.len(), 1, "closing cycle record must be suppressed");
+        assert_eq!(answers[0].record_type(), RecordType::CNAME);
+        assert_eq!(
+            answers[0].data,
+            RData::CNAME(CNAME(Name::from_str("b.lan.").unwrap()))
         );
+
+        // The same holds when the cycle is entered from `b.lan`.
+        let answers_b = table
+            .lookup(&Name::from_str("b.lan.").unwrap(), RecordType::A, &client)
+            .expect("valid prefix must be returned");
+        assert_eq!(answers_b.len(), 1);
+        assert_eq!(
+            answers_b[0].data,
+            RData::CNAME(CNAME(Name::from_str("a.lan.").unwrap()))
+        );
+    }
+
+    #[test]
+    fn test_self_referencing_cname_is_suppressed() {
+        let toml_str = r#"
+auto_ptr = false
+entries = [
+    { domain = "loop.lan", type = "CNAME", answer = "loop.lan" }
+]
+"#;
+        let cfg: RewritesConfig = toml::from_str(toml_str).unwrap();
+        let table = RewriteTable::new(cfg);
+        let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+
+        // A self-referencing CNAME resolves to no answer (the pipeline falls
+        // through to upstream/blocking stages instead of emitting a loop).
+        assert!(
+            table
+                .lookup(
+                    &Name::from_str("loop.lan.").unwrap(),
+                    RecordType::A,
+                    &client
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_exact_match_returns_all_answers_in_order() {
+        let toml_str = r#"
+auto_ptr = false
+entries = [
+    { domain = "multi.lan", type = "A", answer = "192.168.1.10" },
+    { domain = "multi.lan", type = "A", answer = "192.168.1.11" },
+    { domain = "multi.lan", type = "A", answer = "192.168.1.12" }
+]
+"#;
+        let cfg: RewritesConfig = toml::from_str(toml_str).unwrap();
+        let table = RewriteTable::new(cfg);
+        let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+
+        let answers = table
+            .lookup(
+                &Name::from_str("multi.lan.").unwrap(),
+                RecordType::A,
+                &client,
+            )
+            .unwrap();
+        assert_eq!(answers.len(), 3, "every rule for (domain, type) must match");
+        let ips: Vec<Ipv4Addr> = answers
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ips,
+            vec![
+                Ipv4Addr::new(192, 168, 1, 10),
+                Ipv4Addr::new(192, 168, 1, 11),
+                Ipv4Addr::new(192, 168, 1, 12),
+            ],
+            "answer order must be stable (configuration order)"
+        );
+    }
+
+    #[test]
+    fn test_wildcard_specificity_beats_insertion_order() {
+        // The less specific wildcard is configured first on purpose: the
+        // longest matching suffix must win deterministically.
+        let toml_str = r#"
+auto_ptr = false
+entries = [
+    { domain = "*.home.arpa", type = "A", answer = "192.168.1.10" },
+    { domain = "*.sub.home.arpa", type = "A", answer = "192.168.1.20" },
+    { domain = "*.home.arpa", type = "A", answer = "192.168.1.11" }
+]
+"#;
+        let cfg: RewritesConfig = toml::from_str(toml_str).unwrap();
+        let table = RewriteTable::new(cfg);
+        let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+
+        // `x.sub.home.arpa` is covered by both suffixes; only the most
+        // specific one may answer.
+        let deep = table
+            .lookup(
+                &Name::from_str("x.sub.home.arpa.").unwrap(),
+                RecordType::A,
+                &client,
+            )
+            .unwrap();
+        assert_eq!(deep.len(), 1);
+        assert_eq!(deep[0].data, RData::A(A(Ipv4Addr::new(192, 168, 1, 20))));
+
+        // `x.home.arpa` only matches `*.home.arpa`; both same-suffix rules
+        // answer, in configuration order.
+        let shallow = table
+            .lookup(
+                &Name::from_str("x.home.arpa.").unwrap(),
+                RecordType::A,
+                &client,
+            )
+            .unwrap();
+        assert_eq!(shallow.len(), 2);
+        assert_eq!(shallow[0].data, RData::A(A(Ipv4Addr::new(192, 168, 1, 10))));
+        assert_eq!(shallow[1].data, RData::A(A(Ipv4Addr::new(192, 168, 1, 11))));
+    }
+
+    #[test]
+    fn test_exception_clients_support_cidr() {
+        let toml_str = r#"
+auto_ptr = false
+entries = [
+    { domain = "*.lab.lan", type = "A", answer = "10.0.0.5", exception_clients = ["10.10.0.0/16", "fd00::/8"] },
+]
+"#;
+        let cfg: RewritesConfig = toml::from_str(toml_str).unwrap();
+        let table = RewriteTable::new(cfg);
+        let qname = Name::from_str("nas.lab.lan.").unwrap();
+
+        // In-range IPv4 client is excepted.
+        let excepted = ClientContext::new(IpAddr::from_str("10.10.4.7").unwrap());
+        assert!(table.lookup(&qname, RecordType::A, &excepted).is_none());
+
+        // In-range IPv6 client is excepted.
+        let excepted_v6 = ClientContext::new(IpAddr::from_str("fd00::7").unwrap());
+        assert!(table.lookup(&qname, RecordType::A, &excepted_v6).is_none());
+
+        // Out-of-range client still receives the rewrite.
+        let allowed = ClientContext::new(IpAddr::from_str("10.11.0.1").unwrap());
+        assert!(table.lookup(&qname, RecordType::A, &allowed).is_some());
+        let allowed_v6 = ClientContext::new(IpAddr::from_str("fe80::1").unwrap());
+        assert!(table.lookup(&qname, RecordType::A, &allowed_v6).is_some());
+    }
+
+    #[test]
+    fn test_configurable_rewrite_ttl() {
+        let toml_str = r#"
+auto_ptr = false
+ttl = 120
+entries = [
+    { domain = "printer.lan", type = "A", answer = "192.168.1.50" },
+]
+"#;
+        let cfg: RewritesConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ttl, 120);
+        let table = RewriteTable::new(cfg);
+        let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+        let answers = table
+            .lookup(
+                &Name::from_str("printer.lan.").unwrap(),
+                RecordType::A,
+                &client,
+            )
+            .unwrap();
+        assert_eq!(answers[0].ttl, 120);
+
+        // Absent `ttl` keeps the historical 60s default.
+        let default_cfg: RewritesConfig = toml::from_str("auto_ptr = false\nentries = []").unwrap();
+        assert_eq!(default_cfg.ttl, 60);
+        let default_table = RewriteTable::new(default_cfg);
+        assert_eq!(default_table.ttl, 60);
+    }
+
+    #[test]
+    fn test_auto_ptr_includes_cgnat_link_local_and_loopback() {
+        assert!(is_auto_ptr_candidate_v4(&Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(is_auto_ptr_candidate_v4(&Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(is_auto_ptr_candidate_v4(&Ipv4Addr::new(100, 127, 255, 254)));
+        assert!(is_auto_ptr_candidate_v4(&Ipv4Addr::new(169, 254, 1, 1)));
+        assert!(is_auto_ptr_candidate_v4(&Ipv4Addr::LOCALHOST));
+        assert!(!is_auto_ptr_candidate_v4(&Ipv4Addr::new(100, 128, 0, 1)));
+        assert!(!is_auto_ptr_candidate_v4(&Ipv4Addr::new(8, 8, 8, 8)));
+        // `is_rfc1918` keeps its strict RFC1918 meaning.
+        assert!(!is_rfc1918(&Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(!is_rfc1918(&Ipv4Addr::LOCALHOST));
     }
 
     #[test]
@@ -496,6 +840,31 @@ entries = [
         assert_eq!(answers_v6.len(), 1);
         let expected_v6_target = Name::from_str("printer-v6.lan.").unwrap();
         assert_eq!(answers_v6[0].data, RData::PTR(PTR(expected_v6_target)));
+    }
+
+    #[test]
+    fn test_unidentified_client_id_does_not_bypass_exception() {
+        let table = sample_table();
+        let mut attacker = ClientContext::new(IpAddr::from_str("192.168.1.99").unwrap());
+        // Simulates `/dns-query/admin-laptop`: the raw id is attacker-controlled
+        // while the client remains unidentified (no resolved client_name).
+        attacker.id = Some(sito_core::ClientId::new("admin-laptop"));
+
+        let qname_nas = Name::from_str("nas.home.arpa.").unwrap();
+        assert!(
+            table.lookup(&qname_nas, RecordType::A, &attacker).is_some(),
+            "unidentified clients must not match rewrite exceptions by raw id"
+        );
+
+        // Identified clients may still be excepted by their resolved identity.
+        let mut identified = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+        identified.client_name = Some("admin-laptop".to_string());
+        identified.id = Some(sito_core::ClientId::new("admin-laptop"));
+        assert!(
+            table
+                .lookup(&qname_nas, RecordType::A, &identified)
+                .is_none()
+        );
     }
 
     #[test]

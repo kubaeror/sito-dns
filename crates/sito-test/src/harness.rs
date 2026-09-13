@@ -4,7 +4,7 @@ use crate::client::TestDnsClient;
 use sito::server::run_server_with_shutdown;
 use sito_core::config::Config;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -20,12 +20,129 @@ pub struct TestServerInstance {
     shutdown_tx: Option<oneshot::Sender<()>>,
     server_task: Option<JoinHandle<anyhow::Result<()>>>,
     data_dir: PathBuf,
+    /// Ports reserved for this instance; released when it is dropped.
+    reserved_ports: Vec<u16>,
+}
+
+/// Serializes probe-then-bind across parallel tests in one binary: without it,
+/// two tests can probe the same free port before either server binds it. The
+/// lock is held from port probing until the instance reports ready, then
+/// released so tests run concurrently.
+static SPAWN_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+/// Polls `condition` every 25 ms until it returns true or `timeout` elapses.
+///
+/// Prefer this over fixed sleeps so tests wait for the actual event (certificate
+/// reload, HA sync, ...) instead of depending on machine speed.
+pub async fn wait_until<F, Fut>(timeout: Duration, mut condition: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if condition().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Ports currently held by live test instances in this binary.
+///
+/// The OS can hand a just-released ephemeral port to another test before the
+/// previous server's sockets are fully torn down; reserving ports for the
+/// lifetime of each instance (plus the spawn lock) removes that race.
+static RESERVED_PORTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+    std::sync::OnceLock::new();
+
+fn reserve_port(port: u16) -> bool {
+    RESERVED_PORTS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap()
+        .insert(port)
+}
+
+fn release_reserved_ports(ports: &[u16]) {
+    if let Some(reserved) = RESERVED_PORTS.get() {
+        let mut guard = reserved.lock().unwrap();
+        for port in ports {
+            guard.remove(port);
+        }
+    }
+}
+
+/// RAII broker that reserves ephemeral ports and releases them if startup
+/// fails before the instance takes ownership.
+struct PortReservations {
+    ports: Vec<u16>,
+    armed: bool,
+}
+
+impl PortReservations {
+    fn new() -> Self {
+        Self {
+            ports: Vec::new(),
+            armed: true,
+        }
+    }
+
+    fn reserve_tcp(&mut self) -> std::io::Result<(std::net::TcpListener, u16)> {
+        for _ in 0..20 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let port = listener.local_addr()?.port();
+            if reserve_port(port) {
+                self.ports.push(port);
+                return Ok((listener, port));
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "no unreserved ephemeral TCP port after 20 attempts",
+        ))
+    }
+
+    fn reserve_udp(&mut self) -> std::io::Result<(std::net::UdpSocket, u16)> {
+        for _ in 0..20 {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let port = socket.local_addr()?.port();
+            if reserve_port(port) {
+                self.ports.push(port);
+                return Ok((socket, port));
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "no unreserved ephemeral UDP port after 20 attempts",
+        ))
+    }
+
+    /// Transfers ownership of the reserved ports to the caller.
+    fn commit(mut self) -> Vec<u16> {
+        self.armed = false;
+        std::mem::take(&mut self.ports)
+    }
+}
+
+impl Drop for PortReservations {
+    fn drop(&mut self) {
+        if self.armed {
+            release_reserved_ports(&self.ports);
+        }
+    }
 }
 
 impl TestServerInstance {
     /// Spawns a new server instance with the given configuration modifications,
     /// retrying up to 5 times if an ephemeral port collision occurs during parallel test execution.
     pub async fn spawn(config: Config) -> Result<Self, anyhow::Error> {
+        let spawn_lock = SPAWN_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+        let _guard = spawn_lock.lock().await;
+
         let mut last_err = anyhow::anyhow!("Failed to spawn test server instance");
         for attempt in 0..5 {
             match Self::try_spawn(config.clone()).await {
@@ -44,9 +161,10 @@ impl TestServerInstance {
     }
 
     async fn try_spawn(mut config: Config) -> Result<Self, anyhow::Error> {
-        // Allocate ephemeral ports ensuring no collisions between listeners
-        let probe_dns = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = probe_dns.local_addr()?.port();
+        // Allocate ephemeral ports through the broker so no two instances in
+        // this binary can pick the same port.
+        let mut reservations = PortReservations::new();
+        let (probe_dns, port) = reservations.reserve_tcp()?;
 
         let mut dot_port = config.dns.dot_port;
         let mut doh_port = config.dns.doh_port;
@@ -61,26 +179,26 @@ impl TestServerInstance {
 
         if has_tls {
             if dot_port == 853 || dot_port == 0 {
-                let p = std::net::TcpListener::bind("127.0.0.1:0")?;
-                dot_port = p.local_addr()?.port();
+                let (p, reserved) = reservations.reserve_tcp()?;
+                dot_port = reserved;
                 config.dns.dot_port = dot_port;
                 probe_dot = Some(p);
             }
             if doh_port == 443 || doh_port == 0 {
-                let p = std::net::TcpListener::bind("127.0.0.1:0")?;
-                doh_port = p.local_addr()?.port();
+                let (p, reserved) = reservations.reserve_tcp()?;
+                doh_port = reserved;
                 config.dns.doh_port = doh_port;
                 probe_doh = Some(p);
             }
             if doq_port == 853 || doq_port == 0 {
-                let p = std::net::UdpSocket::bind("127.0.0.1:0")?;
-                doq_port = p.local_addr()?.port();
+                let (p, reserved) = reservations.reserve_udp()?;
+                doq_port = reserved;
                 config.dns.doq_port = doq_port;
                 probe_doq = Some(p);
             }
             if doh3_port == 443 || doh3_port == 0 {
-                let p = std::net::UdpSocket::bind("127.0.0.1:0")?;
-                doh3_port = p.local_addr()?.port();
+                let (p, reserved) = reservations.reserve_udp()?;
+                doh3_port = reserved;
                 config.dns.doh3_port = doh3_port;
                 probe_doh3 = Some(p);
             }
@@ -89,8 +207,8 @@ impl TestServerInstance {
         let mut probe_web = None;
         let mut web_port = config.get_web_config().port;
         if web_port == 8080 || web_port == 0 {
-            let p = std::net::TcpListener::bind("127.0.0.1:0")?;
-            web_port = p.local_addr()?.port();
+            let (p, reserved) = reservations.reserve_tcp()?;
+            web_port = reserved;
             let mut web_cfg = config.get_web_config();
             web_cfg.bind = "127.0.0.1".parse().unwrap();
             web_cfg.port = web_port;
@@ -106,15 +224,23 @@ impl TestServerInstance {
         drop(probe_doh3);
         drop(probe_web);
 
-        let temp_dir = std::env::temp_dir().join(format!(
-            "sito_test_inst_{}_{}_{}",
-            std::process::id(),
-            port,
-            rand::random::<u32>()
-        ));
-        tokio::fs::create_dir_all(&temp_dir).await?;
-
-        config.server.data_dir = temp_dir.clone();
+        // Tests that need files inside the server data directory (e.g.
+        // file:// blocklists) may set it before spawning; otherwise use an
+        // isolated per-instance temporary directory.
+        let temp_dir = if config.server.data_dir == Path::new("/var/lib/sito") {
+            let dir = std::env::temp_dir().join(format!(
+                "sito_test_inst_{}_{}_{}",
+                std::process::id(),
+                port,
+                rand::random::<u32>()
+            ));
+            tokio::fs::create_dir_all(&dir).await?;
+            config.server.data_dir = dir.clone();
+            dir
+        } else {
+            tokio::fs::create_dir_all(&config.server.data_dir).await?;
+            config.server.data_dir.clone()
+        };
         config.dns.bind = vec!["127.0.0.1".parse().unwrap()];
         config.dns.port = port;
 
@@ -222,6 +348,7 @@ impl TestServerInstance {
             shutdown_tx: Some(shutdown_tx),
             server_task: Some(server_task),
             data_dir: temp_dir,
+            reserved_ports: reservations.commit(),
         })
     }
 
@@ -345,6 +472,7 @@ impl Drop for TestServerInstance {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+        release_reserved_ports(&self.reserved_ports);
         let dir = self.data_dir.clone();
         tokio::spawn(async move {
             let _ = tokio::fs::remove_dir_all(&dir).await;

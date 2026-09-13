@@ -180,6 +180,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_udp_truncates_to_configured_edns_size_even_when_client_advertises_larger() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let std_socket = create_reuseport_udp_socket(&bind_addr).unwrap();
+        let port = std_socket.local_addr().unwrap().port();
+        drop(std_socket);
+
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let configured_edns_size = 1232u16;
+        let config = UdpConfig {
+            bind_addr: actual_addr,
+            worker_count: 1,
+            edns_udp_size: configured_edns_size,
+            rate_limit_per_ip: 100,
+            rate_limiter: None,
+        };
+
+        // Handler generates a response well above the configured server maximum.
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::NoError;
+            let qname = query.queries[0].name().clone();
+            for i in 0..200 {
+                resp.answers.push(Record::from_rdata(
+                    qname.clone(),
+                    300,
+                    RData::A(A(std::net::Ipv4Addr::new(
+                        10,
+                        1,
+                        (i / 256) as u8,
+                        (i % 256) as u8,
+                    ))),
+                ));
+            }
+            Some(resp)
+        });
+
+        let _handles = start_udp_listener(&config, &handler, &shutdown_rx).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Client advertises the maximum EDNS payload (65535), which must not
+        // override the server's configured 1232-byte amplification bound.
+        let mut query = Message::new(2003, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("huge2.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        sito_proto::set_edns_payload_size(&mut query, 65535);
+
+        let encoded = encode_message(&query).unwrap();
+        client.send_to(&encoded, actual_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 65_535];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for UDP response")
+            .unwrap();
+
+        assert!(
+            len <= usize::from(configured_edns_size),
+            "response of {len} bytes exceeds the configured {configured_edns_size}-byte bound"
+        );
+        let resp = decode_message(&buf[..len]).unwrap();
+        assert_eq!(resp.metadata.id, 2003);
+        assert!(
+            resp.metadata.truncation,
+            "oversized response must be truncated with TC=1"
+        );
+
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
     async fn test_udp_concurrent_queries_no_head_of_line_blocking() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -331,6 +407,139 @@ mod tests {
         assert!(received_ids.contains(&3001));
         assert!(received_ids.contains(&3002));
         assert!(received_ids.contains(&3003));
+
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_zero_length_frame_closes_connection() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let config = TcpConfig {
+            bind_addr: actual_addr,
+            max_connections: 10,
+            idle_timeout: Duration::from_secs(5),
+            rate_limit_per_ip: 100,
+            rate_limiter: None,
+        };
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let _handle = start_tcp_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut stream = TcpStream::connect(actual_addr).await.unwrap();
+        // Zero-length DNS-over-TCP frame: must close instead of spinning.
+        stream.write_all(&[0u8, 0u8]).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("server should close the connection")
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "connection should be closed after a zero-length frame"
+        );
+
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_large_response_keeps_framing_in_sync() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let config = TcpConfig {
+            bind_addr: actual_addr,
+            max_connections: 10,
+            idle_timeout: Duration::from_secs(5),
+            rate_limit_per_ip: 100,
+            rate_limiter: None,
+        };
+
+        // A response over 65535 bytes cannot be u16 length-prefixed.
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::NoError;
+            let qname = query.queries[0].name().clone();
+            let answers = if qname.to_string().starts_with("huge") {
+                5000
+            } else {
+                1
+            };
+            for i in 0..answers {
+                resp.answers.push(Record::from_rdata(
+                    qname.clone(),
+                    300,
+                    RData::A(A(std::net::Ipv4Addr::new(
+                        10,
+                        2,
+                        (i / 256) as u8,
+                        (i % 256) as u8,
+                    ))),
+                ));
+            }
+            Some(resp)
+        });
+
+        let _handle = start_tcp_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut stream = TcpStream::connect(actual_addr).await.unwrap();
+
+        let encode_query = |id: u16, name: &str| {
+            let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+            query
+                .queries
+                .push(Query::query(Name::from_str(name).unwrap(), RecordType::A));
+            encode_message(&query).unwrap()
+        };
+
+        for wire in [
+            encode_query(8101, "huge.example.com."),
+            encode_query(8102, "small.example.com."),
+        ] {
+            stream
+                .write_all(&(wire.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&wire).await.unwrap();
+        }
+        stream.flush().await.unwrap();
+
+        // Both queries must be answered with valid, length-prefixed frames:
+        // a >64 KB attempt must never wrap its 2-octet length prefix and
+        // desynchronize the stream (the encoder truncates to the u16 ceiling).
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let mut len_buf = [0u8; 2];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let resp_len = u16::from_be_bytes(len_buf) as usize;
+            let mut resp_buf = vec![0u8; resp_len];
+            stream.read_exact(&mut resp_buf).await.unwrap();
+            let resp = decode_message(&resp_buf).unwrap();
+            received.push(resp.metadata.id);
+        }
+        assert!(received.contains(&8101), "got ids: {received:?}");
+        assert!(received.contains(&8102), "got ids: {received:?}");
 
         let _ = shutdown_tx.send(true);
     }

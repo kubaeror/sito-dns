@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
             Commands::Healthcheck {
                 address,
                 timeout_ms,
+                setup_fallback,
             } => {
                 let (dns_target, web_target) = if let Some(addr) = address {
                     (Some(addr), "127.0.0.1:8080".parse().unwrap())
@@ -70,7 +71,9 @@ async fn main() -> anyhow::Result<()> {
                     (None, "127.0.0.1:8080".parse().unwrap())
                 };
 
-                if let Err(e) = run_healthcheck_or_web(dns_target, web_target, timeout_ms).await {
+                if let Err(e) =
+                    run_healthcheck_or_web(dns_target, web_target, timeout_ms, setup_fallback).await
+                {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }
@@ -97,8 +100,13 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             Commands::Ha { command } => match command {
-                sito::cli::HaCommands::GenCerts { dir, master, slave } => {
-                    if let Err(e) = sito::cli::run_ha_gen_certs(&dir, master, slave) {
+                sito::cli::HaCommands::GenCerts {
+                    dir,
+                    master,
+                    slave,
+                    san,
+                } => {
+                    if let Err(e) = sito::cli::run_ha_gen_certs(&dir, master, slave, &san) {
                         eprintln!("{e}");
                         std::process::exit(1);
                     }

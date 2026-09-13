@@ -27,27 +27,107 @@ use crate::state::ServerContext;
 fn is_sensitive_key(key: &str) -> bool {
     matches!(
         key,
-        "key" | "password" | "password_hash" | "secret" | "token" | "api_key" | "slave_token"
+        "key"
+            | "password"
+            | "password_hash"
+            | "secret"
+            | "token"
+            | "api_key"
+            | "slave_token"
+            | "credential"
+            | "credentials"
+            | "psk"
+            | "passphrase"
     ) || key.ends_with("_token")
         || key.ends_with("_password")
         || key.ends_with("_secret")
         || key.ends_with("_key")
 }
 
-/// Mask sensitive values (e.g. key = "...", password = "...") with "***"
+/// Extracts the final key segment from a (possibly dotted/quoted) TOML key.
+fn sensitive_key_of(lhs: &str) -> &str {
+    let last = lhs.trim().rsplit('.').next().unwrap_or(lhs).trim();
+    last.trim_matches('"').trim_matches('\'')
+}
+
+/// Masks sensitive values inside a single-line inline table.
+fn mask_inline_table(value: &str) -> String {
+    let trimmed = value.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return value.to_string();
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let masked: Vec<String> = inner
+        .split(',')
+        .map(|pair| {
+            if let Some((key, _)) = pair.split_once('=')
+                && is_sensitive_key(sensitive_key_of(key))
+            {
+                return format!("{} = \"***\"", key.trim());
+            }
+            pair.to_string()
+        })
+        .collect();
+    format!("{{{}}}", masked.join(","))
+}
+
+fn bracket_delta(line: &str) -> i64 {
+    let opens =
+        i64::try_from(line.chars().filter(|c| matches!(c, '[' | '{')).count()).unwrap_or(i64::MAX);
+    let closes =
+        i64::try_from(line.chars().filter(|c| matches!(c, ']' | '}')).count()).unwrap_or(i64::MAX);
+    opens - closes
+}
+
+/// Mask sensitive values (e.g. `key = "..."`, `slave_token = "..."`,
+/// `secret = ["a"]`, `[tls] key = ...` or multi-line arrays/inline tables)
+/// with `"***"`.
 pub fn mask_sensitive_toml(toml_str: &str) -> String {
     let mut out = Vec::new();
+    let mut masking_multiline = false;
+    let mut depth = 0i64;
+
     for line in toml_str.lines() {
-        let trimmed = line.trim_start();
-        let key = trimmed.split('=').next().unwrap_or("").trim();
-        if is_sensitive_key(key)
-            && let Some(idx) = line.find('=')
-        {
-            let (prefix, _) = line.split_at(idx + 1);
-            out.push(format!("{prefix} \"***\""));
+        if masking_multiline {
+            out.push("***".to_string());
+            depth += bracket_delta(line);
+            if depth <= 0 {
+                masking_multiline = false;
+            }
             continue;
         }
-        out.push(line.to_string());
+
+        let trimmed = line.trim_start();
+        let Some((lhs, rhs)) = trimmed.split_once('=') else {
+            out.push(line.to_string());
+            continue;
+        };
+        if !is_sensitive_key(sensitive_key_of(lhs)) {
+            // Inline tables can contain nested secret keys (e.g. credentials).
+            if rhs.trim_start().starts_with('{') && rhs.contains('=') {
+                let (prefix, _) = match line.find('=') {
+                    Some(idx) => line.split_at(idx + 1),
+                    None => (line, ""),
+                };
+                out.push(format!("{prefix} {}", mask_inline_table(rhs)));
+            } else {
+                out.push(line.to_string());
+            }
+            continue;
+        }
+
+        let (prefix, _) = match line.find('=') {
+            Some(idx) => line.split_at(idx + 1),
+            None => (line, ""),
+        };
+        let value = rhs.trim();
+        let opens_collection = (value.starts_with('[') && !value.ends_with(']'))
+            || (value.starts_with('{') && !value.ends_with('}'));
+        if opens_collection {
+            masking_multiline = true;
+            depth = bracket_delta(value);
+        }
+        out.push(format!("{prefix} \"***\""));
     }
     out.join("\n")
 }
@@ -148,6 +228,46 @@ pub async fn update_config(
         message: "Configuration successfully updated".to_string(),
         restart_required,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mask_sensitive_toml_covers_tokens_arrays_and_tables() {
+        let toml_str = r#"[tls]
+key = "super-secret-private-key"
+cert = "public-cert.pem"
+
+[server]
+slave_token = "abc123"
+
+[upstream]
+servers = ["1.1.1.1", "9.9.9.9"]
+api_key = ["first", "second"]
+
+[web]
+header = { api_token = "Bearer xyz", Accept = "text/html" }
+"#;
+        let masked = mask_sensitive_toml(toml_str);
+        assert!(!masked.contains("super-secret-private-key"));
+        assert!(!masked.contains("abc123"));
+        assert!(!masked.contains("first"));
+        assert!(!masked.contains("Bearer xyz"));
+        assert!(masked.contains("cert = \"public-cert.pem\""));
+        assert!(masked.contains("\"1.1.1.1\""));
+        assert!(masked.contains("\"***\""));
+    }
+
+    #[test]
+    fn test_mask_sensitive_toml_multiline_collection() {
+        let toml_str = "slave_token = [\n  \"secret1\",\n  \"secret2\",\n]\nname = \"ok\"\n";
+        let masked = mask_sensitive_toml(toml_str);
+        assert!(!masked.contains("secret1"));
+        assert!(!masked.contains("secret2"));
+        assert!(masked.contains("name = \"ok\""));
+    }
 }
 
 /// Settings that are only read at process start; changing them needs a restart.
@@ -403,18 +523,34 @@ pub async fn prepare_restore(
     rand::rng().fill(&mut token_bytes);
     let token = hex::encode(token_bytes);
 
-    // Save token with 5-minute expiry
+    // Save token with 5-minute expiry, pruning expired entries and capping the
+    // number of outstanding restorations.
     let expires_at = Instant::now() + Duration::from_secs(300);
-    ctx.restore_tokens
-        .lock()
-        .unwrap()
-        .insert(token.clone(), (config_toml.clone(), expires_at));
+    {
+        let mut tokens = ctx
+            .restore_tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        tokens.retain(|_, (_, expiry)| *expiry > now);
+        while tokens.len() >= 32 {
+            let Some(oldest) = tokens
+                .iter()
+                .min_by_key(|(_, (_, expiry))| *expiry)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            tokens.remove(&oldest);
+        }
+        tokens.insert(token.clone(), (config_toml.clone(), expires_at));
+    }
 
     Ok(Json(RestorePreparedResponse {
         confirmation_token: token,
         message: "Backup verified successfully. Submit confirmation token to apply restoration."
             .to_string(),
-        config_preview: config_toml,
+        config_preview: mask_sensitive_toml(&config_toml),
     }))
 }
 
@@ -437,7 +573,10 @@ pub async fn confirm_restore(
     Json(req): Json<RestoreConfirmRequest>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
     let pending = {
-        let mut map = ctx.restore_tokens.lock().unwrap();
+        let mut map = ctx
+            .restore_tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.remove(&req.confirmation_token)
     };
 

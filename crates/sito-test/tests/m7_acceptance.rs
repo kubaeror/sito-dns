@@ -87,8 +87,6 @@ async fn test_m7_doq_query_and_early_data_disabled() {
         .await
         .expect("start doq listener");
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     // Build QUIC client trusting our test cert
     let mut root_store = rustls::RootCertStore::empty();
     let certs = load_certificates(&cert_path).unwrap();
@@ -186,8 +184,6 @@ async fn test_m7_doh3_post_and_get_queries() {
     let _h = start_doh3_listener(doh3_cfg, handler, shutdown_rx)
         .await
         .expect("start doh3 listener");
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let mut root_store = rustls::RootCertStore::empty();
     let certs = load_certificates(&cert_path).unwrap();
@@ -298,8 +294,6 @@ async fn test_m7_doh_alt_svc_header_advertisement() {
     let _handle = start_doh_listener(doh_config, handler, shutdown_rx)
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     let client = reqwest::Client::new();
     let mut query = Message::new(101, MessageType::Query, OpCode::Query);
     query.queries.push(Query::query(

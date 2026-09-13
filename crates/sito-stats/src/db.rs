@@ -298,7 +298,7 @@ impl StatsDb {
             SELECT
                 COUNT(*) as total,
                 SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) as blocked,
-                SUM(CASE WHEN verdict = 'stale' OR rule = 'cache' THEN 1 ELSE 0 END) as cached
+                SUM(CASE WHEN rule IN ('cache', 'stale_cache') OR verdict = 'stale' THEN 1 ELSE 0 END) as cached
             FROM query_log
             WHERE ts >= ?
             ",
@@ -504,7 +504,15 @@ impl StatsDb {
         Ok(row.map(|r| (r.get("last_id"), r.get("last_ts"))))
     }
 
-    /// Aggregates older logs into `stats_hourly` and prunes query logs older than retention period.
+    /// Aggregates older logs into `stats_hourly` and prunes query logs older
+    /// than the retention period.
+    ///
+    /// The aggregate read, the rollup upsert, the watermark update and the
+    /// delete all run in a single `BEGIN IMMEDIATE` transaction. Producers
+    /// cannot interleave a (possibly backdated) insert between the read and the
+    /// delete, so no pruned row can be deleted without being aggregated.
+    /// Because deleted rows no longer exist, the watermark is not used to skip
+    /// rows: every row below the cutoff is aggregated exactly once.
     pub async fn cleanup_retention(
         &self,
         retention_days: u32,
@@ -513,37 +521,36 @@ impl StatsDb {
         let retention_ms = i64::from(retention_days) * 24 * 3600 * 1000;
         let cutoff = now_ms.saturating_sub(retention_ms);
 
-        let watermark_id: i64 = sqlx::query_scalar(
-            "SELECT last_id FROM stats_watermark WHERE key = 'hourly_aggregation'",
-        )
-        .fetch_optional(&self.pool)
-        .await?
-        .unwrap_or(0);
+        // `BEGIN IMMEDIATE` takes the write lock up front so concurrent writers
+        // wait instead of failing the aggregate/delete with `SQLITE_BUSY`.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
-        // Aggregate hourly buckets for entries newer than watermark up to cutoff
+        // Aggregate hourly buckets for every entry below the cutoff. The
+        // previous implementation filtered by `id > watermark_id`, which lost
+        // rows whose timestamp (and therefore id order) was inverted by
+        // concurrent producers. Aggregating and deleting the exact same
+        // predicate inside one transaction makes ordering irrelevant.
         let hours_to_aggregate = sqlx::query(
             r"
             SELECT
                 (ts / 3600000) * 3600000 as hour,
                 COUNT(*) as queries,
                 SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) as blocked,
-                SUM(CASE WHEN verdict = 'stale' OR rule = 'cache' THEN 1 ELSE 0 END) as cached,
+                SUM(CASE WHEN rule IN ('cache', 'stale_cache') OR verdict = 'stale' THEN 1 ELSE 0 END) as cached,
                 MAX(id) as max_id,
                 MAX(ts) as max_ts
             FROM query_log
-            WHERE ts < ? AND id > ?
+            WHERE ts < ?
             GROUP BY hour
             ",
         )
         .bind(cutoff)
-        .bind(watermark_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         let mut aggregated_hours = 0;
-        let mut max_seen_id = watermark_id;
+        let mut max_seen_id = 0i64;
         let mut max_seen_ts = 0i64;
-        let mut tx = self.pool.begin().await?;
 
         for row in hours_to_aggregate {
             let hour: i64 = row.get("hour");
@@ -577,14 +584,24 @@ impl StatsDb {
             aggregated_hours += 1;
         }
 
-        if max_seen_id > watermark_id {
+        // Delete exactly the rows that were aggregated above (same predicate in
+        // the same transaction).
+        let del_res = sqlx::query("DELETE FROM query_log WHERE ts < ?")
+            .bind(cutoff)
+            .execute(&mut *tx)
+            .await?;
+
+        // Record the highest timestamp/id processed for observability. The
+        // watermark is informational now that aggregation and deletion share a
+        // transaction; `MAX` keeps it monotonic across runs.
+        if max_seen_ts > 0 || max_seen_id > 0 {
             sqlx::query(
                 r"
                 INSERT INTO stats_watermark (key, last_id, last_ts)
                 VALUES ('hourly_aggregation', ?, ?)
                 ON CONFLICT(key) DO UPDATE SET
-                    last_id = excluded.last_id,
-                    last_ts = excluded.last_ts
+                    last_id = MAX(stats_watermark.last_id, excluded.last_id),
+                    last_ts = MAX(stats_watermark.last_ts, excluded.last_ts)
                 ",
             )
             .bind(max_seen_id)
@@ -592,12 +609,6 @@ impl StatsDb {
             .execute(&mut *tx)
             .await?;
         }
-
-        // Delete pruned rows
-        let del_res = sqlx::query("DELETE FROM query_log WHERE ts < ?")
-            .bind(cutoff)
-            .execute(&mut *tx)
-            .await?;
 
         tx.commit().await?;
 
@@ -614,13 +625,25 @@ impl StatsDb {
     }
 
     /// Returns the database file size in bytes if stored on disk.
+    ///
+    /// WAL mode keeps recent writes in `<db>-wal` and index metadata in
+    /// `<db>-shm`; both count towards the on-disk footprint and are included.
     pub async fn db_size_bytes(&self) -> Result<u64, StatsError> {
-        if let Some(ref path) = self.db_path {
-            let meta = tokio::fs::metadata(path).await?;
-            Ok(meta.len())
-        } else {
-            Ok(0)
+        let Some(ref path) = self.db_path else {
+            return Ok(0);
+        };
+
+        let mut total = 0u64;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            match tokio::fs::metadata(PathBuf::from(candidate)).await {
+                Ok(meta) => total = total.saturating_add(meta.len()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StatsError::Io(e)),
+            }
         }
+        Ok(total)
     }
 
     /// Returns aggregated activity for the last N hours bucketed by hour.
@@ -654,7 +677,10 @@ impl StatsDb {
             map.insert(hour_sec, (total, blocked));
         }
 
-        // Also check stats_hourly in case older logs were pruned by retention
+        // Also merge stats_hourly in case older logs were pruned by retention.
+        // A live query and an archived rollup can legitimately cover the same
+        // hour (retention prunes part of an hour), so the two are added
+        // together rather than one silently replacing the other.
         let archived_rows = sqlx::query(
             r"
             SELECT
@@ -667,14 +693,15 @@ impl StatsDb {
         )
         .bind(start_ms)
         .fetch_all(&self.pool)
-        .await
-        .unwrap_or_default();
+        .await?;
 
         for r in archived_rows {
             let hour_sec: i64 = r.get("hour_sec");
             let total: i64 = r.get::<Option<i64>, _>("total").unwrap_or(0);
             let blocked: i64 = r.get::<Option<i64>, _>("blocked").unwrap_or(0);
-            map.entry(hour_sec).or_insert((total, blocked));
+            let entry = map.entry(hour_sec).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(total);
+            entry.1 = entry.1.saturating_add(blocked);
         }
 
         let mut result = Vec::with_capacity(hours as usize);
