@@ -224,9 +224,11 @@ fn percent_decode(input: &str) -> String {
                 out.push(b' ');
                 i += 1;
             }
+            // Decode on raw bytes: slicing a `str` here can land inside a
+            // multi-byte UTF-8 sequence and panic the process (panic = abort).
             b'%' if i + 2 < bytes.len() => {
-                if let Ok(byte) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
-                    out.push(byte);
+                if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    out.push((hi << 4) | lo);
                     i += 3;
                 } else {
                     out.push(bytes[i]);
@@ -240,6 +242,15 @@ fn percent_decode(input: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Extracts the CSRF token from the `X-CSRF-Token` header or (for
@@ -515,6 +526,30 @@ mod tests {
         assert_eq!(
             form_field(b"csrf_token=a%2Fb", "csrf_token"),
             Some("a/b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_form_field_percent_decode_non_ascii_does_not_panic() {
+        // Regression: a `%` followed by a multi-byte UTF-8 sequence used to
+        // slice a `str` at a non-char-boundary and abort the process.
+        assert_eq!(
+            form_field("csrf_token=%€".as_bytes(), "csrf_token"),
+            Some("%€".to_string())
+        );
+        assert_eq!(
+            form_field("csrf_token=%é".as_bytes(), "csrf_token"),
+            Some("%é".to_string())
+        );
+        // Truncated escape at the very end is preserved literally.
+        assert_eq!(
+            form_field(b"csrf_token=abc%", "csrf_token"),
+            Some("abc%".to_string())
+        );
+        // Invalid hex falls through byte-by-byte.
+        assert_eq!(
+            form_field(b"csrf_token=%zz", "csrf_token"),
+            Some("%zz".to_string())
         );
     }
 

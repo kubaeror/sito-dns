@@ -23,6 +23,7 @@ jobs:
   build-binaries:
     name: build (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -94,6 +95,7 @@ jobs:
     name: Generate SBOM & Publish Release
     needs: [build-binaries]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write # create the GitHub release
       id-token: write # cosign keyless signing via GitHub OIDC
@@ -110,10 +112,24 @@ jobs:
       - name: Flatten artifacts and compute unified SHA256SUMS
         run: |
           mkdir -p release-assets
-          find artifacts -type f -name "*.tar.gz" -exec cp {} release-assets/ \;
+          # Publish the per-archive .sha256 files as documented, plus the
+          # unified SHA256SUMS consumed by the installer.
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.tar.gz.sha256" \) -exec cp {} release-assets/ \;
           cd release-assets
           sha256sum *.tar.gz > SHA256SUMS
           cd ..
+
+      - name: Verify release tag matches the workspace version
+        env:
+          # workflow_dispatch input is passed via env, never interpolated
+          # directly into the shell.
+          RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
+        run: |
+          VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "${RELEASE_TAG}" != "v${VERSION}" ]; then
+            echo "::error::Release tag '${RELEASE_TAG}' does not match workspace version 'v${VERSION}'"
+            exit 1
+          fi
 
       - name: Install cargo-sbom
         uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
@@ -142,6 +158,9 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          # Required on workflow_dispatch: without an explicit tag the action
+          # throws "GitHub Releases requires a tag".
+          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
           files: |
             release-assets/*
           generate_release_notes: true
@@ -151,6 +170,7 @@ jobs:
   docker-build-push:
     name: Build and Push Multi-Arch Container Image
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write # push the image to GHCR

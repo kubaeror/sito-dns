@@ -42,7 +42,10 @@ fn enforce_secret_file_permissions(path: &Path) {
 fn enforce_secret_file_permissions(_path: &Path) {}
 
 /// Writes a file containing key material with owner-only permissions (0600).
-fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+///
+/// `mode` only applies when the file is created; existing files are re-chmodded
+/// and a failure to restrict permissions is returned as an error (fail closed).
+pub fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;

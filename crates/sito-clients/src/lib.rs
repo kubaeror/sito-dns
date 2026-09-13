@@ -19,7 +19,9 @@ pub mod schedule;
 pub mod services;
 
 pub use bundled::{BundledList, BundledListError, BundledManifest};
-pub use config::{BlockedServiceConfig, ClientEntryConfig, ClientGroupConfig, ClientsConfig};
+pub use config::{
+    BlockedServiceConfig, ClientEntryConfig, ClientGroupConfig, ClientsConfig, IntegrationsConfig,
+};
 pub use mac::{MacResolver, normalize_mac, normalize_mac_id};
 pub use parental::ParentalRegistry;
 pub use policy::EffectivePolicy;

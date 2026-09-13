@@ -217,10 +217,12 @@ async fn test_m8_mtls_handshake_rejects_foreign_cert() {
     ))));
 
     let handles = SlaveAppHandles {
-        config: config_arc.clone(),
+        runtime: Arc::new(sito_runtime::RuntimeState::new(
+            config_arc.clone(),
+            clients_arc.clone(),
+            rewrites_arc.clone(),
+        )),
         filter: filter_engine.clone(),
-        rewrites: rewrites_arc.clone(),
-        clients: clients_arc.clone(),
         metrics: metrics.clone(),
         config_path: None,
     };
@@ -409,10 +411,12 @@ async fn test_m8_slave_rollback_on_invalid_bundle() {
     let metrics = MetricsRegistry::new("0.1.0", "test");
 
     let handles = SlaveAppHandles {
-        config: config_arc.clone(),
+        runtime: Arc::new(sito_runtime::RuntimeState::new(
+            config_arc.clone(),
+            clients_arc.clone(),
+            rewrites_arc.clone(),
+        )),
         filter: filter_engine.clone(),
-        rewrites: rewrites_arc.clone(),
-        clients: clients_arc.clone(),
         metrics,
         config_path: None,
     };
@@ -676,14 +680,16 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
         HostsFilterEngine::init(slave1_cfg.filtering.clone(), temp_dir.join("slave1")).await,
     );
     let slave1_handles = SlaveAppHandles {
-        config: Arc::new(ArcSwap::new(Arc::new(slave1_cfg))),
+        runtime: Arc::new(sito_runtime::RuntimeState::new(
+            Arc::new(ArcSwap::new(Arc::new(slave1_cfg))),
+            Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
+                Default::default(),
+            )))),
+            Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
+                Default::default(),
+            )))),
+        )),
         filter: slave1_filter.clone(),
-        rewrites: Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
-            Default::default(),
-        )))),
-        clients: Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
-            Default::default(),
-        )))),
         metrics: metrics.clone(),
         config_path: None,
     };
@@ -712,14 +718,16 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
         HostsFilterEngine::init(slave2_cfg.filtering.clone(), temp_dir.join("slave2")).await,
     );
     let slave2_handles = SlaveAppHandles {
-        config: Arc::new(ArcSwap::new(Arc::new(slave2_cfg))),
+        runtime: Arc::new(sito_runtime::RuntimeState::new(
+            Arc::new(ArcSwap::new(Arc::new(slave2_cfg))),
+            Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
+                Default::default(),
+            )))),
+            Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
+                Default::default(),
+            )))),
+        )),
         filter: slave2_filter.clone(),
-        rewrites: Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
-            Default::default(),
-        )))),
-        clients: Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
-            Default::default(),
-        )))),
         metrics: metrics.clone(),
         config_path: None,
     };
@@ -845,14 +853,16 @@ async fn test_m8_chaos_master_mid_push_kill() {
         HostsFilterEngine::init(slave_cfg.filtering.clone(), temp_dir.join("slave")).await,
     );
     let slave_handles = SlaveAppHandles {
-        config: Arc::new(ArcSwap::new(Arc::new(slave_cfg))),
+        runtime: Arc::new(sito_runtime::RuntimeState::new(
+            Arc::new(ArcSwap::new(Arc::new(slave_cfg))),
+            Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
+                Default::default(),
+            )))),
+            Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
+                Default::default(),
+            )))),
+        )),
         filter: slave_filter.clone(),
-        rewrites: Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
-            Default::default(),
-        )))),
-        clients: Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
-            Default::default(),
-        )))),
         metrics: metrics.clone(),
         config_path: None,
     };

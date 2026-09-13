@@ -6,8 +6,8 @@ instance_name = "sito-main"
 data_dir = "/var/lib/sito"
 log_level = "info"
 log_format = "pretty"
-# Require cosign-verified release signatures for in-app updates
-# update_require_signature = false
+# Require cosign-verified release signatures for in-app updates (default true)
+# update_require_signature = true
 
 [dns]
 bind = ["0.0.0.0", "::"]
@@ -66,6 +66,7 @@ refresh_interval_hours = 24
 blocking_mode = "zero_ip"
 blocking_ttl = 10
 cname_cloaking = true
+fail_closed = true
 anti_doh_bypass = "off"
 lists = []
 custom_rules = [

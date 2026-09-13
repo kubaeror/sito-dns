@@ -5,6 +5,100 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.7.0] - 2026-09-13
+
+### Audit 5 remediation (independent full audit)
+
+Full findings, evidence and status: `docs/audit5.md`. No breaking configuration
+or API changes. Wave 0 (P0), Wave 1 (P1) and the highest-value Wave 2 (P2)
+items are fixed with regression tests; deferred items are listed in the audit.
+
+#### Critical (P0)
+- **DoT upstream startup crash**: `DotUpstream::new` used the ambiguous
+  rustls `ClientConfig::builder()` while the dependency graph enables both
+  `ring` and `aws_lc_rs`, aborting the process (`panic = "abort"`) for any
+  `tls://` upstream, including the shipped example config. It now selects the
+  ring provider explicitly.
+- **DNSSEC cross-zone signature forgery**: a signature from any chain-validated
+  key was accepted for records owned by any other name, granting AD=1 and
+  poisoning the cache. RFC 4035 §5.3.1 signer-containment is now enforced for
+  every trusted signature.
+- **Unauthenticated wizard takeover**: the first-boot setup token expired after
+  24 h, after which `/ui/wizard/complete` accepted unauthenticated requests
+  and let any network peer set a new admin password. The token now survives
+  until setup completes.
+
+#### Security (P1)
+- **Authenticated process abort**: CSRF form percent-decoding sliced a `str`
+  at a non-char boundary for non-ASCII input; decoding is now byte-based.
+- **Filter identity spoofing**: `$client=` matched the client-controlled DoH
+  path / DoT SNI claim; only registry-resolved identity now matches.
+- **Filtering fail-open**: a failed initial list load left an enabled engine
+  allowing all traffic; `filtering.fail_closed` (default true) answers
+  SERVFAIL until a snapshot loads.
+- **DNSSEC prefetch bypass**: background cache refresh inserted unvalidated
+  upstream responses (including attacker AD=1); prefetch now validates.
+- **Updater**: signature policy defaults to required and `sito update` fails
+  closed when the config cannot be read; cosign identity is pinned to the
+  release workflow on tag refs (installer included).
+- **TOTP replay**: `verify_totp` now serializes read-verify-write, preventing
+  code replay and double-spent backup codes under concurrency.
+- **Restore decompression**: config backups are capped per entry and in total.
+- **Rate limiting**: one shared per-client budget across all transports, and
+  per-query limits on TCP/DoT/DoQ instead of accept-time only; DoT upstream
+  connections are capped.
+- **SSRF**: subscription targets now unwrap NAT64/6to4/Teredo IPv4 embeddings.
+- **Secret handling**: HA bundles strip `client_id_secrets` and RouterOS
+  credentials (restored from node-local config); ACME bootstrap key is 0600.
+
+#### High (P1, continued)
+- **HA apply**: pushed bundles are published through `RuntimeState` instead of
+  raw ArcSwaps, so the pipeline observes them; slave-local `[ha]` section,
+  instance name and data dir are preserved when persisting pushes.
+- **API config integrity**: `PUT /config` and `POST /config/reload` run deep
+  section validation; reload applies filter/upstream/cache/clients/rewrites
+  and reports restart-only settings truthfully.
+- **CI**: nightly fuzz installs cargo-fuzz and pins the nightly toolchain;
+  `workflow_dispatch` releases pass `tag_name` and verify tag == version; all
+  jobs have timeouts.
+- **AdGuard converter**: emits `custom_ip:<ip>`, escapes TOML strings
+  correctly, maps per-client upstreams/log toggles and filtering groups.
+
+#### Correctness and hygiene (P2)
+- Cache rejects out-of-bailiwick answer owners, re-checks CNAME targets on
+  cache hits, and is flushed whenever filter rules change.
+- IDN queries are consistently handled as punycode (parental/service matching,
+  per-domain routing, cache keys); config accepts raw IDN.
+- DoH bodies are capped at 65535 bytes; DoQ/DoH3 streams have timeouts; DoH3
+  no longer decodes a partial body after a receive error.
+- DNSSEC key fetches set the DO bit; irrelevant expired RRSIGs no longer turn
+  processable answers Bogus.
+- API tokens default to a 90-day TTL; deleting a user revokes their sessions;
+  group descriptions persist; query-log rate-limiter state is bounded.
+- Filter rule count/compile metrics are reported; metric label cardinality is
+  capped; upstream error labels use bounded kinds.
+- Concurrent runtime-list updates are serialized; config-watcher failures log
+  the hot-reload impact at error level.
+
+#### Follow-ups (previously deferred, now fixed)
+- **DNSSEC**: NSEC NXDOMAIN proofs now require a wildcard denial at the
+  closest encloser (RFC 4035 §5.4) and wildcard NODATA proofs are accepted;
+  records are grouped per signer so multi-record proofs validate together.
+- **HA**: reconnecting slave sessions carry a connection id so superseded
+  connections cannot evict or mutate live entries; the master listener bounds
+  handshakes at 10 s and concurrent sessions at 64.
+- **Setup/ops**: wizard-completed setup rebuilds TLS/ACME acceptors before
+  binding listeners; Docker images ship a writable `/etc/sito` owned by the
+  nonroot uid; client-registry generations share the RouterOS lease store so
+  sync survives hot reloads; a failed listener rebind leaves a retryable
+  manager instead of orphaning the server; release assets include the
+  documented per-archive `.sha256` files.
+- **Docs**: security review rewritten to the implemented controls,
+  `SECURITY.md` version corrected, HA runbook/benchmarks/first-time-setup
+  claims reconciled with the tree.
+
+---
+
 ## [1.6.0] - 2026-09-13
 
 ### Audit 4 remediation (DNSSEC, HA, security, correctness, ops)

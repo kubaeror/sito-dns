@@ -72,15 +72,45 @@ def normalize_bootstrap(value: str) -> str:
     return v
 
 
-def convert_blocking_mode(agh_mode: str) -> str:
+def toml_quote(value: Any) -> str:
+    """Renders a Python value as a TOML basic string with full escaping."""
+    out = ['"']
+    for ch in str(value):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20:
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def convert_blocking_mode(dns: Dict[str, Any]) -> str:
+    """Maps AdGuard's blocking mode (and custom IP) to sito's blocking_mode.
+
+    sito accepts `custom_ip:<ip>`; the bare `custom_ip` value is invalid.
+    """
+    mode = str(dns.get("blocking_mode", "default")).lower()
+    if mode == "custom_ip":
+        # sito carries a single custom address: prefer IPv4, fall back to IPv6.
+        ip = dns.get("blocking_ipv4") or dns.get("blocking_ipv6")
+        return f"custom_ip:{ip}" if ip else "zero_ip"
     mapping = {
         "default": "zero_ip",
         "null_ip": "zero_ip",
         "nxdomain": "nxdomain",
         "refused": "refused",
-        "custom_ip": "custom_ip",
     }
-    return mapping.get(str(agh_mode).lower(), "zero_ip")
+    return mapping.get(mode, "zero_ip")
 
 
 def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
@@ -107,7 +137,7 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
 
     # DNS bind (AdGuard uses an empty list to mean all interfaces)
     bind_hosts = dns.get("bind_hosts") or ["0.0.0.0"]
-    bind_quoted = ", ".join(f'"{h}"' for h in bind_hosts)
+    bind_quoted = ", ".join(toml_quote(h) for h in bind_hosts)
     lines.append(f"bind = [{bind_quoted}]")
     lines.append(f"port = {dns.get('port', 53)}")
 
@@ -122,7 +152,8 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
         lines.append("doq_port = 0")
 
     lines.append(f"rate_limit_per_ip = {dns.get('ratelimit', 20)}")
-    lines.append(f"edns_udp_size = {dns.get('edns_client_subnet', {}).get('edns_udp_size', 1232) if isinstance(dns.get('edns_client_subnet'), dict) else 1232}")
+    # AdGuard has no EDNS buffer-size key; keep sito's spec-safe default.
+    lines.append(f"edns_udp_size = {dns.get('edns_udp_size', 1232)}")
     lines.append("")
 
     # DNS Cache
@@ -146,11 +177,11 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
     lines.append("[upstream]")
     lines.append("servers = [")
     for u in upstreams:
-        lines.append(f'    "{normalize_upstream(u)}",')
+        lines.append(f"    {toml_quote(normalize_upstream(u))},")
     lines.append("]")
     lines.append("bootstrap = [")
     for b in bootstrap:
-        lines.append(f'    "{normalize_bootstrap(b)}",')
+        lines.append(f"    {toml_quote(normalize_bootstrap(b))},")
     lines.append("]")
     lines.append('strategy = "parallel"')
     lines.append("timeout_ms = 5000")
@@ -160,7 +191,7 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
     lines.extend([
         "[filtering]",
         f"enabled = {str(filtering.get('enabled', True)).lower()}",
-        f'blocking_mode = "{convert_blocking_mode(dns.get("blocking_mode", "default"))}"',
+        f"blocking_mode = {toml_quote(convert_blocking_mode(dns))}",
         f"blocking_ttl = {dns.get('blocking_ipv4_ttl', 10)}",
         "cname_cloaking = true",
     ])
@@ -170,8 +201,7 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
     if user_rules:
         lines.append("custom_rules = [")
         for r in user_rules:
-            escaped = r.replace('"', '\\"')
-            lines.append(f'    "{escaped}",')
+            lines.append(f"    {toml_quote(r)},")
         lines.append("]")
     else:
         lines.append("custom_rules = []")
@@ -180,15 +210,15 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
     # Subscription Filter Lists
     filters = agh_cfg.get("filters", [])
     for f in filters:
-        name = f.get("name", "AdGuard List").replace('"', '\\"')
-        url = f.get("url", "").replace('"', '\\"')
+        url = f.get("url", "")
         if not url:
             continue
+        name = f.get("name", "AdGuard List")
         enabled = str(f.get("enabled", True)).lower()
         lines.extend([
             "[[filtering.lists]]",
-            f'name = "{name}"',
-            f'url = "{url}"',
+            f"name = {toml_quote(name)}",
+            f"url = {toml_quote(url)}",
             f"enabled = {enabled}",
             "",
         ])
@@ -211,28 +241,50 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
             rtype = "CNAME"
         lines.extend([
             "[[rewrites.entries]]",
-            f'domain = "{domain}"',
-            f'type = "{rtype}"',
-            f'answer = "{answer}"',
+            f"domain = {toml_quote(domain)}",
+            f"type = {toml_quote(rtype)}",
+            f"answer = {toml_quote(answer)}",
             "exception_clients = []",
             "",
         ])
 
-    # Clients
+    # Clients. AdGuard keeps per-client policy on the client; sito keeps
+    # filtering policy on groups, so clients with filtering disabled are
+    # routed to a generated `no-filtering` group and per-client upstreams are
+    # carried over. Other AdGuard per-client toggles (parental, safe browsing)
+    # have no per-client equivalent and are intentionally not emitted.
     persistent_clients = clients.get("persistent", [])
     if persistent_clients:
+        if any(c.get("filtering_enabled", True) is False for c in persistent_clients):
+            lines.extend([
+                '[clients.groups."no-filtering"]',
+                "filtering = false",
+                "",
+            ])
         lines.append("[clients]")
         for c in persistent_clients:
             c_name = c.get("name", "Client")
             c_ids = c.get("ids", [])
-            ids_str = ", ".join(f'"{i}"' for i in c_ids)
+            ids_str = ", ".join(toml_quote(i) for i in c_ids)
+            group = "default" if c.get("filtering_enabled", True) is not False else "no-filtering"
             lines.extend([
                 "[[clients.entries]]",
-                f'name = "{c_name}"',
+                f"name = {toml_quote(c_name)}",
                 f"ids = [{ids_str}]",
-                f'group = "default"',
-                "",
+                f"group = {toml_quote(group)}",
             ])
+            client_upstreams = c.get("upstreams") or []
+            if client_upstreams:
+                upstreams_str = ", ".join(
+                    toml_quote(normalize_upstream(u)) for u in client_upstreams
+                )
+                lines.append(f"upstreams = [{upstreams_str}]")
+                lines.append("use_global_upstreams = false")
+            if c.get("ignore_querylog"):
+                lines.append("ignore_query_log = true")
+            if c.get("ignore_statistics"):
+                lines.append("ignore_stats = true")
+            lines.append("")
 
     # TLS (certificates for DoT/DoH)
     cert_path = tls.get("certificate_path")
@@ -240,8 +292,8 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
     if cert_path and key_path:
         lines.extend([
             "[tls]",
-            f'cert = "{cert_path}"',
-            f'key = "{key_path}"',
+            f"cert = {toml_quote(cert_path)}",
+            f"key = {toml_quote(key_path)}",
             "",
         ])
 
@@ -264,7 +316,8 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
     # separately from AdGuard)
     lines.extend([
         "[stats]",
-        f"retention_days = {max(7, int(querylog.get('interval', 90)))}",
+        # AdGuard stores its retention interval under `stats.interval`.
+        f"retention_days = {max(7, int(stats.get('interval', 90)))}",
         "",
         "[privacy]",
         f"anonymize_querylog = {str(querylog.get('anonymize_client_ip', False)).lower()}",

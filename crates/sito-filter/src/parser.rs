@@ -74,12 +74,10 @@ impl ClientMatcher {
         match self {
             Self::Ip(ip) => ctx.ip == *ip,
             Self::Cidr { ip, prefix } => cidr_matches(*ip, *prefix, ctx.ip),
+            // Only identity fields populated by `ClientRegistry::resolve` are
+            // trusted here. `ctx.id`/`ctx.sni` are wire-claimed (DoH path, DoT
+            // SNI) and must not satisfy a `$client=` matcher on their own.
             Self::Name(name) => {
-                if let Some(id) = &ctx.id
-                    && id.as_str().eq_ignore_ascii_case(name)
-                {
-                    return true;
-                }
                 if let Some(client_name) = &ctx.client_name
                     && client_name.eq_ignore_ascii_case(name)
                 {
@@ -1054,9 +1052,14 @@ plain-ad.com
         let ctx_match2 = ClientContext::new("10.5.6.7".parse().unwrap());
         assert!(client_filter.matches(&ctx_match2));
 
-        let mut ctx_neg = ClientContext::new("192.168.1.1".parse().unwrap());
-        ctx_neg.id = Some(sito_core::client::ClientId::new("laptop"));
+        // Negative `~laptop` excludes a registry-resolved client name.
+        let ctx_neg = ClientContext::new("192.168.1.1".parse().unwrap()).with_client_name("laptop");
         assert!(!client_filter.matches(&ctx_neg));
+
+        // A wire-claimed id is not an authenticated identity and must not
+        // activate the negative matcher.
+        let ctx_spoofed = ClientContext::with_id("192.168.1.1".parse().unwrap(), "laptop");
+        assert!(client_filter.matches(&ctx_spoofed));
 
         let ctx_nomatch = ClientContext::new("172.16.0.1".parse().unwrap());
         assert!(!client_filter.matches(&ctx_nomatch));

@@ -1,6 +1,5 @@
 //! Background slave replication worker and state apply coordinator.
 
-use arc_swap::ArcSwap;
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::ServerName;
 use std::collections::HashMap;
@@ -28,12 +27,14 @@ use crate::slave::state::{SlaveState, SlaveStatusTracker};
 use crate::transport::{ExponentialBackoff, build_client_tls_config};
 
 /// Active server handles that the slave atomically updates when a new bundle is applied.
+///
+/// Config/clients/rewrites are published through [`RuntimeState`] so the query
+/// pipeline observes them in the same coherent snapshot as the file watcher
+/// and API paths do; the individual handles must not be written directly.
 #[derive(Clone)]
 pub struct SlaveAppHandles {
-    pub config: Arc<ArcSwap<Config>>,
+    pub runtime: Arc<sito_runtime::RuntimeState>,
     pub filter: Arc<HostsFilterEngine>,
-    pub rewrites: Arc<ArcSwap<RewriteTable>>,
-    pub clients: Arc<ArcSwap<ClientRegistry>>,
     pub metrics: MetricsRegistry,
     pub config_path: Option<PathBuf>,
 }
@@ -102,8 +103,9 @@ pub async fn apply_config_push(
         None
     };
 
-    // Staging clients validation if present
-    let staging_clients: Option<ClientsConfig> = if let Some(ref c_val) = bundle.clients {
+    // Staging clients validation if present. Per-client shared secrets are
+    // stripped from replicated configuration; keep the node-local values.
+    let mut staging_clients: Option<ClientsConfig> = if let Some(ref c_val) = bundle.clients {
         match c_val.clone().try_into() {
             Ok(cc) => Some(cc),
             Err(e) => {
@@ -118,6 +120,11 @@ pub async fn apply_config_push(
     } else {
         None
     };
+    if let Some(ref mut clients) = staging_clients {
+        for (name, secret) in local_client_id_secrets(handles.config_path.as_deref()) {
+            clients.client_id_secrets.entry(name).or_insert(secret);
+        }
+    }
 
     // Include custom rules in staging filtering config
     staging_config.filtering.custom_rules = bundle.custom_rules;
@@ -133,32 +140,43 @@ pub async fn apply_config_push(
         return Err(HaError::Rollback(reason));
     }
 
-    // 5. Atomic swap into active runtime handles
-    if let Some(rewrites_cfg) = staging_rewrites {
-        handles
-            .rewrites
-            .store(Arc::new(RewriteTable::new(rewrites_cfg)));
-    }
-
-    if let Some(clients_cfg) = staging_clients {
-        handles
-            .clients
-            .store(Arc::new(ClientRegistry::new(clients_cfg)));
-    }
-
-    // Atomic swap of configuration
-    handles.config.store(Arc::new(staging_config));
+    // 5. Atomic swap into the coherent runtime snapshot. Publishing through
+    // `RuntimeState::replace` keeps the pipeline from observing a torn mix of
+    // old and new components (direct handle stores bypassed the snapshot).
+    let current = handles.runtime.snapshot();
+    let snapshot = sito_runtime::RuntimeSnapshot {
+        config: Arc::new(staging_config),
+        clients: staging_clients.map_or_else(
+            || current.clients.clone(),
+            |cfg| {
+                Arc::new(ClientRegistry::with_routeros_leases(
+                    cfg,
+                    current.clients.routeros_leases_store(),
+                ))
+            },
+        ),
+        rewrites: staging_rewrites.map_or_else(
+            || current.rewrites.clone(),
+            |cfg| Arc::new(RewriteTable::new(cfg)),
+        ),
+    };
+    handles.runtime.replace(snapshot);
 
     // Persist configuration to disk if path is provided. The pushed TOML can
-    // contain substituted credentials, so write atomically with 0600.
-    if let Some(ref path) = handles.config_path
-        && let Err(e) = write_private_atomic(path, &substituted_toml)
-    {
-        error!(
-            error = %e,
-            path = %path.display(),
-            "Failed to persist applied configuration to disk"
-        );
+    // contain substituted credentials, so write atomically with 0600. The
+    // master's sanitized bundle has `[ha]` stripped and `instance_name`
+    // removed; without merging the local replication settings back in, a
+    // slave restart would boot without its master URL/pins and stop
+    // replicating.
+    if let Some(ref path) = handles.config_path {
+        let persisted = merge_local_replication_config(&substituted_toml, path);
+        if let Err(e) = write_private_atomic(path, &persisted) {
+            error!(
+                error = %e,
+                path = %path.display(),
+                "Failed to persist applied configuration to disk"
+            );
+        }
     }
 
     // Mark tracker as synced
@@ -175,6 +193,97 @@ pub async fn apply_config_push(
     );
 
     Ok(bundle.version)
+}
+
+/// Merges the slave's local replication settings into a pushed configuration
+/// before it is persisted:
+///
+/// * `[ha]` (master URL, certificates, pins, token) is slave-local and is
+///   removed by `sanitize_config_for_bundle` on the master.
+/// * `server.instance_name` identifies this slave and is also removed on the
+///   master.
+/// * `server.data_dir` points at slave-local state and must not be replaced
+///   by the master's path.
+///
+/// Returns the input unchanged when either TOML cannot be parsed.
+fn merge_local_replication_config(pushed_toml: &str, local_path: &std::path::Path) -> String {
+    let Ok(local_raw) = std::fs::read_to_string(local_path) else {
+        return pushed_toml.to_string();
+    };
+    let (Ok(mut pushed), Ok(local)) = (
+        pushed_toml.parse::<toml::Table>(),
+        local_raw.parse::<toml::Table>(),
+    ) else {
+        return pushed_toml.to_string();
+    };
+
+    if let Some(ha) = local.get("ha") {
+        pushed.insert("ha".to_string(), ha.clone());
+    }
+    if let (Some(toml::Value::Table(local_server)), Some(toml::Value::Table(server))) =
+        (local.get("server"), pushed.get_mut("server"))
+    {
+        for key in ["instance_name", "data_dir"] {
+            if let Some(value) = local_server.get(key) {
+                server.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    // Per-client shared secrets and RouterOS credentials are stripped from the
+    // replicated config; restore the node-local values so a restart keeps them.
+    if let Some(secrets) = local
+        .get("clients")
+        .and_then(|c| c.get("client_id_secrets"))
+        && let Some(toml::Value::Table(clients)) = pushed.get_mut("clients")
+    {
+        clients.insert("client_id_secrets".to_string(), secrets.clone());
+    }
+    if let Some(local_credentials) = local
+        .get("integrations")
+        .and_then(|i| i.get("mikrotik"))
+        .and_then(toml::Value::as_table)
+        && let Some(pushed_mikrotik) = pushed
+            .get_mut("integrations")
+            .and_then(|i| i.as_table_mut())
+            .and_then(|i| i.get_mut("mikrotik"))
+            .and_then(toml::Value::as_table_mut)
+    {
+        for key in ["token", "password"] {
+            if let Some(value) = local_credentials.get(key) {
+                pushed_mikrotik.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+
+    toml::to_string_pretty(&pushed).unwrap_or_else(|_| pushed_toml.to_string())
+}
+
+/// Reads the node-local `[clients] client_id_secrets` table (name -> secret).
+fn local_client_id_secrets(path: Option<&std::path::Path>) -> HashMap<String, String> {
+    let Some(path) = path else {
+        return HashMap::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(table) = raw.parse::<toml::Table>() else {
+        return HashMap::new();
+    };
+    table
+        .get("clients")
+        .and_then(|clients| clients.get("client_id_secrets"))
+        .and_then(toml::Value::as_table)
+        .map(|secrets| {
+            secrets
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .as_str()
+                        .map(|secret| (name.clone(), secret.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Atomically writes `contents` to `path`, restricting permissions to the
@@ -615,4 +724,122 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_local_replication_config_preserves_ha_and_identity() {
+        let dir = std::env::temp_dir().join(format!("sito_ha_merge_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let local = r#"
+config_version = 1
+
+[server]
+role = "slave"
+instance_name = "slave-1"
+data_dir = "/var/lib/sito"
+
+[ha]
+master_url = "wss://master.example:8953"
+master_pubkey = "abc123"
+cert = "/etc/sito/slave.crt"
+key = "/etc/sito/slave.key"
+
+[clients]
+client_id_secrets = { "kids-tablet" = "s3cret-value" }
+
+[integrations.mikrotik]
+url = "https://192.168.1.1"
+password = "routeros-password"
+"#;
+        std::fs::write(&path, local).unwrap();
+
+        // Sanitized bundle from the master: no [ha], no instance_name, no
+        // client secrets and no RouterOS password.
+        let pushed = r#"
+config_version = 1
+
+[server]
+role = "slave"
+data_dir = "/var/lib/sito-master"
+
+[clients]
+
+[integrations.mikrotik]
+url = "https://192.168.1.1"
+"#;
+
+        let merged = merge_local_replication_config(pushed, &path);
+        let table: toml::Table = merged.parse().unwrap();
+
+        let ha = table.get("ha").expect("[ha] must be preserved");
+        assert_eq!(
+            ha.get("master_url").and_then(toml::Value::as_str),
+            Some("wss://master.example:8953")
+        );
+        let server = table.get("server").unwrap();
+        assert_eq!(
+            server.get("instance_name").and_then(toml::Value::as_str),
+            Some("slave-1")
+        );
+        assert_eq!(
+            server.get("data_dir").and_then(toml::Value::as_str),
+            Some("/var/lib/sito")
+        );
+        assert_eq!(
+            server.get("role").and_then(toml::Value::as_str),
+            Some("slave")
+        );
+        assert_eq!(
+            table
+                .get("clients")
+                .and_then(|c| c.get("client_id_secrets"))
+                .and_then(|s| s.get("kids-tablet"))
+                .and_then(toml::Value::as_str),
+            Some("s3cret-value"),
+            "node-local client secrets must survive a push"
+        );
+        assert_eq!(
+            table
+                .get("integrations")
+                .and_then(|i| i.get("mikrotik"))
+                .and_then(|m| m.get("password"))
+                .and_then(toml::Value::as_str),
+            Some("routeros-password"),
+            "node-local RouterOS credentials must survive a push"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_local_client_id_secrets_reads_table() {
+        let dir = std::env::temp_dir().join(format!("sito_ha_secrets_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[clients]\nclient_id_secrets = { \"phone\" = \"abc\" }\n",
+        )
+        .unwrap();
+        let secrets = local_client_id_secrets(Some(&path));
+        assert_eq!(secrets.get("phone").map(String::as_str), Some("abc"));
+        assert!(local_client_id_secrets(None).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_merge_local_replication_config_without_local_file_is_noop() {
+        let pushed = "config_version = 1\n[server]\nrole = \"slave\"\n";
+        let merged = merge_local_replication_config(
+            pushed,
+            std::path::Path::new("/nonexistent/config.toml"),
+        );
+        assert_eq!(merged, pushed);
+    }
 }

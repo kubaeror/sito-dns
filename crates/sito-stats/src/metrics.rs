@@ -68,6 +68,13 @@ struct InternerState {
     labels: Vec<Arc<str>>,
 }
 
+/// Maximum distinct interned label values per registry. Beyond this, values
+/// are collapsed into `__other__` so unbounded input (e.g. raw error strings)
+/// cannot grow memory forever.
+const MAX_INTERNER_LABELS: usize = 4_096;
+/// Label value used once [`MAX_INTERNER_LABELS`] is reached.
+const INTERNER_OVERFLOW_LABEL: &str = "__other__";
+
 /// Interns metric label values into dense integer ids.
 ///
 /// Lookups take a shared `RwLock` read guard and allocate nothing; an id is
@@ -88,6 +95,16 @@ impl LabelInterner {
         }
 
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(&id) = state.ids.get(value) {
+            return id;
+        }
+        // Collapse new values into a single overflow label once the cap is
+        // reached; existing (known) labels keep their ids.
+        let value = if state.labels.len() >= MAX_INTERNER_LABELS {
+            INTERNER_OVERFLOW_LABEL
+        } else {
+            value
+        };
         if let Some(&id) = state.ids.get(value) {
             return id;
         }
@@ -181,6 +198,8 @@ pub struct MetricsRegistry {
     ha_slaves_connected: Arc<AtomicI64>,
     ha_config_version: Arc<Mutex<BTreeMap<String, f64>>>,
     querylog_dropped: Arc<AtomicU64>,
+    filter_rules: Arc<AtomicU64>,
+    filter_compile_seconds: Arc<Mutex<HistogramState>>,
     build_version: String,
     build_commit: String,
 }
@@ -213,6 +232,8 @@ impl MetricsRegistry {
             ha_slaves_connected: Arc::new(AtomicI64::new(0)),
             ha_config_version: Arc::new(Mutex::new(BTreeMap::new())),
             querylog_dropped: Arc::new(AtomicU64::new(0)),
+            filter_rules: Arc::new(AtomicU64::new(0)),
+            filter_compile_seconds: Arc::new(Mutex::new(HistogramState::new())),
             build_version: version.into(),
             build_commit: commit.into(),
         }
@@ -331,6 +352,21 @@ impl MetricsRegistry {
 
     pub fn inc_querylog_dropped(&self) {
         self.querylog_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Publishes the number of active compiled filter rules.
+    pub fn set_filter_rules(&self, count: usize) {
+        self.filter_rules
+            .store(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Records how long the last filter snapshot compilation took.
+    pub fn observe_filter_compile(&self, seconds: f64) {
+        let mut hist = self
+            .filter_compile_seconds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        hist.observe(seconds);
     }
 
     /// Returns total query count and blocked query count processed by this registry.
@@ -698,12 +734,13 @@ impl MetricsRegistry {
         );
 
         // 9. sito_filter_rules
-        //
-        // The filter engine does not report per-list counts; the family is kept
-        // at its default so dashboards and alerts do not break.
         out.push_str("# HELP sito_filter_rules Number of active filter rules per list\n");
         out.push_str("# TYPE sito_filter_rules gauge\n");
-        out.push_str("sito_filter_rules{list=\"total\"} 0\n");
+        let _ = writeln!(
+            out,
+            "sito_filter_rules{{list=\"total\"}} {}",
+            self.filter_rules.load(Ordering::Relaxed)
+        );
 
         // 10. sito_filter_compile_seconds
         out.push_str(
@@ -711,7 +748,10 @@ impl MetricsRegistry {
         );
         out.push_str("# TYPE sito_filter_compile_seconds histogram\n");
         {
-            let hist = HistogramState::new();
+            let hist = self
+                .filter_compile_seconds
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             for (i, &b) in LATENCY_BUCKETS.iter().enumerate() {
                 let c = hist.counts[i];
                 let _ = writeln!(out, "sito_filter_compile_seconds_bucket{{le=\"{b}\"}} {c}");
@@ -1101,6 +1141,41 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         assert!(rendered.contains(&format!("method=\"{escaped}\"")));
         // The raw (unescaped) label value must never appear in the exposition.
         assert!(!rendered.contains("a\"b\\c\nd"));
+    }
+
+    #[test]
+    fn test_label_interner_caps_cardinality() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        for i in 0..(MAX_INTERNER_LABELS + 100) {
+            reg.inc_upstream_errors(&format!("bounded-{i}"), "io");
+        }
+        let labels = reg
+            .labels
+            .state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .labels
+            .len();
+        assert!(
+            labels <= MAX_INTERNER_LABELS + 1,
+            "interner must collapse values after the cap (got {labels})"
+        );
+        let rendered = reg.render_prometheus();
+        assert!(
+            rendered.contains(r#"upstream="__other__""#),
+            "overflow label must be used once the cap is reached"
+        );
+    }
+
+    #[test]
+    fn test_filter_metrics_are_reported() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.set_filter_rules(42);
+        reg.observe_filter_compile(0.25);
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains("sito_filter_rules{list=\"total\"} 42"));
+        assert!(rendered.contains("sito_filter_compile_seconds_count 1"));
+        assert!(rendered.contains("sito_filter_compile_seconds_sum 0.25"));
     }
 }
 

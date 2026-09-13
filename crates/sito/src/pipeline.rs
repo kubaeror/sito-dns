@@ -539,6 +539,22 @@ impl DnsPipeline {
     /// A DNSSEC-aware client must never be served an unvalidated entry while
     /// validation is enabled: such a lookup is treated as a miss so the query
     /// is re-resolved upstream.
+    /// True when any CNAME target in `response` is blocked by the current
+    /// filter rules. Cached entries are re-checked because rules can change
+    /// after the response was stored (cache hits skip the upstream uncloaking
+    /// pass unless this is applied).
+    fn cname_target_blocked(
+        &self,
+        response: &Message,
+        qtype: RecordType,
+        client: &ClientContext,
+    ) -> bool {
+        response.answers.iter().any(|record| match &record.data {
+            RData::CNAME(cname) => self.filter.evaluate(&cname.0, qtype, client).is_blocked(),
+            _ => false,
+        })
+    }
+
     async fn cached_response(&self, query: &Message, client_wants_dnssec: bool) -> Option<Message> {
         let response = self.cache.get_for_query(query).await?;
         if client_wants_dnssec
@@ -589,8 +605,18 @@ impl DnsPipeline {
             let bg_query = query.clone();
             // Refresh with the same DNSSEC shape as the primary resolution:
             // when validation is enabled force DO so the refreshed entry
-            // carries RRSIGs even for DO=0 clients.
-            let bg_resolve_query = if self.dnssec.load().mode == sito_dnssec::DnssecMode::Disabled {
+            // carries RRSIGs even for DO=0 clients, and run the same
+            // validation as the primary path before inserting. Otherwise a
+            // malicious upstream could plant AD=1 bogus data in the cache.
+            let dnssec_mode = self.dnssec.load().mode;
+            let bg_validator = if dnssec_mode == sito_dnssec::DnssecMode::Disabled
+                || bg_query.metadata.checking_disabled
+            {
+                None
+            } else {
+                Some(self.dnssec.load_full())
+            };
+            let bg_resolve_query = if dnssec_mode == sito_dnssec::DnssecMode::Disabled {
                 bg_query.clone()
             } else {
                 let mut q = bg_query.clone();
@@ -602,9 +628,22 @@ impl DnsPipeline {
             };
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Ok(resp) = bg_upstream.resolve(&bg_resolve_query).await
-                    && (resp.metadata.response_code == ResponseCode::NoError
-                        || resp.metadata.response_code == ResponseCode::NXDomain)
+                let Ok(mut resp) = bg_upstream.resolve(&bg_resolve_query).await else {
+                    return;
+                };
+                if let Some(validator) = bg_validator {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as u32;
+                    let key_fetcher =
+                        sito_upstream::UpstreamKeyFetcher::new(Arc::clone(&bg_upstream));
+                    let _ = validator
+                        .validate_with_key_fetcher(&mut resp, None, now, &key_fetcher)
+                        .await;
+                }
+                if resp.metadata.response_code == ResponseCode::NoError
+                    || resp.metadata.response_code == ResponseCode::NXDomain
                 {
                     bg_cache.insert(&bg_query, &resp).await;
                 }
@@ -702,32 +741,49 @@ impl QueryHandler for DnsPipeline {
 
             let qname = first_query.name();
             let qtype = first_query.query_type();
-            let domain_str = qname.to_utf8();
+            // ASCII/punycode form: parental/service lists, safe-search and
+            // per-domain routing are all stored as punycode. `to_utf8` would
+            // UTS46-decode `xn--` labels and never match an IDN rule.
+            let domain_str = qname.to_ascii().to_lowercase();
 
             // Collect filter candidates once for both the `$important`
             // (stage 1) and standard (stage 3) passes. The snapshot is loaded
             // once so both passes see the same compiled rule set, and the
             // candidate walk is not repeated. Clients with filtering disabled
             // skip the work entirely.
-            let (normalized_domain, filter_snapshot, filter_candidates) =
-                if policy.is_filtering_enabled {
-                    let normalized = normalized_query_domain(qname);
-                    let snapshot = self.filter.snapshot();
-                    let mut candidates = FilterCandidates::default();
-                    snapshot.allowlist.collect_candidates(
-                        &normalized,
-                        &snapshot.interner,
-                        &mut candidates.allow,
+            let (normalized_domain, filter_snapshot, filter_candidates) = if policy
+                .is_filtering_enabled
+            {
+                let normalized = normalized_query_domain(qname);
+                let snapshot = self.filter.snapshot();
+                // Fail closed when filtering was never able to load its
+                // rules: an initial download failure must not silently
+                // turn into an allow-all resolver.
+                if config.filtering.enabled && config.filtering.fail_closed && snapshot.unavailable
+                {
+                    // The engine logs/statuses the load failure once; keep this
+                    // per-query path at debug level to avoid log flooding.
+                    debug!(
+                        domain = %normalized,
+                        "Filtering enabled but no rule snapshot has loaded; failing closed"
                     );
-                    snapshot.blocklist.collect_candidates(
-                        &normalized,
-                        &snapshot.interner,
-                        &mut candidates.block,
-                    );
-                    (normalized, Some(snapshot), candidates)
-                } else {
-                    (String::new(), None, FilterCandidates::default())
-                };
+                    return QueryOutcome::servfail(query_id, &query, domain_str, qtype);
+                }
+                let mut candidates = FilterCandidates::default();
+                snapshot.allowlist.collect_candidates(
+                    &normalized,
+                    &snapshot.interner,
+                    &mut candidates.allow,
+                );
+                snapshot.blocklist.collect_candidates(
+                    &normalized,
+                    &snapshot.interner,
+                    &mut candidates.block,
+                );
+                (normalized, Some(snapshot), candidates)
+            } else {
+                (String::new(), None, FilterCandidates::default())
+            };
 
             trace!(qname = %qname, qtype = ?qtype, "Processing DNS query");
 
@@ -841,6 +897,25 @@ impl QueryHandler for DnsPipeline {
             // cache insert below.
             let _cache_single_flight: Option<sito_cache::SingleFlightGuard> = if cache_enabled {
                 if let Some(cached_resp) = self.cached_response(&query, client_wants_dnssec).await {
+                    if config.filtering.enabled
+                        && config.filtering.cname_cloaking
+                        && policy.is_filtering_enabled
+                        && self.cname_target_blocked(&cached_resp, qtype, &client)
+                    {
+                        info!(
+                            qname = %qname,
+                            "Cached response blocked via CNAME uncloaking"
+                        );
+                        return Self::blocked_outcome(
+                            &query,
+                            config,
+                            query_id,
+                            &domain_str,
+                            qtype,
+                            Some("cname_uncloaking"),
+                            None,
+                        );
+                    }
                     return self
                         .cache_hit_outcome(
                             &query,
@@ -865,6 +940,25 @@ impl QueryHandler for DnsPipeline {
                 let flight = self.cache.single_flight_for_query(&query).await;
                 if let Some(cached_resp) = self.cached_response(&query, client_wants_dnssec).await {
                     // A concurrent query populated the entry while we waited.
+                    if config.filtering.enabled
+                        && config.filtering.cname_cloaking
+                        && policy.is_filtering_enabled
+                        && self.cname_target_blocked(&cached_resp, qtype, &client)
+                    {
+                        info!(
+                            qname = %qname,
+                            "Cached response blocked via CNAME uncloaking"
+                        );
+                        return Self::blocked_outcome(
+                            &query,
+                            config,
+                            query_id,
+                            &domain_str,
+                            qtype,
+                            Some("cname_uncloaking"),
+                            None,
+                        );
+                    }
                     return self
                         .cache_hit_outcome(
                             &query,
@@ -1031,7 +1125,7 @@ impl QueryHandler for DnsPipeline {
                         "Upstream resolution failed"
                     );
                     if let Some(ref m) = self.metrics {
-                        m.inc_upstream_errors("all", &e.to_string());
+                        m.inc_upstream_errors("all", e.kind());
                     }
 
                     if cache_enabled

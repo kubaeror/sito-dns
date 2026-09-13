@@ -415,7 +415,10 @@ fn split_host_port(target: &str, default_port: u16) -> (String, u16) {
 fn clean_rule_domain(d: &str) -> String {
     let s = d.trim().to_lowercase();
     let s = s.trim_start_matches('*').trim_start_matches('.');
-    s.trim_end_matches('.').to_string()
+    let s = s.trim_end_matches('.');
+    // Accept raw IDN in configuration and store the punycode form so it
+    // matches the wire-format query name.
+    sito_proto::normalize_domain_or_idna(s).unwrap_or_else(|_| s.to_string())
 }
 
 impl UpstreamManager {
@@ -581,7 +584,9 @@ impl UpstreamManager {
     ) -> Result<(Message, String), UpstreamError> {
         let inner = self.inner.load();
         if let Some(query) = msg.queries.first() {
-            let qname_str = query.name.to_utf8().to_lowercase();
+            // ASCII/punycode form: per-domain rules are normalized to
+            // punycode, so a UTS46-decoded IDN would never match them.
+            let qname_str = query.name.to_ascii().to_lowercase();
             let qname_clean = qname_str.trim_end_matches('.');
             for (domains, group) in &inner.per_domain_rules {
                 for d in domains {
@@ -1014,6 +1019,28 @@ mod tests {
         let statuses = manager.statuses().await;
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].0, "1.1.1.1:53");
+    }
+
+    #[tokio::test]
+    async fn test_manager_with_tls_upstream_constructs_without_panicking() {
+        // Regression for the P0 where DoT construction used the ambiguous
+        // rustls builder and aborted the process under `panic = "abort"`.
+        let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
+        let config = UpstreamConfig {
+            servers: vec!["tls://1.1.1.1".to_string()],
+            bootstrap: vec![],
+            strategy: UpstreamStrategy::Failover,
+            timeout_ms: 1000,
+            probe_domain: "cloudflare.com".to_string(),
+            pool_size: 2,
+            per_domain: vec![],
+        };
+        let manager = UpstreamManager::from_config(&config, &bootstrap).await;
+        assert!(
+            manager.is_ok(),
+            "tls:// upstream must construct successfully: {:?}",
+            manager.err()
+        );
     }
 
     #[test]

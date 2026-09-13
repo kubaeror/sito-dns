@@ -11,6 +11,7 @@ sito-core.workspace = true
 sito-filter.workspace = true
 sito-clients.workspace = true
 sito-rewrites.workspace = true
+sito-runtime.workspace = true
 sito-stats.workspace = true
 
 anyhow.workspace = true

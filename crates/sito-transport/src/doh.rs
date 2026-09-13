@@ -14,6 +14,11 @@ use tracing::{debug, info, trace, warn};
 /// connection permit indefinitely.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum DNS message size accepted on the DoH path (RFC 8484 over the
+/// 65535-byte DNS-over-TCP framing limit). Larger bodies are rejected before
+/// buffering beyond this bound.
+pub(crate) const MAX_DOH_BODY_BYTES: usize = 65_535;
+
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, Query, State};
@@ -146,6 +151,13 @@ async fn handle_doh_request<H: QueryHandler>(
             if body.is_empty() {
                 return (StatusCode::BAD_REQUEST, "Empty DNS query body").into_response();
             }
+            if body.len() > MAX_DOH_BODY_BYTES {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "DNS message exceeds the 65535-byte limit",
+                )
+                    .into_response();
+            }
             body.to_vec()
         }
         Method::GET => {
@@ -154,7 +166,14 @@ async fn handle_doh_request<H: QueryHandler>(
             };
 
             match decode_base64url(dns_param) {
-                Ok(bytes) => bytes,
+                Ok(bytes) if bytes.len() <= MAX_DOH_BODY_BYTES => bytes,
+                Ok(_) => {
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "DNS message exceeds the 65535-byte limit",
+                    )
+                        .into_response();
+                }
                 Err(e) => {
                     debug!("DoH base64url decode error: {}", e);
                     return (StatusCode::BAD_REQUEST, "Invalid base64url encoding").into_response();
@@ -297,6 +316,9 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
     let app = Router::new()
         .route("/dns-query", any(doh_route::<H>))
         .route("/dns-query/{client_id}", any(doh_route_with_client::<H>))
+        // Reject oversized bodies before they are buffered (the handler also
+        // checks, but this bounds memory per request).
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_DOH_BODY_BYTES))
         .with_state(state);
 
     // Built once: `TowerToHyperService` is `Copy` and the router clone is

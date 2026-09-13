@@ -85,6 +85,8 @@ pub const MAX_TOTP_ATTEMPTS: u32 = 5;
 pub const MAX_SETUP_TOKEN_FAILURES: u32 = 10;
 /// Rolling window for setup-token failure throttling.
 pub const SETUP_TOKEN_RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Age at which a still-pending setup emits a one-time operator warning.
+pub const SETUP_TOKEN_PENDING_WARN: Duration = Duration::from_hours(24);
 
 #[derive(Debug, Clone)]
 struct PendingTotp {
@@ -261,6 +263,8 @@ pub struct AuthManager {
     setup_token: Arc<Mutex<Option<SetupToken>>>,
     /// Failed setup-token attempts keyed by client IP.
     setup_token_failures: Arc<Mutex<HashMap<String, FailureWindow>>>,
+    /// Whether the one-time "setup still pending" warning was already emitted.
+    setup_pending_warned: Arc<AtomicBool>,
     /// Serializes second-factor verification so a backup code cannot be
     /// consumed by two concurrent requests.
     totp_verification_lock: Arc<tokio::sync::Mutex<()>>,
@@ -397,6 +401,7 @@ impl AuthManager {
             default_admin_active: Arc::new(AtomicBool::new(false)),
             setup_token: Arc::new(Mutex::new(None)),
             setup_token_failures: Arc::new(Mutex::new(HashMap::new())),
+            setup_pending_warned: Arc::new(AtomicBool::new(false)),
             totp_verification_lock: Arc::new(tokio::sync::Mutex::new(())),
             users_path,
             sessions_path,
@@ -539,6 +544,7 @@ impl AuthManager {
             default_admin_active: Arc::new(AtomicBool::new(false)),
             setup_token: Arc::new(Mutex::new(None)),
             setup_token_failures: Arc::new(Mutex::new(HashMap::new())),
+            setup_pending_warned: Arc::new(AtomicBool::new(false)),
             totp_verification_lock: Arc::new(tokio::sync::Mutex::new(())),
             users_path: Some(path.clone()),
             sessions_path: None,
@@ -702,6 +708,7 @@ impl AuthManager {
             token: token.clone(),
             created_at: Instant::now(),
         });
+        self.setup_pending_warned.store(false, Ordering::SeqCst);
         tracing::warn!(
             "First-boot setup token generated; required for /wizard, /ui/wizard/* and /ui/upstreams/test until setup completes"
         );
@@ -813,6 +820,9 @@ impl AuthManager {
             if username == "admin" {
                 self.default_admin_active.store(false, Ordering::SeqCst);
             }
+            // A deleted account must lose access immediately: sessions are
+            // not re-validated against the user table on every request.
+            self.purge_user_sessions(username);
             self.save_users();
         }
         removed
@@ -844,7 +854,13 @@ impl AuthManager {
             role,
             totp: None,
         };
-        lock(&self.users).insert(username.to_string(), user);
+        let existed = lock(&self.users)
+            .insert(username.to_string(), user)
+            .is_some();
+        if existed {
+            // Overwriting an account (new password/role) revokes its sessions.
+            self.purge_user_sessions(username);
+        }
         self.save_users();
     }
 
@@ -1062,6 +1078,12 @@ impl AuthManager {
                 remaining_seconds: secs,
             };
         }
+
+        // Serialize the read-verify-write cycle. Without this, two concurrent
+        // requests with the same TOTP step both verify against the same
+        // `last_used_step` and both succeed (code replay), and one backup code
+        // can be consumed twice.
+        let _verify_guard = self.totp_verification_lock.lock().await;
 
         let snapshot = {
             let users = lock(&self.users);
@@ -1418,12 +1440,36 @@ impl AuthManager {
             let mut windows = lock(&self.setup_token_failures);
             windows.retain(|_, w| now.duration_since(w.window_start) <= SETUP_TOKEN_RATE_WINDOW);
         }
-        // Expire long-lived setup tokens (e.g. server left in setup mode).
+        // The setup token must never silently expire while the deployment is
+        // still in first-run state: without it, `/ui/wizard/complete` would be
+        // reachable unauthenticated and an attacker could claim the admin
+        // account. It is consumed when setup completes; clear any leftover
+        // once `setup_complete` is set by another path.
+        let setup_complete = self.setup_complete.load(Ordering::SeqCst);
         let mut token = lock(&self.setup_token);
-        if let Some(ref entry) = *token
-            && entry.created_at.elapsed() > Duration::from_hours(24)
+        if setup_complete {
+            if token.take().is_some() {
+                self.setup_pending_warned.store(false, Ordering::SeqCst);
+            }
+        } else if let Some(entry) = token.as_ref()
+            && entry.created_at.elapsed() > SETUP_TOKEN_PENDING_WARN
+            && !self.setup_pending_warned.swap(true, Ordering::SeqCst)
         {
-            *token = None;
+            tracing::warn!(
+                "Setup mode has been pending for over 24 hours; the first-boot setup token \
+                 remains required until setup completes (see the token printed at startup)"
+            );
+        }
+    }
+
+    /// Ages the setup token for tests (no effect when no token is active).
+    #[cfg(test)]
+    pub fn age_setup_token_for_test(&self, age: Duration) {
+        let mut token = lock(&self.setup_token);
+        if let Some(entry) = token.as_mut() {
+            entry.created_at = Instant::now()
+                .checked_sub(age)
+                .expect("test age must fit in Instant range");
         }
     }
 
@@ -1600,6 +1646,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_totp_backup_code_is_single_use_under_concurrency() {
+        let mgr = Arc::new(AuthManager::new());
+        let setup = mgr.init_totp_setup("admin").await.expect("setup");
+        assert!(
+            mgr.confirm_totp_setup("admin", &setup.backup_codes[0])
+                .await
+        );
+
+        let LoginResult::TotpRequired { partial_token: t1 } =
+            mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("Expected TOTP required");
+        };
+        let LoginResult::TotpRequired { partial_token: t2 } =
+            mgr.login("admin", "adminadmin", "127.0.0.2").await
+        else {
+            panic!("Expected TOTP required");
+        };
+
+        // Both requests race on the same unused backup code.
+        let code = setup.backup_codes[1].clone();
+        let code_2 = code.clone();
+        let mgr_2 = Arc::clone(&mgr);
+        let (r1, r2) = tokio::join!(mgr.verify_totp(&t1, &code, "127.0.0.1"), async move {
+            mgr_2.verify_totp(&t2, &code_2, "127.0.0.2").await
+        },);
+
+        let successes = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, TotpVerifyResult::Success(_)))
+            .count();
+        assert_eq!(
+            successes, 1,
+            "a backup code must be consumed exactly once: {r1:?} / {r2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_user_revokes_sessions() {
+        let mgr = AuthManager::new();
+        let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("expected direct login");
+        };
+        assert!(mgr.validate_session(&session.id).is_some());
+
+        assert!(mgr.delete_user("admin"));
+        assert!(
+            mgr.validate_session(&session.id).is_none(),
+            "a deleted account's sessions must be invalidated"
+        );
+    }
+
+    #[tokio::test]
     async fn test_auth_manager_api_tokens() {
         let mgr = AuthManager::new();
         let (meta, resp) = mgr.create_token("grafana", Role::Viewer);
@@ -1663,6 +1763,37 @@ mod tests {
             mgr.validate_setup_token(Some(&token), "198.51.100.8"),
             SetupTokenStatus::Missing
         );
+    }
+
+    #[test]
+    fn test_setup_token_does_not_expire_before_setup_completes() {
+        let mgr = AuthManager::with_storage(
+            std::env::temp_dir().join(format!("sito_setup_tok_age_{}", rand::random::<u64>())),
+            24,
+            5,
+        )
+        .unwrap();
+        let token = mgr.setup_token().expect("token provisioned");
+
+        // Regression: a server left in setup mode longer than the old 24 h
+        // expiry must still require the token; an expired token previously
+        // enabled unauthenticated `/ui/wizard/complete`.
+        mgr.age_setup_token_for_test(Duration::from_hours(72));
+        mgr.prune();
+
+        assert!(
+            mgr.setup_token_required(),
+            "setup token must survive while setup is pending"
+        );
+        assert_eq!(
+            mgr.validate_setup_token(Some(&token), "198.51.100.9"),
+            SetupTokenStatus::Valid
+        );
+
+        // Once setup is complete the residual token is cleared.
+        mgr.mark_setup_complete();
+        mgr.prune();
+        assert!(!mgr.setup_token_required());
     }
 
     #[tokio::test]

@@ -507,6 +507,27 @@ pub fn run_ha_gen_certs(
     Ok(())
 }
 
+/// Reads the update signature policy from `config_path`.
+///
+/// Fails closed: an unreadable or invalid configuration is an error, because
+/// falling back to `checksum-only` would silently disable signature
+/// enforcement on a host that had it enabled.
+fn update_signature_policy(config_path: &Path) -> Result<bool, anyhow::Error> {
+    let content = std::fs::read_to_string(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Refusing to update: cannot read configuration '{}' to determine the signature policy: {e}",
+            config_path.display()
+        )
+    })?;
+    let cfg = Config::from_toml_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "Refusing to update: configuration '{}' is invalid: {e}",
+            config_path.display()
+        )
+    })?;
+    Ok(cfg.server.update_require_signature)
+}
+
 /// Executes the `update` subcommand.
 pub async fn run_update(
     check: bool,
@@ -545,10 +566,10 @@ pub async fn run_update(
     }
 
     println!("\nApplying update to v{}...", info.latest_version);
-    let require_signature = std::fs::read_to_string(config_path)
-        .ok()
-        .and_then(|content| Config::from_toml_str(&content).ok())
-        .is_some_and(|cfg| cfg.server.update_require_signature);
+    // Fail closed: if the configuration cannot be read or parsed we cannot
+    // know whether signatures are required, so refuse instead of silently
+    // downgrading to checksum-only verification.
+    let require_signature = update_signature_policy(config_path)?;
     if require_signature {
         println!("Signature verification is required by configuration.");
     }
@@ -658,6 +679,37 @@ mod tests {
         let cli_custom = Cli::try_parse_from(args_custom).expect("parse args");
         assert!(cli_custom.no_setup);
         assert_eq!(cli_custom.config, PathBuf::from("/etc/sito/custom.toml"));
+    }
+
+    #[test]
+    fn test_update_signature_policy_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("sito_update_policy_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Missing config: refuse instead of silently disabling signatures.
+        let missing = dir.join("missing.toml");
+        assert!(update_signature_policy(&missing).is_err());
+
+        // Invalid config: refuse.
+        let invalid = dir.join("invalid.toml");
+        std::fs::write(&invalid, "not = [valid").unwrap();
+        assert!(update_signature_policy(&invalid).is_err());
+
+        // Default config enables the requirement.
+        let default_cfg = dir.join("default.toml");
+        std::fs::write(&default_cfg, "config_version = 1\n").unwrap();
+        assert!(update_signature_policy(&default_cfg).unwrap());
+
+        // Explicit opt-out is honored.
+        let opt_out = dir.join("opt_out.toml");
+        std::fs::write(
+            &opt_out,
+            "config_version = 1\n[server]\nupdate_require_signature = false\n",
+        )
+        .unwrap();
+        assert!(!update_signature_policy(&opt_out).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

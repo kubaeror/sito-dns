@@ -484,8 +484,11 @@ fn evaluate_denial(
     trusted_sigs: &[TrustedSignature],
 ) -> DenialResult {
     let nxdomain = response.metadata.response_code == ResponseCode::NXDomain;
-    let mut secure = false;
     let mut opt_out = false;
+    // NSEC/NSEC3 records grouped by signer zone: a complete denial proof can
+    // span several records (e.g. qname cover plus wildcard cover), so the
+    // whole signed set must be evaluated together.
+    let mut nsec_groups: HashMap<LowerName, (Name, Vec<NsecRecord<'_>>)> = HashMap::new();
     let mut nsec3_groups: HashMap<LowerName, Vec<Nsec3Record<'_>>> = HashMap::new();
 
     for record in response
@@ -508,19 +511,14 @@ fn evaluate_denial(
             }
             match (nsec_rdata, nsec3_rdata) {
                 (Some(nsec), _) if trusted.covered == RecordType::NSEC => {
-                    let proof = evaluate_nsec_denial(
-                        &[NsecRecord {
+                    nsec_groups
+                        .entry(trusted.signer.clone())
+                        .or_insert_with(|| (trusted.signer_name.clone(), Vec::new()))
+                        .1
+                        .push(NsecRecord {
                             owner: &record.name,
                             rdata: nsec,
-                        }],
-                        negative_name,
-                        qtype,
-                        nxdomain,
-                        &trusted.signer_name,
-                    );
-                    if proof == NsecDenial::Secure {
-                        secure = true;
-                    }
+                        });
                 }
                 (_, Some(nsec3)) if trusted.covered == RecordType::NSEC3 => {
                     nsec3_groups
@@ -536,8 +534,12 @@ fn evaluate_denial(
         }
     }
 
-    if secure {
-        return DenialResult::Secure;
+    for (signer, records) in nsec_groups.values() {
+        if evaluate_nsec_denial(records, negative_name, qtype, nxdomain, signer)
+            == NsecDenial::Secure
+        {
+            return DenialResult::Secure;
+        }
     }
     for records in nsec3_groups.values() {
         match evaluate_nsec3_denial(records, negative_name, qtype, nxdomain) {
@@ -1273,6 +1275,7 @@ impl DnssecValidator {
         // relevant to the question (or a complete denial proof) is covered by a
         // signature that verified with a chain-validated key.
         let anchors = self.trust_anchors.load();
+        let relevant_keys = relevant_answer_keys(response, &qname, qtype);
         let mut first_failure: Option<(&'static str, u16)> = None;
         let mut policy_violation = false;
         let mut has_trusted_sig = false;
@@ -1283,19 +1286,29 @@ impl DnssecValidator {
         for (rrsig_owner, rrsig) in &rrsigs {
             let inception = rrsig.input().sig_inception.get();
             let expiration = rrsig.input().sig_expiration.get();
+            let type_covered = rrsig.input().type_covered;
+
+            // Failures on signatures for RRsets that are not relevant to the
+            // question (e.g. stale RRSIGs in the authority section of an
+            // otherwise valid answer) must not turn the response Bogus.
+            let rrsig_relevant =
+                relevant_keys.contains(&(LowerName::from(rrsig_owner), type_covered));
 
             // RFC 4035 5.3.1 with a bounded clock skew: a signature is usable
             // within +/- 300 s of its validity window.
             if now.saturating_add(MAX_CLOCK_SKEW) < inception {
-                first_failure.get_or_insert(("Signature not yet valid", EDE_DNSSEC_BOGUS));
+                if rrsig_relevant {
+                    first_failure.get_or_insert(("Signature not yet valid", EDE_DNSSEC_BOGUS));
+                }
                 continue;
             }
             if now > expiration.saturating_add(MAX_CLOCK_SKEW) {
-                first_failure.get_or_insert(("Signature expired", EDE_SIGNATURE_EXPIRED));
+                if rrsig_relevant {
+                    first_failure.get_or_insert(("Signature expired", EDE_SIGNATURE_EXPIRED));
+                }
                 continue;
             }
 
-            let type_covered = rrsig.input().type_covered;
             let signer_name = &rrsig.input().signer_name;
             let key_tag = rrsig.input().key_tag;
 
@@ -1332,7 +1345,9 @@ impl DnssecValidator {
             if !dnskey_policy_ok(&dnskey) {
                 // Signatures exist but every usable key was rejected by
                 // policy; this must not silently downgrade to Insecure.
-                policy_violation = true;
+                if rrsig_relevant {
+                    policy_violation = true;
+                }
                 continue;
             }
 
@@ -1347,10 +1362,12 @@ impl DnssecValidator {
             // An RRSIG that covers nothing in the response cannot authenticate
             // anything and is a validation failure.
             if covered_records.is_empty() {
-                first_failure.get_or_insert((
-                    "RRSIG does not cover any records in the response",
-                    EDE_DNSSEC_BOGUS,
-                ));
+                if rrsig_relevant {
+                    first_failure.get_or_insert((
+                        "RRSIG does not cover any records in the response",
+                        EDE_DNSSEC_BOGUS,
+                    ));
+                }
                 continue;
             }
 
@@ -1364,10 +1381,26 @@ impl DnssecValidator {
                 )
                 .is_err()
             {
-                first_failure.get_or_insert((
-                    "Cryptographic signature verification failed",
-                    EDE_DNSSEC_BOGUS,
-                ));
+                if rrsig_relevant {
+                    first_failure.get_or_insert((
+                        "Cryptographic signature verification failed",
+                        EDE_DNSSEC_BOGUS,
+                    ));
+                }
+                continue;
+            }
+
+            // RFC 4035 5.3.1: the RRSIG signer must be the zone containing the
+            // RRset owner. Without this containment check, any key validated
+            // for one domain could authenticate records owned by any other
+            // name (cross-zone signature forgery granting AD=1).
+            if !lower_signer.zone_of(&LowerName::from(rrsig_owner)) {
+                if rrsig_relevant {
+                    first_failure.get_or_insert((
+                        "RRSIG signer does not contain the RRset owner",
+                        EDE_DNSSEC_BOGUS,
+                    ));
+                }
                 continue;
             }
 
@@ -1401,7 +1434,7 @@ impl DnssecValidator {
         // Secure/AD is granted only for the positive answer RRset(s) relevant
         // to the question (including a CNAME chain) or for a complete
         // NSEC/NSEC3 denial proof. Unrelated signatures never grant AD.
-        let relevant = relevant_answer_keys(response, &qname, qtype);
+        let relevant = &relevant_keys;
         let present_relevant: HashSet<(LowerName, RecordType)> = response
             .answers
             .iter()
@@ -1880,24 +1913,43 @@ mod tests {
         signer: &hickory_proto::dnssec::DnssecSigner,
         response_code: ResponseCode,
     ) -> Message {
+        signed_nsec_response_records(
+            origin,
+            &[(nsec_owner.clone(), next.clone(), bitmap.to_vec())],
+            qname,
+            dnskey,
+            signer,
+            response_code,
+        )
+    }
+
+    /// Builds a signed negative response containing one or more NSEC RRsets.
+    fn signed_nsec_response_records(
+        origin: &Name,
+        nsecs: &[(Name, Name, Vec<RecordType>)],
+        qname: &Name,
+        dnskey: &DNSKEY,
+        signer: &hickory_proto::dnssec::DnssecSigner,
+        response_code: ResponseCode,
+    ) -> Message {
         use hickory_proto::dnssec::rdata::NSEC;
         use hickory_proto::rr::RecordSet;
-
-        let nsec = NSEC::new(next.clone(), bitmap.iter().copied());
-        let nsec_record = Record::from_rdata(
-            nsec_owner.clone(),
-            300,
-            RData::DNSSEC(DNSSECRData::NSEC(nsec)),
-        );
-        let mut set = RecordSet::new(nsec_owner.clone(), RecordType::NSEC, 0);
-        set.insert(nsec_record.clone(), 0);
-        let nsec_sig = sign_test_rrset(&set, signer);
 
         let mut msg = Message::new(24, MessageType::Response, OpCode::Query);
         msg.queries.push(Query::query(qname.clone(), RecordType::A));
         msg.metadata.response_code = response_code;
-        msg.authorities.push(nsec_record);
-        msg.authorities.push(nsec_sig);
+
+        for (owner, next, bitmap) in nsecs {
+            let nsec = NSEC::new(next.clone(), bitmap.iter().copied());
+            let nsec_record =
+                Record::from_rdata(owner.clone(), 300, RData::DNSSEC(DNSSECRData::NSEC(nsec)));
+            let mut set = RecordSet::new(owner.clone(), RecordType::NSEC, 0);
+            set.insert(nsec_record.clone(), 0);
+            let nsec_sig = sign_test_rrset(&set, signer);
+            msg.authorities.push(nsec_record);
+            msg.authorities.push(nsec_sig);
+        }
+
         msg.additionals.push(Record::from_rdata(
             origin.clone(),
             300,
@@ -1920,11 +1972,24 @@ mod tests {
         let validator =
             DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
 
-        let mut msg = signed_nsec_response(
+        // A complete NXDOMAIN proof: one NSEC covers the qname and another
+        // covers the wildcard `*.nsec.example`, so no wildcard could have
+        // synthesized the name.
+        let bitmap = vec![RecordType::A, RecordType::NSEC, RecordType::RRSIG];
+        let mut msg = signed_nsec_response_records(
             &origin,
-            &origin,
-            &nsec_next(&origin),
-            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+            &[
+                (
+                    origin.clone(),
+                    Name::from_str("a.nsec.example.").unwrap(),
+                    bitmap.clone(),
+                ),
+                (
+                    Name::from_str("a.nsec.example.").unwrap(),
+                    nsec_next(&origin),
+                    bitmap,
+                ),
+            ],
             &qname,
             &dnskey,
             &signer,
@@ -1935,6 +2000,38 @@ mod tests {
 
         assert_eq!(outcome, ValidationOutcome::Secure);
         assert!(msg.metadata.authentic_data);
+    }
+
+    #[test]
+    fn test_nxdomain_without_wildcard_denial_is_bogus() {
+        let (origin, dnskey, signer) = create_test_signer("nsec.example.");
+        let qname = Name::from_str("missing.nsec.example.").unwrap();
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        // Only the qname is covered; nothing proves that `*.nsec.example` does
+        // not exist, so the NXDOMAIN must not be authenticated.
+        let mut msg = signed_nsec_response(
+            &origin,
+            &Name::from_str("a.nsec.example.").unwrap(),
+            &nsec_next(&origin),
+            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+            &qname,
+            &dnskey,
+            &signer,
+            ResponseCode::NXDomain,
+        );
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("test"), now);
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "missing wildcard denial must be Bogus, got {outcome:?}"
+        );
+        assert!(!msg.metadata.authentic_data);
     }
 
     #[test]
@@ -2746,6 +2843,41 @@ mod tests {
         let outcome = validator.validate_response(&mut msg, Some("rel"), now);
 
         assert!(matches!(outcome, ValidationOutcome::Bogus { .. }));
+        assert!(!msg.metadata.authentic_data);
+    }
+
+    #[test]
+    fn test_cross_zone_rrsig_does_not_grant_ad() {
+        // A validated attacker zone signs an RRset owned by the victim zone.
+        // RFC 4035 5.3.1 requires the signer to contain the owner; without the
+        // containment check this granted AD=1 for arbitrary names.
+        let (attacker, attacker_key, attacker_signer) = create_test_signer("attacker.example.");
+        let (victim, _victim_key, _victim_signer) = create_test_signer("victim.example.");
+        let (answer, answer_sig) = signed_a_response(&victim, &attacker_signer);
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(attacker_key.public_key(), LowerName::from(&attacker));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let mut msg = Message::new(37, MessageType::Response, OpCode::Query);
+        msg.queries
+            .push(Query::query(victim.clone(), RecordType::A));
+        msg.answers.push(answer);
+        msg.answers.push(answer_sig);
+        msg.additionals.push(Record::from_rdata(
+            attacker,
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(attacker_key)),
+        ));
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("xzone"), now);
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "cross-zone RRSIG must be Bogus, got {outcome:?}"
+        );
         assert!(!msg.metadata.authentic_data);
     }
 

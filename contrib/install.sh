@@ -251,7 +251,7 @@ else
         if cosign verify-blob \
             --certificate "${TMP_DIR}/${CERT_NAME}" \
             --signature "${TMP_DIR}/${SIG_NAME}" \
-            --certificate-identity-regexp "https://github.com/${REPO}/.*" \
+            --certificate-identity-regexp "^https://github.com/${REPO}/\.github/workflows/release\.yml@refs/tags/.*$" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             "${TMP_DIR}/${TARBALL_NAME}"; then
             echo "Cosign keyless signature verified successfully."

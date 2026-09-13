@@ -6,7 +6,7 @@ This guide explains how to migrate existing AdGuard Home configurations, subscri
 
 ## 1. Automated Migration Using `adguard_to_sito.py`
 
-`sito` provides an automated Python conversion script located in `contrib/adguard_to_sito.py`. It parses an existing `AdGuardHome.yaml` file and generates a complete, valid `config.toml` for `sito`.
+`sito` provides an automated Python conversion script located in `contrib/adguard_to_sito.py`. It parses an existing `AdGuardHome.yaml` file and generates a valid `config.toml` for `sito` covering DNS listeners, upstreams, filtering, rewrites and clients (see the mapping caveats in section 2).
 
 ### 1.1 Running the Converter
 ```bash
@@ -21,7 +21,8 @@ Before starting the server, validate the converted configuration against the sit
 ```bash
 sito check-config --config /etc/sito/config.toml
 ```
-If validation passes, the command exits with code `0` and prints `"Configuration is valid."`.
+If validation passes, the command exits with code `0` and prints
+`Config file '<path>' is valid (listening on port <n>)`.
 
 ---
 
@@ -31,10 +32,10 @@ If validation passes, the command exits with code `0` and prints `"Configuration
 |---|---|---|
 | `dns.upstream_dns` | `[upstream] servers = [...]` | Full support for DoT (`tls://`) and plain DNS (UDP/TCP). |
 | `dns.bootstrap_dns` | `[upstream] bootstrap = [...]` | Bootstrap IP addresses for encrypted upstreams. |
-| `dns.blocking_mode` | `[filtering] blocking_mode = "..."` | `default`/`null_ip` maps to `zero_ip` (`0.0.0.0`/`::`). |
+| `dns.blocking_mode` | `[filtering] blocking_mode = "..."` | `default`/`null_ip` maps to `zero_ip`; `custom_ip` maps to `custom_ip:<blocking_ipv4>`. |
 | `filters` (subscriptions) | `[[filtering.lists]]` | Preserves list name, URL, and enabled status. |
 | `user_rules` (custom rules) | `[filtering] custom_rules = [...]` | 100% ABP syntax compatibility (domain anchors, wildcards, `$badfilter`, `$client`, `$dnsrewrite`). |
-| `clients.persistent` | `[[clients.entries]]` | Maps client IP, CIDR, MAC address, and DoT/DoH ClientID tokens. |
+| `clients.persistent` | `[[clients.entries]]` | Maps client IDs (IP/CIDR/MAC/ClientID), per-client upstreams, `ignore_querylog`/`ignore_statistics`, and `filtering_enabled` (routed to a generated `no-filtering` group). Per-client parental/safe-browsing toggles have no sito equivalent and are not emitted. |
 | `dns.rewrites` | `[[rewrites.entries]]` | Exact domain and wildcard (`*.example.com`) local DNS overrides. |
 | `tls.certificate_path` | `[tls] cert = "..."` | Direct PEM certificate reuse. |
 | `tls.private_key_path` | `[tls] key = "..."` | Direct private key reuse. |

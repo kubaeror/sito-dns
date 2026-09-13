@@ -323,8 +323,13 @@ pub struct AuthConfig {
     #[serde(default = "default_session_persist")]
     pub session_persist: bool,
     /// Default lifetime for newly created API tokens in days (`0` = no expiry).
-    #[serde(default)]
+    /// Defaults to 90 days so credentials do not live forever by omission.
+    #[serde(default = "default_token_ttl_days")]
     pub token_default_ttl_days: u64,
+}
+
+fn default_token_ttl_days() -> u64 {
+    90
 }
 
 fn default_session_ttl_hours() -> u64 {
@@ -345,7 +350,7 @@ impl Default for AuthConfig {
             session_ttl_hours: default_session_ttl_hours(),
             login_rate_limit: default_login_rate_limit(),
             session_persist: default_session_persist(),
-            token_default_ttl_days: 0,
+            token_default_ttl_days: default_token_ttl_days(),
         }
     }
 }
@@ -364,8 +369,10 @@ pub struct ServerConfig {
     #[serde(default = "default_server_log_format")]
     pub log_format: String,
     /// Require a verified release signature (cosign) for in-app updates.
-    /// Default: false (checksum-only) until signed releases are guaranteed.
-    #[serde(default)]
+    /// Default: true. A signature that is present is always verified; with
+    /// this disabled, a missing signature falls back to same-origin SHA-256
+    /// only, which does not protect against a compromised release channel.
+    #[serde(default = "default_true")]
     pub update_require_signature: bool,
 }
 
@@ -393,7 +400,7 @@ impl Default for ServerConfig {
             data_dir: default_server_data_dir(),
             log_level: default_server_log_level(),
             log_format: default_server_log_format(),
-            update_require_signature: false,
+            update_require_signature: true,
         }
     }
 }
@@ -1002,6 +1009,12 @@ pub struct FilteringConfig {
     pub blocking_ttl: u32,
     #[serde(default = "default_true")]
     pub cname_cloaking: bool,
+    /// When true, queries are answered with SERVFAIL while filtering is
+    /// enabled but no usable rule snapshot has ever loaded (e.g. every list
+    /// failed at boot). Prevents a failed initial load from silently
+    /// disabling all filtering.
+    #[serde(default = "default_true")]
+    pub fail_closed: bool,
     #[serde(default = "default_filtering_anti_doh_bypass")]
     pub anti_doh_bypass: String,
     #[serde(default)]
@@ -1028,6 +1041,7 @@ impl Default for FilteringConfig {
             blocking_mode: BlockingMode::default(),
             blocking_ttl: default_filtering_blocking_ttl(),
             cname_cloaking: true,
+            fail_closed: true,
             anti_doh_bypass: default_filtering_anti_doh_bypass(),
             lists: Vec::new(),
             custom_rules: Vec::new(),
@@ -1345,6 +1359,20 @@ key = "/path/to/key.pem"
             }
             other => panic!("expected dns.cache.negative_ttl_max error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_default_api_token_ttl_is_bounded() {
+        let auth = AuthConfig::default();
+        assert_eq!(
+            auth.token_default_ttl_days, 90,
+            "API tokens must expire by default instead of living forever"
+        );
+        // Explicit opt-out (no expiry) still parses.
+        let cfg = Config::from_toml_str("config_version = 1\n[auth]\ntoken_default_ttl_days = 0\n")
+            .unwrap();
+        let parsed: AuthConfig = cfg.auth.unwrap().try_into().unwrap();
+        assert_eq!(parsed.token_default_ttl_days, 0);
     }
 
     #[test]

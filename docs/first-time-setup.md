@@ -1,3 +1,11 @@
+> **Historical document.** This was the implementation plan for the first-boot
+> setup wizard and installer changes; it is kept for design history. Several
+> "Current State" claims below (missing-wizard hard error, installer-generated
+> config, default credentials, port conflicts) no longer describe the tree.
+> For current behavior see [first-boot setup in the
+> README](../README.md#-first-time-setup-wizard),
+> [security-audit.md](security-audit.md) and [audit5.md](audit5.md).
+
 # Plan: Web-Based First-Time Setup Wizard + Installer Hardening
 
 **Repo:** `sito-dns` (Rust workspace, axum-based DNS server with HTMX admin panel)
