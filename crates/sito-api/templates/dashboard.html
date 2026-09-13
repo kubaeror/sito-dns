@@ -16,7 +16,11 @@
     </div>
     <span class="badge badge-info">Live Stream</span>
   </div>
-  <div id="chart-container" style="width: 100%; height: 260px; min-height: 260px;"></div>
+  <div id="chart-container"
+       data-times="{{ hourly_times_json }}"
+       data-totals="{{ hourly_totals_json }}"
+       data-blocked="{{ hourly_blocked_json }}"
+       style="width: 100%; height: 260px; min-height: 260px;"></div>
 </div>
 
 <!-- Upstream Resolvers Health -->
@@ -63,58 +67,4 @@
     </table>
   </div>
 </div>
-
-<script>
-  // Initialize uPlot Chart
-  document.addEventListener("DOMContentLoaded", () => {
-    const el = document.getElementById("chart-container");
-    if (!el) return;
-
-    const width = el.clientWidth || 800;
-    const times = {{ hourly_times_json|safe }};
-    const totals = {{ hourly_totals_json|safe }};
-    const blocked = {{ hourly_blocked_json|safe }};
-
-    const data = [times, totals, blocked];
-
-    const opts = {
-      width: width,
-      height: 260,
-      cursor: { sync: { key: "querychart" } },
-      scales: { x: { time: true } },
-      axes: [
-        {
-          stroke: "#94a3b8",
-          grid: { stroke: "rgba(148, 163, 184, 0.1)" },
-          ticks: { stroke: "#94a3b8" },
-        },
-        {
-          stroke: "#94a3b8",
-          grid: { stroke: "rgba(148, 163, 184, 0.1)" },
-          ticks: { stroke: "#94a3b8" },
-        }
-      ],
-      series: [
-        {},
-        {
-          label: "Total Queries",
-          stroke: "#10b981",
-          fill: "rgba(16, 185, 129, 0.15)",
-          width: 2,
-        },
-        {
-          label: "Blocked",
-          stroke: "#ef4444",
-          fill: "rgba(239, 68, 68, 0.2)",
-          width: 2,
-        }
-      ],
-    };
-
-    const chart = new uPlot(opts, data, el);
-    window.addEventListener("resize", () => {
-      chart.setSize({ width: el.clientWidth, height: 260 });
-    });
-  });
-</script>
 {% endblock %}

@@ -11,16 +11,10 @@
   <script src="/static/htmx-ws.js"></script>
   <script src="/static/uplot.min.js"></script>
   <script defer src="/static/alpine.min.js"></script>
-  <script>
-    function toggleTheme() {
-      const current = localStorage.getItem('sito_theme') || 'dark';
-      const next = current === 'dark' ? 'light' : 'dark';
-      localStorage.setItem('sito_theme', next);
-    }
-  </script>
+  <script defer src="/static/app.js"></script>
   {% block head %}{% endblock %}
 </head>
-<body hx-boost="true">
+<body hx-boost="true" hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'>
   {% if is_authenticated %}
   <div class="app-layout">
     <!-- Sidebar -->
@@ -79,6 +73,7 @@
           <span class="user-role-badge">{{ user_role }}</span>
         </div>
         <form action="/ui/logout" method="POST" style="margin:0;">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button type="submit" class="btn-icon" title="Log out">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/></svg>
           </button>
@@ -101,7 +96,7 @@
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
             </template>
           </button>
-          <a href="/swagger-ui" target="_blank" class="btn btn-outline btn-sm">API Docs</a>
+          <a href="/api/docs" target="_blank" class="btn btn-outline btn-sm">API Docs</a>
         </div>
       </header>
 

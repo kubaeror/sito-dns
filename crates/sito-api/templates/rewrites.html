@@ -32,7 +32,11 @@
           <td><span class="badge badge-neutral mono">{{ r.record_type }}</span></td>
           <td class="mono" style="color: var(--accent-secondary);">{{ r.answer }}</td>
           <td style="text-align: center;">
-            <form action="/ui/rewrites/delete" method="POST" style="display:inline;" onsubmit="return confirm('Delete rewrite for {{ r.domain }}?');">
+            <form action="/ui/rewrites/delete" method="POST" style="display:inline;"
+                  data-confirm="Delete rewrite for {{ r.domain }}?"
+                  @submit="if (!confirm($el.dataset.confirm)) { $event.preventDefault(); }">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="id" value="{{ r.id }}">
               <input type="hidden" name="domain" value="{{ r.domain }}">
               <input type="hidden" name="record_type" value="{{ r.record_type }}">
               <input type="hidden" name="answer" value="{{ r.answer }}">
@@ -59,6 +63,7 @@
         <button class="btn-icon" @click="showModal = false">&times;</button>
       </div>
       <form action="/ui/rewrites/add" method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <div class="modal-body">
           <div class="form-group">
             <label class="form-label" for="rw-domain">Domain Name</label>

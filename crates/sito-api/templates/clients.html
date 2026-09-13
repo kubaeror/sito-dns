@@ -40,7 +40,10 @@
             <span class="badge badge-info">{{ c.group }}</span>
           </td>
           <td style="text-align: center;">
-            <form action="/ui/clients/delete" method="POST" style="display:inline;" onsubmit="return confirm('Remove client {{ c.name }}?');">
+            <form action="/ui/clients/delete" method="POST" style="display:inline;"
+                  data-confirm="Remove client {{ c.name }}?"
+                  @submit="if (!confirm($el.dataset.confirm)) { $event.preventDefault(); }">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <input type="hidden" name="name" value="{{ c.name }}">
               <button type="submit" class="btn-icon" style="color: var(--accent-danger);" title="Delete client">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
@@ -65,6 +68,7 @@
         <button class="btn-icon" @click="showModal = false">&times;</button>
       </div>
       <form action="/ui/clients/add" method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <div class="modal-body">
           <div class="form-group">
             <label class="form-label" for="client-name">Device / Client Name</label>
