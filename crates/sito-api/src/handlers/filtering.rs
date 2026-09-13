@@ -111,6 +111,7 @@ pub async fn add_filter_list(
         .map_err(|e| {
             ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
         })?;
+    ctx.cache.flush();
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
     ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);
@@ -198,6 +199,7 @@ pub async fn update_filter_list(
         .map_err(|e| {
             ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
         })?;
+    ctx.cache.flush();
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
     ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);
@@ -233,6 +235,7 @@ pub async fn delete_filter_list(
         .map_err(|e| {
             ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
         })?;
+    ctx.cache.flush();
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
     ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);
@@ -262,6 +265,7 @@ pub async fn refresh_filtering(
         .reload_with_config(&cfg.filtering)
         .await
         .map_err(|e| ProblemDetails::internal_error(format!("Refresh failed: {e}")))?;
+    ctx.cache.flush();
     Ok(Json(GenericMessageResponse {
         message: format!("Successfully refreshed filter lists ({count} active rules compiled)"),
     }))
@@ -312,6 +316,7 @@ pub async fn set_filtering_rules(
         .map_err(|e| {
             ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
         })?;
+    ctx.cache.flush();
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
     ctx.set_config(new_cfg);
     crate::publish_bundle(&ctx);

@@ -421,6 +421,8 @@ async fn apply_hot_config(ctx: &ServerContext, cfg: Config) -> Result<(), Proble
         .map_err(|e| {
             ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
         })?;
+    // Filter rules changed: drop cached answers that may now be blocked.
+    ctx.cache.flush();
 
     let bootstrap = sito_upstream::BootstrapResolver::new(
         cfg.upstream.bootstrap.clone(),

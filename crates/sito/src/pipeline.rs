@@ -539,6 +539,22 @@ impl DnsPipeline {
     /// A DNSSEC-aware client must never be served an unvalidated entry while
     /// validation is enabled: such a lookup is treated as a miss so the query
     /// is re-resolved upstream.
+    /// True when any CNAME target in `response` is blocked by the current
+    /// filter rules. Cached entries are re-checked because rules can change
+    /// after the response was stored (cache hits skip the upstream uncloaking
+    /// pass unless this is applied).
+    fn cname_target_blocked(
+        &self,
+        response: &Message,
+        qtype: RecordType,
+        client: &ClientContext,
+    ) -> bool {
+        response.answers.iter().any(|record| match &record.data {
+            RData::CNAME(cname) => self.filter.evaluate(&cname.0, qtype, client).is_blocked(),
+            _ => false,
+        })
+    }
+
     async fn cached_response(&self, query: &Message, client_wants_dnssec: bool) -> Option<Message> {
         let response = self.cache.get_for_query(query).await?;
         if client_wants_dnssec
@@ -878,6 +894,25 @@ impl QueryHandler for DnsPipeline {
             // cache insert below.
             let _cache_single_flight: Option<sito_cache::SingleFlightGuard> = if cache_enabled {
                 if let Some(cached_resp) = self.cached_response(&query, client_wants_dnssec).await {
+                    if config.filtering.enabled
+                        && config.filtering.cname_cloaking
+                        && policy.is_filtering_enabled
+                        && self.cname_target_blocked(&cached_resp, qtype, &client)
+                    {
+                        info!(
+                            qname = %qname,
+                            "Cached response blocked via CNAME uncloaking"
+                        );
+                        return Self::blocked_outcome(
+                            &query,
+                            config,
+                            query_id,
+                            &domain_str,
+                            qtype,
+                            Some("cname_uncloaking"),
+                            None,
+                        );
+                    }
                     return self
                         .cache_hit_outcome(
                             &query,
@@ -902,6 +937,25 @@ impl QueryHandler for DnsPipeline {
                 let flight = self.cache.single_flight_for_query(&query).await;
                 if let Some(cached_resp) = self.cached_response(&query, client_wants_dnssec).await {
                     // A concurrent query populated the entry while we waited.
+                    if config.filtering.enabled
+                        && config.filtering.cname_cloaking
+                        && policy.is_filtering_enabled
+                        && self.cname_target_blocked(&cached_resp, qtype, &client)
+                    {
+                        info!(
+                            qname = %qname,
+                            "Cached response blocked via CNAME uncloaking"
+                        );
+                        return Self::blocked_outcome(
+                            &query,
+                            config,
+                            query_id,
+                            &domain_str,
+                            qtype,
+                            Some("cname_uncloaking"),
+                            None,
+                        );
+                    }
                     return self
                         .cache_hit_outcome(
                             &query,

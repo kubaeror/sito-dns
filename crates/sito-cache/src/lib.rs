@@ -552,6 +552,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_out_of_bailiwick_answer_owner_is_not_cached() {
+        let config = make_test_config(10, 3600, 1800);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("asked.example.").unwrap();
+        let injected = Name::from_str("victim.other.").unwrap();
+
+        // Question matches the query, but the answer RRset belongs to an
+        // unrelated owner: classic additional-section injection.
+        let query = query_for(50, &qname);
+        let mut response = answer_response(50, &injected, [192, 0, 2, 50]);
+        response.queries = query.queries.clone();
+
+        cache.insert(&query, &response).await;
+        assert!(
+            cache
+                .get(&qname, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "out-of-bailiwick answer owners must not be cached"
+        );
+
+        // A legitimate CNAME chain (qname -> target) remains cacheable.
+        let target = Name::from_str("target.example.").unwrap();
+        let mut cname = response.clone();
+        cname.answers = vec![
+            Record::from_rdata(
+                qname.clone(),
+                60,
+                RData::CNAME(sito_proto::rdata::CNAME(target.clone())),
+            ),
+            Record::from_rdata(
+                target.clone(),
+                60,
+                RData::A(sito_proto::rdata::A("192.0.2.51".parse().unwrap())),
+            ),
+        ];
+        cache.insert(&query, &cname).await;
+        assert!(
+            cache
+                .get(&qname, RecordType::A, DNSClass::IN)
+                .await
+                .is_some(),
+            "a CNAME chain to the queried name must stay cacheable"
+        );
+    }
+
+    #[tokio::test]
     async fn test_do_cd_and_ecs_split_cache_keys() {
         let config = make_test_config(10, 3600, 1800);
         let cache = DnsCache::new(config);

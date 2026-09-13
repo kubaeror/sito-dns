@@ -694,6 +694,8 @@ pub async fn filtering_toggle_handler(
             &format!("Failed to apply filter configuration: {e}"),
         );
     }
+    // Filter rules changed: drop cached answers that may now be blocked.
+    ctx.cache.flush();
     if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return error_response(
@@ -752,6 +754,8 @@ pub async fn filtering_add_handler(
             &format!("Failed to apply filter configuration: {e}"),
         );
     }
+    // Filter rules changed: drop cached answers that may now be blocked.
+    ctx.cache.flush();
     if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return error_response(
@@ -789,6 +793,8 @@ pub async fn filtering_delete_handler(
             &format!("Failed to apply filter configuration: {e}"),
         );
     }
+    // Filter rules changed: drop cached answers that may now be blocked.
+    ctx.cache.flush();
     if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return error_response(
@@ -834,6 +840,8 @@ pub async fn filtering_custom_rules_handler(
             &format!("Failed to apply filter configuration: {e}"),
         );
     }
+    // Filter rules changed: drop cached answers that may now be blocked.
+    ctx.cache.flush();
     if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return error_response(
@@ -927,6 +935,7 @@ pub async fn filtering_update_all_handler(
             &format!("Failed to refresh filter lists: {e}"),
         );
     }
+    ctx.cache.flush();
     Redirect::to("/filtering").into_response()
 }
 
@@ -1517,6 +1526,7 @@ pub async fn system_reload_handler(
             &format!("Failed to apply filter configuration: {e}"),
         );
     }
+    ctx.cache.flush();
     let bootstrap = sito_upstream::BootstrapResolver::new(
         cfg.upstream.bootstrap.clone(),
         std::time::Duration::from_millis(cfg.upstream.timeout_ms),

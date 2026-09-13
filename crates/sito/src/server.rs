@@ -527,10 +527,16 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
                                     "Applied hot-reloaded log level"
                                 );
                             }
-                            if let Err(e) =
-                                watcher_filter.reload_with_config(&new_cfg.filtering).await
-                            {
-                                error!(error = %e, "Failed to hot-reload filter configuration");
+                            match watcher_filter.reload_with_config(&new_cfg.filtering).await {
+                                Ok(_) => {
+                                    // Filter rules changed: previously allowed
+                                    // responses may now be blocked, so cached
+                                    // entries must not outlive the old rules.
+                                    watcher_cache.flush();
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "Failed to hot-reload filter configuration");
+                                }
                             }
                             let new_rewrites_cfg = match rewrites_from_config(&new_cfg) {
                                 Ok(cfg) => cfg,
