@@ -10,11 +10,12 @@ We release security patches and vulnerability fixes for the **current minor rele
 
 | Release Line | Supported Status | Notes |
 |---|---|---|
-| `0.1.x` (current) | :white_check_mark: Supported | Active development |
-| Prior minor release | :white_check_mark: Supported | Critical security fixes only |
+| `1.6.x` (current) | :white_check_mark: Supported | Active development |
+| Prior minor release (`1.5.x`) | :white_check_mark: Supported | Critical security fixes only |
 | Older releases | :x: Unsupported | Upgrade recommended |
 
-Once `sito` reaches `1.0.0`, LTS release branches and patch schedules will be published in this policy.
+Patch releases within a supported line are published from `main` and tagged
+`vX.Y.Z`; see [CHANGELOG.md](CHANGELOG.md) for the current release.
 
 ---
 
@@ -24,7 +25,7 @@ Once `sito` reaches `1.0.0`, LTS release branches and patch schedules will be pu
 
 To report a vulnerability:
 1. **GitHub Private Security Advisory (Preferred):** Open a draft advisory through the repository's [Security Advisories tab](https://github.com/kubaeror/sito-dns/security/advisories/new).
-2. **Encrypted Email (Alternative):** Email `security@sito.internal` or the project maintainer with detailed disclosure and reproduction steps.
+2. **Email (Alternative):** Contact the maintainer listed on the GitHub profile for the repository with detailed disclosure and reproduction steps. Public issues are not an acceptable channel for vulnerability reports.
 
 ### Report Contents
 To assist in rapid triage, please include:

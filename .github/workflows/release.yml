@@ -112,7 +112,9 @@ jobs:
       - name: Flatten artifacts and compute unified SHA256SUMS
         run: |
           mkdir -p release-assets
-          find artifacts -type f -name "*.tar.gz" -exec cp {} release-assets/ \;
+          # Publish the per-archive .sha256 files as documented, plus the
+          # unified SHA256SUMS consumed by the installer.
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.tar.gz.sha256" \) -exec cp {} release-assets/ \;
           cd release-assets
           sha256sum *.tar.gz > SHA256SUMS
           cd ..

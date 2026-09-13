@@ -6,7 +6,10 @@ This guide covers deploying **sito** on Linux hosts using the automated one-line
 
 ## 1. Quick Install (Automated Shell Script)
 
-For Debian/Ubuntu, Arch, RHEL/Fedora, and Alpine Linux:
+For systemd-based distributions (Debian/Ubuntu, Arch, RHEL/Fedora). Alpine
+and other non-systemd systems are not covered by the automated installer
+(it requires `useradd`/`groupadd` and systemd); install the release binary
+manually and supervise it with your init system.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/main/contrib/install.sh | sudo bash
@@ -198,8 +201,10 @@ accepts the admin web interface while the API reports first-boot setup pending
 > **Config directory permissions.** The image runs as UID/GID `65532`
 > (non-root). When bind-mounting a host directory for `/etc/sito`, hand it to
 > that user once: `sudo chown -R 65532:65532 /opt/sito/config`. Alternatively
-> keep configuration in a named volume (as the Compose example below does),
-> which Docker initialises with the correct ownership.
+> keep configuration in a named volume mounted at `/etc/sito` (the image
+> ships that path owned by `65532:65532`, and Docker initialises fresh named
+> volumes from the image path), though the Compose example below bind-mounts
+> `./config` for convenience.
 
 > **Data directory permissions.** Fresh named volumes (such as `sito-data`)
 > inherit the `65532:65532` ownership created in the image, so no manual step

@@ -1,6 +1,14 @@
 # Benchmarking Report and Performance Budget Compliance
 
-This document records the empirical benchmarking results, throughput analysis, and resource consumption profile of **sito v1.0.0**, evaluated against the binding performance contracts established in **Plan Section 16.1** and **ADR-0008 (Performance Budget)**.
+This document records the benchmarking results, throughput analysis, and
+resource consumption profile from the original reference-hardware run against
+the performance contracts in **ADR-0008 (Performance Budget)**. The absolute
+numbers below were captured on that hardware at v1.0.0 and are **not**
+re-measured on every release; CI gates performance only through the
+`cargo bench` job (see `.github/workflows/nightly-fuzz.yml`) and the
+`SITO_BENCH_TESTS` release-mode test run. Re-run
+`cargo bench -p sito-test --bench pipeline_bench` on your own hardware before
+comparing.
 
 ---
 
@@ -10,8 +18,8 @@ All tests were executed on the authoritative reference hardware specification:
 * **CPU:** 8 physical x86_64 cores @ 3.60 GHz (AVX2 enabled)
 * **RAM:** 16 GB DDR4
 * **NIC:** 10 GbE Intel X520 (`ixgbe`), dual-port, SR-IOV enabled
-* **OS:** Linux 6.8.0-40-generic (kernel sysctl parameters tuned per [docs/performance.md](file:///home/ubuntu/sito-dns/docs/performance.md))
-* **Build Configuration:** `profile.release` (`lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = true`, `target-cpu = "x86-64-v3"`, `--features mimalloc`)
+* **OS:** Linux 6.8.0-40-generic (kernel sysctl parameters tuned per [performance.md](performance.md))
+* **Build Configuration:** `profile.release` (`lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = true`, `--features mimalloc`) using the host's default target CPU
 
 ### 1.1 Target vs. Measured Throughput and Latency
 
@@ -22,7 +30,7 @@ All tests were executed on the authoritative reference hardware specification:
 | **DoT (Persistent TLS connections)** | ≥ 50,000 QPS | **68,400 QPS** | **PASS** | +36.8% |
 | **DoH H2 (Persistent TLS connections)** | ≥ 40,000 QPS | **47,900 QPS** | **PASS** | +19.7% |
 | **Added Latency p99 (Cache Hits)** | < 1.0 ms | **0.34 ms (340 µs)** | **PASS** | 66.0% below cap |
-| **Total RSS RAM (1,000,000 rules + cache)** | < 512 MB | **248 MB** | **PASS** | 51.5% below cap |
+| **Total RSS RAM (1,000,000 rules + cache)** | < 512 MB | **285.6 MB** | **PASS** | 44.2% below cap |
 
 ---
 

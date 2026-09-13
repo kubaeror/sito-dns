@@ -103,10 +103,19 @@ services:
       - "853:853/tcp"
       - "853:853/udp"
       - "443:443/tcp"
+      - "443:443/udp"
       - "8080:8080/tcp"
     volumes:
+      # Host bind mounts must be handed to the container user once:
+      #   sudo chown -R 65532:65532 ./config
       - ./config:/etc/sito
       - sito-data:/var/lib/sito
+    healthcheck:
+      test: ["CMD", "/usr/bin/sito", "--config", "/etc/sito/config.toml", "healthcheck", "--setup-fallback"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   sito-data:
