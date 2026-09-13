@@ -47,6 +47,8 @@ pub struct MasterCoordinator {
     /// Serializes bundle publication so the version check and store cannot
     /// interleave and regress the active version.
     publish_lock: Arc<Mutex<()>>,
+    /// Monotonic id assigned to each accepted slave connection.
+    next_connection_id: Arc<AtomicU64>,
 }
 
 impl MasterCoordinator {
@@ -78,6 +80,7 @@ impl MasterCoordinator {
             pending_fallbacks: Arc::new(Mutex::new(HashSet::new())),
             stale_repushes: Arc::new(Mutex::new(HashMap::new())),
             publish_lock: Arc::new(Mutex::new(())),
+            next_connection_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -488,8 +491,11 @@ impl MasterCoordinator {
         );
 
         let (tx, mut rx) = mpsc::channel::<HaMessage>(32);
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
 
-        // Register slave in tracking map
+        // Register slave in tracking map. A reconnecting instance replaces the
+        // previous entry; `connection_id` lets the superseded session detect
+        // that it no longer owns the entry.
         {
             let mut slaves = self.slaves.lock().unwrap();
             slaves.insert(
@@ -503,6 +509,7 @@ impl MasterCoordinator {
                     last_stats: None,
                     sender: tx.clone(),
                     capabilities: capabilities.clone(),
+                    connection_id,
                 },
             );
             #[allow(clippy::cast_possible_wrap)]
@@ -547,12 +554,26 @@ impl MasterCoordinator {
 
                 // Periodic ping + liveness watchdog
                 _ = ping_interval.tick() => {
-                    let stale = {
+                    let (superseded, stale) = {
                         let slaves = self.slaves.lock().unwrap();
-                        slaves.get(&slave_instance).is_some_and(|s| {
-                            s.last_ping.elapsed() > Duration::from_secs(ping_secs.saturating_mul(3))
-                        })
+                        match slaves.get(&slave_instance) {
+                            Some(s) if s.connection_id == connection_id => (
+                                false,
+                                s.last_ping.elapsed()
+                                    > Duration::from_secs(ping_secs.saturating_mul(3)),
+                            ),
+                            // Replaced by a newer connection (or removed):
+                            // this session must stop acting on the entry.
+                            _ => (true, false),
+                        }
                     };
+                    if superseded {
+                        debug!(
+                            instance = %slave_instance,
+                            "HA session superseded by a newer connection; closing"
+                        );
+                        break;
+                    }
                     if stale {
                         warn!(
                             instance = %slave_instance,
@@ -573,19 +594,21 @@ impl MasterCoordinator {
                 msg_opt = ws_stream.next() => {
                     match msg_opt {
                         Some(Ok(WsMessage::Text(txt))) => {
-                            if !self.process_slave_msg(&slave_instance, &txt) {
+                            if !self.process_slave_msg(&slave_instance, connection_id, &txt) {
                                 break;
                             }
                         }
                         Some(Ok(WsMessage::Binary(bin))) => {
                             if let Ok(txt) = std::str::from_utf8(&bin)
-                                && !self.process_slave_msg(&slave_instance, txt) {
+                                && !self.process_slave_msg(&slave_instance, connection_id, txt) {
                                     break;
                                 }
                         }
                         Some(Ok(WsMessage::Pong(_))) => {
                             let mut slaves = self.slaves.lock().unwrap();
-                            if let Some(s) = slaves.get_mut(&slave_instance) {
+                            if let Some(s) = slaves.get_mut(&slave_instance)
+                                && s.connection_id == connection_id
+                            {
                                 s.last_ping = Instant::now();
                             }
                         }
@@ -603,18 +626,39 @@ impl MasterCoordinator {
             }
         }
 
-        // Cleanup disconnected slave
-        {
-            let mut slaves = self.slaves.lock().unwrap();
-            slaves.remove(&slave_instance);
-            #[allow(clippy::cast_possible_wrap)]
-            self.metrics.set_ha_slaves_connected(slaves.len() as i64);
+        // Cleanup disconnected slave. Only remove the entry when this session
+        // still owns it: a slow teardown of an old connection must not evict
+        // the reconnected slave's live entry or its metric label.
+        if self.unregister_session(&slave_instance, connection_id) {
+            self.metrics.remove_ha_config_version(&slave_instance);
+            info!(instance = %slave_instance, "Unregistered replica slave from active tracker");
+        } else {
+            debug!(
+                instance = %slave_instance,
+                "Superseded HA session ended; live entry left untouched"
+            );
         }
-        self.metrics.remove_ha_config_version(&slave_instance);
-        info!(instance = %slave_instance, "Unregistered replica slave from active tracker");
     }
 
-    fn process_slave_msg(&self, slave_instance: &str, text: &str) -> bool {
+    /// Removes the tracked slave entry if it still belongs to `connection_id`.
+    ///
+    /// Returns true when this session owned the entry (and removed it); false
+    /// when a newer connection has replaced it, in which case the live entry is
+    /// left untouched.
+    fn unregister_session(&self, instance: &str, connection_id: u64) -> bool {
+        let mut slaves = self.slaves.lock().unwrap();
+        let owned = slaves
+            .get(instance)
+            .is_some_and(|s| s.connection_id == connection_id);
+        if owned {
+            slaves.remove(instance);
+        }
+        #[allow(clippy::cast_possible_wrap)]
+        self.metrics.set_ha_slaves_connected(slaves.len() as i64);
+        owned
+    }
+
+    fn process_slave_msg(&self, slave_instance: &str, connection_id: u64, text: &str) -> bool {
         let msg = match HaMessage::from_json(text) {
             Ok(m) => m,
             Err(e) => {
@@ -629,6 +673,18 @@ impl MasterCoordinator {
                 applied,
                 error,
             } => {
+                // Ignore acknowledgements from a superseded connection: the
+                // entry now belongs to a newer session.
+                let owned = {
+                    let slaves = self.slaves.lock().unwrap();
+                    slaves
+                        .get(slave_instance)
+                        .is_some_and(|s| s.connection_id == connection_id)
+                };
+                if !owned {
+                    return true;
+                }
+
                 let current = self.get_current_version();
                 if applied && version == current {
                     info!(
@@ -637,9 +693,16 @@ impl MasterCoordinator {
                         "Slave successfully applied configuration bundle"
                     );
                     let mut slaves = self.slaves.lock().unwrap();
-                    if let Some(s) = slaves.get_mut(slave_instance) {
+                    if let Some(s) = slaves.get_mut(slave_instance)
+                        && s.connection_id == connection_id
+                    {
                         s.synced_version = version;
+                    } else {
+                        // An older connection acknowledging after its entry was
+                        // replaced must not update the live session.
+                        return true;
                     }
+                    drop(slaves);
                     #[allow(clippy::cast_precision_loss)]
                     self.metrics
                         .set_ha_config_version(slave_instance, version as f64);
@@ -676,25 +739,31 @@ impl MasterCoordinator {
             } => {
                 let upstreams_count = upstreams.len();
                 let mut slaves = self.slaves.lock().unwrap();
-                if let Some(s) = slaves.get_mut(slave_instance) {
-                    if !s.capabilities.iter().any(|c| c == "stats-v1") {
-                        warn!(
-                            instance = %slave_instance,
-                            "Ignoring StatsReport from slave that did not advertise the 'stats-v1' capability"
-                        );
-                        return true;
-                    }
-                    s.last_stats = Some(SlaveStatsSummary {
-                        window_s,
-                        queries,
-                        blocked,
-                        upstreams_count,
-                    });
+                let Some(s) = slaves.get_mut(slave_instance) else {
+                    return true;
+                };
+                if s.connection_id != connection_id {
+                    return true;
                 }
+                if !s.capabilities.iter().any(|c| c == "stats-v1") {
+                    warn!(
+                        instance = %slave_instance,
+                        "Ignoring StatsReport from slave that did not advertise the 'stats-v1' capability"
+                    );
+                    return true;
+                }
+                s.last_stats = Some(SlaveStatsSummary {
+                    window_s,
+                    queries,
+                    blocked,
+                    upstreams_count,
+                });
             }
             HaMessage::Pong { .. } => {
                 let mut slaves = self.slaves.lock().unwrap();
-                if let Some(s) = slaves.get_mut(slave_instance) {
+                if let Some(s) = slaves.get_mut(slave_instance)
+                    && s.connection_id == connection_id
+                {
                     s.last_ping = Instant::now();
                 }
             }
@@ -704,6 +773,7 @@ impl MasterCoordinator {
                 if let Some(ref push) = *self.active_push.lock().unwrap() {
                     let slaves = self.slaves.lock().unwrap();
                     if let Some(s) = slaves.get(slave_instance)
+                        && s.connection_id == connection_id
                         && let Err(e) = s.sender.try_send(push.clone())
                     {
                         warn!(instance = %slave_instance, "Resync push could not be queued: {e}");
@@ -966,6 +1036,7 @@ mod tests {
                 last_stats: None,
                 sender: tx.clone(),
                 capabilities: vec!["stats-v1".to_string()],
+                connection_id: 1,
             },
         );
 
@@ -983,5 +1054,47 @@ mod tests {
         // Cleanup removes the per-instance metric label.
         coordinator.metrics.set_ha_config_version("slave-1", 1.0);
         coordinator.metrics.remove_ha_config_version("slave-1");
+    }
+
+    #[test]
+    fn test_unregister_superseded_session_keeps_live_entry() {
+        let coordinator = test_coordinator();
+        let (old_tx, _old_rx) = mpsc::channel::<HaMessage>(1);
+        let (new_tx, _new_rx) = mpsc::channel::<HaMessage>(1);
+
+        let entry = |connection_id: u64, sender: mpsc::Sender<HaMessage>| ActiveSlave {
+            instance: "slave-1".to_string(),
+            remote_addr: "127.0.0.1:1000".parse().unwrap(),
+            synced_version: 1,
+            last_ping: Instant::now(),
+            connected_at: Utc::now(),
+            last_stats: None,
+            sender,
+            capabilities: vec![],
+            connection_id,
+        };
+
+        coordinator
+            .slaves
+            .lock()
+            .unwrap()
+            .insert("slave-1".to_string(), entry(1, old_tx));
+        // A reconnect replaces the tracked entry.
+        coordinator
+            .slaves
+            .lock()
+            .unwrap()
+            .insert("slave-1".to_string(), entry(2, new_tx));
+
+        // The old session tearing down later must not evict the live entry.
+        assert!(!coordinator.unregister_session("slave-1", 1));
+        assert!(
+            coordinator.slaves.lock().unwrap().contains_key("slave-1"),
+            "superseded session must not remove the reconnected slave"
+        );
+
+        // The owning session still cleans up normally.
+        assert!(coordinator.unregister_session("slave-1", 2));
+        assert!(!coordinator.slaves.lock().unwrap().contains_key("slave-1"));
     }
 }
