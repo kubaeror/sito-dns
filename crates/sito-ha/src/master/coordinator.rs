@@ -44,6 +44,9 @@ pub struct MasterCoordinator {
     pending_fallbacks: Arc<Mutex<HashSet<String>>>,
     /// Last stale version for which a catch-up push was already attempted per slave.
     stale_repushes: Arc<Mutex<HashMap<String, u64>>>,
+    /// Serializes bundle publication so the version check and store cannot
+    /// interleave and regress the active version.
+    publish_lock: Arc<Mutex<()>>,
 }
 
 impl MasterCoordinator {
@@ -74,6 +77,7 @@ impl MasterCoordinator {
             state_path: Arc::new(Mutex::new(None)),
             pending_fallbacks: Arc::new(Mutex::new(HashSet::new())),
             stale_repushes: Arc::new(Mutex::new(HashMap::new())),
+            publish_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -212,6 +216,14 @@ impl MasterCoordinator {
 
     /// Sets and signs a new configuration bundle, immediately broadcasting it to all connected slaves.
     pub fn update_bundle(&self, bundle: ConfigBundle) -> Result<u64, HaError> {
+        // Serialize the check-then-store: two concurrent publishers could
+        // otherwise both pass the monotonicity check and store out of order,
+        // regressing the active version and broadcasting a stale bundle.
+        let _publish_guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let version = bundle.version;
         let current = self.current_version.load(Ordering::SeqCst);
         if version <= current {
@@ -850,6 +862,42 @@ mod tests {
         assert_eq!(coordinator.get_current_version(), 2);
 
         assert_eq!(coordinator.update_bundle(test_bundle(3)).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_concurrent_update_bundle_never_regresses_version() {
+        use std::sync::Arc as StdArc;
+
+        let coordinator = StdArc::new(test_coordinator());
+        let first = StdArc::clone(&coordinator);
+        let second = StdArc::clone(&coordinator);
+
+        // Versions 2 and 3 race: the lock must prevent 3 from being stored
+        // and then overwritten by 2 (or vice versa).
+        let t1 = std::thread::spawn(move || first.update_bundle(test_bundle(2)));
+        let t2 = std::thread::spawn(move || second.update_bundle(test_bundle(3)));
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        let final_version = coordinator.get_current_version();
+        assert!(
+            final_version == 2 || final_version == 3,
+            "unexpected final version {final_version}"
+        );
+        let active = coordinator
+            .active_bundle
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("active bundle");
+        assert_eq!(
+            active.version, final_version,
+            "active bundle must match the published version"
+        );
+        // Any successful publish must not exceed the final version.
+        for version in [r1, r2].into_iter().flatten() {
+            assert!(version <= final_version);
+        }
     }
 
     #[test]

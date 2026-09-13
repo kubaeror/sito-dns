@@ -116,15 +116,23 @@ pub fn sanitize_config_for_bundle(master_toml: &str) -> Result<String, HaError> 
         }
     }
 
-    // 6. Mask integrations secrets if present
+    // 6. Strip integration secrets: these are provisioned per node (or
+    // supplied via `${SECRET:...}` for the fields that support it) and must
+    // never travel inside the replicated configuration.
     if let Some(toml::Value::Table(integrations_table)) = table.get_mut("integrations")
         && let Some(toml::Value::Table(mikrotik)) = integrations_table.get_mut("mikrotik")
-        && mikrotik.contains_key("token")
     {
-        mikrotik.insert(
-            "token".to_string(),
-            toml::Value::String("${SECRET:mikrotik_token}".to_string()),
-        );
+        mikrotik.remove("token");
+        mikrotik.remove("password");
+    }
+
+    // 7. Strip per-client shared secrets (DoH path / DoT SNI identity). A
+    // table cannot be replaced by a `${SECRET:...}` string placeholder without
+    // breaking TOML, so slaves keep their local copy (see
+    // `merge_local_replication_config`) and master-added secrets must be
+    // provisioned per node.
+    if let Some(toml::Value::Table(clients_table)) = table.get_mut("clients") {
+        clients_table.remove("client_id_secrets");
     }
 
     toml::to_string_pretty(&table).map_err(|e| HaError::Serialization(e.to_string()))
@@ -365,8 +373,12 @@ key = "super_secret_private_key_content"
 [auth]
 admin_password_hash = "$argon2id$v=19$m=65536,t=3,p=4$secret_hash"
 
+[clients]
+client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
+
 [integrations.mikrotik]
 token = "mikrotik_secret_token_12345"
+password = "mikrotik_secret_password"
 "#;
 
         let sanitized = sanitize_config_for_bundle(master_toml).unwrap();
@@ -376,20 +388,24 @@ token = "mikrotik_secret_token_12345"
         assert!(!sanitized.contains("master-prod"));
         assert!(sanitized.contains("role = \"slave\""));
 
-        // Check masking
+        // Check masking and stripping
         assert!(!sanitized.contains("super_secret_private_key_content"));
         assert!(!sanitized.contains("secret_hash"));
         assert!(!sanitized.contains("mikrotik_secret_token_12345"));
+        assert!(!sanitized.contains("mikrotik_secret_password"));
+        assert!(!sanitized.contains("client_shared_secret_9876"));
+        assert!(!sanitized.contains("client_id_secrets"));
 
         assert!(sanitized.contains("${SECRET:tls_key}"));
         assert!(sanitized.contains("${SECRET:admin_password_hash}"));
-        assert!(sanitized.contains("${SECRET:mikrotik_token}"));
 
         // Security scanner test
         let secrets = [
             "super_secret_private_key_content",
             "secret_hash",
             "mikrotik_secret_token_12345",
+            "mikrotik_secret_password",
+            "client_shared_secret_9876",
         ];
         assert!(scan_for_secrets(&sanitized, &secrets).is_ok());
 
