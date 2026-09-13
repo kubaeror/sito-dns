@@ -1,4 +1,4 @@
-# sito-dns — Full Audit #5 (independent, v1.6.0)
+# sito-dns — Full Audit #5 (independent, audited v1.6.0; remediated in v1.7.0)
 
 Scope: whole workspace (15 crates, ~64k LOC), `.github/`, Docker/systemd,
 installer, converter, docs. Method: parallel source review plus hand

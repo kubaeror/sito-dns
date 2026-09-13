@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v1.6.0**.
+This document is the exhaustive configuration reference for **sito v1.7.0**.
 
 `sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the local secret store, then `DNSD_SECRET_<NAME>`, then a bare `<NAME>` environment variable.
 

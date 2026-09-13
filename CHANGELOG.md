@@ -5,7 +5,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased]
+## [1.7.0] - 2026-09-13
 
 ### Audit 5 remediation (independent full audit)
 

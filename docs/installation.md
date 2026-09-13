@@ -162,7 +162,7 @@ sudo systemctl start sito
 
 # Option B: re-run the installer (SITO_VERSION pins a release)
 sudo systemctl stop sito
-sudo SITO_VERSION=1.6.0 bash contrib/install.sh
+sudo SITO_VERSION=1.7.0 bash contrib/install.sh
 ```
 
 The installer backs up the previous binary to `/usr/local/bin/sito.bak` and
@@ -358,12 +358,12 @@ sha256sum -c SHA256SUMS
 
 ```bash
 cosign verify-blob \
-  --certificate sito-v1.6.0-x86_64-unknown-linux-gnu.tar.gz.pem \
-  --signature   sito-v1.6.0-x86_64-unknown-linux-gnu.tar.gz.sig \
+  --certificate sito-v1.7.0-x86_64-unknown-linux-gnu.tar.gz.pem \
+  --signature   sito-v1.7.0-x86_64-unknown-linux-gnu.tar.gz.sig \
   --certificate-identity-regexp \
       '^https://github.com/kubaeror/sito-dns/.github/workflows/release.yml@refs/.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  sito-v1.6.0-x86_64-unknown-linux-gnu.tar.gz
+  sito-v1.7.0-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 The identity pins the artifact to this repository's release workflow and the
