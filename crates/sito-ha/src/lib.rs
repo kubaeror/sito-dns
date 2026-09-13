@@ -705,4 +705,54 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[tokio::test]
+    async fn test_master_closes_stalled_slave_handshake() {
+        use tokio::io::AsyncReadExt;
+
+        let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        let port = reserve_port();
+        let coordinator = MasterCoordinator::new(
+            "master-stall".to_string(),
+            1,
+            signing_key,
+            sito_stats::MetricsRegistry::new("0.1.0", "test"),
+        )
+        .with_token(Some("tok".to_string()));
+
+        let master_cfg = HaConfig {
+            replication_port: port,
+            listen_addr: "127.0.0.1".to_string(),
+            allow_insecure_ws: true,
+            slave_token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let _server = spawn_master_server(master_cfg, coordinator, shutdown_rx);
+
+        // Wait for the listener, then connect and send nothing: the server must
+        // close the socket after the handshake timeout instead of pinning a
+        // task forever (slowloris).
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to master");
+        let mut buf = [0u8; 1];
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(20), stream.read(&mut buf)).await;
+        assert!(
+            matches!(res, Ok(Ok(0) | Err(_))),
+            "stalled handshake must be closed by the master: {res:?}"
+        );
+
+        let _ = shutdown_tx.send(true);
+    }
 }

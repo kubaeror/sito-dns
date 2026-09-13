@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
+use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
@@ -787,6 +788,12 @@ impl MasterCoordinator {
     }
 }
 
+/// Maximum concurrently accepted slave connections (handshake + session).
+const MAX_SLAVE_CONNECTIONS: usize = 64;
+/// Upper bound on the TLS handshake and WebSocket upgrade of a slave
+/// connection; a slowloris peer must not pin a task or socket indefinitely.
+const MASTER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Spawns the master WebSocket replication server listener.
 pub fn spawn_master_server(
     ha_config: HaConfig,
@@ -840,6 +847,8 @@ pub fn spawn_master_server(
 
         info!(addr = %listen_addr, "Master HA replication listener active");
 
+        let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_SLAVE_CONNECTIONS));
+
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -852,35 +861,49 @@ pub fn spawn_master_server(
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((tcp_stream, peer_addr)) => {
+                            let Ok(permit) = connection_semaphore.clone().try_acquire_owned() else {
+                                warn!(
+                                    peer = %peer_addr,
+                                    "HA slave connection limit ({MAX_SLAVE_CONNECTIONS}) reached; rejecting"
+                                );
+                                continue;
+                            };
                             let coord = coordinator.clone();
                             let acceptor_opt = tls_acceptor.clone();
 
                             tokio::spawn(async move {
-                                if let Some(acceptor) = acceptor_opt {
-                                    match acceptor.accept(tcp_stream).await {
-                                        Ok(tls_stream) => {
-                                            match tokio_tungstenite::accept_async(tls_stream).await {
-                                                Ok(ws_stream) => {
-                                                    coord.handle_connection(ws_stream, peer_addr).await;
-                                                }
-                                                Err(e) => {
-                                                    warn!(peer = %peer_addr, "WebSocket upgrade failed: {e}");
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(peer = %peer_addr, "mTLS handshake rejected: {e}");
-                                        }
+                                let _permit = permit;
+                                let upgrade = async {
+                                    if let Some(acceptor) = acceptor_opt {
+                                        let tls_stream = timeout(
+                                            MASTER_HANDSHAKE_TIMEOUT,
+                                            acceptor.accept(tcp_stream),
+                                        )
+                                        .await
+                                        .map_err(|_| "mTLS handshake timed out".to_string())?
+                                        .map_err(|e| format!("mTLS handshake rejected: {e}"))?;
+                                        let ws_stream = timeout(
+                                            MASTER_HANDSHAKE_TIMEOUT,
+                                            tokio_tungstenite::accept_async(tls_stream),
+                                        )
+                                        .await
+                                        .map_err(|_| "WebSocket upgrade timed out".to_string())?
+                                        .map_err(|e| format!("WebSocket upgrade failed: {e}"))?;
+                                        coord.handle_connection(ws_stream, peer_addr).await;
+                                    } else {
+                                        let ws_stream = timeout(
+                                            MASTER_HANDSHAKE_TIMEOUT,
+                                            tokio_tungstenite::accept_async(tcp_stream),
+                                        )
+                                        .await
+                                        .map_err(|_| "WebSocket upgrade timed out".to_string())?
+                                        .map_err(|e| format!("Plain WebSocket upgrade failed: {e}"))?;
+                                        coord.handle_connection(ws_stream, peer_addr).await;
                                     }
-                                } else {
-                                    match tokio_tungstenite::accept_async(tcp_stream).await {
-                                        Ok(ws_stream) => {
-                                            coord.handle_connection(ws_stream, peer_addr).await;
-                                        }
-                                        Err(e) => {
-                                            warn!(peer = %peer_addr, "Plain WebSocket upgrade failed: {e}");
-                                        }
-                                    }
+                                    Ok::<(), String>(())
+                                };
+                                if let Err(e) = upgrade.await {
+                                    warn!(peer = %peer_addr, "{e}");
                                 }
                             });
                         }
