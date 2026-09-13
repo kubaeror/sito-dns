@@ -968,7 +968,7 @@ pub async fn run_server_full(
         shutdown_rx: shutdown_rx.clone(),
     }));
 
-    let cert_watchers = init_tls_and_acme(&config, &shutdown_rx, &listener_acceptors).await?;
+    let mut cert_watchers = init_tls_and_acme(&config, &shutdown_rx, &listener_acceptors).await?;
 
     if setup_pending {
         info!(
@@ -981,6 +981,17 @@ pub async fn run_server_full(
             Some(()) = dns_start_rx.recv() => {
                 info!("Setup wizard completed: binding and starting DNS listeners in-process...");
                 let current_cfg = config_arc.load();
+                // The wizard may have configured TLS/ACME after startup, when
+                // the initial acceptors were built from the empty config.
+                // Re-initialize so DoT/DoH/DoQ listen immediately instead of
+                // requiring a restart.
+                match init_tls_and_acme(&current_cfg, &shutdown_rx, &listener_acceptors).await {
+                    Ok(watchers) => cert_watchers.extend(watchers),
+                    Err(e) => warn!(
+                        error = %e,
+                        "Failed to initialize TLS after setup; encrypted listeners may be unavailable"
+                    ),
+                }
                 let acceptors = listener_acceptors
                     .lock()
                     .await
@@ -1684,6 +1695,7 @@ async fn wait_for_shutdown_signal(
 #[cfg(test)]
 mod tests {
     use super::canonical_config_path;
+    use super::*;
     use std::path::Path;
 
     #[test]
@@ -1715,6 +1727,46 @@ mod tests {
             resolved.file_name(),
             Some(std::ffi::OsStr::new("config.toml"))
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_tls_acceptors_rebuilt_from_updated_config() {
+        // The setup wizard can configure TLS after startup; re-initializing
+        // must populate the acceptors so encrypted listeners bind immediately.
+        let (cert_pem, key_pem) =
+            generate_self_signed_cert(&["localhost".to_string()]).expect("self-signed cert");
+        let dir = std::env::temp_dir().join(format!("sito_tls_reinit_{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert_pem).unwrap();
+        std::fs::write(&key_path, key_pem).unwrap();
+
+        let mut config = Config::default();
+        config.tls = Some(sito_core::config::TlsConfig {
+            cert: Some(cert_path),
+            key: Some(key_path),
+            sni_certs: Vec::new(),
+        });
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let acceptors = tokio::sync::Mutex::new(None);
+        let watchers = init_tls_and_acme(&config, &shutdown_rx, &acceptors)
+            .await
+            .expect("TLS initialization");
+
+        let snapshot = acceptors
+            .lock()
+            .await
+            .clone()
+            .expect("acceptors must be stored");
+        assert!(snapshot.dot.is_some(), "DoT acceptor must exist");
+        assert!(snapshot.doh.is_some(), "DoH acceptor must exist");
+        assert!(snapshot.doq.is_some(), "DoQ acceptor must exist");
+        assert!(snapshot.doh3.is_some(), "DoH3 acceptor must exist");
+
+        drop(watchers);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
