@@ -9,7 +9,6 @@ pub mod dnssec_fetch;
 pub mod domain;
 pub mod engine;
 pub mod error;
-pub mod state;
 pub mod verdict;
 
 pub use client::{ClientContext, ClientId};
@@ -22,5 +21,4 @@ pub use dnssec_fetch::DnssecKeyFetcher;
 pub use domain::{matches_domain_suffix, matches_strict_subdomain};
 pub use engine::FilterEngine;
 pub use error::{ConfigError, UpstreamError};
-pub use state::AppState;
 pub use verdict::{BlockReason, RewriteAction, RuleRef, Verdict};
