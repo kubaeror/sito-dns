@@ -9,13 +9,13 @@
 
 use crate::downloader::{
     DEFAULT_DOWNLOAD_TIMEOUT, DEFAULT_MAX_LIST_BYTES, cache_key_for_list, cache_path_for_list,
-    read_from_cache, save_to_cache,
+    read_from_cache_capped, save_to_cache,
 };
 use crate::error::FilterError;
 use reqwest::StatusCode;
 use reqwest::header::{IF_MODIFIED_SINCE, IF_NONE_MATCH};
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
@@ -80,6 +80,30 @@ pub(crate) fn is_denied_target_ip(ip: IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_denied_target_ip(IpAddr::V4(v4));
             }
+            // Translation/encapsulation prefixes that embed an IPv4 address:
+            // without unwrapping these, a NAT64/6to4/Teredo literal could
+            // reach a private v4 target through a v6-only denylist.
+            let o = v6.octets();
+            let embedded = if o[0] == 0x00
+                && o[1] == 0x64
+                && o[2] == 0xff
+                && o[3] == 0x9b
+                && o[4..12].iter().all(|b| *b == 0)
+            {
+                // NAT64 64:ff9b::/96
+                Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]))
+            } else if o[0] == 0x20 && o[1] == 0x02 {
+                // 6to4 2002::/16
+                Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]))
+            } else if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0 && o[3] == 0 {
+                // Teredo 2001:0000::/32: client IPv4 is bitwise-inverted.
+                Some(Ipv4Addr::new(!o[12], !o[13], !o[14], !o[15]))
+            } else {
+                None
+            };
+            if let Some(v4) = embedded {
+                return is_denied_target_ip(IpAddr::V4(v4));
+            }
             let seg = v6.segments();
             v6.is_loopback()
                 || v6.is_unspecified()
@@ -130,9 +154,10 @@ fn build_client(
 async fn load_cache_or(
     cache_path: &Path,
     list_name: &str,
+    max_bytes: usize,
     error: FilterError,
 ) -> Result<String, FilterError> {
-    match read_from_cache(cache_path).await {
+    match read_from_cache_capped(cache_path, max_bytes).await {
         Ok(cached) => {
             info!(
                 list = %list_name,
@@ -423,7 +448,7 @@ impl SubscriptionFetcher {
                         error = %e,
                         "Refusing local blocklist; attempting disk cache fallback"
                     );
-                    load_cache_or(&cache_path, list_name, e).await
+                    load_cache_or(&cache_path, list_name, self.max_bytes, e).await
                 }
             };
         }
@@ -449,7 +474,7 @@ impl SubscriptionFetcher {
                     error = %e,
                     "Refusing blocklist URL target; attempting disk cache fallback"
                 );
-                return load_cache_or(&cache_path, list_name, e).await;
+                return load_cache_or(&cache_path, list_name, self.max_bytes, e).await;
             }
         };
         let client = match pinned.as_ref() {
@@ -486,7 +511,7 @@ impl SubscriptionFetcher {
                     let status = resp.status();
                     if status == StatusCode::NOT_MODIFIED {
                         info!(list = %list_name, "Blocklist unchanged (HTTP 304 Not Modified), serving disk cache");
-                        match read_from_cache(&cache_path).await {
+                        match read_from_cache_capped(&cache_path, self.max_bytes).await {
                             Ok(content) => return Ok(content),
                             Err(e) => {
                                 // The server claims "not modified" but we have
@@ -636,7 +661,7 @@ impl SubscriptionFetcher {
             url: url.to_string(),
             reason: "blocklist download failed".to_string(),
         });
-        load_cache_or(&cache_path, list_name, fallback_error).await
+        load_cache_or(&cache_path, list_name, self.max_bytes, fallback_error).await
     }
 }
 
@@ -839,6 +864,12 @@ mod tests {
             "2001:db8::1",
             "::ffff:127.0.0.1",
             "ff02::1",
+            // IPv4-embedding translation prefixes.
+            "64:ff9b::7f00:1",                      // NAT64 -> 127.0.0.1
+            "64:ff9b::a9fe:a9fe",                   // NAT64 -> 169.254.169.254 (metadata)
+            "2002:7f00:1::",                        // 6to4 -> 127.0.0.1
+            "2002:a9fe:a9fe::",                     // 6to4 -> 169.254.169.254
+            "2001:0:4136:e378:8000:63bf:80ff:fffe", // Teredo -> 127.0.0.1
         ] {
             let ip: IpAddr = denied.parse().unwrap();
             assert!(is_denied_target_ip(ip), "{denied} must be denied");
