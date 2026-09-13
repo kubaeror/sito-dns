@@ -1021,6 +1021,28 @@ mod tests {
         assert_eq!(statuses[0].0, "1.1.1.1:53");
     }
 
+    #[tokio::test]
+    async fn test_manager_with_tls_upstream_constructs_without_panicking() {
+        // Regression for the P0 where DoT construction used the ambiguous
+        // rustls builder and aborted the process under `panic = "abort"`.
+        let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
+        let config = UpstreamConfig {
+            servers: vec!["tls://1.1.1.1".to_string()],
+            bootstrap: vec![],
+            strategy: UpstreamStrategy::Failover,
+            timeout_ms: 1000,
+            probe_domain: "cloudflare.com".to_string(),
+            pool_size: 2,
+            per_domain: vec![],
+        };
+        let manager = UpstreamManager::from_config(&config, &bootstrap).await;
+        assert!(
+            manager.is_ok(),
+            "tls:// upstream must construct successfully: {:?}",
+            manager.err()
+        );
+    }
+
     #[test]
     fn test_split_host_port_supports_ipv6_literals() {
         assert_eq!(
