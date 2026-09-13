@@ -880,6 +880,9 @@ pub async fn filtering_simulate_handler(
                     sito_core::verdict::BlockReason::Parental => "parental filter".to_string(),
                     sito_core::verdict::BlockReason::Service(s) => format!("blocked service: {s}"),
                     sito_core::verdict::BlockReason::AntiDohBypass => "Anti-DoH bypass".to_string(),
+                    sito_core::verdict::BlockReason::FilterUnavailable => {
+                        "filter rules unavailable (fail-closed)".to_string()
+                    }
                 };
                 axum::response::Html(format!(
                     "<div class='badge badge-danger' style='font-size:0.9rem; padding: 6px 12px;'>BLOCKED ({})</div>",

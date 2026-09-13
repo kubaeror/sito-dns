@@ -63,9 +63,22 @@ pub struct FilterSnapshot {
     pub rules: Vec<Rule>,
     /// Total count of unique rules in this snapshot.
     pub rule_count: usize,
+    /// True when no rule set has ever been compiled into this snapshot
+    /// (initial load still running or failed). Used for fail-closed mode.
+    pub unavailable: bool,
 }
 
 impl FilterSnapshot {
+    /// Placeholder snapshot used before the first successful compile or after
+    /// a failed initial load. Never carries rules.
+    #[must_use]
+    pub fn unavailable() -> Self {
+        Self {
+            unavailable: true,
+            ..Self::default()
+        }
+    }
+
     /// Compiles a slice of parsed rules into high-throughput lookup structures,
     /// resolving `$badfilter` deactivations and deduplicating identical rules.
     pub fn compile(parsed_rules: Vec<Rule>) -> Self {
@@ -154,6 +167,7 @@ impl FilterSnapshot {
             blocklist,
             rules: active_rules,
             rule_count,
+            unavailable: false,
         }
     }
 
@@ -476,7 +490,7 @@ impl HostsFilterEngine {
             ..FilterStatus::default()
         };
         Self {
-            snapshot: ArcSwap::new(Arc::new(FilterSnapshot::default())),
+            snapshot: ArcSwap::new(Arc::new(FilterSnapshot::unavailable())),
             config: ArcSwap::new(Arc::new(config)),
             data_dir,
             downloader: ListDownloader::default(),
@@ -511,6 +525,14 @@ impl HostsFilterEngine {
     /// Current number of active loaded blocking rules.
     pub fn rule_count(&self) -> usize {
         self.snapshot.load().rule_count
+    }
+
+    /// True when filtering is enabled with `fail_closed` and no rule snapshot
+    /// has ever been compiled (initial load running or failed). Callers
+    /// should refuse to resolve rather than silently allow everything.
+    pub fn unavailable_for_fail_closed(&self) -> bool {
+        let config = self.config.load();
+        config.enabled && config.fail_closed && self.snapshot.load().unavailable
     }
 
     /// Current observable status of the filter engine.
@@ -801,13 +823,16 @@ impl HostsFilterEngine {
         qtype: RecordType,
         client: &ClientContext,
     ) -> Option<Verdict> {
-        if !self.config.load().enabled {
+        let config = self.config.load();
+        if !config.enabled {
             return None;
+        }
+        let snapshot = self.snapshot.load();
+        if config.fail_closed && snapshot.unavailable {
+            return Some(Verdict::Block(BlockReason::FilterUnavailable));
         }
 
         let normalized = normalized_query_domain(qname);
-
-        let snapshot = self.snapshot.load();
         snapshot.evaluate_important(&normalized, qtype, client)
     }
 
@@ -818,26 +843,32 @@ impl HostsFilterEngine {
         qtype: RecordType,
         client: &ClientContext,
     ) -> Verdict {
-        if !self.config.load().enabled {
+        let config = self.config.load();
+        if !config.enabled {
             return Verdict::Allow(None);
+        }
+        let snapshot = self.snapshot.load();
+        if config.fail_closed && snapshot.unavailable {
+            return Verdict::Block(BlockReason::FilterUnavailable);
         }
 
         let normalized = normalized_query_domain(qname);
-
-        let snapshot = self.snapshot.load();
         snapshot.evaluate_standard(&normalized, qtype, client)
     }
 }
 
 impl FilterEngine for HostsFilterEngine {
     fn evaluate(&self, qname: &Name, qtype: RecordType, client: &ClientContext) -> Verdict {
-        if !self.config.load().enabled {
+        let config = self.config.load();
+        if !config.enabled {
             return Verdict::Allow(None);
+        }
+        let snapshot = self.snapshot.load();
+        if config.fail_closed && snapshot.unavailable {
+            return Verdict::Block(BlockReason::FilterUnavailable);
         }
 
         let normalized = normalized_query_domain(qname);
-
-        let snapshot = self.snapshot.load();
         snapshot.evaluate(&normalized, qtype, client)
     }
 }
@@ -1310,7 +1341,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+        let engine = HostsFilterEngine::init(config.clone(), temp_dir.clone()).await;
 
         assert_eq!(engine.state(), FilterState::Failed);
         let status = engine.status();
@@ -1320,6 +1351,29 @@ mod tests {
         assert!(
             engine.reload().await.is_err(),
             "an enabled engine with zero loadable sources must not report success"
+        );
+
+        // Fail-closed default: a failed initial load must not allow traffic.
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let probe = Name::from_str("anything.example.").unwrap();
+        let verdict = engine.evaluate(&probe, RecordType::A, &client);
+        assert_eq!(
+            verdict,
+            Verdict::Block(BlockReason::FilterUnavailable),
+            "fail_closed engines must block while no snapshot has loaded"
+        );
+
+        // Opting out restores allow-all on the same failed state.
+        let allow_open = FilteringConfig {
+            fail_closed: false,
+            ..config.clone()
+        };
+        let open_engine = HostsFilterEngine::init(allow_open, temp_dir.clone()).await;
+        assert_eq!(open_engine.state(), FilterState::Failed);
+        assert!(
+            open_engine
+                .evaluate(&probe, RecordType::A, &client)
+                .is_allowed()
         );
 
         // A later successful reload transitions back to Ready.

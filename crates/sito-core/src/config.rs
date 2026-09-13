@@ -1002,6 +1002,12 @@ pub struct FilteringConfig {
     pub blocking_ttl: u32,
     #[serde(default = "default_true")]
     pub cname_cloaking: bool,
+    /// When true, queries are answered with SERVFAIL while filtering is
+    /// enabled but no usable rule snapshot has ever loaded (e.g. every list
+    /// failed at boot). Prevents a failed initial load from silently
+    /// disabling all filtering.
+    #[serde(default = "default_true")]
+    pub fail_closed: bool,
     #[serde(default = "default_filtering_anti_doh_bypass")]
     pub anti_doh_bypass: String,
     #[serde(default)]
@@ -1028,6 +1034,7 @@ impl Default for FilteringConfig {
             blocking_mode: BlockingMode::default(),
             blocking_ttl: default_filtering_blocking_ttl(),
             cname_cloaking: true,
+            fail_closed: true,
             anti_doh_bypass: default_filtering_anti_doh_bypass(),
             lists: Vec::new(),
             custom_rules: Vec::new(),

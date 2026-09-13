@@ -388,6 +388,12 @@ pub async fn check_filtering(
                 Some("anti_doh_bypass".to_string()),
                 Some("anti_doh_bypass".to_string()),
             ),
+            sito_core::verdict::BlockReason::FilterUnavailable => (
+                "blocked".to_string(),
+                Some("filter_unavailable".to_string()),
+                Some("fail_closed".to_string()),
+                Some("fail_closed".to_string()),
+            ),
         },
         sito_core::verdict::Verdict::Rewrite(_) => ("rewritten".to_string(), None, None, None),
     };

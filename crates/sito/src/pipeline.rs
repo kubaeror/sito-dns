@@ -709,25 +709,39 @@ impl QueryHandler for DnsPipeline {
             // once so both passes see the same compiled rule set, and the
             // candidate walk is not repeated. Clients with filtering disabled
             // skip the work entirely.
-            let (normalized_domain, filter_snapshot, filter_candidates) =
-                if policy.is_filtering_enabled {
-                    let normalized = normalized_query_domain(qname);
-                    let snapshot = self.filter.snapshot();
-                    let mut candidates = FilterCandidates::default();
-                    snapshot.allowlist.collect_candidates(
-                        &normalized,
-                        &snapshot.interner,
-                        &mut candidates.allow,
+            let (normalized_domain, filter_snapshot, filter_candidates) = if policy
+                .is_filtering_enabled
+            {
+                let normalized = normalized_query_domain(qname);
+                let snapshot = self.filter.snapshot();
+                // Fail closed when filtering was never able to load its
+                // rules: an initial download failure must not silently
+                // turn into an allow-all resolver.
+                if config.filtering.enabled && config.filtering.fail_closed && snapshot.unavailable
+                {
+                    // The engine logs/statuses the load failure once; keep this
+                    // per-query path at debug level to avoid log flooding.
+                    debug!(
+                        domain = %normalized,
+                        "Filtering enabled but no rule snapshot has loaded; failing closed"
                     );
-                    snapshot.blocklist.collect_candidates(
-                        &normalized,
-                        &snapshot.interner,
-                        &mut candidates.block,
-                    );
-                    (normalized, Some(snapshot), candidates)
-                } else {
-                    (String::new(), None, FilterCandidates::default())
-                };
+                    return QueryOutcome::servfail(query_id, &query, domain_str, qtype);
+                }
+                let mut candidates = FilterCandidates::default();
+                snapshot.allowlist.collect_candidates(
+                    &normalized,
+                    &snapshot.interner,
+                    &mut candidates.allow,
+                );
+                snapshot.blocklist.collect_candidates(
+                    &normalized,
+                    &snapshot.interner,
+                    &mut candidates.block,
+                );
+                (normalized, Some(snapshot), candidates)
+            } else {
+                (String::new(), None, FilterCandidates::default())
+            };
 
             trace!(qname = %qname, qtype = ?qtype, "Processing DNS query");
 

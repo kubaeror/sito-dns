@@ -66,6 +66,7 @@ refresh_interval_hours = 24
 blocking_mode = "zero_ip"
 blocking_ttl = 10
 cname_cloaking = true
+fail_closed = true
 anti_doh_bypass = "off"
 lists = []
 custom_rules = [
