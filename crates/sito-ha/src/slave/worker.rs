@@ -152,15 +152,20 @@ pub async fn apply_config_push(
     handles.runtime.replace(snapshot);
 
     // Persist configuration to disk if path is provided. The pushed TOML can
-    // contain substituted credentials, so write atomically with 0600.
-    if let Some(ref path) = handles.config_path
-        && let Err(e) = write_private_atomic(path, &substituted_toml)
-    {
-        error!(
-            error = %e,
-            path = %path.display(),
-            "Failed to persist applied configuration to disk"
-        );
+    // contain substituted credentials, so write atomically with 0600. The
+    // master's sanitized bundle has `[ha]` stripped and `instance_name`
+    // removed; without merging the local replication settings back in, a
+    // slave restart would boot without its master URL/pins and stop
+    // replicating.
+    if let Some(ref path) = handles.config_path {
+        let persisted = merge_local_replication_config(&substituted_toml, path);
+        if let Err(e) = write_private_atomic(path, &persisted) {
+            error!(
+                error = %e,
+                path = %path.display(),
+                "Failed to persist applied configuration to disk"
+            );
+        }
     }
 
     // Mark tracker as synced
@@ -177,6 +182,44 @@ pub async fn apply_config_push(
     );
 
     Ok(bundle.version)
+}
+
+/// Merges the slave's local replication settings into a pushed configuration
+/// before it is persisted:
+///
+/// * `[ha]` (master URL, certificates, pins, token) is slave-local and is
+///   removed by `sanitize_config_for_bundle` on the master.
+/// * `server.instance_name` identifies this slave and is also removed on the
+///   master.
+/// * `server.data_dir` points at slave-local state and must not be replaced
+///   by the master's path.
+///
+/// Returns the input unchanged when either TOML cannot be parsed.
+fn merge_local_replication_config(pushed_toml: &str, local_path: &std::path::Path) -> String {
+    let Ok(local_raw) = std::fs::read_to_string(local_path) else {
+        return pushed_toml.to_string();
+    };
+    let (Ok(mut pushed), Ok(local)) = (
+        pushed_toml.parse::<toml::Table>(),
+        local_raw.parse::<toml::Table>(),
+    ) else {
+        return pushed_toml.to_string();
+    };
+
+    if let Some(ha) = local.get("ha") {
+        pushed.insert("ha".to_string(), ha.clone());
+    }
+    if let (Some(toml::Value::Table(local_server)), Some(toml::Value::Table(server))) =
+        (local.get("server"), pushed.get_mut("server"))
+    {
+        for key in ["instance_name", "data_dir"] {
+            if let Some(value) = local_server.get(key) {
+                server.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+
+    toml::to_string_pretty(&pushed).unwrap_or_else(|_| pushed_toml.to_string())
 }
 
 /// Atomically writes `contents` to `path`, restricting permissions to the
@@ -617,4 +660,76 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_local_replication_config_preserves_ha_and_identity() {
+        let dir = std::env::temp_dir().join(format!("sito_ha_merge_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let local = r#"
+config_version = 1
+
+[server]
+role = "slave"
+instance_name = "slave-1"
+data_dir = "/var/lib/sito"
+
+[ha]
+master_url = "wss://master.example:8953"
+master_pubkey = "abc123"
+cert = "/etc/sito/slave.crt"
+key = "/etc/sito/slave.key"
+"#;
+        std::fs::write(&path, local).unwrap();
+
+        // Sanitized bundle from the master: no [ha], no instance_name, and the
+        // master's own data_dir.
+        let pushed = r#"
+config_version = 1
+
+[server]
+role = "slave"
+data_dir = "/var/lib/sito-master"
+"#;
+
+        let merged = merge_local_replication_config(pushed, &path);
+        let table: toml::Table = merged.parse().unwrap();
+
+        let ha = table.get("ha").expect("[ha] must be preserved");
+        assert_eq!(
+            ha.get("master_url").and_then(toml::Value::as_str),
+            Some("wss://master.example:8953")
+        );
+        let server = table.get("server").unwrap();
+        assert_eq!(
+            server.get("instance_name").and_then(toml::Value::as_str),
+            Some("slave-1")
+        );
+        assert_eq!(
+            server.get("data_dir").and_then(toml::Value::as_str),
+            Some("/var/lib/sito")
+        );
+        assert_eq!(
+            server.get("role").and_then(toml::Value::as_str),
+            Some("slave")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_merge_local_replication_config_without_local_file_is_noop() {
+        let pushed = "config_version = 1\n[server]\nrole = \"slave\"\n";
+        let merged = merge_local_replication_config(
+            pushed,
+            std::path::Path::new("/nonexistent/config.toml"),
+        );
+        assert_eq!(merged, pushed);
+    }
 }
