@@ -236,6 +236,7 @@ ignore_query_log = false
 trusted = false
 
 [clients.groups.kids]
+description = "Kids devices (parental policy)"
 filtering = true
 lists = ["OISD"]
 custom_rules = ["||fortnite.com^$important"]
@@ -257,7 +258,7 @@ schedule = "0 0 15-21 * * MON-FRI"
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `entries` | array of tables | `[]` | Client definitions mapping IP addresses, plus shared-secret DoT SNI / DoH path identifiers and MAC addresses, to groups. Available entry keys: `name`, `ids`, `group`, `ignore_query_log`, `ignore_stats` (skip Prometheus counters), `use_global_upstreams`, `upstreams` (when `use_global_upstreams = false`, the client resolves through these servers only and its answers bypass the shared cache), `trusted`. Display names and `ids` never authenticate a client on their own. |
-| `groups` | table (map of name → group) | `{}` | Policy groups keyed by group name, e.g. `[clients.groups.kids]`, with optional `[[clients.groups.<name>.blocked_services]]` entries. |
+| `groups` | table (map of name → group) | `{}` | Policy groups keyed by group name, e.g. `[clients.groups.kids]`, with optional `[[clients.groups.<name>.blocked_services]]` entries. Group fields: description (optional operator note), filtering, lists, custom_rules, safe_search, safe_search_youtube, parental, parental_categories, schedule_enabled, schedule, blocked_services. |
 | `client_id_secrets` | table (map of entry name → secret) | `{}` | Shared secrets accepted as the first DoT SNI label (`<secret>.dns.example.com`) or the DoH path segment (`/dns-query/<secret>`). Empty disables path/SNI identification. |
 | `trust_routeros_lease_names` | boolean | `false` | Trust RouterOS DHCP lease host names/comments for client identification. Off by default because lease data is client-controlled. |
 
@@ -299,7 +300,7 @@ trusted_proxies = ["10.0.0.1", "192.168.1.10"]   # individual proxy IPs
 session_ttl_hours = 24
 login_rate_limit = 5
 session_persist = true          # persist sessions/tokens across restarts
-token_default_ttl_days = 0      # 0 = API tokens never expire
+token_default_ttl_days = 90     # 0 = API tokens never expire
 ```
 
 | Key | Type | Default | Description |
@@ -312,7 +313,7 @@ token_default_ttl_days = 0      # 0 = API tokens never expire
 | `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required. |
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
 | `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL; corrupt stores are backed up and start empty. Use `sito reset-sessions` to invalidate everything. |
-| `auth.token_default_ttl_days` | integer | `0` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
+| `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
 
 ---
 

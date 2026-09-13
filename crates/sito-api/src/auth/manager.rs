@@ -820,6 +820,9 @@ impl AuthManager {
             if username == "admin" {
                 self.default_admin_active.store(false, Ordering::SeqCst);
             }
+            // A deleted account must lose access immediately: sessions are
+            // not re-validated against the user table on every request.
+            self.purge_user_sessions(username);
             self.save_users();
         }
         removed
@@ -851,7 +854,13 @@ impl AuthManager {
             role,
             totp: None,
         };
-        lock(&self.users).insert(username.to_string(), user);
+        let existed = lock(&self.users)
+            .insert(username.to_string(), user)
+            .is_some();
+        if existed {
+            // Overwriting an account (new password/role) revokes its sessions.
+            self.purge_user_sessions(username);
+        }
         self.save_users();
     }
 
@@ -1671,6 +1680,22 @@ mod tests {
         assert_eq!(
             successes, 1,
             "a backup code must be consumed exactly once: {r1:?} / {r2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_user_revokes_sessions() {
+        let mgr = AuthManager::new();
+        let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("expected direct login");
+        };
+        assert!(mgr.validate_session(&session.id).is_some());
+
+        assert!(mgr.delete_user("admin"));
+        assert!(
+            mgr.validate_session(&session.id).is_none(),
+            "a deleted account's sessions must be invalidated"
         );
     }
 

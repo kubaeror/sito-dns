@@ -78,6 +78,9 @@ pub struct ClientEntryConfig {
 /// A policy group configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientGroupConfig {
+    /// Free-form operator note; informational only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(default = "default_true")]
     pub filtering: bool,
     #[serde(default)]
@@ -103,6 +106,7 @@ pub struct ClientGroupConfig {
 impl Default for ClientGroupConfig {
     fn default() -> Self {
         Self {
+            description: None,
             filtering: true,
             lists: Vec::new(),
             custom_rules: Vec::new(),

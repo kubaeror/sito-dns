@@ -148,7 +148,7 @@ fn payload_secret(doh_path: Option<&String>, dot_sni: Option<&String>) -> Option
 fn group_to_dto(name: &str, group: &ClientGroupConfig) -> ClientGroupDto {
     ClientGroupDto {
         name: name.to_string(),
-        description: None,
+        description: group.description.clone(),
         filtering_enabled: group.filtering,
         parental_control: group.parental,
         safe_search: group.safe_search,
@@ -505,6 +505,7 @@ pub async fn update_client_group(
     };
 
     let group = ClientGroupConfig {
+        description: payload.description.or_else(|| existing.description.clone()),
         filtering: payload.filtering_enabled.unwrap_or(existing.filtering),
         lists: payload.lists.unwrap_or_else(|| existing.lists.clone()),
         custom_rules: payload
@@ -555,6 +556,7 @@ pub async fn add_client_group(
         )));
     }
     let group = ClientGroupConfig {
+        description: payload.description.clone(),
         filtering: payload.filtering_enabled,
         lists: Vec::new(),
         custom_rules: Vec::new(),
@@ -870,6 +872,7 @@ mod tests {
         cfg.groups.insert(
             "kids".to_string(),
             ClientGroupConfig {
+                description: Some("kids policy".to_string()),
                 filtering: true,
                 lists: vec!["OISD".to_string()],
                 custom_rules: vec!["||x^".to_string()],
@@ -909,6 +912,11 @@ mod tests {
         assert!(group.parental);
         assert_eq!(group.parental_categories, vec!["adult"]);
         assert!(group.schedule_enabled);
+        assert_eq!(
+            group.description.as_deref(),
+            Some("kids policy"),
+            "description must survive a partial update"
+        );
         assert_eq!(group.blocked_services.len(), 1);
         assert_eq!(group.blocked_services[0].service, "tiktok");
 

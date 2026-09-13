@@ -323,8 +323,13 @@ pub struct AuthConfig {
     #[serde(default = "default_session_persist")]
     pub session_persist: bool,
     /// Default lifetime for newly created API tokens in days (`0` = no expiry).
-    #[serde(default)]
+    /// Defaults to 90 days so credentials do not live forever by omission.
+    #[serde(default = "default_token_ttl_days")]
     pub token_default_ttl_days: u64,
+}
+
+fn default_token_ttl_days() -> u64 {
+    90
 }
 
 fn default_session_ttl_hours() -> u64 {
@@ -345,7 +350,7 @@ impl Default for AuthConfig {
             session_ttl_hours: default_session_ttl_hours(),
             login_rate_limit: default_login_rate_limit(),
             session_persist: default_session_persist(),
-            token_default_ttl_days: 0,
+            token_default_ttl_days: default_token_ttl_days(),
         }
     }
 }
@@ -1354,6 +1359,20 @@ key = "/path/to/key.pem"
             }
             other => panic!("expected dns.cache.negative_ttl_max error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_default_api_token_ttl_is_bounded() {
+        let auth = AuthConfig::default();
+        assert_eq!(
+            auth.token_default_ttl_days, 90,
+            "API tokens must expire by default instead of living forever"
+        );
+        // Explicit opt-out (no expiry) still parses.
+        let cfg = Config::from_toml_str("config_version = 1\n[auth]\ntoken_default_ttl_days = 0\n")
+            .unwrap();
+        let parsed: AuthConfig = cfg.auth.unwrap().try_into().unwrap();
+        assert_eq!(parsed.token_default_ttl_days, 0);
     }
 
     #[test]
