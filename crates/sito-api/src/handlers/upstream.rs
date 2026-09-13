@@ -3,12 +3,9 @@
 use axum::Json;
 use axum::extract::State;
 use sito_core::config::{UpstreamConfig, UpstreamStrategy};
-use sito_proto::{Message, MessageType, Name, OpCode, Query, RecordType};
-use sito_upstream::{BootstrapResolver, DotUpstream, PlainUpstream, Upstream};
-use std::net::SocketAddr;
-use std::str::FromStr;
+use sito_upstream::BootstrapResolver;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::auth::rbac::RequireOperator;
 use crate::config_writer::save_config_atomic;
@@ -124,10 +121,15 @@ pub async fn update_upstream_config(
             prev_cfg.upstream.bootstrap.clone(),
             Duration::from_millis(prev_cfg.upstream.timeout_ms),
         );
-        let _ = ctx
+        if let Err(rollback_err) = ctx
             .upstream
             .reload(&prev_cfg.upstream, &prev_bootstrap)
-            .await;
+            .await
+        {
+            tracing::error!(
+                "Failed to roll back upstream configuration after persist error: {rollback_err:?}"
+            );
+        }
         return Err(e);
     }
     ctx.set_config(new_config);
@@ -152,105 +154,72 @@ pub async fn test_upstream_servers(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
     Json(req): Json<UpstreamTestRequest>,
-) -> Json<UpstreamTestResponse> {
-    let bootstrap = BootstrapResolver::new(
-        ctx.config.load().upstream.bootstrap.clone(),
-        Duration::from_millis(2000),
-    );
+) -> Result<Json<UpstreamTestResponse>, ProblemDetails> {
+    if req.servers.len() > crate::probe::MAX_PROBE_SERVERS {
+        return Err(ProblemDetails::bad_request(format!(
+            "At most {} upstream servers may be tested per request",
+            crate::probe::MAX_PROBE_SERVERS
+        )));
+    }
+    let probe_domain = ctx.config.load().upstream.probe_domain.clone();
+    let server_count = req.servers.len();
 
-    let test_qname = Name::from_str("example.com.").unwrap();
-    let mut results = Vec::new();
-
-    for server in req.servers {
-        let start = Instant::now();
-        let timeout = Duration::from_millis(3000);
-
-        let upstream_res: Result<Arc<dyn Upstream>, String> =
-            if let Some(tls_target) = server.strip_prefix("tls://") {
-                let parts: Vec<&str> = tls_target.split(':').collect();
-                let host = parts[0];
-                let port: u16 = if parts.len() > 1 {
-                    parts[1].parse().unwrap_or(853)
-                } else {
-                    853
-                };
-
-                match bootstrap.resolve_hostname(host).await {
-                    Ok(ips) if !ips.is_empty() => {
-                        let addr = SocketAddr::new(ips[0], port);
-                        match DotUpstream::new(addr, host.to_string(), timeout, 2) {
-                            Ok(dot) => Ok(Arc::new(dot)),
-                            Err(e) => Err(format!("DoT setup failed: {e}")),
-                        }
-                    }
-                    Ok(_) => Err("No IPs resolved for upstream host".to_string()),
-                    Err(e) => Err(format!("Bootstrap resolution failed: {e}")),
-                }
-            } else {
-                let target = server.strip_prefix("udp://").unwrap_or(&server);
-                let addr_res = if let Ok(addr) = SocketAddr::from_str(target) {
-                    Ok(addr)
-                } else {
-                    let parts: Vec<&str> = target.split(':').collect();
-                    let host = parts[0];
-                    let port: u16 = if parts.len() > 1 {
-                        parts[1].parse().unwrap_or(53)
-                    } else {
-                        53
-                    };
-
-                    match bootstrap.resolve_hostname(host).await {
-                        Ok(ips) if !ips.is_empty() => Ok(SocketAddr::new(ips[0], port)),
-                        Ok(_) => Err("No IPs resolved for host".to_string()),
-                        Err(e) => Err(format!("Failed to resolve {host}: {e}")),
-                    }
-                };
-
-                match addr_res {
-                    Ok(addr) => Ok(Arc::new(PlainUpstream::new(addr, timeout))),
-                    Err(e) => Err(e),
-                }
-            };
-
-        match upstream_res {
-            Ok(up) => {
-                let mut query = Message::new(1, MessageType::Query, OpCode::Query);
-                query
-                    .queries
-                    .push(Query::query(test_qname.clone(), RecordType::A));
-
-                match up.resolve(&query).await {
-                    Ok(_) => {
-                        let rtt = start.elapsed().as_millis() as u64;
-                        results.push(UpstreamTestItem {
-                            server,
-                            rtt_ms: Some(rtt),
-                            healthy: true,
-                            error: None,
-                        });
-                    }
-                    Err(e) => {
-                        results.push(UpstreamTestItem {
-                            server,
-                            rtt_ms: None,
-                            healthy: false,
-                            error: Some(e.to_string()),
-                        });
-                    }
-                }
-            }
-            Err(e) => {
-                results.push(UpstreamTestItem {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, server) in req.servers.into_iter().enumerate() {
+        let Ok(permit) = semaphore.clone().acquire_owned().await else {
+            break;
+        };
+        let domain = probe_domain.clone();
+        set.spawn(async move {
+            let _permit = permit;
+            let start = std::time::Instant::now();
+            let outcome = tokio::time::timeout(
+                crate::probe::PROBE_TIMEOUT,
+                crate::probe::probe_upstream_target(&server, &domain),
+            )
+            .await;
+            let item = match outcome {
+                Ok(Ok(_)) => UpstreamTestItem {
+                    server,
+                    rtt_ms: Some(start.elapsed().as_millis() as u64),
+                    healthy: true,
+                    error: None,
+                },
+                Ok(Err(e)) => UpstreamTestItem {
                     server,
                     rtt_ms: None,
                     healthy: false,
                     error: Some(e),
-                });
+                },
+                Err(_) => UpstreamTestItem {
+                    server,
+                    rtt_ms: None,
+                    healthy: false,
+                    error: Some("probe timed out".to_string()),
+                },
+            };
+            (idx, item)
+        });
+    }
+
+    let mut results: Vec<Option<UpstreamTestItem>> = (0..server_count).map(|_| None).collect();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((idx, item)) => {
+                if idx < results.len() {
+                    results[idx] = Some(item);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Upstream probe task failed: {e}");
             }
         }
     }
 
-    Json(UpstreamTestResponse { results })
+    Ok(Json(UpstreamTestResponse {
+        results: results.into_iter().flatten().collect(),
+    }))
 }
 
 #[cfg(test)]
@@ -261,6 +230,7 @@ mod tests {
     use arc_swap::ArcSwap;
     use sito_core::config::Config;
     use std::sync::Mutex;
+    use std::time::Instant;
 
     async fn mock_context(temp_dir: &std::path::Path) -> ServerContext {
         let db_path = temp_dir.join("test.db");

@@ -75,6 +75,8 @@ use utoipa::OpenApi;
             crate::models::FilterCheckResponse,
             crate::models::ClientDto,
             crate::models::ClientGroupDto,
+            crate::models::UpdateClientRequest,
+            crate::models::UpdateClientGroupRequest,
             crate::models::RewriteDto,
             crate::models::AddRewriteRequest,
             crate::models::UpstreamConfigDto,
@@ -93,6 +95,7 @@ use utoipa::OpenApi;
             crate::models::LoginResponse,
             crate::models::TotpVerifyRequest,
             crate::models::TotpConfirmRequest,
+            crate::models::DisableTotpRequest,
             crate::models::CreateTokenRequest,
             crate::models::HaStatusResponse,
             crate::models::HaSlaveSummary,
@@ -126,7 +129,7 @@ use utoipa::OpenApi;
     ),
     info(
         title = "sito DNS Administrative API",
-        version = "1.5.0",
+        version = "1.6.0",
         description = "Administrative REST API and OpenAPI 3.0 specification for the sito DNS server",
         license(name = "GPL-3.0-only")
     )
