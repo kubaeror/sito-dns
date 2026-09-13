@@ -1,5 +1,6 @@
 //! Server lifecycle and runner implementation.
 
+use notify::{Event, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -27,37 +28,360 @@ use sito_upstream::{BootstrapResolver, UpstreamManager};
 use crate::pipeline::DnsPipeline;
 
 #[derive(serde::Deserialize, Default)]
-struct IntegrationsConfig {
+pub(crate) struct IntegrationsConfig {
     mikrotik: Option<sito_clients::RouterOsConfig>,
     lists: Option<sito_clients::ListCategoriesConfig>,
 }
 
-/// Runs the complete sito DNS server with graceful shutdown handling.
-pub async fn run_server(config: Config) -> anyhow::Result<()> {
-    let config_path = config.server.data_dir.join("config.toml");
-    run_server_full(config, config_path, None, false).await
+/// Parses the optional `[clients]` section, surfacing type errors instead of
+/// silently discarding all client policies.
+pub(crate) fn clients_from_config(config: &Config) -> anyhow::Result<sito_clients::ClientsConfig> {
+    match config.clients.as_ref() {
+        Some(value) => value
+            .clone()
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("invalid [clients] configuration: {e}")),
+        None => Ok(sito_clients::ClientsConfig::default()),
+    }
 }
 
-/// Runs the DNS server with an optional custom shutdown receiver (useful for testing).
-pub async fn run_server_with_shutdown(
-    config: Config,
-    custom_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
-) -> anyhow::Result<()> {
-    let config_path = config.server.data_dir.join("config.toml");
-    run_server_full(config, config_path, custom_shutdown, false).await
+/// Parses the optional `[rewrites]` section, surfacing type errors.
+pub(crate) fn rewrites_from_config(
+    config: &Config,
+) -> anyhow::Result<sito_rewrites::RewritesConfig> {
+    match config.rewrites.as_ref() {
+        Some(value) => value
+            .clone()
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("invalid [rewrites] configuration: {e}")),
+        None => Ok(sito_rewrites::RewritesConfig::default()),
+    }
 }
 
-/// Runs the DNS server with custom config path, shutdown receiver, and setup-pending mode.
-pub async fn run_server_full(
-    config: Config,
-    config_path: impl AsRef<Path>,
-    custom_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
-    setup_pending: bool,
-) -> anyhow::Result<()> {
-    let config_path_buf = config_path.as_ref().to_path_buf();
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let in_flight = Arc::new(AtomicUsize::new(0));
+/// Parses the optional `[integrations]` section, surfacing type errors.
+pub(crate) fn integrations_from_config(
+    config: &Config,
+) -> anyhow::Result<Option<IntegrationsConfig>> {
+    match config.integrations.as_ref() {
+        Some(value) => value
+            .clone()
+            .try_into::<IntegrationsConfig>()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("invalid [integrations] configuration: {e}")),
+        None => Ok(None),
+    }
+}
 
+/// Validates every TOML-valued configuration section at startup and in
+/// `check-config`, so a type error aborts instead of silently falling back to
+/// defaults (which could drop trusted proxies, client policies or HA settings).
+pub fn validate_typed_sections(config: &Config) -> anyhow::Result<()> {
+    clients_from_config(config)?;
+    rewrites_from_config(config)?;
+    integrations_from_config(config)?;
+
+    if let Some(ref value) = config.web {
+        value
+            .clone()
+            .try_into::<sito_core::config::WebConfig>()
+            .map_err(|e| anyhow::anyhow!("invalid [web] configuration: {e}"))?;
+    }
+    if let Some(ref value) = config.auth {
+        value
+            .clone()
+            .try_into::<sito_core::config::AuthConfig>()
+            .map_err(|e| anyhow::anyhow!("invalid [auth] configuration: {e}"))?;
+    }
+    if let Some(ref value) = config.stats {
+        value
+            .clone()
+            .try_into::<sito_core::config::StatsConfig>()
+            .map_err(|e| anyhow::anyhow!("invalid [stats] configuration: {e}"))?;
+    }
+    if let Some(ref value) = config.ha {
+        let ha_cfg = sito_ha::HaConfig::from_toml_value(value)
+            .map_err(|e| anyhow::anyhow!("invalid [ha] configuration: {e}"))?;
+        ha_cfg
+            .validate(&config.server.role)
+            .map_err(|e| anyhow::anyhow!("invalid [ha] configuration: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Query-log writer channel capacity (entries).
+const QUERYLOG_BUFFER: usize = 10_000;
+/// How often the query-log drop counter is published to Prometheus.
+const QUERYLOG_METRICS_INTERVAL: Duration = Duration::from_secs(5);
+/// Graceful shutdown budget for draining in-flight queries.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Stats retention sweep interval (retention_days is re-read every cycle).
+const RETENTION_INTERVAL: Duration = Duration::from_hours(24);
+/// Debounce window for config file watcher events.
+const WATCHER_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// Resolves the config path to an absolute path so the file watcher can watch
+/// its parent directory even for the default relative `config.toml`. Symlinks
+/// are resolved when the file exists; otherwise it is anchored to the current
+/// working directory.
+fn canonical_config_path(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(_) => std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
+    }
+}
+
+/// Builds one protocol's hot-reloadable TLS acceptor and starts its certificate
+/// watcher. Returns `None` (with a warning) when the certificate material cannot
+/// be loaded, matching the previous per-protocol behaviour.
+#[allow(clippy::too_many_arguments)]
+fn build_tls_acceptor(
+    protocol: &str,
+    cert: &Path,
+    key: &Path,
+    sni_tuples: &[(String, PathBuf, PathBuf)],
+    alpn: &[Vec<u8>],
+    challenge_keys: Option<Arc<dashmap::DashMap<String, Arc<rustls::sign::CertifiedKey>>>>,
+    cert_watchers: &mut Vec<sito_transport::CertWatcher>,
+) -> Option<TlsAcceptorManager> {
+    let config = match challenge_keys.clone() {
+        Some(keys) => {
+            load_server_config_with_challenges(cert, key, sni_tuples, alpn.to_vec(), keys)
+        }
+        None => load_server_config(cert, key, sni_tuples, alpn.to_vec()),
+    };
+    match config {
+        Ok(config) => {
+            let manager = match challenge_keys {
+                Some(keys) => TlsAcceptorManager::with_challenge_keys(config, keys),
+                None => TlsAcceptorManager::new(config),
+            };
+            match CertWatcher::start(cert, key, sni_tuples, alpn, manager.clone()) {
+                Ok(watcher) => cert_watchers.push(watcher),
+                Err(e) => warn!(protocol, "Certificate watcher failed to start: {e}"),
+            }
+            Some(manager)
+        }
+        Err(e) => {
+            warn!(protocol, "Failed to initialize TLS configuration: {e}");
+            None
+        }
+    }
+}
+
+/// Builds per-client upstream managers, reusing existing managers by key so a
+/// hot reload does not re-resolve unchanged upstream scopes.
+async fn build_scoped_upstreams(
+    config: &Config,
+    bootstrap: &BootstrapResolver,
+    clients: &sito_clients::ClientsConfig,
+    existing: &HashMap<String, Arc<UpstreamManager>>,
+) -> HashMap<String, Arc<UpstreamManager>> {
+    let mut scoped: HashMap<String, Arc<UpstreamManager>> = HashMap::new();
+    for entry in &clients.entries {
+        if entry.use_global_upstreams {
+            continue;
+        }
+        let Some(ref servers) = entry.upstreams else {
+            continue;
+        };
+        if servers.is_empty() {
+            continue;
+        }
+        let key = servers.join(",");
+        if scoped.contains_key(&key) {
+            continue;
+        }
+        if let Some(manager) = existing.get(&key) {
+            scoped.insert(key, manager.clone());
+            continue;
+        }
+        let mut upstream_cfg = config.upstream.clone();
+        upstream_cfg.servers.clone_from(servers);
+        upstream_cfg.per_domain.clear();
+        match UpstreamManager::from_config(&upstream_cfg, bootstrap).await {
+            Ok(manager) => {
+                info!(
+                    client = %entry.name,
+                    servers = ?servers,
+                    "Initialized per-client upstream scope"
+                );
+                scoped.insert(key, Arc::new(manager));
+            }
+            Err(e) => warn!(
+                client = %entry.name,
+                error = %e,
+                "Failed to initialize per-client upstreams; this client falls back to global upstreams"
+            ),
+        }
+    }
+    scoped
+}
+
+/// High-availability role setup produced by [`init_ha`].
+struct HaRuntime {
+    config: sito_ha::HaConfig,
+    coordinator: Option<sito_ha::MasterCoordinator>,
+    tracker: Option<sito_ha::SlaveStatusTracker>,
+    resync_sender: Option<tokio::sync::mpsc::Sender<()>>,
+}
+
+/// Initializes the HA role (master replication server or slave worker) and
+/// returns the shared handles plus the validated HA configuration.
+#[allow(clippy::too_many_arguments)]
+fn init_ha(
+    config: &Config,
+    config_path: &Path,
+    metrics: &sito_stats::MetricsRegistry,
+    config_arc: &Arc<ArcSwap<Config>>,
+    filter_engine: &Arc<HostsFilterEngine>,
+    rewrites_arc: &Arc<ArcSwap<sito_rewrites::RewriteTable>>,
+    clients_arc: &Arc<ArcSwap<sito_clients::ClientRegistry>>,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> anyhow::Result<HaRuntime> {
+    let ha_config: sito_ha::HaConfig = config
+        .ha
+        .as_ref()
+        .map(sito_ha::HaConfig::from_toml_value)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("Invalid HA configuration: {e}"))?
+        .unwrap_or_else(|| sito_ha::HaConfig {
+            replication_port: 0,
+            ..Default::default()
+        });
+
+    ha_config
+        .validate(&config.server.role)
+        .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
+
+    let (master_coordinator, slave_tracker, resync_sender) = if config.server.role == "master" {
+        // Load or create master Ed25519 signing key (0600 on Unix)
+        let signing_key_path = config.server.data_dir.join("ha_signing.key");
+        let signing_key = Arc::new(sito_ha::Ed25519SigningKey::load_or_create(
+            &signing_key_path,
+        )?);
+
+        let coordinator = sito_ha::MasterCoordinator::new(
+            config.server.instance_name.clone(),
+            0,
+            signing_key.clone(),
+            metrics.clone(),
+        )
+        .with_state_path(config.server.data_dir.join("ha_state.toml"));
+
+        // Continue the version sequence across restarts; only a master with no
+        // recoverable state starts a fresh v1 sequence.
+        let restored_version = coordinator.restore_state()?;
+
+        let initial_toml = std::fs::read_to_string(config_path)
+            .unwrap_or_else(|_| toml::to_string_pretty(config).unwrap_or_default());
+        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&initial_toml).unwrap_or_default();
+        if let Some(ref token) = ha_config.slave_token
+            && let Err(e) = sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])
+        {
+            anyhow::bail!("Refusing to publish HA bundle with a leaked secret: {e}");
+        }
+        let list_metadata = config
+            .filtering
+            .lists
+            .iter()
+            .map(|l| sito_ha::FilterListMetadata {
+                name: l.name.clone(),
+                url: l.url.clone(),
+                enabled: l.enabled,
+                refresh_hours: l.refresh_hours,
+            })
+            .collect();
+
+        if restored_version.is_none() {
+            #[allow(clippy::cast_sign_loss)]
+            let initial_bundle = sito_ha::ConfigBundle {
+                version: 1,
+                timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                config_toml: sanitized_toml,
+                custom_rules: config.filtering.custom_rules.clone(),
+                rewrites: config.rewrites.clone(),
+                clients: config.clients.clone(),
+                lists: list_metadata,
+            };
+            coordinator.update_bundle(initial_bundle)?;
+            info!("Published initial HA configuration bundle version 1");
+        } else {
+            info!(
+                version = restored_version.unwrap_or_default(),
+                "Resumed HA configuration sequence from persisted state"
+            );
+        }
+
+        // Spawn master replication listener if replication_port > 0
+        let _master_server_handle = if ha_config.replication_port > 0 {
+            Some(sito_ha::spawn_master_server(
+                ha_config.clone(),
+                coordinator.clone(),
+                shutdown_rx.clone(),
+            ))
+        } else {
+            None
+        };
+
+        (Some(coordinator), None, None)
+    } else {
+        // Slave role
+        let tracker = sito_ha::SlaveStatusTracker::new(
+            config.server.instance_name.clone(),
+            0,
+            ha_config.master_url.clone(),
+        );
+
+        let slave_handles = sito_ha::SlaveAppHandles {
+            config: config_arc.clone(),
+            filter: filter_engine.clone(),
+            rewrites: rewrites_arc.clone(),
+            clients: clients_arc.clone(),
+            metrics: metrics.clone(),
+            config_path: Some(config_path.to_path_buf()),
+        };
+
+        let (resync_tx, resync_rx) = tokio::sync::mpsc::channel(4);
+
+        if ha_config.master_url.is_some() {
+            let _slave_worker_handle = sito_ha::spawn_slave_worker(
+                ha_config.clone(),
+                tracker.clone(),
+                slave_handles,
+                resync_rx,
+                shutdown_rx.clone(),
+            );
+        }
+
+        (None, Some(tracker), Some(resync_tx))
+    };
+
+    Ok(HaRuntime {
+        config: ha_config,
+        coordinator: master_coordinator,
+        tracker: slave_tracker,
+        resync_sender,
+    })
+}
+
+/// Long-lived runtime components created during startup.
+struct RuntimeComponents {
+    stats_db: StatsDb,
+    metrics: MetricsRegistry,
+    querylog_writer: QueryLogWriter,
+    querylog_sender: sito_stats::QueryLogSender,
+    bootstrap: BootstrapResolver,
+    upstream_manager: Arc<UpstreamManager>,
+    cache: Arc<DnsCache>,
+    filter_engine: Arc<HostsFilterEngine>,
+}
+
+/// Opens the stats database and initializes metrics, query logging, upstreams,
+/// cache and the filter engine together with their background tasks.
+async fn init_runtime_components(
+    config: &Config,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> anyhow::Result<RuntimeComponents> {
     // Ensure data directory exists
     tokio::fs::create_dir_all(&config.server.data_dir).await?;
 
@@ -66,12 +390,15 @@ pub async fn run_server_full(
     let stats_db = StatsDb::open(&db_path).await?;
 
     // Initialize Prometheus metrics registry with 18 metrics per Table 14.2
-    let metrics = MetricsRegistry::new(env!("CARGO_PKG_VERSION"), "git");
+    let metrics = MetricsRegistry::new(
+        env!("CARGO_PKG_VERSION"),
+        option_env!("SITO_BUILD_COMMIT").unwrap_or("unknown"),
+    );
 
     // Initialize QueryLogWriter (10k buffer per M5.1)
     let querylog_writer = QueryLogWriter::spawn_with_anonymize(
         stats_db.clone(),
-        10_000,
+        QUERYLOG_BUFFER,
         config.privacy.anonymize_querylog,
     );
     let querylog_sender = querylog_writer.sender();
@@ -83,7 +410,7 @@ pub async fn run_server_full(
         let metrics = metrics.clone();
         let mut drop_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            let mut interval = tokio::time::interval(QUERYLOG_METRICS_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
@@ -121,54 +448,318 @@ pub async fn run_server_full(
         .clone()
         .spawn_refresh_task(shutdown_rx.clone());
 
-    // Initialize DNSSEC validator
-    let dnssec = Arc::new(DnssecValidator::from_config(&config.dns.dnssec));
+    Ok(RuntimeComponents {
+        stats_db,
+        metrics,
+        querylog_writer,
+        querylog_sender,
+        bootstrap,
+        upstream_manager,
+        cache,
+        filter_engine,
+    })
+}
 
-    // Initialize client registry
-    let clients_config: sito_clients::ClientsConfig = config
-        .clients
-        .as_ref()
-        .and_then(|v| v.clone().try_into().ok())
-        .unwrap_or_default();
+/// Handles shared with [`run_config_watcher`].
+struct ConfigWatcher {
+    config_path: PathBuf,
+    runtime: Arc<sito_runtime::RuntimeState>,
+    rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
+    listener_manager: Arc<tokio::sync::Mutex<Option<DnsListenerManager>>>,
+    listener_acceptors: Arc<tokio::sync::Mutex<Option<ListenerAcceptors>>>,
+    pipeline: Arc<DnsPipeline>,
+    filter: Arc<HostsFilterEngine>,
+    coordinator: Option<sito_ha::MasterCoordinator>,
+    upstream: Arc<UpstreamManager>,
+    bootstrap: BootstrapResolver,
+    querylog: sito_stats::QueryLogSender,
+    cache: Arc<DnsCache>,
+    dnssec: Arc<ArcSwap<DnssecValidator>>,
+    scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>>,
+    shutdown_rx: watch::Receiver<bool>,
+}
 
-    // Build per-client upstream managers for entries that opt out of the globals.
-    let scoped_upstreams: Arc<HashMap<String, Arc<UpstreamManager>>> = {
-        let mut scoped: HashMap<String, Arc<UpstreamManager>> = HashMap::new();
-        for entry in &clients_config.entries {
-            if entry.use_global_upstreams {
-                continue;
-            }
-            let Some(ref servers) = entry.upstreams else {
-                continue;
-            };
-            if servers.is_empty() {
-                continue;
-            }
-            let key = servers.join(",");
-            if scoped.contains_key(&key) {
-                continue;
-            }
-            let mut upstream_cfg = config.upstream.clone();
-            upstream_cfg.servers.clone_from(servers);
-            upstream_cfg.per_domain.clear();
-            match UpstreamManager::from_config(&upstream_cfg, &bootstrap).await {
-                Ok(manager) => {
-                    info!(
-                        client = %entry.name,
-                        servers = ?servers,
-                        "Initialized per-client upstream scope"
-                    );
-                    scoped.insert(key, Arc::new(manager));
+/// Watches the configuration file and applies hot reloads in-process. Returns
+/// when shutdown is signalled, when the watcher cannot be initialized, or when
+/// the watched directory disappears.
+async fn run_config_watcher(watcher: ConfigWatcher) {
+    let ConfigWatcher {
+        config_path: watcher_config_path,
+        runtime: watcher_runtime,
+        rate_limiters: watcher_rate_limiters,
+        listener_manager: watcher_listener_manager,
+        listener_acceptors: watcher_listener_acceptors,
+        pipeline: watcher_pipeline,
+        filter: watcher_filter,
+        coordinator: watcher_coordinator,
+        upstream: watcher_upstream,
+        bootstrap: watcher_bootstrap,
+        querylog: watcher_querylog,
+        cache: watcher_cache,
+        dnssec: watcher_dnssec,
+        scoped_upstreams: watcher_scoped_upstreams,
+        shutdown_rx: mut watcher_shutdown_rx,
+    } = watcher;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let event_filter_path = watcher_config_path.clone();
+    let mut watcher = match notify::recommended_watcher(move |res: Result<Event, _>| {
+        if let Ok(event) = res
+            && (event.kind.is_modify() || event.kind.is_create())
+            && event.paths.iter().any(|path| {
+                path == &event_filter_path || path.file_name() == event_filter_path.file_name()
+            })
+        {
+            let _ = tx.send(());
+        }
+    }) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("Failed to initialize config file watcher: {e}");
+            return;
+        }
+    };
+
+    // Watch the parent directory so a config file created after startup
+    // (first-run wizard) is also picked up.
+    let watch_target = watcher_config_path
+        .parent()
+        .map_or_else(|| watcher_config_path.clone(), std::path::Path::to_path_buf);
+    if let Err(e) = watcher.watch(&watch_target, RecursiveMode::NonRecursive) {
+        warn!(
+            "Failed to watch config directory {}: {e}",
+            watch_target.display()
+        );
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            _ = watcher_shutdown_rx.changed() => {
+                if *watcher_shutdown_rx.borrow() {
+                    break;
                 }
-                Err(e) => warn!(
-                    client = %entry.name,
-                    error = %e,
-                    "Failed to initialize per-client upstreams; this client falls back to global upstreams"
-                ),
+            }
+            Some(()) = rx.recv() => {
+                // Debounce brief bursts of file writes
+                tokio::time::sleep(WATCHER_DEBOUNCE).await;
+                while rx.try_recv().is_ok() {}
+
+                match tokio::fs::read_to_string(&watcher_config_path).await {
+                    Ok(content) => match Config::from_toml_str(&content) {
+                        Ok(new_cfg) => {
+                            if let Err(e) = validate_typed_sections(&new_cfg) {
+                                error!(
+                                    error = %e,
+                                    "Rejecting config hot-reload: invalid configuration section"
+                                );
+                                continue;
+                            }
+                            info!("Detected configuration file change, hot-reloading");
+                            if crate::logging::reload_level(&new_cfg.server.log_level) {
+                                info!(
+                                    level = %new_cfg.server.log_level,
+                                    "Applied hot-reloaded log level"
+                                );
+                            }
+                            if let Err(e) =
+                                watcher_filter.reload_with_config(&new_cfg.filtering).await
+                            {
+                                error!(error = %e, "Failed to hot-reload filter configuration");
+                            }
+                            let new_rewrites_cfg = match rewrites_from_config(&new_cfg) {
+                                Ok(cfg) => cfg,
+                                Err(e) => {
+                                    error!(error = %e, "Rejecting config hot-reload");
+                                    continue;
+                                }
+                            };
+                            let new_rewrites =
+                                sito_rewrites::RewriteTable::new(new_rewrites_cfg);
+
+                            let new_clients_cfg = match clients_from_config(&new_cfg) {
+                                Ok(cfg) => cfg,
+                                Err(e) => {
+                                    error!(error = %e, "Rejecting config hot-reload");
+                                    continue;
+                                }
+                            };
+                            let new_clients =
+                                sito_clients::ClientRegistry::new(new_clients_cfg.clone());
+
+                            // DNSSEC settings are not read through the config
+                            // snapshot at query time; swap the validator so
+                            // mode/anchors/NTAs apply immediately.
+                            watcher_dnssec.store(Arc::new(DnssecValidator::from_config(
+                                &new_cfg.dns.dnssec,
+                            )));
+
+                            // Rebuild per-client upstream scopes, reusing
+                            // managers whose upstream set is unchanged.
+                            let rebuilt_scoped = {
+                                let existing = watcher_scoped_upstreams.load_full();
+                                build_scoped_upstreams(
+                                    &new_cfg,
+                                    &watcher_bootstrap,
+                                    &new_clients_cfg,
+                                    &existing,
+                                )
+                                .await
+                            };
+                            watcher_scoped_upstreams.store(Arc::new(rebuilt_scoped));
+
+                            if let Err(e) = watcher_upstream
+                                .reload(&new_cfg.upstream, &watcher_bootstrap)
+                                .await
+                            {
+                                warn!("Failed to hot-reload upstream configuration: {e}");
+                            }
+                            watcher_querylog
+                                .set_anonymize(new_cfg.privacy.anonymize_querylog);
+                            watcher_cache.update_config(new_cfg.dns.cache.clone()).await;
+                            if let Ok(limiters) = watcher_rate_limiters.lock() {
+                                for limiter in limiters.iter() {
+                                    limiter.set_rate(new_cfg.dns.rate_limit_per_ip);
+                                }
+                            }
+
+                            // Publish config, clients and rewrites together so a
+                            // query cannot observe a half-applied reload.
+                            watcher_runtime.replace(sito_runtime::RuntimeSnapshot {
+                                config: Arc::new(new_cfg.clone()),
+                                clients: Arc::new(new_clients),
+                                rewrites: Arc::new(new_rewrites),
+                            });
+
+                            // Rebind listeners when bind/port/related settings change.
+                            let current_manager =
+                                watcher_listener_manager.lock().await.take();
+                            if let Some(manager) = current_manager {
+                                if manager.needs_restart(&new_cfg) {
+                                    let acceptors =
+                                        watcher_listener_acceptors.lock().await.clone();
+                                    if let Some(acceptors) = acceptors {
+                                        info!("DNS listener bindings changed; rebinding in-process");
+                                        match manager
+                                            .restart(
+                                                &new_cfg,
+                                                watcher_pipeline.clone(),
+                                                acceptors,
+                                                watcher_rate_limiters.clone(),
+                                            )
+                                            .await
+                                        {
+                                            Ok(new_manager) => {
+                                                *watcher_listener_manager.lock().await =
+                                                    Some(new_manager);
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to rebind DNS listeners: {e}");
+                                            }
+                                        }
+                                    } else {
+                                        warn!(
+                                            "Listener TLS acceptors unavailable; keeping current listeners"
+                                        );
+                                        *watcher_listener_manager.lock().await =
+                                            Some(manager);
+                                    }
+                                } else {
+                                    *watcher_listener_manager.lock().await = Some(manager);
+                                }
+                            }
+
+                            if let Some(ref coord) = watcher_coordinator {
+                                let next_version = coord.get_current_version() + 1;
+                                let sanitized_toml = sito_ha::sanitize_config_for_bundle(&content).unwrap_or_default();
+                                let list_metadata = new_cfg.filtering.lists.iter().map(|l| sito_ha::FilterListMetadata {
+                                    name: l.name.clone(),
+                                    url: l.url.clone(),
+                                    enabled: l.enabled,
+                                    refresh_hours: l.refresh_hours,
+                                }).collect();
+
+                                #[allow(clippy::cast_sign_loss)]
+                                let new_bundle = sito_ha::ConfigBundle {
+                                    version: next_version,
+                                    timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                                    config_toml: sanitized_toml,
+                                    custom_rules: new_cfg.filtering.custom_rules.clone(),
+                                    rewrites: new_cfg.rewrites.clone(),
+                                    clients: new_cfg.clients.clone(),
+                                    lists: list_metadata,
+                                };
+
+                                if let Err(e) = coord.update_bundle(new_bundle) {
+                                    warn!("Failed to broadcast updated bundle to slaves: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Ignoring invalid hot-reloaded configuration: {e}");
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to read modified configuration file: {e}");
+                    }
+                }
             }
         }
-        Arc::new(scoped)
-    };
+    }
+}
+
+/// Runs the complete sito DNS server with graceful shutdown handling.
+pub async fn run_server(config: Config) -> anyhow::Result<()> {
+    let config_path = config.server.data_dir.join("config.toml");
+    run_server_full(config, config_path, None, false).await
+}
+
+/// Runs the DNS server with an optional custom shutdown receiver (useful for testing).
+pub async fn run_server_with_shutdown(
+    config: Config,
+    custom_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> anyhow::Result<()> {
+    let config_path = config.server.data_dir.join("config.toml");
+    run_server_full(config, config_path, custom_shutdown, false).await
+}
+
+/// Runs the DNS server with custom config path, shutdown receiver, and setup-pending mode.
+pub async fn run_server_full(
+    config: Config,
+    config_path: impl AsRef<Path>,
+    custom_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+    setup_pending: bool,
+) -> anyhow::Result<()> {
+    validate_typed_sections(&config)?;
+    // Canonicalize so the file watcher compares absolute event paths, and so
+    // the default relative `config.toml` still yields a watchable directory.
+    let config_path_buf = canonical_config_path(config_path.as_ref());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+
+    let components = init_runtime_components(&config, &shutdown_rx).await?;
+    let stats_db = components.stats_db;
+    let metrics = components.metrics;
+    let querylog_writer = components.querylog_writer;
+    let querylog_sender = components.querylog_sender;
+    let bootstrap = components.bootstrap;
+    let upstream_manager = components.upstream_manager;
+    let cache = components.cache;
+    let filter_engine = components.filter_engine;
+
+    // Initialize DNSSEC validator
+    let dnssec_swap = Arc::new(ArcSwap::from(Arc::new(DnssecValidator::from_config(
+        &config.dns.dnssec,
+    ))));
+
+    // Initialize client registry
+    let clients_config = clients_from_config(&config)?;
+
+    // Build per-client upstream managers for entries that opt out of the globals.
+    let scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>> =
+        Arc::new(ArcSwap::from(Arc::new(
+            build_scoped_upstreams(&config, &bootstrap, &clients_config, &HashMap::new()).await,
+        )));
 
     let client_registry = Arc::new(sito_clients::ClientRegistry::new(clients_config));
 
@@ -179,10 +770,11 @@ pub async fn run_server_full(
         parental_registry.clone(),
         service_registry.clone(),
     ));
-    if let Some(ref int_val) = config.integrations
-        && let Ok(integrations) = int_val.clone().try_into::<IntegrationsConfig>()
-        && let Some(lists_cfg) = integrations.lists
+    let integrations = integrations_from_config(&config)?;
+    if let Some(ref integrations) = integrations
+        && let Some(ref lists_cfg) = integrations.lists
     {
+        let lists_cfg = lists_cfg.clone();
         if let Err(e) = lists_cfg.validate() {
             warn!("Ignoring invalid [integrations.lists] configuration: {e}");
         } else if !lists_cfg.categories.is_empty() {
@@ -196,16 +788,11 @@ pub async fn run_server_full(
     }
 
     // Initialize local rewrites table
-    let rewrites_config: sito_rewrites::RewritesConfig = config
-        .rewrites
-        .as_ref()
-        .and_then(|v| v.clone().try_into().ok())
-        .unwrap_or_default();
+    let rewrites_config = rewrites_from_config(&config)?;
     let rewrite_table = Arc::new(sito_rewrites::RewriteTable::new(rewrites_config));
 
     // Initialize MikroTik RouterOS integration if configured
-    if let Some(ref int_val) = config.integrations
-        && let Ok(integrations) = int_val.clone().try_into::<IntegrationsConfig>()
+    if let Some(integrations) = integrations
         && let Some(mikrotik_cfg) = integrations.mikrotik
         && mikrotik_cfg.enabled
     {
@@ -233,7 +820,7 @@ pub async fn run_server_full(
             filter_engine.clone(),
             cache.clone(),
             upstream_manager.clone(),
-            dnssec,
+            dnssec_swap.load_full(),
             clients_arc.clone(),
             parental_registry,
             service_registry,
@@ -242,110 +829,28 @@ pub async fn run_server_full(
         )
         .with_runtime(runtime.clone())
         .with_runtime_lists(runtime_lists.clone())
-        .with_scoped_upstreams(scoped_upstreams)
+        .with_shared_dnssec(dnssec_swap.clone())
+        .with_shared_scoped_upstreams(scoped_upstreams.clone())
         .with_stats(querylog_sender.clone(), metrics.clone()),
     );
 
     // Initialize High Availability (HA) clustering subsystem per role
-    let ha_config: sito_ha::HaConfig = config
-        .ha
-        .as_ref()
-        .map(sito_ha::HaConfig::from_toml_value)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("Invalid HA configuration: {e}"))?
-        .unwrap_or_else(|| sito_ha::HaConfig {
-            replication_port: 0,
-            ..Default::default()
-        });
-
-    ha_config
-        .validate(&config.server.role)
-        .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
-
-    let (master_coordinator, slave_tracker, resync_sender) = if config.server.role == "master" {
-        // Load or create master Ed25519 signing key (0600 on Unix)
-        let signing_key_path = config.server.data_dir.join("ha_signing.key");
-        let signing_key = Arc::new(sito_ha::Ed25519SigningKey::load_or_create(
-            &signing_key_path,
-        )?);
-
-        let coordinator = sito_ha::MasterCoordinator::new(
-            config.server.instance_name.clone(),
-            1,
-            signing_key.clone(),
-            metrics.clone(),
-        );
-
-        let initial_toml = std::fs::read_to_string(&config_path_buf)
-            .unwrap_or_else(|_| toml::to_string_pretty(&config).unwrap_or_default());
-        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&initial_toml).unwrap_or_default();
-        let list_metadata = config
-            .filtering
-            .lists
-            .iter()
-            .map(|l| sito_ha::FilterListMetadata {
-                name: l.name.clone(),
-                url: l.url.clone(),
-                enabled: l.enabled,
-                refresh_hours: l.refresh_hours,
-            })
-            .collect();
-
-        #[allow(clippy::cast_sign_loss)]
-        let initial_bundle = sito_ha::ConfigBundle {
-            version: 1,
-            timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            config_toml: sanitized_toml,
-            custom_rules: config.filtering.custom_rules.clone(),
-            rewrites: config.rewrites.clone(),
-            clients: config.clients.clone(),
-            lists: list_metadata,
-        };
-        let _ = coordinator.update_bundle(initial_bundle);
-
-        // Spawn master replication listener if replication_port > 0
-        let _master_server_handle = if ha_config.replication_port > 0 {
-            Some(sito_ha::spawn_master_server(
-                ha_config.clone(),
-                coordinator.clone(),
-                shutdown_rx.clone(),
-            ))
-        } else {
-            None
-        };
-
-        (Some(coordinator), None, None)
-    } else {
-        // Slave role
-        let tracker = sito_ha::SlaveStatusTracker::new(
-            config.server.instance_name.clone(),
-            0,
-            ha_config.master_url.clone(),
-        );
-
-        let slave_handles = sito_ha::SlaveAppHandles {
-            config: config_arc.clone(),
-            filter: filter_engine.clone(),
-            rewrites: rewrites_arc.clone(),
-            clients: clients_arc.clone(),
-            metrics: metrics.clone(),
-            config_path: Some(config_path_buf.clone()),
-        };
-
-        let (resync_tx, resync_rx) = tokio::sync::mpsc::channel(4);
-
-        if ha_config.master_url.is_some() {
-            let _slave_worker_handle = sito_ha::spawn_slave_worker(
-                ha_config.clone(),
-                tracker.clone(),
-                slave_handles,
-                resync_rx,
-                shutdown_rx.clone(),
-            );
-        }
-
-        (None, Some(tracker), Some(resync_tx))
-    };
+    let ha_runtime = init_ha(
+        &config,
+        &config_path_buf,
+        &metrics,
+        &config_arc,
+        &filter_engine,
+        &rewrites_arc,
+        &clients_arc,
+        &shutdown_rx,
+    )?;
+    let _ha_config = ha_runtime.config;
+    let (master_coordinator, slave_tracker, resync_sender) = (
+        ha_runtime.coordinator,
+        ha_runtime.tracker,
+        ha_runtime.resync_sender,
+    );
 
     // Administrative REST API server
     let auth_cfg = config.get_auth_config();
@@ -398,9 +903,11 @@ pub async fn run_server_full(
     let web_cfg = config_arc.load().get_web_config();
     if web_cfg.enabled {
         let web_addr = SocketAddr::new(web_cfg.bind, web_cfg.port);
-        if !web_cfg.bind.is_loopback() && config_arc.load().get_tls_config().is_none() {
+        // DNS TLS does not terminate the admin UI: axum serves plain HTTP here
+        // regardless, so warn whenever the UI is reachable beyond loopback.
+        if !web_cfg.bind.is_loopback() {
             warn!(
-                "Web UI running over plain HTTP on {web_addr}; credentials transmitted in plaintext. Set up TLS or reverse proxy."
+                "Admin web UI listening on {web_addr} over plain HTTP; credentials and the setup token are transmitted in plaintext. Terminate TLS in front of it (reverse proxy) or bind to loopback."
             );
         }
         let listener = tokio::net::TcpListener::bind(web_addr).await.map_err(|e| {
@@ -429,7 +936,7 @@ pub async fn run_server_full(
     let retention_config = config_arc.clone();
     let mut retention_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_hours(24));
+        let mut interval = tokio::time::interval(RETENTION_INTERVAL);
         interval.tick().await;
         loop {
             tokio::select! {
@@ -459,191 +966,148 @@ pub async fn run_server_full(
         Arc::new(tokio::sync::Mutex::new(None));
 
     // Spawn config file watcher for hot-reload
-    let watcher_config_path = config_path_buf.clone();
-    let watcher_runtime = runtime.clone();
-    let watcher_rate_limiters = rate_limiters.clone();
-    let watcher_listener_manager = listener_manager.clone();
-    let watcher_listener_acceptors = listener_acceptors.clone();
-    let watcher_pipeline = pipeline.clone();
-    let watcher_filter = filter_engine.clone();
-    let watcher_coordinator = master_coordinator.clone();
-    let watcher_upstream = upstream_manager.clone();
-    let watcher_bootstrap = bootstrap.clone();
-    let watcher_querylog = querylog_sender.clone();
-    let watcher_cache = cache.clone();
-    let mut watcher_shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(run_config_watcher(ConfigWatcher {
+        config_path: config_path_buf.clone(),
+        runtime: runtime.clone(),
+        rate_limiters: rate_limiters.clone(),
+        listener_manager: listener_manager.clone(),
+        listener_acceptors: listener_acceptors.clone(),
+        pipeline: pipeline.clone(),
+        filter: filter_engine.clone(),
+        coordinator: master_coordinator.clone(),
+        upstream: upstream_manager.clone(),
+        bootstrap: bootstrap.clone(),
+        querylog: querylog_sender.clone(),
+        cache: cache.clone(),
+        dnssec: dnssec_swap.clone(),
+        scoped_upstreams: scoped_upstreams.clone(),
+        shutdown_rx: shutdown_rx.clone(),
+    }));
 
-    tokio::spawn(async move {
-        use notify::{Event, RecursiveMode, Watcher};
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let event_filter_path = watcher_config_path.clone();
-        let mut watcher = match notify::recommended_watcher(move |res: Result<Event, _>| {
-            if let Ok(event) = res
-                && (event.kind.is_modify() || event.kind.is_create())
-                && event.paths.contains(&event_filter_path)
-            {
-                let _ = tx.send(());
-            }
-        }) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!("Failed to initialize config file watcher: {e}");
-                return;
-            }
-        };
+    let cert_watchers = init_tls_and_acme(&config, &shutdown_rx, &listener_acceptors).await?;
 
-        // Watch the parent directory so a config file created after startup
-        // (first-run wizard) is also picked up.
-        let watch_target = watcher_config_path
-            .parent()
-            .map_or_else(|| watcher_config_path.clone(), std::path::Path::to_path_buf);
-        if let Err(e) = watcher.watch(&watch_target, RecursiveMode::NonRecursive) {
+    if setup_pending {
+        info!(
+            "Server running in setup-pending mode: DNS listeners (ports 53/853/443) are not bound until setup completes via web panel"
+        );
+        tokio::select! {
+            res = wait_for_shutdown_signal(custom_shutdown) => {
+                res?;
+            }
+            Some(()) = dns_start_rx.recv() => {
+                info!("Setup wizard completed: binding and starting DNS listeners in-process...");
+                let current_cfg = config_arc.load();
+                let acceptors = listener_acceptors
+                    .lock()
+                    .await
+                    .clone()
+                    .unwrap_or(ListenerAcceptors {
+                        dot: None,
+                        doh: None,
+                        doq: None,
+                        doh3: None,
+                    });
+                let manager = DnsListenerManager::start(
+                    &current_cfg,
+                    pipeline.clone(),
+                    acceptors,
+                    rate_limiters.clone(),
+                )
+                .await?;
+                *listener_manager.lock().await = Some(manager);
+
+                info!(
+                    port = current_cfg.dns.port,
+                    bind = ?current_cfg.dns.bind,
+                    "sito DNS server successfully initialized and listening"
+                );
+
+                wait_for_shutdown_signal(None).await?;
+            }
+        }
+    } else {
+        let acceptors = listener_acceptors
+            .lock()
+            .await
+            .clone()
+            .unwrap_or(ListenerAcceptors {
+                dot: None,
+                doh: None,
+                doq: None,
+                doh3: None,
+            });
+        let manager =
+            DnsListenerManager::start(&config, pipeline.clone(), acceptors, rate_limiters.clone())
+                .await?;
+        *listener_manager.lock().await = Some(manager);
+
+        info!(
+            port = config.dns.port,
+            bind = ?config.dns.bind,
+            "sito DNS server successfully initialized and listening"
+        );
+
+        // Wait for termination signal
+        wait_for_shutdown_signal(custom_shutdown).await?;
+    }
+
+    shutdown_server(
+        &shutdown_tx,
+        &listener_manager,
+        &in_flight,
+        querylog_writer,
+        cert_watchers,
+    )
+    .await;
+    Ok(())
+}
+
+/// Stops listeners, drains in-flight queries within the shutdown budget,
+/// flushes the query log and releases the certificate watchers.
+async fn shutdown_server(
+    shutdown_tx: &watch::Sender<bool>,
+    listener_manager: &tokio::sync::Mutex<Option<DnsListenerManager>>,
+    in_flight: &AtomicUsize,
+    querylog_writer: QueryLogWriter,
+    cert_watchers: Vec<sito_transport::CertWatcher>,
+) {
+    info!("Initiating graceful shutdown (stopping listeners)...");
+    let _ = shutdown_tx.send(true);
+    let current_manager = listener_manager.lock().await.take();
+    if let Some(manager) = current_manager {
+        manager.stop().await;
+    }
+
+    // Wait for in-flight queries to finish (5 s timeout per plan section 3.5)
+    let shutdown_deadline = std::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    while in_flight.load(Ordering::SeqCst) > 0 {
+        if std::time::Instant::now() >= shutdown_deadline {
             warn!(
-                "Failed to watch config directory {}: {e}",
-                watch_target.display()
+                remaining = in_flight.load(Ordering::SeqCst),
+                "Graceful shutdown timeout reached; draining remaining queries"
             );
-            return;
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
-        loop {
-            tokio::select! {
-                _ = watcher_shutdown_rx.changed() => {
-                    if *watcher_shutdown_rx.borrow() {
-                        break;
-                    }
-                }
-                Some(()) = rx.recv() => {
-                    // Debounce brief bursts of file writes
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    while rx.try_recv().is_ok() {}
+    info!("Flushing and shutting down query log writer...");
+    querylog_writer.shutdown().await;
 
-                    match tokio::fs::read_to_string(&watcher_config_path).await {
-                        Ok(content) => match Config::from_toml_str(&content) {
-                            Ok(new_cfg) => {
-                                info!("Detected configuration file change, hot-reloading");
-                                if crate::logging::reload_level(&new_cfg.server.log_level) {
-                                    info!(
-                                        level = %new_cfg.server.log_level,
-                                        "Applied hot-reloaded log level"
-                                    );
-                                }
-                                let _ = watcher_filter.reload_with_config(&new_cfg.filtering).await;
-                                let new_rewrites_cfg: sito_rewrites::RewritesConfig = new_cfg
-                                    .rewrites
-                                    .as_ref()
-                                    .and_then(|v| v.clone().try_into().ok())
-                                    .unwrap_or_default();
-                                let new_rewrites =
-                                    sito_rewrites::RewriteTable::new(new_rewrites_cfg);
+    // Stop certificate watchers after listeners have drained.
+    drop(cert_watchers);
 
-                                let new_clients_cfg: sito_clients::ClientsConfig = new_cfg
-                                    .clients
-                                    .as_ref()
-                                    .and_then(|v| v.clone().try_into().ok())
-                                    .unwrap_or_default();
-                                let new_clients =
-                                    sito_clients::ClientRegistry::new(new_clients_cfg);
+    info!("Graceful shutdown complete, exiting");
+}
 
-                                if let Err(e) = watcher_upstream
-                                    .reload(&new_cfg.upstream, &watcher_bootstrap)
-                                    .await
-                                {
-                                    warn!("Failed to hot-reload upstream configuration: {e}");
-                                }
-                                watcher_querylog
-                                    .set_anonymize(new_cfg.privacy.anonymize_querylog);
-                                watcher_cache.update_config(new_cfg.dns.cache.clone()).await;
-                                if let Ok(limiters) = watcher_rate_limiters.lock() {
-                                    for limiter in limiters.iter() {
-                                        limiter.set_rate(new_cfg.dns.rate_limit_per_ip);
-                                    }
-                                }
-
-                                // Publish config, clients and rewrites together so a
-                                // query cannot observe a half-applied reload.
-                                watcher_runtime.replace(sito_runtime::RuntimeSnapshot {
-                                    config: Arc::new(new_cfg.clone()),
-                                    clients: Arc::new(new_clients),
-                                    rewrites: Arc::new(new_rewrites),
-                                });
-
-                                // Rebind listeners when bind/port/related settings change.
-                                let current_manager =
-                                    watcher_listener_manager.lock().await.take();
-                                if let Some(manager) = current_manager {
-                                    if manager.needs_restart(&new_cfg) {
-                                        let acceptors =
-                                            watcher_listener_acceptors.lock().await.clone();
-                                        if let Some(acceptors) = acceptors {
-                                            info!("DNS listener bindings changed; rebinding in-process");
-                                            match manager
-                                                .restart(
-                                                    &new_cfg,
-                                                    watcher_pipeline.clone(),
-                                                    acceptors,
-                                                    watcher_rate_limiters.clone(),
-                                                )
-                                                .await
-                                            {
-                                                Ok(new_manager) => {
-                                                    *watcher_listener_manager.lock().await =
-                                                        Some(new_manager);
-                                                }
-                                                Err(e) => {
-                                                    error!("Failed to rebind DNS listeners: {e}");
-                                                }
-                                            }
-                                        } else {
-                                            warn!(
-                                                "Listener TLS acceptors unavailable; keeping current listeners"
-                                            );
-                                            *watcher_listener_manager.lock().await =
-                                                Some(manager);
-                                        }
-                                    } else {
-                                        *watcher_listener_manager.lock().await = Some(manager);
-                                    }
-                                }
-
-                                if let Some(ref coord) = watcher_coordinator {
-                                    let next_version = coord.get_current_version() + 1;
-                                    let sanitized_toml = sito_ha::sanitize_config_for_bundle(&content).unwrap_or_default();
-                                    let list_metadata = new_cfg.filtering.lists.iter().map(|l| sito_ha::FilterListMetadata {
-                                        name: l.name.clone(),
-                                        url: l.url.clone(),
-                                        enabled: l.enabled,
-                                        refresh_hours: l.refresh_hours,
-                                    }).collect();
-
-                                    #[allow(clippy::cast_sign_loss)]
-                                    let new_bundle = sito_ha::ConfigBundle {
-                                        version: next_version,
-                                        timestamp: chrono::Utc::now().timestamp_millis() as u64,
-                                        config_toml: sanitized_toml,
-                                        custom_rules: new_cfg.filtering.custom_rules.clone(),
-                                        rewrites: new_cfg.rewrites.clone(),
-                                        clients: new_cfg.clients.clone(),
-                                        lists: list_metadata,
-                                    };
-
-                                    if let Err(e) = coord.update_bundle(new_bundle) {
-                                        warn!("Failed to broadcast updated bundle to slaves: {e}");
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Ignoring invalid hot-reloaded configuration: {e}");
-                            }
-                        },
-                        Err(e) => {
-                            warn!("Failed to read modified configuration file: {e}");
-                        }
-                    }
-                }
-            }
-        }
-    });
-
+/// Loads certificates and ACME configuration, builds the per-protocol TLS
+/// acceptors, publishes them for in-process listener rebinds, starts the ACME
+/// renewal manager and returns the certificate watchers that must stay alive.
+async fn init_tls_and_acme(
+    config: &Config,
+    shutdown_rx: &watch::Receiver<bool>,
+    listener_acceptors: &tokio::sync::Mutex<Option<ListenerAcceptors>>,
+) -> anyhow::Result<Vec<sito_transport::CertWatcher>> {
     // ACME and TLS setup
     let acme_cfg = config.get_acme_config();
     let is_acme_enabled = acme_cfg
@@ -704,98 +1168,60 @@ pub async fn run_server_full(
 
     let (dot_acceptor_mgr, doh_acceptor_mgr, doq_acceptor_mgr, doh3_acceptor_mgr) =
         if let (Some(cert), Some(key)) = (&effective_cert, &effective_key) {
-            let doh_alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()];
-            let doh_mgr = match load_server_config_with_challenges(
+            let doh_mgr = build_tls_acceptor(
+                "doh",
                 cert,
                 key,
                 &sni_tuples,
-                doh_alpn.clone(),
-                challenge_keys.clone(),
-            ) {
-                Ok(cfg) => {
-                    let mgr = TlsAcceptorManager::with_challenge_keys(cfg, challenge_keys.clone());
-                    match CertWatcher::start(cert, key, &sni_tuples, &doh_alpn, mgr.clone()) {
-                        Ok(watcher) => cert_watchers.push(watcher),
-                        Err(e) => warn!("Certificate watcher failed to start: {e}"),
-                    }
-                    Some(mgr)
-                }
-                Err(e) => {
-                    warn!("Failed to initialize DoH TLS configuration: {e}");
-                    None
-                }
-            };
-
-            let dot_alpn = vec![b"dot".to_vec()];
-            let dot_mgr = match load_server_config(cert, key, &sni_tuples, dot_alpn.clone()) {
-                Ok(cfg) => {
-                    let mgr = TlsAcceptorManager::new(cfg);
-                    match CertWatcher::start(cert, key, &sni_tuples, &dot_alpn, mgr.clone()) {
-                        Ok(watcher) => cert_watchers.push(watcher),
-                        Err(e) => warn!("Certificate watcher failed to start: {e}"),
-                    }
-                    Some(mgr)
-                }
-                Err(e) => {
-                    warn!("Failed to initialize DoT TLS configuration: {e}");
-                    None
-                }
-            };
-
-            let doq_alpn = vec![b"doq".to_vec()];
-            let doq_mgr = match load_server_config(cert, key, &sni_tuples, doq_alpn.clone()) {
-                Ok(cfg) => {
-                    let mgr = TlsAcceptorManager::new(cfg);
-                    match CertWatcher::start(cert, key, &sni_tuples, &doq_alpn, mgr.clone()) {
-                        Ok(watcher) => cert_watchers.push(watcher),
-                        Err(e) => warn!("Certificate watcher failed to start: {e}"),
-                    }
-                    Some(mgr)
-                }
-                Err(e) => {
-                    warn!("Failed to initialize DoQ TLS configuration: {e}");
-                    None
-                }
-            };
-
-            let doh3_alpn = vec![b"h3".to_vec()];
-            let doh3_mgr = match load_server_config(cert, key, &sni_tuples, doh3_alpn.clone()) {
-                Ok(cfg) => {
-                    let mgr = TlsAcceptorManager::new(cfg);
-                    match CertWatcher::start(cert, key, &sni_tuples, &doh3_alpn, mgr.clone()) {
-                        Ok(watcher) => cert_watchers.push(watcher),
-                        Err(e) => warn!("Certificate watcher failed to start: {e}"),
-                    }
-                    Some(mgr)
-                }
-                Err(e) => {
-                    warn!("Failed to initialize DoH3 TLS configuration: {e}");
-                    None
-                }
-            };
-
+                &[b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()],
+                Some(challenge_keys.clone()),
+                &mut cert_watchers,
+            );
+            let dot_mgr = build_tls_acceptor(
+                "dot",
+                cert,
+                key,
+                &sni_tuples,
+                &[b"dot".to_vec()],
+                None,
+                &mut cert_watchers,
+            );
+            let doq_mgr = build_tls_acceptor(
+                "doq",
+                cert,
+                key,
+                &sni_tuples,
+                &[b"doq".to_vec()],
+                None,
+                &mut cert_watchers,
+            );
+            let doh3_mgr = build_tls_acceptor(
+                "doh3",
+                cert,
+                key,
+                &sni_tuples,
+                &[b"h3".to_vec()],
+                None,
+                &mut cert_watchers,
+            );
             (dot_mgr, doh_mgr, doq_mgr, doh3_mgr)
         } else {
             (None, None, None, None)
         };
-
-    // Share TLS acceptors with the config watcher for in-process listener rebinds.
-    *listener_acceptors.lock().await = Some(ListenerAcceptors {
-        dot: dot_acceptor_mgr.clone(),
-        doh: doh_acceptor_mgr.clone(),
-        doq: doq_acceptor_mgr.clone(),
-        doh3: doh3_acceptor_mgr.clone(),
-    });
 
     // If ACME is enabled, start ACME renewal background manager
     if let Some(acme) = acme_cfg
         && acme.enabled
         && !acme.domains.is_empty()
     {
-        let email = acme
-            .email
-            .clone()
-            .unwrap_or_else(|| "admin@example.com".to_string());
+        let email = if let Some(email) = acme.email.clone() {
+            email
+        } else {
+            warn!(
+                "[acme] enabled without an account email; using admin@example.com. Set acme.email to receive expiry notices."
+            );
+            "admin@example.com".to_string()
+        };
         let storage_dir = acme
             .cache_dir
             .clone()
@@ -840,93 +1266,15 @@ pub async fn run_server_full(
         );
     }
 
-    if setup_pending {
-        info!(
-            "Server running in setup-pending mode: DNS listeners (ports 53/853/443) are not bound until setup completes via web panel"
-        );
-        tokio::select! {
-            res = wait_for_shutdown_signal(custom_shutdown) => {
-                res?;
-            }
-            Some(()) = dns_start_rx.recv() => {
-                info!("Setup wizard completed: binding and starting DNS listeners in-process...");
-                let current_cfg = config_arc.load();
-                let manager = DnsListenerManager::start(
-                    &current_cfg,
-                    pipeline.clone(),
-                    ListenerAcceptors {
-                        dot: dot_acceptor_mgr.clone(),
-                        doh: doh_acceptor_mgr.clone(),
-                        doq: doq_acceptor_mgr.clone(),
-                        doh3: doh3_acceptor_mgr.clone(),
-                    },
-                    rate_limiters.clone(),
-                )
-                .await?;
-                *listener_manager.lock().await = Some(manager);
+    // Share TLS acceptors with the config watcher for in-process listener rebinds.
+    *listener_acceptors.lock().await = Some(ListenerAcceptors {
+        dot: dot_acceptor_mgr,
+        doh: doh_acceptor_mgr,
+        doq: doq_acceptor_mgr,
+        doh3: doh3_acceptor_mgr,
+    });
 
-                info!(
-                    port = current_cfg.dns.port,
-                    bind = ?current_cfg.dns.bind,
-                    "sito DNS server successfully initialized and listening"
-                );
-
-                wait_for_shutdown_signal(None).await?;
-            }
-        }
-    } else {
-        let manager = DnsListenerManager::start(
-            &config,
-            pipeline.clone(),
-            ListenerAcceptors {
-                dot: dot_acceptor_mgr.clone(),
-                doh: doh_acceptor_mgr.clone(),
-                doq: doq_acceptor_mgr.clone(),
-                doh3: doh3_acceptor_mgr.clone(),
-            },
-            rate_limiters.clone(),
-        )
-        .await?;
-        *listener_manager.lock().await = Some(manager);
-
-        info!(
-            port = config.dns.port,
-            bind = ?config.dns.bind,
-            "sito DNS server successfully initialized and listening"
-        );
-
-        // Wait for termination signal
-        wait_for_shutdown_signal(custom_shutdown).await?;
-    }
-
-    info!("Initiating graceful shutdown (stopping listeners)...");
-    let _ = shutdown_tx.send(true);
-    let current_manager = listener_manager.lock().await.take();
-    if let Some(manager) = current_manager {
-        manager.stop().await;
-    }
-
-    // Wait for in-flight queries to finish (5 s timeout per plan section 3.5)
-    let shutdown_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while in_flight.load(Ordering::SeqCst) > 0 {
-        if std::time::Instant::now() >= shutdown_deadline {
-            warn!(
-                remaining = in_flight.load(Ordering::SeqCst),
-                "Graceful shutdown timeout reached; draining remaining queries"
-            );
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    info!("Flushing and shutting down query log writer...");
-    querylog_writer.shutdown().await;
-
-    // Stop certificate watchers after listeners have drained.
-    drop(cert_watchers);
-
-    info!("Graceful shutdown complete, exiting");
-    Ok(())
+    Ok(cert_watchers)
 }
 
 /// Periodically refreshes `[integrations.lists]` categories through the
@@ -938,7 +1286,8 @@ pub(crate) async fn run_list_refresh(
     data_dir: PathBuf,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let fetcher = sito_filter::subscription::SubscriptionFetcher::default();
+    let fetcher =
+        sito_filter::subscription::SubscriptionFetcher::default().with_file_root(data_dir.clone());
     let default_hours = config.refresh_hours.max(1);
     let mut entries: Vec<(String, String, Duration, tokio::time::Instant)> = config
         .categories
@@ -1340,4 +1689,42 @@ async fn wait_for_shutdown_signal(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_config_path;
+    use std::path::Path;
+
+    #[test]
+    fn test_canonical_config_path_for_relative_default() {
+        let resolved = canonical_config_path(Path::new("config.toml"));
+        assert!(
+            resolved.is_absolute(),
+            "relative paths must become absolute: {resolved:?}"
+        );
+        assert_eq!(
+            resolved.file_name(),
+            Some(std::ffi::OsStr::new("config.toml"))
+        );
+        assert!(
+            resolved.parent().is_some_and(|p| !p.as_os_str().is_empty()),
+            "the watcher needs a watchable parent directory"
+        );
+    }
+
+    #[test]
+    fn test_canonical_config_path_existing_file() {
+        let dir = std::env::temp_dir().join(format!("sito_cfg_path_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        std::fs::write(&file, "config_version = 1\n").unwrap();
+        let resolved = canonical_config_path(&file);
+        assert!(resolved.is_absolute());
+        assert_eq!(
+            resolved.file_name(),
+            Some(std::ffi::OsStr::new("config.toml"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
