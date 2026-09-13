@@ -860,6 +860,45 @@ mod tests {
         }
         assert!(rebound, "server did not rebind to the new DNS port");
 
+        // Point the config at an occupied UDP port: the rebind must fail and
+        // the previous listeners must be restored.
+        let blocker = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let blocked_port = blocker.local_addr().unwrap().port();
+        config.dns.port = blocked_port;
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&config).expect("serialize config"),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            query_port(second_port).await,
+            "previous listeners must be restored after a failed rebind"
+        );
+
+        // A later valid change must still apply: a failed rebind must not
+        // permanently orphan the listener manager.
+        let third_port = reserve_udp_port();
+        config.dns.port = third_port;
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&config).expect("serialize config"),
+        )
+        .unwrap();
+        let mut rebound_again = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if query_port(third_port).await {
+                rebound_again = true;
+                break;
+            }
+        }
+        assert!(
+            rebound_again,
+            "a failed rebind must not permanently orphan the listener manager"
+        );
+        drop(blocker);
+
         let _ = shutdown_tx.send(());
         let result = tokio::time::timeout(Duration::from_secs(8), server_task).await;
         assert!(result.is_ok(), "server failed to shut down after rebind");

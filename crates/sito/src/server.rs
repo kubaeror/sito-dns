@@ -623,15 +623,18 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
                             });
 
                             // Rebind listeners when bind/port/related settings change.
-                            let current_manager =
-                                watcher_listener_manager.lock().await.take();
-                            if let Some(manager) = current_manager {
-                                if manager.needs_restart(&new_cfg) {
+                            // The manager stays in the slot across failures so a
+                            // later event can retry instead of orphaning the server.
+                            {
+                                let mut slot = watcher_listener_manager.lock().await;
+                                if let Some(manager) = slot.as_mut()
+                                    && manager.needs_restart(&new_cfg)
+                                {
                                     let acceptors =
                                         watcher_listener_acceptors.lock().await.clone();
                                     if let Some(acceptors) = acceptors {
                                         info!("DNS listener bindings changed; rebinding in-process");
-                                        match manager
+                                        if let Err(e) = manager
                                             .restart(
                                                 &new_cfg,
                                                 watcher_pipeline.clone(),
@@ -640,23 +643,13 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
                                             )
                                             .await
                                         {
-                                            Ok(new_manager) => {
-                                                *watcher_listener_manager.lock().await =
-                                                    Some(new_manager);
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to rebind DNS listeners: {e}");
-                                            }
+                                            error!("Failed to rebind DNS listeners: {e}");
                                         }
                                     } else {
                                         warn!(
                                             "Listener TLS acceptors unavailable; keeping current listeners"
                                         );
-                                        *watcher_listener_manager.lock().await =
-                                            Some(manager);
                                     }
-                                } else {
-                                    *watcher_listener_manager.lock().await = Some(manager);
                                 }
                             }
 
@@ -1065,7 +1058,7 @@ async fn shutdown_server(
     info!("Initiating graceful shutdown (stopping listeners)...");
     let _ = shutdown_tx.send(true);
     let current_manager = listener_manager.lock().await.take();
-    if let Some(manager) = current_manager {
+    if let Some(mut manager) = current_manager {
         manager.stop().await;
     }
 
@@ -1449,7 +1442,7 @@ impl DnsListenerManager {
         self.plan != ListenerPlan::from_config(config)
     }
 
-    async fn stop(mut self) {
+    async fn stop(&mut self) {
         let _ = self.shutdown_tx.send(true);
         if let Ok(mut registry) = self.rate_limiters.lock() {
             registry.clear();
@@ -1461,13 +1454,17 @@ impl DnsListenerManager {
 
     /// Stops the current listeners and binds a new generation. If the new
     /// bindings cannot be established, the previous configuration is restored.
+    ///
+    /// The manager is never consumed: even when the new bind *and* the revert
+    /// fail, an empty manager stays in the slot so a later config event can
+    /// attempt a rebind instead of leaving the server permanently orphaned.
     async fn restart(
-        self,
+        &mut self,
         config: &Config,
         pipeline: Arc<DnsPipeline>,
         acceptors: ListenerAcceptors,
         rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<()> {
         let previous = self.config.clone();
         self.stop().await;
 
@@ -1479,14 +1476,25 @@ impl DnsListenerManager {
         )
         .await
         {
-            Ok(manager) => Ok(manager),
+            Ok(manager) => {
+                *self = manager;
+                Ok(())
+            }
             Err(e) => {
                 warn!(
                     "Failed to bind new DNS listener configuration ({e}); restoring previous bindings"
                 );
-                Self::start(&previous, pipeline, acceptors, rate_limiters)
-                    .await
-                    .map_err(|revert| anyhow::anyhow!("{e}; revert failed: {revert}"))
+                match Self::start(&previous, pipeline, acceptors, rate_limiters).await {
+                    Ok(reverted) => {
+                        *self = reverted;
+                        Err(e)
+                    }
+                    Err(revert) => {
+                        self.config = previous;
+                        self.plan = ListenerPlan::from_config(&self.config);
+                        Err(anyhow::anyhow!("{e}; revert failed: {revert}"))
+                    }
+                }
             }
         }
     }
