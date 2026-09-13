@@ -9,6 +9,12 @@ use data_encoding::BASE32_DNSSEC;
 use hickory_proto::dnssec::rdata::NSEC3;
 use hickory_proto::rr::{Name, RecordType};
 
+/// Maximum NSEC3 iteration count accepted for validation (RFC 9276).
+///
+/// Records exceeding this bound are ignored, which makes the proof
+/// incomplete rather than secure.
+pub const MAX_ITERATIONS: u16 = 150;
+
 /// An NSEC3 record together with the owner name carrying its hashed label.
 #[derive(Debug, Clone, Copy)]
 pub struct Nsec3Record<'a> {
@@ -92,6 +98,9 @@ pub fn evaluate_nsec3_denial(
     let relevant: Vec<Nsec3Record<'_>> = records
         .iter()
         .filter(|record| record.owner.base_name().zone_of(qname))
+        // RFC 9276: iterations above the cap are not accepted; ignoring them
+        // yields an incomplete (never secure) proof.
+        .filter(|record| record.rdata.iterations() <= MAX_ITERATIONS)
         .copied()
         .collect();
     if relevant.is_empty() {
@@ -195,7 +204,6 @@ mod tests {
 
     fn nssec3_optout_fixture() -> (Name, Name, NSEC3) {
         let qname = Name::from_ascii("missing.example.").unwrap();
-        let zone = Name::from_ascii("example.").unwrap();
         let missing_hash = Nsec3HashAlgorithm::SHA1
             .hash(&[], &qname, 0)
             .unwrap()
@@ -285,5 +293,46 @@ mod tests {
             evaluate_nsec3_denial(&[], &qname, RecordType::A, true),
             Nsec3Denial::Incomplete
         );
+    }
+
+    #[test]
+    fn test_iterations_over_cap_is_incomplete() {
+        let zone = Name::from_ascii("example.").unwrap();
+        let qname = Name::from_ascii("missing.example.").unwrap();
+
+        for (iterations, expected) in [
+            (MAX_ITERATIONS, Nsec3Denial::OptOut),
+            (MAX_ITERATIONS + 1, Nsec3Denial::Incomplete),
+        ] {
+            let encloser_hash = Nsec3HashAlgorithm::SHA1
+                .hash(&[], &zone, iterations)
+                .unwrap()
+                .as_ref()
+                .to_vec();
+            let qname_hash = Nsec3HashAlgorithm::SHA1
+                .hash(&[], &qname, iterations)
+                .unwrap()
+                .as_ref()
+                .to_vec();
+            let rdata = NSEC3::new(
+                Nsec3HashAlgorithm::SHA1,
+                true,
+                iterations,
+                Vec::new(),
+                increment(&qname_hash),
+                [RecordType::SOA, RecordType::RRSIG],
+            );
+            let label = BASE32_DNSSEC.encode(&encloser_hash);
+            let owner = Name::from_ascii(format!("{label}.{}", zone.to_ascii())).unwrap();
+            let records = [Nsec3Record {
+                owner: &owner,
+                rdata: &rdata,
+            }];
+            assert_eq!(
+                evaluate_nsec3_denial(&records, &qname, RecordType::A, true),
+                expected,
+                "iterations={iterations}"
+            );
+        }
     }
 }
