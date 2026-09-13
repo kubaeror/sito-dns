@@ -21,6 +21,11 @@ use sito_proto::{Message, decode_message, encode_message};
 /// Idle pooled connections older than this are discarded instead of reused.
 const POOL_IDLE_TTL: Duration = Duration::from_secs(30);
 
+/// Maximum number of simultaneously outstanding *new* DoT connections. Bounds
+/// outbound FD/TLS-handshake amplification when the upstream is slow or the
+/// query flood is large; pooled connections are reused without a permit.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
 struct PooledConnection {
     stream: TlsStream<TcpStream>,
     idle_since: Instant,
@@ -34,6 +39,7 @@ pub struct DotUpstream {
     pool_size: usize,
     connector: TlsConnector,
     pool: Mutex<Vec<PooledConnection>>,
+    connect_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl DotUpstream {
@@ -68,6 +74,7 @@ impl DotUpstream {
             pool_size: pool_size.max(1),
             connector,
             pool: Mutex::new(Vec::new()),
+            connect_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         })
     }
 
@@ -86,6 +93,7 @@ impl DotUpstream {
             pool_size: pool_size.max(1),
             connector: TlsConnector::from(Arc::new(client_config)),
             pool: Mutex::new(Vec::new()),
+            connect_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         }
     }
 
@@ -223,8 +231,25 @@ impl Upstream for DotUpstream {
             }
         }
 
+        // Bound newly opened connections; pooled reuse is not limited.
+        let permit = match timeout(
+            self.query_timeout,
+            Arc::clone(&self.connect_semaphore).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(UpstreamError::BadResponse(
+                    "DoT connection limiter closed".to_string(),
+                ));
+            }
+            Err(_) => return Err(UpstreamError::Timeout),
+        };
         let conn = self.connect_tls().await?;
-        self.query_on_connection(conn, msg, &encoded).await
+        let result = self.query_on_connection(conn, msg, &encoded).await;
+        drop(permit);
+        result
     }
 }
 

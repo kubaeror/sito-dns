@@ -1462,39 +1462,37 @@ async fn start_dns_listeners(
 )> {
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let mut handles = Vec::new();
-    let mut rate_limiters = Vec::new();
+
+    // One limiter per client IP shared by every listener (all bind addresses
+    // and protocols), so an attacker cannot multiply the budget by switching
+    // transport or destination address.
+    let shared_limiter = Arc::new(sito_transport::RateLimiter::new(
+        config.dns.rate_limit_per_ip,
+        config.dns.rate_limit_per_ip * 2,
+    ));
+    let rate_limiters = vec![shared_limiter.clone()];
 
     for bind_ip in &config.dns.bind {
         let addr = SocketAddr::new(*bind_ip, config.dns.port);
 
         // Start UDP listener
-        let udp_limiter = Arc::new(sito_transport::RateLimiter::new(
-            config.dns.rate_limit_per_ip,
-            config.dns.rate_limit_per_ip * 2,
-        ));
-        rate_limiters.push(udp_limiter.clone());
         let udp_config = UdpConfig {
             bind_addr: addr,
             worker_count,
             edns_udp_size: config.dns.edns_udp_size,
             rate_limit_per_ip: config.dns.rate_limit_per_ip,
-            rate_limiter: Some(udp_limiter),
+            rate_limiter: Some(shared_limiter.clone()),
         };
         let udp_handles = start_udp_listener(&udp_config, &pipeline, &shutdown_rx)?;
         handles.extend(udp_handles);
 
         // Start TCP listener
-        let tcp_limiter = Arc::new(sito_transport::RateLimiter::new(
-            config.dns.rate_limit_per_ip,
-            config.dns.rate_limit_per_ip * 2,
-        ));
-        rate_limiters.push(tcp_limiter.clone());
         let tcp_config = TcpConfig {
             bind_addr: addr,
             max_connections: config.dns.max_tcp_connections,
             idle_timeout: Duration::from_secs(10),
             rate_limit_per_ip: config.dns.rate_limit_per_ip,
-            rate_limiter: Some(tcp_limiter),
+            rate_limiter: Some(shared_limiter.clone()),
         };
         let tcp_handle =
             start_tcp_listener(tcp_config, pipeline.clone(), shutdown_rx.clone()).await?;
@@ -1508,13 +1506,7 @@ async fn start_dns_listeners(
             let mut dot_config = DotConfig::new(dot_addr, dot_mgr.clone());
             dot_config.dot_padding = config.dns.dot_padding;
             dot_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-            dot_config.rate_limiter = Some(Arc::new(sito_transport::RateLimiter::new(
-                config.dns.rate_limit_per_ip,
-                config.dns.rate_limit_per_ip * 2,
-            )));
-            if let Some(limiter) = &dot_config.rate_limiter {
-                rate_limiters.push(limiter.clone());
-            }
+            dot_config.rate_limiter = Some(shared_limiter.clone());
             dot_config.max_connections = config.dns.max_tcp_connections;
             let dot_handle =
                 start_dot_listener(dot_config, pipeline.clone(), shutdown_rx.clone()).await?;
@@ -1543,13 +1535,7 @@ async fn start_dns_listeners(
                     })
                     .with_dedicated_hostname(dedicated_host);
                 doh_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-                doh_config.rate_limiter = Some(Arc::new(sito_transport::RateLimiter::new(
-                    config.dns.rate_limit_per_ip,
-                    config.dns.rate_limit_per_ip * 2,
-                )));
-                if let Some(limiter) = &doh_config.rate_limiter {
-                    rate_limiters.push(limiter.clone());
-                }
+                doh_config.rate_limiter = Some(shared_limiter.clone());
                 doh_config.max_connections = config.dns.max_tcp_connections;
                 let doh_handle =
                     start_doh_listener(doh_config, pipeline.clone(), shutdown_rx.clone()).await?;
@@ -1564,13 +1550,7 @@ async fn start_dns_listeners(
             let doq_addr = SocketAddr::new(*bind_ip, config.dns.doq_port);
             let mut doq_config = DoqConfig::new(doq_addr, Some(doq_mgr.clone()));
             doq_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-            doq_config.rate_limiter = Some(Arc::new(sito_transport::RateLimiter::new(
-                config.dns.rate_limit_per_ip,
-                config.dns.rate_limit_per_ip * 2,
-            )));
-            if let Some(limiter) = &doq_config.rate_limiter {
-                rate_limiters.push(limiter.clone());
-            }
+            doq_config.rate_limiter = Some(shared_limiter.clone());
             doq_config.max_connections = config.dns.max_tcp_connections;
             match start_doq_listener(doq_config, pipeline.clone(), shutdown_rx.clone()).await {
                 Ok(doq_handle) => handles.push(doq_handle),
@@ -1588,13 +1568,7 @@ async fn start_dns_listeners(
             let mut doh3_config = Doh3Config::new(doh3_addr, Some(doh3_mgr.clone()))
                 .with_dedicated_hostname(dedicated_host);
             doh3_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-            doh3_config.rate_limiter = Some(Arc::new(sito_transport::RateLimiter::new(
-                config.dns.rate_limit_per_ip,
-                config.dns.rate_limit_per_ip * 2,
-            )));
-            if let Some(limiter) = &doh3_config.rate_limiter {
-                rate_limiters.push(limiter.clone());
-            }
+            doh3_config.rate_limiter = Some(shared_limiter.clone());
             doh3_config.max_connections = config.dns.max_tcp_connections;
             match start_doh3_listener(doh3_config, pipeline.clone(), shutdown_rx.clone()).await {
                 Ok(doh3_handle) => handles.push(doh3_handle),

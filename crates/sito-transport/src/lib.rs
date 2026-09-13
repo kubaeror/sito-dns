@@ -412,6 +412,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tcp_per_query_rate_limit_drops_excess_on_same_connection() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let config = TcpConfig {
+            bind_addr: actual_addr,
+            max_connections: 10,
+            idle_timeout: Duration::from_secs(2),
+            rate_limit_per_ip: 1,
+            // One token, no burst: only the first query may pass.
+            rate_limiter: Some(Arc::new(crate::limiter::RateLimiter::new(1, 1))),
+        };
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::NoError;
+            Some(resp)
+        });
+
+        let _handle = start_tcp_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut stream = TcpStream::connect(actual_addr).await.unwrap();
+        for id in 1u16..=2 {
+            let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+            query.queries.push(Query::query(
+                Name::from_str("q.example.com.").unwrap(),
+                RecordType::A,
+            ));
+            let encoded = encode_message(&query).unwrap();
+            stream
+                .write_all(&(encoded.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&encoded).await.unwrap();
+        }
+        stream.flush().await.unwrap();
+
+        // First query answered.
+        let mut len_buf = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut len_buf))
+            .await
+            .expect("first query must be answered")
+            .unwrap();
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await.unwrap();
+        let resp = decode_message(&buf).unwrap();
+        assert_eq!(resp.metadata.id, 1);
+
+        // Second query on the same connection is dropped by the limiter.
+        let second =
+            tokio::time::timeout(Duration::from_millis(400), stream.read_exact(&mut len_buf)).await;
+        assert!(
+            second.is_err(),
+            "queries beyond the per-IP budget must be dropped"
+        );
+
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
     async fn test_tcp_zero_length_frame_closes_connection() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
