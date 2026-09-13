@@ -1070,6 +1070,12 @@ impl AuthManager {
             };
         }
 
+        // Serialize the read-verify-write cycle. Without this, two concurrent
+        // requests with the same TOTP step both verify against the same
+        // `last_used_step` and both succeed (code replay), and one backup code
+        // can be consumed twice.
+        let _verify_guard = self.totp_verification_lock.lock().await;
+
         let snapshot = {
             let users = lock(&self.users);
             users
@@ -1628,6 +1634,44 @@ mod tests {
                 .await,
             TotpVerifyResult::TokenExpired | TotpVerifyResult::LockedOut { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_totp_backup_code_is_single_use_under_concurrency() {
+        let mgr = Arc::new(AuthManager::new());
+        let setup = mgr.init_totp_setup("admin").await.expect("setup");
+        assert!(
+            mgr.confirm_totp_setup("admin", &setup.backup_codes[0])
+                .await
+        );
+
+        let LoginResult::TotpRequired { partial_token: t1 } =
+            mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("Expected TOTP required");
+        };
+        let LoginResult::TotpRequired { partial_token: t2 } =
+            mgr.login("admin", "adminadmin", "127.0.0.2").await
+        else {
+            panic!("Expected TOTP required");
+        };
+
+        // Both requests race on the same unused backup code.
+        let code = setup.backup_codes[1].clone();
+        let code_2 = code.clone();
+        let mgr_2 = Arc::clone(&mgr);
+        let (r1, r2) = tokio::join!(mgr.verify_totp(&t1, &code, "127.0.0.1"), async move {
+            mgr_2.verify_totp(&t2, &code_2, "127.0.0.2").await
+        },);
+
+        let successes = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, TotpVerifyResult::Success(_)))
+            .count();
+        assert_eq!(
+            successes, 1,
+            "a backup code must be consumed exactly once: {r1:?} / {r2:?}"
+        );
     }
 
     #[tokio::test]
