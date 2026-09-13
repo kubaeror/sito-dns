@@ -698,7 +698,7 @@ mod tests {
         // Default config enables the requirement.
         let default_cfg = dir.join("default.toml");
         std::fs::write(&default_cfg, "config_version = 1\n").unwrap();
-        assert_eq!(update_signature_policy(&default_cfg).unwrap(), true);
+        assert!(update_signature_policy(&default_cfg).unwrap());
 
         // Explicit opt-out is honored.
         let opt_out = dir.join("opt_out.toml");
@@ -707,7 +707,7 @@ mod tests {
             "config_version = 1\n[server]\nupdate_require_signature = false\n",
         )
         .unwrap();
-        assert_eq!(update_signature_policy(&opt_out).unwrap(), false);
+        assert!(!update_signature_policy(&opt_out).unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
