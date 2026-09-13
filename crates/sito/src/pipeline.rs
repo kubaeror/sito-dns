@@ -1125,7 +1125,7 @@ impl QueryHandler for DnsPipeline {
                         "Upstream resolution failed"
                     );
                     if let Some(ref m) = self.metrics {
-                        m.inc_upstream_errors("all", &e.to_string());
+                        m.inc_upstream_errors("all", e.kind());
                     }
 
                     if cache_enabled

@@ -441,6 +441,7 @@ struct ConfigWatcher {
     cache: Arc<DnsCache>,
     dnssec: Arc<ArcSwap<DnssecValidator>>,
     scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>>,
+    metrics: sito_stats::MetricsRegistry,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -463,6 +464,7 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
         cache: watcher_cache,
         dnssec: watcher_dnssec,
         scoped_upstreams: watcher_scoped_upstreams,
+        metrics: watcher_metrics,
         shutdown_rx: mut watcher_shutdown_rx,
     } = watcher;
 
@@ -527,8 +529,14 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
                                     "Applied hot-reloaded log level"
                                 );
                             }
+                            let filter_started = std::time::Instant::now();
                             match watcher_filter.reload_with_config(&new_cfg.filtering).await {
                                 Ok(_) => {
+                                    watcher_metrics
+                                        .set_filter_rules(watcher_filter.rule_count());
+                                    watcher_metrics.observe_filter_compile(
+                                        filter_started.elapsed().as_secs_f64(),
+                                    );
                                     // Filter rules changed: previously allowed
                                     // responses may now be blocked, so cached
                                     // entries must not outlive the old rules.
@@ -717,6 +725,7 @@ pub async fn run_server_full(
     let upstream_manager = components.upstream_manager;
     let cache = components.cache;
     let filter_engine = components.filter_engine;
+    metrics.set_filter_rules(filter_engine.rule_count());
 
     // Initialize DNSSEC validator
     let dnssec_swap = Arc::new(ArcSwap::from(Arc::new(DnssecValidator::from_config(
@@ -950,6 +959,7 @@ pub async fn run_server_full(
         cache: cache.clone(),
         dnssec: dnssec_swap.clone(),
         scoped_upstreams: scoped_upstreams.clone(),
+        metrics: metrics.clone(),
         shutdown_rx: shutdown_rx.clone(),
     }));
 

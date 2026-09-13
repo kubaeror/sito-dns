@@ -415,12 +415,16 @@ pub async fn reload_config(
 /// component error instead of reporting a successful reload that applied
 /// nothing.
 async fn apply_hot_config(ctx: &ServerContext, cfg: Config) -> Result<(), ProblemDetails> {
+    let filter_started = Instant::now();
     ctx.filter
         .reload_with_config(&cfg.filtering)
         .await
         .map_err(|e| {
             ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
         })?;
+    ctx.metrics.set_filter_rules(ctx.filter.rule_count());
+    ctx.metrics
+        .observe_filter_compile(filter_started.elapsed().as_secs_f64());
     // Filter rules changed: drop cached answers that may now be blocked.
     ctx.cache.flush();
 
