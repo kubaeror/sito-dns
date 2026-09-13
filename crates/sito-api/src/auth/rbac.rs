@@ -7,10 +7,11 @@ use crate::auth::session::extract_session_cookie;
 use crate::auth::token::Role;
 use crate::error::ProblemDetails;
 use axum::extract::FromRequestParts;
-use axum::http::header::{AUTHORIZATION, COOKIE};
+use axum::http::header::{AUTHORIZATION, CONNECTION, COOKIE, UPGRADE};
 use axum::http::request::Parts;
+use std::collections::HashSet;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Authenticated user / token context.
 #[derive(Debug, Clone)]
@@ -53,6 +54,42 @@ impl Deref for RequireAdmin {
     }
 }
 
+/// True when the request is a WebSocket upgrade (`Upgrade: websocket` +
+/// `Connection: Upgrade`).
+pub fn is_websocket_upgrade(parts: &Parts) -> bool {
+    let upgrade = parts
+        .headers
+        .get(UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    let connection = parts
+        .headers
+        .get(CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+        });
+    upgrade && connection
+}
+
+/// Logs the `?token=` deprecation warning once per API token (identified by
+/// its Blake3 digest so plaintext tokens never reach the logs).
+fn warn_query_token_deprecation(token: &str) {
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let digest = blake3::hash(token.as_bytes()).to_hex().to_string();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut set = warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if set.insert(digest) {
+        tracing::warn!(
+            "Deprecated `?token=` query authentication used on a WebSocket upgrade. \
+             Support will be removed in sito 2.0; use the `Authorization: Bearer` header instead."
+        );
+    }
+}
+
 /// Helper to authenticate from request parts against AuthManager.
 pub fn authenticate_request(
     parts: &Parts,
@@ -91,12 +128,18 @@ pub fn authenticate_request(
         ));
     }
 
-    // 3. Try query parameter `token` (supported for WebSocket stream connections)
-    if let Some(query) = parts.uri.query() {
+    // 3. Legacy `?token=` query parameter: only for WebSocket upgrades without
+    //    an Authorization header. Deprecated, warned and slated for removal in
+    //    2.0. Every other endpoint must use the header or a session cookie.
+    if is_websocket_upgrade(parts)
+        && let Some(query) = parts.uri.query()
+    {
         for param in query.split('&') {
-            if let Some(token) = param.strip_prefix("token=") {
-                let clean_token = token.trim();
+            let (key, value) = param.split_once('=').unwrap_or((param, ""));
+            if key == "token" {
+                let clean_token = value.trim();
                 if let Some(meta) = auth_mgr.validate_token(clean_token) {
+                    warn_query_token_deprecation(clean_token);
                     return Ok(AuthUser {
                         username: meta.name,
                         role: meta.scope,
@@ -175,5 +218,41 @@ where
                 "Insufficient privileges: requires Admin role",
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+
+    #[test]
+    fn test_websocket_upgrade_detection() {
+        let ws = Request::builder()
+            .uri("/api/v1/querylog/stream?token=abc")
+            .header(UPGRADE, "websocket")
+            .header(CONNECTION, "keep-alive, Upgrade")
+            .body(())
+            .unwrap();
+        assert!(is_websocket_upgrade(&ws.into_parts().0));
+
+        let plain = Request::builder()
+            .uri("/api/v1/querylog?token=abc")
+            .body(())
+            .unwrap();
+        assert!(!is_websocket_upgrade(&plain.into_parts().0));
+    }
+
+    #[test]
+    fn test_query_token_ignored_for_non_websocket_requests() {
+        let mgr = AuthManager::new();
+        let (_, resp) = mgr.create_token("ws", Role::Viewer);
+        let req = Request::builder()
+            .uri(format!("/api/v1/querylog?token={}", resp.token))
+            .body(())
+            .unwrap();
+        let (parts, ()) = req.into_parts();
+        let err = authenticate_request(&parts, &mgr).unwrap_err();
+        assert!(err.detail.contains("Authentication required"));
     }
 }

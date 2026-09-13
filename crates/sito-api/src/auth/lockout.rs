@@ -4,8 +4,14 @@
 //! Per-IP rate limiting for login endpoints.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+
+/// Locks a mutex, recovering from poisoning instead of panicking (a panic
+/// would abort the resolver build because release uses `panic = "abort"`).
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 const MAX_FAILED_ATTEMPTS: u32 = 5;
 const LOCKOUT_DURATION: Duration = Duration::from_mins(15); // 15 minutes
@@ -43,7 +49,7 @@ impl LockoutTracker {
     ///
     /// Returns remaining lockout duration in seconds if locked.
     pub fn check_lockout(&self, key: &str) -> Option<u64> {
-        let mut map = self.attempts.lock().unwrap();
+        let mut map = lock(&self.attempts);
         if let Some(record) = map.get_mut(key) {
             let now = Instant::now();
             if let Some(until) = record.locked_until {
@@ -65,7 +71,7 @@ impl LockoutTracker {
     ///
     /// Returns `(is_locked, remaining_attempts)`.
     pub fn record_failure(&self, key: &str) -> (bool, u32) {
-        let mut map = self.attempts.lock().unwrap();
+        let mut map = lock(&self.attempts);
         let now = Instant::now();
 
         if !map.contains_key(key) && map.len() >= MAX_LOCKOUT_ENTRIES {
@@ -102,7 +108,7 @@ impl LockoutTracker {
 
     /// Clears any recorded failures upon successful authentication.
     pub fn record_success(&self, key: &str) {
-        let mut map = self.attempts.lock().unwrap();
+        let mut map = lock(&self.attempts);
         map.remove(key);
     }
 
@@ -116,7 +122,7 @@ impl LockoutTracker {
 
         let now = Instant::now();
         let window = Duration::from_secs(60);
-        let mut map = self.ip_rates.lock().unwrap();
+        let mut map = lock(&self.ip_rates);
 
         if !map.contains_key(ip) && map.len() >= MAX_IP_RATE_ENTRIES {
             map.retain(|_, record| {
@@ -154,7 +160,7 @@ impl LockoutTracker {
         let now = Instant::now();
         let window = Duration::from_secs(60);
         {
-            let mut ip_map = self.ip_rates.lock().unwrap();
+            let mut ip_map = lock(&self.ip_rates);
             ip_map.retain(|_, record| {
                 record
                     .timestamps
@@ -163,7 +169,7 @@ impl LockoutTracker {
             });
         }
         {
-            let mut attempt_map = self.attempts.lock().unwrap();
+            let mut attempt_map = lock(&self.attempts);
             attempt_map.retain(|_, record| {
                 if let Some(until) = record.locked_until {
                     now < until
@@ -176,12 +182,12 @@ impl LockoutTracker {
 
     #[cfg(test)]
     pub fn attempts_len(&self) -> usize {
-        self.attempts.lock().unwrap().len()
+        lock(&self.attempts).len()
     }
 
     #[cfg(test)]
     pub fn ip_rates_len(&self) -> usize {
-        self.ip_rates.lock().unwrap().len()
+        lock(&self.ip_rates).len()
     }
 }
 
@@ -239,7 +245,7 @@ mod tests {
 
         // Advance timestamps manually in state to simulate expiration
         {
-            let mut attempts = tracker.attempts.lock().unwrap();
+            let mut attempts = lock(&tracker.attempts);
             if let Some(rec) = attempts.get_mut("user1") {
                 rec.last_attempt = Instant::now()
                     .checked_sub(Duration::from_secs(1000))
@@ -247,7 +253,7 @@ mod tests {
             }
         }
         {
-            let mut ip_rates = tracker.ip_rates.lock().unwrap();
+            let mut ip_rates = lock(&tracker.ip_rates);
             if let Some(rec) = ip_rates.get_mut("1.2.3.4") {
                 rec.timestamps = vec![
                     Instant::now()

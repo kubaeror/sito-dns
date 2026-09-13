@@ -66,6 +66,10 @@ pub fn resolve_client_ip(
 
 /// Determines if the request arrived over HTTPS, either directly (if server is configured with TLS)
 /// or via a trusted reverse proxy with `X-Forwarded-Proto: https`.
+///
+/// `X-Forwarded-Proto` is only trusted when the direct peer is a configured
+/// trusted proxy; without peer information the header is ignored so clients
+/// cannot spoof a secure connection.
 pub fn is_https_request(
     peer_addr: Option<SocketAddr>,
     headers: &HeaderMap,
@@ -76,14 +80,9 @@ pub fn is_https_request(
         return true;
     }
 
-    if let Some(peer) = peer_addr {
-        if trusted_proxies.contains(&peer.ip())
-            && let Some(proto) = headers.get("x-forwarded-proto")
-            && let Ok(val) = proto.to_str()
-        {
-            return val.eq_ignore_ascii_case("https");
-        }
-    } else if let Some(proto) = headers.get("x-forwarded-proto")
+    if let Some(peer) = peer_addr
+        && trusted_proxies.contains(&peer.ip())
+        && let Some(proto) = headers.get("x-forwarded-proto")
         && let Ok(val) = proto.to_str()
     {
         return val.eq_ignore_ascii_case("https");
@@ -187,7 +186,8 @@ mod tests {
 
         let mut https_headers = HeaderMap::new();
         https_headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        assert!(is_https_request(None, &https_headers, &[], false));
+        // Without peer information the header must not be trusted.
+        assert!(!is_https_request(None, &https_headers, &[], false));
 
         let proxy_ip: IpAddr = "10.0.0.1".parse().unwrap();
         let peer = SocketAddr::new(proxy_ip, 12345);

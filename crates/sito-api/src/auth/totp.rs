@@ -1,20 +1,33 @@
 //! TOTP implementation conforming to RFC 6238 and section 12.2.
 //!
-//! 30s window, ±1 step tolerance, 10 one-time backup codes stored hashed.
+//! 30s window, ±1 step tolerance, replay protection for accepted time steps,
+//! and 10 one-time backup codes with 128 bits of entropy stored as Argon2id
+//! hashes (never as unsalted fast hashes).
 
-use blake3::Hash;
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
+use argon2::{Algorithm, Argon2, Params, Version};
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
-use subtle::ConstantTimeEq;
 use totp_rs::{Builder, Secret};
+
+/// Backup-code Argon2 memory cost in KiB (16 MiB; codes are already high-entropy).
+const BACKUP_ARGON2_M_COST: u32 = 16_384;
+const BACKUP_ARGON2_T_COST: u32 = 2;
+const BACKUP_ARGON2_P_COST: u32 = 2;
 
 /// TOTP configuration and state for a user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TotpConfig {
     pub enabled: bool,
     pub secret: String,
-    /// Hashes of remaining one-time backup codes.
+    /// Argon2id hashes of remaining one-time backup codes.
     pub backup_code_hashes: Vec<String>,
+    /// Highest accepted TOTP time-step, used to reject replays within the
+    /// ±1 window. `None` until the first successful dynamic-code login.
+    #[serde(default)]
+    pub last_used_step: Option<u64>,
 }
 
 /// Returned during TOTP setup.
@@ -27,7 +40,8 @@ pub struct TotpSetupResponse {
 }
 
 impl TotpConfig {
-    /// Generates a new TOTP setup with secret, URL, QR code, and 10 plaintext backup codes.
+    /// Generates a new TOTP setup with secret, URL, QR code, and 10 plaintext
+    /// backup codes (128-bit random each).
     pub fn generate(issuer: &str, username: &str) -> (Self, TotpSetupResponse) {
         let secret = Secret::generate();
         let secret_str = secret.to_base32();
@@ -42,12 +56,14 @@ impl TotpConfig {
         let otpauth_url = totp.to_url().unwrap_or_default();
         let qr_code = totp.to_qr_base64().unwrap_or_default();
 
-        // Generate 10 one-time 8-character backup codes
+        // Generate 10 one-time backup codes with 128 bits of entropy each.
         let mut plaintext_backup_codes = Vec::with_capacity(10);
         let mut backup_code_hashes = Vec::with_capacity(10);
 
         for _ in 0..10 {
-            let code = format!("{:08x}", rand::random::<u32>());
+            let mut bytes = [0u8; 16];
+            rand::rng().fill(&mut bytes);
+            let code = hex::encode(bytes);
             let hash = hash_backup_code(&code);
             plaintext_backup_codes.push(code);
             backup_code_hashes.push(hash);
@@ -56,7 +72,8 @@ impl TotpConfig {
         let config = Self {
             enabled: false,
             secret: secret_str.clone(),
-            backup_code_hashes: backup_code_hashes.clone(),
+            backup_code_hashes,
+            last_used_step: None,
         };
 
         let response = TotpSetupResponse {
@@ -69,13 +86,14 @@ impl TotpConfig {
         (config, response)
     }
 
-    /// Verifies an entered TOTP code (either 6-digit dynamic code or 8-char backup code).
+    /// Verifies an entered TOTP code (6-digit dynamic code or backup code).
     ///
-    /// If a backup code matches, it is consumed (removed from remaining hashes).
+    /// Dynamic codes inside the ±1 step window are rejected if their time-step
+    /// was already used (replay protection). A matching backup code is consumed.
     pub fn verify(&mut self, code: &str, username: &str, issuer: &str) -> bool {
         let clean_code = code.trim().replace(' ', "");
 
-        // 1. Try dynamic 6-digit TOTP code
+        // 1. Try dynamic 6-digit TOTP code.
         if clean_code.len() == 6
             && clean_code.chars().all(|c| c.is_ascii_digit())
             && let Ok(secret) = Secret::try_from_base32(&self.secret)
@@ -89,18 +107,20 @@ impl TotpConfig {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if totp.check(&clean_code, now).is_some() {
+            if let Some(matched_step) = totp.check(&clean_code, now) {
+                if self.last_used_step.is_some_and(|last| matched_step <= last) {
+                    return false;
+                }
+                self.last_used_step = Some(matched_step);
                 return true;
             }
         }
 
-        // 2. Try one-time backup codes using constant-time comparison
-        let entered_hash = hash_backup_code(&clean_code);
-        let entered_bytes = entered_hash.as_bytes();
+        // 2. Try one-time backup codes. Evaluate every hash (no early exit) so
+        //    the position of the match is not observable from timing.
         let mut matched_idx = None;
         for (idx, h) in self.backup_code_hashes.iter().enumerate() {
-            let h_bytes = h.as_bytes();
-            if h_bytes.len() == entered_bytes.len() && bool::from(h_bytes.ct_eq(entered_bytes)) {
+            if verify_backup_code(&clean_code, h) {
                 matched_idx = Some(idx);
             }
         }
@@ -114,24 +134,38 @@ impl TotpConfig {
     }
 }
 
+fn backup_argon2() -> Argon2<'static> {
+    let params = Params::new(
+        BACKUP_ARGON2_M_COST,
+        BACKUP_ARGON2_T_COST,
+        BACKUP_ARGON2_P_COST,
+        None,
+    )
+    .expect("valid backup-code Argon2 parameters");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
 fn hash_backup_code(code: &str) -> String {
-    let hash: Hash = blake3::hash(code.as_bytes());
-    hash.to_hex().to_string()
+    backup_argon2()
+        .hash_password(code.as_bytes())
+        .map(|hash| hash.to_string())
+        .expect("backup-code hashing cannot fail")
+}
+
+fn verify_backup_code(code: &str, hash_str: &str) -> bool {
+    let Ok(parsed_hash) = PasswordHash::new(hash_str) else {
+        return false;
+    };
+    backup_argon2()
+        .verify_password(code.as_bytes(), &parsed_hash)
+        .is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_totp_setup_and_verification() {
-        let (mut config, setup) = TotpConfig::generate("sito", "admin");
-
-        assert_eq!(setup.backup_codes.len(), 10);
-        assert!(!setup.qr_code.is_empty());
-        assert!(setup.otpauth_url.contains("sito"));
-
-        // Generate valid 6-digit code
+    fn dynamic_code(config: &TotpConfig) -> String {
         let secret = Secret::try_from_base32(&config.secret).unwrap();
         let totp = Builder::new()
             .with_secret(secret)
@@ -139,13 +173,30 @@ mod tests {
             .with_account_name("admin")
             .build()
             .unwrap();
-
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let valid_code = totp.generate(now).to_string();
+        totp.generate(now).to_string()
+    }
 
+    #[test]
+    fn test_totp_setup_and_verification() {
+        let (mut config, setup) = TotpConfig::generate("sito", "admin");
+
+        assert_eq!(setup.backup_codes.len(), 10);
+        for code in &setup.backup_codes {
+            assert_eq!(code.len(), 32, "backup codes must carry >= 128 bits");
+            assert!(code.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        assert!(!setup.qr_code.is_empty());
+        assert!(setup.otpauth_url.contains("sito"));
+
+        // Plaintext codes are never stored; hashes are Argon2id.
+        assert!(config.backup_code_hashes[0].starts_with("$argon2id$"));
+        assert_ne!(config.backup_code_hashes[0], setup.backup_codes[0]);
+
+        let valid_code = dynamic_code(&config);
         assert!(config.verify(&valid_code, "admin", "sito"));
         assert!(!config.verify("999999", "admin", "sito"));
 
@@ -156,5 +207,21 @@ mod tests {
         // One-time code cannot be reused
         assert_eq!(config.backup_code_hashes.len(), 9);
         assert!(!config.verify(backup_code, "admin", "sito"));
+    }
+
+    #[test]
+    fn test_totp_replay_is_rejected() {
+        let (mut config, _setup) = TotpConfig::generate("sito", "admin");
+        let code = dynamic_code(&config);
+
+        assert!(config.verify(&code, "admin", "sito"), "first use accepted");
+        assert!(
+            config.last_used_step.is_some(),
+            "accepted step must be recorded"
+        );
+        assert!(
+            !config.verify(&code, "admin", "sito"),
+            "replayed code must be rejected"
+        );
     }
 }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
@@ -51,6 +51,19 @@ pub enum TotpVerifyResult {
     RateLimited,
 }
 
+/// Result of validating a first-boot setup token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupTokenStatus {
+    /// Token matched.
+    Valid,
+    /// Token did not match.
+    Invalid,
+    /// No token is provisioned (setup already completed) or none was supplied.
+    Missing,
+    /// Too many failed attempts from this client.
+    RateLimited,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserAccount {
     pub username: String,
@@ -63,14 +76,32 @@ pub struct UserAccount {
 pub const MAX_SESSIONS: usize = 10_000;
 pub const MAX_PENDING_TOTP: usize = 10_000;
 pub const MAX_PARTIAL_TOKENS: usize = 10_000;
+/// Maximum number of API tokens kept in memory/on disk.
+pub const MAX_API_TOKENS: usize = 256;
 pub const PENDING_TOTP_TTL: Duration = Duration::from_secs(600); // 10 minutes
 /// Maximum wrong TOTP codes per partial token before it is invalidated.
 pub const MAX_TOTP_ATTEMPTS: u32 = 5;
+/// Maximum failed first-boot setup-token attempts per client within the window.
+pub const MAX_SETUP_TOKEN_FAILURES: u32 = 10;
+/// Rolling window for setup-token failure throttling.
+pub const SETUP_TOKEN_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 struct PendingTotp {
     config: TotpConfig,
     created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct SetupToken {
+    token: String,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FailureWindow {
+    window_start: Instant,
+    failures: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -116,6 +147,38 @@ struct SessionsFile {
 struct TokensFile {
     #[serde(default)]
     tokens: Vec<ApiTokenMeta>,
+}
+
+/// Locks a mutex, recovering the guard when the lock was poisoned by a panic
+/// in another task instead of propagating the panic.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A fixed Argon2 hash used to keep the unknown-username login path as
+/// expensive as the wrong-password path (prevents user enumeration).
+fn dummy_password_hash() -> &'static str {
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    DUMMY.get_or_init(|| {
+        let secret = format!("sito-dummy-{}", rand::random::<u64>());
+        hash_password(&secret).expect("valid dummy password hash")
+    })
+}
+
+async fn hash_password_blocking(password: String) -> Result<(String, bool), String> {
+    tokio::task::spawn_blocking(move || {
+        let hash = hash_password(&password)?;
+        let is_default = verify_password("adminadmin", &hash);
+        Ok((hash, is_default))
+    })
+    .await
+    .map_err(|e| format!("password hashing task failed: {e}"))?
+}
+
+async fn verify_password_blocking(password: String, hash: String) -> bool {
+    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
+        .await
+        .unwrap_or(false)
 }
 
 /// Atomically writes a secret file with owner-only permissions.
@@ -192,6 +255,15 @@ pub struct AuthManager {
     session_ttl_secs: i64,
     login_rate_limit: usize,
     setup_complete: Arc<AtomicBool>,
+    /// True while the bootstrapped `admin` account still uses its default password.
+    default_admin_active: Arc<AtomicBool>,
+    /// One-time first-boot setup token (only provisioned until setup completes).
+    setup_token: Arc<Mutex<Option<SetupToken>>>,
+    /// Failed setup-token attempts keyed by client IP.
+    setup_token_failures: Arc<Mutex<HashMap<String, FailureWindow>>>,
+    /// Serializes second-factor verification so a backup code cannot be
+    /// consumed by two concurrent requests.
+    totp_verification_lock: Arc<tokio::sync::Mutex<()>>,
     users_path: Option<PathBuf>,
     sessions_path: Option<PathBuf>,
     tokens_path: Option<PathBuf>,
@@ -322,6 +394,10 @@ impl AuthManager {
             session_ttl_secs,
             login_rate_limit,
             setup_complete: Arc::new(AtomicBool::new(false)),
+            default_admin_active: Arc::new(AtomicBool::new(false)),
+            setup_token: Arc::new(Mutex::new(None)),
+            setup_token_failures: Arc::new(Mutex::new(HashMap::new())),
+            totp_verification_lock: Arc::new(tokio::sync::Mutex::new(())),
             users_path,
             sessions_path,
             tokens_path,
@@ -390,22 +466,24 @@ impl AuthManager {
                     return Err(AuthStorageError::EmptyUsersFile { path: path.clone() });
                 }
 
-                let (has_admin, admin_password_changed) = {
-                    let mut map = mgr.users.lock().unwrap();
+                let (has_admin, admin_default_active) = {
+                    let mut map = lock(&mgr.users);
                     for u in file.users {
                         map.insert(u.username.clone(), u);
                     }
                     if let Some(admin) = map.get("admin") {
-                        (true, !verify_password("adminadmin", &admin.password_hash))
+                        (true, verify_password("adminadmin", &admin.password_hash))
                     } else {
                         (false, false)
                     }
                 };
-                if !has_admin || admin_password_changed {
-                    mgr.setup_complete.store(true, Ordering::SeqCst);
-                }
+                mgr.default_admin_active
+                    .store(admin_default_active, Ordering::SeqCst);
+                mgr.setup_complete
+                    .store(has_admin && !admin_default_active, Ordering::SeqCst);
                 mgr.load_sessions();
                 mgr.load_tokens();
+                mgr.provision_setup_token_if_needed();
                 return Ok(mgr);
             }
 
@@ -427,6 +505,7 @@ impl AuthManager {
 
         mgr.load_sessions();
         mgr.load_tokens();
+        mgr.provision_setup_token_if_needed();
         Ok(mgr)
     }
 
@@ -457,6 +536,10 @@ impl AuthManager {
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
             login_rate_limit: 5,
             setup_complete: Arc::new(AtomicBool::new(false)),
+            default_admin_active: Arc::new(AtomicBool::new(false)),
+            setup_token: Arc::new(Mutex::new(None)),
+            setup_token_failures: Arc::new(Mutex::new(HashMap::new())),
+            totp_verification_lock: Arc::new(tokio::sync::Mutex::new(())),
             users_path: Some(path.clone()),
             sessions_path: None,
             tokens_path: None,
@@ -473,7 +556,7 @@ impl AuthManager {
             return;
         };
         let users_list: Vec<UserAccount> = {
-            let users = self.users.lock().unwrap();
+            let users = lock(&self.users);
             users.values().cloned().collect()
         };
         let file_content = UsersFile { users: users_list };
@@ -488,7 +571,7 @@ impl AuthManager {
         let Some(ref path) = self.sessions_path else {
             return;
         };
-        let sessions: Vec<Session> = self.sessions.lock().unwrap().values().cloned().collect();
+        let sessions: Vec<Session> = lock(&self.sessions).values().cloned().collect();
         let Ok(toml_str) = toml::to_string_pretty(&SessionsFile { sessions }) else {
             tracing::error!("Failed to serialize sessions to TOML");
             return;
@@ -500,7 +583,7 @@ impl AuthManager {
         let Some(ref path) = self.tokens_path else {
             return;
         };
-        let tokens: Vec<ApiTokenMeta> = self.tokens.lock().unwrap().values().cloned().collect();
+        let tokens: Vec<ApiTokenMeta> = lock(&self.tokens).values().cloned().collect();
         let Ok(toml_str) = toml::to_string_pretty(&TokensFile { tokens }) else {
             tracing::error!("Failed to serialize API tokens to TOML");
             return;
@@ -522,9 +605,10 @@ impl AuthManager {
         };
         match toml::from_str::<SessionsFile>(&content) {
             Ok(file) => {
-                let mut sessions = self.sessions.lock().unwrap();
-                for session in file.sessions {
+                let mut sessions = lock(&self.sessions);
+                for mut session in file.sessions {
                     if !session.is_expired() {
+                        session.ensure_csrf_token();
                         sessions.insert(session.id.clone(), session);
                     }
                 }
@@ -554,11 +638,20 @@ impl AuthManager {
         match toml::from_str::<TokensFile>(&content) {
             Ok(file) => {
                 let now = chrono::Utc::now().timestamp();
-                let mut tokens = self.tokens.lock().unwrap();
-                for token in file.tokens {
-                    if token.expires_at.is_none_or(|exp| now < exp) {
-                        tokens.insert(token.hash.clone(), token);
+                let mut tokens = lock(&self.tokens);
+                // Newest first so when the cap trims loaded tokens we keep the
+                // most recently issued ones.
+                let mut loaded: Vec<ApiTokenMeta> = file
+                    .tokens
+                    .into_iter()
+                    .filter(|token| token.expires_at.is_none_or(|exp| now < exp))
+                    .collect();
+                loaded.sort_by_key(|t| std::cmp::Reverse(t.created_at));
+                for token in loaded {
+                    if tokens.len() >= MAX_API_TOKENS {
+                        break;
                     }
+                    tokens.insert(token.hash.clone(), token);
                 }
             }
             Err(e) => {
@@ -574,40 +667,152 @@ impl AuthManager {
 
     fn create_user_internal(&self, username: &str, password: &str, role: Role) {
         let hash = hash_password(password).expect("valid password hash");
+        let is_default = username == "admin" && verify_password("adminadmin", &hash);
+        if username == "admin" {
+            self.default_admin_active
+                .store(is_default, Ordering::SeqCst);
+        }
         let user = UserAccount {
             username: username.to_string(),
             password_hash: hash,
             role,
             totp: None,
         };
-        self.users
-            .lock()
-            .unwrap()
-            .insert(username.to_string(), user);
+        lock(&self.users).insert(username.to_string(), user);
     }
+
+    // ------------------------------------------------------------------
+    // First-boot setup token
+    // ------------------------------------------------------------------
+
+    /// Generates the one-time setup token when the deployment is still in
+    /// first-run state. The token is printed to stdout/logs exactly once.
+    fn provision_setup_token_if_needed(&self) {
+        if self.users_path.is_none() || self.setup_complete.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut guard = lock(&self.setup_token);
+        if guard.is_some() {
+            return;
+        }
+        let mut bytes = [0u8; 32];
+        rand::rng().fill(&mut bytes);
+        let token = hex::encode(bytes);
+        *guard = Some(SetupToken {
+            token: token.clone(),
+            created_at: Instant::now(),
+        });
+        tracing::warn!(
+            "First-boot setup token generated; required for /wizard, /ui/wizard/* and /ui/upstreams/test until setup completes"
+        );
+        eprintln!(
+            "\n==================================================================\n \
+             First-boot setup token: {token}\n \
+             Open /wizard?setup_token={token} (or provide the X-Setup-Token header)\n\
+             ==================================================================\n"
+        );
+    }
+
+    /// Returns the active first-boot setup token, if any. Intended for setup
+    /// tooling and tests; it is never rendered to unauthenticated web clients
+    /// on its own.
+    pub fn setup_token(&self) -> Option<String> {
+        lock(&self.setup_token)
+            .as_ref()
+            .map(|entry| entry.token.clone())
+    }
+
+    /// Returns true while a first-boot setup token is active.
+    pub fn setup_token_required(&self) -> bool {
+        lock(&self.setup_token).is_some()
+    }
+
+    /// Invalidates the setup token (setup completed).
+    pub fn consume_setup_token(&self) {
+        *lock(&self.setup_token) = None;
+    }
+
+    fn setup_token_rate_limited(&self, client_ip: &str) -> bool {
+        let mut windows = lock(&self.setup_token_failures);
+        let now = Instant::now();
+        windows.retain(|_, w| now.duration_since(w.window_start) <= SETUP_TOKEN_RATE_WINDOW);
+        windows
+            .get(client_ip)
+            .is_some_and(|w| w.failures >= MAX_SETUP_TOKEN_FAILURES)
+    }
+
+    fn record_setup_token_failure(&self, client_ip: &str) {
+        let mut windows = lock(&self.setup_token_failures);
+        let now = Instant::now();
+        let entry = windows
+            .entry(client_ip.to_string())
+            .or_insert(FailureWindow {
+                window_start: now,
+                failures: 0,
+            });
+        if now.duration_since(entry.window_start) > SETUP_TOKEN_RATE_WINDOW {
+            entry.window_start = now;
+            entry.failures = 0;
+        }
+        entry.failures = entry.failures.saturating_add(1);
+    }
+
+    /// Constant-time setup-token validation with per-client failure throttling.
+    pub fn validate_setup_token(
+        &self,
+        candidate: Option<&str>,
+        client_ip: &str,
+    ) -> SetupTokenStatus {
+        if self.setup_token_rate_limited(client_ip) {
+            return SetupTokenStatus::RateLimited;
+        }
+
+        let guard = lock(&self.setup_token);
+        let Some(ref entry) = *guard else {
+            return SetupTokenStatus::Missing;
+        };
+
+        let Some(candidate) = candidate.filter(|c| !c.is_empty()) else {
+            drop(guard);
+            self.record_setup_token_failure(client_ip);
+            return SetupTokenStatus::Missing;
+        };
+
+        let expected = entry.token.as_bytes();
+        let supplied = candidate.as_bytes();
+        let matches = expected.len() == supplied.len() && bool::from(expected.ct_eq(supplied));
+        drop(guard);
+
+        if matches {
+            SetupTokenStatus::Valid
+        } else {
+            self.record_setup_token_failure(client_ip);
+            SetupTokenStatus::Invalid
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Users
+    // ------------------------------------------------------------------
 
     /// Returns true if the server is in first-run state (setup has not been completed and default credentials are active).
     pub fn is_first_run(&self) -> bool {
-        if self.setup_complete.load(Ordering::SeqCst) {
-            return false;
-        }
-        let users = self.users.lock().unwrap();
-        if let Some(admin) = users.get("admin") {
-            verify_password("adminadmin", &admin.password_hash)
-        } else {
-            false
-        }
+        !self.setup_complete.load(Ordering::SeqCst)
+            && self.default_admin_active.load(Ordering::SeqCst)
     }
 
     /// Checks whether a user with the given username exists.
     pub fn has_user(&self, username: &str) -> bool {
-        self.users.lock().unwrap().contains_key(username)
+        lock(&self.users).contains_key(username)
     }
 
     /// Deletes a user account by username. Returns true if the user existed and was removed.
     pub fn delete_user(&self, username: &str) -> bool {
-        let removed = self.users.lock().unwrap().remove(username).is_some();
+        let removed = lock(&self.users).remove(username).is_some();
         if removed {
+            if username == "admin" {
+                self.default_admin_active.store(false, Ordering::SeqCst);
+            }
             self.save_users();
         }
         removed
@@ -615,12 +820,7 @@ impl AuthManager {
 
     /// Returns true if the default bootstrapped admin user is still active with default password.
     pub fn is_default_admin_active(&self) -> bool {
-        let users = self.users.lock().unwrap();
-        if let Some(admin) = users.get("admin") {
-            verify_password("adminadmin", &admin.password_hash)
-        } else {
-            false
-        }
+        self.default_admin_active.load(Ordering::SeqCst)
     }
 
     /// Marks initial setup as completed.
@@ -628,41 +828,67 @@ impl AuthManager {
         self.setup_complete.store(true, Ordering::SeqCst);
     }
 
-    /// Creates or updates a user account.
-    pub fn create_user(&self, username: &str, password: &str, role: Role) {
-        let hash = hash_password(password).expect("valid password hash");
+    /// Creates or updates a user account. Hashing runs on the blocking pool.
+    pub async fn create_user(&self, username: &str, password: &str, role: Role) {
+        let Ok((hash, is_default)) = hash_password_blocking(password.to_string()).await else {
+            tracing::error!(user = username, "Failed to hash password for new user");
+            return;
+        };
+        if username == "admin" {
+            self.default_admin_active
+                .store(is_default, Ordering::SeqCst);
+        }
         let user = UserAccount {
             username: username.to_string(),
             password_hash: hash,
             role,
             totp: None,
         };
-        self.users
-            .lock()
-            .unwrap()
-            .insert(username.to_string(), user);
+        lock(&self.users).insert(username.to_string(), user);
         self.save_users();
     }
 
     /// Updates password for an existing user and invalidates their sessions.
-    pub fn update_user_password(&self, username: &str, password: &str) -> bool {
-        if let Ok(hash) = hash_password(password) {
-            let mut users = self.users.lock().unwrap();
-            if let Some(user) = users.get_mut(username) {
-                user.password_hash = hash;
-                drop(users);
-                self.save_users();
-                self.purge_user_sessions(username);
-                return true;
+    pub async fn update_user_password(&self, username: &str, password: &str) -> bool {
+        let Ok((hash, is_default)) = hash_password_blocking(password.to_string()).await else {
+            return false;
+        };
+
+        let mut users = lock(&self.users);
+        if let Some(user) = users.get_mut(username) {
+            user.password_hash = hash;
+            drop(users);
+            if username == "admin" {
+                self.default_admin_active
+                    .store(is_default, Ordering::SeqCst);
             }
+            self.save_users();
+            self.purge_user_sessions(username);
+            return true;
         }
         false
+    }
+
+    /// Verifies a user's current password without holding the users lock
+    /// across the Argon2 computation. Unknown users get a dummy verification
+    /// to keep timing comparable.
+    pub async fn verify_user_password(&self, username: &str, password: &str) -> bool {
+        let stored = {
+            let users = lock(&self.users);
+            users.get(username).map(|u| u.password_hash.clone())
+        };
+        let (hash, exists) = match stored {
+            Some(hash) => (hash, true),
+            None => (dummy_password_hash().to_string(), false),
+        };
+        let verified = verify_password_blocking(password.to_string(), hash).await;
+        exists && verified
     }
 
     /// Removes all active sessions belonging to a user (used after credential changes).
     pub fn purge_user_sessions(&self, username: &str) {
         let removed = {
-            let mut sessions = self.sessions.lock().unwrap();
+            let mut sessions = lock(&self.sessions);
             let before = sessions.len();
             sessions.retain(|_, session| session.username != username);
             sessions.len() != before
@@ -673,12 +899,19 @@ impl AuthManager {
     }
 
     fn insert_session(&self, session: Session) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = lock(&self.sessions);
         if !sessions.contains_key(&session.id) && sessions.len() >= MAX_SESSIONS {
             sessions.retain(|_, s| !s.is_expired());
-            if sessions.len() >= MAX_SESSIONS
-                && let Some(oldest_key) = sessions.keys().next().cloned()
-            {
+            // Deterministic eviction: oldest created_at first, then earliest
+            // expiry, then id for total ordering.
+            while sessions.len() >= MAX_SESSIONS {
+                let Some(oldest_key) = sessions
+                    .values()
+                    .min_by_key(|s| (s.created_at, s.expires_at, s.id.clone()))
+                    .map(|s| s.id.clone())
+                else {
+                    break;
+                };
                 sessions.remove(&oldest_key);
             }
         }
@@ -687,8 +920,12 @@ impl AuthManager {
         self.save_sessions();
     }
 
+    // ------------------------------------------------------------------
+    // Login / TOTP
+    // ------------------------------------------------------------------
+
     /// Primary login flow (`POST /auth/login`).
-    pub fn login(&self, username: &str, password: &str, client_ip: &str) -> LoginResult {
+    pub async fn login(&self, username: &str, password: &str, client_ip: &str) -> LoginResult {
         // 1. IP rate limiting
         if !self
             .lockout
@@ -704,8 +941,25 @@ impl AuthManager {
             };
         }
 
-        let users = self.users.lock().unwrap();
-        let Some(user) = users.get(username) else {
+        // 3. Fetch the stored hash and TOTP state without holding the lock
+        //    across the Argon2 verification.
+        let stored = {
+            let users = lock(&self.users);
+            users.get(username).map(|u| {
+                (
+                    u.password_hash.clone(),
+                    u.role,
+                    u.totp.as_ref().is_some_and(|t| t.enabled),
+                )
+            })
+        };
+
+        // Unknown user: run a dummy verification so the response time does not
+        // reveal whether the account exists.
+        let Some((hash, role, totp_enabled)) = stored else {
+            let _ =
+                verify_password_blocking(password.to_string(), dummy_password_hash().to_string())
+                    .await;
             let (locked, rem) = self.lockout.record_failure(username);
             return if locked {
                 LoginResult::LockedOut {
@@ -718,8 +972,8 @@ impl AuthManager {
             };
         };
 
-        // 3. Verify password
-        if !verify_password(password, &user.password_hash) {
+        let password_valid = verify_password_blocking(password.to_string(), hash.clone()).await;
+        if !password_valid {
             let (locked, rem) = self.lockout.record_failure(username);
             return if locked {
                 LoginResult::LockedOut {
@@ -733,20 +987,23 @@ impl AuthManager {
         }
 
         // Password valid: check if TOTP is enabled
-        if let Some(ref totp) = user.totp
-            && totp.enabled
-        {
+        if totp_enabled {
             let mut bytes = [0u8; 32];
             rand::rng().fill(&mut bytes);
             let partial_token = hex::encode(bytes);
 
-            let mut partials = self.partial_tokens.lock().unwrap();
+            let mut partials = lock(&self.partial_tokens);
             let now = Instant::now();
             if !partials.contains_key(&partial_token) && partials.len() >= MAX_PARTIAL_TOKENS {
                 partials.retain(|_, auth| now < auth.expires_at);
-                if partials.len() >= MAX_PARTIAL_TOKENS
-                    && let Some(oldest_key) = partials.keys().next().cloned()
-                {
+                while partials.len() >= MAX_PARTIAL_TOKENS {
+                    let Some(oldest_key) = partials
+                        .iter()
+                        .min_by_key(|(_, auth)| auth.expires_at)
+                        .map(|(k, _)| k.clone())
+                    else {
+                        break;
+                    };
                     partials.remove(&oldest_key);
                 }
             }
@@ -764,13 +1021,13 @@ impl AuthManager {
 
         // Authentication successful
         self.lockout.record_success(username);
-        let session = Session::new(username, user.role, self.session_ttl_secs);
+        let session = Session::new(username, role, self.session_ttl_secs);
         self.insert_session(session.clone());
         LoginResult::Success(session)
     }
 
     /// Second login phase: verify TOTP code with partial token (`POST /auth/totp/verify`).
-    pub fn verify_totp(
+    pub async fn verify_totp(
         &self,
         partial_token: &str,
         code: &str,
@@ -787,7 +1044,7 @@ impl AuthManager {
 
         // 2. Resolve and validate the partial token
         let (username, is_expired) = {
-            let partials = self.partial_tokens.lock().unwrap();
+            let partials = lock(&self.partial_tokens);
             let Some(auth) = partials.get(partial_token) else {
                 return TotpVerifyResult::TokenExpired;
             };
@@ -795,7 +1052,7 @@ impl AuthManager {
         };
 
         if is_expired {
-            self.partial_tokens.lock().unwrap().remove(partial_token);
+            lock(&self.partial_tokens).remove(partial_token);
             return TotpVerifyResult::TokenExpired;
         }
 
@@ -806,63 +1063,103 @@ impl AuthManager {
             };
         }
 
-        let mut users = self.users.lock().unwrap();
-        let Some(user) = users.get_mut(&username) else {
-            self.partial_tokens.lock().unwrap().remove(partial_token);
+        let snapshot = {
+            let users = lock(&self.users);
+            users
+                .get(&username)
+                .map(|user| (user.role, user.totp.clone()))
+        };
+        let Some((role, Some(totp))) = snapshot else {
+            lock(&self.partial_tokens).remove(partial_token);
             return TotpVerifyResult::TokenExpired;
         };
-        let Some(totp) = user.totp.as_mut() else {
+        if !totp.enabled {
             return TotpVerifyResult::Invalid;
+        }
+
+        // 4. Verify off the async worker without holding the users lock.
+        let code_owned = code.to_string();
+        let username_for_verify = username.clone();
+        let verified = tokio::task::spawn_blocking(move || {
+            let mut config = totp;
+            let ok = config.verify(&code_owned, &username_for_verify, "sito");
+            (config, ok)
+        })
+        .await;
+
+        let (updated_totp, valid) = match verified {
+            Ok((config, ok)) => (Some(config), ok),
+            Err(e) => {
+                tracing::error!("TOTP verification task failed: {e}");
+                (None, false)
+            }
         };
 
-        if totp.verify(code, &username, "sito") {
-            // Success: consume partial token, reset lockout, generate session
-            self.partial_tokens.lock().unwrap().remove(partial_token);
+        if let Some(updated_totp) = updated_totp
+            && valid
+        {
+            // Success: consume partial token, reset lockout, persist TOTP state.
+            lock(&self.partial_tokens).remove(partial_token);
             self.lockout.record_success(&username);
 
-            let role = user.role;
-            drop(users);
+            {
+                let mut users = lock(&self.users);
+                if let Some(user) = users.get_mut(&username) {
+                    user.totp = Some(updated_totp);
+                }
+            }
             self.save_users();
 
             let session = Session::new(&username, role, self.session_ttl_secs);
             self.insert_session(session.clone());
-            TotpVerifyResult::Success(session)
-        } else {
-            // Failure: count it against both the partial token and the account lockout.
-            let (locked, _rem) = self.lockout.record_failure(&username);
-            let remaining_attempts = {
-                let mut partials = self.partial_tokens.lock().unwrap();
-                if let Some(auth) = partials.get_mut(partial_token) {
-                    auth.failed_attempts += 1;
-                    MAX_TOTP_ATTEMPTS.saturating_sub(auth.failed_attempts)
-                } else {
-                    0
-                }
-            };
-            if locked {
-                // Account locked: consume the partial token as well.
-                self.partial_tokens.lock().unwrap().remove(partial_token);
-                return TotpVerifyResult::LockedOut {
-                    remaining_seconds: 15 * 60,
-                };
-            }
-            if remaining_attempts == 0 {
-                self.partial_tokens.lock().unwrap().remove(partial_token);
-            }
-            TotpVerifyResult::Invalid
+            return TotpVerifyResult::Success(session);
         }
+
+        // Failure: count it against both the partial token and the account lockout.
+        let (locked, _rem) = self.lockout.record_failure(&username);
+        let remaining_attempts = {
+            let mut partials = lock(&self.partial_tokens);
+            if let Some(auth) = partials.get_mut(partial_token) {
+                auth.failed_attempts += 1;
+                MAX_TOTP_ATTEMPTS.saturating_sub(auth.failed_attempts)
+            } else {
+                0
+            }
+        };
+        if locked {
+            // Account locked: consume the partial token as well.
+            lock(&self.partial_tokens).remove(partial_token);
+            return TotpVerifyResult::LockedOut {
+                remaining_seconds: 15 * 60,
+            };
+        }
+        if remaining_attempts == 0 {
+            lock(&self.partial_tokens).remove(partial_token);
+        }
+        TotpVerifyResult::Invalid
     }
 
-    /// Initiates TOTP setup for a user (`GET /auth/totp/setup`).
-    pub fn init_totp_setup(&self, username: &str) -> Option<TotpSetupResponse> {
-        let (config, resp) = TotpConfig::generate("sito", username);
+    /// Initiates TOTP setup for a user (`GET /auth/totp/setup`). Backup-code
+    /// hashing (Argon2) runs on the blocking pool.
+    pub async fn init_totp_setup(&self, username: &str) -> Option<TotpSetupResponse> {
+        let username_owned = username.to_string();
+        let (config, resp) =
+            tokio::task::spawn_blocking(move || TotpConfig::generate("sito", &username_owned))
+                .await
+                .ok()?;
+
         let now = Instant::now();
-        let mut pending = self.pending_totp_setups.lock().unwrap();
+        let mut pending = lock(&self.pending_totp_setups);
         if !pending.contains_key(username) && pending.len() >= MAX_PENDING_TOTP {
             pending.retain(|_, p| now.duration_since(p.created_at) <= PENDING_TOTP_TTL);
-            if pending.len() >= MAX_PENDING_TOTP
-                && let Some(oldest_key) = pending.keys().next().cloned()
-            {
+            while pending.len() >= MAX_PENDING_TOTP {
+                let Some(oldest_key) = pending
+                    .iter()
+                    .min_by_key(|(_, p)| p.created_at)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
                 pending.remove(&oldest_key);
             }
         }
@@ -877,9 +1174,9 @@ impl AuthManager {
     }
 
     /// Confirms and activates TOTP for a user using initial code verification.
-    pub fn confirm_totp_setup(&self, username: &str, code: &str) -> bool {
-        let mut pending = self.pending_totp_setups.lock().unwrap();
-        let Some(mut item) = pending.remove(username) else {
+    pub async fn confirm_totp_setup(&self, username: &str, code: &str) -> bool {
+        let item = lock(&self.pending_totp_setups).remove(username);
+        let Some(mut item) = item else {
             return false;
         };
 
@@ -887,24 +1184,82 @@ impl AuthManager {
             return false;
         }
 
-        if item.config.verify(code, username, "sito") {
-            item.config.enabled = true;
-            let mut users = self.users.lock().unwrap();
-            if let Some(user) = users.get_mut(username) {
-                user.totp = Some(item.config);
-                drop(users);
-                self.save_users();
-                // Changing the second factor invalidates existing sessions.
-                self.purge_user_sessions(username);
-                return true;
-            }
+        let _totp_guard = self.totp_verification_lock.lock().await;
+        let code_owned = code.to_string();
+        let username_owned = username.to_string();
+        let verified = tokio::task::spawn_blocking(move || {
+            let ok = item.config.verify(&code_owned, &username_owned, "sito");
+            (item.config, ok)
+        })
+        .await;
+
+        let Ok((mut config, ok)) = verified else {
+            return false;
+        };
+        if !ok {
+            return false;
         }
-        false
+
+        config.enabled = true;
+        {
+            let mut users = lock(&self.users);
+            let Some(user) = users.get_mut(username) else {
+                return false;
+            };
+            user.totp = Some(config);
+        }
+        self.save_users();
+        // Changing the second factor invalidates existing sessions.
+        self.purge_user_sessions(username);
+        true
+    }
+
+    /// Returns true when the user has TOTP enabled.
+    pub fn totp_enabled(&self, username: &str) -> bool {
+        lock(&self.users)
+            .get(username)
+            .and_then(|u| u.totp.as_ref())
+            .is_some_and(|t| t.enabled)
+    }
+
+    /// Verifies a TOTP or backup code for a user (used for re-authentication),
+    /// consuming a backup code on success.
+    pub async fn verify_second_factor(&self, username: &str, code: &str) -> bool {
+        let _totp_guard = self.totp_verification_lock.lock().await;
+        let totp = lock(&self.users).get(username).and_then(|u| u.totp.clone());
+        let Some(totp) = totp else {
+            return false;
+        };
+        if !totp.enabled {
+            return false;
+        }
+
+        let code_owned = code.to_string();
+        let username_owned = username.to_string();
+        let verified = tokio::task::spawn_blocking(move || {
+            let mut config = totp;
+            let ok = config.verify(&code_owned, &username_owned, "sito");
+            (config, ok)
+        })
+        .await;
+
+        let Ok((updated, ok)) = verified else {
+            return false;
+        };
+        if ok {
+            let mut users = lock(&self.users);
+            if let Some(user) = users.get_mut(username) {
+                user.totp = Some(updated);
+            }
+            drop(users);
+            self.save_users();
+        }
+        ok
     }
 
     /// Disables TOTP 2FA for a user and invalidates their sessions.
     pub fn disable_totp(&self, username: &str) -> bool {
-        let mut users = self.users.lock().unwrap();
+        let mut users = lock(&self.users);
         if let Some(user) = users.get_mut(username) {
             user.totp = None;
             drop(users);
@@ -918,7 +1273,7 @@ impl AuthManager {
 
     /// Validates an active session from a cookie.
     pub fn validate_session(&self, session_id: &str) -> Option<Session> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = lock(&self.sessions);
         if let Some(session) = sessions.get(session_id) {
             if session.is_expired() {
                 sessions.remove(session_id);
@@ -933,7 +1288,7 @@ impl AuthManager {
 
     /// Logs out and destroys an active session.
     pub fn logout(&self, session_id: &str) {
-        let removed = self.sessions.lock().unwrap().remove(session_id).is_some();
+        let removed = lock(&self.sessions).remove(session_id).is_some();
         if removed {
             self.save_sessions();
         }
@@ -948,22 +1303,33 @@ impl AuthManager {
                 .saturating_mul(86_400);
             meta.expires_at = Some(chrono::Utc::now().timestamp().saturating_add(ttl_secs));
         }
-        self.tokens
-            .lock()
-            .unwrap()
-            .insert(meta.hash.clone(), meta.clone());
+        let mut tokens = lock(&self.tokens);
+        let now = chrono::Utc::now().timestamp();
+        tokens.retain(|_, t| t.expires_at.is_none_or(|exp| now < exp));
+        while tokens.len() >= MAX_API_TOKENS {
+            let Some(oldest_key) = tokens
+                .iter()
+                .min_by_key(|(_, t)| (t.created_at, t.id.clone()))
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            tokens.remove(&oldest_key);
+        }
+        tokens.insert(meta.hash.clone(), meta.clone());
+        drop(tokens);
         self.save_tokens();
         (meta, resp)
     }
 
     /// Lists all active API tokens.
     pub fn list_tokens(&self) -> Vec<ApiTokenMeta> {
-        self.tokens.lock().unwrap().values().cloned().collect()
+        lock(&self.tokens).values().cloned().collect()
     }
 
     /// Revokes an API token by ID.
     pub fn delete_token(&self, id: &str) -> bool {
-        let mut tokens = self.tokens.lock().unwrap();
+        let mut tokens = lock(&self.tokens);
         if let Some(key) = tokens
             .iter()
             .find(|(_, m)| m.id == id)
@@ -982,7 +1348,7 @@ impl AuthManager {
     pub fn validate_token(&self, token: &str) -> Option<ApiTokenMeta> {
         let hash = hash_token(token);
         let hash_bytes = hash.as_bytes();
-        let mut tokens = self.tokens.lock().unwrap();
+        let mut tokens = lock(&self.tokens);
         let now = chrono::Utc::now().timestamp();
 
         let mut matched_key: Option<String> = None;
@@ -1014,11 +1380,12 @@ impl AuthManager {
         None
     }
 
-    /// Prunes expired sessions, partial tokens, pending TOTP setups, and lockout/rate limits.
+    /// Prunes expired sessions, partial tokens, pending TOTP setups, API
+    /// tokens and rate-limit state.
     pub fn prune(&self) {
         self.lockout.prune();
         let sessions_changed = {
-            let mut sessions = self.sessions.lock().unwrap();
+            let mut sessions = lock(&self.sessions);
             let before = sessions.len();
             sessions.retain(|_, s| !s.is_expired());
             sessions.len() != before
@@ -1028,7 +1395,7 @@ impl AuthManager {
         }
         let tokens_changed = {
             let now = chrono::Utc::now().timestamp();
-            let mut tokens = self.tokens.lock().unwrap();
+            let mut tokens = lock(&self.tokens);
             let before = tokens.len();
             tokens.retain(|_, t| t.expires_at.is_none_or(|exp| now < exp));
             tokens.len() != before
@@ -1038,13 +1405,25 @@ impl AuthManager {
         }
         {
             let now = Instant::now();
-            let mut pending = self.pending_totp_setups.lock().unwrap();
+            let mut pending = lock(&self.pending_totp_setups);
             pending.retain(|_, p| now.duration_since(p.created_at) <= PENDING_TOTP_TTL);
         }
         {
             let now = Instant::now();
-            let mut partials = self.partial_tokens.lock().unwrap();
+            let mut partials = lock(&self.partial_tokens);
             partials.retain(|_, p| now < p.expires_at);
+        }
+        {
+            let now = Instant::now();
+            let mut windows = lock(&self.setup_token_failures);
+            windows.retain(|_, w| now.duration_since(w.window_start) <= SETUP_TOKEN_RATE_WINDOW);
+        }
+        // Expire long-lived setup tokens (e.g. server left in setup mode).
+        let mut token = lock(&self.setup_token);
+        if let Some(ref entry) = *token
+            && entry.created_at.elapsed() > Duration::from_hours(24)
+        {
+            *token = None;
         }
     }
 
@@ -1074,22 +1453,22 @@ impl AuthManager {
 
     #[cfg(test)]
     pub fn sessions_len(&self) -> usize {
-        self.sessions.lock().unwrap().len()
+        lock(&self.sessions).len()
     }
 
     #[cfg(test)]
     pub fn partial_tokens_len(&self) -> usize {
-        self.partial_tokens.lock().unwrap().len()
+        lock(&self.partial_tokens).len()
     }
 
     #[cfg(test)]
     pub fn pending_totp_len(&self) -> usize {
-        self.pending_totp_setups.lock().unwrap().len()
+        lock(&self.pending_totp_setups).len()
     }
 
     #[cfg(test)]
     pub fn expire_session_for_test(&self, session_id: &str) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = lock(&self.sessions);
         if let Some(s) = sessions.get_mut(session_id) {
             s.expires_at = 0;
         }
@@ -1097,7 +1476,7 @@ impl AuthManager {
 
     #[cfg(test)]
     pub fn expire_partial_tokens_for_test(&self) {
-        let mut partials = self.partial_tokens.lock().unwrap();
+        let mut partials = lock(&self.partial_tokens);
         for auth in partials.values_mut() {
             auth.expires_at = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
         }
@@ -1105,7 +1484,7 @@ impl AuthManager {
 
     #[cfg(test)]
     pub fn expire_pending_totp_for_test(&self) {
-        let mut pending = self.pending_totp_setups.lock().unwrap();
+        let mut pending = lock(&self.pending_totp_setups);
         for p in pending.values_mut() {
             p.created_at = Instant::now()
                 .checked_sub(Duration::from_secs(1000))
@@ -1118,11 +1497,11 @@ impl AuthManager {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_auth_manager_login_and_session() {
+    #[tokio::test]
+    async fn test_auth_manager_login_and_session() {
         let mgr = AuthManager::new();
         // Login with default admin
-        match mgr.login("admin", "adminadmin", "127.0.0.1") {
+        match mgr.login("admin", "adminadmin", "127.0.0.1").await {
             LoginResult::Success(session) => {
                 assert_eq!(session.username, "admin");
                 assert_eq!(session.role, Role::Admin);
@@ -1134,50 +1513,71 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_auth_manager_totp_flow() {
+    #[tokio::test]
+    async fn test_unknown_user_and_wrong_password_are_rejected() {
         let mgr = AuthManager::new();
-        let setup = mgr.init_totp_setup("admin").expect("setup");
+        assert!(matches!(
+            mgr.login("ghost", "whatever", "127.0.0.1").await,
+            LoginResult::InvalidCredentials { .. }
+        ));
+        assert!(matches!(
+            mgr.login("admin", "wrongpassword", "127.0.0.1").await,
+            LoginResult::InvalidCredentials { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_auth_manager_totp_flow() {
+        let mgr = AuthManager::new();
+        let setup = mgr.init_totp_setup("admin").await.expect("setup");
 
         // Use backup code to confirm setup
-        assert!(mgr.confirm_totp_setup("admin", &setup.backup_codes[0]));
+        assert!(
+            mgr.confirm_totp_setup("admin", &setup.backup_codes[0])
+                .await
+        );
 
         // Login now requires TOTP
-        match mgr.login("admin", "adminadmin", "127.0.0.1") {
+        match mgr.login("admin", "adminadmin", "127.0.0.1").await {
             LoginResult::TotpRequired { partial_token } => {
                 // Invalid code fails
                 assert!(matches!(
-                    mgr.verify_totp(&partial_token, "000000", "127.0.0.1"),
+                    mgr.verify_totp(&partial_token, "000000", "127.0.0.1").await,
                     TotpVerifyResult::Invalid
                 ));
                 // Valid backup code succeeds
-                let session =
-                    match mgr.verify_totp(&partial_token, &setup.backup_codes[1], "127.0.0.1") {
-                        TotpVerifyResult::Success(session) => session,
-                        other => panic!("expected TOTP success, got {other:?}"),
-                    };
+                let session = match mgr
+                    .verify_totp(&partial_token, &setup.backup_codes[1], "127.0.0.1")
+                    .await
+                {
+                    TotpVerifyResult::Success(session) => session,
+                    other => panic!("expected TOTP success, got {other:?}"),
+                };
                 assert_eq!(session.role, Role::Admin);
             }
             _ => panic!("Expected TOTP required"),
         }
     }
 
-    #[test]
-    fn test_totp_bruteforce_attempt_limit() {
+    #[tokio::test]
+    async fn test_totp_bruteforce_attempt_limit() {
         // High IP rate limit so the per-account lockout/attempt cap is exercised.
         let mgr = AuthManager::with_config(24, 1000);
-        let setup = mgr.init_totp_setup("admin").expect("setup");
-        assert!(mgr.confirm_totp_setup("admin", &setup.backup_codes[0]));
+        let setup = mgr.init_totp_setup("admin").await.expect("setup");
+        assert!(
+            mgr.confirm_totp_setup("admin", &setup.backup_codes[0])
+                .await
+        );
 
         let LoginResult::TotpRequired { partial_token } =
-            mgr.login("admin", "adminadmin", "127.0.0.1")
+            mgr.login("admin", "adminadmin", "127.0.0.1").await
         else {
             panic!("Expected TOTP required");
         };
 
         let mut saw_terminal = false;
         for _ in 0..MAX_TOTP_ATTEMPTS {
-            match mgr.verify_totp(&partial_token, "000000", "127.0.0.1") {
+            match mgr.verify_totp(&partial_token, "000000", "127.0.0.1").await {
                 TotpVerifyResult::Invalid => {}
                 TotpVerifyResult::LockedOut { .. } => {
                     saw_terminal = true;
@@ -1193,13 +1593,14 @@ mod tests {
 
         // The partial token is consumed and cannot be used with a valid code.
         assert!(matches!(
-            mgr.verify_totp(&partial_token, &setup.backup_codes[1], "127.0.0.1"),
+            mgr.verify_totp(&partial_token, &setup.backup_codes[1], "127.0.0.1")
+                .await,
             TotpVerifyResult::TokenExpired | TotpVerifyResult::LockedOut { .. }
         ));
     }
 
-    #[test]
-    fn test_auth_manager_api_tokens() {
+    #[tokio::test]
+    async fn test_auth_manager_api_tokens() {
         let mgr = AuthManager::new();
         let (meta, resp) = mgr.create_token("grafana", Role::Viewer);
 
@@ -1214,7 +1615,58 @@ mod tests {
     }
 
     #[test]
-    fn test_user_persistence_across_restart() {
+    fn test_api_token_cap_evicts() {
+        let mgr = AuthManager::new();
+        for i in 0..(MAX_API_TOKENS + 5) {
+            mgr.create_token(&format!("tok-{i}"), Role::Viewer);
+        }
+        assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
+    }
+
+    #[test]
+    fn test_setup_token_lifecycle_and_rate_limit() {
+        let mgr = AuthManager::with_storage(
+            std::env::temp_dir().join(format!("sito_setup_tok_{}", rand::random::<u64>())),
+            24,
+            5,
+        )
+        .unwrap();
+        assert!(mgr.setup_token_required());
+
+        // Unknown tokens are rejected and throttled.
+        assert_eq!(
+            mgr.validate_setup_token(Some("wrong"), "198.51.100.7"),
+            SetupTokenStatus::Invalid
+        );
+        for _ in 0..MAX_SETUP_TOKEN_FAILURES {
+            let _ = mgr.validate_setup_token(Some("wrong"), "198.51.100.7");
+        }
+        assert_eq!(
+            mgr.validate_setup_token(Some("wrong"), "198.51.100.7"),
+            SetupTokenStatus::RateLimited
+        );
+
+        // The actual token is valid (need to read it from state in tests).
+        let token = lock(&mgr.setup_token)
+            .as_ref()
+            .map(|t| t.token.clone())
+            .expect("token provisioned");
+        assert_eq!(
+            mgr.validate_setup_token(Some(&token), "198.51.100.8"),
+            SetupTokenStatus::Valid
+        );
+
+        // Consuming invalidates it.
+        mgr.consume_setup_token();
+        assert!(!mgr.setup_token_required());
+        assert_eq!(
+            mgr.validate_setup_token(Some(&token), "198.51.100.8"),
+            SetupTokenStatus::Missing
+        );
+    }
+
+    #[tokio::test]
+    async fn test_user_persistence_across_restart() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_auth_test_{}", rand::random::<u64>()));
         let _ = std::fs::create_dir_all(&temp_dir);
@@ -1224,15 +1676,19 @@ mod tests {
             assert!(mgr.is_first_run());
 
             // Change admin password
-            assert!(mgr.update_user_password("admin", "newsecret123"));
+            assert!(mgr.update_user_password("admin", "newsecret123").await);
             assert!(!mgr.is_first_run());
 
             // Create operator user
-            mgr.create_user("operator1", "oppassword", Role::Operator);
+            mgr.create_user("operator1", "oppassword", Role::Operator)
+                .await;
 
             // Setup TOTP for operator1
-            let setup = mgr.init_totp_setup("operator1").expect("totp setup");
-            assert!(mgr.confirm_totp_setup("operator1", &setup.backup_codes[0]));
+            let setup = mgr.init_totp_setup("operator1").await.expect("totp setup");
+            assert!(
+                mgr.confirm_totp_setup("operator1", &setup.backup_codes[0])
+                    .await
+            );
         }
 
         // Simulate server restart by creating a new AuthManager pointing to same directory
@@ -1241,13 +1697,13 @@ mod tests {
             assert!(!mgr.is_first_run());
 
             // Old default credentials must FAIL
-            match mgr.login("admin", "adminadmin", "127.0.0.1") {
+            match mgr.login("admin", "adminadmin", "127.0.0.1").await {
                 LoginResult::InvalidCredentials { .. } => {}
                 other => panic!("expected invalid credentials, got {other:?}"),
             }
 
             // New password must SUCCEED
-            match mgr.login("admin", "newsecret123", "127.0.0.1") {
+            match mgr.login("admin", "newsecret123", "127.0.0.1").await {
                 LoginResult::Success(session) => {
                     assert_eq!(session.username, "admin");
                     assert_eq!(session.role, Role::Admin);
@@ -1256,7 +1712,7 @@ mod tests {
             }
 
             // Operator must exist and require TOTP
-            match mgr.login("operator1", "oppassword", "127.0.0.1") {
+            match mgr.login("operator1", "oppassword", "127.0.0.1").await {
                 LoginResult::TotpRequired { .. } => {}
                 other => panic!("expected TotpRequired, got {other:?}"),
             }
@@ -1323,8 +1779,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    #[test]
-    fn test_reset_admin_credentials() {
+    #[tokio::test]
+    async fn test_reset_admin_credentials() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_auth_reset_test_{}", rand::random::<u64>()));
         let _ = std::fs::create_dir_all(&temp_dir);
@@ -1332,7 +1788,7 @@ mod tests {
         // First bootstrap
         {
             let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
-            mgr.update_user_password("admin", "firstpassword");
+            mgr.update_user_password("admin", "firstpassword").await;
         }
 
         // Corrupt the users file
@@ -1347,7 +1803,7 @@ mod tests {
 
         // Now loading with_storage must succeed
         let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
-        match mgr.login("admin", "newpassword_reset", "127.0.0.1") {
+        match mgr.login("admin", "newpassword_reset", "127.0.0.1").await {
             LoginResult::Success(session) => {
                 assert_eq!(session.username, "admin");
                 assert_eq!(session.role, Role::Admin);
@@ -1362,14 +1818,15 @@ mod tests {
     async fn test_prune_expired_entries() {
         let mgr = Arc::new(AuthManager::new());
         // 1. Create a session and expire it
-        let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1") else {
+        let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
             panic!("login failed");
         };
         assert_eq!(mgr.sessions_len(), 1);
         mgr.expire_session_for_test(&session.id);
 
         // 2. Create pending totp and expire it
-        mgr.init_totp_setup("admin");
+        mgr.init_totp_setup("admin").await;
         assert_eq!(mgr.pending_totp_len(), 1);
         mgr.expire_pending_totp_for_test();
 
@@ -1388,15 +1845,15 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn test_session_persistence_across_restart() {
+    #[tokio::test]
+    async fn test_session_persistence_across_restart() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_sess_test_{}", rand::random::<u64>()));
         let _ = std::fs::create_dir_all(&temp_dir);
 
         let session_id = {
             let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
-            let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1")
+            let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1").await
             else {
                 panic!("login failed");
             };
@@ -1405,7 +1862,11 @@ mod tests {
 
         // Restart: session must still validate and the file must be 0600.
         let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
-        assert!(mgr.validate_session(&session_id).is_some());
+        let restored = mgr.validate_session(&session_id).expect("session restored");
+        assert!(
+            !restored.csrf_token.is_empty(),
+            "legacy sessions get a CSRF token on load"
+        );
 
         let sessions_file = temp_dir.join("sessions.toml");
         assert!(sessions_file.exists());
@@ -1476,7 +1937,7 @@ mod tests {
         let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
         let (mut meta, resp) = mgr.create_token("expired", Role::Viewer);
         meta.expires_at = Some(chrono::Utc::now().timestamp() - 10);
-        mgr.tokens.lock().unwrap().insert(meta.hash.clone(), meta);
+        lock(&mgr.tokens).insert(meta.hash.clone(), meta);
         mgr.save_tokens();
         drop(mgr);
 
@@ -1494,7 +1955,7 @@ mod tests {
         // Bootstrap a valid manager, then corrupt the sessions file.
         {
             let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
-            let _ = mgr.login("admin", "adminadmin", "127.0.0.1");
+            drop(mgr);
         }
         std::fs::write(temp_dir.join("sessions.toml"), "not = [valid toml").unwrap();
 
@@ -1525,11 +1986,24 @@ mod tests {
             0,
         )
         .unwrap();
-        let LoginResult::Success(_session) = mgr.login("admin", "adminadmin", "127.0.0.1") else {
-            panic!("login failed");
-        };
         assert!(!temp_dir.join("sessions.toml").exists());
+        drop(mgr);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_lock_recovery_after_poisoning() {
+        let mgr = AuthManager::new();
+        let users = mgr.users.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = users.lock().unwrap();
+            panic!("poison the users lock");
+        }));
+        // The manager must keep working instead of panicking.
+        assert!(mgr.has_user("admin"));
+        let (meta, resp) = mgr.create_token("post-poison", Role::Viewer);
+        assert!(mgr.validate_token(&resp.token).is_some());
+        assert!(mgr.delete_token(&meta.id));
     }
 }
