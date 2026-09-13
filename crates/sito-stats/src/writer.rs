@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tracing::error;
+use tracing::{error, warn};
 
 /// Default capacity for bounded query log channel per plan section 14.1.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 10_000;
@@ -15,6 +15,54 @@ pub const DEFAULT_CHANNEL_CAPACITY: usize = 10_000;
 pub const BATCH_SIZE_THRESHOLD: usize = 1000;
 /// Batch time interval before flushing accumulated entries to disk.
 pub const BATCH_TIME_INTERVAL: Duration = Duration::from_secs(5);
+/// Maximum attempts to persist a batch before dropping it and counting the loss.
+const MAX_FLUSH_ATTEMPTS: u32 = 3;
+/// Delay between failed flush attempts.
+const FLUSH_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Persists `batch`, retrying transient SQLite failures a bounded number of
+/// times. On persistent failure the entries are dropped and counted in
+/// `dropped_total` so data loss is observable instead of silent.
+async fn flush_batch(
+    db: &StatsDb,
+    batch: &mut Vec<QueryLogEntry>,
+    dropped_total: &AtomicU64,
+    reason: &'static str,
+) {
+    if batch.is_empty() {
+        return;
+    }
+
+    let mut attempt = 1u32;
+    loop {
+        match db.insert_batch(batch).await {
+            Ok(()) => {
+                batch.clear();
+                return;
+            }
+            Err(e) if attempt < MAX_FLUSH_ATTEMPTS => {
+                warn!(
+                    attempt,
+                    max_attempts = MAX_FLUSH_ATTEMPTS,
+                    error = %e,
+                    "Failed to flush query log batch ({reason}); retrying"
+                );
+                tokio::time::sleep(FLUSH_RETRY_DELAY).await;
+                attempt += 1;
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    dropped = batch.len(),
+                    "Failed to flush query log batch ({reason}) after {attempt} attempts; dropping entries"
+                );
+                dropped_total.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                batch.clear();
+                return;
+            }
+        }
+    }
+}
 
 enum WriterCommand {
     Entry(Box<QueryLogEntry>),
@@ -26,6 +74,8 @@ enum WriterCommand {
 #[derive(Clone)]
 pub struct QueryLogSender {
     tx: mpsc::Sender<WriterCommand>,
+    /// Entries dropped by the pipeline: channel backpressure plus batches whose
+    /// SQLite flush failed after bounded retries.
     dropped_total: Arc<AtomicU64>,
     live_tail_tx: broadcast::Sender<QueryLogEntry>,
     anonymize: Arc<AtomicBool>,
@@ -64,7 +114,9 @@ impl QueryLogSender {
         self.anonymize.store(enabled, Ordering::Relaxed);
     }
 
-    /// Returns the total number of dropped query log events due to channel backpressure.
+    /// Returns the total number of query log events dropped, either because the
+    /// ingest channel was full or because a SQLite batch flush failed after
+    /// bounded retries.
     pub fn dropped_total(&self) -> u64 {
         self.dropped_total.load(Ordering::Relaxed)
     }
@@ -134,49 +186,26 @@ impl QueryLogWriter {
                                 }
                                 batch.push(*entry);
                                 if batch.len() >= BATCH_SIZE_THRESHOLD {
-                                    if let Err(e) = db.insert_batch(&batch).await {
-                                        error!("Failed to flush query log batch: {}", e);
-                                    }
-                                    batch.clear();
+                                    flush_batch(&db, &mut batch, &dropped_total, "size threshold").await;
                                 }
                             }
                             Some(WriterCommand::Flush(ack)) => {
-                                if !batch.is_empty() {
-                                    if let Err(e) = db.insert_batch(&batch).await {
-                                        error!("Failed to flush query log batch on flush: {}", e);
-                                    }
-                                    batch.clear();
-                                }
+                                flush_batch(&db, &mut batch, &dropped_total, "explicit flush").await;
                                 let _ = ack.send(());
                             }
                             Some(WriterCommand::Shutdown(ack)) => {
-                                if !batch.is_empty() {
-                                    if let Err(e) = db.insert_batch(&batch).await {
-                                        error!("Failed to flush query log batch on shutdown: {}", e);
-                                    }
-                                    batch.clear();
-                                }
+                                flush_batch(&db, &mut batch, &dropped_total, "shutdown").await;
                                 let _ = ack.send(());
                                 break;
                             }
                             None => {
-                                if !batch.is_empty() {
-                                    if let Err(e) = db.insert_batch(&batch).await {
-                                        error!("Failed to flush query log batch on channel close: {}", e);
-                                    }
-                                    batch.clear();
-                                }
+                                flush_batch(&db, &mut batch, &dropped_total, "channel close").await;
                                 break;
                             }
                         }
                     }
                     _ = interval.tick() => {
-                        if !batch.is_empty() {
-                            if let Err(e) = db.insert_batch(&batch).await {
-                                error!("Failed to flush query log batch on tick: {}", e);
-                            }
-                            batch.clear();
-                        }
+                        flush_batch(&db, &mut batch, &dropped_total, "timer tick").await;
                     }
                 }
             }
