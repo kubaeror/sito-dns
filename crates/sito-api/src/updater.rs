@@ -329,11 +329,15 @@ pub struct CosignVerifier {
 }
 
 impl CosignVerifier {
-    /// Creates a verifier that requires the signature identity to belong to the
-    /// given GitHub repository's release workflow.
+    /// Creates a verifier that requires the signature identity to be this
+    /// repository's release workflow on a tag ref. A repo-wide `.*` pattern
+    /// would also accept signatures minted by any other (or future) workflow
+    /// with OIDC access.
     pub fn new(repo: &str) -> Self {
         Self {
-            identity_regexp: format!("https://github.com/{repo}/.*"),
+            identity_regexp: format!(
+                "^https://github.com/{repo}/\\.github/workflows/release\\.yml@refs/tags/.*$"
+            ),
         }
     }
 
@@ -938,6 +942,21 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
                 Err(_) => Err(UpdateError::SignatureInvalid("mock failure".to_string())),
             }
         }
+    }
+
+    #[test]
+    fn test_cosign_identity_is_pinned_to_release_workflow_tags() {
+        let verifier = CosignVerifier::new("kubaeror/sito-dns");
+        // Must not accept signatures from arbitrary repo workflows/branches.
+        assert!(
+            verifier
+                .identity_regexp
+                .contains("\\.github/workflows/release\\.yml@refs/tags/"),
+            "identity regexp must pin the release workflow and tag refs: {}",
+            verifier.identity_regexp
+        );
+        assert!(verifier.identity_regexp.starts_with('^'));
+        assert!(verifier.identity_regexp.ends_with('$'));
     }
 
     #[tokio::test]

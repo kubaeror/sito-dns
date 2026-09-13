@@ -364,8 +364,10 @@ pub struct ServerConfig {
     #[serde(default = "default_server_log_format")]
     pub log_format: String,
     /// Require a verified release signature (cosign) for in-app updates.
-    /// Default: false (checksum-only) until signed releases are guaranteed.
-    #[serde(default)]
+    /// Default: true. A signature that is present is always verified; with
+    /// this disabled, a missing signature falls back to same-origin SHA-256
+    /// only, which does not protect against a compromised release channel.
+    #[serde(default = "default_true")]
     pub update_require_signature: bool,
 }
 
@@ -393,7 +395,7 @@ impl Default for ServerConfig {
             data_dir: default_server_data_dir(),
             log_level: default_server_log_level(),
             log_format: default_server_log_format(),
-            update_require_signature: false,
+            update_require_signature: true,
         }
     }
 }

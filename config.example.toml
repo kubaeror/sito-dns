@@ -6,8 +6,8 @@ instance_name = "sito-main"
 data_dir = "/var/lib/sito"
 log_level = "info"
 log_format = "pretty"
-# Require cosign-verified release signatures for in-app updates
-# update_require_signature = false
+# Require cosign-verified release signatures for in-app updates (default true)
+# update_require_signature = true
 
 [dns]
 bind = ["0.0.0.0", "::"]
