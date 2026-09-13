@@ -74,6 +74,16 @@ pub fn recv_with_pktinfo(
         return Err(std::io::Error::last_os_error());
     }
 
+    // The kernel sets MSG_TRUNC when the datagram was larger than `buf` and
+    // was silently clamped. Report it instead of handing a partial message to
+    // the caller (which could desynchronize DNS parsing).
+    if msg.msg_flags & libc::MSG_TRUNC != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "datagram larger than the receive buffer (MSG_TRUNC)",
+        ));
+    }
+
     let src_addr = sockaddr_to_socket_addr(&src_storage)?;
     let mut dst_ip = None;
 

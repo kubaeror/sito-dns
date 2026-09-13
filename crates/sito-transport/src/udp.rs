@@ -7,6 +7,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::watch::Receiver;
 use tracing::{debug, error, info, trace, warn};
@@ -17,6 +18,26 @@ use sito_proto::{client_edns_payload_size, decode_message, encode_message, set_e
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
 use crate::pktinfo::{enable_pktinfo, recv_with_pktinfo, send_with_pktinfo};
+
+/// Size of the per-worker receive buffer for inbound UDP datagrams.
+const UDP_RECV_BUFFER_SIZE: usize = 4096;
+
+/// Backoff applied after a transient receive error before retrying.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Whether a failed `recvmsg` is transient (EINTR, ENOBUFS, ICMP-induced
+/// connection errors) and the worker should retry rather than exit.
+fn is_transient_recv_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::OutOfMemory
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+    ) || err.raw_os_error() == Some(libc::ENOBUFS)
+}
 
 /// Options for configuring a UDP listener instance.
 #[derive(Debug, Clone)]
@@ -105,7 +126,7 @@ pub fn start_udp_listener<H: QueryHandler>(
         );
 
         let handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
+            let mut buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
             let fd = async_fd.get_ref().as_raw_fd();
 
             loop {
@@ -159,7 +180,10 @@ pub fn start_udp_listener<H: QueryHandler>(
                                     tokio::spawn(async move {
                                         let _permit = permit;
                                         let fd = async_fd.get_ref().as_raw_fd();
+                                        // Never amplify beyond the configured server maximum:
+                                        // the effective bound is min(client-advertised, configured).
                                         let client_max_payload = client_edns_payload_size(&query);
+                                        let max_payload = client_max_payload.min(edns_udp_size);
                                         let resp = handler.handle(query, ClientContext::new(client_ip)).await;
 
                                         if let Some(mut response) = resp {
@@ -176,12 +200,14 @@ pub fn start_udp_listener<H: QueryHandler>(
                                                 }
                                             };
 
-                                            // If answer exceeds client buffer, truncate (TC=1)
-                                            if encoded.len() > client_max_payload as usize {
+                                            // If answer exceeds the negotiated payload, truncate (TC=1)
+                                            if encoded.len() > max_payload as usize {
                                                 debug!(
-                                                    "Response size {} exceeds client max payload {}, setting TC=1",
+                                                    "Response size {} exceeds negotiated max payload {} (client {}, server {}), setting TC=1",
                                                     encoded.len(),
-                                                    client_max_payload
+                                                    max_payload,
+                                                    client_max_payload,
+                                                    edns_udp_size
                                                 );
                                                 let mut truncated = response.truncate();
                                                 if truncated.edns.is_some() {
@@ -202,8 +228,22 @@ pub fn start_udp_listener<H: QueryHandler>(
                                     guard.clear_ready();
                                     break;
                                 }
+                                // Oversized datagrams are dropped: the kernel consumed
+                                // them already, so the worker can keep serving.
+                                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                                    debug!("UDP worker #{} dropping malformed/oversized datagram: {}", worker_id, e);
+                                }
+                                // Transient socket errors (EINTR, ENOBUFS, ICMP) must not
+                                // kill the worker; retry with a small backoff.
+                                Err(e) if is_transient_recv_error(&e) => {
+                                    warn!(
+                                        "UDP worker #{} transient recv error: {}; retrying after {:?}",
+                                        worker_id, e, RECV_ERROR_BACKOFF
+                                    );
+                                    tokio::time::sleep(RECV_ERROR_BACKOFF).await;
+                                }
                                 Err(e) => {
-                                    warn!("UDP recv error: {}", e);
+                                    warn!("UDP worker #{} fatal recv error: {}; stopping", worker_id, e);
                                     break;
                                 }
                             }
@@ -217,4 +257,28 @@ pub fn start_udp_listener<H: QueryHandler>(
     }
 
     Ok(tasks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transient_recv_errors_are_retried() {
+        assert!(is_transient_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::Interrupted
+        )));
+        assert!(is_transient_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::OutOfMemory
+        )));
+        assert!(is_transient_recv_error(&std::io::Error::from_raw_os_error(
+            libc::ENOBUFS
+        )));
+        assert!(!is_transient_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::InvalidInput
+        )));
+        assert!(!is_transient_recv_error(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+    }
 }

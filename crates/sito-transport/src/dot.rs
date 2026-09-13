@@ -15,7 +15,15 @@ use sito_proto::{DOT_PADDING_BLOCK_SIZE, apply_dot_padding, decode_message, enco
 
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
+use crate::tcp::{MAX_PIPELINED_QUERIES, frame_prefix};
 use crate::tls::TlsAcceptorManager;
+
+/// Bounded wait for the TLS handshake; slowloris clients must not hold a
+/// connection permit indefinitely.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on a single write/flush operation to a client.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configuration options for the DoT listener.
 #[derive(Clone)]
@@ -126,10 +134,18 @@ async fn handle_dot_connection<H: QueryHandler>(
     handler: Arc<H>,
     config: DotConfig,
 ) -> std::io::Result<()> {
-    let tls_stream = match acceptor.accept(stream).await {
-        Ok(s) => s,
-        Err(e) => {
+    let tls_stream = match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             debug!("DoT TLS handshake failed for {}: {}", peer_addr, e);
+            return Ok(());
+        }
+        Err(_) => {
+            debug!(
+                "DoT TLS handshake timed out after {}s for {}",
+                TLS_HANDSHAKE_TIMEOUT.as_secs(),
+                peer_addr
+            );
             return Ok(());
         }
     };
@@ -157,17 +173,50 @@ async fn handle_dot_connection<H: QueryHandler>(
     let (mut reader, mut writer) = tokio::io::split(tls_stream);
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
 
-    // Writer task
+    // Writer task. Frames are u16 length-prefixed; oversized responses are
+    // dropped rather than wrapped around.
     let write_task = tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
-            let len = bytes.len() as u16;
-            writer.write_all(&len.to_be_bytes()).await?;
-            writer.write_all(&bytes).await?;
-            writer.flush().await?;
+            let Some(len) = frame_prefix(bytes.len()) else {
+                warn!(
+                    "DoT response of {} bytes exceeds the 65535-byte DNS-over-TCP limit; dropping",
+                    bytes.len()
+                );
+                continue;
+            };
+            let write_res = timeout(WRITE_TIMEOUT, async {
+                writer.write_all(&len).await?;
+                writer.write_all(&bytes).await?;
+                writer.flush().await?;
+                Ok::<(), std::io::Error>(())
+            })
+            .await;
+            match write_res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    warn!(
+                        "DoT write to {} timed out after {}s; closing connection",
+                        peer_addr,
+                        WRITE_TIMEOUT.as_secs()
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "DoT write timeout",
+                    ));
+                }
+            }
         }
         let _ = writer.shutdown().await;
         Ok::<(), std::io::Error>(())
     });
+
+    // Bound in-flight pipelined queries per connection (same cap as TCP).
+    let pipeline_semaphore = Arc::new(Semaphore::new(
+        config
+            .max_queries_per_connection
+            .clamp(1, MAX_PIPELINED_QUERIES),
+    ));
 
     let conn_start = Instant::now();
     let mut query_count = 0usize;
@@ -211,7 +260,13 @@ async fn handle_dot_connection<H: QueryHandler>(
         };
 
         if read_len == 0 {
-            continue;
+            // Zero-length frames are a protocol violation; close instead of
+            // spinning on the 00 00 prefix.
+            debug!(
+                "DoT client {} sent a zero-length frame; closing connection",
+                peer_addr
+            );
+            break;
         }
 
         let mut msg_buf = vec![0u8; read_len];
@@ -241,9 +296,13 @@ async fn handle_dot_connection<H: QueryHandler>(
         let tx = tx.clone();
         let client_ctx = client_ctx.clone();
         let dot_padding = config.dot_padding;
+        let Ok(pipeline_permit) = Arc::clone(&pipeline_semaphore).acquire_owned().await else {
+            break;
+        };
 
-        // Pipelining: handle query concurrently
+        // Pipelining: handle query concurrently, bounded by the per-connection cap
         tokio::spawn(async move {
+            let _permit = pipeline_permit;
             if let Some(mut response) = handler.handle(query, client_ctx).await {
                 if dot_padding {
                     let _ = apply_dot_padding(&mut response, DOT_PADDING_BLOCK_SIZE);
