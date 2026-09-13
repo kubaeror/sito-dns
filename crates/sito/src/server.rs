@@ -27,12 +27,6 @@ use sito_upstream::{BootstrapResolver, UpstreamManager};
 
 use crate::pipeline::DnsPipeline;
 
-#[derive(serde::Deserialize, Default)]
-pub(crate) struct IntegrationsConfig {
-    mikrotik: Option<sito_clients::RouterOsConfig>,
-    lists: Option<sito_clients::ListCategoriesConfig>,
-}
-
 /// Parses the optional `[clients]` section, surfacing type errors instead of
 /// silently discarding all client policies.
 pub(crate) fn clients_from_config(config: &Config) -> anyhow::Result<sito_clients::ClientsConfig> {
@@ -61,11 +55,11 @@ pub(crate) fn rewrites_from_config(
 /// Parses the optional `[integrations]` section, surfacing type errors.
 pub(crate) fn integrations_from_config(
     config: &Config,
-) -> anyhow::Result<Option<IntegrationsConfig>> {
+) -> anyhow::Result<Option<sito_clients::IntegrationsConfig>> {
     match config.integrations.as_ref() {
         Some(value) => value
             .clone()
-            .try_into::<IntegrationsConfig>()
+            .try_into::<sito_clients::IntegrationsConfig>()
             .map(Some)
             .map_err(|e| anyhow::anyhow!("invalid [integrations] configuration: {e}")),
         None => Ok(None),
@@ -75,37 +69,12 @@ pub(crate) fn integrations_from_config(
 /// Validates every TOML-valued configuration section at startup and in
 /// `check-config`, so a type error aborts instead of silently falling back to
 /// defaults (which could drop trusted proxies, client policies or HA settings).
+///
+/// The implementation is shared with the API write paths
+/// (`sito_api::config_validation`) so an accepted configuration is always one
+/// the server can load.
 pub fn validate_typed_sections(config: &Config) -> anyhow::Result<()> {
-    clients_from_config(config)?;
-    rewrites_from_config(config)?;
-    integrations_from_config(config)?;
-
-    if let Some(ref value) = config.web {
-        value
-            .clone()
-            .try_into::<sito_core::config::WebConfig>()
-            .map_err(|e| anyhow::anyhow!("invalid [web] configuration: {e}"))?;
-    }
-    if let Some(ref value) = config.auth {
-        value
-            .clone()
-            .try_into::<sito_core::config::AuthConfig>()
-            .map_err(|e| anyhow::anyhow!("invalid [auth] configuration: {e}"))?;
-    }
-    if let Some(ref value) = config.stats {
-        value
-            .clone()
-            .try_into::<sito_core::config::StatsConfig>()
-            .map_err(|e| anyhow::anyhow!("invalid [stats] configuration: {e}"))?;
-    }
-    if let Some(ref value) = config.ha {
-        let ha_cfg = sito_ha::HaConfig::from_toml_value(value)
-            .map_err(|e| anyhow::anyhow!("invalid [ha] configuration: {e}"))?;
-        ha_cfg
-            .validate(&config.server.role)
-            .map_err(|e| anyhow::anyhow!("invalid [ha] configuration: {e}"))?;
-    }
-    Ok(())
+    sito_api::config_validation::validate_typed_sections(config)
 }
 
 /// Query-log writer channel capacity (entries).
