@@ -311,6 +311,50 @@ fn test_m9_example_config_is_valid() {
     config
         .validate()
         .expect("example config must pass validation");
+    sito::server::validate_typed_sections(&config)
+        .expect("example config must pass typed section validation");
+}
+
+#[test]
+fn test_m9_check_config_rejects_invalid_typed_sections() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_check_typed_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // `ids` must be an array; a string previously caused the whole [clients]
+    // section to be silently discarded.
+    let bad_clients = temp_dir.join("bad_clients.toml");
+    fs::write(
+        &bad_clients,
+        "config_version = 1\n[server]\nrole = \"master\"\n[clients]\n[[clients.entries]]\nname = \"x\"\nids = \"not-a-list\"\n",
+    )
+    .unwrap();
+    let err = sito::cli::run_check_config(&bad_clients).expect_err("invalid clients must fail");
+    assert!(
+        err.to_string().contains("clients"),
+        "error should name the clients section: {err}"
+    );
+
+    // `[web]` bind must be a single IP, not an array.
+    let bad_web = temp_dir.join("bad_web.toml");
+    fs::write(
+        &bad_web,
+        "config_version = 1\n[server]\nrole = \"master\"\n[web]\nbind = [\"127.0.0.1\"]\n",
+    )
+    .unwrap();
+    let err = sito::cli::run_check_config(&bad_web).expect_err("invalid web must fail");
+    assert!(
+        err.to_string().contains("web"),
+        "error should name the web section: {err}"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
@@ -382,18 +426,12 @@ fn test_m9_release_configuration_and_systemd() {
 
     let cargo_content = fs::read_to_string(&cargo_toml_path).expect("read Cargo.toml");
 
-    // Verify workspace version is at least 1.0.0
+    // The workspace version must match the crate version so release metadata
+    // can never drift from the packaged version.
     assert!(
-        cargo_content.contains("version = \"1.5.0\"")
-            || cargo_content.contains("version = \"1.4.0\"")
-            || cargo_content.contains("version = \"1.3.0\"")
-            || cargo_content.contains("version = \"1.2.1\"")
-            || cargo_content.contains("version = \"1.2.0\"")
-            || cargo_content.contains("version = \"1.1.1\"")
-            || cargo_content.contains("version = \"1.1.0\"")
-            || cargo_content.contains("version = \"1.0.1\"")
-            || cargo_content.contains("version = \"1.0.0\""),
-        "Workspace package version must be at least 1.0.0"
+        cargo_content.contains(&format!("version = \"{}\"", env!("CARGO_PKG_VERSION"))),
+        "Workspace package version must match sito-test (expected {})",
+        env!("CARGO_PKG_VERSION")
     );
 
     // Verify release profile optimization

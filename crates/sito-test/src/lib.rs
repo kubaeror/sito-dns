@@ -5,7 +5,7 @@ pub mod harness;
 pub mod mock;
 
 pub use client::{DotConnection, TestDnsClient};
-pub use harness::{TestServerInstance, generate_expired_test_cert, generate_test_cert};
+pub use harness::{TestServerInstance, generate_expired_test_cert, generate_test_cert, wait_until};
 pub use mock::MockDnsServer;
 
 #[cfg(test)]
@@ -289,6 +289,7 @@ mod tests {
         .unwrap();
 
         let mut config = Config::default();
+        config.server.data_dir = temp_dir.clone();
         config.filtering.lists = vec![FilterListConfig {
             name: "local_hosts".to_string(),
             url: format!("file://{}", hosts_file.display()),
@@ -544,9 +545,9 @@ mod tests {
         let server = TestServerInstance::spawn(config).await.unwrap();
         let client = server.client();
 
-        // Query 1: sigok -> NOERROR with AD=1
+        // Query 1: sigok -> NOERROR with AD=1 (DO=1 so AD is returned)
         let resp_ok = client
-            .query_udp("sigok.example.com", RecordType::A)
+            .query_udp_dnssec("sigok.example.com", RecordType::A)
             .await
             .unwrap();
         assert_eq!(
@@ -581,6 +582,94 @@ mod tests {
             !resp_nta.metadata.authentic_data,
             "AD bit must not be set for NTA bypassed zone"
         );
+
+        server.shutdown().await.unwrap();
+    }
+
+    /// 10b. Acceptance test: CD=1 bypasses validation, AD requires DO/AD opt-in
+    #[tokio::test]
+    async fn test_acceptance_dnssec_cd_and_ad_flags() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use hickory_proto::dnssec::PublicKey;
+        use hickory_proto::dnssec::rdata::DNSSECRData;
+        use hickory_proto::rr::Record;
+        use sito_dnssec::test_util::create_test_signed_domain;
+
+        let mock_upstream = MockDnsServer::spawn().await.unwrap();
+
+        // Secure domain: AD=1 only when the client signals DNSSEC awareness.
+        let (origin_secure, dnskey, a_record, rrsig_record, _) =
+            create_test_signed_domain("cdok.example.com.");
+        let pubkey_secure = BASE64_STANDARD.encode(dnskey.public_key().public_bytes());
+        mock_upstream.add_custom_response(
+            "cdok.example.com",
+            RecordType::A,
+            vec![a_record, rrsig_record],
+            vec![Record::from_rdata(
+                origin_secure.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)),
+            )],
+        );
+
+        // Bogus domain: tampered answer would SERVFAIL without CD.
+        let (origin_bogus, dnskey_bogus, _a_orig, rrsig_bogus, _) =
+            create_test_signed_domain("cdfail.example.com.");
+        let pubkey_bogus = BASE64_STANDARD.encode(dnskey_bogus.public_key().public_bytes());
+        let tampered = Record::from_rdata(
+            origin_bogus.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(9, 9, 9, 9))),
+        );
+        mock_upstream.add_custom_response(
+            "cdfail.example.com",
+            RecordType::A,
+            vec![tampered, rrsig_bogus],
+            vec![Record::from_rdata(
+                origin_bogus,
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey_bogus)),
+            )],
+        );
+
+        let mut config = Config::default();
+        config.upstream.servers = vec![mock_upstream.addr().to_string()];
+        config.dns.dnssec.validate = true;
+        config.dns.dnssec.mode = "validate".to_string();
+        config.dns.dnssec.trust_anchors = vec![
+            format!("cdok.example.com.:13:{pubkey_secure}"),
+            format!("cdfail.example.com.:13:{pubkey_bogus}"),
+        ];
+
+        let server = TestServerInstance::spawn(config).await.unwrap();
+        let client = server.client();
+
+        // No DO/AD requested -> answer must not carry AD.
+        let resp_plain = client
+            .query_udp("cdok.example.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_plain.metadata.response_code,
+            hickory_proto::op::ResponseCode::NoError
+        );
+        assert!(
+            !resp_plain.metadata.authentic_data,
+            "AD must be cleared for clients that did not request DNSSEC"
+        );
+
+        // CD=1 -> validation is skipped, no SERVFAIL and no AD.
+        let resp_cd = client
+            .query_udp_cd("cdfail.example.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_cd.metadata.response_code,
+            hickory_proto::op::ResponseCode::NoError,
+            "CD=1 must bypass DNSSEC SERVFAIL"
+        );
+        assert!(!resp_cd.metadata.authentic_data);
 
         server.shutdown().await.unwrap();
     }
@@ -629,9 +718,6 @@ mod tests {
         tokio::fs::write(&cert_file, cert2_pem).await.unwrap();
         tokio::fs::write(&key_file, key2_pem).await.unwrap();
 
-        // Allow cert watcher debouncer / fs event to process
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
         // 3. Existing persistent connection STILL works and serves queries!
         let resp2 = conn.query("reload.test", RecordType::A).await.unwrap();
         assert_eq!(
@@ -639,7 +725,23 @@ mod tests {
             hickory_proto::op::ResponseCode::NoError
         );
 
-        // 4. New connection connects using the new cert2 SNI
+        // 4. Wait for the certificate watcher to apply cert2, then connect with
+        //    the new SNI. Poll instead of sleeping so the test is event-driven.
+        let reloaded = wait_until(Duration::from_secs(5), || {
+            let client = client.clone();
+            let addr = server.dot_addr();
+            async move {
+                client
+                    .connect_dot(addr, "cert2.sito.local", None)
+                    .await
+                    .is_ok()
+            }
+        })
+        .await;
+        assert!(
+            reloaded,
+            "certificate watcher did not apply cert2 within 5s"
+        );
         let mut conn2 = client
             .connect_dot(server.dot_addr(), "cert2.sito.local", None)
             .await
@@ -811,6 +913,11 @@ mod tests {
             name = "guest-device"
             ids = ["guest-client"]
             group = "bypass"
+
+            [client_id_secrets]
+            "kid-device" = "kid-client"
+            "adult-device" = "adult-client"
+            "guest-device" = "guest-client"
 
             [groups.kids]
             filtering = true
@@ -985,6 +1092,9 @@ mod tests {
             name = "admin-laptop"
             ids = ["admin-laptop"]
             group = "default"
+
+            [client_id_secrets]
+            "admin-laptop" = "admin-laptop"
         "#,
         )
         .unwrap();
@@ -1153,6 +1263,9 @@ mod tests {
             name = "phone"
             ids = ["phone"]
             group = "kids"
+
+            [client_id_secrets]
+            "phone" = "phone"
 
             [groups.kids]
             safe_search = true

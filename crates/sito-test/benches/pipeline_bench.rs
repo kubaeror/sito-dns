@@ -68,6 +68,7 @@ fn bench_cache_lookup(c: &mut Criterion) {
     );
 
     let mut response = Message::new(1001, MessageType::Response, OpCode::Query);
+    response.queries.clone_from(&query.queries);
     response.answers.push(record);
 
     rt.block_on(async {
@@ -158,6 +159,7 @@ fn bench_rewrites_and_clients(c: &mut Criterion) {
                 exception_clients: vec![],
             },
         ],
+        ..Default::default()
     };
     let rewrites = RewriteTable::new(config);
     let clients_config = ClientsConfig::default();
