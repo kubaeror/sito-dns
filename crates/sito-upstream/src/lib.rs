@@ -28,7 +28,7 @@ mod tests {
     use super::*;
     use sito_core::config::UpstreamStrategy;
     use sito_core::error::UpstreamError;
-    use sito_proto::rdata::A;
+    use sito_proto::rdata::{A, AAAA};
     use sito_proto::{
         Message, MessageType, Name, OpCode, Query, RData, Record, RecordType, ResponseCode,
         decode_message, encode_message,
@@ -105,31 +105,62 @@ mod tests {
         assert_eq!(calls_alive.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn test_bootstrap_resolves_hostname_mock() {
-        // Spawn a mock plain DNS server on an ephemeral port acting as bootstrap DNS
-        let mock_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let mock_addr = mock_socket.local_addr().unwrap();
-
+    /// Spawns a mock bootstrap DNS server answering A and AAAA queries.
+    /// `ipv4`/`ipv6` may be `None` to synthesize an empty NOERROR answer.
+    fn spawn_bootstrap_server(
+        ipv4: Option<std::net::Ipv4Addr>,
+        ipv6: Option<std::net::Ipv6Addr>,
+    ) -> (SocketAddr, Arc<AtomicU32>) {
+        let query_count = Arc::new(AtomicU32::new(0));
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let socket = tokio::net::UdpSocket::from_std(listener).unwrap();
+        let count = Arc::clone(&query_count);
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            if let Ok((len, peer)) = mock_socket.recv_from(&mut buf).await
-                && let Ok(query) = decode_message(&buf[..len])
-            {
+            loop {
+                let Ok((len, peer)) = socket.recv_from(&mut buf).await else {
+                    break;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                let Ok(query) = decode_message(&buf[..len]) else {
+                    continue;
+                };
                 let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
                 resp.queries = query.queries.clone();
                 resp.metadata.response_code = ResponseCode::NoError;
-                // Return 1.2.3.4 for any query
-                resp.answers.push(Record::from_rdata(
-                    query.queries[0].name().clone(),
-                    300,
-                    RData::A(A(std::net::Ipv4Addr::new(1, 2, 3, 4))),
-                ));
+                let qname = query.queries[0].name().clone();
+                match query.queries[0].query_type() {
+                    RecordType::A => {
+                        if let Some(v4) = ipv4 {
+                            resp.answers
+                                .push(Record::from_rdata(qname, 300, RData::A(A(v4))));
+                        }
+                    }
+                    RecordType::AAAA => {
+                        if let Some(v6) = ipv6 {
+                            resp.answers.push(Record::from_rdata(
+                                qname,
+                                300,
+                                RData::AAAA(AAAA(v6)),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
                 if let Ok(encoded) = encode_message(&resp) {
-                    let _ = mock_socket.send_to(&encoded, peer).await;
+                    let _ = socket.send_to(&encoded, peer).await;
                 }
             }
         });
+        (addr, query_count)
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_resolves_hostname_mock() {
+        let (mock_addr, _) =
+            spawn_bootstrap_server(Some(std::net::Ipv4Addr::new(1, 2, 3, 4)), None);
 
         let bootstrap = BootstrapResolver::new(vec![mock_addr.ip()], Duration::from_millis(1000))
             .with_port(mock_addr.port());
@@ -142,6 +173,55 @@ mod tests {
         assert_eq!(
             ips,
             vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_resolves_ipv6_only_hostname() {
+        let v6 = std::net::Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+        let (mock_addr, _) = spawn_bootstrap_server(None, Some(v6));
+
+        let bootstrap = BootstrapResolver::new(vec![mock_addr.ip()], Duration::from_millis(1000))
+            .with_port(mock_addr.port());
+
+        let ips = bootstrap
+            .resolve_hostname("v6-only.example.com")
+            .await
+            .expect("IPv6-only hostname must resolve via AAAA");
+        assert_eq!(ips, vec![std::net::IpAddr::V6(v6)]);
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_concurrent_lookups_are_single_flight() {
+        let (mock_addr, query_count) =
+            spawn_bootstrap_server(Some(std::net::Ipv4Addr::new(9, 9, 9, 9)), None);
+
+        let bootstrap = BootstrapResolver::new(vec![mock_addr.ip()], Duration::from_millis(1000))
+            .with_port(mock_addr.port());
+
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let bootstrap = bootstrap.clone();
+            tasks.push(tokio::spawn(async move {
+                bootstrap.resolve_hostname("shared.example.com").await
+            }));
+        }
+        for task in tasks {
+            let ips = task
+                .await
+                .expect("join")
+                .expect("concurrent bootstrap lookup");
+            assert_eq!(
+                ips,
+                vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(9, 9, 9, 9))]
+            );
+        }
+
+        // One resolution attempt = one A + one AAAA query, not 16x that.
+        let total = query_count.load(Ordering::SeqCst);
+        assert!(
+            total <= 2,
+            "concurrent lookups must share a single resolution (saw {total} queries)"
         );
     }
 
