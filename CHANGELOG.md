@@ -5,6 +5,90 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.6.0] - 2026-09-13
+
+### Audit 4 remediation (DNSSEC, HA, security, correctness, ops)
+
+Full findings, work packages and status: `docs/audit4-followup-plan.md`.
+No breaking configuration or API changes; DNSSEC remains enabled by default.
+
+#### Critical
+- **DNSSEC trust chain**: DS delegation now requires a strict parent/child
+  hierarchy with a signer-bound RRSIG; signatures are bound to the RRset they
+  cover (empty coverage fails); the root DNSKEY is fetched and linked to the
+  root anchors; stripped RRSIGs under a zone previously proven signed are
+  `Bogus`; NSEC and NSEC3 denial proofs are validated with an iteration cap;
+  the key cache only stores verified keys, never downgrades validated entries
+  and is bounded; RFC 8624 algorithm/digest policy; +/-300 s clock skew;
+  CD=1 skips validation and AD is only returned to clients that requested it.
+- **HA replication state**: the master publishes v1 at startup and persists
+  the active version/bundle (`ha_state.toml`, 0600) so restarts continue the
+  monotonic sequence; stale slave ACKs trigger a one-shot catch-up push;
+  fallback deliveries are coalesced; secret substitution fails closed; the
+  slave persists pushed configs 0600 atomically; `scan_for_secrets` is wired
+  into publish; TLS masters with empty pins now require a client CA (which is
+  honoured by the verifier).
+
+#### Security
+- **First boot**: one-time setup token (CSPRNG, printed to the console) gates
+  the wizard and the upstream tester; probe targets are pinned and deny
+  loopback/private/metadata ranges with bounded concurrency.
+- **Web**: session-bound CSRF tokens, strict Origin/Referer (null rejected),
+  `__Host-` cookies when TLS, tightened CSP, `no-store` on auth/config, HSTS
+  only on genuine TLS; unauthenticated `/health` reports setup state.
+- **Auth**: Argon2 moved off the async mutex (`spawn_blocking`); timing-safe
+  unknown-user path; TOTP replay protection; 128-bit Argon2-hashed backup
+  codes accepted by the UI; re-auth required to disable TOTP; `?token=` only
+  on the WebSocket upgrade without `Authorization` (deprecated); ordered
+  session eviction, token cap, poisoned-lock recovery.
+- **Filtering/subscriptions**: `file://` is allowlisted to the data directory
+  and regular files; HTTP fetches block private/metadata targets, disable
+  redirects, and never use environment proxies (which would bypass the
+  resolved-address SSRF guard); streamed size caps; cache filenames hashed;
+  runtime parental and service catalogues get drop guards; IDN/punycode rules
+  now match (fail-open normalization removed); overlapping Aho-Corasick
+  matches are collected; parser precedence is deterministic and unknown
+  modifiers no longer widen a rule to all clients; DFA compile is bounded.
+- **Transport**: UDP responses truncated to `min(client, server)` EDNS size;
+  TLS handshake/write timeouts; DoT pipeline cap; >64 KB framing rejected
+  instead of wrapping; rate-limiter buckets bounded; ACME challenge cleanup
+  and SNI preservation on reload; DoQ accepts up to 65535-byte queries.
+- **Upstreams**: DoH GET fallback fixed; redirects disabled; DNS content type
+  required; streamed body cap; real DoQ wire-ID check; multi-IP failover with
+  re-resolution; bootstrap asks A and AAAA with single-flight.
+- **API**: stable IDs for lists/rewrites, partial client/group updates that
+  preserve fields, `doh_path` classification fix, stats window clamps, strict
+  updater semver and per-entry decompression caps, masked restore preview,
+  surfaced reload errors, metrics token auth, pagination caps.
+
+#### Correctness / performance / ops
+- **Cache**: DO/CD/ECS in the key, stale serves lose AD/RRSIG, negative
+  answers require SOA, only cacheable rcodes stored, per-key single-flight.
+- **Rewrites**: CNAME cycles suppressed, deterministic wildcard specificity,
+  multiple answers, configurable `ttl`, CGNAT/link-local auto-PTR.
+- **Clients**: DoH path / DoT SNI identity requires a shared secret
+  (`client_id_secrets`, now written and validated by the clients API);
+  RouterOS lease names are opt-in; longest-prefix match; schedules fail
+  closed; rewrite exceptions only match an authenticated resolved client
+  (a raw `/dns-query/<name>` path can no longer bypass them).
+- **Stats**: retention is transactional with backdated-row safety, failed
+  flushes are retried and counted, hot-path metrics are allocation-free,
+  label escaping covers all families, new `(client_ip, ts)` index.
+- **Hot reload**: watcher path canonicalization (relative `config.toml` now
+  works), typed-section validation before apply, DNSSEC validator and
+  per-client upstream scopes reload, filter errors surfaced.
+- **Ops**: `ha gen-certs` accepts repeatable `--san HOST_OR_IP` for LAN
+  certificates; installer resolves the latest release tag (no stale 1.4.0),
+  healthcheck requires NOERROR and only fails over to the web UI with
+  `--setup-fallback` during setup, digest-pinned images with a writable data
+  volume and SBOM/provenance attestations, least-privilege CI permissions,
+  `deny.toml` source policy tightened, install/HA runbooks corrected.
+- **Config**: invalid `[clients]`/`[rewrites]`/`[web]`/`[auth]`/`[stats]`/
+  `[ha]`/`[integrations]` sections now fail startup and `check-config`
+  instead of silently falling back to defaults.
+
+---
+
 ## [1.5.0] - 2026-09-12
 
 ### Audit 3 Remediation (security, correctness, ops)

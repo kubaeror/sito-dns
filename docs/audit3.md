@@ -1,5 +1,12 @@
 # sito-dns v1.4.0 — Full Audit #3 (post first-time-setup-wizard)
 
+> **Superseded in part by Audit 4 (`docs/audit4-followup-plan.md`, v1.6.0).**
+> The follow-up DNSSEC work claimed complete below still allowed cross-zone DS
+> acceptance, RRset/RRSIG decoupling and root-anchor bypasses; those were found
+> and fixed in WP-1 of Audit 4. Hot reload, HA version sequencing, the
+> installer version and several API behaviours are likewise corrected there.
+> Treat the completion claims in this document as historical.
+
 Scope: whole workspace (14 crates, ~39k LOC), `contrib/`, Docker, systemd, CI, release
 pipeline, docs and example configuration. Findings were verified directly in source
 (all `file:line` references point at commit `82c8672` + untracked docs at audit time).
