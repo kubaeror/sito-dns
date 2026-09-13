@@ -259,6 +259,23 @@ mod tests {
     }
 
     #[test]
+    fn test_restore_archive_rejects_decompression_bomb() {
+        let enc = GzEncoder::new(Vec::new(), Compression::default());
+        let mut tar = Builder::new(enc);
+        let bomb = vec![b'a'; (MAX_RESTORE_CONFIG_BYTES + 1) as usize];
+        let mut header = Header::new_gnu();
+        header.set_size(bomb.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "config.toml", &bomb[..])
+            .unwrap();
+        let bytes = tar.into_inner().unwrap().finish().unwrap();
+
+        let err = extract_backup_archive(&bytes).expect_err("bomb must be rejected");
+        assert!(err.to_string().contains("exceeds"), "got: {err}");
+    }
+
+    #[test]
     fn test_restore_archive_rejects_typed_section_errors() {
         let bad_config = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\nentries = \"not-an-array\"\n";
         let archive = create_backup_archive(bad_config).expect("archive builds");
@@ -480,6 +497,14 @@ pub fn create_backup_archive(config_toml: &str) -> anyhow::Result<Vec<u8>> {
     Ok(compressed)
 }
 
+/// Maximum decompressed size accepted for `config.toml` inside a restore archive.
+const MAX_RESTORE_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+/// Maximum decompressed size accepted for `metadata.json` inside a restore archive.
+const MAX_RESTORE_METADATA_BYTES: u64 = 64 * 1024;
+/// Maximum combined decompressed size accepted for a restore archive. Caps
+/// gzip bombs even when individual entries lie about their sizes.
+const MAX_RESTORE_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Extract and validate a compressed .tar.gz archive containing config.toml and metadata.json
 pub fn extract_backup_archive(archive_bytes: &[u8]) -> anyhow::Result<(String, BackupMetadata)> {
     if archive_bytes.is_empty() {
@@ -491,22 +516,43 @@ pub fn extract_backup_archive(archive_bytes: &[u8]) -> anyhow::Result<(String, B
 
     let mut restored_config_toml = None;
     let mut restored_metadata = None;
+    let mut total_read: u64 = 0;
 
     let entries = archive.entries()?;
     for entry_res in entries {
-        let mut entry = entry_res?;
+        let entry = entry_res?;
         let path = entry.path()?.to_string_lossy().to_string();
 
-        if path == "config.toml" || path.ends_with("/config.toml") {
-            let mut s = String::new();
-            entry.read_to_string(&mut s)?;
-            restored_config_toml = Some(s);
+        let cap = if path == "config.toml" || path.ends_with("/config.toml") {
+            MAX_RESTORE_CONFIG_BYTES
         } else if path == "metadata.json" || path.ends_with("/metadata.json") {
-            let mut s = String::new();
-            entry.read_to_string(&mut s)?;
-            if let Ok(meta) = serde_json::from_str::<BackupMetadata>(&s) {
-                restored_metadata = Some(meta);
-            }
+            MAX_RESTORE_METADATA_BYTES
+        } else {
+            continue;
+        };
+
+        // Read at most cap+1 bytes so an oversized (or lying) entry is
+        // rejected without buffering it in full.
+        let mut limited = entry.take(cap + 1);
+        let mut bytes = Vec::new();
+        limited.read_to_end(&mut bytes)?;
+        let read = bytes.len() as u64;
+        if read > cap {
+            anyhow::bail!("Restore archive entry '{path}' exceeds the {cap}-byte limit");
+        }
+        total_read = total_read.saturating_add(read);
+        if total_read > MAX_RESTORE_TOTAL_BYTES {
+            anyhow::bail!(
+                "Restore archive expands beyond the {MAX_RESTORE_TOTAL_BYTES}-byte limit"
+            );
+        }
+
+        let s = String::from_utf8(bytes)
+            .map_err(|e| anyhow::anyhow!("Restore archive entry '{path}' is not UTF-8: {e}"))?;
+        if path == "config.toml" || path.ends_with("/config.toml") {
+            restored_config_toml = Some(s);
+        } else if let Ok(meta) = serde_json::from_str::<BackupMetadata>(&s) {
+            restored_metadata = Some(meta);
         }
     }
 
