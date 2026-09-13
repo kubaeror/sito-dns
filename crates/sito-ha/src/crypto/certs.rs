@@ -102,12 +102,47 @@ pub fn compute_blake3_raw_hex(cert_der: &[u8]) -> String {
     blake3::hash(cert_der).to_hex().to_string()
 }
 
+/// Appends user-provided SANs (IP addresses or DNS names) to certificate params.
+fn append_extra_sans(
+    params: &mut CertificateParams,
+    extra_sans: &[String],
+    role: &str,
+) -> Result<(), HaError> {
+    for san in extra_sans {
+        let trimmed = san.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(ip) = trimmed.parse::<IpAddr>() {
+            params.subject_alt_names.push(SanType::IpAddress(ip));
+        } else {
+            let dns: rcgen::string::Ia5String = trimmed.try_into().map_err(|e| {
+                HaError::Crypto(format!("Invalid {role} certificate SAN '{trimmed}': {e}"))
+            })?;
+            params.subject_alt_names.push(SanType::DnsName(dns));
+        }
+    }
+    Ok(())
+}
+
 /// Generates self-signed CA, master and/or slave certificates, writing them to `dir`.
 /// If both `gen_master` and `gen_slave` are false, generates the complete set (both).
 pub fn generate_ha_certs(
     dir: &Path,
+    gen_master: bool,
+    gen_slave: bool,
+) -> Result<GeneratedCerts, HaError> {
+    generate_ha_certs_with_sans(dir, gen_master, gen_slave, &[])
+}
+
+/// Like [`generate_ha_certs`], with additional subject alternative names
+/// applied to both the master and slave certificates. Each entry is parsed as
+/// an IP address first and otherwise added as a DNS name.
+pub fn generate_ha_certs_with_sans(
+    dir: &Path,
     mut gen_master: bool,
     mut gen_slave: bool,
+    extra_sans: &[String],
 ) -> Result<GeneratedCerts, HaError> {
     if !gen_master && !gen_slave {
         gen_master = true;
@@ -174,6 +209,7 @@ pub fn generate_ha_certs(
             master_params
                 .subject_alt_names
                 .push(SanType::IpAddress(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+            append_extra_sans(&mut master_params, extra_sans, "master")?;
 
             let mut dn = DistinguishedName::new();
             dn.push(DnType::CommonName, "sito-master");
@@ -225,6 +261,7 @@ pub fn generate_ha_certs(
             slave_params
                 .subject_alt_names
                 .push(SanType::IpAddress(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+            append_extra_sans(&mut slave_params, extra_sans, "slave")?;
 
             let mut dn = DistinguishedName::new();
             dn.push(DnType::CommonName, "sito-slave");
@@ -332,6 +369,28 @@ mod tests {
         let summary = certs.summary();
         assert!(summary.contains("sito HA mTLS Certificates"));
         assert!(summary.contains("master_fingerprint"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_generate_ha_certs_with_extra_sans() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ha_san_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let sans = vec!["10.20.30.40".to_string(), "dns.example.lan".to_string()];
+        let certs = generate_ha_certs_with_sans(&temp_dir, true, true, &sans).unwrap();
+        assert!(certs.master_cert_path.as_ref().unwrap().exists());
+        assert!(certs.slave_cert_path.as_ref().unwrap().exists());
+
+        // Blank entries are ignored rather than failing generation.
+        generate_ha_certs_with_sans(&temp_dir, true, false, &["  ".to_string()]).unwrap();
+
+        // Non-ASCII DNS names cannot be encoded and must be rejected.
+        let bad = generate_ha_certs_with_sans(&temp_dir, true, false, &["münchen.de".to_string()]);
+        assert!(bad.is_err(), "invalid SAN must fail certificate generation");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

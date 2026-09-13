@@ -256,18 +256,19 @@ pub fn verify_and_unpack_push(
     have_version: u64,
     master_pubkey: &[u8],
 ) -> Result<ConfigBundle, HaError> {
-    let (version, signature_ed25519, payload_b64, payload_hash_blake3) = match push {
+    let (version, signature_ed25519, payload_b64, payload_hash_blake3, envelope_hash) = match push {
         HaMessage::ConfigPush {
             version,
             signature_ed25519,
             payload_b64,
             payload_hash_blake3,
-            ..
+            hash_blake3,
         } => (
             *version,
             signature_ed25519,
             payload_b64,
             payload_hash_blake3,
+            hash_blake3,
         ),
         other => {
             return Err(HaError::Protocol(format!(
@@ -300,6 +301,13 @@ pub fn verify_and_unpack_push(
         return Err(HaError::Protocol(format!(
             "Payload BLAKE3 checksum mismatch: computed {computed_hash_hex}, expected {expected_hash}"
         )));
+    }
+    // The envelope hash must agree with the signed payload hash; a mismatch
+    // indicates tampering with the outer message.
+    if envelope_hash.trim_start_matches("blake3:") != computed_hash_hex {
+        return Err(HaError::Protocol(
+            "Envelope BLAKE3 hash does not match the signed payload hash".to_string(),
+        ));
     }
 
     // 4. Ed25519 signature verification

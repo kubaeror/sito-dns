@@ -124,6 +124,7 @@ impl HaConfig {
 
                 let has_cert = self.cert.is_some();
                 let has_key = self.key.is_some();
+                let has_ca = self.ca.is_some();
 
                 if (has_cert && !has_key) || (!has_cert && has_key) {
                     return Err(HaError::Validation {
@@ -134,10 +135,13 @@ impl HaConfig {
                 }
 
                 if has_cert && has_key {
-                    if !has_token && !has_pins {
+                    // TLS without either pinned client fingerprints or a client
+                    // CA rejects every handshake at runtime, so fail validation
+                    // instead of booting an unreachable master.
+                    if !has_pins && !has_ca {
                         return Err(HaError::Validation {
-                            field: "slave_token".to_string(),
-                            reason: "Master replication requires authentication: either slave_token or pinned_slave_fingerprints must be configured".to_string(),
+                            field: "pinned_slave_fingerprints".to_string(),
+                            reason: "TLS replication requires pinned_slave_fingerprints or ca; empty pins reject every client certificate".to_string(),
                         });
                     }
                 } else {

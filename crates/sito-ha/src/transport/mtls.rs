@@ -104,6 +104,12 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
         now: UnixTime,
     ) -> Result<ClientCertVerified, RustlsError> {
         if self.pinned_fingerprints.is_empty() {
+            // Without pins, a configured CA is the only acceptable client
+            // authentication anchor. Reject everything otherwise.
+            if let Some(ref webpki) = self.webpki {
+                webpki.verify_client_cert(end_entity, intermediates, now)?;
+                return Ok(ClientCertVerified::assertion());
+            }
             return Err(RustlsError::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
