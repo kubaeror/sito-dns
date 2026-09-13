@@ -589,8 +589,18 @@ impl DnsPipeline {
             let bg_query = query.clone();
             // Refresh with the same DNSSEC shape as the primary resolution:
             // when validation is enabled force DO so the refreshed entry
-            // carries RRSIGs even for DO=0 clients.
-            let bg_resolve_query = if self.dnssec.load().mode == sito_dnssec::DnssecMode::Disabled {
+            // carries RRSIGs even for DO=0 clients, and run the same
+            // validation as the primary path before inserting. Otherwise a
+            // malicious upstream could plant AD=1 bogus data in the cache.
+            let dnssec_mode = self.dnssec.load().mode;
+            let bg_validator = if dnssec_mode == sito_dnssec::DnssecMode::Disabled
+                || bg_query.metadata.checking_disabled
+            {
+                None
+            } else {
+                Some(self.dnssec.load_full())
+            };
+            let bg_resolve_query = if dnssec_mode == sito_dnssec::DnssecMode::Disabled {
                 bg_query.clone()
             } else {
                 let mut q = bg_query.clone();
@@ -602,9 +612,22 @@ impl DnsPipeline {
             };
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Ok(resp) = bg_upstream.resolve(&bg_resolve_query).await
-                    && (resp.metadata.response_code == ResponseCode::NoError
-                        || resp.metadata.response_code == ResponseCode::NXDomain)
+                let Ok(mut resp) = bg_upstream.resolve(&bg_resolve_query).await else {
+                    return;
+                };
+                if let Some(validator) = bg_validator {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as u32;
+                    let key_fetcher =
+                        sito_upstream::UpstreamKeyFetcher::new(Arc::clone(&bg_upstream));
+                    let _ = validator
+                        .validate_with_key_fetcher(&mut resp, None, now, &key_fetcher)
+                        .await;
+                }
+                if resp.metadata.response_code == ResponseCode::NoError
+                    || resp.metadata.response_code == ResponseCode::NXDomain
                 {
                     bg_cache.insert(&bg_query, &resp).await;
                 }
