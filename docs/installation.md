@@ -104,6 +104,7 @@ Copy `contrib/systemd/sito.service` to `/etc/systemd/system/sito.service`:
 ```ini
 [Unit]
 Description=sito high-performance filtering DNS server
+Documentation=https://github.com/kubaeror/sito-dns
 After=network-online.target
 Wants=network-online.target
 
@@ -112,6 +113,10 @@ Type=simple
 User=sito
 Group=sito
 ExecStart=/usr/local/bin/sito --config /etc/sito/config.toml
+# The service runs unprivileged with ProtectSystem=strict, so in-app updates
+# cannot replace the binary in /usr/local/bin. Updates must be applied as root
+# while the service is stopped: sudo systemctl stop sito && sudo sito update
+# (or re-run this installer). See docs/installation.md "Updating sito".
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -137,6 +142,33 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now sito
 ```
 
+### 2.6 Updating sito
+
+The hardened unit runs as the unprivileged `sito` user with
+`ProtectSystem=strict`, and `/usr/local/bin/sito` is root-owned. The in-process
+self-update therefore cannot replace its own binary while the service is
+running (the write returns `EACCES`). Apply updates as root with the service
+stopped:
+
+```bash
+# Option A: built-in updater
+sudo systemctl stop sito
+sudo sito update --check   # optional: preview the release first
+sudo sito update
+sudo systemctl start sito
+
+# Option B: re-run the installer (SITO_VERSION pins a release)
+sudo systemctl stop sito
+sudo SITO_VERSION=1.6.0 bash contrib/install.sh
+```
+
+The installer backs up the previous binary to `/usr/local/bin/sito.bak` and
+restores it automatically if the post-install health check fails. If you manage
+the binary manually, stop the service, replace `/usr/local/bin/sito`, re-apply
+the bind capability (`sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito`),
+then start the service again. Docker deployments are updated by pulling the new
+image tag, not from inside the container.
+
 ---
 
 ## 3. Docker Deployment
@@ -149,19 +181,33 @@ docker run -d \
   --cap-add=NET_BIND_SERVICE \
   -p 53:53/udp \
   -p 53:53/tcp \
-  -p 853:853 \
-  -p 443:443 \
+  -p 853:853/tcp \
+  -p 853:853/udp \
+  -p 443:443/tcp \
+  -p 443:443/udp \
   -p 8080:8080 \
   -v /opt/sito/config:/etc/sito \
   -v sito-data:/var/lib/sito \
   ghcr.io/kubaeror/sito-dns:latest
 ```
 
+The image defines a healthcheck that probes DNS on the configured port and only
+accepts the admin web interface while the API reports first-boot setup pending
+(`sito healthcheck --setup-fallback`).
+
 > **Config directory permissions.** The image runs as UID/GID `65532`
 > (non-root). When bind-mounting a host directory for `/etc/sito`, hand it to
 > that user once: `sudo chown -R 65532:65532 /opt/sito/config`. Alternatively
 > keep configuration in a named volume (as the Compose example below does),
 > which Docker initialises with the correct ownership.
+
+> **Data directory permissions.** Fresh named volumes (such as `sito-data`)
+> inherit the `65532:65532` ownership created in the image, so no manual step
+> is needed. If you bind-mount a host directory at `/var/lib/sito` instead,
+> hand it to the same user once: `sudo chown -R 65532:65532 /opt/sito/data`.
+> Volumes created by images older than 1.6.0 may already be root-owned; fix
+> them once with
+> `docker run --rm -v sito-data:/data busybox chown -R 65532:65532 /data`.
 
 ---
 
@@ -179,14 +225,16 @@ services:
     ports:
       - "53:53/udp"
       - "53:53/tcp"
-      - "853:853"
-      - "443:443"
+      - "853:853/tcp"
+      - "853:853/udp"
+      - "443:443/tcp"
+      - "443:443/udp"
       - "8080:8080"
     volumes:
       - ./config:/etc/sito
       - sito-data:/var/lib/sito
     healthcheck:
-      test: ["CMD", "/usr/local/bin/sito", "healthcheck", "--address", "127.0.0.1:53"]
+      test: ["CMD", "/usr/bin/sito", "--config", "/etc/sito/config.toml", "healthcheck", "--setup-fallback"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -194,6 +242,10 @@ services:
 volumes:
   sito-data:
 ```
+
+The `--setup-fallback` healthcheck flag keeps the container healthy while the
+first-boot wizard is active; once setup completes the DNS probe must succeed, so
+a broken DNS listener still turns the container unhealthy.
 
 ### 4.2 High-Availability Master/Slave on LAN (`macvlan`)
 Run redundant master and slave instances on separate dedicated LAN IPs on a single server:
@@ -220,6 +272,11 @@ services:
     volumes:
       - ./master-config:/etc/sito
       - master-data:/var/lib/sito
+    healthcheck:
+      test: ["CMD", "/usr/bin/sito", "--config", "/etc/sito/config.toml", "healthcheck", "--setup-fallback"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
 
   sito-slave:
     image: ghcr.io/kubaeror/sito-dns:latest
@@ -231,9 +288,21 @@ services:
     volumes:
       - ./slave-config:/etc/sito
       - slave-data:/var/lib/sito
-    environment:
-      - DNSD__HA__MASTER_URL=wss://192.168.1.10:8953
+    healthcheck:
+      test: ["CMD", "/usr/bin/sito", "--config", "/etc/sito/config.toml", "healthcheck", "--setup-fallback"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
 ```
+
+> [!NOTE]
+> Configuration, including `[ha] master_url`, is read exclusively from the
+> mounted `config.toml`; environment overrides (for example
+> `DNSD__HA__MASTER_URL`) are not supported. Make the host config directories
+> writable by uid/gid 65532 once:
+> `sudo chown -R 65532:65532 ./master-config ./slave-config`. The full macvlan
+> reference deployment, including certificate handling and the RouterOS DHCP
+> hints, is in `docker-compose.ha.yml`.
 
 ---
 
@@ -252,6 +321,16 @@ dig @127.0.0.1 -p 53 doubleclick.net +short
 ### 5.2 Verify API and Web Panel
 ```bash
 curl -fsSL http://127.0.0.1:8080/api/v1/status | jq .
+```
+
+The CLI health probe requires a matching DNS response with a `NOERROR` rcode:
+
+```bash
+sito --config /etc/sito/config.toml healthcheck
+
+# First-boot window only: accept the admin web interface while the API reports
+# setup pending (DNS listeners are not bound until setup completes).
+sito --config /etc/sito/config.toml healthcheck --setup-fallback
 ```
 
 Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard. If the wizard is skipped with `--no-setup`, the bootstrap credentials are `admin` / `adminadmin` and **must be changed immediately** (Settings -> Administrator).
@@ -274,12 +353,12 @@ sha256sum -c SHA256SUMS
 
 ```bash
 cosign verify-blob \
-  --certificate sito-v1.5.0-x86_64-unknown-linux-gnu.tar.gz.pem \
-  --signature   sito-v1.5.0-x86_64-unknown-linux-gnu.tar.gz.sig \
+  --certificate sito-v1.6.0-x86_64-unknown-linux-gnu.tar.gz.pem \
+  --signature   sito-v1.6.0-x86_64-unknown-linux-gnu.tar.gz.sig \
   --certificate-identity-regexp \
       '^https://github.com/kubaeror/sito-dns/.github/workflows/release.yml@refs/.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  sito-v1.5.0-x86_64-unknown-linux-gnu.tar.gz
+  sito-v1.6.0-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 The identity pins the artifact to this repository's release workflow and the

@@ -7,8 +7,11 @@
 #
 # QUICK START:
 # 1. Generate mTLS certificate suite and BLAKE3 pinned fingerprints:
-#    sito ha gen-certs --dir ./ha/certs --master 192.168.1.10 --slave 192.168.1.11
-#    (see docs/runbook-ha.md for SAN/pinning details)
+#    sito ha gen-certs --dir ./ha/certs --master --slave
+#    (--master/--slave are booleans selecting which certs to generate; omit
+#    both to generate the full set. Generated certs carry only localhost /
+#    sito-master / sito-slave / 127.0.0.1 / ::1 SANs, so keep the default
+#    fingerprint pinning; see docs/runbook-ha.md for SAN/pinning details.)
 #
 # 2. Copy certificates to node directories:
 #    mkdir -p ha/master/certs ha/slave/certs
@@ -22,6 +25,8 @@
 #    configuration comes exclusively from config.toml.
 #    The mounted config directories must be writable by uid 65532 (distroless nonroot):
 #      sudo chown -R 65532:65532 ha/master/config ha/slave/config
+#    The named data volumes are initialized with uid/gid 65532 ownership by the
+#    image; only bind-mounted data directories need the same chown.
 # 5. Start the HA cluster:
 #    docker compose -f docker-compose.ha.yml up -d
 #
@@ -63,6 +68,7 @@ services:
           "--config",
           "/etc/sito/config.toml",
           "healthcheck",
+          "--setup-fallback",
         ]
       interval: 15s
       timeout: 5s
@@ -98,6 +104,7 @@ services:
           "--config",
           "/etc/sito/config.toml",
           "healthcheck",
+          "--setup-fallback",
         ]
       interval: 15s
       timeout: 5s
@@ -131,8 +138,9 @@ services:
 # Networking: Macvlan driver gives each container its own dedicated LAN IP
 # NOTE: If running on a host/cloud VPS without macvlan support (e.g. Docker
 # Desktop), replace with standard bridge network and port mappings:
-# Master: 53:53/udp, 53:53/tcp, 8080:8080, 8953:8953
-# Slave:  53:53/udp, 53:53/tcp (web UI is read-only; bind to a distinct host port)
+# Master: 53:53/udp, 53:53/tcp, 853:853/tcp, 443:443/tcp, 443:443/udp, 8080:8080, 8953:8953
+# Slave:  53:53/udp, 53:53/tcp, 853:853/tcp, 443:443/tcp, 443:443/udp
+#         (web UI is read-only; bind it to a distinct host port if needed)
 # =============================================================================
 networks:
   lan:
