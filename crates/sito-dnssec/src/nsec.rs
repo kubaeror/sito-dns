@@ -50,10 +50,16 @@ pub fn covers(record: &NsecRecord<'_>, qname: &Name) -> bool {
 ///
 /// An NSEC at a delegation point from the parent zone (NS without SOA) denies
 /// the type only for the parent, not for the child zone that owns the name.
+/// The exception is DS: RFC 6840 §4.1/§4.4 accepts a parent-side delegation
+/// NSEC (NS set, SOA clear, DS clear) as proof that no DS exists at the
+/// delegation, which is what makes an unsigned delegation provable.
 fn denies_type(record: &NsecRecord<'_>, qtype: RecordType) -> bool {
     let types = record.rdata.type_set();
     if types.contains(qtype) || types.contains(RecordType::CNAME) {
         return false;
+    }
+    if qtype == RecordType::DS {
+        return true;
     }
     !types.contains(RecordType::NS) || types.contains(RecordType::SOA)
 }
@@ -460,6 +466,53 @@ mod tests {
         }];
         assert_eq!(
             evaluate_nsec_denial(&records, &qname, RecordType::A, false, &zone),
+            NsecDenial::Incomplete
+        );
+    }
+
+    #[test]
+    fn test_ds_nodata_at_delegation_is_secure() {
+        // RFC 6840 4.1/4.4: a parent-side delegation NSEC (NS set, SOA clear,
+        // DS clear) proves that no DS exists at the delegation, while it must
+        // not deny other types for the child zone.
+        let zone = Name::from_str("example.").unwrap();
+        let qname = Name::from_str("child.example.").unwrap();
+        let (owner, delegation) = nsec(
+            "child.example.",
+            "z.example.",
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+        );
+        let records = [NsecRecord {
+            owner: &owner,
+            rdata: &delegation,
+        }];
+        assert_eq!(
+            evaluate_nsec_denial(&records, &qname, RecordType::DS, false, &zone),
+            NsecDenial::Secure
+        );
+        assert_eq!(
+            evaluate_nsec_denial(&records, &qname, RecordType::A, false, &zone),
+            NsecDenial::Incomplete,
+            "the parent NSEC must not deny child-zone types"
+        );
+
+        // A DS bit in the bitmap means there is a DS, so no denial.
+        let (_, with_ds) = nsec(
+            "child.example.",
+            "z.example.",
+            &[
+                RecordType::NS,
+                RecordType::DS,
+                RecordType::NSEC,
+                RecordType::RRSIG,
+            ],
+        );
+        let records = [NsecRecord {
+            owner: &owner,
+            rdata: &with_ds,
+        }];
+        assert_eq!(
+            evaluate_nsec_denial(&records, &qname, RecordType::DS, false, &zone),
             NsecDenial::Incomplete
         );
     }

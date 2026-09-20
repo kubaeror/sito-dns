@@ -128,25 +128,37 @@ pub fn evaluate_nsec3_denial(
 
     if !nxdomain {
         if closest == *qname {
-            // Exact match that denies the queried type.
-            let denied = relevant
-                .iter()
-                .any(|record| matches(record, qname) && !record.rdata.type_set().contains(qtype));
+            // Exact match that denies the queried type. RFC 6840 §4.3 also
+            // requires the CNAME bit to be clear: without that check a
+            // positive CNAME answer could be replayed as NODATA with
+            // authenticated NSEC3 records.
+            let denied = relevant.iter().any(|record| {
+                matches(record, qname)
+                    && !record.rdata.type_set().contains(qtype)
+                    && !record.rdata.type_set().contains(RecordType::CNAME)
+            });
             return if denied {
                 Nsec3Denial::Secure
             } else {
                 Nsec3Denial::Incomplete
             };
         }
-        // Wildcard NODATA: the qname must be covered and the wildcard match
-        // must deny the queried type.
+        // Wildcard NODATA: RFC 5155 §8.7 requires a covering record for the
+        // *next closer* name (the child of the closest encloser towards
+        // qname), not for the qname itself (whose hash may fall elsewhere),
+        // and the wildcard match must deny the type and CNAME.
         let Some(wildcard) = wildcard_of(&closest) else {
             return Nsec3Denial::Incomplete;
         };
-        let covered = relevant.iter().any(|record| covers(record, qname));
-        let denied = relevant
-            .iter()
-            .any(|record| matches(record, &wildcard) && !record.rdata.type_set().contains(qtype));
+        let Some(next_closer) = next_closer else {
+            return Nsec3Denial::Incomplete;
+        };
+        let covered = relevant.iter().any(|record| covers(record, &next_closer));
+        let denied = relevant.iter().any(|record| {
+            matches(record, &wildcard)
+                && !record.rdata.type_set().contains(qtype)
+                && !record.rdata.type_set().contains(RecordType::CNAME)
+        });
         return if covered && denied {
             Nsec3Denial::Secure
         } else {
@@ -334,5 +346,170 @@ mod tests {
                 "iterations={iterations}"
             );
         }
+    }
+
+    fn decrement(bytes: &[u8]) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        for byte in out.iter_mut().rev() {
+            *byte = byte.wrapping_sub(1);
+            if *byte != u8::MAX {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_exact_nodata_with_cname_bit_is_not_secure() {
+        // RFC 6840 4.3: a matching NSEC3 that denies the queried type must
+        // also have the CNAME bit clear, otherwise a positive CNAME answer
+        // could be replayed as NODATA.
+        let qname = Name::from_ascii("alias.example.").unwrap();
+        let qname_hash = Nsec3HashAlgorithm::SHA1
+            .hash(&[], &qname, 0)
+            .unwrap()
+            .as_ref()
+            .to_vec();
+        let label = BASE32_DNSSEC.encode(&qname_hash);
+        let owner = Name::from_ascii(format!("{label}.example.")).unwrap();
+
+        let with_cname = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            increment(&qname_hash),
+            [RecordType::CNAME, RecordType::RRSIG],
+        );
+        let records = [Nsec3Record {
+            owner: &owner,
+            rdata: &with_cname,
+        }];
+        assert_eq!(
+            evaluate_nsec3_denial(&records, &qname, RecordType::A, false),
+            Nsec3Denial::Incomplete
+        );
+
+        // Without the CNAME bit the same bitmat is a valid NODATA proof.
+        let without_cname = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            increment(&qname_hash),
+            [RecordType::SOA, RecordType::RRSIG],
+        );
+        let records = [Nsec3Record {
+            owner: &owner,
+            rdata: &without_cname,
+        }];
+        assert_eq!(
+            evaluate_nsec3_denial(&records, &qname, RecordType::A, false),
+            Nsec3Denial::Secure
+        );
+    }
+
+    #[test]
+    fn test_wildcard_nodata_requires_next_closer_cover() {
+        // RFC 5155 8.7: the wildcard NODATA proof must cover the next closer
+        // name, not the qname hash.
+        let zone = Name::from_ascii("example.").unwrap();
+        let qname = Name::from_ascii("a.b.example.").unwrap();
+        let next_closer = Name::from_ascii("b.example.").unwrap();
+
+        let hash = |name: &Name| {
+            Nsec3HashAlgorithm::SHA1
+                .hash(&[], name, 0)
+                .unwrap()
+                .as_ref()
+                .to_vec()
+        };
+        let owner_of = |hashed: &[u8]| {
+            Name::from_ascii(format!("{}.example.", BASE32_DNSSEC.encode(hashed))).unwrap()
+        };
+
+        // Closest encloser: example.
+        let encloser_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            increment(&hash(&zone)),
+            [RecordType::SOA, RecordType::RRSIG],
+        );
+        let encloser_owner = owner_of(&hash(&zone));
+
+        // Wildcard match denying A (and CNAME).
+        let wildcard = Name::from_ascii("*.example.").unwrap();
+        let wildcard_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            increment(&hash(&wildcard)),
+            [RecordType::SOA, RecordType::RRSIG],
+        );
+        let wildcard_owner = owner_of(&hash(&wildcard));
+
+        // Cover for the next closer name (b.example).
+        let cover_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            increment(&increment(&hash(&next_closer))),
+            [RecordType::SOA, RecordType::RRSIG],
+        );
+        let cover_owner = owner_of(&decrement(&decrement(&hash(&next_closer))));
+
+        let records = [
+            Nsec3Record {
+                owner: &encloser_owner,
+                rdata: &encloser_rdata,
+            },
+            Nsec3Record {
+                owner: &wildcard_owner,
+                rdata: &wildcard_rdata,
+            },
+            Nsec3Record {
+                owner: &cover_owner,
+                rdata: &cover_rdata,
+            },
+        ];
+        assert_eq!(
+            evaluate_nsec3_denial(&records, &qname, RecordType::A, false),
+            Nsec3Denial::Secure,
+            "a cover of the next closer name must complete the proof"
+        );
+
+        // A cover of the qname hash only (the pre-fix behavior) proves
+        // nothing about the next closer name.
+        let qname_cover_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            increment(&increment(&hash(&qname))),
+            [RecordType::SOA, RecordType::RRSIG],
+        );
+        let qname_cover_owner = owner_of(&decrement(&decrement(&hash(&qname))));
+        let records = [
+            Nsec3Record {
+                owner: &encloser_owner,
+                rdata: &encloser_rdata,
+            },
+            Nsec3Record {
+                owner: &wildcard_owner,
+                rdata: &wildcard_rdata,
+            },
+            Nsec3Record {
+                owner: &qname_cover_owner,
+                rdata: &qname_cover_rdata,
+            },
+        ];
+        assert_eq!(
+            evaluate_nsec3_denial(&records, &qname, RecordType::A, false),
+            Nsec3Denial::Incomplete
+        );
     }
 }

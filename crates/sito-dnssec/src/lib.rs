@@ -109,6 +109,47 @@ fn same_public_key(a: &DNSKEY, b: &DNSKEY) -> bool {
     a.algorithm() == b.algorithm() && a.public_key().public_bytes() == b.public_key().public_bytes()
 }
 
+/// Applies the RFC 4035 §5.3.3 authenticated TTL to every RRset covered by an
+/// RRSIG in the response: the TTL must not exceed the received TTL, the
+/// RRSIG's Original TTL, or the remaining signature validity. Without this a
+/// validated answer with a long record TTL but a short-lived signature would
+/// be cached and served with AD=1 after the signature expired.
+fn apply_authenticated_ttls(response: &mut Message, now: u32) {
+    let signatures: Vec<(LowerName, RecordType, RRSIG)> = response
+        .answers
+        .iter()
+        .chain(response.authorities.iter())
+        .filter_map(|record| match &record.data {
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some((
+                LowerName::from(&record.name),
+                rrsig.input().type_covered,
+                rrsig.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    if signatures.is_empty() {
+        return;
+    }
+    for section in [&mut response.answers, &mut response.authorities] {
+        for record in section.iter_mut() {
+            // RFC 4035 §5.3.3 also caps the RRSIG RR's own TTL.
+            if let RData::DNSSEC(DNSSECRData::RRSIG(own)) = &record.data {
+                record.ttl = record.ttl.min(own.authenticated_ttl(record, now));
+                continue;
+            }
+            let owner = LowerName::from(&record.name);
+            let covered = record.record_type();
+            if let Some((_, _, rrsig)) = signatures
+                .iter()
+                .find(|(sig_owner, sig_covered, _)| *sig_owner == owner && *sig_covered == covered)
+            {
+                record.ttl = record.ttl.min(rrsig.authenticated_ttl(record, now));
+            }
+        }
+    }
+}
+
 /// DNSSEC validation mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DnssecMode {
@@ -1522,7 +1563,7 @@ impl DnssecValidator {
             };
             match denial {
                 DenialResult::Secure if all_present_signed || present_relevant.is_empty() => {
-                    return self.secure_outcome(response);
+                    return self.secure_outcome(response, now);
                 }
                 DenialResult::Secure => {
                     return self.handle_bogus(
@@ -1556,7 +1597,7 @@ impl DnssecValidator {
                 }
             }
         } else if all_present_signed {
-            return self.secure_outcome(response);
+            return self.secure_outcome(response, now);
         }
 
         if !key_set.forged.is_empty() {
@@ -1611,7 +1652,8 @@ impl DnssecValidator {
     }
 
     /// Marks a response secure and records the outcome.
-    fn secure_outcome(&self, response: &mut Message) -> ValidationOutcome {
+    fn secure_outcome(&self, response: &mut Message, now: u32) -> ValidationOutcome {
+        apply_authenticated_ttls(response, now);
         response.metadata.authentic_data = true;
         let outcome = ValidationOutcome::Secure;
         self.metrics.record_validation(&outcome);
@@ -3678,5 +3720,77 @@ mod tests {
         // DNSKEY/DS pairs for a.b.example, b.example and example plus the root
         // DNSKEY = 7 fetches, one more than the old flat budget of 6.
         assert_eq!(fetcher.calls(), 7);
+    }
+
+    /// Regression: RFC 4035 5.3.3 - a validated RRset may not be cached (or
+    /// served with AD=1) beyond its signature's remaining validity.
+    #[test]
+    fn test_authenticated_ttl_is_capped_by_signature_expiry() {
+        use hickory_proto::dnssec::crypto::EcdsaSigningKey;
+        use hickory_proto::dnssec::{DnssecSigner, SigningKey};
+        use hickory_proto::rr::RecordSet;
+
+        let origin = Name::from_str("shortsig.example.").unwrap();
+        let pkcs8 = EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256)
+            .expect("generate pkcs8");
+        let private = EcdsaSigningKey::from_pkcs8(&pkcs8, Algorithm::ECDSAP256SHA256)
+            .expect("key from pkcs8");
+        let dnskey = DNSKEY::from_key(&private.to_public_key().expect("public key"));
+        let signer = DnssecSigner::new(
+            dnskey.clone(),
+            Box::new(private),
+            origin.clone(),
+            Duration::from_secs(30),
+        );
+
+        let answer = Record::from_rdata(
+            origin.clone(),
+            86400,
+            RData::A(A(Ipv4Addr::new(203, 0, 113, 9))),
+        );
+        let mut set = RecordSet::new(origin.clone(), RecordType::A, 86400);
+        set.insert(answer.clone(), 0);
+        let signature = sign_test_rrset(&set, &signer);
+
+        let mut trust_anchors = TrustAnchors::empty();
+        trust_anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new())
+            .with_trust_anchors(trust_anchors);
+
+        let mut msg = Message::new(3, MessageType::Response, OpCode::Query);
+        msg.queries
+            .push(Query::query(origin.clone(), RecordType::A));
+        msg.answers.push(answer);
+        msg.answers.push(signature);
+        msg.additionals.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)),
+        ));
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("ttl-test"), now);
+        assert_eq!(outcome, ValidationOutcome::Secure);
+
+        let answer_ttl = msg
+            .answers
+            .iter()
+            .find(|record| record.record_type() == RecordType::A)
+            .expect("answer")
+            .ttl;
+        assert!(
+            answer_ttl <= 30,
+            "authenticated TTL must not outlive the signature, got {answer_ttl}"
+        );
+        let sig_ttl = msg
+            .answers
+            .iter()
+            .find(|record| record.record_type() == RecordType::RRSIG)
+            .expect("rrsig")
+            .ttl;
+        assert!(
+            sig_ttl <= 30,
+            "the RRSIG TTL must be capped as well, got {sig_ttl}"
+        );
     }
 }
