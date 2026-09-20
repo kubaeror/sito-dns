@@ -779,27 +779,6 @@ struct DsLink {
     matched: bool,
 }
 
-/// Expiry for a validated key/zone: the minimum of the owner's TTL and the
-/// matching signature expiration, defaulting to one hour.
-fn key_record_expiry(response: &Message, owner: &Name, rrsigs: &[(Name, SIG)], now: u32) -> u32 {
-    let ttl = response
-        .answers
-        .iter()
-        .chain(response.authorities.iter())
-        .chain(response.additionals.iter())
-        .filter(|record| record.name == *owner)
-        .map(|record| record.ttl)
-        .min()
-        .unwrap_or(3600);
-    let ttl_expiry = now.saturating_add(ttl);
-    let sig_expiry = rrsigs
-        .iter()
-        .filter(|(sig_owner, _)| *sig_owner == *owner)
-        .map(|(_, sig)| sig.input().sig_expiration.get())
-        .min();
-    sig_expiry.map_or(ttl_expiry, |e| e.min(ttl_expiry))
-}
-
 /// DNSSEC validation engine.
 pub struct DnssecValidator {
     pub mode: DnssecMode,
@@ -807,9 +786,15 @@ pub struct DnssecValidator {
     pub nta_domains: Arc<ArcSwap<Vec<String>>>,
     pub key_cache: KeyCache,
     pub metrics: Arc<DnssecMetrics>,
-    /// Zones whose DS link or signature chain has been validated, with an
-    /// expiry timestamp. A later response under one of these zones that carries
-    /// no RRSIG is a stripped-signature downgrade and must not be Insecure.
+    /// Zones that actually signed response data which validated against a
+    /// trust anchor, with an expiry timestamp. A later response under one of
+    /// these zones that carries no RRSIG is a stripped-signature downgrade and
+    /// must not be Insecure.
+    ///
+    /// Only signatures over response data mark a zone; linking a key to an
+    /// anchor (e.g. the root DNSKEY fetched by the chain walk) proves the key
+    /// but not that descendants are authoritative-signed, so it must never
+    /// mark a zone as signed.
     signed_zones: DashMap<LowerName, u32>,
 }
 
@@ -1045,9 +1030,13 @@ impl DnssecValidator {
             let anchored = anchors.contains(key.public_key())
                 || anchors.contains_with_name(key.public_key(), &lower);
             if anchored || self.key_cache.is_validated(&lower, tag, key, now) {
+                // Note: linking a key to an anchor proves the *key*, not that
+                // the name is in a signed zone. Marking a zone here (in
+                // particular the root, whose key is fetched by the chain walk)
+                // would make every descendant without RRSIGs look like a
+                // stripped-signature downgrade. Zone evidence is only recorded
+                // for signatures that actually validated over response data.
                 result.validated.insert((lower.clone(), dnskey_fingerprint(key)));
-                let expiry = key_record_expiry(response, owner, rrsigs, now);
-                self.mark_signed_zone(&lower, expiry);
             }
         }
 
@@ -1134,8 +1123,6 @@ impl DnssecValidator {
                         {
                             changed = true;
                         }
-                        let expiry = key_record_expiry(response, ds_owner, rrsigs, now);
-                        self.mark_signed_zone(&lower_ds, expiry);
                     }
                 }
             }
@@ -1175,8 +1162,6 @@ impl DnssecValidator {
                         changed = true;
                     }
                 }
-                let expiry = key_record_expiry(response, owner, rrsigs, now);
-                self.mark_signed_zone(&lower, expiry);
             }
         }
 
@@ -3332,9 +3317,9 @@ mod tests {
             .map(|(i, byte)| u32::from(*byte) << if i & 1 == 0 { 8 } else { 0 })
             .sum();
 
-        for flags in 0x0100u32..=0xFFFF {
+        for flags in 0u32..=0xFFFF {
             // Zone key flag set, revoke flag clear (required by policy).
-            if flags & 0x0080 != 0 {
+            if flags & 0x0100 == 0 || flags & 0x0080 != 0 {
                 continue;
             }
             let ac = base_ac + flags;
@@ -3345,28 +3330,47 @@ mod tests {
         None
     }
 
+    /// Builds a key pair whose key tag collides with `target_tag` but whose
+    /// public key material differs.
+    ///
+    /// The tag is varied through the DNSKEY flags field. Policy requires the
+    /// zone-key bit set and the revoke bit clear, so only a quarter of the
+    /// reachable tag residues is covered per generated key; fresh keys are
+    /// generated until one collides (expected ~4 attempts).
+    fn forge_same_tag_key(
+        target_tag: u16,
+    ) -> (DNSKEY, hickory_proto::dnssec::crypto::EcdsaSigningKey) {
+        use hickory_proto::dnssec::crypto::EcdsaSigningKey;
+        use hickory_proto::dnssec::SigningKey;
+
+        for _ in 0..256 {
+            let pkcs8 = EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256)
+                .expect("generate fake pkcs8");
+            let private = EcdsaSigningKey::from_pkcs8(&pkcs8, Algorithm::ECDSAP256SHA256)
+                .expect("fake key from pkcs8");
+            let public = private.to_public_key().expect("fake public key");
+            let plain = DNSKEY::from_key(&public);
+            if let Some(flags) = find_same_tag_flags(&plain, target_tag) {
+                let key = DNSKEY::with_flags(flags, plain.public_key().clone());
+                return (key, private);
+            }
+        }
+        panic!("a 16-bit tag collision must be constructible");
+    }
+
     /// Regression for the same-tag DNSKEY forgery: including the anchored key
     /// plus a same-tag forgery must not let the forgery be trusted, and must
     /// never replace the anchored key in the validated-key cache.
     #[test]
     fn test_same_tag_dnskey_forgery_is_not_trusted() {
-        use hickory_proto::dnssec::crypto::EcdsaSigningKey;
-        use hickory_proto::dnssec::{DnssecSigner, SigningKey};
+        use hickory_proto::dnssec::DnssecSigner;
 
         let (origin, real_key, real_signer) =
             crate::test_util::create_test_signer("victim.example.");
         let real_tag = real_key.calculate_key_tag().expect("real tag");
 
         // A different key pair whose tag is forced to collide.
-        let pkcs8 = EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256)
-            .expect("generate fake pkcs8");
-        let fake_private = EcdsaSigningKey::from_pkcs8(&pkcs8, Algorithm::ECDSAP256SHA256)
-            .expect("fake key from pkcs8");
-        let fake_public = fake_private.to_public_key().expect("fake public key");
-        let fake_plain = DNSKEY::from_key(&fake_public);
-        let collision_flags = find_same_tag_flags(&fake_plain, real_tag)
-            .expect("a 16-bit tag collision must be constructible");
-        let fake_key = DNSKEY::with_flags(collision_flags, fake_plain.public_key().clone());
+        let (fake_key, fake_private) = forge_same_tag_key(real_tag);
         assert_eq!(fake_key.calculate_key_tag().expect("fake tag"), real_tag);
         assert_ne!(
             dnskey_fingerprint(&fake_key),
@@ -3443,5 +3447,137 @@ mod tests {
         ));
         let outcome = validator.validate_response(&mut legit, Some("legit"), now);
         assert_eq!(outcome, ValidationOutcome::Secure);
+    }
+
+    /// Regression: linking a key to a trust anchor (in particular the root key
+    /// fetched by the chain walk) must not mark the root or any other zone as
+    /// signed. Doing so turned every unrelated unsigned response into a
+    /// stripped-signature "Bogus" and SERVFAILed it (audit 6, P0-2).
+    #[test]
+    fn test_building_validated_key_set_does_not_mark_zones_signed() {
+        let anchors = TrustAnchors::default();
+        let anchor = anchors.get(0).expect("default root anchor").clone();
+        let root = Name::root();
+        let root_key = DNSKEY::with_flags(257, anchor);
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new());
+        let mut response = Message::new(45, MessageType::Response, OpCode::Query);
+        response.additionals.push(Record::from_rdata(
+            root.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(root_key.clone())),
+        ));
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let result = validator.build_validated_key_set(
+            &response,
+            &[(root.clone(), root_key)],
+            &[],
+            now,
+        );
+        assert!(!result.validated.is_empty());
+        for name in ["unsigned.example.", "com.", "www.example.org."] {
+            let lower = LowerName::from(&Name::from_str(name).expect("name"));
+            assert!(
+                !validator.signed_zone_contains(&lower, now),
+                "{name} must not be recorded as signed just because the root key was linked"
+            );
+        }
+    }
+
+    /// An unrelated unsigned response after a successful validation must stay
+    /// Insecure and resolvable (this SERVFAILed before the audit-6 fix).
+    #[test]
+    fn test_signed_response_does_not_make_unrelated_unsigned_names_bogus() {
+        let (origin, dnskey, a_record, rrsig_record, _) =
+            create_test_signed_domain("signed.example.");
+
+        let mut trust_anchors = TrustAnchors::empty();
+        trust_anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new())
+            .with_trust_anchors(trust_anchors);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+        let mut signed = Message::new(1, MessageType::Response, OpCode::Query);
+        signed
+            .queries
+            .push(Query::query(origin.clone(), RecordType::A));
+        signed.answers.push(a_record);
+        signed.answers.push(rrsig_record);
+        signed.additionals.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)),
+        ));
+        assert_eq!(
+            validator.validate_response(&mut signed, Some("t"), now),
+            ValidationOutcome::Secure
+        );
+
+        let unrelated = Name::from_str("unrelated.test.").expect("name");
+        let mut unsigned = Message::new(2, MessageType::Response, OpCode::Query);
+        unsigned
+            .queries
+            .push(Query::query(unrelated.clone(), RecordType::A));
+        unsigned.answers.push(Record::from_rdata(
+            unrelated,
+            300,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
+        ));
+        let outcome = validator.validate_response(&mut unsigned, Some("t"), now);
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Insecure,
+            "an unrelated unsigned response must not be treated as a downgrade"
+        );
+        assert_eq!(unsigned.metadata.response_code, ResponseCode::NoError);
+        assert!(!unsigned.metadata.authentic_data);
+    }
+
+    /// Within a zone that actually signed data, a response without RRSIGs is
+    /// still a stripped-signature downgrade and must be Bogus.
+    #[test]
+    fn test_stripped_rrsig_in_proven_signed_zone_is_bogus() {
+        let (origin, dnskey, a_record, rrsig_record, _) =
+            create_test_signed_domain("signed.example.");
+
+        let mut trust_anchors = TrustAnchors::empty();
+        trust_anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new())
+            .with_trust_anchors(trust_anchors);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let mut signed = Message::new(1, MessageType::Response, OpCode::Query);
+        signed
+            .queries
+            .push(Query::query(origin.clone(), RecordType::A));
+        signed.answers.push(a_record);
+        signed.answers.push(rrsig_record);
+        signed.additionals.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)),
+        ));
+        assert_eq!(
+            validator.validate_response(&mut signed, Some("t"), now),
+            ValidationOutcome::Secure
+        );
+
+        let other = Name::from_str("other.signed.example.").expect("name");
+        let mut stripped = Message::new(2, MessageType::Response, OpCode::Query);
+        stripped
+            .queries
+            .push(Query::query(other.clone(), RecordType::A));
+        stripped.answers.push(Record::from_rdata(
+            other,
+            300,
+            RData::A(A(Ipv4Addr::new(198, 51, 100, 7))),
+        ));
+        let outcome = validator.validate_response(&mut stripped, Some("t"), now);
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "stripped signatures in a proven-signed zone must stay Bogus: {outcome:?}"
+        );
+        assert_eq!(stripped.metadata.response_code, ResponseCode::ServFail);
     }
 }
