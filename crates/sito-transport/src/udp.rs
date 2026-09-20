@@ -73,13 +73,19 @@ pub fn create_reuseport_udp_socket(addr: &SocketAddr) -> std::io::Result<std::ne
     #[cfg(unix)]
     unsafe {
         let opt: libc::c_int = 1;
-        libc::setsockopt(
+        let rc = libc::setsockopt(
             socket.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_REUSEPORT,
             (&raw const opt).cast::<libc::c_void>(),
             std::mem::size_of_val(&opt) as libc::socklen_t,
         );
+        if rc != 0 {
+            // Without SO_REUSEPORT the multi-worker fan-out cannot bind the
+            // same address repeatedly; surface the real cause instead of a
+            // confusing EADDRINUSE on worker 2.
+            return Err(std::io::Error::last_os_error());
+        }
     }
 
     if addr.is_ipv6() {

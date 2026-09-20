@@ -195,7 +195,14 @@ pub fn send_with_pktinfo(
 
     let bytes_sent = unsafe { libc::sendmsg(fd, &msg, 0) };
     if bytes_sent < 0 {
-        // If sendmsg fails (e.g. invalid source address), fall back to standard send_to
+        // On a multi-homed host the fallback can send from a different source
+        // address than the one the client queried; make that visible instead
+        // of failing over silently.
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(
+            "sendmsg with source address failed ({}); falling back to the default source address",
+            err
+        );
         send_to_raw(fd, buf, peer_addr)
     } else {
         Ok(bytes_sent as usize)

@@ -1563,6 +1563,12 @@ async fn start_dns_listeners(
         handles.push(tcp_handle);
 
         // Start DoT listener if dot_port > 0 and TLS is configured
+        if config.dns.dot_port > 0 && dot_acceptor_mgr.is_none() {
+            error!(
+                addr = %SocketAddr::new(*bind_ip, config.dns.dot_port),
+                "DoT port is configured but no TLS certificate/ACME material is available; the DoT listener is NOT running"
+            );
+        }
         if config.dns.dot_port > 0
             && let Some(ref dot_mgr) = dot_acceptor_mgr
         {
@@ -1591,12 +1597,13 @@ async fn start_dns_listeners(
                 let doh_addr = SocketAddr::new(*bind_ip, config.dns.doh_port);
                 let dedicated_host = (!config.dns.doh_dedicated_hostname.trim().is_empty())
                     .then(|| config.dns.doh_dedicated_hostname.trim().to_string());
+                // Only advertise HTTP/3 when a DoH3 listener can actually be
+                // started (port configured and TLS material available); a
+                // bind failure is logged at error level below.
+                let alt_svc_port = (config.dns.doh3_port > 0 && doh3_acceptor_mgr.is_some())
+                    .then_some(config.dns.doh3_port);
                 let mut doh_config = DohConfig::new(doh_addr, doh_acceptor_mgr.clone())
-                    .with_alt_svc_port(if config.dns.doh3_port > 0 {
-                        Some(config.dns.doh3_port)
-                    } else {
-                        None
-                    })
+                    .with_alt_svc_port(alt_svc_port)
                     .with_dedicated_hostname(dedicated_host);
                 doh_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
                 doh_config.rate_limiter = Some(shared_limiter.clone());
@@ -1618,7 +1625,7 @@ async fn start_dns_listeners(
             doq_config.max_connections = config.dns.max_tcp_connections;
             match start_doq_listener(doq_config, pipeline.clone(), shutdown_rx.clone()).await {
                 Ok(doq_handle) => handles.push(doq_handle),
-                Err(e) => warn!("Failed to start DoQ listener on {doq_addr}: {e}"),
+                Err(e) => error!("Failed to start the configured DoQ listener on {doq_addr}: {e}"),
             }
         }
 
@@ -1636,7 +1643,9 @@ async fn start_dns_listeners(
             doh3_config.max_connections = config.dns.max_tcp_connections;
             match start_doh3_listener(doh3_config, pipeline.clone(), shutdown_rx.clone()).await {
                 Ok(doh3_handle) => handles.push(doh3_handle),
-                Err(e) => warn!("Failed to start DoH3 listener on {doh3_addr}: {e}"),
+                Err(e) => {
+                    error!("Failed to start the configured DoH3 listener on {doh3_addr}: {e}")
+                }
             }
         }
     }

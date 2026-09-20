@@ -45,6 +45,7 @@ impl PlainUpstream {
         query: &Message,
         encoded_query: &[u8],
         deadline: Instant,
+        original_id: u16,
     ) -> Result<Message, UpstreamError> {
         let Ok(len) = u16::try_from(encoded_query.len()) else {
             return Err(UpstreamError::BadResponse(
@@ -75,9 +76,10 @@ impl PlainUpstream {
 
         match res {
             Ok(Ok(bytes)) => {
-                let response = decode_message(&bytes)
+                let mut response = decode_message(&bytes)
                     .map_err(|e| UpstreamError::BadResponse(e.to_string()))?;
                 validate_response(query, &response)?;
+                response.metadata.id = original_id;
                 Ok(response)
             }
             Ok(Err(e)) => Err(classify_io_error(&e)),
@@ -93,7 +95,15 @@ impl Upstream for PlainUpstream {
         // fallback); phases must not each restart the full timeout.
         let deadline = Instant::now() + self.query_timeout;
 
-        let encoded = encode_message(msg).map_err(|e| UpstreamError::BadResponse(e.to_string()))?;
+        // RFC 5452 §9.1: randomize the message ID on the wire so an off-path
+        // attacker cannot predict it from the (client-chosen) ID, and restore
+        // the caller's ID on the response. TLS/QUIC upstreams do not need this
+        // and keep the caller's ID.
+        let original_id = msg.metadata.id;
+        let mut wire_msg = msg.clone();
+        wire_msg.metadata.id = rand::random();
+        let encoded =
+            encode_message(&wire_msg).map_err(|e| UpstreamError::BadResponse(e.to_string()))?;
         if encoded.len() > u16::MAX as usize {
             return Err(UpstreamError::BadResponse(
                 "plain DNS query exceeds the 65535-byte DNS-over-TCP limit".to_string(),
@@ -131,7 +141,7 @@ impl Upstream for PlainUpstream {
             Err(_) => return Err(UpstreamError::Timeout),
         };
 
-        let response = match decode_message(&buf[..bytes_read]) {
+        let mut response = match decode_message(&buf[..bytes_read]) {
             Ok(response) => response,
             // A full buffer combined with a decode failure usually means the
             // datagram did not fit; retry over TCP before giving up.
@@ -140,11 +150,14 @@ impl Upstream for PlainUpstream {
                     "Upstream {} response may have been truncated at {} bytes ({}); retrying over TCP",
                     self.server_addr, buffer_size, e
                 );
-                return self.resolve_tcp(msg, &encoded, deadline).await;
+                return self
+                    .resolve_tcp(&wire_msg, &encoded, deadline, original_id)
+                    .await;
             }
             Err(e) => return Err(UpstreamError::BadResponse(e.to_string())),
         };
-        validate_response(msg, &response)?;
+        validate_response(&wire_msg, &response)?;
+        response.metadata.id = original_id;
 
         // Fallback to TCP if UDP response was truncated
         if response.metadata.truncation {
@@ -152,7 +165,9 @@ impl Upstream for PlainUpstream {
                 "Upstream {} returned TC=1 over UDP, retrying over TCP",
                 self.server_addr
             );
-            return self.resolve_tcp(msg, &encoded, deadline).await;
+            return self
+                .resolve_tcp(&wire_msg, &encoded, deadline, original_id)
+                .await;
         }
 
         trace!(
@@ -178,7 +193,7 @@ pub fn classify_io_error(err: &std::io::Error) -> UpstreamError {
 mod tests {
     use super::*;
     use sito_proto::set_edns_payload_size;
-    use sito_proto::{MessageType, OpCode, Query, RecordType};
+    use sito_proto::{MessageType, OpCode, Query, RecordType, ResponseCode};
     use std::str::FromStr;
 
     fn make_query() -> Message {
@@ -213,6 +228,41 @@ mod tests {
             udp_recv_buffer_size(&query),
             MAX_UDP_BUFFER_SIZE,
             "buffer must not exceed the UDP ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plain_udp_randomizes_wire_id_and_restores_caller_id() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let seen: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
+        let seen_server = Arc::clone(&seen);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let query = decode_message(&buf[..n]).unwrap();
+            *seen_server.lock().unwrap() = Some(query.metadata.id);
+
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::NoError;
+            let bytes = encode_message(&resp).unwrap();
+            server.send_to(&bytes, peer).await.unwrap();
+        });
+
+        let upstream = PlainUpstream::new(addr, Duration::from_secs(2));
+        let response = upstream.resolve(&make_query()).await.expect("resolve");
+        server_task.await.unwrap();
+
+        let wire_id = seen.lock().unwrap().expect("server saw a query");
+        assert_ne!(wire_id, 7, "the on-the-wire ID must be randomized");
+        assert_eq!(
+            response.metadata.id, 7,
+            "the caller's message ID must be restored"
         );
     }
 }
