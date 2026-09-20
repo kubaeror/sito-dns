@@ -1644,7 +1644,7 @@ async fn start_dns_listeners(
             match start_doh3_listener(doh3_config, pipeline.clone(), shutdown_rx.clone()).await {
                 Ok(doh3_handle) => handles.push(doh3_handle),
                 Err(e) => {
-                    error!("Failed to start the configured DoH3 listener on {doh3_addr}: {e}")
+                    error!("Failed to start the configured DoH3 listener on {doh3_addr}: {e}");
                 }
             }
         }
