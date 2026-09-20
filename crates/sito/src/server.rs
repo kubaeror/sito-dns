@@ -39,6 +39,27 @@ pub(crate) fn clients_from_config(config: &Config) -> anyhow::Result<sito_client
     }
 }
 
+/// Maps client-group policy onto the filter engine's per-group rule sets.
+///
+/// Groups that define neither `lists` nor `custom_rules` are skipped so the
+/// engine does not compile empty snapshots.
+pub(crate) fn group_rule_sets(
+    clients: &sito_clients::ClientsConfig,
+) -> Vec<sito_filter::GroupRuleSet> {
+    let mut groups: Vec<sito_filter::GroupRuleSet> = clients
+        .groups
+        .iter()
+        .filter(|(_, group)| !group.lists.is_empty() || !group.custom_rules.is_empty())
+        .map(|(name, group)| sito_filter::GroupRuleSet {
+            name: name.clone(),
+            lists: group.lists.clone(),
+            custom_rules: group.custom_rules.clone(),
+        })
+        .collect();
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+    groups
+}
+
 /// Parses the optional `[rewrites]` section, surfacing type errors.
 pub(crate) fn rewrites_from_config(
     config: &Config,
@@ -567,6 +588,9 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
                                     continue;
                                 }
                             };
+                            // Refresh per-group rule sets after both the lists
+                            // and the group policy have been re-read.
+                            watcher_filter.set_group_rules(group_rule_sets(&new_clients_cfg));
                             // Carry the RouterOS lease store across the reload so
                             // the running sync task keeps feeding the new registry.
                             let leases = watcher_runtime
@@ -739,6 +763,9 @@ pub async fn run_server_full(
 
     // Initialize client registry
     let clients_config = clients_from_config(&config)?;
+    // Compile per-group rule sets so group `lists`/`custom_rules` actually
+    // apply (previously they were stored but never evaluated).
+    filter_engine.set_group_rules(group_rule_sets(&clients_config));
 
     // Build per-client upstream managers for entries that opt out of the globals.
     let scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>> =

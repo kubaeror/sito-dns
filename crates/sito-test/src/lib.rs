@@ -896,6 +896,7 @@ mod tests {
         mock_upstream.add_a_record("tiktok.com", Ipv4Addr::new(1, 2, 3, 4), 300);
         mock_upstream.add_a_record("www.google.com", Ipv4Addr::new(1, 2, 3, 4), 300);
         mock_upstream.add_a_record("allowed-clean.com", Ipv4Addr::new(1, 2, 3, 4), 300);
+        mock_upstream.add_a_record("fortnite-group-rule.com", Ipv4Addr::new(1, 2, 3, 4), 300);
 
         let clients_val: toml::Value = toml::from_str(
             r#"
@@ -924,6 +925,7 @@ mod tests {
             safe_search = true
             parental = true
             parental_categories = ["adult"]
+            custom_rules = ["||fortnite-group-rule.com^"]
             [[groups.kids.blocked_services]]
             service = "tiktok"
 
@@ -1055,6 +1057,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.answers[0].record_type(), RecordType::A);
+
+        // --- 5. Group custom_rules (audit 6, WP-3.1) ---
+        // The kids group adds `||fortnite-group-rule.com^`; it must block for
+        // group members only.
+        let r = client
+            .query_doh_post(&doh_kid, "fortnite-group-rule.com", RecordType::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.answers[0].data,
+            RData::A(A(Ipv4Addr::UNSPECIFIED)),
+            "group custom_rules must block for group members"
+        );
+        for (label, url) in [("adult", &doh_adult), ("default", &doh_default)] {
+            let r = client
+                .query_doh_post(url, "fortnite-group-rule.com", RecordType::A)
+                .await
+                .unwrap();
+            assert_eq!(
+                r.answers[0].data,
+                RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+                "group custom_rules must not apply to the {label} policy"
+            );
+        }
 
         server.shutdown().await.unwrap();
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;

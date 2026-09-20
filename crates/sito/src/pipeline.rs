@@ -217,6 +217,33 @@ struct FilterCandidates {
     block: Vec<u32>,
 }
 
+/// Combines the global and per-group standard verdicts.
+///
+/// Allow rules from either set win over block rules from the other set;
+/// rewrites apply when no allow matched; blocks from the global set take
+/// precedence in the returned reason.
+fn combine_standard_verdicts(global: Verdict, group: Option<Verdict>) -> Verdict {
+    let allow_rule_matched = |verdict: &Verdict| matches!(verdict, Verdict::Allow(Some(_)));
+    let global_allowed = allow_rule_matched(&global);
+    let group_allowed = group.as_ref().is_some_and(allow_rule_matched);
+    if global_allowed || group_allowed {
+        return Verdict::Allow(None);
+    }
+    if let Some(Verdict::Rewrite(action)) = group {
+        return Verdict::Rewrite(action);
+    }
+    if let Verdict::Rewrite(action) = global {
+        return Verdict::Rewrite(action);
+    }
+    if let Verdict::Block(_) = global {
+        return global;
+    }
+    if let Some(block @ Verdict::Block(_)) = group {
+        return block;
+    }
+    Verdict::Allow(None)
+}
+
 /// Normalizes a query name to its ASCII/punycode, lowercased form.
 ///
 /// Mirrors `sito_filter`'s private `normalized_query_domain` exactly so the
@@ -456,6 +483,7 @@ impl DnsPipeline {
         normalized_domain: &str,
         snapshot: &sito_filter::FilterSnapshot,
         candidates: &FilterCandidates,
+        group: Option<(&sito_filter::FilterSnapshot, &FilterCandidates)>,
         qtype: RecordType,
         query_id: u16,
     ) -> Option<QueryOutcome> {
@@ -507,13 +535,28 @@ impl DnsPipeline {
             ));
         }
 
-        match snapshot.evaluate_standard_candidates(
+        // A per-group standard allow rule may unblock a global block, and a
+        // per-group block applies to group members even when the global set
+        // does not match.
+        let group_verdict = group.map(|(group_snapshot, group_candidates)| {
+            group_snapshot.evaluate_standard_candidates(
+                normalized_domain,
+                qtype,
+                client,
+                &group_candidates.allow,
+                &group_candidates.block,
+            )
+        });
+        let global_verdict = snapshot.evaluate_standard_candidates(
             normalized_domain,
             qtype,
             client,
             &candidates.allow,
             &candidates.block,
-        ) {
+        );
+        let combined = combine_standard_verdicts(global_verdict, group_verdict);
+
+        match combined {
             Verdict::Block(verdict) => {
                 info!(
                     qname = %domain_str,
@@ -785,6 +828,33 @@ impl QueryHandler for DnsPipeline {
                 (String::new(), None, FilterCandidates::default())
             };
 
+            // Per-group extra rules (clients.groups.<name>.lists/custom_rules)
+            // are compiled separately by the engine and applied only to clients
+            // whose resolved policy selects the group.
+            let (group_snapshot, group_candidates) = if policy.is_filtering_enabled
+                && (!policy.lists.is_empty() || !policy.custom_rules.is_empty())
+            {
+                match self.filter.group_snapshot(&policy.group_name) {
+                    Some(snapshot) => {
+                        let mut candidates = FilterCandidates::default();
+                        snapshot.allowlist.collect_candidates(
+                            &normalized_domain,
+                            &snapshot.interner,
+                            &mut candidates.allow,
+                        );
+                        snapshot.blocklist.collect_candidates(
+                            &normalized_domain,
+                            &snapshot.interner,
+                            &mut candidates.block,
+                        );
+                        (Some(snapshot), Some(candidates))
+                    }
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+
             trace!(qname = %qname, qtype = ?qtype, "Processing DNS query");
 
             let bypass_check_needed = match config.filtering.anti_doh_bypass.as_str() {
@@ -803,15 +873,28 @@ impl QueryHandler for DnsPipeline {
 
             // ADR-0007 Stage 1: $important filter rules (takes precedence over local rewrites)
             let mut important_allowed = false;
-            if let Some(filter_snapshot) = filter_snapshot.as_ref()
-                && let Some(verdict) = filter_snapshot.evaluate_important_candidates(
+            let mut important_verdict = filter_snapshot.as_ref().and_then(|snapshot| {
+                snapshot.evaluate_important_candidates(
                     &normalized_domain,
                     qtype,
                     &client,
                     &filter_candidates.allow,
                     &filter_candidates.block,
                 )
+            });
+            if important_verdict.is_none()
+                && let (Some(group), Some(candidates)) =
+                    (group_snapshot.as_ref(), group_candidates.as_ref())
             {
+                important_verdict = group.evaluate_important_candidates(
+                    &normalized_domain,
+                    qtype,
+                    &client,
+                    &candidates.allow,
+                    &candidates.block,
+                );
+            }
+            if let Some(verdict) = important_verdict {
                 match verdict {
                     Verdict::Block(_) => {
                         info!(
@@ -867,6 +950,7 @@ impl QueryHandler for DnsPipeline {
                     &normalized_domain,
                     filter_snapshot,
                     &filter_candidates,
+                    group_snapshot.as_deref().zip(group_candidates.as_ref()),
                     qtype,
                     query_id,
                 )

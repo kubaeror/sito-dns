@@ -242,7 +242,21 @@ impl FilterSnapshot {
         allow_candidates: &[u32],
         block_candidates: &[u32],
     ) -> Verdict {
-        // Stage 3: Standard Allowlist (@@...)
+        if let Some(allow) =
+            self.evaluate_standard_allow_candidates(qtype, client, allow_candidates)
+        {
+            return allow;
+        }
+        self.evaluate_standard_block_candidates(domain, qtype, client, block_candidates)
+    }
+
+    /// Stage 3 only: the standard allowlist (`@@...`, non-important).
+    pub fn evaluate_standard_allow_candidates(
+        &self,
+        qtype: RecordType,
+        client: &ClientContext,
+        allow_candidates: &[u32],
+    ) -> Option<Verdict> {
         for &rule_id in allow_candidates {
             let rule = &self.rules[rule_id as usize];
             if rule.modifiers.important {
@@ -259,10 +273,19 @@ impl FilterSnapshot {
                 continue;
             }
             let rule_ref = RuleRef::new(&rule.raw).with_source(&rule.source, rule.line as usize);
-            return Verdict::Allow(Some(rule_ref));
+            return Some(Verdict::Allow(Some(rule_ref)));
         }
+        None
+    }
 
-        // Stage 4: Standard Blocklist (...)
+    /// Stage 4 only: the standard blocklist (`$dnsrewrite` included).
+    pub fn evaluate_standard_block_candidates(
+        &self,
+        domain: &str,
+        qtype: RecordType,
+        client: &ClientContext,
+        block_candidates: &[u32],
+    ) -> Verdict {
         for &rule_id in block_candidates {
             let rule = &self.rules[rule_id as usize];
             if rule.modifiers.important {
@@ -464,6 +487,22 @@ fn normalized_query_domain(qname: &Name) -> String {
 }
 
 /// Thread-safe filtering engine implementing AdGuard ABP and hosts blocking.
+/// Extra filtering rules contributed by a client-group policy.
+///
+/// Group `lists` reference configured global lists by name; `custom_rules` use
+/// the same AdGuard/ABP syntax as `filtering.custom_rules`. The rules are
+/// compiled into a per-group snapshot on top of the global one and applied
+/// only to clients whose resolved policy selects the group.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupRuleSet {
+    /// Group name as used by `clients.groups.<name>`.
+    pub name: String,
+    /// Names of configured filter lists this group adds.
+    pub lists: Vec<String>,
+    /// Ad-hoc rules this group adds.
+    pub custom_rules: Vec<String>,
+}
+
 pub struct HostsFilterEngine {
     snapshot: ArcSwap<FilterSnapshot>,
     config: ArcSwap<FilteringConfig>,
@@ -476,6 +515,10 @@ pub struct HostsFilterEngine {
     reload_lock: tokio::sync::Mutex<()>,
     /// Observability state (loading/ready/failed, per-list failures).
     status: ArcSwap<FilterStatus>,
+    /// Group policies to compile extra rule sets for (refreshed on config reload).
+    group_defs: ArcSwap<Vec<GroupRuleSet>>,
+    /// Compiled per-group rule sets, keyed by group name.
+    group_snapshots: ArcSwap<FnvHashMap<String, Arc<FilterSnapshot>>>,
 }
 
 impl HostsFilterEngine {
@@ -497,7 +540,68 @@ impl HostsFilterEngine {
             list_rules: std::sync::Mutex::new(FnvHashMap::default()),
             reload_lock: tokio::sync::Mutex::new(()),
             status: ArcSwap::new(Arc::new(status)),
+            group_defs: ArcSwap::new(Arc::new(Vec::new())),
+            group_snapshots: ArcSwap::new(Arc::new(FnvHashMap::default())),
         }
+    }
+
+    /// Replaces the group rule definitions and rebuilds the per-group snapshots
+    /// from the currently loaded lists. Called whenever clients/group policy or
+    /// blocklists are (re)loaded.
+    pub fn set_group_rules(&self, groups: Vec<GroupRuleSet>) {
+        self.group_defs.store(Arc::new(groups));
+        let list_rules = self
+            .list_rules
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        self.rebuild_group_snapshots(&list_rules);
+    }
+
+    /// Returns the compiled extra rule set for `group`, if the group defines any.
+    #[must_use]
+    pub fn group_snapshot(&self, group: &str) -> Option<Arc<FilterSnapshot>> {
+        self.group_snapshots.load().get(group).cloned()
+    }
+
+    /// Compiles one snapshot per group from the current per-list rules.
+    ///
+    /// Lists a group references but that are not loaded are skipped (the group
+    /// still gets its custom rules); a group with no usable rules is removed so
+    /// the pipeline does not evaluate an empty set.
+    fn rebuild_group_snapshots(&self, list_rules: &FnvHashMap<String, Vec<Rule>>) {
+        let defs = self.group_defs.load();
+        let mut compiled = FnvHashMap::default();
+        for def in defs.iter() {
+            let mut rules = Vec::new();
+            for list_name in &def.lists {
+                if let Some(list_rules) = list_rules.get(list_name) {
+                    rules.extend(list_rules.iter().cloned());
+                } else {
+                    warn!(
+                        group = %def.name,
+                        list = %list_name,
+                        "Group policy references a filter list that is not loaded; rules from it are inactive"
+                    );
+                }
+            }
+            for rule_text in &def.custom_rules {
+                let (parsed, rejected) = parse_rules(rule_text, &format!("group:{}", def.name));
+                if rejected > 0 {
+                    warn!(
+                        group = %def.name,
+                        "Rejected {} invalid rule(s) in group custom_rules",
+                        rejected
+                    );
+                }
+                rules.extend(parsed);
+            }
+            if rules.is_empty() {
+                continue;
+            }
+            compiled.insert(def.name.clone(), Arc::new(FilterSnapshot::compile(rules)));
+        }
+        self.group_snapshots.store(Arc::new(compiled));
     }
 
     /// Initializes and loads lists immediately (from download or disk cache).
@@ -754,6 +858,16 @@ impl HostsFilterEngine {
 
         self.snapshot.store(Arc::new(new_snapshot));
         *self.list_rules.lock().unwrap() = new_list_rules;
+        // Group rule sets are selected from the list rules, so they must track
+        // the freshly loaded snapshot.
+        {
+            let list_rules = self
+                .list_rules
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            self.rebuild_group_snapshots(&list_rules);
+        }
         let last_error = if failed_lists.is_empty() {
             None
         } else {
@@ -1623,5 +1737,76 @@ mod tests {
             engine.evaluate(&probe, RecordType::A, &client),
             Verdict::Block(BlockReason::FilterUnavailable)
         );
+    }
+
+    /// Regression: group `lists`/`custom_rules` must actually be compiled and
+    /// evaluated (they were stored in the policy but never applied).
+    #[tokio::test]
+    async fn test_group_rules_are_compiled_and_evaluated() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_rules_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let kids_path = temp_dir.join("kids-list.txt");
+        tokio::fs::write(&kids_path, "||cartoon.example^\n")
+            .await
+            .unwrap();
+
+        let config = FilteringConfig {
+            lists: vec![FilterListConfig {
+                name: "school".to_string(),
+                url: format!("file://{}", kids_path.display()),
+                enabled: true,
+                refresh_hours: None,
+            }],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+        assert_eq!(engine.state(), FilterState::Ready);
+
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: vec!["school".to_string()],
+            custom_rules: vec!["||fortnite.example^$important".to_string()],
+        }]);
+
+        let snapshot = engine
+            .group_snapshot("kids")
+            .expect("group snapshot compiled");
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let cartoon = Name::from_str("www.cartoon.example.").unwrap();
+        let fortnite = Name::from_str("fortnite.example.").unwrap();
+        let other = Name::from_str("example.org.").unwrap();
+
+        assert!(
+            matches!(
+                snapshot.evaluate_important("fortnite.example", RecordType::A, &client),
+                Some(Verdict::Block(_))
+            ),
+            "group custom_rules must compile and match"
+        );
+        assert!(matches!(
+            snapshot.evaluate("www.cartoon.example", RecordType::A, &client),
+            Verdict::Block(_)
+        ));
+        assert!(
+            snapshot
+                .evaluate("example.org", RecordType::A, &client)
+                .is_allowed()
+        );
+        let _ = (cartoon, fortnite, other);
+
+        // Groups without configured rules produce no snapshot.
+        assert!(engine.group_snapshot("missing").is_none());
+
+        // A policy that adds no rules must not create an empty group entry.
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "empty".to_string(),
+            ..Default::default()
+        }]);
+        assert!(engine.group_snapshot("empty").is_none());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }
