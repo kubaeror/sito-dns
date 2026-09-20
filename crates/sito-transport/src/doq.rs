@@ -343,7 +343,8 @@ mod tests {
     async fn test_doq_query_and_response() {
         let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
 
-        let temp_dir = std::env::temp_dir().join(format!("sito_doq_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_doq_test_qr_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
         let cert_file = temp_dir.join("cert.pem");
         let key_file = temp_dir.join("key.pem");
@@ -446,7 +447,8 @@ mod tests {
     async fn test_doq_rejects_non_zero_message_id() {
         let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
 
-        let temp_dir = std::env::temp_dir().join(format!("sito_doq_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_doq_test_badid_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
         let cert_file = temp_dir.join("cert.pem");
         let key_file = temp_dir.join("key.pem");
