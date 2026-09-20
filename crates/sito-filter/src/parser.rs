@@ -799,10 +799,12 @@ fn parse_pattern(raw_pattern: &str) -> Option<Pattern> {
 
     // Domain match: `||domain^` or `||domain`
     if let Some(domain_part) = p.strip_prefix("||") {
-        let domain_cleaned = domain_part
-            .strip_suffix('^')
-            .unwrap_or(domain_part)
-            .trim_end_matches('/');
+        let domain_cleaned = domain_part.strip_suffix('^').unwrap_or(domain_part);
+        // A path fragment cannot match a DNS query; treating `||example.com/`
+        // as a full domain block would widen the rule's meaning. Keep it inert.
+        if domain_cleaned.contains('/') {
+            return None;
+        }
         if domain_cleaned.contains('*') {
             // Query domains are lowercased; keep wildcard anchors in the same
             // case space so matching stays case-insensitive.
@@ -829,11 +831,13 @@ fn parse_pattern(raw_pattern: &str) -> Option<Pattern> {
         return Some(Pattern::Wildcard(p.to_ascii_lowercase()));
     }
 
-    // Plain rule: if it contains dot and no slash -> Domain match, otherwise Substring
+    // Plain rule: a bare domain blocks the exact host only (AdGuard semantics:
+    // `example.org` matches example.org but not its subdomains). Rules with a
+    // path cannot match at DNS level and stay inert.
     if p.contains('.') && !p.contains('/') {
         let stripped = p.strip_suffix('^').unwrap_or(p);
         if let Ok(normalized) = normalize_domain(stripped) {
-            return Some(Pattern::Domain(normalized));
+            return Some(Pattern::Exact(normalized));
         }
     }
 

@@ -14,6 +14,8 @@ This document defines the compatibility of the `sito` DNS filtering engine (`sit
 | `substring-token` | Domain contains substring | **Full** | `AhoCorasick` multi-pattern automaton | Fast AC automaton over all substring patterns. |
 | `/^ad[0-9]+\.domain\.com$/`| Regular expression pattern | **Full** | Unified `regex_automata` DFA | Compiled into dense DFA regex runner. |
 | `@@||domain.com^` | Exception / allowlist rule | **Full** | Separate compiled allowlist structures | Evaluated ahead of blocking rules (see Precedence hierarchy). |
+| `example.org` | Bare domain: exact host only | **Full** | `Pattern::Exact` | AdGuard semantics: `www.example.org` is **not** blocked by `example.org`. |
+| `||domain.com/path` | URL / path rule | **Inert** | Parser rejects the pattern | Paths cannot match a DNS query; the rule never widens to a domain block. |
 | `# comment` / `! comment` | Comment or metadata header | **Full** | Ignored by parser | Comment lines, list headers (`! Title: ...`, `! Checksum: ...`) skipped cleanly. |
 
 ---
@@ -23,10 +25,10 @@ This document defines the compatibility of the `sito` DNS filtering engine (`sit
 | Modifier | Syntax | Supported | Behavior |
 |---|---|---|---|
 | `$important` | `||domain^$important` or `@@||domain^$important` | **Yes** | Elevates rule priority. An important block rule overrides a standard allowlist rule; an important allowlist rule overrides an important block rule. |
-| `$denyallow` | `||domain^$denyallow=domain1\|domain2` | **Yes** | Excludes specified domains (and their subdomains) from being blocked by the enclosing rule. |
+| `$denyallow` | `||domain^$denyallow=domain1\|domain2` | **Yes** | Excludes specified domains (and their subdomains) from being blocked by the enclosing rule. On exception rules (`@@...$denyallow=...`) the listed domains stay covered by the block rules instead of being allowed. |
 | `$client` | `$client=192.168.1.10`, `$client=10.0.0.0/24`, `$client=laptop`, `$client=~tv` | **Yes** | Restricts rule to matching client IP, CIDR range, or client identifier. Supports negation with `~`. |
 | `$dnstype` | `$dnstype=A\|AAAA`, `$dnstype=HTTPS`, `$dnstype=65`, `$dnstype=~TXT` | **Yes** | Restricts rule to specific DNS query types (by name or RFC type number). Supports negation with `~`. |
-| `$dnsrewrite` | `$dnsrewrite=NOERROR;A;1.2.3.4` or shorthand `$dnsrewrite=1.2.3.4` | **Yes** | Synthesizes rewrite response (`A`, `AAAA`, `CNAME`, `PTR`, `TXT`, `NXDOMAIN`, `REFUSED`). |
+| `$dnsrewrite` | `$dnsrewrite=NOERROR;A;1.2.3.4` or shorthand `$dnsrewrite=1.2.3.4` | **Partial** | Synthesizes `A`, `AAAA` and `CNAME` answers. Other record types (`PTR`, `TXT`, `NXDOMAIN`, `REFUSED`) are parsed but currently answer NODATA; bare `@@...$dnsrewrite` cancellation and multi-rule aggregation are not implemented (tracked in the audit-6 remediation plan, WP-3.5). |
 | `$badfilter` | `||domain^$badfilter` | **Yes** | Deactivates identical earlier rule in the same or lower-priority lists based on canonical representation. |
 | Browser modifiers | `$third-party`, `$popup`, `$script`, `$image`, `$stylesheet`, `$websocket` | **Ignored** | Safely skipped with `tracing::warn!` without failing list compilation (fail-safe parity with AdGuard Home). |
 
@@ -53,7 +55,7 @@ Per ADR-0005 and plan section 4.5:
 | `zero_ip` (default) | Returns `NOERROR` with `0.0.0.0` for type A, `::` for type AAAA. Configurable TTL. |
 | `nxdomain` | Returns `RCODE = 3 (NXDOMAIN)` with empty answer section. |
 | `refused` | Returns `RCODE = 5 (REFUSED)` with empty answer section. |
-| `custom_ip` | Returns configured IPv4 (`custom_ip_v4`) for A, configured IPv6 (`custom_ip_v6`) for AAAA. |
+| `custom_ip` | Returns the configured address (`blocking_mode = "custom_ip:<ip>"`) for A/AAAA queries. |
 | `null_rdata` | Returns `NOERROR` with empty answer section (NODATA). |
 
 > **Note on Query Types other than A/AAAA:**

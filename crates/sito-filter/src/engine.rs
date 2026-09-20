@@ -197,6 +197,11 @@ impl FilterSnapshot {
             {
                 continue;
             }
+            // `@@...$denyallow=a|b` is an exception for everything *except*
+            // a/b; it must not allow a denyallow match.
+            if rule.modifiers.denyallow_matches(domain) {
+                continue;
+            }
             if let Some(dnstype_filter) = &rule.modifiers.dnstype
                 && !dnstype_filter.matches(qtype)
             {
@@ -249,7 +254,7 @@ impl FilterSnapshot {
         block_candidates: &[u32],
     ) -> Verdict {
         if let Some(allow) =
-            self.evaluate_standard_allow_candidates(qtype, client, allow_candidates)
+            self.evaluate_standard_allow_candidates(domain, qtype, client, allow_candidates)
         {
             return allow;
         }
@@ -259,6 +264,7 @@ impl FilterSnapshot {
     /// Stage 3 only: the standard allowlist (`@@...`, non-important).
     pub fn evaluate_standard_allow_candidates(
         &self,
+        domain: &str,
         qtype: RecordType,
         client: &ClientContext,
         allow_candidates: &[u32],
@@ -271,6 +277,12 @@ impl FilterSnapshot {
             if let Some(client_filter) = &rule.modifiers.client
                 && !client_filter.matches(client)
             {
+                continue;
+            }
+            // AdGuard `@@*$denyallow=com|net` allows everything *except* the
+            // listed domains: an exception must not apply when the queried
+            // domain matches denyallow.
+            if rule.modifiers.denyallow_matches(domain) {
                 continue;
             }
             if let Some(dnstype_filter) = &rule.modifiers.dnstype

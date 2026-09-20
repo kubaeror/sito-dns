@@ -704,3 +704,63 @@ fn test_conformance_corpus_200_rules() {
         }
     }
 }
+
+// --- AdGuard semantics regressions (audit 6, WP-3.5) ---
+
+#[test]
+fn test_conformance_bare_domain_blocks_exact_host_only() {
+    // AdGuard: `example.org` blocks example.org but not its subdomains.
+    let snapshot = FilterSnapshot::compile(parse_rules("example.org\n", "conformance").0);
+    let client = default_client();
+    assert!(matches!(
+        snapshot.evaluate("example.org", RecordType::A, &client),
+        Verdict::Block(_)
+    ));
+    assert!(matches!(
+        snapshot.evaluate("www.example.org", RecordType::A, &client),
+        Verdict::Allow(None)
+    ));
+}
+
+#[test]
+fn test_conformance_path_rule_is_inert_at_dns_level() {
+    // `||example.com/path` cannot match a DNS query and must not be widened
+    // into a domain block.
+    let snapshot = FilterSnapshot::compile(parse_rules("||path-rule.example/\n", "conformance").0);
+    let client = default_client();
+    assert!(matches!(
+        snapshot.evaluate("path-rule.example", RecordType::A, &client),
+        Verdict::Allow(None)
+    ));
+    assert!(matches!(
+        snapshot.evaluate("sub.path-rule.example", RecordType::A, &client),
+        Verdict::Allow(None)
+    ));
+}
+
+#[test]
+fn test_conformance_denyallow_on_exception_rule() {
+    // `@@*$denyallow=blocked.example` allows everything except
+    // blocked.example; the denyallow domain must stay blocked.
+    let rules = "
+@@*$denyallow=blocked.example
+||blocked.example^
+";
+    let snapshot = FilterSnapshot::compile(parse_rules(rules, "conformance").0);
+    let client = default_client();
+    assert!(
+        matches!(
+            snapshot.evaluate("blocked.example", RecordType::A, &client),
+            Verdict::Block(_)
+        ),
+        "denyallow domains must not be allowed by the exception"
+    );
+    assert!(matches!(
+        snapshot.evaluate("other.example", RecordType::A, &client),
+        Verdict::Allow(_)
+    ));
+    assert!(matches!(
+        snapshot.evaluate("sub.blocked.example", RecordType::A, &client),
+        Verdict::Block(_)
+    ));
+}
