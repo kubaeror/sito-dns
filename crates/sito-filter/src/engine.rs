@@ -582,6 +582,9 @@ impl HostsFilterEngine {
         let _reload_guard = self.reload_lock.lock().await;
 
         if !config.enabled {
+            // A disabled engine answers normally; the placeholder keeps
+            // `unavailable_for_fail_closed` false while disabled and forces a
+            // fresh successful load before fail-closed can be relied on again.
             self.snapshot.store(Arc::new(FilterSnapshot::default()));
             self.list_rules.lock().unwrap().clear();
             self.set_status(FilterStatus {
@@ -730,6 +733,12 @@ impl HostsFilterEngine {
                 lists = ?failed_lists,
                 "No filter rules could be loaded; refusing to advertise an enabled empty snapshot"
             );
+            // Keep the engine explicitly unavailable so `fail_closed` answers
+            // SERVFAIL instead of allow-all. Previously the previous snapshot
+            // (e.g. the empty one stored while filtering was disabled) was kept
+            // with `unavailable = false`, silently disabling fail-closed after
+            // a disabled -> enabled transition.
+            self.snapshot.store(Arc::new(FilterSnapshot::unavailable()));
             self.set_status(FilterStatus {
                 state: FilterState::Failed,
                 rule_count: 0,
@@ -1569,5 +1578,50 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Regression: fail-closed must survive a disabled -> enabled transition.
+    /// The empty snapshot stored while disabled used to keep
+    /// `unavailable = false`, so a subsequent failed load served allow-all.
+    #[tokio::test]
+    async fn test_fail_closed_survives_disabled_to_enabled_transition() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_failclosed_trans_{}", std::process::id()));
+        let disabled = FilteringConfig {
+            enabled: false,
+            fail_closed: true,
+            lists: vec![FilterListConfig {
+                name: "dead".to_string(),
+                url: "http://127.0.0.1:1/list.txt".to_string(),
+                enabled: true,
+                refresh_hours: None,
+            }],
+            ..Default::default()
+        };
+        let enabled = FilteringConfig {
+            enabled: true,
+            fail_closed: true,
+            ..disabled.clone()
+        };
+        let engine = HostsFilterEngine::init(disabled, temp_dir.clone()).await;
+        assert_eq!(engine.state(), FilterState::Disabled);
+        assert!(!engine.unavailable_for_fail_closed());
+
+        assert!(
+            engine.reload_with_config(&enabled).await.is_err(),
+            "the dead list must fail to load"
+        );
+        assert_eq!(engine.state(), FilterState::Failed);
+        assert!(
+            engine.unavailable_for_fail_closed(),
+            "a failed load after enabling must still be fail-closed"
+        );
+
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let probe = Name::from_str("anything.example.").unwrap();
+        assert_eq!(
+            engine.evaluate(&probe, RecordType::A, &client),
+            Verdict::Block(BlockReason::FilterUnavailable)
+        );
     }
 }
