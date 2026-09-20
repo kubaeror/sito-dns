@@ -749,6 +749,7 @@ impl HostsFilterEngine {
         }
 
         let custom_rules = config.custom_rules.clone();
+        let max_rules = config.max_rules;
         let base_rules = self.list_rules.lock().unwrap().clone();
         let enabled_names: FnvHashSet<String> = config
             .lists
@@ -758,61 +759,105 @@ impl HostsFilterEngine {
             .collect();
 
         // Compile rules in blocking task to avoid stalling the tokio async runtime
-        let (new_snapshot, count, new_list_rules, rejected_lists) =
-            tokio::task::spawn_blocking(move || {
-                // Merge instead of overwriting: rules from lists that failed to
-                // fetch in this cycle (or that are not part of a partial refresh)
-                // are retained so a transient failure cannot drop protection.
-                let mut map = base_rules;
-                // Drop rules for lists that are no longer enabled/configured.
-                map.retain(|name, _| enabled_names.contains(name));
+        let join_result = tokio::task::spawn_blocking(move || -> Result<_, FilterError> {
+            // Merge instead of overwriting: rules from lists that failed to
+            // fetch in this cycle (or that are not part of a partial refresh)
+            // are retained so a transient failure cannot drop protection.
+            let mut map = base_rules;
+            // Drop rules for lists that are no longer enabled/configured.
+            map.retain(|name, _| enabled_names.contains(name));
 
-                let mut rejected = Vec::new();
-                for (name, content) in list_contents {
-                    let (rules, _) = parse_rules(&content, &name);
-                    if let Some(reason) = regex_load_exceeds_limits(&rules) {
-                        error!(
-                            list = %name,
-                            reason = %reason,
-                            "Rejecting blocklist with excessive regex pattern load"
-                        );
-                        rejected.push(name);
-                        continue;
-                    }
-                    map.insert(name, rules);
+            let mut rejected = Vec::new();
+            for (name, content) in list_contents {
+                let (rules, _) = parse_rules(&content, &name);
+                if let Some(reason) = regex_load_exceeds_limits(&rules) {
+                    error!(
+                        list = %name,
+                        reason = %reason,
+                        "Rejecting blocklist with excessive regex pattern load"
+                    );
+                    rejected.push(name);
+                    continue;
                 }
+                map.insert(name, rules);
+            }
 
-                // Deterministic rule-id assignment: lists sorted by name, rule
-                // order preserved within each list, custom rules last (config
-                // order). Candidate precedence (first match wins) therefore stays
-                // stable across reloads and hash-map iteration order changes.
-                let mut names: Vec<&String> = map.keys().collect();
-                names.sort_unstable();
-                let total_rules: usize = map.values().map(Vec::len).sum();
-                let mut all_rules = Vec::with_capacity(total_rules + custom_rules.len());
-                for name in names {
-                    all_rules.extend(map[name].iter().cloned());
-                }
-                for rule_text in &custom_rules {
-                    let (rules, _) = parse_rules(rule_text, "custom");
-                    all_rules.extend(rules);
-                }
-                let snapshot = FilterSnapshot::compile(all_rules);
-                let count = snapshot.rule_count;
-                (snapshot, count, map, rejected)
-            })
-            .await
-            .map_err(|e| {
-                error!("Filter rule compilation task failed: {e}");
-                self.set_status(FilterStatus {
-                    state: FilterState::Failed,
-                    rule_count: self.snapshot.load().rule_count,
-                    failed_lists: failed_lists.clone(),
-                    last_error: Some(e.to_string()),
-                    ..FilterStatus::default()
+            // Deterministic rule-id assignment: lists sorted by name, rule
+            // order preserved within each list, custom rules last (config
+            // order). Candidate precedence (first match wins) therefore stays
+            // stable across reloads and hash-map iteration order changes.
+            let mut names: Vec<&String> = map.keys().collect();
+            names.sort_unstable();
+            let parsed_rules: usize = map.values().map(Vec::len).sum();
+            // Bound the materialised rule set: a hostile 64 MiB list can
+            // hold tens of millions of minimal lines, and every rule is
+            // materialised several times. Rejecting the reload keeps the
+            // previous snapshot instead of OOM-killing the daemon.
+            if parsed_rules + custom_rules.len() > max_rules {
+                error!(
+                    parsed = parsed_rules + custom_rules.len(),
+                    limit = max_rules,
+                    "Filter rule set exceeds filtering.max_rules"
+                );
+                return Err(FilterError::TooManyRules {
+                    count: parsed_rules + custom_rules.len(),
+                    limit: max_rules,
                 });
-                FilterError::CompileTaskFailed(e.to_string())
-            })?;
+            }
+            let total_rules = parsed_rules;
+            let mut all_rules = Vec::with_capacity(total_rules + custom_rules.len());
+            for name in names {
+                all_rules.extend(map[name].iter().cloned());
+            }
+            for rule_text in &custom_rules {
+                let (rules, _) = parse_rules(rule_text, "custom");
+                all_rules.extend(rules);
+            }
+            let snapshot = FilterSnapshot::compile(all_rules);
+            let count = snapshot.rule_count;
+            Ok((snapshot, count, map, rejected))
+        })
+        .await
+        .map_err(|e| {
+            error!("Filter rule compilation task failed: {e}");
+            self.set_status(FilterStatus {
+                state: FilterState::Failed,
+                rule_count: self.snapshot.load().rule_count,
+                failed_lists: failed_lists.clone(),
+                last_error: Some(e.to_string()),
+                ..FilterStatus::default()
+            });
+            FilterError::CompileTaskFailed(e.to_string())
+        })?;
+
+        let (new_snapshot, count, new_list_rules, rejected_lists) = match join_result {
+            Ok(result) => result,
+            Err(e) => {
+                let prev_count = self.snapshot.load().rule_count;
+                error!(error = %e, "Rejecting filter reload");
+                if prev_count == 0 {
+                    // Fail closed rather than advertise an over-limit set as
+                    // active or silently allow traffic.
+                    self.snapshot.store(Arc::new(FilterSnapshot::unavailable()));
+                    self.set_status(FilterStatus {
+                        state: FilterState::Failed,
+                        rule_count: 0,
+                        failed_lists: failed_lists.clone(),
+                        last_error: Some(e.to_string()),
+                        ..FilterStatus::default()
+                    });
+                } else {
+                    self.set_status(FilterStatus {
+                        state: FilterState::Ready,
+                        rule_count: prev_count,
+                        failed_lists: failed_lists.clone(),
+                        last_error: Some(e.to_string()),
+                        ..FilterStatus::default()
+                    });
+                }
+                return Err(e);
+            }
+        };
 
         failed_lists.extend(rejected_lists);
 
@@ -1826,6 +1871,83 @@ mod tests {
             ..Default::default()
         }]);
         assert!(engine.group_snapshot("empty").is_none());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Regression (audit 6, WP-3.3): an oversized rule set must be rejected
+    /// instead of materialising unbounded memory, and a failed first load must
+    /// stay fail-closed.
+    #[tokio::test]
+    async fn test_max_rules_cap_rejects_oversized_reload() {
+        let temp_dir = std::env::temp_dir().join(format!("sito_max_rules_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let path = temp_dir.join("big-list.txt");
+        let content: String = (0..50).fold(String::new(), |mut acc, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(acc, "||blocked-{i}.example^");
+            acc
+        });
+        tokio::fs::write(&path, content).await.unwrap();
+        let list = FilterListConfig {
+            name: "big".to_string(),
+            url: format!("file://{}", path.display()),
+            enabled: true,
+            refresh_hours: None,
+        };
+
+        // First load above the cap: fail closed.
+        let engine = HostsFilterEngine::init(
+            FilteringConfig {
+                max_rules: 10,
+                lists: vec![list.clone()],
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        )
+        .await;
+        assert_eq!(engine.state(), FilterState::Failed);
+        assert!(engine.unavailable_for_fail_closed());
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let probe = Name::from_str("blocked-1.example.").unwrap();
+        assert_eq!(
+            engine.evaluate(&probe, RecordType::A, &client),
+            Verdict::Block(BlockReason::FilterUnavailable)
+        );
+
+        // A reload that would exceed the cap keeps the previous snapshot.
+        let engine = HostsFilterEngine::init(
+            FilteringConfig {
+                max_rules: 1000,
+                lists: vec![list.clone()],
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        )
+        .await;
+        assert_eq!(engine.state(), FilterState::Ready);
+        assert_eq!(engine.rule_count(), 50);
+
+        let err = engine
+            .reload_with_config(&FilteringConfig {
+                max_rules: 10,
+                lists: vec![list],
+                ..Default::default()
+            })
+            .await
+            .expect_err("an oversized set must be rejected");
+        assert!(matches!(err, FilterError::TooManyRules { .. }));
+        assert_eq!(
+            engine.state(),
+            FilterState::Ready,
+            "previous snapshot retained"
+        );
+        assert_eq!(engine.rule_count(), 50);
+        assert!(
+            engine.evaluate(&probe, RecordType::A, &client).is_blocked(),
+            "the previous snapshot must keep filtering"
+        );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

@@ -36,4 +36,7 @@ pub enum FilterError {
 
     #[error("No filter list sources could be loaded ({failed} failed): {details}")]
     NoSourcesLoaded { failed: usize, details: String },
+
+    #[error("Filter rule set exceeds the configured limit of {limit} rules (parsed: {count})")]
+    TooManyRules { count: usize, limit: usize },
 }

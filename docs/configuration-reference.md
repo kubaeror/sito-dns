@@ -218,6 +218,7 @@ enabled = true
 | `cname_cloaking` | boolean | `true` | Follow CNAME chains upstream and apply filter rules against intermediate canonical names. |
 | `fail_closed` | boolean | `true` | Answer SERVFAIL while filtering is enabled but no rule snapshot has ever loaded (e.g. every list failed at boot), instead of silently allowing traffic. |
 | `anti_doh_bypass` | string | `"off"` | Block known public DoH/DoT resolvers to enforce network-wide filtering: `"off"`, `"block_all"`, or `"block_except_trusted"`. |
+| `max_rules` | integer | `2000000` | Hard cap on the total parsed rules (all lists plus custom rules). A reload above the cap is rejected and the previous snapshot is retained (or the engine stays fail-closed when nothing loaded yet). |
 | `custom_rules` | array of strings | `[]` | In-line custom ABP / AdGuard filter rules. |
 | `lists` | array of tables | `[]` | Subscription lists to download and compile (`name`, `url`, `enabled`). Schemes: `http://`, `https://`, `file://`. Global `refresh_interval_hours` controls update frequency. |
 

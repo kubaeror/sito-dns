@@ -1084,6 +1084,11 @@ pub struct FilteringConfig {
     pub fail_closed: bool,
     #[serde(default = "default_filtering_anti_doh_bypass")]
     pub anti_doh_bypass: String,
+    /// Hard cap on the total number of parsed rules (all lists plus custom
+    /// rules). A reload that would exceed the cap is rejected instead of
+    /// materialising an unbounded rule set.
+    #[serde(default = "default_filtering_max_rules")]
+    pub max_rules: usize,
     #[serde(default)]
     pub lists: Vec<FilterListConfig>,
     #[serde(default)]
@@ -1099,6 +1104,9 @@ fn default_filtering_blocking_ttl() -> u32 {
 fn default_filtering_anti_doh_bypass() -> String {
     "off".to_string()
 }
+fn default_filtering_max_rules() -> usize {
+    2_000_000
+}
 
 impl Default for FilteringConfig {
     fn default() -> Self {
@@ -1110,6 +1118,7 @@ impl Default for FilteringConfig {
             cname_cloaking: true,
             fail_closed: true,
             anti_doh_bypass: default_filtering_anti_doh_bypass(),
+            max_rules: default_filtering_max_rules(),
             lists: Vec::new(),
             custom_rules: Vec::new(),
         }
@@ -1122,6 +1131,12 @@ impl FilteringConfig {
             return Err(ConfigError::validation(
                 "filtering.refresh_interval_hours",
                 "refresh_interval_hours must be greater than 0",
+            ));
+        }
+        if self.max_rules == 0 {
+            return Err(ConfigError::validation(
+                "filtering.max_rules",
+                "max_rules must be greater than 0",
             ));
         }
         for (i, list) in self.lists.iter().enumerate() {
