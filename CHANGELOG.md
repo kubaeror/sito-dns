@@ -5,6 +5,39 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased] — Audit 6 remediation
+
+Full findings: independent audit of v1.7.0 (audit 6). Remediation plan:
+`/home/ubuntu/.opencode/plan/sito-dns-remediation-plan.md`. This section tracks
+the shipped parts; Phase 0 (release blockers) is complete.
+
+### Critical (P0)
+- **DNSSEC validation bypass via key-tag collision**: trust was keyed on the
+  16-bit key tag, so an anchored key paired with a same-tag forgery could
+  authenticate forged answers (AD=1) and poison the validated-key cache. Trust
+  is now bound to the full DNSKEY public-key bytes, validated cache entries are
+  never overwritten by a same-tag key, and every candidate key for an RRSIG is
+  tried instead of the first tag match.
+- **DNSSEC global SERVFAIL after the first chain fetch**: linking the fetched
+  root DNSKEY to the trust anchor marked the root as a "signed zone", turning
+  every later unsigned response into a stripped-signature Bogus/SERVFAIL in the
+  default `validate` mode. Only signatures that validated over response data
+  now record zone evidence.
+- **Default `dns.bind = ["0.0.0.0", "::"]` failed to start**: the TCP `::`
+  socket was dual-stack, so binding it after `0.0.0.0` returned EADDRINUSE and
+  aborted startup. TCP/DoT/DoH listeners now set `IPV6_V6ONLY` and
+  `SO_REUSEADDR` explicitly.
+- **RUSTSEC-2026-0285**: `rustls` 0.23.43 accepted TLS 1.3 handshake messages
+  across encryption level boundaries; upgraded to 0.23.45 (CI `cargo deny`
+  now passes).
+
+### High (P1)
+- **Listener tasks busy-spun at 100% CPU** after a partial startup or failed
+  listener rebind because a closed shutdown channel was treated as "no change"
+  in every listener/pruner/watcher loop; a dropped sender now stops the task.
+
+---
+
 ## [1.7.0] - 2026-09-13
 
 ### Audit 5 remediation (independent full audit)
