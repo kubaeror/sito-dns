@@ -20,7 +20,9 @@ use crate::tls::TlsAcceptorManager;
 
 /// Maximum DNS message size accepted over a DoQ stream (RFC 9250, 2-octet
 /// length prefix; the DNS-over-TCP ceiling is 65535 bytes).
-const MAX_DOQ_MESSAGE_BYTES: usize = 65_535;
+/// RFC 9250 §4.3 DoQ stream error codes used when abandoning a stream.
+const DOQ_PROTOCOL_ERROR: u32 = 2;
+const DOQ_EXCESSIVE_LOAD: u32 = 4;
 
 /// Upper bound on handling a single QUIC stream: a client that opens a stream
 /// and never completes the length prefix/body must not pin a task forever.
@@ -189,8 +191,9 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                 }
 
                                 let query_len = u16::from_be_bytes(len_buf) as usize;
-                                if query_len == 0 || query_len > MAX_DOQ_MESSAGE_BYTES {
-                                    warn!("DoQ invalid query length {} from {}", query_len, peer_addr);
+                                if query_len == 0 {
+                                    warn!("DoQ zero-length query from {}", peer_addr);
+                                    let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
                                     return;
                                 }
 
@@ -208,13 +211,29 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                         "DoQ per-query rate limit exceeded for client {}",
                                         client_ip
                                     );
+                                    let _ = send.reset(DOQ_EXCESSIVE_LOAD.into());
                                     return;
                                 }
 
                                 let query = match decode_message(&query_buf) {
-                                    Ok(q) => q,
+                                    Ok(mut q) => {
+                                        // RFC 9250 §4.2.1: the DNS Message ID on
+                                        // the wire MUST be 0; a non-zero ID is a
+                                        // protocol error (§4.3.3).
+                                        if q.metadata.id != 0 {
+                                            warn!(
+                                                "DoQ query with non-zero message ID {} from {}",
+                                                q.metadata.id, peer_addr
+                                            );
+                                            let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
+                                            return;
+                                        }
+                                        q.metadata.id = 0;
+                                        q
+                                    }
                                     Err(e) => {
                                         warn!("DoQ failed decoding DNS query from {}: {}", peer_addr, e);
+                                        let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
                                         return;
                                     }
                                 };
@@ -224,7 +243,9 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                     None => ClientContext::new(client_ip).with_proto("doq"),
                                 };
 
-                                if let Some(response) = handler.handle(query, client_ctx).await {
+                                if let Some(mut response) = handler.handle(query, client_ctx).await {
+                                    // RFC 9250 §4.2.1: responses always carry ID 0.
+                                    response.metadata.id = 0;
                                     match encode_message(&response) {
                                         Ok(encoded) => {
                                             let Some(resp_len) = frame_prefix(encoded.len()) else {
@@ -378,7 +399,8 @@ mod tests {
 
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
 
-        let mut query = Message::new(9901, MessageType::Query, OpCode::Query);
+        // RFC 9250 §4.2.1: the on-the-wire message ID must be 0.
+        let mut query = Message::new(0, MessageType::Query, OpCode::Query);
         query.queries.push(Query::query(
             Name::from_str("doq-test.example.com.").unwrap(),
             RecordType::A,
@@ -398,12 +420,113 @@ mod tests {
         recv.read_exact(&mut resp_buf).await.unwrap();
 
         let dns_resp = decode_message(&resp_buf).unwrap();
-        assert_eq!(dns_resp.metadata.id, 9901);
+        assert_eq!(dns_resp.metadata.id, 0);
         assert_eq!(dns_resp.answers.len(), 1);
         assert_eq!(
             dns_resp.answers[0].data,
             RData::A(A(std::net::Ipv4Addr::new(9, 9, 9, 9)))
         );
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_doq_rejects_non_zero_message_id() {
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+
+        let temp_dir = std::env::temp_dir().join(format!("sito_doq_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        std::fs::write(&cert_file, &cert_pem).unwrap();
+        std::fs::write(&key_file, &key_pem).unwrap();
+
+        let server_config =
+            crate::tls::load_server_config(&cert_file, &key_file, &[], vec![b"doq".to_vec()])
+                .unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = udp_socket.local_addr().unwrap().port();
+        drop(udp_socket);
+
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
+
+        let handler = Arc::new(|query: Message, client: ClientContext| async move {
+            assert_eq!(client.proto, "doq");
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::NoError;
+            let qname = query.queries[0].name().clone();
+            resp.answers.push(Record::from_rdata(
+                qname,
+                300,
+                RData::A(A(std::net::Ipv4Addr::new(9, 9, 9, 9))),
+            ));
+            Some(resp)
+        });
+
+        let _handle = start_doq_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Build Quinn client
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
+        root_store.add(cert_der).unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"doq".to_vec()];
+
+        let quic_client_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls)).unwrap();
+        let client_cfg = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
+
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_cfg);
+
+        let conn = client_endpoint
+            .connect(actual_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+
+        // RFC 9250 §4.3.3: a non-zero message ID is a fatal protocol error.
+        let mut query = Message::new(1234, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("doq-test.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let wire = encode_message(&query).unwrap();
+
+        let len_prefix = (wire.len() as u16).to_be_bytes();
+        send.write_all(&len_prefix).await.unwrap();
+        send.write_all(&wire).await.unwrap();
+        send.finish().unwrap();
+
+        // The server must abandon the stream with DOQ_PROTOCOL_ERROR (2).
+        let mut resp_len_buf = [0u8; 2];
+        let err = recv
+            .read_exact(&mut resp_len_buf)
+            .await
+            .expect_err("a non-zero message ID must be rejected");
+        match err {
+            quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)) => {
+                assert_eq!(code.into_inner(), u64::from(DOQ_PROTOCOL_ERROR));
+            }
+            other => panic!("expected a DOQ_PROTOCOL_ERROR reset, got {other:?}"),
+        }
 
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -474,7 +597,7 @@ mod tests {
 
         // RFC 9250 permits DNS messages up to 65535 bytes; build a query well
         // above the previous 4096-byte server cap.
-        let mut query = Message::new(4242, MessageType::Query, OpCode::Query);
+        let mut query = Message::new(0, MessageType::Query, OpCode::Query);
         for i in 0..300 {
             query.queries.push(Query::query(
                 Name::from_str(&format!("q{i}.example.com.")).unwrap(),

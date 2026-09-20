@@ -2,9 +2,13 @@
 //! GET (?dns=) and POST methods, path-based ClientID routing, and rate limiting.
 
 use std::collections::HashMap;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
@@ -12,6 +16,14 @@ use tracing::{debug, info, trace, warn};
 /// Bounded wait for the TLS handshake; slowloris clients must not hold a
 /// connection permit indefinitely.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bounded wait for request headers once the connection is established.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Read-idle timeout for established DoH connections: a peer that completes
+/// the handshake and then sends nothing must not hold a connection permit
+/// indefinitely.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum DNS message size accepted on the DoH path (RFC 8484 over the
 /// 65535-byte DNS-over-TCP framing limit). Larger bodies are rejected before
@@ -21,11 +33,11 @@ pub(crate) const MAX_DOH_BODY_BYTES: usize = 65_535;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use base64::Engine;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use hyper_util::service::TowerToHyperService;
 
@@ -86,13 +98,117 @@ struct DohState<H: QueryHandler> {
     dedicated_hostname: Option<String>,
 }
 
-/// Returns true when the request Host matches the configured dedicated hostname.
-fn host_matches(headers: &HeaderMap, expected: &str) -> bool {
-    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
-        return false;
+/// Normalizes an authority or hostname: strips user-info, a port and IPv6
+/// brackets, and a trailing root dot.
+fn normalize_host(value: &str) -> String {
+    let value = value.trim();
+    let value = value.rsplit_once('@').map_or(value, |(_, host)| host);
+    let host = if let Some(rest) = value.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        value.split(':').next().unwrap_or(value)
     };
-    let host = host.split(':').next().unwrap_or(host).trim();
-    host.eq_ignore_ascii_case(expected.trim())
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Effective host of a request: the URI authority (HTTP/2 and HTTP/3
+/// `:authority`) or the `Host` header (HTTP/1.1).
+fn request_host(uri: &Uri, headers: &HeaderMap) -> Option<String> {
+    let raw = uri
+        .authority()
+        .map(|authority| authority.as_str().to_string())
+        .or_else(|| {
+            headers
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })?;
+    let host = normalize_host(&raw);
+    (!host.is_empty()).then_some(host)
+}
+
+/// Returns true when the request authority/Host matches the configured
+/// dedicated hostname.
+///
+/// HTTP/2 (and HTTP/3) do not send a `Host` header; the authority travels in
+/// the `:authority` pseudo-header and is exposed through the request URI. Only
+/// checking `Host` rejected every HTTP/2 request with 421.
+fn host_matches(uri: &Uri, headers: &HeaderMap, expected: &str) -> bool {
+    let expected = normalize_host(expected);
+    !expected.is_empty() && request_host(uri, headers).is_some_and(|host| host == expected)
+}
+
+/// Wraps a connection so that a read-idle peer cannot hold its permit
+/// forever. Any successful read refreshes the deadline; the connection is
+/// closed with a timeout error when no bytes arrive for `IDLE_TIMEOUT`.
+struct IdleTimeoutStream<S> {
+    inner: S,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+    timeout: Duration,
+}
+
+impl<S> IdleTimeoutStream<S> {
+    fn new(inner: S, timeout: Duration) -> Self {
+        Self {
+            inner,
+            sleep: Box::pin(tokio::time::sleep(timeout)),
+            timeout,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for IdleTimeoutStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                this.sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.timeout);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => match this.sleep.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "DoH connection idle timeout",
+                ))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Builds the hyper connection builder with header-read timeouts enabled.
+fn connection_builder() -> ConnBuilder<TokioExecutor> {
+    let mut builder = ConnBuilder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .timer(TokioTimer::new());
+    builder
 }
 
 fn decode_base64url(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
@@ -101,17 +217,19 @@ fn decode_base64url(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_doh_request<H: QueryHandler>(
     state: Arc<DohState<H>>,
     peer_addr: SocketAddr,
     client_id: Option<String>,
     method: Method,
+    uri: Uri,
     headers: HeaderMap,
     params: HashMap<String, String>,
     body: Bytes,
 ) -> Response {
     if let Some(ref expected) = state.dedicated_hostname
-        && !host_matches(&headers, expected)
+        && !host_matches(&uri, &headers, expected)
     {
         return (
             StatusCode::MISDIRECTED_REQUEST,
@@ -230,18 +348,21 @@ async fn doh_route<H: QueryHandler>(
     State(state): State<Arc<DohState<H>>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     method: Method,
+    uri: Uri,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response {
-    handle_doh_request(state, peer_addr, None, method, headers, params, body).await
+    handle_doh_request(state, peer_addr, None, method, uri, headers, params, body).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn doh_route_with_client<H: QueryHandler>(
     State(state): State<Arc<DohState<H>>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Path(client_id): Path<String>,
     method: Method,
+    uri: Uri,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
@@ -251,6 +372,7 @@ async fn doh_route_with_client<H: QueryHandler>(
         peer_addr,
         Some(client_id),
         method,
+        uri,
         headers,
         params,
         body,
@@ -366,9 +488,14 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
                             let acceptor = mgr.acceptor();
                             match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp_stream)).await {
                                 Ok(Ok(tls_stream)) => {
-                                    let io = TokioIo::new(tls_stream);
-                                    let conn_builder = ConnBuilder::new(TokioExecutor::new());
-                                    if let Err(e) = conn_builder.serve_connection_with_upgrades(io, hyper_service).await {
+                                    let io = TokioIo::new(IdleTimeoutStream::new(
+                                        tls_stream,
+                                        IDLE_TIMEOUT,
+                                    ));
+                                    if let Err(e) = connection_builder()
+                                        .serve_connection_with_upgrades(io, hyper_service)
+                                        .await
+                                    {
                                         trace!("DoH TLS connection error for {}: {}", peer_addr, e);
                                     }
                                 }
@@ -384,9 +511,14 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
                                 }
                             }
                         } else {
-                            let io = TokioIo::new(tcp_stream);
-                            let conn_builder = ConnBuilder::new(TokioExecutor::new());
-                            if let Err(e) = conn_builder.serve_connection_with_upgrades(io, hyper_service).await {
+                            let io = TokioIo::new(IdleTimeoutStream::new(
+                                tcp_stream,
+                                IDLE_TIMEOUT,
+                            ));
+                            if let Err(e) = connection_builder()
+                                .serve_connection_with_upgrades(io, hyper_service)
+                                .await
+                            {
                                 trace!("DoH plain HTTP connection error for {}: {}", peer_addr, e);
                             }
                         }
@@ -405,17 +537,29 @@ mod tests {
 
     #[test]
     fn test_dedicated_hostname_matching() {
+        // HTTP/1.1: Host header with a port.
         let mut headers = HeaderMap::new();
         headers.insert(
             header::HOST,
             HeaderValue::from_static("dns.example.com:8443"),
         );
-        assert!(host_matches(&headers, "dns.example.com"));
-        assert!(host_matches(&headers, "DNS.EXAMPLE.COM"));
-        assert!(!host_matches(&headers, "other.example.com"));
+        let uri: Uri = "/dns-query".parse().expect("uri");
+        assert!(host_matches(&uri, &headers, "dns.example.com"));
+        assert!(host_matches(&uri, &headers, "DNS.EXAMPLE.COM."));
+        assert!(!host_matches(&uri, &headers, "other.example.com"));
 
         let empty = HeaderMap::new();
-        assert!(!host_matches(&empty, "dns.example.com"));
+        assert!(!host_matches(&uri, &empty, "dns.example.com"));
+
+        // HTTP/2: authority in the URI, no Host header.
+        let uri: Uri = "https://dns.example.com/dns-query".parse().expect("uri");
+        assert!(host_matches(&uri, &HeaderMap::new(), "dns.example.com"));
+
+        // IPv6 literal and a trailing-dot FQDN.
+        let uri: Uri = "https://[2001:db8::1]:443/dns-query".parse().expect("uri");
+        assert!(host_matches(&uri, &HeaderMap::new(), "[2001:db8::1]"));
+        let uri: Uri = "https://dns.example.com./dns-query".parse().expect("uri");
+        assert!(host_matches(&uri, &HeaderMap::new(), "dns.example.com"));
     }
 
     /// The per-connection `ConnectInfo` extension must reach the route

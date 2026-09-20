@@ -25,6 +25,11 @@ const MAX_DOH3_BODY_BYTES: usize = 65_535;
 /// client that opens a stream and stalls must not pin a task forever.
 const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum accepted size of an HTTP/3 field section (request headers). The
+/// default in h3 0.0.8 is `VarInt::MAX`, which lets a peer force unbounded
+/// buffering before the limit is checked.
+const MAX_DOH3_FIELD_SECTION_BYTES: u64 = 16 * 1024;
+
 /// Configuration options for the DoH3 listener.
 #[derive(Clone)]
 pub struct Doh3Config {
@@ -91,6 +96,13 @@ pub fn build_quinn_h3_server_config(
     transport_cfg.max_idle_timeout(Some(timeout));
     transport_cfg.max_concurrent_bidi_streams(100u32.into());
     transport_cfg.max_concurrent_uni_streams(100u32.into());
+    // The h3 0.0.8 frame decoder buffers a complete HEADERS payload before the
+    // field-section limit applies, so the QUIC flow-control windows are the
+    // effective memory bound for a request. Keep them small: 128 KiB per
+    // stream and 2 MiB per connection (previously the connection window was
+    // effectively unbounded).
+    transport_cfg.stream_receive_window(quinn::VarInt::from_u32(128 * 1024));
+    transport_cfg.receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
 
     quinn_cfg.transport_config(Arc::new(transport_cfg));
 
@@ -192,7 +204,9 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
 
                         trace!("DoH3 QUIC connection established from {}", peer_addr);
 
-                        let mut h3_conn = match h3::server::builder()
+                        let mut h3_server = h3::server::builder();
+                        h3_server.max_field_section_size(MAX_DOH3_FIELD_SECTION_BYTES);
+                        let mut h3_conn = match h3_server
                             .build(h3_quinn::Connection::new(conn))
                             .await
                         {
