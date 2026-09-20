@@ -95,6 +95,20 @@ fn dnskey_policy_ok(key: &DNSKEY) -> bool {
     }
 }
 
+/// Identity of a validated DNSKEY: its full public-key bytes.
+///
+/// A 16-bit key tag is not a unique key identity (RFC 4035 §5.3.1): an
+/// attacker can pair an anchored key with a same-tag forgery, so trust must
+/// always be bound to the exact key material.
+fn dnskey_fingerprint(key: &DNSKEY) -> Vec<u8> {
+    key.public_key().public_bytes().to_vec()
+}
+
+/// Whether two DNSKEYs carry the same public key material.
+fn same_public_key(a: &DNSKEY, b: &DNSKEY) -> bool {
+    a.algorithm() == b.algorithm() && a.public_key().public_bytes() == b.public_key().public_bytes()
+}
+
 /// DNSSEC validation mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DnssecMode {
@@ -296,6 +310,20 @@ impl KeyCache {
         None
     }
 
+    /// Whether `key` itself (not just some key with the same tag) is a cached
+    /// validated key. Trust must never be granted from the tag alone: a key
+    /// tag collision would otherwise let a forged DNSKEY inherit an anchored
+    /// key's trust.
+    #[must_use]
+    pub fn is_validated(&self, name: &LowerName, key_tag: u16, key: &DNSKEY, now: u32) -> bool {
+        self.keys
+            .get(&(name.clone(), key_tag))
+            .is_some_and(|entry| {
+                let (cached, expires_at, validated) = entry.value();
+                *validated && now <= *expires_at && same_public_key(cached, key)
+            })
+    }
+
     /// Stores a key that has not (yet) been linked to a trust anchor.
     ///
     /// An existing unexpired validated entry is never downgraded. Primarily a
@@ -335,6 +363,10 @@ impl KeyCache {
 
     /// [`Self::insert_validated`] with an explicit `now` for deterministic
     /// callers.
+    ///
+    /// An existing unexpired validated entry with the same tag but different
+    /// key material is never overwritten: otherwise a forged key that shares a
+    /// tag with a validated key could inherit its trust.
     pub fn insert_validated_with_now(
         &self,
         name: LowerName,
@@ -343,6 +375,15 @@ impl KeyCache {
         expires_at: u32,
         now: u32,
     ) {
+        if let Some(existing) = self.keys.get(&(name.clone(), key_tag)) {
+            let (cached, existing_expiry, existing_validated) = existing.value();
+            if *existing_validated && now <= *existing_expiry && !same_public_key(cached, &key) {
+                // Keep the original validated key; the different key is either
+                // a forgery or a rollover that must be re-validated from
+                // scratch.
+                return;
+            }
+        }
         self.keys.insert((name, key_tag), (key, expires_at, true));
         self.enforce_bounds(now);
     }
@@ -717,8 +758,9 @@ fn verify_rrsig_covered(response: &Message, owner: &Name, rrsig: &SIG, key: &DNS
 #[derive(Default)]
 struct KeySetBuild {
     /// Keys linked to a trust anchor (directly, via DS, or via a validated
-    /// DNSKEY RRset).
-    validated: HashSet<(LowerName, u16)>,
+    /// DNSKEY RRset), identified by full public-key bytes (a key tag is not a
+    /// unique key identity).
+    validated: HashSet<(LowerName, Vec<u8>)>,
     /// Zones whose DS RRset was validly signed by a validated parent but whose
     /// delegation failed the digest/algorithm policy.
     policy_rejected: HashSet<LowerName>,
@@ -1002,8 +1044,8 @@ impl DnssecValidator {
             let lower = LowerName::from(owner);
             let anchored = anchors.contains(key.public_key())
                 || anchors.contains_with_name(key.public_key(), &lower);
-            if anchored || self.key_cache.get_validated(&lower, tag, now).is_some() {
-                result.validated.insert((lower.clone(), tag));
+            if anchored || self.key_cache.is_validated(&lower, tag, key, now) {
+                result.validated.insert((lower.clone(), dnskey_fingerprint(key)));
                 let expiry = key_record_expiry(response, owner, rrsigs, now);
                 self.mark_signed_zone(&lower, expiry);
             }
@@ -1040,7 +1082,7 @@ impl DnssecValidator {
                     let lower_parent = LowerName::from(parent_owner);
                     if !result
                         .validated
-                        .contains(&(lower_parent.clone(), parent_tag))
+                        .contains(&(lower_parent.clone(), dnskey_fingerprint(parent_key)))
                     {
                         continue;
                     }
@@ -1085,11 +1127,11 @@ impl DnssecValidator {
                         if !ds.covers(ds_owner, child_key).unwrap_or(false) {
                             continue;
                         }
-                        let Ok(tag) = child_key.calculate_key_tag() else {
-                            continue;
-                        };
                         link.matched = true;
-                        if result.validated.insert((lower_ds.clone(), tag)) {
+                        if result
+                            .validated
+                            .insert((lower_ds.clone(), dnskey_fingerprint(child_key)))
+                        {
                             changed = true;
                         }
                         let expiry = key_record_expiry(response, ds_owner, rrsigs, now);
@@ -1106,7 +1148,10 @@ impl DnssecValidator {
                     continue;
                 };
                 let lower = LowerName::from(owner);
-                if !result.validated.contains(&(lower.clone(), tag)) {
+                if !result
+                    .validated
+                    .contains(&(lower.clone(), dnskey_fingerprint(signer_key)))
+                {
                     continue;
                 }
                 let rrset_signed = rrsigs.iter().any(|(sig_owner, sig)| {
@@ -1123,10 +1168,9 @@ impl DnssecValidator {
                     if other_owner != owner || !dnskey_policy_ok(other_key) {
                         continue;
                     }
-                    if let Ok(other_tag) = other_key.calculate_key_tag()
-                        && result
-                            .validated
-                            .insert((LowerName::from(other_owner), other_tag))
+                    if result
+                        .validated
+                        .insert((LowerName::from(other_owner), dnskey_fingerprint(other_key)))
                     {
                         changed = true;
                     }
@@ -1146,9 +1190,11 @@ impl DnssecValidator {
             }
         }
 
-        for (lower, tag) in &result.validated {
+        for (lower, fingerprint) in &result.validated {
+            // Insert the DNSKEY whose *bytes* were validated. Matching by tag
+            // here would let a same-tag forgery overwrite the validated key.
             let Some((owner, key)) = dnskeys.iter().find(|(owner, key)| {
-                LowerName::from(owner) == *lower && key.calculate_key_tag().ok() == Some(*tag)
+                LowerName::from(owner) == *lower && dnskey_fingerprint(key) == *fingerprint
             }) else {
                 continue;
             };
@@ -1169,8 +1215,11 @@ impl DnssecValidator {
                 .map(|(_, sig)| sig.input().sig_expiration.get())
                 .min();
             let expiry = sig_expiry.map_or(ttl_expiry, |e| e.min(ttl_expiry));
+            let Ok(tag) = key.calculate_key_tag() else {
+                continue;
+            };
             self.key_cache
-                .insert_validated_with_now(lower.clone(), *tag, key.clone(), expiry, now);
+                .insert_validated_with_now(lower.clone(), tag, key.clone(), expiry, now);
         }
 
         result
@@ -1312,42 +1361,32 @@ impl DnssecValidator {
             let signer_name = &rrsig.input().signer_name;
             let key_tag = rrsig.input().key_tag;
 
-            // Find the matching DNSKEY: first the validated-key cache, then the
-            // response itself. The algorithm must match too (RFC 4035 5.3.1).
-            // Keys from the response are never cached before they have been
-            // linked to a trust anchor.
+            // Candidate keys for this RRSIG: the validated-key cache plus every
+            // response DNSKEY with the same owner, tag and algorithm. All
+            // candidates are tried because a key tag is not a unique key
+            // identity (RFC 4035 5.3.1): an anchored key and a same-tag forgery
+            // can both match, and stopping at the first match would let the
+            // forgery shadow -- or inherit -- the real key's trust.
             let lower_signer = LowerName::from(signer_name);
             let cached_key = self
                 .key_cache
                 .get(&lower_signer, key_tag, now)
                 .filter(|key| key.algorithm() == rrsig.input().algorithm);
             self.metrics.record_key_cache(cached_key.is_some());
-            let mut matching_key = cached_key;
-
-            if matching_key.is_none() {
-                for (key_owner, dnskey) in &response_dnskeys {
-                    if key_owner == signer_name
-                        && dnskey.algorithm() == rrsig.input().algorithm
-                        && let Ok(tag) = dnskey.calculate_key_tag()
-                        && tag == key_tag
-                    {
-                        matching_key = Some(dnskey.clone());
-                        break;
-                    }
+            let mut candidates: Vec<DNSKEY> = Vec::new();
+            if let Some(key) = cached_key {
+                candidates.push(key);
+            }
+            for (key_owner, dnskey) in &response_dnskeys {
+                if key_owner == signer_name
+                    && dnskey.algorithm() == rrsig.input().algorithm
+                    && dnskey.calculate_key_tag().ok() == Some(key_tag)
+                {
+                    candidates.push(dnskey.clone());
                 }
             }
-
-            let Some(dnskey) = matching_key else {
+            if candidates.is_empty() {
                 // No usable key material: the chain fetch path may resolve it.
-                continue;
-            };
-
-            if !dnskey_policy_ok(&dnskey) {
-                // Signatures exist but every usable key was rejected by
-                // policy; this must not silently downgrade to Insecure.
-                if rrsig_relevant {
-                    policy_violation = true;
-                }
                 continue;
             }
 
@@ -1372,48 +1411,73 @@ impl DnssecValidator {
             }
 
             let rrsig_rdata = RRSIG::from_sig(rrsig.input().clone(), rrsig.sig().to_vec());
-            if dnskey
-                .verify_rrsig(
-                    rrsig_owner,
-                    DNSClass::IN,
-                    &rrsig_rdata,
-                    covered_records.into_iter(),
-                )
-                .is_err()
-            {
-                if rrsig_relevant {
-                    first_failure.get_or_insert((
+            let mut accepted = false;
+            let mut candidate_policy_rejected = false;
+            let mut candidate_failure: Option<(&'static str, u16)> = None;
+
+            for dnskey in &candidates {
+                if !dnskey_policy_ok(dnskey) {
+                    // Signatures exist but every usable key was rejected by
+                    // policy; this must not silently downgrade to Insecure.
+                    candidate_policy_rejected = true;
+                    continue;
+                }
+
+                if dnskey
+                    .verify_rrsig(
+                        rrsig_owner,
+                        DNSClass::IN,
+                        &rrsig_rdata,
+                        covered_records.iter().copied(),
+                    )
+                    .is_err()
+                {
+                    candidate_failure.get_or_insert((
                         "Cryptographic signature verification failed",
                         EDE_DNSSEC_BOGUS,
                     ));
+                    continue;
                 }
-                continue;
-            }
 
-            // RFC 4035 5.3.1: the RRSIG signer must be the zone containing the
-            // RRset owner. Without this containment check, any key validated
-            // for one domain could authenticate records owned by any other
-            // name (cross-zone signature forgery granting AD=1).
-            if !lower_signer.zone_of(&LowerName::from(rrsig_owner)) {
-                if rrsig_relevant {
-                    first_failure.get_or_insert((
+                // RFC 4035 5.3.1: the RRSIG signer must be the zone containing
+                // the RRset owner. Without this containment check, any key
+                // validated for one domain could authenticate records owned by
+                // any other name (cross-zone signature forgery granting AD=1).
+                if !lower_signer.zone_of(&LowerName::from(rrsig_owner)) {
+                    candidate_failure.get_or_insert((
                         "RRSIG signer does not contain the RRset owner",
                         EDE_DNSSEC_BOGUS,
                     ));
+                    continue;
                 }
-                continue;
+
+                // Trust is bound to the exact key material, never to the tag.
+                let is_trusted = anchors.contains(dnskey.public_key())
+                    || anchors.contains_with_name(dnskey.public_key(), &lower_signer)
+                    || key_set
+                        .validated
+                        .contains(&(lower_signer.clone(), dnskey_fingerprint(dnskey)))
+                    || self
+                        .key_cache
+                        .is_validated(&lower_signer, key_tag, dnskey, now);
+
+                if !is_trusted {
+                    continue;
+                }
+
+                accepted = true;
+                break;
             }
 
-            // Check if DNSKEY is trusted (anchor, validated chain, or cache)
-            let is_trusted = anchors.contains(dnskey.public_key())
-                || anchors.contains_with_name(dnskey.public_key(), &lower_signer)
-                || key_set.validated.contains(&(lower_signer.clone(), key_tag))
-                || self
-                    .key_cache
-                    .get_validated(&lower_signer, key_tag, now)
-                    .is_some();
-
-            if !is_trusted {
+            if !accepted {
+                if candidate_policy_rejected {
+                    policy_violation = true;
+                }
+                if let Some((reason, ede_code)) = candidate_failure
+                    && rrsig_relevant
+                {
+                    first_failure.get_or_insert((reason, ede_code));
+                }
                 continue;
             }
 
@@ -3125,10 +3189,11 @@ mod tests {
             RData::DNSSEC(DNSSECRData::DNSKEY(root_key.clone())),
         ));
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let fingerprint = dnskey_fingerprint(&root_key);
         let dnskeys = vec![(root.clone(), root_key)];
         let result = validator.build_validated_key_set(&response, &dnskeys, &[], now);
 
-        assert!(result.validated.contains(&(lower.clone(), tag)));
+        assert!(result.validated.contains(&(lower.clone(), fingerprint)));
         assert!(result.forged.is_empty());
         assert!(result.policy_rejected.is_empty());
         assert!(
@@ -3244,5 +3309,139 @@ mod tests {
             .filter(|(code, _)| u16::from(*code) == 15)
             .count();
         assert_eq!(ede_count, 1, "EDE options must not be duplicated");
+    }
+
+    /// Finds a DNSKEY `flags` value that gives `key`'s public material the
+    /// requested key tag (key tags are only 16-bit checksums, so collisions are
+    /// trivially constructible).
+    fn find_same_tag_flags(key: &DNSKEY, target_tag: u16) -> Option<u16> {
+        use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+
+        // The key tag is computed over the wire form, where the flags field is
+        // the first 16-bit word and contributes exactly `flags` to the sum.
+        // Encode once with zero flags to obtain the flag-independent sum.
+        let zero = DNSKEY::with_flags(0, key.public_key().clone());
+        let mut bytes = Vec::with_capacity(512);
+        {
+            let mut encoder = BinEncoder::new(&mut bytes);
+            zero.emit(&mut encoder).expect("encode DNSKEY");
+        }
+        let base_ac: u32 = bytes
+            .iter()
+            .enumerate()
+            .map(|(i, byte)| u32::from(*byte) << if i & 1 == 0 { 8 } else { 0 })
+            .sum();
+
+        for flags in 0x0100u32..=0xFFFF {
+            // Zone key flag set, revoke flag clear (required by policy).
+            if flags & 0x0080 != 0 {
+                continue;
+            }
+            let ac = base_ac + flags;
+            if ((ac + (ac >> 16)) & 0xFFFF) as u16 == target_tag {
+                return Some(flags as u16);
+            }
+        }
+        None
+    }
+
+    /// Regression for the same-tag DNSKEY forgery: including the anchored key
+    /// plus a same-tag forgery must not let the forgery be trusted, and must
+    /// never replace the anchored key in the validated-key cache.
+    #[test]
+    fn test_same_tag_dnskey_forgery_is_not_trusted() {
+        use hickory_proto::dnssec::crypto::EcdsaSigningKey;
+        use hickory_proto::dnssec::{DnssecSigner, SigningKey};
+
+        let (origin, real_key, real_signer) =
+            crate::test_util::create_test_signer("victim.example.");
+        let real_tag = real_key.calculate_key_tag().expect("real tag");
+
+        // A different key pair whose tag is forced to collide.
+        let pkcs8 = EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256)
+            .expect("generate fake pkcs8");
+        let fake_private = EcdsaSigningKey::from_pkcs8(&pkcs8, Algorithm::ECDSAP256SHA256)
+            .expect("fake key from pkcs8");
+        let fake_public = fake_private.to_public_key().expect("fake public key");
+        let fake_plain = DNSKEY::from_key(&fake_public);
+        let collision_flags = find_same_tag_flags(&fake_plain, real_tag)
+            .expect("a 16-bit tag collision must be constructible");
+        let fake_key = DNSKEY::with_flags(collision_flags, fake_plain.public_key().clone());
+        assert_eq!(fake_key.calculate_key_tag().expect("fake tag"), real_tag);
+        assert_ne!(
+            dnskey_fingerprint(&fake_key),
+            dnskey_fingerprint(&real_key),
+            "the forged key must not be the anchored key"
+        );
+        let fake_signer = DnssecSigner::new(
+            fake_key.clone(),
+            Box::new(fake_private),
+            origin.clone(),
+            Duration::from_secs(3600),
+        );
+
+        let mut trust_anchors = TrustAnchors::empty();
+        trust_anchors.insert_with_name(real_key.public_key(), LowerName::from(&origin));
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new())
+            .with_trust_anchors(trust_anchors);
+
+        // Attacker ordering: the forged key first, the anchored key second.
+        let (answer, forged_sig) = signed_a_response(&origin, &fake_signer);
+        let mut response = Message::new(9, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(origin.clone(), RecordType::A));
+        response.answers.push(answer);
+        response.answers.push(forged_sig);
+        response.additionals.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(fake_key.clone())),
+        ));
+        response.additionals.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(real_key.clone())),
+        ));
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut response, Some("attacker"), now);
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a same-tag forgery must not validate: {outcome:?}"
+        );
+        assert!(!response.metadata.authentic_data);
+
+        // The anchored key must still be the cached validated key, and the
+        // forged key must never be trusted from the shared tag.
+        let lower = LowerName::from(&origin);
+        assert!(
+            validator
+                .key_cache
+                .is_validated(&lower, real_tag, &real_key, now),
+            "the anchored key must remain validated in the cache"
+        );
+        assert!(
+            !validator
+                .key_cache
+                .is_validated(&lower, real_tag, &fake_key, now),
+            "the forged key must not inherit the anchored key's trust"
+        );
+
+        // The legitimate response signed by the anchored key still validates.
+        let (legit_answer, legit_sig) = signed_a_response(&origin, &real_signer);
+        let mut legit = Message::new(10, MessageType::Response, OpCode::Query);
+        legit
+            .queries
+            .push(Query::query(origin.clone(), RecordType::A));
+        legit.answers.push(legit_answer);
+        legit.answers.push(legit_sig);
+        legit.additionals.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(real_key.clone())),
+        ));
+        let outcome = validator.validate_response(&mut legit, Some("legit"), now);
+        assert_eq!(outcome, ValidationOutcome::Secure);
     }
 }
