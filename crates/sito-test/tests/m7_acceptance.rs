@@ -118,7 +118,8 @@ async fn test_m7_doq_query_and_early_data_disabled() {
     // Open bidirectional stream per RFC 9250
     let (mut send, mut recv) = connection.open_bi().await.unwrap();
 
-    let mut query = Message::new(42, MessageType::Query, OpCode::Query);
+    // RFC 9250 §4.2.1: DoQ carries Message ID 0 on the wire.
+    let mut query = Message::new(0, MessageType::Query, OpCode::Query);
     query.queries.push(Query::query(
         Name::from_str("example.com.").unwrap(),
         RecordType::A,
@@ -137,7 +138,7 @@ async fn test_m7_doq_query_and_early_data_disabled() {
     recv.read_exact(&mut resp_buf).await.unwrap();
 
     let decoded = decode_message(&resp_buf).unwrap();
-    assert_eq!(decoded.metadata.id, 42);
+    assert_eq!(decoded.metadata.id, 0);
     assert_eq!(decoded.metadata.response_code, ResponseCode::NoError);
     assert_eq!(decoded.answers.len(), 1);
 

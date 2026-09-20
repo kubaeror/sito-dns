@@ -59,6 +59,35 @@ the shipped parts; Phase 0 (release blockers) is complete.
 - **Trust anchors**: malformed `dns.dnssec.trust_anchors` entries now fail
   configuration validation instead of silently defaulting algorithms.
 
+### Transport (Phase 2)
+- **DoH**: dedicated-hostname matching uses the URI authority (HTTP/2/3
+  `:authority`) and normalizes ports, IPv6 literals and FQDNs; connections get
+  a header-read timeout and a 30 s read-idle timeout.
+- **DoH3**: field-section limit (16 KiB) and bounded QUIC receive windows
+  (128 KiB/stream, 2 MiB/connection) stop whole-HEADERS buffering from being
+  used for memory exhaustion.
+- **DoQ**: RFC 9250 wire Message ID 0 is enforced (and responses use ID 0);
+  oversized responses fall back to TC=1.
+- **Framing**: TCP/DoT/DoQ responses above 65535 bytes are answered with TC=1
+  (question preserved) instead of being dropped; DoT padding only applies to
+  EDNS clients and never exceeds the framing limit; a default `DotConfig`
+  enforces its per-query rate limit.
+- **ACME**: rotation writes key and cert atomically and records a cert/key
+  fingerprint so a partially completed rotation forces renewal instead of
+  serving a mismatched pair.
+- **Upstream**: plain UDP/TCP randomize the on-the-wire Message ID (RFC 5452)
+  and restore the caller's ID; the bootstrap resolver only accepts answers for
+  the queried owner.
+- **Listeners**: SO_REUSEPORT failures surface as the real error, the sendmsg
+  source-address fallback is logged, DoT without TLS and DoQ/DoH3 bind failures
+  log at error level, and Alt-Svc advertises h3 only when a DoH3 listener is
+  possible.
+
+### Filtering (Phase 3, partial)
+- A failed reload with zero loadable sources now keeps the engine explicitly
+  unavailable, so `fail_closed` answers SERVFAIL after a disabled → enabled
+  transition instead of silently allowing traffic.
+
 ---
 
 ## [1.7.0] - 2026-09-13
