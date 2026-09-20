@@ -88,6 +88,25 @@ the shipped parts; Phase 0 (release blockers) is complete.
   unavailable, so `fail_closed` answers SERVFAIL after a disabled → enabled
   transition instead of silently allowing traffic.
 
+### Filtering (Phase 3)
+- **Per-group `lists`/`custom_rules` are implemented**: the engine compiles one
+  extra snapshot per group from the referenced loaded lists plus the group's
+  custom rules; the pipeline evaluates group `$important` after global ones and
+  combines standard verdicts so a group allow can unblock and a group block
+  applies to members.
+- **Bounded regex compilation**: patterns compile in 128-pattern batches with
+  bisection on failure and a hard batch budget, so one pathological subset can
+  no longer stall compilation or silently disable the regex/wildcard class;
+  dropped patterns are counted and logged.
+- **`filtering.max_rules`** (default 2,000,000) caps the parsed rule set; an
+  over-limit reload retains the previous snapshot or stays fail-closed.
+- A failed reload with zero loadable sources keeps the engine unavailable, so
+  `fail_closed` survives a disabled → enabled transition.
+- **AdGuard semantics**: bare domains block the exact host only, URL/path rules
+  are inert at DNS level, and `$denyallow` is honoured on exception rules.
+- **Rewrites**: IDN config entries and lookups are normalized to ASCII/
+  punycode, so punycode entries (the form the wire and lists use) match.
+
 ---
 
 ## [1.7.0] - 2026-09-13

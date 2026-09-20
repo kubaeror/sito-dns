@@ -15,7 +15,7 @@ use crate::error::FilterError;
 use reqwest::StatusCode;
 use reqwest::header::{IF_MODIFIED_SINCE, IF_NONE_MATCH};
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
@@ -56,64 +56,12 @@ pub async fn save_metadata(path: &Path, meta: &ListMetadata) -> Result<(), Filte
         })
 }
 
-/// Returns true for IPs that must never be fetched as blocklist sources:
-/// loopback, private, link-local (including cloud metadata), CGNAT,
-/// unspecified, multicast, reserved and documentation ranges.
+/// Returns true for IPs that must never be fetched as blocklist sources.
+///
+/// Delegates to the shared guard in [`sito_core::ssrf`] so subscriptions, the
+/// upstream probe and any future outbound integration agree on the denylist.
 pub(crate) fn is_denied_target_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || o[0] == 0
-                || o[0] >= 240
-                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 (CGNAT)
-                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
-                || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15
-        }
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_denied_target_ip(IpAddr::V4(v4));
-            }
-            // Translation/encapsulation prefixes that embed an IPv4 address:
-            // without unwrapping these, a NAT64/6to4/Teredo literal could
-            // reach a private v4 target through a v6-only denylist.
-            let o = v6.octets();
-            let embedded = if o[0] == 0x00
-                && o[1] == 0x64
-                && o[2] == 0xff
-                && o[3] == 0x9b
-                && o[4..12].iter().all(|b| *b == 0)
-            {
-                // NAT64 64:ff9b::/96
-                Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]))
-            } else if o[0] == 0x20 && o[1] == 0x02 {
-                // 6to4 2002::/16
-                Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]))
-            } else if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0 && o[3] == 0 {
-                // Teredo 2001:0000::/32: client IPv4 is bitwise-inverted.
-                Some(Ipv4Addr::new(!o[12], !o[13], !o[14], !o[15]))
-            } else {
-                None
-            };
-            if let Some(v4) = embedded {
-                return is_denied_target_ip(IpAddr::V4(v4));
-            }
-            let seg = v6.segments();
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
-                || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link local
-                || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
-                || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0) // 100::/64 discard
-        }
-    }
+    sito_core::is_denied_target_ip(ip)
 }
 
 /// Returns true when `path` (canonical) is inside `root`.
