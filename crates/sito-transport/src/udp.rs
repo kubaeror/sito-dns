@@ -131,8 +131,8 @@ pub fn start_udp_listener<H: QueryHandler>(
 
             loop {
                 tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
                             debug!("UDP worker #{} stopping due to cancellation", worker_id);
                             break;
                         }

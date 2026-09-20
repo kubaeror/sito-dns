@@ -550,8 +550,8 @@ pub fn start_acme_manager(
 
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
                         debug!("ACME manager shutting down");
                         break;
                     }

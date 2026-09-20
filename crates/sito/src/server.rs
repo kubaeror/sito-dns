@@ -382,8 +382,8 @@ async fn init_runtime_components(
                     _ = interval.tick() => {
                         metrics.set_querylog_dropped(sender.dropped_total());
                     }
-                    _ = drop_shutdown.changed() => {
-                        if *drop_shutdown.borrow() {
+                    res = drop_shutdown.changed() => {
+                        if res.is_err() || *drop_shutdown.borrow() {
                             metrics.set_querylog_dropped(sender.dropped_total());
                             break;
                         }
@@ -506,8 +506,8 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
 
     loop {
         tokio::select! {
-            _ = watcher_shutdown_rx.changed() => {
-                if *watcher_shutdown_rx.borrow() {
+            res = watcher_shutdown_rx.changed() => {
+                if res.is_err() || *watcher_shutdown_rx.borrow() {
                     break;
                 }
             }
@@ -923,8 +923,8 @@ pub async fn run_server_full(
         interval.tick().await;
         loop {
             tokio::select! {
-                _ = retention_shutdown_rx.changed() => {
-                    if *retention_shutdown_rx.borrow() {
+                res = retention_shutdown_rx.changed() => {
+                    if res.is_err() || *retention_shutdown_rx.borrow() {
                         break;
                     }
                 }
@@ -1324,8 +1324,8 @@ pub(crate) async fn run_list_refresh(
             .saturating_duration_since(tokio::time::Instant::now());
 
         tokio::select! {
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
+            res = shutdown_rx.changed() => {
+                if res.is_err() || *shutdown_rx.borrow() {
                     break;
                 }
             }

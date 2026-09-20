@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant, timeout};
 use tracing::{debug, info, trace, warn};
@@ -64,7 +64,7 @@ pub async fn start_dot_listener<H: QueryHandler>(
     handler: Arc<H>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
-    let listener = TcpListener::bind(config.bind_addr).await?;
+    let listener = crate::net::bind_tcp_listener(config.bind_addr)?;
     let local_addr = listener.local_addr()?;
     info!("DoT listener started on {}", local_addr);
 
@@ -80,8 +80,8 @@ pub async fn start_dot_listener<H: QueryHandler>(
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
                         debug!("DoT listener stopping due to shutdown");
                         break;
                     }

@@ -709,8 +709,8 @@ impl UpstreamManager {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
                             break;
                         }
                     }

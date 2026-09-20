@@ -14,6 +14,7 @@ pub mod doq;
 pub mod dot;
 pub mod handler;
 pub mod limiter;
+pub mod net;
 pub mod pktinfo;
 pub mod tcp;
 pub mod tls;
@@ -30,6 +31,7 @@ pub use doq::{DoqConfig, build_quinn_server_config, start_doq_listener};
 pub use dot::{DotConfig, start_dot_listener};
 pub use handler::QueryHandler;
 pub use limiter::RateLimiter;
+pub use net::bind_tcp_listener;
 pub use tcp::{TcpConfig, start_tcp_listener};
 pub use tls::{
     CertWatcher, DynamicCertResolver, TlsAcceptorManager, TlsError, build_server_config,
@@ -1197,5 +1199,65 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Regression: a dropped shutdown sender (partial startup failure, failed
+    /// rebind) must stop listener tasks instead of leaving `changed()`
+    /// returning `Err` in a busy loop forever.
+    #[tokio::test]
+    async fn test_listeners_exit_when_shutdown_sender_is_dropped() {
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        // TCP
+        let (tcp_tx, tcp_rx) = watch::channel(false);
+        let tcp_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp_probe.local_addr().unwrap().port();
+        drop(tcp_probe);
+        let tcp_handle = start_tcp_listener(
+            TcpConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], tcp_port)),
+                ..TcpConfig::default()
+            },
+            handler.clone(),
+            tcp_rx,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(tcp_tx);
+        tokio::time::timeout(Duration::from_secs(2), tcp_handle)
+            .await
+            .expect("TCP listener must exit when the shutdown sender is dropped")
+            .expect("TCP listener task panicked");
+
+        // UDP (one worker)
+        let (udp_tx, udp_rx) = watch::channel(false);
+        let udp_probe = create_reuseport_udp_socket(&"127.0.0.1:0".parse().unwrap()).unwrap();
+        let udp_port = udp_probe.local_addr().unwrap().port();
+        drop(udp_probe);
+        let udp_handles = start_udp_listener(
+            &UdpConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], udp_port)),
+                worker_count: 1,
+                edns_udp_size: 1232,
+                rate_limit_per_ip: 100,
+                rate_limiter: None,
+            },
+            &handler,
+            &udp_rx,
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(udp_tx);
+        for handle in udp_handles {
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("UDP worker must exit when the shutdown sender is dropped")
+                .expect("UDP worker task panicked");
+        }
     }
 }

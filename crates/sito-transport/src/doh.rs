@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
@@ -291,7 +290,7 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
     handler: Arc<H>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
-    let listener = TcpListener::bind(config.bind_addr).await?;
+    let listener = crate::net::bind_tcp_listener(config.bind_addr)?;
     let local_addr = listener.local_addr()?;
     info!("DoH listener started on {}", local_addr);
 
@@ -331,8 +330,8 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
                         debug!("DoH listener stopping due to shutdown");
                         break;
                     }
@@ -427,6 +426,7 @@ mod tests {
         use sito_proto::{Message, MessageType, Name, OpCode, Query, RecordType};
         use std::str::FromStr;
         use std::sync::Mutex;
+        use tokio::net::TcpListener;
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap();

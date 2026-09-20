@@ -3,11 +3,18 @@
 use crate::client::TestDnsClient;
 use sito::server::run_server_with_shutdown;
 use sito_core::config::Config;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+
+/// Optional overrides for [`TestServerInstance::spawn_with_options`].
+#[derive(Clone, Default)]
+pub struct HarnessOptions {
+    /// DNS bind addresses. Defaults to loopback IPv4.
+    pub dns_bind: Option<Vec<IpAddr>>,
+}
 
 /// In-process running test instance of the `sito` DNS server.
 pub struct TestServerInstance {
@@ -140,12 +147,21 @@ impl TestServerInstance {
     /// Spawns a new server instance with the given configuration modifications,
     /// retrying up to 5 times if an ephemeral port collision occurs during parallel test execution.
     pub async fn spawn(config: Config) -> Result<Self, anyhow::Error> {
+        Self::spawn_with_options(config, HarnessOptions::default()).await
+    }
+
+    /// Spawns a server with explicit harness overrides (e.g. a dual-stack bind
+    /// list instead of the default loopback-only test bind).
+    pub async fn spawn_with_options(
+        config: Config,
+        options: HarnessOptions,
+    ) -> Result<Self, anyhow::Error> {
         let spawn_lock = SPAWN_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
         let _guard = spawn_lock.lock().await;
 
         let mut last_err = anyhow::anyhow!("Failed to spawn test server instance");
         for attempt in 0..5 {
-            match Self::try_spawn(config.clone()).await {
+            match Self::try_spawn(config.clone(), options.clone()).await {
                 Ok(instance) => return Ok(instance),
                 Err(e) => {
                     tracing::warn!(
@@ -160,7 +176,7 @@ impl TestServerInstance {
         Err(last_err)
     }
 
-    async fn try_spawn(mut config: Config) -> Result<Self, anyhow::Error> {
+    async fn try_spawn(mut config: Config, options: HarnessOptions) -> Result<Self, anyhow::Error> {
         // Allocate ephemeral ports through the broker so no two instances in
         // this binary can pick the same port.
         let mut reservations = PortReservations::new();
@@ -241,7 +257,9 @@ impl TestServerInstance {
             tokio::fs::create_dir_all(&config.server.data_dir).await?;
             config.server.data_dir.clone()
         };
-        config.dns.bind = vec!["127.0.0.1".parse().unwrap()];
+        config.dns.bind = options
+            .dns_bind
+            .unwrap_or_else(|| vec!["127.0.0.1".parse().expect("valid loopback address")]);
         config.dns.port = port;
 
         let addr = SocketAddr::new("127.0.0.1".parse().unwrap(), port);

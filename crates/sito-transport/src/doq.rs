@@ -128,8 +128,8 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = accept_shutdown_rx.changed() => {
-                    if *accept_shutdown_rx.borrow() {
+                res = accept_shutdown_rx.changed() => {
+                    if res.is_err() || *accept_shutdown_rx.borrow() {
                         debug!("DoQ listener stopping due to shutdown");
                         endpoint_accept.close(0u32.into(), b"Server shutdown");
                         break;
@@ -271,8 +271,8 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
             let mut last_config = mgr.current_config();
             loop {
                 tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
                             break;
                         }
                     }
