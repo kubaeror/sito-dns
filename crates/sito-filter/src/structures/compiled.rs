@@ -22,6 +22,55 @@ pub const MAX_REGEX_PATTERN_LEN: usize = 16 * 1024;
 /// DFA memory ceiling per compiled rule set (10 MB).
 pub const MAX_DFA_SIZE_BYTES: usize = 10 * 1024 * 1024;
 
+/// Maximum number of regex patterns compiled into a single DFA batch.
+///
+/// Compilation work for `build_many` grows super-linearly with the pattern
+/// count, so the pattern set is partitioned into small batches first; a batch
+/// that still cannot be compiled is bisected down to the offending pattern.
+pub const REGEX_BATCH_SIZE: usize = 128;
+/// Upper bound on the number of compiled DFA batches per rule set.
+pub const MAX_REGEX_BATCHES: usize = 512;
+
+/// Builds a bounded regex DFA batch, bisecting on failure so one invalid or
+/// oversized pattern cannot drop its neighbours.
+fn build_regex_batch(
+    patterns: &[String],
+    rules: &[Vec<u32>],
+    batches: &mut Vec<RegexBatch>,
+    dropped: &mut usize,
+) {
+    if patterns.is_empty() {
+        return;
+    }
+    let make_builder = || {
+        let mut builder = DfaBuilder::new();
+        builder.configure(
+            DfaConfig::new()
+                .match_kind(RegexMatchKind::All)
+                .dfa_size_limit(Some(MAX_DFA_SIZE_BYTES)),
+        );
+        builder
+    };
+    if let Ok(dfa) = make_builder().build_many(patterns) {
+        batches.push(RegexBatch {
+            dfa,
+            pattern_to_rules: rules.to_vec(),
+        });
+        return;
+    }
+    if patterns.len() == 1 {
+        error!(
+            pattern = %patterns[0],
+            "Skipping invalid/unsupported regex blocking rule"
+        );
+        *dropped += 1;
+        return;
+    }
+    let mid = patterns.len() / 2;
+    build_regex_batch(&patterns[..mid], &rules[..mid], batches, dropped);
+    build_regex_batch(&patterns[mid..], &rules[mid..], batches, dropped);
+}
+
 /// Converts an ABP wildcard string into an anchored regex pattern.
 pub fn wildcard_to_regex(wildcard: &str) -> String {
     let mut regex = String::from("^");
@@ -40,6 +89,15 @@ pub fn wildcard_to_regex(wildcard: &str) -> String {
     regex
 }
 
+/// One bounded batch of regex/wildcard patterns and its dense DFA.
+#[derive(Debug, Clone)]
+pub struct RegexBatch {
+    /// Dense regex DFA for this subset (MatchKind::All).
+    pub dfa: DFA<Vec<u32>>,
+    /// Maps this batch's pattern index to rule IDs.
+    pub pattern_to_rules: Vec<Vec<u32>>,
+}
+
 /// Compiled set of patterns belonging to a category (e.g. allowlist or blocklist).
 #[derive(Default, Debug, Clone)]
 pub struct CompiledRuleSet {
@@ -51,10 +109,13 @@ pub struct CompiledRuleSet {
     pub ac: Option<AhoCorasick>,
     /// Maps AC pattern index to list of rule IDs.
     pub ac_pattern_to_rules: Vec<Vec<u32>>,
-    /// Dense regex DFA for regular expressions and wildcards (MatchKind::All).
-    pub regex: Option<DFA<Vec<u32>>>,
-    /// Maps regex pattern index to list of rule IDs.
-    pub regex_pattern_to_rules: Vec<Vec<u32>>,
+    /// Dense regex DFAs compiled in bounded batches. Patterns are partitioned
+    /// so one pathological subset cannot stall compilation or disable the
+    /// whole regex/wildcard class.
+    pub regex_batches: Vec<RegexBatch>,
+    /// Regex patterns that could not be compiled (oversized, invalid or over
+    /// the global batch budget).
+    pub dropped_regex_patterns: usize,
     /// Prefix rules: (prefix, list of rule IDs).
     pub prefixes: Vec<(String, Vec<u32>)>,
 }
@@ -100,19 +161,26 @@ impl CompiledRuleSet {
         }
 
         // 5. Regex DFA match (overlapping, reports every matching pattern)
-        if let Some(dfa) = &self.regex {
-            let mut patset = PatternSet::new(dfa.pattern_len());
-            if dfa
+        for batch in &self.regex_batches {
+            let mut patset = PatternSet::new(batch.dfa.pattern_len());
+            if batch
+                .dfa
                 .try_which_overlapping_matches(&Input::new(domain.as_bytes()), &mut patset)
                 .is_ok()
             {
                 for pat_idx in patset.iter() {
-                    if let Some(rules) = self.regex_pattern_to_rules.get(pat_idx.as_usize()) {
+                    if let Some(rules) = batch.pattern_to_rules.get(pat_idx.as_usize()) {
                         candidates.extend_from_slice(rules);
                     }
                 }
             }
         }
+    }
+
+    /// Whether any regex/wildcard pattern is compiled in this rule set.
+    #[must_use]
+    pub fn has_regex(&self) -> bool {
+        !self.regex_batches.is_empty()
     }
 }
 
@@ -203,17 +271,10 @@ impl RuleSetBuilder {
             }
         };
 
-        // 4. Regex DFA
-        let (regex, regex_pattern_to_rules) = if self.regexes.is_empty() {
-            (None, Vec::new())
+        // 4. Regex DFAs, compiled in bounded batches
+        let (regex_batches, dropped_regex_patterns) = if self.regexes.is_empty() {
+            (Vec::new(), 0)
         } else {
-            if self.regexes.len() > 5000 {
-                warn!(
-                    count = self.regexes.len(),
-                    "Compiling >5000 regexes into unified DFA; this may take extra compilation time"
-                );
-            }
-
             let mut unique_re: FnvHashMap<String, Vec<u32>> = FnvHashMap::default();
             for (pattern, rule_id) in self.regexes {
                 unique_re.entry(pattern).or_default().push(rule_id);
@@ -225,6 +286,7 @@ impl RuleSetBuilder {
             // single pathological pattern cannot consume unbounded resources.
             let mut pat_strings = Vec::with_capacity(regex_entries.len());
             let mut pat_to_rules = Vec::with_capacity(regex_entries.len());
+            let mut dropped = 0usize;
             for (pat, rules) in regex_entries {
                 if pat.len() > MAX_REGEX_PATTERN_LEN {
                     error!(
@@ -232,6 +294,7 @@ impl RuleSetBuilder {
                         limit = MAX_REGEX_PATTERN_LEN,
                         "Skipping oversized regex blocking rule"
                     );
+                    dropped += 1;
                     continue;
                 }
                 pat_strings.push(pat);
@@ -253,62 +316,33 @@ impl RuleSetBuilder {
                     max_pattern_bytes = MAX_REGEX_PATTERN_BYTES,
                     "Regex rule set exceeds compilation limits; skipping regex and wildcard rules for this set"
                 );
-                (None, Vec::new())
+                dropped += pat_strings.len();
+                (Vec::new(), dropped)
             } else if pat_strings.is_empty() {
-                // Every pattern was dropped as oversized.
-                (None, Vec::new())
+                (Vec::new(), dropped)
             } else {
-                let make_builder = || {
-                    let mut builder = DfaBuilder::new();
-                    builder.configure(
-                        DfaConfig::new()
-                            .match_kind(RegexMatchKind::All)
-                            .dfa_size_limit(Some(MAX_DFA_SIZE_BYTES)),
-                    );
-                    builder
-                };
-
-                match make_builder().build_many(&pat_strings) {
-                    Ok(dfa) => (Some(dfa), pat_to_rules),
-                    Err(e) => {
-                        // A single unsupported pattern must not disable the whole
-                        // regex + wildcard rule class. Compile individually and
-                        // keep everything that succeeds.
-                        warn!(
-                            error = %e,
-                            "Unified regex DFA compilation failed; compiling patterns individually"
-                        );
-                        let mut kept_patterns = Vec::new();
-                        let mut kept_rules = Vec::new();
-                        for (pat, rules) in pat_strings.iter().zip(pat_to_rules.iter()) {
-                            if make_builder().build(pat).is_ok() {
-                                kept_patterns.push(pat.clone());
-                                kept_rules.push(rules.clone());
-                            } else {
-                                error!(
-                                    pattern = %pat,
-                                    "Skipping invalid/unsupported regex blocking rule"
-                                );
-                            }
-                        }
-
-                        if kept_patterns.is_empty() {
-                            (None, Vec::new())
-                        } else {
-                            match make_builder().build_many(&kept_patterns) {
-                                Ok(dfa) => (Some(dfa), kept_rules),
-                                Err(e) => {
-                                    error!(
-                                        error = %e,
-                                        kept = kept_patterns.len(),
-                                        "Failed to build regex DFA even after dropping invalid patterns"
-                                    );
-                                    (None, Vec::new())
-                                }
-                            }
-                        }
-                    }
+                let mut batches = Vec::new();
+                let mut dropped_in_batches = 0usize;
+                for (patterns, rules) in pat_strings
+                    .chunks(REGEX_BATCH_SIZE)
+                    .zip(pat_to_rules.chunks(REGEX_BATCH_SIZE))
+                {
+                    build_regex_batch(patterns, rules, &mut batches, &mut dropped_in_batches);
                 }
+                if batches.len() > MAX_REGEX_BATCHES {
+                    let extra: usize = batches[MAX_REGEX_BATCHES..]
+                        .iter()
+                        .map(|batch| batch.pattern_to_rules.len())
+                        .sum();
+                    error!(
+                        batches = batches.len(),
+                        limit = MAX_REGEX_BATCHES,
+                        "Regex batch budget exceeded; dropping the remaining patterns"
+                    );
+                    batches.truncate(MAX_REGEX_BATCHES);
+                    dropped_in_batches += extra;
+                }
+                (batches, dropped + dropped_in_batches)
             }
         };
 
@@ -317,8 +351,8 @@ impl RuleSetBuilder {
             trie,
             ac,
             ac_pattern_to_rules,
-            regex,
-            regex_pattern_to_rules,
+            regex_batches,
+            dropped_regex_patterns,
             prefixes,
         }
     }
@@ -428,7 +462,7 @@ mod tests {
 
         let compiled = builder.build(&mut interner);
         assert!(
-            compiled.regex.is_none(),
+            !compiled.has_regex(),
             "an over-limit regex set must be refused instead of compiled"
         );
 
@@ -449,7 +483,7 @@ mod tests {
         builder.add_regex(r"^ok\.example$".to_string(), 2);
 
         let compiled = builder.build(&mut interner);
-        assert!(compiled.regex.is_some(), "small regex must still compile");
+        assert!(compiled.has_regex(), "small regex must still compile");
 
         let mut candidates = Vec::new();
         compiled.collect_candidates("ok.example", &interner, &mut candidates);
@@ -460,7 +494,7 @@ mod tests {
         let mut builder = RuleSetBuilder::new();
         builder.add_regex("b".repeat(MAX_REGEX_PATTERN_LEN + 1), 3);
         let compiled = builder.build(&mut interner);
-        assert!(compiled.regex.is_none());
+        assert!(!compiled.has_regex());
     }
 
     #[test]
@@ -501,5 +535,81 @@ mod tests {
         }
         // Within each source the lowest rule id wins first.
         assert_eq!(results[0][0], 10);
+    }
+
+    /// Regression (audit 6, WP-3.2): a large but in-limit wildcard set must
+    /// compile in bounded time and keep every rule active. Previously the
+    /// unified build could take minutes and then silently dropped the whole
+    /// regex/wildcard class (allow-all for those rules) while still counting
+    /// them as active.
+    #[test]
+    fn test_pathological_wildcard_set_compiles_in_bounded_batches() {
+        let mut interner = LabelInterner::new();
+        let mut builder = RuleSetBuilder::new();
+        // Three full batches: compilation work per build is bounded by
+        // REGEX_BATCH_SIZE instead of growing with the whole pattern set.
+        let count = (REGEX_BATCH_SIZE * 3) as u32;
+        for i in 0..count {
+            builder.add_wildcard(&format!("*.sub{i}.example.com"), i);
+        }
+
+        let started = std::time::Instant::now();
+        let compiled = builder.build(&mut interner);
+        let elapsed = started.elapsed();
+
+        assert!(
+            compiled.has_regex(),
+            "an in-limit wildcard set must compile, not be dropped wholesale"
+        );
+        assert_eq!(
+            compiled.regex_batches.len(),
+            3,
+            "patterns must be partitioned into bounded batches"
+        );
+        assert_eq!(
+            compiled.dropped_regex_patterns, 0,
+            "no pattern may be silently dropped"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "batched compilation must be bounded, took {elapsed:?}"
+        );
+
+        // Every rule must still be reachable through matching.
+        let mut candidates = Vec::new();
+        compiled.collect_candidates("foo.sub7.example.com", &interner, &mut candidates);
+        assert!(candidates.contains(&7), "got candidates: {candidates:?}");
+        candidates.clear();
+        compiled.collect_candidates(
+            &format!("foo.sub{}.example.com", count - 1),
+            &interner,
+            &mut candidates,
+        );
+        assert!(
+            candidates.contains(&(count - 1)),
+            "got candidates: {candidates:?}"
+        );
+    }
+
+    /// An invalid pattern must only drop itself: its neighbours in the same
+    /// batch stay compiled and active.
+    #[test]
+    fn test_invalid_pattern_drops_only_itself() {
+        let mut interner = LabelInterner::new();
+        let mut builder = RuleSetBuilder::new();
+        builder.add_regex("^valid-one\\.example$".to_string(), 1);
+        builder.add_regex("^(".to_string(), 2);
+        builder.add_regex("^valid-two\\.example$".to_string(), 3);
+
+        let compiled = builder.build(&mut interner);
+        assert!(compiled.has_regex());
+        assert_eq!(compiled.dropped_regex_patterns, 1);
+
+        let mut candidates = Vec::new();
+        compiled.collect_candidates("valid-one.example", &interner, &mut candidates);
+        assert!(candidates.contains(&1));
+        candidates.clear();
+        compiled.collect_candidates("valid-two.example", &interner, &mut candidates);
+        assert!(candidates.contains(&3), "got candidates: {candidates:?}");
     }
 }

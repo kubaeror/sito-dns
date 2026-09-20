@@ -66,6 +66,9 @@ pub struct FilterSnapshot {
     /// True when no rule set has ever been compiled into this snapshot
     /// (initial load still running or failed). Used for fail-closed mode.
     pub unavailable: bool,
+    /// Regex/wildcard patterns that could not be compiled into any DFA batch
+    /// (invalid, oversized or over the batch budget). Zero on a healthy load.
+    pub dropped_regex_patterns: usize,
 }
 
 impl FilterSnapshot {
@@ -159,6 +162,8 @@ impl FilterSnapshot {
         let allowlist = allow_builder.build(&mut interner);
         let blocklist = block_builder.build(&mut interner);
         let rule_count = active_rules.len();
+        let dropped_regex_patterns =
+            allowlist.dropped_regex_patterns + blocklist.dropped_regex_patterns;
 
         Self {
             exact: legacy_exact,
@@ -168,6 +173,7 @@ impl FilterSnapshot {
             rules: active_rules,
             rule_count,
             unavailable: false,
+            dropped_regex_patterns,
         }
     }
 
@@ -631,6 +637,14 @@ impl HostsFilterEngine {
         self.snapshot.load().rule_count
     }
 
+    /// Number of regex/wildcard patterns that could not be compiled into the
+    /// current snapshot. A non-zero value means part of the regex class is
+    /// inactive and should be surfaced to operators.
+    #[must_use]
+    pub fn dropped_regex_patterns(&self) -> usize {
+        self.snapshot.load().dropped_regex_patterns
+    }
+
     /// True when filtering is enabled with `fail_closed` and no rule snapshot
     /// has ever been compiled (initial load running or failed). Callers
     /// should refuse to resolve rather than silently allow everything.
@@ -856,6 +870,12 @@ impl HostsFilterEngine {
             });
         }
 
+        if new_snapshot.dropped_regex_patterns > 0 {
+            error!(
+                dropped = new_snapshot.dropped_regex_patterns,
+                "Some regex/wildcard blocking rules could not be compiled and are inactive"
+            );
+        }
         self.snapshot.store(Arc::new(new_snapshot));
         *self.list_rules.lock().unwrap() = new_list_rules;
         // Group rule sets are selected from the list rules, so they must track
