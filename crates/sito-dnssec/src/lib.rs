@@ -441,7 +441,9 @@ impl KeyCache {
     pub fn purge_expired(&self, now: u32) -> usize {
         let before = self.keys.len();
         self.keys.retain(|_, (_, expires_at, _)| *expires_at >= now);
-        before - self.keys.len()
+        // Concurrent inserts between the two `len()` calls can make the
+        // difference negative; the count is informational.
+        before.saturating_sub(self.keys.len())
     }
 
     /// Keeps the cache bounded: purge expired entries first and, if the cache
@@ -1062,9 +1064,9 @@ struct KeySetBuild {
     /// DNSKEY RRset), identified by full public-key bytes (a key tag is not a
     /// unique key identity).
     validated: HashSet<(LowerName, Vec<u8>)>,
-    /// Zones whose DS RRset was validly signed by a validated parent but whose
-    /// delegation failed the digest/algorithm policy.
-    policy_rejected: HashSet<LowerName>,
+    /// Zones whose only DS records use an unsupported digest or algorithm:
+    /// RFC 6840 §5.2 treats them as unsigned delegations instead of Bogus.
+    unsupported: HashSet<LowerName>,
     /// Zones whose DS RRset was validly signed by a validated parent but whose
     /// hierarchy or digest did not match (cross-zone or forged DS).
     forged: HashSet<LowerName>,
@@ -1075,7 +1077,10 @@ struct KeySetBuild {
 struct DsLink {
     signed: bool,
     hierarchy_bad: bool,
+    /// A DS record used an unsupported digest or algorithm.
     policy_bad: bool,
+    /// At least one DS record used a supported digest and algorithm.
+    supported_present: bool,
     child_present: bool,
     matched: bool,
 }
@@ -1521,6 +1526,7 @@ impl DnssecValidator {
                         link.policy_bad = true;
                         continue;
                     }
+                    link.supported_present = true;
 
                     let mut child_keys = dnskeys
                         .iter()
@@ -1586,12 +1592,12 @@ impl DnssecValidator {
         }
 
         for (owner, link) in &ds_links {
-            if link.hierarchy_bad {
+            if link.hierarchy_bad
+                || (link.signed && link.child_present && !link.matched && link.supported_present)
+            {
                 result.forged.insert(owner.clone());
-            } else if link.signed && link.policy_bad && !link.matched {
-                result.policy_rejected.insert(owner.clone());
-            } else if link.signed && link.child_present && !link.matched {
-                result.forged.insert(owner.clone());
+            } else if link.signed && link.policy_bad && !link.supported_present && !link.matched {
+                result.unsupported.insert(owner.clone());
             }
         }
 
@@ -1917,6 +1923,19 @@ impl DnssecValidator {
                 .iter()
                 .all(|key| trusted_covered.contains(key));
 
+        // RFC 4035 §3.2.3: the AD bit may only be set when every RRset in the
+        // Answer and Authority sections is authentic. Additional-section glue
+        // is exempt. Without this, an attacker could attach unauthenticated
+        // records to an otherwise valid response and have them marked AD=1.
+        let all_section_rrsets_signed = response
+            .answers
+            .iter()
+            .chain(response.authorities.iter())
+            .filter(|record| record.record_type() != RecordType::RRSIG)
+            .all(|record| {
+                trusted_covered.contains(&(LowerName::from(&record.name), record.record_type()))
+            });
+
         let negative = is_negative_response(response, &qname, qtype);
         let negative_name = if negative {
             negative_answer_name(response, &qname)
@@ -1939,6 +1958,15 @@ impl DnssecValidator {
             };
             match denial {
                 DenialResult::Secure if all_present_signed || present_relevant.is_empty() => {
+                    if !all_section_rrsets_signed {
+                        debug!(
+                            "DNSSEC denial proof is valid but the response carries unauthenticated RRsets; clearing AD"
+                        );
+                        response.metadata.authentic_data = false;
+                        let outcome = ValidationOutcome::Insecure;
+                        self.metrics.record_validation(&outcome);
+                        return outcome;
+                    }
                     return self.secure_outcome(response, now);
                 }
                 DenialResult::Secure => {
@@ -1973,6 +2001,15 @@ impl DnssecValidator {
                 }
             }
         } else if all_present_signed {
+            if !all_section_rrsets_signed {
+                debug!(
+                    "DNSSEC answer RRsets are authenticated but the response carries unauthenticated RRsets; clearing AD"
+                );
+                response.metadata.authentic_data = false;
+                let outcome = ValidationOutcome::Insecure;
+                self.metrics.record_validation(&outcome);
+                return outcome;
+            }
             return self.secure_outcome(response, now);
         }
 
@@ -1984,13 +2021,18 @@ impl DnssecValidator {
                 EDE_DNSSEC_BOGUS,
             );
         }
-        if !key_set.policy_rejected.is_empty() {
-            return self.handle_bogus(
-                response,
+        if !key_set.unsupported.is_empty() && !all_present_signed {
+            // RFC 6840 §5.2: when every DS at the delegation uses an
+            // unsupported digest or algorithm, treat the zone as unsigned
+            // instead of failing closed.
+            debug!(
                 upstream,
-                "DNSSEC algorithm or digest not allowed by policy",
-                EDE_DNSSEC_BOGUS,
+                "DNSSEC: only unsupported DS algorithms at the delegation; treating as unsigned"
             );
+            response.metadata.authentic_data = false;
+            let outcome = ValidationOutcome::Insecure;
+            self.metrics.record_validation(&outcome);
+            return outcome;
         }
         if let Some((reason, ede_code)) = first_failure {
             return self.handle_bogus(response, upstream, reason, ede_code);
@@ -3403,7 +3445,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ds_sha1_digest_is_bogus() {
+    fn test_ds_sha1_digest_is_treated_as_unsigned() {
         use hickory_proto::dnssec::DigestType;
         use hickory_proto::rr::RecordSet;
 
@@ -3442,12 +3484,15 @@ mod tests {
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
         let outcome = validator.validate_response(&mut msg, Some("sha1-ds"), now);
 
-        assert!(matches!(outcome, ValidationOutcome::Bogus { .. }));
+        // RFC 6840 5.2: an unsupported DS digest makes the delegation
+        // unsigned; the answer is served with AD=0, not SERVFAIL.
+        assert_eq!(outcome, ValidationOutcome::Insecure);
         assert!(!msg.metadata.authentic_data);
+        assert_ne!(msg.metadata.response_code, ResponseCode::ServFail);
     }
 
     #[test]
-    fn test_ds_rsasha1_algorithm_is_bogus() {
+    fn test_ds_rsasha1_algorithm_is_treated_as_unsigned() {
         use hickory_proto::dnssec::DigestType;
         use hickory_proto::rr::RecordSet;
 
@@ -3493,8 +3538,9 @@ mod tests {
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
         let outcome = validator.validate_response(&mut msg, Some("rsasha1-ds"), now);
 
-        assert!(matches!(outcome, ValidationOutcome::Bogus { .. }));
+        assert_eq!(outcome, ValidationOutcome::Insecure);
         assert!(!msg.metadata.authentic_data);
+        assert_ne!(msg.metadata.response_code, ResponseCode::ServFail);
     }
 
     #[test]
@@ -3606,7 +3652,7 @@ mod tests {
 
         assert!(result.validated.contains(&(lower.clone(), fingerprint)));
         assert!(result.forged.is_empty());
-        assert!(result.policy_rejected.is_empty());
+        assert!(result.unsupported.is_empty());
         assert!(
             validator
                 .key_cache
@@ -4360,5 +4406,49 @@ mod tests {
             "an in-zone name still requires signatures: {outcome:?}"
         );
         assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    }
+
+    /// RFC 4035 3.2.3: AD must not be set when the Answer/Authority sections
+    /// contain an RRset that is not covered by a trusted signature.
+    #[test]
+    fn test_unauthenticated_authority_rrset_clears_ad() {
+        let (origin, dnskey, a_record, rrsig_record, signer) =
+            create_test_signed_domain("ad.example.");
+        let _ = signer;
+
+        let mut trust_anchors = TrustAnchors::empty();
+        trust_anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new())
+            .with_trust_anchors(trust_anchors);
+
+        let ns = Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::NS(hickory_proto::rr::rdata::NS(
+                Name::from_str("ns.ad.example.").expect("ns"),
+            )),
+        );
+
+        let mut msg = Message::new(6, MessageType::Response, OpCode::Query);
+        msg.queries
+            .push(Query::query(origin.clone(), RecordType::A));
+        msg.answers.push(a_record);
+        msg.answers.push(rrsig_record);
+        msg.authorities.push(ns);
+        msg.additionals.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)),
+        ));
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("ad-test"), now);
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Insecure,
+            "an unsigned authority RRset must clear AD"
+        );
+        assert!(!msg.metadata.authentic_data);
+        assert_ne!(msg.metadata.response_code, ResponseCode::ServFail);
     }
 }

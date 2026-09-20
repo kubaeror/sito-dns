@@ -653,6 +653,69 @@ impl CacheConfig {
     }
 }
 
+/// Validates one `zone:algorithm:base64` trust-anchor entry. An operator typo
+/// must fail configuration loading instead of silently producing a different
+/// anchor set (the validator used to default the algorithm to ECDSA P-256).
+fn validate_trust_anchor(anchor: &str) -> Result<(), ConfigError> {
+    use base64::Engine as _;
+
+    let parts: Vec<&str> = anchor.split(':').collect();
+    let (domain, algorithm, encoded) = match parts.as_slice() {
+        [domain, algorithm, encoded] => (domain.trim(), algorithm.trim(), encoded.trim()),
+        [domain, encoded] => (domain.trim(), "13", encoded.trim()),
+        _ => {
+            return Err(ConfigError::validation(
+                "dns.dnssec.trust_anchors",
+                format!("'{anchor}' must be 'zone:algorithm:base64' or 'zone:base64'"),
+            ));
+        }
+    };
+    if domain.is_empty() {
+        return Err(ConfigError::validation(
+            "dns.dnssec.trust_anchors",
+            format!("'{anchor}' has an empty zone name"),
+        ));
+    }
+    let algorithm: u8 = algorithm.parse().map_err(|_| {
+        ConfigError::validation(
+            "dns.dnssec.trust_anchors",
+            format!("'{anchor}' has an unparsable algorithm number '{algorithm}'"),
+        )
+    })?;
+    if !matches!(algorithm, 8 | 10 | 13 | 14 | 15) {
+        return Err(ConfigError::validation(
+            "dns.dnssec.trust_anchors",
+            format!("'{anchor}' uses unsupported DNSSEC algorithm {algorithm}"),
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| {
+            ConfigError::validation(
+                "dns.dnssec.trust_anchors",
+                format!("'{anchor}' has invalid base64 key material: {e}"),
+            )
+        })?;
+    if bytes.is_empty() {
+        return Err(ConfigError::validation(
+            "dns.dnssec.trust_anchors",
+            format!("'{anchor}' has empty key material"),
+        ));
+    }
+    let name = if domain.ends_with('.') {
+        domain.to_string()
+    } else {
+        format!("{domain}.")
+    };
+    hickory_proto::rr::Name::from_str(&name).map_err(|e| {
+        ConfigError::validation(
+            "dns.dnssec.trust_anchors",
+            format!("'{anchor}' has an invalid zone name: {e}"),
+        )
+    })?;
+    Ok(())
+}
+
 fn default_dnssec_mode() -> String {
     "validate".to_string()
 }
@@ -694,7 +757,11 @@ impl DnssecConfig {
                 "dns.dnssec.mode",
                 format!("unrecognized DNSSEC mode: '{}'", self.mode),
             )),
+        }?;
+        for anchor in &self.trust_anchors {
+            validate_trust_anchor(anchor)?;
         }
+        Ok(())
     }
 
     /// Check if a domain matches any configured Negative Trust Anchor (NTA/NTP).
@@ -1385,5 +1452,41 @@ key = "/path/to/key.pem"
         );
         assert_ne!(cfg.dns.dot_port, cfg.dns.doq_port);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_trust_anchor_validation_rejects_malformed_entries() {
+        let base = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+
+        for (anchor, needle) in [
+            ("", "must be 'zone:algorithm:base64'"),
+            ("com:not-a-number:AQID", "unparsable algorithm"),
+            ("com:99:AQID", "unsupported DNSSEC algorithm 99"),
+            ("com:13:!!!not-base64!!!", "invalid base64"),
+            ("com:13:", "empty key material"),
+            ("bad..name:13:AQID", "invalid zone name"),
+        ] {
+            let toml = format!("{base}[dns.dnssec]\ntrust_anchors = [\"{anchor}\"]\n");
+            // `from_toml_str` validates eagerly, so accept the error from
+            // either stage.
+            let message = match Config::from_toml_str(&toml) {
+                Ok(config) => config
+                    .validate()
+                    .expect_err(&format!("'{anchor}' must be rejected"))
+                    .to_string(),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                message.contains(needle),
+                "unexpected error for '{anchor}': {message}"
+            );
+        }
+
+        // A well-formed anchor is accepted.
+        let toml = format!(
+            "{base}[dns.dnssec]\ntrust_anchors = [\"com:13:AQIDBA==\"]\n"
+        );
+        let config = Config::from_toml_str(&toml).expect("parses");
+        config.validate().expect("valid anchor");
     }
 }

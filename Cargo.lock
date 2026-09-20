@@ -3107,6 +3107,7 @@ version = "1.7.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "base64 0.23.1",
  "hickory-proto",
  "serde",
  "thiserror",
