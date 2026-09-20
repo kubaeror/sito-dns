@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, trace, warn};
 
 use sito_core::client::ClientContext;
-use sito_proto::{decode_message, encode_message};
+use sito_proto::{decode_message, encode_message, truncate_for_framing};
 
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
@@ -248,11 +248,22 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                     response.metadata.id = 0;
                                     match encode_message(&response) {
                                         Ok(encoded) => {
+                                            let encoded =
+                                                if frame_prefix(encoded.len()).is_none() {
+                                                    warn!(
+                                                        "DoQ response of {} bytes exceeds the 65535-byte limit; sending TC=1",
+                                                        encoded.len()
+                                                    );
+                                                    let Some(truncated) =
+                                                        truncate_for_framing(&encoded)
+                                                    else {
+                                                        return;
+                                                    };
+                                                    truncated
+                                                } else {
+                                                    encoded
+                                                };
                                             let Some(resp_len) = frame_prefix(encoded.len()) else {
-                                                warn!(
-                                                    "DoQ response of {} bytes exceeds the 65535-byte DNS message limit; dropping",
-                                                    encoded.len()
-                                                );
                                                 return;
                                             };
                                             if let Err(e) = send.write_all(&resp_len).await {

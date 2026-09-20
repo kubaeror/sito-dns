@@ -10,7 +10,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
 
 use sito_core::client::ClientContext;
-use sito_proto::{decode_message, encode_message};
+use sito_proto::{decode_message, encode_message, truncate_for_framing};
 
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
@@ -144,11 +144,21 @@ async fn handle_tcp_connection<H: QueryHandler>(
     // cannot be framed and is dropped instead of being wrapped around.
     let write_task = tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
-            let Some(len) = frame_prefix(bytes.len()) else {
+            let bytes = if frame_prefix(bytes.len()).is_none() {
+                // RFC 7766 §8: fall back to a TC=1 response instead of
+                // leaving the client waiting for a frame that never comes.
                 warn!(
-                    "TCP response of {} bytes exceeds the 65535-byte DNS-over-TCP limit; dropping",
+                    "TCP response of {} bytes exceeds the 65535-byte DNS-over-TCP limit; sending TC=1",
                     bytes.len()
                 );
+                let Some(truncated) = truncate_for_framing(&bytes) else {
+                    continue;
+                };
+                truncated
+            } else {
+                bytes
+            };
+            let Some(len) = frame_prefix(bytes.len()) else {
                 continue;
             };
             let write_res = timeout(WRITE_TIMEOUT, async {

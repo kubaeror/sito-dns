@@ -46,7 +46,7 @@ mod tests {
     use sito_core::client::ClientContext;
     use sito_proto::rdata::A;
     use sito_proto::{
-        Message, MessageType, Name, OpCode, Query, RData, Record, RecordType, ResponseCode,
+        Edns, Message, MessageType, Name, OpCode, Query, RData, Record, RecordType, ResponseCode,
         decode_message, encode_message,
     };
     use std::net::SocketAddr;
@@ -595,9 +595,10 @@ mod tests {
         }
         stream.flush().await.unwrap();
 
-        // Both queries must be answered with valid, length-prefixed frames:
-        // a >64 KB attempt must never wrap its 2-octet length prefix and
-        // desynchronize the stream (the encoder truncates to the u16 ceiling).
+        // Both queries must be answered with valid, length-prefixed frames.
+        // The >64 KB response must come back as TC=1 with the question
+        // preserved (RFC 7766 §8) instead of being dropped, and neither frame
+        // may wrap its 2-octet length prefix.
         let mut received = Vec::new();
         for _ in 0..2 {
             let mut len_buf = [0u8; 2];
@@ -606,10 +607,23 @@ mod tests {
             let mut resp_buf = vec![0u8; resp_len];
             stream.read_exact(&mut resp_buf).await.unwrap();
             let resp = decode_message(&resp_buf).unwrap();
-            received.push(resp.metadata.id);
+            received.push(resp);
         }
-        assert!(received.contains(&8101), "got ids: {received:?}");
-        assert!(received.contains(&8102), "got ids: {received:?}");
+        let huge = received
+            .iter()
+            .find(|resp| resp.metadata.id == 8101)
+            .expect("huge response");
+        let small = received
+            .iter()
+            .find(|resp| resp.metadata.id == 8102)
+            .expect("small response");
+        assert!(
+            huge.metadata.truncation,
+            "an unframable response must be truncated with TC=1"
+        );
+        assert_eq!(huge.queries.len(), 1, "the question must be preserved");
+        assert!(!small.metadata.truncation);
+        assert_eq!(small.answers.len(), 1);
 
         let _ = shutdown_tx.send(true);
     }
@@ -687,12 +701,13 @@ mod tests {
         let server_name = ServerName::try_from("dot.example.com").unwrap().to_owned();
         let mut tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
 
-        // Send a query
+        // Send an EDNS query: RFC 8467 padding applies to EDNS clients.
         let mut query = Message::new(4001, MessageType::Query, OpCode::Query);
         query.queries.push(Query::query(
             Name::from_str("dot.example.com.").unwrap(),
             RecordType::A,
         ));
+        query.set_edns(Edns::new());
         let encoded = encode_message(&query).unwrap();
         let len = encoded.len() as u16;
         tls_stream.write_all(&len.to_be_bytes()).await.unwrap();
@@ -714,6 +729,29 @@ mod tests {
             resp_len % sito_proto::DOT_PADDING_BLOCK_SIZE,
             0,
             "Response must be padded to block size 468"
+        );
+
+        // A non-EDNS query must not receive an OPT record (RFC 6891 §6.1.1).
+        let mut plain = Message::new(4002, MessageType::Query, OpCode::Query);
+        plain.queries.push(Query::query(
+            Name::from_str("dot.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let encoded = encode_message(&plain).unwrap();
+        let len = encoded.len() as u16;
+        tls_stream.write_all(&len.to_be_bytes()).await.unwrap();
+        tls_stream.write_all(&encoded).await.unwrap();
+        tls_stream.flush().await.unwrap();
+
+        tls_stream.read_exact(&mut len_buf).await.unwrap();
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        tls_stream.read_exact(&mut resp_buf).await.unwrap();
+        let resp = decode_message(&resp_buf).unwrap();
+        assert_eq!(resp.metadata.id, 4002);
+        assert!(
+            resp.edns.is_none(),
+            "non-EDNS clients must not receive an OPT record"
         );
 
         let _ = shutdown_tx.send(true);

@@ -45,6 +45,18 @@ pub fn set_edns_payload_size(msg: &mut Message, max_payload: u16) {
 /// Default block size for RFC 8467 DNS-over-TLS response padding.
 pub const DOT_PADDING_BLOCK_SIZE: usize = 468;
 
+/// Builds a TC=1 response that fits the 65535-byte DNS-over-TCP framing limit
+/// (RFC 7766 §8): the question is preserved and the answer sections dropped.
+///
+/// Returns `None` when the message cannot be decoded or the truncated form
+/// still cannot be framed.
+pub fn truncate_for_framing(encoded: &[u8]) -> Option<Vec<u8>> {
+    let message = decode_message(encoded).ok()?;
+    let truncated = message.truncate();
+    let bytes = encode_message(&truncated).ok()?;
+    (bytes.len() <= 0xFFFF).then_some(bytes)
+}
+
 /// Apply RFC 8467 block-length padding to a DNS message using EDNS(0) option 12.
 pub fn apply_dot_padding(msg: &mut Message, block_size: usize) -> Result<(), ProtoError> {
     use hickory_proto::rr::rdata::opt::EdnsOption;

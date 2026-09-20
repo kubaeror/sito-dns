@@ -11,7 +11,9 @@ use tokio::time::{Instant, timeout};
 use tracing::{debug, info, trace, warn};
 
 use sito_core::client::ClientContext;
-use sito_proto::{DOT_PADDING_BLOCK_SIZE, apply_dot_padding, decode_message, encode_message};
+use sito_proto::{
+    DOT_PADDING_BLOCK_SIZE, apply_dot_padding, decode_message, encode_message, truncate_for_framing,
+};
 
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
@@ -76,6 +78,13 @@ pub async fn start_dot_listener<H: QueryHandler>(
         ))
     });
     rate_limiter.spawn_pruner(shutdown_rx.clone());
+
+    // The per-query check inside the connection handler reads
+    // `config.rate_limiter`; make sure a default-constructed DotConfig still
+    // enforces the configured limit instead of silently serving unlimited
+    // queries.
+    let mut config = config;
+    config.rate_limiter = Some(Arc::clone(&rate_limiter));
 
     let handle = tokio::spawn(async move {
         loop {
@@ -173,11 +182,19 @@ async fn handle_dot_connection<H: QueryHandler>(
     // dropped rather than wrapped around.
     let write_task = tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
-            let Some(len) = frame_prefix(bytes.len()) else {
+            let bytes = if frame_prefix(bytes.len()).is_none() {
                 warn!(
-                    "DoT response of {} bytes exceeds the 65535-byte DNS-over-TCP limit; dropping",
+                    "DoT response of {} bytes exceeds the 65535-byte DNS-over-TCP limit; sending TC=1",
                     bytes.len()
                 );
+                let Some(truncated) = truncate_for_framing(&bytes) else {
+                    continue;
+                };
+                truncated
+            } else {
+                bytes
+            };
+            let Some(len) = frame_prefix(bytes.len()) else {
                 continue;
             };
             let write_res = timeout(WRITE_TIMEOUT, async {
@@ -300,10 +317,13 @@ async fn handle_dot_connection<H: QueryHandler>(
             }
         };
 
+        // RFC 6891 §6.1.1: only clients that sent an OPT record may receive
+        // one; padding a non-EDNS client would add an OPT it does not expect.
+        let client_has_edns = query.edns.is_some();
         let handler = Arc::clone(&handler);
         let tx = tx.clone();
         let client_ctx = client_ctx.clone();
-        let dot_padding = config.dot_padding;
+        let dot_padding = config.dot_padding && client_has_edns;
         let Ok(pipeline_permit) = Arc::clone(&pipeline_semaphore).acquire_owned().await else {
             break;
         };
