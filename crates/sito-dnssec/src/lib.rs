@@ -963,13 +963,18 @@ impl DnssecValidator {
 
         let original_additionals = response.additionals.len();
         let anchors = self.trust_anchors.load();
-        let mut budget = 6u8;
         let mut visited = HashSet::new();
         let mut fetched_any = false;
         for signer in signers.iter().take(4) {
-            if budget == 0 {
-                break;
-            }
+            // Reaching the root costs one DNSKEY lookup per label plus one DS
+            // lookup per non-root level; a fixed budget of 6 could not reach
+            // the root from a signer with three or more labels, leaving
+            // otherwise valid zones Indeterminate on a cold cache.
+            let mut budget = signer
+                .num_labels()
+                .saturating_mul(2)
+                .saturating_add(1)
+                .min(31);
             if fetch_zone_chain(
                 &anchors,
                 fetcher,
@@ -3579,5 +3584,99 @@ mod tests {
             "stripped signatures in a proven-signed zone must stay Bogus: {outcome:?}"
         );
         assert_eq!(stripped.metadata.response_code, ResponseCode::ServFail);
+    }
+
+    /// Regression: the chain walk must reach the root for signers with three or
+    /// more labels (budget used to be a flat 6, which stopped one level short
+    /// and left the zone Indeterminate on a cold cache).
+    #[tokio::test]
+    async fn test_chain_fetch_reaches_root_for_three_label_signer() {
+        /// A DS RRset for `child`, signed by `parent_signer`.
+        fn signed_ds(
+            child: &Name,
+            child_key: &DNSKEY,
+            parent_signer: &hickory_proto::dnssec::DnssecSigner,
+        ) -> Message {
+            use hickory_proto::dnssec::DigestType;
+            use hickory_proto::rr::RecordSet;
+            let ds = DS::from_key(child_key.public_key(), child, DigestType::SHA256).expect("ds");
+            let record = Record::from_rdata(child.clone(), 300, RData::DNSSEC(DNSSECRData::DS(ds)));
+            let mut set = RecordSet::new(child.clone(), RecordType::DS, 0);
+            set.insert(record.clone(), 0);
+            let sig = sign_test_rrset(&set, parent_signer);
+            let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+            message.authorities.push(record);
+            message.authorities.push(sig);
+            message
+        }
+
+        let (root_name, root_key, root_signer) = create_test_signer(".");
+        let (example, example_key, example_signer) = create_test_signer("example.");
+        let (b_example, b_key, b_signer) = create_test_signer("b.example.");
+        let (ab_example, ab_key, ab_signer) = create_test_signer("a.b.example.");
+
+        let qname = Name::from_str("www.a.b.example.").unwrap();
+        let (answer, answer_sig) = signed_a_response(&qname, &ab_signer);
+
+        let fetcher = StaticFetcher::new()
+            .with(
+                &ab_example,
+                RecordType::DNSKEY,
+                fetched_dnskey_message(&ab_example, std::slice::from_ref(&ab_key), None),
+            )
+            .with(
+                &ab_example,
+                RecordType::DS,
+                signed_ds(&ab_example, &ab_key, &b_signer),
+            )
+            .with(
+                &b_example,
+                RecordType::DNSKEY,
+                fetched_dnskey_message(&b_example, std::slice::from_ref(&b_key), None),
+            )
+            .with(
+                &b_example,
+                RecordType::DS,
+                signed_ds(&b_example, &b_key, &example_signer),
+            )
+            .with(
+                &example,
+                RecordType::DNSKEY,
+                fetched_dnskey_message(&example, std::slice::from_ref(&example_key), None),
+            )
+            .with(
+                &example,
+                RecordType::DS,
+                signed_ds(&example, &example_key, &root_signer),
+            )
+            .with(
+                &root_name,
+                RecordType::DNSKEY,
+                fetched_dnskey_message(&root_name, std::slice::from_ref(&root_key), None),
+            );
+
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+        validator.add_trust_anchor(&root_key, LowerName::from(&root_name));
+
+        let mut response = Message::new(42, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname, RecordType::A));
+        response.answers.push(answer);
+        response.answers.push(answer_sig);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("cold-cache"), now, &fetcher)
+            .await;
+
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Secure,
+            "a 3-label signer must validate from a cold cache"
+        );
+        // DNSKEY/DS pairs for a.b.example, b.example and example plus the root
+        // DNSKEY = 7 fetches, one more than the old flat budget of 6.
+        assert_eq!(fetcher.calls(), 7);
     }
 }
