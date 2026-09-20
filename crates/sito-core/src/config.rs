@@ -1483,9 +1483,7 @@ key = "/path/to/key.pem"
         }
 
         // A well-formed anchor is accepted.
-        let toml = format!(
-            "{base}[dns.dnssec]\ntrust_anchors = [\"com:13:AQIDBA==\"]\n"
-        );
+        let toml = format!("{base}[dns.dnssec]\ntrust_anchors = [\"com:13:AQIDBA==\"]\n");
         let config = Config::from_toml_str(&toml).expect("parses");
         config.validate().expect("valid anchor");
     }

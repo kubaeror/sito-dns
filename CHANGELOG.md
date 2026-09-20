@@ -36,6 +36,29 @@ the shipped parts; Phase 0 (release blockers) is complete.
   listener rebind because a closed shutdown channel was treated as "no change"
   in every listener/pruner/watcher loop; a dropped sender now stops the task.
 
+### DNSSEC correctness (Phase 1)
+- **Chain-fetch budget**: a flat budget of 6 fetches could not reach the root
+  from signers with three or more labels; the budget now scales with the label
+  count (`2*labels+1`).
+- **Stripped signature vs unsigned delegation**: a response without RRSIGs
+  under a previously validated zone was always a downgrade. The validator now
+  probes the DS records of the candidate delegation cuts with the zone's
+  validated key; an authenticated DS denial (NSEC/NSEC3 including opt-out)
+  proves an unsigned delegation and resolves as Insecure, while an
+  authenticated DS, an in-zone DS NODATA or an unprovable delegation stays
+  fail-closed Bogus.
+- **NSEC DS NODATA at a delegation** is accepted (RFC 6840 §4.1/§4.4).
+- **NSEC3 NODATA** requires the CNAME bit to be clear (RFC 6840 §4.3) and the
+  wildcard NODATA proof now covers the next closer name (RFC 5155 §8.7).
+- **Authenticated TTLs**: validated RRsets and RRSIGs are capped by the
+  signature validity (RFC 4035 §5.3.3), so cache entries cannot outlive their
+  signatures.
+- **AD semantics**: AD is only set when every Answer/Authority RRset is
+  authentic (RFC 4035 §3.2.3); unsupported DS digests/algorithms treat the
+  delegation as unsigned (RFC 6840 §5.2) instead of SERVFAIL.
+- **Trust anchors**: malformed `dns.dnssec.trust_anchors` entries now fail
+  configuration validation instead of silently defaulting algorithms.
+
 ---
 
 ## [1.7.0] - 2026-09-13

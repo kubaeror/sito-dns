@@ -827,7 +827,12 @@ fn response_has_rrsigs(response: &Message) -> bool {
 /// Whether an RRSIG is inside its validity window (allowing clock skew).
 fn rrsig_time_ok(rrsig: &RRSIG, now: u32) -> bool {
     now.saturating_add(MAX_CLOCK_SKEW) >= rrsig.input().sig_inception.get()
-        && now <= rrsig.input().sig_expiration.get().saturating_add(MAX_CLOCK_SKEW)
+        && now
+            <= rrsig
+                .input()
+                .sig_expiration
+                .get()
+                .saturating_add(MAX_CLOCK_SKEW)
 }
 
 /// Whether the response contains a signature over `owner`/`type_covered` that
@@ -907,14 +912,8 @@ fn ds_response_status(
             record.name == *cut && matches!(record.data, RData::DNSSEC(DNSSECRData::DS(_)))
         });
     if has_ds {
-        return if has_valid_rrsig_for(
-            response,
-            cut,
-            RecordType::DS,
-            parent_zone,
-            parent_keys,
-            now,
-        ) {
+        return if has_valid_rrsig_for(response, cut, RecordType::DS, parent_zone, parent_keys, now)
+        {
             DsStatus::Signed
         } else {
             DsStatus::Unknown
@@ -967,17 +966,15 @@ fn ds_response_status(
         .collect();
     if !nsec3_records.is_empty() {
         // Exact match (the owner is a hash, so the zone is the parent zone).
-        let exact = nsec3_records.iter().find(|record| {
-            match &record.data {
-                RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) => nsec3::matches(
-                    &nsec3::Nsec3Record {
-                        owner: &record.name,
-                        rdata: nsec3,
-                    },
-                    cut,
-                ),
-                _ => false,
-            }
+        let exact = nsec3_records.iter().find(|record| match &record.data {
+            RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) => nsec3::matches(
+                &nsec3::Nsec3Record {
+                    owner: &record.name,
+                    rdata: nsec3,
+                },
+                cut,
+            ),
+            _ => false,
         });
         if let Some(record) = exact {
             let record_name = record.name.clone();
@@ -1273,7 +1270,9 @@ impl DnssecValidator {
     fn closest_signed_zone(&self, name: &LowerName, now: u32) -> Option<LowerName> {
         self.signed_zones
             .iter()
-            .filter(|entry| *entry.value() >= now && entry.key() != name && entry.key().zone_of(name))
+            .filter(|entry| {
+                *entry.value() >= now && entry.key() != name && entry.key().zone_of(name)
+            })
             .max_by_key(|entry| entry.key().num_labels())
             .map(|entry| entry.key().clone())
     }
@@ -1461,7 +1460,9 @@ impl DnssecValidator {
                 // would make every descendant without RRSIGs look like a
                 // stripped-signature downgrade. Zone evidence is only recorded
                 // for signatures that actually validated over response data.
-                result.validated.insert((lower.clone(), dnskey_fingerprint(key)));
+                result
+                    .validated
+                    .insert((lower.clone(), dnskey_fingerprint(key)));
             }
         }
 
@@ -3812,8 +3813,8 @@ mod tests {
     fn forge_same_tag_key(
         target_tag: u16,
     ) -> (DNSKEY, hickory_proto::dnssec::crypto::EcdsaSigningKey) {
-        use hickory_proto::dnssec::crypto::EcdsaSigningKey;
         use hickory_proto::dnssec::SigningKey;
+        use hickory_proto::dnssec::crypto::EcdsaSigningKey;
 
         for _ in 0..256 {
             let pkcs8 = EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256)
@@ -3931,8 +3932,7 @@ mod tests {
         let anchor = anchors.get(0).expect("default root anchor").clone();
         let root = Name::root();
         let root_key = DNSKEY::with_flags(257, anchor);
-        let validator =
-            DnssecValidator::new(DnssecMode::Validate, Vec::new());
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
         let mut response = Message::new(45, MessageType::Response, OpCode::Query);
         response.additionals.push(Record::from_rdata(
             root.clone(),
@@ -3940,12 +3940,8 @@ mod tests {
             RData::DNSSEC(DNSSECRData::DNSKEY(root_key.clone())),
         ));
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
-        let result = validator.build_validated_key_set(
-            &response,
-            &[(root.clone(), root_key)],
-            &[],
-            now,
-        );
+        let result =
+            validator.build_validated_key_set(&response, &[(root.clone(), root_key)], &[], now);
         assert!(!result.validated.is_empty());
         for name in ["unsigned.example.", "com.", "www.example.org."] {
             let lower = LowerName::from(&Name::from_str(name).expect("name"));
@@ -4126,9 +4122,7 @@ mod tests {
         validator.add_trust_anchor(&root_key, LowerName::from(&root_name));
 
         let mut response = Message::new(42, MessageType::Response, OpCode::Query);
-        response
-            .queries
-            .push(Query::query(qname, RecordType::A));
+        response.queries.push(Query::query(qname, RecordType::A));
         response.answers.push(answer);
         response.answers.push(answer_sig);
 
@@ -4156,8 +4150,8 @@ mod tests {
         use hickory_proto::rr::RecordSet;
 
         let origin = Name::from_str("shortsig.example.").unwrap();
-        let pkcs8 = EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256)
-            .expect("generate pkcs8");
+        let pkcs8 =
+            EcdsaSigningKey::generate_pkcs8(Algorithm::ECDSAP256SHA256).expect("generate pkcs8");
         let private = EcdsaSigningKey::from_pkcs8(&pkcs8, Algorithm::ECDSAP256SHA256)
             .expect("key from pkcs8");
         let dnskey = DNSKEY::from_key(&private.to_public_key().expect("public key"));
@@ -4224,7 +4218,12 @@ mod tests {
     /// the key and signer.
     fn signed_zone_validator(
         zone: &str,
-    ) -> (DnssecValidator, Name, DNSKEY, hickory_proto::dnssec::DnssecSigner) {
+    ) -> (
+        DnssecValidator,
+        Name,
+        DNSKEY,
+        hickory_proto::dnssec::DnssecSigner,
+    ) {
         let (origin, dnskey, a_record, rrsig_record, signer) = create_test_signed_domain(zone);
         let mut trust_anchors = TrustAnchors::empty();
         trust_anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
@@ -4254,8 +4253,7 @@ mod tests {
     /// SERVFAIL (audit 6, WP-1.2).
     #[tokio::test]
     async fn test_authenticated_ds_denial_downgrades_child_delegation_to_insecure() {
-        let (validator, zone, zone_key, zone_signer) =
-            signed_zone_validator("signed.example.");
+        let (validator, zone, zone_key, zone_signer) = signed_zone_validator("signed.example.");
         let cut = Name::from_str("unsigned.signed.example.").expect("cut");
         let ds_message = signed_nsec_response(
             &zone,
@@ -4302,8 +4300,7 @@ mod tests {
         use hickory_proto::dnssec::DigestType;
         use hickory_proto::rr::RecordSet;
 
-        let (validator, zone, zone_key, zone_signer) =
-            signed_zone_validator("signed.example.");
+        let (validator, zone, zone_key, zone_signer) = signed_zone_validator("signed.example.");
         let cut = Name::from_str("unsigned.signed.example.").expect("cut");
         let qname = Name::from_str("www.unsigned.signed.example.").expect("qname");
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
@@ -4332,11 +4329,7 @@ mod tests {
         let (child_zone, child_key, _) = create_test_signer("unsigned.signed.example.");
         assert_eq!(child_zone, cut);
         let ds = DS::from_key(child_key.public_key(), &cut, DigestType::SHA256).expect("ds");
-        let ds_record = Record::from_rdata(
-            cut.clone(),
-            300,
-            RData::DNSSEC(DNSSECRData::DS(ds)),
-        );
+        let ds_record = Record::from_rdata(cut.clone(), 300, RData::DNSSEC(DNSSECRData::DS(ds)));
         let mut set = RecordSet::new(cut.clone(), RecordType::DS, 0);
         set.insert(ds_record.clone(), 0);
         let ds_sig = sign_test_rrset(&set, &zone_signer);
@@ -4372,8 +4365,7 @@ mod tests {
     /// (no NS bit) still requires signatures: Bogus.
     #[tokio::test]
     async fn test_in_zone_ds_nodata_still_requires_signatures() {
-        let (validator, zone, zone_key, zone_signer) =
-            signed_zone_validator("signed.example.");
+        let (validator, zone, zone_key, zone_signer) = signed_zone_validator("signed.example.");
         let qname = Name::from_str("www.signed.example.").expect("qname");
         let ds_message = signed_nsec_response(
             &zone,
