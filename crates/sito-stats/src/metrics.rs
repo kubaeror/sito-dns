@@ -75,6 +75,108 @@ const MAX_INTERNER_LABELS: usize = 4_096;
 /// Label value used once [`MAX_INTERNER_LABELS`] is reached.
 const INTERNER_OVERFLOW_LABEL: &str = "__other__";
 
+/// Query types that keep an exact numeric `qtype` label on
+/// `sito_queries_total`. The DNS wire type is a free 16-bit field, so exposing
+/// it verbatim would let any client create up to 65 536 permanent series per
+/// protocol and verdict. Everything outside this list is collapsed into
+/// [`QTYPE_OTHER_LABEL`], bounding the series count to
+/// `protocols × (KNOWN_QTYPES.len() + 1) × verdicts`.
+///
+/// The list covers the types a resolver sees in practice (IANA common and
+/// DNSSEC-enabled types).
+pub const KNOWN_QTYPES: &[u16] = &[
+    1,     // A
+    2,     // NS
+    5,     // CNAME
+    6,     // SOA
+    12,    // PTR
+    13,    // HINFO
+    15,    // MX
+    16,    // TXT
+    17,    // RP
+    24,    // SIG
+    25,    // KEY
+    28,    // AAAA
+    29,    // LOC
+    33,    // SRV
+    35,    // NAPTR
+    36,    // KX
+    37,    // CERT
+    39,    // DNAME
+    41,    // OPT
+    43,    // DS
+    44,    // SSHFP
+    45,    // IPSECKEY
+    46,    // RRSIG
+    47,    // NSEC
+    48,    // DNSKEY
+    49,    // DHCID
+    50,    // NSEC3
+    51,    // NSEC3PARAM
+    52,    // TLSA
+    53,    // SMIMEA
+    55,    // HIP
+    59,    // CDS
+    60,    // CDNSKEY
+    61,    // OPENPGPKEY
+    62,    // CSYNC
+    63,    // ZONEMD
+    64,    // SVCB
+    65,    // HTTPS
+    99,    // SPF
+    108,   // EUI48
+    109,   // EUI64
+    249,   // TKEY
+    250,   // TSIG
+    251,   // IXFR
+    252,   // AXFR
+    255,   // ANY
+    256,   // URI
+    257,   // CAA
+    259,   // DOA
+    260,   // AMTRELAY
+    32768, // TA
+    32769, // DLV
+];
+/// Label value used for query types outside [`KNOWN_QTYPES`].
+const QTYPE_OTHER_LABEL: &str = "__other__";
+/// Sentinel stored in the counter key for every [`QTYPE_OTHER_LABEL`] query
+/// type. Type 65535 is reserved (RFC 6895), so it never has to be preserved.
+const QTYPE_OTHER: u16 = u16::MAX;
+
+const QTYPE_BITMAP_WORDS: usize = 65_536 / 64;
+
+/// Builds a 65 536-bit membership bitmap from [`KNOWN_QTYPES`] at compile time.
+const fn qtype_bitmap() -> [u64; QTYPE_BITMAP_WORDS] {
+    let mut words = [0u64; QTYPE_BITMAP_WORDS];
+    let mut i = 0;
+    while i < KNOWN_QTYPES.len() {
+        let qtype = KNOWN_QTYPES[i] as usize;
+        words[qtype / 64] |= 1u64 << (qtype % 64);
+        i += 1;
+    }
+    words
+}
+
+static KNOWN_QTYPE_BITMAP: [u64; QTYPE_BITMAP_WORDS] = qtype_bitmap();
+
+/// Returns true when `qtype` has a dedicated `sito_queries_total` series.
+#[inline]
+fn is_known_qtype(qtype: u16) -> bool {
+    let qtype = qtype as usize;
+    KNOWN_QTYPE_BITMAP[qtype / 64] & (1u64 << (qtype % 64)) != 0
+}
+
+/// Maps a raw wire query type to the bounded label stored in the counter key.
+#[inline]
+fn bounded_qtype(qtype: u16) -> u16 {
+    if is_known_qtype(qtype) {
+        qtype
+    } else {
+        QTYPE_OTHER
+    }
+}
+
 /// Interns metric label values into dense integer ids.
 ///
 /// Lookups take a shared `RwLock` read guard and allocate nothing; an id is
@@ -242,7 +344,10 @@ impl MetricsRegistry {
     pub fn inc_queries(&self, proto: &str, qtype: u16, verdict: &str) {
         let proto_id = self.labels.intern(proto);
         let verdict_id = self.labels.intern(verdict);
-        increment_counter(&self.queries_total, (proto_id, qtype, verdict_id));
+        increment_counter(
+            &self.queries_total,
+            (proto_id, bounded_qtype(qtype), verdict_id),
+        );
         increment_counter(&self.transport_queries_total, proto_id);
     }
 
@@ -350,6 +455,12 @@ impl MetricsRegistry {
         self.querylog_dropped.store(dropped, Ordering::Relaxed);
     }
 
+    /// Increments the query-log drop counter by one.
+    ///
+    /// Production publishes the writer's cumulative drop count through
+    /// [`Self::set_querylog_dropped`] (the writer cannot depend on the metrics
+    /// registry directly); this per-event helper exists for tests and is kept
+    /// for the `sito-test` acceptance suite.
     pub fn inc_querylog_dropped(&self) {
         self.querylog_dropped.fetch_add(1, Ordering::Relaxed);
     }
@@ -457,11 +568,16 @@ impl MetricsRegistry {
                         .then_with(|| a.2.as_ref().cmp(b.2.as_ref()))
                 });
                 for (proto, qtype, verdict, count) in entries {
+                    let qtype_label = if qtype == QTYPE_OTHER {
+                        QTYPE_OTHER_LABEL.to_string()
+                    } else {
+                        qtype.to_string()
+                    };
                     let _ = writeln!(
                         out,
                         "sito_queries_total{{proto=\"{}\",qtype=\"{}\",verdict=\"{}\"}} {count}",
                         escape_label_value(&proto),
-                        qtype,
+                        qtype_label,
                         escape_label_value(&verdict)
                     );
                 }
@@ -1165,6 +1281,49 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
             rendered.contains(r#"upstream="__other__""#),
             "overflow label must be used once the cap is reached"
         );
+    }
+
+    /// WP-7.1 regression: the client-controlled 16-bit `qtype` must not create
+    /// an unbounded number of `sito_queries_total` series. Common types keep
+    /// exact labels; everything else collapses into `qtype="__other__"`.
+    #[test]
+    fn test_queries_total_qtype_cardinality_is_bounded() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        let flood: u32 = 50_000;
+        for qtype in 0..flood {
+            reg.inc_queries("udp", qtype as u16, "allowed");
+        }
+        // Common types still get their own exact series.
+        reg.inc_queries("udp", 1, "allowed");
+        reg.inc_queries("udp", 28, "allowed");
+
+        let series = reg
+            .queries_total
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        assert!(
+            series <= KNOWN_QTYPES.len() + 1,
+            "qtype flood must collapse into the known set plus __other__ (got {series})"
+        );
+
+        // No observation is lost: the bounded series still account for every
+        // increment.
+        let total: u64 = reg
+            .queries_total
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum();
+        assert_eq!(total, u64::from(flood) + 2);
+
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains(r#"qtype="__other__""#));
+        assert!(rendered.contains(r#"qtype="1""#));
+        assert!(rendered.contains(r#"qtype="28""#));
+        // Raw wire values outside the known set are never exposed.
+        assert!(!rendered.contains(r#"qtype="40000""#));
     }
 
     #[test]

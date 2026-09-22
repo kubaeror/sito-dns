@@ -4,12 +4,143 @@ use crate::entry::QueryLogEntry;
 use crate::error::StatsError;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{Pool, Row, Sqlite, SqliteConnection};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
 use utoipa::ToSchema;
+
+/// Maximum number of rows returned by the per-client/per-upstream aggregate
+/// queries. The endpoints used to return one row per distinct client or
+/// upstream with no bound, so a resolver with many short-lived addresses could
+/// produce an unbounded response.
+pub const MAX_AGGREGATE_ROWS: usize = 1_000;
+
+/// Number of top entries persisted per hour and dimension in `stats_hourly`.
+/// Rollup top lists are a bounded summary of pruned rows, not a full archive.
+const ROLLUP_TOP_N: usize = 100;
+
+/// Minimum number of rows a retention sweep must delete before the database is
+/// vacuumed. `VACUUM` rewrites the whole file, so it is only worth running
+/// after a meaningful amount of data was freed.
+const VACUUM_MIN_DELETED_ROWS: u64 = 1_000;
+
+/// Bounded per-hour rollup payloads extracted from rows about to be pruned.
+#[derive(Default)]
+struct HourRollup {
+    /// `(qname, total, blocked)`
+    domains: Vec<(String, i64, i64)>,
+    /// `(client_ip, client_name, total, blocked, last_seen)`
+    clients: Vec<(String, Option<String>, i64, i64, i64)>,
+    /// `(upstream, total, errors, elapsed_us_sum)`
+    upstreams: Vec<(String, i64, i64, i64)>,
+}
+
+type DomainTop = (String, i64, i64);
+type ClientTop = (String, Option<String>, i64, i64, i64);
+type UpstreamTop = (String, i64, i64, i64);
+
+fn decode_tops<T: serde::de::DeserializeOwned>(json: Option<&str>) -> Vec<T> {
+    json.and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
+fn encode_tops<T: Serialize>(items: &[T]) -> String {
+    serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Keeps the lexicographically largest non-empty client name so the label is
+/// deterministic when a client IP was seen under several names.
+fn keep_max_name(current: &mut Option<String>, candidate: Option<String>) {
+    if let Some(candidate) = candidate
+        && current
+            .as_deref()
+            .is_none_or(|existing| existing < candidate.as_str())
+    {
+        *current = Some(candidate);
+    }
+}
+
+fn merge_domain_tops(
+    existing: Vec<DomainTop>,
+    incoming: Vec<DomainTop>,
+    limit: usize,
+) -> Vec<DomainTop> {
+    let mut merged: HashMap<String, (i64, i64)> = HashMap::new();
+    for (qname, total, blocked) in existing.into_iter().chain(incoming) {
+        let entry = merged.entry(qname).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(total);
+        entry.1 = entry.1.saturating_add(blocked);
+    }
+    let mut items: Vec<DomainTop> = merged
+        .into_iter()
+        .map(|(qname, (total, blocked))| (qname, total, blocked))
+        .collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items.truncate(limit);
+    items
+}
+
+fn merge_blocked_domains(
+    existing: Vec<(String, i64)>,
+    incoming: Vec<(String, i64)>,
+    limit: usize,
+) -> Vec<(String, i64)> {
+    let mut merged: HashMap<String, i64> = HashMap::new();
+    for (qname, blocked) in existing.into_iter().chain(incoming) {
+        let entry = merged.entry(qname).or_insert(0);
+        *entry = entry.saturating_add(blocked);
+    }
+    let mut items: Vec<(String, i64)> = merged.into_iter().collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items.truncate(limit);
+    items
+}
+
+fn merge_client_tops(
+    existing: Vec<ClientTop>,
+    incoming: Vec<ClientTop>,
+    limit: usize,
+) -> Vec<ClientTop> {
+    let mut merged: HashMap<String, (Option<String>, i64, i64, i64)> = HashMap::new();
+    for (ip, name, total, blocked, last_seen) in existing.into_iter().chain(incoming) {
+        let entry = merged.entry(ip).or_insert((None, 0, 0, 0));
+        keep_max_name(&mut entry.0, name);
+        entry.1 = entry.1.saturating_add(total);
+        entry.2 = entry.2.saturating_add(blocked);
+        entry.3 = entry.3.max(last_seen);
+    }
+    let mut items: Vec<ClientTop> = merged
+        .into_iter()
+        .map(|(ip, (name, total, blocked, last_seen))| (ip, name, total, blocked, last_seen))
+        .collect();
+    items.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    items.truncate(limit);
+    items
+}
+
+fn merge_upstream_tops(
+    existing: Vec<UpstreamTop>,
+    incoming: Vec<UpstreamTop>,
+    limit: usize,
+) -> Vec<UpstreamTop> {
+    let mut merged: HashMap<String, (i64, i64, i64)> = HashMap::new();
+    for (upstream, total, errors, elapsed_sum) in existing.into_iter().chain(incoming) {
+        let entry = merged.entry(upstream).or_insert((0, 0, 0));
+        entry.0 = entry.0.saturating_add(total);
+        entry.1 = entry.1.saturating_add(errors);
+        entry.2 = entry.2.saturating_add(elapsed_sum);
+    }
+    let mut items: Vec<UpstreamTop> = merged
+        .into_iter()
+        .map(|(upstream, (total, errors, elapsed_sum))| (upstream, total, errors, elapsed_sum))
+        .collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items.truncate(limit);
+    items
+}
 
 /// Query log filter parameters for pagination and search.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -76,6 +207,218 @@ pub struct RetentionReport {
 pub struct StatsDb {
     pool: Pool<Sqlite>,
     db_path: Option<PathBuf>,
+}
+
+/// Builds the shared `query_log` filter predicate used by both the page query
+/// and the `total_count` query. Cursor pagination and `LIMIT` are deliberately
+/// not part of this predicate.
+fn filtered_query(base: &str, filter: &QueryLogFilter) -> sqlx::QueryBuilder<Sqlite> {
+    let mut builder = sqlx::QueryBuilder::new(base);
+
+    if let Some(from) = filter.from {
+        builder.push(" AND ts >= ");
+        builder.push_bind(from);
+    }
+    if let Some(to) = filter.to {
+        builder.push(" AND ts <= ");
+        builder.push_bind(to);
+    }
+    if let Some(ref status) = filter.status {
+        builder.push(" AND verdict = ");
+        builder.push_bind(status);
+    }
+    if let Some(qtype) = filter.qtype {
+        builder.push(" AND qtype = ");
+        builder.push_bind(i64::from(qtype));
+    }
+    if let Some(ref client) = filter.client {
+        builder.push(" AND (client_ip = ");
+        builder.push_bind(client);
+        builder.push(" OR client_name = ");
+        builder.push_bind(client);
+        builder.push(")");
+    }
+    if let Some(ref domain) = filter.domain {
+        builder.push(" AND qname LIKE ");
+        let escaped = domain
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        builder.push_bind(pattern);
+        builder.push(" ESCAPE '\\'");
+    }
+
+    builder
+}
+
+/// Existing `stats_hourly` top lists for the hours being rolled up again:
+/// `hour -> (top_domains, top_clients, top_upstreams)`.
+type ExistingRollups = HashMap<i64, (Option<String>, Option<String>, Option<String>)>;
+
+/// Extracts bounded per-hour top lists for the rows below `cutoff` inside the
+/// retention transaction.
+async fn collect_hour_rollups(
+    conn: &mut SqliteConnection,
+    cutoff: i64,
+    rollups: &mut HashMap<i64, HourRollup>,
+) -> Result<(), StatsError> {
+    let limit = i64::try_from(ROLLUP_TOP_N).unwrap_or(100);
+
+    // Domains: union of the top-N by total and by blocked count, so both
+    // `top_domains` and `top_blocked_domains` stay representative after the
+    // per-hour lists are merged.
+    let domain_rows = sqlx::query(
+        r"
+        SELECT hour, qname, total, blocked FROM (
+            SELECT
+                (ts / 3600000) * 3600000 AS hour,
+                qname,
+                COUNT(*) AS total,
+                SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) AS blocked,
+                ROW_NUMBER() OVER (
+                    PARTITION BY (ts / 3600000) * 3600000
+                    ORDER BY COUNT(*) DESC, qname ASC
+                ) AS rn_total,
+                ROW_NUMBER() OVER (
+                    PARTITION BY (ts / 3600000) * 3600000
+                    ORDER BY SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) DESC, qname ASC
+                ) AS rn_blocked
+            FROM query_log
+            WHERE ts < ?
+            GROUP BY (ts / 3600000) * 3600000, qname
+        )
+        WHERE rn_total <= ? OR rn_blocked <= ?
+        ",
+    )
+    .bind(cutoff)
+    .bind(limit)
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    for row in domain_rows {
+        let hour: i64 = row.get("hour");
+        rollups.entry(hour).or_default().domains.push((
+            row.get::<String, _>("qname"),
+            row.get::<Option<i64>, _>("total").unwrap_or(0),
+            row.get::<Option<i64>, _>("blocked").unwrap_or(0),
+        ));
+    }
+
+    // Clients: top-N by total with a deterministic name per IP.
+    let client_rows = sqlx::query(
+        r"
+        SELECT hour, client_ip, client_name, total, blocked, last_seen FROM (
+            SELECT
+                (ts / 3600000) * 3600000 AS hour,
+                client_ip,
+                MAX(client_name) AS client_name,
+                COUNT(*) AS total,
+                SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) AS blocked,
+                MAX(ts) AS last_seen,
+                ROW_NUMBER() OVER (
+                    PARTITION BY (ts / 3600000) * 3600000
+                    ORDER BY COUNT(*) DESC, client_ip ASC
+                ) AS rn
+            FROM query_log
+            WHERE ts < ?
+            GROUP BY (ts / 3600000) * 3600000, client_ip
+        )
+        WHERE rn <= ?
+        ",
+    )
+    .bind(cutoff)
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    for row in client_rows {
+        let hour: i64 = row.get("hour");
+        rollups.entry(hour).or_default().clients.push((
+            row.get::<String, _>("client_ip"),
+            row.get::<Option<String>, _>("client_name"),
+            row.get::<Option<i64>, _>("total").unwrap_or(0),
+            row.get::<Option<i64>, _>("blocked").unwrap_or(0),
+            row.get::<Option<i64>, _>("last_seen").unwrap_or(0),
+        ));
+    }
+
+    // Upstreams: top-N by total.
+    let upstream_rows = sqlx::query(
+        r"
+        SELECT hour, upstream, total, errors, elapsed_sum FROM (
+            SELECT
+                (ts / 3600000) * 3600000 AS hour,
+                upstream,
+                COUNT(*) AS total,
+                SUM(CASE WHEN rcode IS NOT NULL AND rcode != 0 THEN 1 ELSE 0 END) AS errors,
+                SUM(COALESCE(elapsed_us, 0)) AS elapsed_sum,
+                ROW_NUMBER() OVER (
+                    PARTITION BY (ts / 3600000) * 3600000
+                    ORDER BY COUNT(*) DESC, upstream ASC
+                ) AS rn
+            FROM query_log
+            WHERE ts < ? AND upstream IS NOT NULL
+            GROUP BY (ts / 3600000) * 3600000, upstream
+        )
+        WHERE rn <= ?
+        ",
+    )
+    .bind(cutoff)
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    for row in upstream_rows {
+        let hour: i64 = row.get("hour");
+        rollups.entry(hour).or_default().upstreams.push((
+            row.get::<String, _>("upstream"),
+            row.get::<Option<i64>, _>("total").unwrap_or(0),
+            row.get::<Option<i64>, _>("errors").unwrap_or(0),
+            row.get::<Option<i64>, _>("elapsed_sum").unwrap_or(0),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Loads the already-stored top lists for the hours being rolled up. Queries
+/// are chunked so a very long retention period cannot exceed SQLite's bound
+/// variable limit.
+async fn load_existing_rollups(
+    conn: &mut SqliteConnection,
+    hours: &[i64],
+) -> Result<ExistingRollups, StatsError> {
+    /// Hours per `IN (...)` statement.
+    const HOURS_PER_QUERY: usize = 500;
+
+    let mut existing = ExistingRollups::new();
+    for chunk in hours.chunks(HOURS_PER_QUERY) {
+        let mut builder = sqlx::QueryBuilder::new(
+            "SELECT hour, top_domains, top_clients, top_upstreams FROM stats_hourly WHERE hour IN (",
+        );
+        {
+            let mut separated = builder.separated(", ");
+            for hour in chunk {
+                separated.push_bind(*hour);
+            }
+            separated.push_unseparated(")");
+        }
+
+        for row in builder.build().fetch_all(&mut *conn).await? {
+            existing.insert(
+                row.get("hour"),
+                (
+                    row.get("top_domains"),
+                    row.get("top_clients"),
+                    row.get("top_upstreams"),
+                ),
+            );
+        }
+    }
+
+    Ok(existing)
 }
 
 impl StatsDb {
@@ -184,46 +527,22 @@ impl StatsDb {
         let limit = filter.limit.unwrap_or(50).clamp(1, 1000);
         let fetch_limit = limit + 1;
 
-        let mut builder: sqlx::QueryBuilder<Sqlite> = sqlx::QueryBuilder::new(
+        // `total_count` counts every row matching the filters regardless of the
+        // cursor, so it stays stable while paging.
+        let mut count_builder = filtered_query("SELECT COUNT(*) FROM query_log WHERE 1=1", filter);
+        let total_count: i64 = count_builder
+            .build_query_scalar()
+            .fetch_one(&self.pool)
+            .await?;
+
+        let mut builder = filtered_query(
             "SELECT id, ts, client_ip, client_name, qname, qtype, rcode, verdict, rule, list_source, upstream, elapsed_us, dnssec, proto FROM query_log WHERE 1=1",
+            filter,
         );
 
         if let Some(cursor) = filter.cursor {
             builder.push(" AND id < ");
             builder.push_bind(cursor);
-        }
-        if let Some(from) = filter.from {
-            builder.push(" AND ts >= ");
-            builder.push_bind(from);
-        }
-        if let Some(to) = filter.to {
-            builder.push(" AND ts <= ");
-            builder.push_bind(to);
-        }
-        if let Some(ref status) = filter.status {
-            builder.push(" AND verdict = ");
-            builder.push_bind(status);
-        }
-        if let Some(qtype) = filter.qtype {
-            builder.push(" AND qtype = ");
-            builder.push_bind(i64::from(qtype));
-        }
-        if let Some(ref client) = filter.client {
-            builder.push(" AND (client_ip = ");
-            builder.push_bind(client);
-            builder.push(" OR client_name = ");
-            builder.push_bind(client);
-            builder.push(")");
-        }
-        if let Some(ref domain) = filter.domain {
-            builder.push(" AND qname LIKE ");
-            let escaped = domain
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            let pattern = format!("%{escaped}%");
-            builder.push_bind(pattern);
-            builder.push(" ESCAPE '\\'");
         }
 
         builder.push(" ORDER BY id DESC LIMIT ");
@@ -276,19 +595,25 @@ impl StatsDb {
         Ok(QueryLogPage {
             entries,
             next_cursor,
-            total_count: None,
+            total_count: Some(total_count),
         })
     }
 
-    /// Deletes all entries from the query log.
+    /// Deletes all entries from the query log after folding them into the
+    /// hourly rollups, so clearing the log does not silently reset the
+    /// statistics totals.
     pub async fn delete_query_logs(&self) -> Result<u64, StatsError> {
-        let res = sqlx::query("DELETE FROM query_log")
-            .execute(&self.pool)
-            .await?;
-        Ok(res.rows_affected())
+        let report = self.rollup_and_delete(i64::MAX).await?;
+        Ok(report.deleted_records)
     }
 
     /// Computes global aggregates for a specified time window in milliseconds.
+    ///
+    /// Rows pruned by retention are served from the `stats_hourly` rollups, so
+    /// windows longer than the detailed retention period still report totals
+    /// and top lists instead of silently under-reporting. Rollup top lists are
+    /// bounded summaries (`ROLLUP_TOP_N` per hour), so the merged top-10 is
+    /// exact for retained data and representative for older windows.
     pub async fn get_global_stats(&self, window_ms: i64) -> Result<GlobalStats, StatsError> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let cutoff = now_ms.saturating_sub(window_ms);
@@ -307,9 +632,29 @@ impl StatsDb {
         .fetch_one(&self.pool)
         .await?;
 
-        let total_queries: i64 = row.get::<Option<i64>, _>("total").unwrap_or(0);
-        let blocked_queries: i64 = row.get::<Option<i64>, _>("blocked").unwrap_or(0);
-        let cached_queries: i64 = row.get::<Option<i64>, _>("cached").unwrap_or(0);
+        let mut total_queries: i64 = row.get::<Option<i64>, _>("total").unwrap_or(0);
+        let mut blocked_queries: i64 = row.get::<Option<i64>, _>("blocked").unwrap_or(0);
+        let mut cached_queries: i64 = row.get::<Option<i64>, _>("cached").unwrap_or(0);
+
+        // Merge the hourly rollups whose bucket overlaps the window. Rollup
+        // buckets and live rows are disjoint (pruned rows are deleted), so the
+        // two sources can be summed even for a partially-pruned hour.
+        let archived = sqlx::query(
+            r"
+            SELECT
+                COALESCE(SUM(queries), 0) as total,
+                COALESCE(SUM(blocked), 0) as blocked,
+                COALESCE(SUM(cached), 0) as cached
+            FROM stats_hourly
+            WHERE hour + 3600000 > ?
+            ",
+        )
+        .bind(cutoff)
+        .fetch_one(&self.pool)
+        .await?;
+        total_queries = total_queries.saturating_add(archived.get::<i64, _>("total"));
+        blocked_queries = blocked_queries.saturating_add(archived.get::<i64, _>("blocked"));
+        cached_queries = cached_queries.saturating_add(archived.get::<i64, _>("cached"));
 
         let blocked_percentage = if total_queries > 0 {
             (blocked_queries as f64 / total_queries as f64) * 100.0
@@ -317,71 +662,43 @@ impl StatsDb {
             0.0
         };
 
-        // Top 10 domains
-        let top_domains_rows = sqlx::query(
-            r"
-            SELECT qname, COUNT(*) as count
-            FROM query_log
-            WHERE ts >= ?
-            GROUP BY qname
-            ORDER BY count DESC
-            LIMIT 10
-            ",
-        )
-        .bind(cutoff)
-        .fetch_all(&self.pool)
-        .await?;
+        // Top lists: merge the live top-N with the archived top-N lists so a
+        // window longer than the detailed retention still reports the largest
+        // domains and clients instead of only the retained tail.
+        let merged_domains = merge_domain_tops(
+            self.live_domain_tops(cutoff, ROLLUP_TOP_N).await?,
+            self.archived_domain_tops(cutoff).await?,
+            ROLLUP_TOP_N,
+        );
 
-        let mut top_domains = Vec::new();
-        for r in top_domains_rows {
-            let qname: String = r.get("qname");
-            let count: i64 = r.get("count");
-            top_domains.push((qname, count));
+        let mut top_domains: Vec<(String, i64)> = merged_domains
+            .iter()
+            .map(|(qname, total, _)| (qname.clone(), *total))
+            .collect();
+        top_domains.truncate(10);
+
+        // Blocked domains are ranked separately so a heavily blocked domain is
+        // not dropped just because it ranks below the total-query top-N.
+        let mut top_blocked_domains = merge_blocked_domains(
+            self.live_blocked_domain_tops(cutoff, ROLLUP_TOP_N).await?,
+            self.archived_blocked_domain_tops(cutoff).await?,
+            ROLLUP_TOP_N,
+        );
+        top_blocked_domains.truncate(10);
+
+        let mut top_clients_by_label: HashMap<String, i64> = HashMap::new();
+        for (ip, name, total, _, _) in merge_client_tops(
+            self.live_client_tops(cutoff, ROLLUP_TOP_N).await?,
+            self.archived_client_tops(cutoff).await?,
+            ROLLUP_TOP_N,
+        ) {
+            let label = name.unwrap_or(ip);
+            let entry = top_clients_by_label.entry(label).or_insert(0);
+            *entry = entry.saturating_add(total);
         }
-
-        // Top 10 blocked domains
-        let top_blocked_rows = sqlx::query(
-            r"
-            SELECT qname, COUNT(*) as count
-            FROM query_log
-            WHERE ts >= ? AND verdict = 'blocked'
-            GROUP BY qname
-            ORDER BY count DESC
-            LIMIT 10
-            ",
-        )
-        .bind(cutoff)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut top_blocked_domains = Vec::new();
-        for r in top_blocked_rows {
-            let qname: String = r.get("qname");
-            let count: i64 = r.get("count");
-            top_blocked_domains.push((qname, count));
-        }
-
-        // Top 10 clients
-        let top_clients_rows = sqlx::query(
-            r"
-            SELECT COALESCE(client_name, client_ip) as client, COUNT(*) as count
-            FROM query_log
-            WHERE ts >= ?
-            GROUP BY client
-            ORDER BY count DESC
-            LIMIT 10
-            ",
-        )
-        .bind(cutoff)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut top_clients = Vec::new();
-        for r in top_clients_rows {
-            let client: String = r.get("client");
-            let count: i64 = r.get("count");
-            top_clients.push((client, count));
-        }
+        let mut top_clients: Vec<(String, i64)> = top_clients_by_label.into_iter().collect();
+        top_clients.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        top_clients.truncate(10);
 
         Ok(GlobalStats {
             total_queries,
@@ -394,50 +711,66 @@ impl StatsDb {
         })
     }
 
-    /// Computes per-client statistics.
+    /// Computes per-client statistics, bounded to [`MAX_AGGREGATE_ROWS`] rows
+    /// with a deterministic ordering (largest total first, then IP) and a
+    /// deterministic `client_name` (`MAX(client_name)` when an address was
+    /// seen under several names). Rows pruned by retention are merged back in
+    /// from the hourly rollups.
     pub async fn get_client_stats(&self, window_ms: i64) -> Result<Vec<ClientStats>, StatsError> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let cutoff = now_ms.saturating_sub(window_ms);
 
-        let rows = sqlx::query(
+        let merged = merge_client_tops(
+            self.live_client_tops(cutoff, MAX_AGGREGATE_ROWS).await?,
+            self.archived_client_tops(cutoff).await?,
+            MAX_AGGREGATE_ROWS,
+        );
+
+        Ok(merged
+            .into_iter()
+            .map(
+                |(client_ip, client_name, total_queries, blocked_queries, last_seen)| ClientStats {
+                    client_ip,
+                    client_name,
+                    total_queries,
+                    blocked_queries,
+                    last_seen,
+                },
+            )
+            .collect())
+    }
+
+    /// Number of distinct clients seen in the window, including archived
+    /// hourly rollups. Used for the `X-Total-Count` response header so callers
+    /// can tell when [`MAX_AGGREGATE_ROWS`] truncated the list.
+    ///
+    /// Archived rollups keep at most `ROLLUP_TOP_N` clients per hour, so the
+    /// count is exact for retained data and a lower bound for older windows.
+    pub async fn count_client_stats(&self, window_ms: i64) -> Result<i64, StatsError> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let cutoff = now_ms.saturating_sub(window_ms);
+
+        let count: i64 = sqlx::query_scalar(
             r"
-            SELECT
-                client_ip,
-                client_name,
-                COUNT(*) as total,
-                SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) as blocked,
-                MAX(ts) as last_seen
-            FROM query_log
-            WHERE ts >= ?
-            GROUP BY client_ip
-            ORDER BY total DESC
+            SELECT COUNT(*) FROM (
+                SELECT client_ip FROM query_log WHERE ts >= ?
+                UNION
+                SELECT je.value ->> 0
+                FROM stats_hourly, json_each(COALESCE(stats_hourly.top_clients, '[]')) AS je
+                WHERE stats_hourly.hour + 3600000 > ?
+            )
             ",
         )
         .bind(cutoff)
-        .fetch_all(&self.pool)
+        .bind(cutoff)
+        .fetch_one(&self.pool)
         .await?;
-
-        let mut stats = Vec::new();
-        for r in rows {
-            let client_ip: String = r.get("client_ip");
-            let client_name: Option<String> = r.get("client_name");
-            let total_queries: i64 = r.get::<Option<i64>, _>("total").unwrap_or(0);
-            let blocked_queries: i64 = r.get::<Option<i64>, _>("blocked").unwrap_or(0);
-            let last_seen: i64 = r.get::<Option<i64>, _>("last_seen").unwrap_or(0);
-
-            stats.push(ClientStats {
-                client_ip,
-                client_name,
-                total_queries,
-                blocked_queries,
-                last_seen,
-            });
-        }
-
-        Ok(stats)
+        Ok(count)
     }
 
-    /// Computes per-upstream statistics.
+    /// Computes per-upstream statistics, bounded to [`MAX_AGGREGATE_ROWS`]
+    /// rows with a deterministic ordering (largest total first, then name).
+    /// Rows pruned by retention are merged back in from the hourly rollups.
     pub async fn get_upstream_stats(
         &self,
         window_ms: i64,
@@ -445,63 +778,340 @@ impl StatsDb {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let cutoff = now_ms.saturating_sub(window_ms);
 
-        let rows = sqlx::query(
+        let merged = merge_upstream_tops(
+            self.live_upstream_tops(cutoff, MAX_AGGREGATE_ROWS).await?,
+            self.archived_upstream_tops(cutoff).await?,
+            MAX_AGGREGATE_ROWS,
+        );
+
+        let total_all: i64 = merged.iter().map(|(_, total, _, _)| *total).sum();
+
+        Ok(merged
+            .into_iter()
+            .map(|(upstream, total_queries, error_queries, elapsed_sum)| {
+                let avg_elapsed_us = if total_queries > 0 {
+                    elapsed_sum / total_queries
+                } else {
+                    0
+                };
+                let share_percentage = if total_all > 0 {
+                    (total_queries as f64 / total_all as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                UpstreamStats {
+                    upstream,
+                    total_queries,
+                    error_queries,
+                    avg_elapsed_us,
+                    share_percentage,
+                }
+            })
+            .collect())
+    }
+
+    /// Number of distinct upstreams seen in the window, including archived
+    /// hourly rollups. Used for the `X-Total-Count` response header.
+    pub async fn count_upstream_stats(&self, window_ms: i64) -> Result<i64, StatsError> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let cutoff = now_ms.saturating_sub(window_ms);
+
+        let count: i64 = sqlx::query_scalar(
             r"
-            SELECT
-                COALESCE(upstream, 'unknown') as upstream,
-                COUNT(*) as total,
-                SUM(CASE WHEN rcode IS NOT NULL AND rcode != 0 THEN 1 ELSE 0 END) as errors,
-                AVG(COALESCE(elapsed_us, 0)) as avg_elapsed
-            FROM query_log
-            WHERE ts >= ? AND upstream IS NOT NULL
-            GROUP BY upstream
-            ORDER BY total DESC
+            SELECT COUNT(*) FROM (
+                SELECT upstream FROM query_log WHERE ts >= ? AND upstream IS NOT NULL
+                UNION
+                SELECT je.value ->> 0
+                FROM stats_hourly, json_each(COALESCE(stats_hourly.top_upstreams, '[]')) AS je
+                WHERE stats_hourly.hour + 3600000 > ?
+            )
             ",
         )
         .bind(cutoff)
+        .bind(cutoff)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// Live top domains inside the window, ordered deterministically.
+    async fn live_domain_tops(
+        &self,
+        cutoff: i64,
+        limit: usize,
+    ) -> Result<Vec<DomainTop>, StatsError> {
+        let rows = sqlx::query(
+            r"
+            SELECT qname,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) as blocked
+            FROM query_log
+            WHERE ts >= ?
+            GROUP BY qname
+            ORDER BY total DESC, qname ASC
+            LIMIT ?
+            ",
+        )
+        .bind(cutoff)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .fetch_all(&self.pool)
         .await?;
 
-        let mut total_all = 0i64;
-        let mut raw = Vec::new();
-
-        for r in rows {
-            let upstream: String = r.get("upstream");
-            let total_queries: i64 = r.get::<Option<i64>, _>("total").unwrap_or(0);
-            let error_queries: i64 = r.get::<Option<i64>, _>("errors").unwrap_or(0);
-            let avg_elapsed: f64 = r.get::<Option<f64>, _>("avg_elapsed").unwrap_or(0.0);
-
-            total_all += total_queries;
-            raw.push((upstream, total_queries, error_queries, avg_elapsed as i64));
-        }
-
-        let mut stats = Vec::new();
-        for (upstream, total_queries, error_queries, avg_elapsed_us) in raw {
-            let share_percentage = if total_all > 0 {
-                (total_queries as f64 / total_all as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            stats.push(UpstreamStats {
-                upstream,
-                total_queries,
-                error_queries,
-                avg_elapsed_us,
-                share_percentage,
-            });
-        }
-
-        Ok(stats)
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("qname"),
+                    r.get::<Option<i64>, _>("total").unwrap_or(0),
+                    r.get::<Option<i64>, _>("blocked").unwrap_or(0),
+                )
+            })
+            .collect())
     }
 
-    /// Returns the watermark (last_id, last_ts) for a given key, or None if not set.
-    pub async fn get_watermark(&self, key: &str) -> Result<Option<(i64, i64)>, StatsError> {
-        let row = sqlx::query("SELECT last_id, last_ts FROM stats_watermark WHERE key = ?")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|r| (r.get("last_id"), r.get("last_ts"))))
+    /// Live top blocked domains inside the window, ranked by blocked count.
+    async fn live_blocked_domain_tops(
+        &self,
+        cutoff: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, i64)>, StatsError> {
+        let rows = sqlx::query(
+            r"
+            SELECT qname,
+                   COUNT(*) as blocked
+            FROM query_log
+            WHERE ts >= ? AND verdict = 'blocked'
+            GROUP BY qname
+            ORDER BY blocked DESC, qname ASC
+            LIMIT ?
+            ",
+        )
+        .bind(cutoff)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("qname"),
+                    r.get::<Option<i64>, _>("blocked").unwrap_or(0),
+                )
+            })
+            .collect())
+    }
+
+    /// Archived top domains from `stats_hourly` buckets overlapping the window.
+    async fn archived_domain_tops(&self, cutoff: i64) -> Result<Vec<DomainTop>, StatsError> {
+        let rows = sqlx::query(
+            r"
+            SELECT je.value ->> 0 AS qname,
+                   SUM(CAST(je.value ->> 1 AS INTEGER)) AS total,
+                   SUM(CAST(je.value ->> 2 AS INTEGER)) AS blocked
+            FROM stats_hourly, json_each(COALESCE(stats_hourly.top_domains, '[]')) AS je
+            WHERE stats_hourly.hour + 3600000 > ?
+            GROUP BY qname
+            ORDER BY total DESC, qname ASC
+            LIMIT ?
+            ",
+        )
+        .bind(cutoff)
+        .bind(i64::try_from(ROLLUP_TOP_N).unwrap_or(100))
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("qname"),
+                    r.get::<Option<i64>, _>("total").unwrap_or(0),
+                    r.get::<Option<i64>, _>("blocked").unwrap_or(0),
+                )
+            })
+            .collect())
+    }
+
+    /// Archived top blocked domains from `stats_hourly` buckets overlapping the
+    /// window, ranked by blocked count.
+    async fn archived_blocked_domain_tops(
+        &self,
+        cutoff: i64,
+    ) -> Result<Vec<(String, i64)>, StatsError> {
+        let rows = sqlx::query(
+            r"
+            SELECT je.value ->> 0 AS qname,
+                   SUM(CAST(je.value ->> 2 AS INTEGER)) AS blocked
+            FROM stats_hourly, json_each(COALESCE(stats_hourly.top_domains, '[]')) AS je
+            WHERE stats_hourly.hour + 3600000 > ?
+            GROUP BY qname
+            HAVING SUM(CAST(je.value ->> 2 AS INTEGER)) > 0
+            ORDER BY blocked DESC, qname ASC
+            LIMIT ?
+            ",
+        )
+        .bind(cutoff)
+        .bind(i64::try_from(ROLLUP_TOP_N).unwrap_or(100))
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("qname"),
+                    r.get::<Option<i64>, _>("blocked").unwrap_or(0),
+                )
+            })
+            .collect())
+    }
+
+    /// Live per-client aggregates inside the window, ordered deterministically.
+    async fn live_client_tops(
+        &self,
+        cutoff: i64,
+        limit: usize,
+    ) -> Result<Vec<ClientTop>, StatsError> {
+        let rows = sqlx::query(
+            r"
+            SELECT client_ip,
+                   MAX(client_name) as client_name,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) as blocked,
+                   MAX(ts) as last_seen
+            FROM query_log
+            WHERE ts >= ?
+            GROUP BY client_ip
+            ORDER BY total DESC, client_ip ASC
+            LIMIT ?
+            ",
+        )
+        .bind(cutoff)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("client_ip"),
+                    r.get::<Option<String>, _>("client_name"),
+                    r.get::<Option<i64>, _>("total").unwrap_or(0),
+                    r.get::<Option<i64>, _>("blocked").unwrap_or(0),
+                    r.get::<Option<i64>, _>("last_seen").unwrap_or(0),
+                )
+            })
+            .collect())
+    }
+
+    /// Archived per-client aggregates from `stats_hourly` buckets overlapping
+    /// the window.
+    async fn archived_client_tops(&self, cutoff: i64) -> Result<Vec<ClientTop>, StatsError> {
+        let rows = sqlx::query(
+            r"
+            SELECT je.value ->> 0 AS client_ip,
+                   MAX(NULLIF(je.value ->> 1, '')) AS client_name,
+                   SUM(CAST(je.value ->> 2 AS INTEGER)) AS total,
+                   SUM(CAST(je.value ->> 3 AS INTEGER)) AS blocked,
+                   MAX(CAST(je.value ->> 4 AS INTEGER)) AS last_seen
+            FROM stats_hourly, json_each(COALESCE(stats_hourly.top_clients, '[]')) AS je
+            WHERE stats_hourly.hour + 3600000 > ?
+            GROUP BY client_ip
+            ORDER BY total DESC, client_ip ASC
+            LIMIT ?
+            ",
+        )
+        .bind(cutoff)
+        .bind(i64::try_from(MAX_AGGREGATE_ROWS).unwrap_or(1000))
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("client_ip"),
+                    r.get::<Option<String>, _>("client_name"),
+                    r.get::<Option<i64>, _>("total").unwrap_or(0),
+                    r.get::<Option<i64>, _>("blocked").unwrap_or(0),
+                    r.get::<Option<i64>, _>("last_seen").unwrap_or(0),
+                )
+            })
+            .collect())
+    }
+
+    /// Live per-upstream aggregates inside the window, ordered deterministically.
+    async fn live_upstream_tops(
+        &self,
+        cutoff: i64,
+        limit: usize,
+    ) -> Result<Vec<UpstreamTop>, StatsError> {
+        let rows = sqlx::query(
+            r"
+            SELECT upstream,
+                   COUNT(*) as total,
+                   SUM(CASE WHEN rcode IS NOT NULL AND rcode != 0 THEN 1 ELSE 0 END) as errors,
+                   SUM(COALESCE(elapsed_us, 0)) as elapsed_sum
+            FROM query_log
+            WHERE ts >= ? AND upstream IS NOT NULL
+            GROUP BY upstream
+            ORDER BY total DESC, upstream ASC
+            LIMIT ?
+            ",
+        )
+        .bind(cutoff)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("upstream"),
+                    r.get::<Option<i64>, _>("total").unwrap_or(0),
+                    r.get::<Option<i64>, _>("errors").unwrap_or(0),
+                    r.get::<Option<i64>, _>("elapsed_sum").unwrap_or(0),
+                )
+            })
+            .collect())
+    }
+
+    /// Archived per-upstream aggregates from `stats_hourly` buckets overlapping
+    /// the window.
+    async fn archived_upstream_tops(&self, cutoff: i64) -> Result<Vec<UpstreamTop>, StatsError> {
+        let rows = sqlx::query(
+            r"
+            SELECT je.value ->> 0 AS upstream,
+                   SUM(CAST(je.value ->> 1 AS INTEGER)) AS total,
+                   SUM(CAST(je.value ->> 2 AS INTEGER)) AS errors,
+                   SUM(CAST(je.value ->> 3 AS INTEGER)) AS elapsed_sum
+            FROM stats_hourly, json_each(COALESCE(stats_hourly.top_upstreams, '[]')) AS je
+            WHERE stats_hourly.hour + 3600000 > ?
+            GROUP BY upstream
+            ORDER BY total DESC, upstream ASC
+            LIMIT ?
+            ",
+        )
+        .bind(cutoff)
+        .bind(i64::try_from(MAX_AGGREGATE_ROWS).unwrap_or(1000))
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("upstream"),
+                    r.get::<Option<i64>, _>("total").unwrap_or(0),
+                    r.get::<Option<i64>, _>("errors").unwrap_or(0),
+                    r.get::<Option<i64>, _>("elapsed_sum").unwrap_or(0),
+                )
+            })
+            .collect())
     }
 
     /// Aggregates older logs into `stats_hourly` and prunes query logs older
@@ -513,6 +1123,10 @@ impl StatsDb {
     /// delete, so no pruned row can be deleted without being aggregated.
     /// Because deleted rows no longer exist, the watermark is not used to skip
     /// rows: every row below the cutoff is aggregated exactly once.
+    ///
+    /// After a sweep that removed at least [`VACUUM_MIN_DELETED_ROWS`] rows the
+    /// database is vacuumed, so pages freed by retention are returned to the OS
+    /// instead of growing the file forever.
     pub async fn cleanup_retention(
         &self,
         retention_days: u32,
@@ -521,6 +1135,23 @@ impl StatsDb {
         let retention_ms = i64::from(retention_days) * 24 * 3600 * 1000;
         let cutoff = now_ms.saturating_sub(retention_ms);
 
+        let report = self.rollup_and_delete(cutoff).await?;
+
+        if report.deleted_records >= VACUUM_MIN_DELETED_ROWS
+            && let Err(e) = self.vacuum().await
+        {
+            // Rollup and delete already committed; a failed compaction must not
+            // make the sweep look failed or lose the report.
+            tracing::warn!(error = %e, "stats retention vacuum failed");
+        }
+
+        Ok(report)
+    }
+
+    /// Folds every row below `cutoff` into `stats_hourly` and deletes exactly
+    /// those rows in one transaction. [`Self::delete_query_logs`] reuses it with
+    /// `cutoff = i64::MAX` so clearing the log preserves aggregate history.
+    async fn rollup_and_delete(&self, cutoff: i64) -> Result<RetentionReport, StatsError> {
         // `BEGIN IMMEDIATE` takes the write lock up front so concurrent writers
         // wait instead of failing the aggregate/delete with `SQLITE_BUSY`.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -548,6 +1179,16 @@ impl StatsDb {
         .fetch_all(&mut *tx)
         .await?;
 
+        let affected_hours: Vec<i64> = hours_to_aggregate
+            .iter()
+            .map(|row| row.get("hour"))
+            .collect();
+        let mut rollups: HashMap<i64, HourRollup> = HashMap::new();
+        if !affected_hours.is_empty() {
+            collect_hour_rollups(&mut tx, cutoff, &mut rollups).await?;
+        }
+        let existing_rollups = load_existing_rollups(&mut tx, &affected_hours).await?;
+
         let mut aggregated_hours = 0;
         let mut max_seen_id = 0i64;
         let mut max_seen_ts = 0i64;
@@ -564,20 +1205,50 @@ impl StatsDb {
                 max_seen_ts = max_seen_ts.max(mts);
             }
 
+            // Merge the new top lists into the ones already stored for this
+            // hour: a partially-pruned hour can be rolled up again later.
+            let mut rollup = rollups.remove(&hour).unwrap_or_default();
+            let (existing_domains, existing_clients, existing_upstreams) =
+                existing_rollups.get(&hour).cloned().unwrap_or_default();
+            rollup.domains = merge_domain_tops(
+                decode_tops(existing_domains.as_deref()),
+                rollup.domains,
+                // Keep room for the union of the top-N by total and by blocked
+                // count, so a blocked-heavy domain survives the rollup even
+                // when it ranks below the total-query top-N.
+                ROLLUP_TOP_N * 2,
+            );
+            rollup.clients = merge_client_tops(
+                decode_tops(existing_clients.as_deref()),
+                rollup.clients,
+                ROLLUP_TOP_N,
+            );
+            rollup.upstreams = merge_upstream_tops(
+                decode_tops(existing_upstreams.as_deref()),
+                rollup.upstreams,
+                ROLLUP_TOP_N,
+            );
+
             sqlx::query(
                 r"
-                INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients)
-                VALUES (?, ?, ?, ?, '[]', '[]')
+                INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients, top_upstreams)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(hour) DO UPDATE SET
                     queries = queries + excluded.queries,
                     blocked = blocked + excluded.blocked,
-                    cached = cached + excluded.cached
+                    cached = cached + excluded.cached,
+                    top_domains = excluded.top_domains,
+                    top_clients = excluded.top_clients,
+                    top_upstreams = excluded.top_upstreams
                 ",
             )
             .bind(hour)
             .bind(queries)
             .bind(blocked)
             .bind(cached)
+            .bind(encode_tops(&rollup.domains))
+            .bind(encode_tops(&rollup.clients))
+            .bind(encode_tops(&rollup.upstreams))
             .execute(&mut *tx)
             .await?;
 
@@ -618,9 +1289,14 @@ impl StatsDb {
         })
     }
 
-    /// Triggers SQLite database VACUUM.
+    /// Triggers SQLite `VACUUM` and truncates the WAL so the compacted file
+    /// size is immediately visible on disk (WAL mode otherwise keeps the freed
+    /// pages in the sidecar file).
     pub async fn vacuum(&self) -> Result<(), StatsError> {
         sqlx::query("VACUUM").execute(&self.pool).await?;
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
