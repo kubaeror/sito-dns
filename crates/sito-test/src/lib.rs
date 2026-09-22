@@ -184,11 +184,13 @@ mod tests {
         // Upstream 2 answered
         assert_eq!(mock_upstream2.query_count(), 1);
 
-        // Total time should be upstream 1 timeout (~400ms) + small overhead.
-        // The strict budget only runs under SITO_BENCH_TESTS; the generous
-        // bound still catches hangs on shared CI runners.
+        // Retries share the overall timeout budget: with two candidates and
+        // timeout_ms = 400 each attempt gets ~200ms, so failover completes in
+        // roughly half the configured budget instead of multiplying it.
+        // The strict upper budget only runs under SITO_BENCH_TESTS; the
+        // generous bound still catches hangs on shared CI runners.
         assert!(
-            elapsed >= Duration::from_millis(350),
+            elapsed >= Duration::from_millis(150),
             "Elapsed was suspiciously fast: {elapsed:?}"
         );
         let budget = if std::env::var_os("SITO_BENCH_TESTS").is_some() {

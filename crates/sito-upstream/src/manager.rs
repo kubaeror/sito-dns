@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, info, trace, warn};
 
 use sito_core::config::{UpstreamConfig, UpstreamStrategy};
 use sito_core::error::UpstreamError;
-use sito_proto::{Message, MessageType, Name, OpCode, Query, RecordType};
+use sito_proto::{Message, MessageType, Name, OpCode, Query, RecordType, ResponseCode};
 
 use crate::bootstrap::BootstrapResolver;
 use crate::doh::HttpsUpstream;
@@ -19,10 +19,94 @@ use crate::doq::QuicUpstream;
 use crate::dot::DotUpstream;
 use crate::health::{HealthStatus, UpstreamHealth};
 use crate::plain::PlainUpstream;
-use crate::upstream::Upstream;
+use crate::upstream::{Upstream, is_retryable_response};
 
 pub type NamedUpstream = (String, Arc<dyn Upstream>);
 pub type PerDomainRule = (Vec<String>, Vec<NamedUpstream>);
+
+/// Failure returned by [`UpstreamManager::resolve_with_upstream`].
+///
+/// Carries the name of the upstream that produced the final error so callers
+/// can attribute metrics and logs per server instead of labelling every
+/// failure `"all"`. [`Self::kind`] and the `Display` implementation delegate to
+/// the underlying [`UpstreamError`], so existing pipelines keep working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamQueryError {
+    /// The underlying upstream failure.
+    pub error: UpstreamError,
+    /// Name of the upstream entry that produced `error`, when one was tried.
+    pub upstream: Option<String>,
+}
+
+impl UpstreamQueryError {
+    /// Failure attributed to a concrete managed upstream.
+    fn from_entry(entry: &ManagedEntry, error: UpstreamError) -> Self {
+        Self {
+            error,
+            upstream: Some(entry.name.clone()),
+        }
+    }
+
+    /// Failure that cannot be attributed to a single server (e.g. no
+    /// candidates were available at all).
+    fn unattributed(error: UpstreamError) -> Self {
+        Self {
+            error,
+            upstream: None,
+        }
+    }
+
+    /// Stable, low-cardinality kind label (delegates to [`UpstreamError::kind`]).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        self.error.kind()
+    }
+
+    /// Consume the failure, discarding upstream attribution.
+    #[must_use]
+    pub fn into_error(self) -> UpstreamError {
+        self.error
+    }
+}
+
+impl std::fmt::Display for UpstreamQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.upstream {
+            Some(name) => write!(f, "upstream '{name}': {}", self.error),
+            None => write!(f, "{}", self.error),
+        }
+    }
+}
+
+impl std::error::Error for UpstreamQueryError {}
+
+impl From<UpstreamQueryError> for UpstreamError {
+    fn from(error: UpstreamQueryError) -> Self {
+        error.error
+    }
+}
+
+/// Error recorded for a structurally valid reply whose response code marks a
+/// transient upstream failure (see [`is_retryable_response`]).
+fn retryable_status_error(code: ResponseCode) -> UpstreamError {
+    UpstreamError::BadResponse(format!("upstream returned {code}, treated as retryable"))
+}
+
+/// Overall deadline for one logical resolve. Retries share this budget so a
+/// failover chain cannot take `timeout_duration × candidates`.
+fn resolve_deadline(timeout_duration: Duration) -> Instant {
+    Instant::now() + timeout_duration
+}
+
+/// Per-attempt budget: an equal share of what is left before `deadline` across
+/// the candidates still to try, so every candidate gets a chance while the
+/// total stays inside the deadline. `None` when the budget is exhausted.
+fn attempt_budget(deadline: Instant, candidates_left: usize) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let left = u32::try_from(candidates_left.max(1)).unwrap_or(u32::MAX);
+    let share = remaining / left;
+    (!share.is_zero()).then_some(share)
+}
 
 #[derive(Clone)]
 struct ManagedEntry {
@@ -226,28 +310,67 @@ impl FailoverUpstream {
         }
     }
 
-    async fn resolve_candidates(&self, msg: &Message) -> Result<Message, UpstreamError> {
-        let candidates = self.candidates.read().await.clone();
+    /// Tries candidates in order until one returns a usable answer. Returns the
+    /// last error (`None` only when there were no candidates at all) so callers
+    /// can decide whether to re-resolve.
+    async fn try_candidates(
+        &self,
+        candidates: &[Arc<dyn Upstream>],
+        msg: &Message,
+        deadline: Instant,
+    ) -> Result<Message, Option<UpstreamError>> {
         let mut last_error = None;
-        for candidate in &candidates {
-            match candidate.resolve(msg).await {
-                Ok(response) => return Ok(response),
-                Err(e) => {
+        let mut remaining = candidates.len();
+        for candidate in candidates {
+            // Each attempt gets an equal share of what is left of the overall
+            // deadline; a failing candidate must not consume the whole budget.
+            let Some(budget) = attempt_budget(deadline, remaining) else {
+                break;
+            };
+            remaining -= 1;
+
+            match timeout(budget, candidate.resolve(msg)).await {
+                Ok(Ok(response)) if !is_retryable_response(&response) => return Ok(response),
+                Ok(Ok(response)) => {
+                    debug!(
+                        "Upstream candidate for '{}' returned retryable {}",
+                        self.host, response.metadata.response_code
+                    );
+                    last_error = Some(retryable_status_error(response.metadata.response_code));
+                }
+                Ok(Err(e)) => {
                     debug!("Upstream candidate for '{}' failed: {}", self.host, e);
                     last_error = Some(e);
                 }
+                Err(_) => {
+                    debug!("Upstream candidate for '{}' timed out", self.host);
+                    last_error = Some(UpstreamError::Timeout);
+                }
             }
         }
+        Err(last_error)
+    }
+
+    async fn resolve_candidates(&self, msg: &Message) -> Result<Message, UpstreamError> {
+        let deadline = resolve_deadline(self.timeout);
+
+        let candidates = self.candidates.read().await.clone();
+        let mut last_error = match self.try_candidates(&candidates, msg, deadline).await {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
 
         // Every known address failed: refresh (bounded) and retry once so
-        // rotated DNS records can be picked up without a restart.
-        if self.try_re_resolve().await {
+        // rotated DNS records can be picked up without a restart. The refresh
+        // and the retry stay inside the same overall deadline.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero()
+            && let Ok(true) = timeout(remaining, self.try_re_resolve()).await
+        {
             let candidates = self.candidates.read().await.clone();
-            for candidate in &candidates {
-                match candidate.resolve(msg).await {
-                    Ok(response) => return Ok(response),
-                    Err(e) => last_error = Some(e),
-                }
+            match self.try_candidates(&candidates, msg, deadline).await {
+                Ok(response) => return Ok(response),
+                Err(error) => last_error = error.or(last_error),
             }
         }
 
@@ -574,14 +697,22 @@ impl UpstreamManager {
 
     /// Resolve a DNS query according to domain rules and configured strategy (parallel, load balance, failover).
     pub async fn resolve(&self, msg: &Message) -> Result<Message, UpstreamError> {
-        self.resolve_with_upstream(msg).await.map(|(resp, _)| resp)
+        self.resolve_with_upstream(msg)
+            .await
+            .map(|(resp, _)| resp)
+            .map_err(UpstreamQueryError::into_error)
     }
 
-    /// Resolve a DNS query according to domain rules and return the response along with the upstream identifier.
+    /// Resolve a DNS query according to domain rules and return the response
+    /// along with the upstream identifier.
+    ///
+    /// On failure the returned [`UpstreamQueryError`] names the upstream that
+    /// produced the final error (when one was tried), so callers can attribute
+    /// metrics per server.
     pub async fn resolve_with_upstream(
         &self,
         msg: &Message,
-    ) -> Result<(Message, String), UpstreamError> {
+    ) -> Result<(Message, String), UpstreamQueryError> {
         let inner = self.inner.load();
         if let Some(query) = msg.queries.first() {
             // ASCII/punycode form: per-domain rules are normalized to
@@ -597,24 +728,43 @@ impl UpstreamManager {
                             "Routing query for {} to per-domain upstreams {:?}",
                             qname_str, domains
                         );
-                        return self.resolve_entries(group, msg, inner.strategy).await;
+                        return self
+                            .resolve_entries(group, msg, inner.strategy, inner.timeout_duration)
+                            .await;
                     }
                 }
             }
         }
 
-        self.resolve_entries(&inner.entries, msg, inner.strategy)
+        self.resolve_entries(&inner.entries, msg, inner.strategy, inner.timeout_duration)
             .await
     }
 
+    /// Runs one resolve across `entries` with the configured `strategy`.
+    ///
+    /// Retryable outcomes are `SERVFAIL`, `REFUSED` and `NOTIMP` replies (see
+    /// [`is_retryable_response`]) as well as transport errors: each is recorded
+    /// against the entry's health and the next candidate is tried.
+    ///
+    /// Strategy-specific behavior:
+    /// - `Failover`: candidates in configuration order.
+    /// - `LoadBalance`: round-robin start index, then the same order wrapped.
+    /// - `Parallel`: all candidates are raced; a retryable reply is treated as
+    ///   a failure for that candidate so the race continues with the others.
+    ///
+    /// All strategies share one deadline (`timeout_duration` from the start of
+    /// this call). Sequential attempts each get an equal share of the remaining
+    /// budget, so total latency stays bounded by the configured timeout instead
+    /// of growing by a factor of the candidate count.
     async fn resolve_entries(
         &self,
         entries: &[ManagedEntry],
         msg: &Message,
         strategy: UpstreamStrategy,
-    ) -> Result<(Message, String), UpstreamError> {
+        timeout_duration: Duration,
+    ) -> Result<(Message, String), UpstreamQueryError> {
         if entries.is_empty() {
-            return Err(UpstreamError::AllDown);
+            return Err(UpstreamQueryError::unattributed(UpstreamError::AllDown));
         }
 
         // Collect available upstreams
@@ -632,6 +782,8 @@ impl UpstreamManager {
             candidates.extend(entries.iter());
         }
 
+        let deadline = resolve_deadline(timeout_duration);
+
         match strategy {
             UpstreamStrategy::Parallel => {
                 let mut futs = Vec::with_capacity(candidates.len());
@@ -642,61 +794,47 @@ impl UpstreamManager {
                     let name = entry.name.clone();
                     futs.push(Box::pin(async move {
                         match u.resolve(&m).await {
-                            Ok(resp) => {
+                            Ok(resp) if !is_retryable_response(&resp) => {
                                 h.write().await.record_success();
                                 Ok((resp, name))
                             }
-                            Err(e) => {
-                                warn!("Upstream {} failed parallel query: {}", name, e);
-                                h.write().await.record_error(&e);
-                                Err(e)
+                            Ok(resp) => {
+                                let error = retryable_status_error(resp.metadata.response_code);
+                                warn!("Upstream {} returned retryable response: {}", name, error);
+                                h.write().await.record_error(&error);
+                                Err(UpstreamQueryError {
+                                    error,
+                                    upstream: Some(name),
+                                })
+                            }
+                            Err(error) => {
+                                warn!("Upstream {} failed parallel query: {}", name, error);
+                                h.write().await.record_error(&error);
+                                Err(UpstreamQueryError {
+                                    error,
+                                    upstream: Some(name),
+                                })
                             }
                         }
                     }));
                 }
-                match futures_util::future::select_ok(futs).await {
-                    Ok((resp, _)) => Ok(resp),
-                    Err(e) => Err(e),
+                // All attempts already run concurrently, so the whole race gets
+                // the full timeout; the deadline only bounds implementations
+                // that ignore their own timeout.
+                match timeout(timeout_duration, futures_util::future::select_ok(futs)).await {
+                    Ok(Ok((resp, _))) => Ok(resp),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(UpstreamQueryError::unattributed(UpstreamError::Timeout)),
                 }
             }
             UpstreamStrategy::LoadBalance => {
                 let start_idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % candidates.len();
-                let mut last_error = None;
-                for i in 0..candidates.len() {
-                    let entry = candidates[(start_idx + i) % candidates.len()];
-                    trace!("Querying upstream (load_balance) {}", entry.name);
-                    match entry.upstream.resolve(msg).await {
-                        Ok(response) => {
-                            entry.health.write().await.record_success();
-                            return Ok((response, entry.name.clone()));
-                        }
-                        Err(e) => {
-                            warn!("Upstream {} failed query: {}", entry.name, e);
-                            entry.health.write().await.record_error(&e);
-                            last_error = Some(e);
-                        }
-                    }
-                }
-                Err(last_error.unwrap_or(UpstreamError::AllDown))
+                let ordered: Vec<&ManagedEntry> = (0..candidates.len())
+                    .map(|i| candidates[(start_idx + i) % candidates.len()])
+                    .collect();
+                resolve_sequential(&ordered, msg, deadline).await
             }
-            UpstreamStrategy::Failover => {
-                let mut last_error = None;
-                for entry in candidates {
-                    trace!("Querying upstream (failover) {}", entry.name);
-                    match entry.upstream.resolve(msg).await {
-                        Ok(response) => {
-                            entry.health.write().await.record_success();
-                            return Ok((response, entry.name.clone()));
-                        }
-                        Err(e) => {
-                            warn!("Upstream {} failed query: {}", entry.name, e);
-                            entry.health.write().await.record_error(&e);
-                            last_error = Some(e);
-                        }
-                    }
-                }
-                Err(last_error.unwrap_or(UpstreamError::AllDown))
-            }
+            UpstreamStrategy::Failover => resolve_sequential(&candidates, msg, deadline).await,
         }
     }
 
@@ -740,7 +878,7 @@ impl UpstreamManager {
                             .map(|entry| entry.upstream.refresh());
                         futures_util::future::join_all(refreshes).await;
 
-                        let probe_timeout = inner.timeout_duration.max(Duration::from_millis(1));
+                        let probe_timeout = health_probe_timeout(inner.timeout_duration);
                         let mut to_probe = Vec::new();
                         for entry in all_entries {
                             let status = entry.health.read().await.status();
@@ -764,6 +902,68 @@ impl UpstreamManager {
     }
 }
 
+/// Minimum timeout for an active health probe. Probes must not reuse the query
+/// timeout: a healthy but slow upstream (e.g. a cold DoT handshake that takes
+/// longer than the query budget) would otherwise be recorded as a failure and
+/// mark a working upstream down.
+const MIN_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout applied to a single active health probe.
+fn health_probe_timeout(query_timeout: Duration) -> Duration {
+    query_timeout.max(MIN_HEALTH_PROBE_TIMEOUT)
+}
+
+/// Runs one candidate attempt inside its share of the overall deadline.
+async fn attempt_entry(
+    entry: &ManagedEntry,
+    msg: &Message,
+    budget: Duration,
+) -> Result<Message, UpstreamError> {
+    match timeout(budget, entry.upstream.resolve(msg)).await {
+        Ok(result) => result,
+        Err(_) => Err(UpstreamError::Timeout),
+    }
+}
+
+/// Tries `ordered` entries in sequence, each within its share of `deadline`.
+///
+/// A reply is only accepted when [`is_retryable_response`] is false; other
+/// replies are recorded against the entry's health and the next entry is tried.
+async fn resolve_sequential(
+    ordered: &[&ManagedEntry],
+    msg: &Message,
+    deadline: Instant,
+) -> Result<(Message, String), UpstreamQueryError> {
+    let mut last_error = None;
+    for (i, entry) in ordered.iter().enumerate() {
+        let Some(budget) = attempt_budget(deadline, ordered.len() - i) else {
+            break;
+        };
+        trace!("Querying upstream {}", entry.name);
+        match attempt_entry(entry, msg, budget).await {
+            Ok(response) if !is_retryable_response(&response) => {
+                entry.health.write().await.record_success();
+                return Ok((response, entry.name.clone()));
+            }
+            Ok(response) => {
+                let error = retryable_status_error(response.metadata.response_code);
+                warn!(
+                    "Upstream {} returned retryable response: {}",
+                    entry.name, error
+                );
+                entry.health.write().await.record_error(&error);
+                last_error = Some(UpstreamQueryError::from_entry(entry, error));
+            }
+            Err(error) => {
+                warn!("Upstream {} failed query: {}", entry.name, error);
+                entry.health.write().await.record_error(&error);
+                last_error = Some(UpstreamQueryError::from_entry(entry, error));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| UpstreamQueryError::unattributed(UpstreamError::AllDown)))
+}
+
 /// Probe a set of upstreams concurrently, bounding each individual probe.
 async fn probe_all(entries: Vec<ManagedEntry>, probe_qname: Name, probe_timeout: Duration) {
     let probes = entries.into_iter().map(|entry| {
@@ -780,9 +980,14 @@ async fn probe_one(entry: ManagedEntry, qname: Name, probe_timeout: Duration) {
     query.queries.push(Query::query(qname, RecordType::A));
 
     match tokio::time::timeout(probe_timeout, entry.upstream.resolve(&query)).await {
-        Ok(Ok(_)) => {
+        Ok(Ok(response)) if !is_retryable_response(&response) => {
             info!("Active probe succeeded for upstream {}", name);
             entry.health.write().await.record_probe_success();
+        }
+        Ok(Ok(response)) => {
+            let error = retryable_status_error(response.metadata.response_code);
+            debug!("Active probe failed for upstream {}: {}", name, error);
+            entry.health.write().await.record_error(&error);
         }
         Ok(Err(e)) => {
             debug!("Active probe failed for upstream {}: {}", name, e);
@@ -834,6 +1039,458 @@ mod tests {
                 Err(UpstreamError::Timeout)
             }
         }
+    }
+
+    /// Mock upstream returning a fixed response code (plus an A answer for
+    /// `NoError`), used to exercise retryability without a socket.
+    struct RcodeMockUpstream {
+        response_code: ResponseCode,
+        delay: Duration,
+        result_ip: std::net::Ipv4Addr,
+        call_count: Arc<AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl Upstream for RcodeMockUpstream {
+        async fn resolve(&self, msg: &Message) -> Result<Message, UpstreamError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            if self.delay > Duration::ZERO {
+                tokio::time::sleep(self.delay).await;
+            }
+            let mut resp = Message::response(msg.metadata.id, msg.metadata.op_code);
+            resp.queries = msg.queries.clone();
+            resp.metadata.response_code = self.response_code;
+            if self.response_code == ResponseCode::NoError {
+                resp.answers.push(Record::from_rdata(
+                    msg.queries[0].name().clone(),
+                    300,
+                    RData::A(A(self.result_ip)),
+                ));
+            }
+            Ok(resp)
+        }
+    }
+
+    /// Spawns a plain-DNS UDP mock answering every query with `response_code`
+    /// (and an A record when `answer` is `Some` and the code is `NoError`).
+    async fn spawn_udp_rcode_server(
+        response_code: ResponseCode,
+        answer: Option<std::net::Ipv4Addr>,
+    ) -> (SocketAddr, Arc<AtomicU32>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&calls);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let Ok(query) = decode_message(&buf[..len]) else {
+                    continue;
+                };
+                let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                resp.queries = query.queries.clone();
+                resp.metadata.response_code = response_code;
+                if response_code == ResponseCode::NoError
+                    && let Some(ip) = answer
+                {
+                    resp.answers.push(Record::from_rdata(
+                        query.queries[0].name().clone(),
+                        300,
+                        RData::A(A(ip)),
+                    ));
+                }
+                if let Ok(encoded) = encode_message(&resp) {
+                    let _ = socket.send_to(&encoded, peer).await;
+                }
+            }
+        });
+        (addr, calls)
+    }
+
+    fn test_query() -> Message {
+        let mut query = Message::new(1, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("test.com.").unwrap(),
+            RecordType::A,
+        ));
+        query
+    }
+
+    /// WP-6.1 item 1: a well-formed SERVFAIL from the first upstream must be
+    /// treated as a failure (not a successful resolution) and the next
+    /// upstream must be tried.
+    #[tokio::test]
+    async fn test_failover_retries_on_servfail_udp_response() {
+        let (servfail_addr, servfail_calls) =
+            spawn_udp_rcode_server(ResponseCode::ServFail, None).await;
+        let (healthy_addr, healthy_calls) = spawn_udp_rcode_server(
+            ResponseCode::NoError,
+            Some(std::net::Ipv4Addr::new(9, 9, 9, 9)),
+        )
+        .await;
+
+        let manager = UpstreamManager::with_upstreams(
+            vec![
+                (
+                    "servfail.dns".to_string(),
+                    Arc::new(PlainUpstream::new(
+                        servfail_addr,
+                        Duration::from_millis(500),
+                    )),
+                ),
+                (
+                    "healthy.dns".to_string(),
+                    Arc::new(PlainUpstream::new(healthy_addr, Duration::from_millis(500))),
+                ),
+            ],
+            UpstreamStrategy::Failover,
+            Duration::from_millis(500),
+        );
+
+        let (resp, upstream) = manager
+            .resolve_with_upstream(&test_query())
+            .await
+            .expect("SERVFAIL must fail over to the healthy upstream");
+        assert_eq!(upstream, "healthy.dns");
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(
+            resp.answers[0].data,
+            RData::A(A(std::net::Ipv4Addr::new(9, 9, 9, 9)))
+        );
+        assert_eq!(servfail_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(healthy_calls.load(Ordering::SeqCst), 1);
+
+        // The retryable reply must also count against the failing server's
+        // health: 3 consecutive failures move it to Suspect.
+        for _ in 0..2 {
+            manager
+                .resolve(&test_query())
+                .await
+                .expect("failover must keep succeeding");
+        }
+        let statuses = manager.statuses().await;
+        let status_of = |name: &str| {
+            statuses
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, s)| *s)
+                .unwrap()
+        };
+        assert_eq!(status_of("servfail.dns"), HealthStatus::Suspect);
+        assert_eq!(status_of("healthy.dns"), HealthStatus::Healthy);
+    }
+
+    /// WP-6.1 item 1/2: every retryable response code fails over to the next
+    /// candidate in the configured order.
+    #[tokio::test]
+    async fn test_all_retryable_rcodes_fail_over() {
+        for code in [
+            ResponseCode::ServFail,
+            ResponseCode::Refused,
+            ResponseCode::NotImp,
+        ] {
+            let calls_bad = Arc::new(AtomicU32::new(0));
+            let calls_good = Arc::new(AtomicU32::new(0));
+            let manager = UpstreamManager::with_upstreams(
+                vec![
+                    (
+                        "bad.dns".to_string(),
+                        Arc::new(RcodeMockUpstream {
+                            response_code: code,
+                            delay: Duration::ZERO,
+                            result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                            call_count: Arc::clone(&calls_bad),
+                        }),
+                    ),
+                    (
+                        "good.dns".to_string(),
+                        Arc::new(RcodeMockUpstream {
+                            response_code: ResponseCode::NoError,
+                            delay: Duration::ZERO,
+                            result_ip: std::net::Ipv4Addr::new(2, 2, 2, 2),
+                            call_count: Arc::clone(&calls_good),
+                        }),
+                    ),
+                ],
+                UpstreamStrategy::Failover,
+                Duration::from_millis(500),
+            );
+
+            let resp = manager
+                .resolve(&test_query())
+                .await
+                .unwrap_or_else(|e| panic!("{code} must fail over, got {e}"));
+            assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+            assert_eq!(calls_bad.load(Ordering::SeqCst), 1, "{code}");
+            assert_eq!(calls_good.load(Ordering::SeqCst), 1, "{code}");
+        }
+    }
+
+    /// WP-6.1 item 2: load_balance retries the same way as failover.
+    #[tokio::test]
+    async fn test_load_balance_retries_on_retryable_response() {
+        let (servfail_addr, servfail_calls) =
+            spawn_udp_rcode_server(ResponseCode::ServFail, None).await;
+        let (healthy_addr, healthy_calls) = spawn_udp_rcode_server(
+            ResponseCode::NoError,
+            Some(std::net::Ipv4Addr::new(5, 5, 5, 5)),
+        )
+        .await;
+
+        let manager = UpstreamManager::with_upstreams(
+            vec![
+                (
+                    "servfail.dns".to_string(),
+                    Arc::new(PlainUpstream::new(
+                        servfail_addr,
+                        Duration::from_millis(500),
+                    )),
+                ),
+                (
+                    "healthy.dns".to_string(),
+                    Arc::new(PlainUpstream::new(healthy_addr, Duration::from_millis(500))),
+                ),
+            ],
+            UpstreamStrategy::LoadBalance,
+            Duration::from_millis(500),
+        );
+
+        // Round-robin starts at index 0, so the SERVFAIL upstream is tried
+        // first and the healthy one must answer.
+        let (resp, upstream) = manager
+            .resolve_with_upstream(&test_query())
+            .await
+            .expect("load_balance must retry on SERVFAIL");
+        assert_eq!(upstream, "healthy.dns");
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(servfail_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(healthy_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// WP-6.1 item 2: parallel racing must not accept a retryable reply while
+    /// another candidate can still answer.
+    #[tokio::test]
+    async fn test_parallel_ignores_retryable_response() {
+        let calls_bad = Arc::new(AtomicU32::new(0));
+        let calls_good = Arc::new(AtomicU32::new(0));
+        let manager = UpstreamManager::with_upstreams(
+            vec![
+                (
+                    "servfail.dns".to_string(),
+                    Arc::new(RcodeMockUpstream {
+                        response_code: ResponseCode::ServFail,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                        call_count: Arc::clone(&calls_bad),
+                    }),
+                ),
+                (
+                    "healthy.dns".to_string(),
+                    Arc::new(RcodeMockUpstream {
+                        response_code: ResponseCode::NoError,
+                        delay: Duration::from_millis(50),
+                        result_ip: std::net::Ipv4Addr::new(3, 3, 3, 3),
+                        call_count: Arc::clone(&calls_good),
+                    }),
+                ),
+            ],
+            UpstreamStrategy::Parallel,
+            Duration::from_millis(500),
+        );
+
+        let (resp, upstream) = manager
+            .resolve_with_upstream(&test_query())
+            .await
+            .expect("parallel must wait for the usable reply");
+        assert_eq!(upstream, "healthy.dns");
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(
+            resp.answers[0].data,
+            RData::A(A(std::net::Ipv4Addr::new(3, 3, 3, 3)))
+        );
+        assert_eq!(calls_bad.load(Ordering::SeqCst), 1);
+    }
+
+    /// WP-6.1 item 3: the failing server is named in the returned error so the
+    /// pipeline can attribute metrics per server instead of `"all"`.
+    #[tokio::test]
+    async fn test_retryable_failure_is_attributed_to_the_server() {
+        let (refused_addr, refused_calls) =
+            spawn_udp_rcode_server(ResponseCode::Refused, None).await;
+        let manager = UpstreamManager::with_upstreams(
+            vec![(
+                "refused.dns".to_string(),
+                Arc::new(PlainUpstream::new(refused_addr, Duration::from_millis(500))),
+            )],
+            UpstreamStrategy::Failover,
+            Duration::from_millis(500),
+        );
+
+        let error = manager
+            .resolve_with_upstream(&test_query())
+            .await
+            .expect_err("REFUSED must not be returned as a successful resolution");
+        assert_eq!(error.upstream.as_deref(), Some("refused.dns"));
+        assert_eq!(error.kind(), "bad_response");
+        assert!(
+            error.to_string().contains("refused.dns")
+                && error.to_string().contains("Query Refused"),
+            "error must name the server and the rcode: {error}"
+        );
+        assert_eq!(refused_calls.load(Ordering::SeqCst), 1);
+
+        // `resolve` keeps its flat `UpstreamError` contract.
+        let flat = manager
+            .resolve(&test_query())
+            .await
+            .expect_err("REFUSED must not be returned as success");
+        assert_eq!(flat.kind(), "bad_response");
+    }
+
+    /// WP-6.1 item 1: retries share one deadline; a hanging first candidate
+    /// must not consume the whole budget and starve the healthy one.
+    #[tokio::test]
+    async fn test_failover_respects_total_deadline() {
+        let calls_healthy = Arc::new(AtomicU32::new(0));
+        let manager = UpstreamManager::with_upstreams(
+            vec![
+                ("hanging.dns".to_string(), Arc::new(HangingUpstream)),
+                (
+                    "healthy.dns".to_string(),
+                    Arc::new(RcodeMockUpstream {
+                        response_code: ResponseCode::NoError,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(7, 7, 7, 7),
+                        call_count: Arc::clone(&calls_healthy),
+                    }),
+                ),
+            ],
+            UpstreamStrategy::Failover,
+            Duration::from_millis(300),
+        );
+
+        let start = Instant::now();
+        for _ in 0..3 {
+            let resp = timeout(Duration::from_secs(2), manager.resolve(&test_query()))
+                .await
+                .expect("resolve must not hang: retries share the configured deadline")
+                .expect("the healthy upstream must answer within the shared deadline");
+            assert_eq!(
+                resp.answers[0].data,
+                RData::A(A(std::net::Ipv4Addr::new(7, 7, 7, 7)))
+            );
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "three 300ms-budget resolves must stay near 3x300ms (took {elapsed:?})"
+        );
+
+        // The hanging candidate's timeouts must be recorded as health failures.
+        let statuses = manager.statuses().await;
+        let hanging = statuses
+            .iter()
+            .find(|(name, _)| name == "hanging.dns")
+            .map(|(_, status)| *status)
+            .unwrap();
+        assert_eq!(hanging, HealthStatus::Suspect);
+        assert_eq!(calls_healthy.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_attempt_budget_shares_the_deadline() {
+        // No time left: no attempt at all.
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("one second before now is representable");
+        assert_eq!(attempt_budget(expired, 1), None);
+
+        // A single candidate gets (almost) the whole remaining budget.
+        let budget = attempt_budget(Instant::now() + Duration::from_millis(300), 1).unwrap();
+        assert!(budget <= Duration::from_millis(300));
+        assert!(budget > Duration::from_millis(250), "{budget:?}");
+
+        // Two candidates share it equally.
+        let budget = attempt_budget(Instant::now() + Duration::from_millis(300), 2).unwrap();
+        assert!(budget <= Duration::from_millis(150));
+        assert!(budget > Duration::from_millis(100), "{budget:?}");
+    }
+
+    /// WP-6.1 item 5: the probe timeout is decoupled from the query timeout.
+    #[test]
+    fn test_health_probe_timeout_is_at_least_five_seconds() {
+        assert_eq!(
+            health_probe_timeout(Duration::from_millis(100)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            health_probe_timeout(Duration::from_secs(8)),
+            Duration::from_secs(8),
+            "a query timeout longer than the floor must be kept"
+        );
+    }
+
+    /// WP-6.1 item 5: a healthy-but-slow upstream must not be marked down by
+    /// probes whose timeout equals the query timeout.
+    #[tokio::test]
+    async fn test_slow_but_healthy_probe_is_not_marked_down() {
+        let entry = ManagedEntry {
+            name: "slow.dns".to_string(),
+            upstream: Arc::new(ConfigurableMockUpstream {
+                succeed: true,
+                delay: Duration::from_millis(200),
+                result_ip: std::net::Ipv4Addr::new(4, 4, 4, 4),
+                call_count: Arc::new(AtomicU32::new(0)),
+            }),
+            health: Arc::new(RwLock::new(UpstreamHealth::new())),
+        };
+        let probe_timeout = health_probe_timeout(Duration::from_millis(100));
+        let qname = Name::from_str("example.com.").unwrap();
+
+        for _ in 0..6 {
+            probe_one(entry.clone(), qname.clone(), probe_timeout).await;
+        }
+
+        assert_eq!(
+            entry.health.read().await.status(),
+            HealthStatus::Healthy,
+            "a 200ms probe with a 100ms query timeout must still succeed"
+        );
+    }
+
+    /// A retryable reply to an active probe is a probe failure: it must not
+    /// count as one of the probe successes that revive a Down upstream.
+    #[tokio::test]
+    async fn test_probe_does_not_count_retryable_response_as_success() {
+        let entry = ManagedEntry {
+            name: "servfail.dns".to_string(),
+            upstream: Arc::new(RcodeMockUpstream {
+                response_code: ResponseCode::ServFail,
+                delay: Duration::ZERO,
+                result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                call_count: Arc::new(AtomicU32::new(0)),
+            }),
+            health: Arc::new(RwLock::new(UpstreamHealth::new())),
+        };
+        {
+            let mut health = entry.health.write().await;
+            for _ in 0..6 {
+                health.record_error(&UpstreamError::Timeout);
+            }
+            assert_eq!(health.status(), HealthStatus::Down);
+        }
+
+        let qname = Name::from_str("example.com.").unwrap();
+        for _ in 0..3 {
+            probe_one(entry.clone(), qname.clone(), Duration::from_secs(1)).await;
+        }
+
+        assert_eq!(
+            entry.health.read().await.status(),
+            HealthStatus::Down,
+            "SERVFAIL probes must not revive a down upstream"
+        );
     }
 
     #[tokio::test]

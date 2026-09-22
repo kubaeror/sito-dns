@@ -21,6 +21,12 @@ use sito_proto::{Message, decode_message, encode_message};
 /// Idle pooled connections older than this are discarded instead of reused.
 const POOL_IDLE_TTL: Duration = Duration::from_secs(30);
 
+// Deferred (WP-2.6 step 4 / WP-6.1): a proactive health ping for idle pooled
+// DoT sockets. The documented behavior is first-use retry: `resolve` below
+// retries once on a fresh connection when a pooled socket turns out stale, and
+// the manager's active probes exercise the upstream separately, so a separate
+// pool ping is not required for correctness.
+
 /// Maximum number of simultaneously outstanding *new* DoT connections. Bounds
 /// outbound FD/TLS-handshake amplification when the upstream is slow or the
 /// query flood is large; pooled connections are reused without a permit.
