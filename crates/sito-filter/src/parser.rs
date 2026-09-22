@@ -3,9 +3,7 @@
 use hickory_proto::rr::RecordType;
 use sito_core::client::ClientContext;
 use sito_proto::normalize_domain;
-use std::collections::HashSet;
 use std::fmt;
-use std::hash::BuildHasher;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use tracing::warn;
@@ -907,107 +905,9 @@ pub fn parse_rules(content: &str, source: &str) -> (Vec<Rule>, usize) {
     (rules, skipped)
 }
 
-/// Legacy hosts-format blocklist parser, maintained for backward compatibility.
-pub fn parse_hosts<S: BuildHasher>(content: &str, set: &mut HashSet<String, S>) -> usize {
-    let mut added = 0;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with('#')
-            || trimmed.starts_with('!')
-            || trimmed.starts_with("[Adblock")
-        {
-            continue;
-        }
-
-        let clean_line = if let Some(idx) = trimmed.find(['#', '!']) {
-            trimmed[..idx].trim()
-        } else {
-            trimmed
-        };
-
-        if clean_line.is_empty() {
-            continue;
-        }
-
-        let tokens: Vec<&str> = clean_line.split_whitespace().collect();
-        if tokens.is_empty() {
-            continue;
-        }
-
-        let domain_tokens: &[&str] = if tokens[0].parse::<IpAddr>().is_ok() {
-            &tokens[1..]
-        } else {
-            &tokens[..]
-        };
-
-        for &raw_domain in domain_tokens {
-            let lower = raw_domain.to_ascii_lowercase();
-            let stripped = lower.strip_suffix('.').unwrap_or(&lower);
-
-            if IGNORED_HOSTNAMES.contains(&stripped) {
-                continue;
-            }
-
-            if let Ok(normalized) = normalize_domain(raw_domain)
-                && set.insert(normalized)
-            {
-                added += 1;
-            }
-        }
-    }
-
-    added
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fnv::FnvHashSet;
-
-    #[test]
-    fn test_parse_hosts_basic() {
-        let content = r"
-# Standard hosts file comment
-127.0.0.1 localhost
-::1 localhost ip6-localhost
-0.0.0.0 ads.example.com
-127.0.0.1 tracking.example.org bad.domain.net # inline comment
-! ABP style comment
-plain-ad.com
-";
-        let mut set = FnvHashSet::default();
-        let count = parse_hosts(content, &mut set);
-
-        assert_eq!(count, 4);
-        assert!(set.contains("ads.example.com"));
-        assert!(set.contains("tracking.example.org"));
-        assert!(set.contains("bad.domain.net"));
-        assert!(set.contains("plain-ad.com"));
-        assert!(!set.contains("localhost"));
-        assert!(!set.contains("ip6-localhost"));
-    }
-
-    #[test]
-    fn test_parse_hosts_normalization() {
-        let content = "0.0.0.0 ADS.EXAMPLE.COM.\n127.0.0.1 Tracker.Org.";
-        let mut set = FnvHashSet::default();
-        parse_hosts(content, &mut set);
-
-        assert!(set.contains("ads.example.com"));
-        assert!(set.contains("tracker.org"));
-    }
-
-    #[test]
-    fn test_parse_hosts_malformed_ignored() {
-        let content = "0.0.0.0 invalid@domain.com\n0.0.0.0 valid.com\n# just a comment\n\n";
-        let mut set = FnvHashSet::default();
-        parse_hosts(content, &mut set);
-
-        assert!(set.contains("valid.com"));
-        assert_eq!(set.len(), 1);
-    }
 
     #[test]
     fn test_parse_adblock_domain_rules() {

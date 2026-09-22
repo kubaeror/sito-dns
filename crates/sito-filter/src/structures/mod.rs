@@ -7,4 +7,4 @@ pub use compiled::{
     MAX_REGEX_PATTERNS, RuleSetBuilder, wildcard_to_regex,
 };
 pub use interner::LabelInterner;
-pub use trie::SuffixTrie;
+pub use trie::{PrefixTrie, SuffixTrie};

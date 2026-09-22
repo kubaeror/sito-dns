@@ -15,5 +15,5 @@ pub use anti_bypass::AntiBypassRegistry;
 pub use downloader::ListDownloader;
 pub use engine::{FilterSnapshot, FilterState, FilterStatus, GroupRuleSet, HostsFilterEngine};
 pub use error::FilterError;
-pub use parser::{Pattern, Rule, RuleKind, RuleModifiers, parse_hosts, parse_rules};
+pub use parser::{Pattern, Rule, RuleKind, RuleModifiers, parse_rules};
 pub use subscription::{ListMetadata, SubscriptionFetcher};

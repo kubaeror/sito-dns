@@ -31,6 +31,9 @@ pub enum FilterError {
     #[error("Invalid URL '{url}': {reason}")]
     InvalidUrl { url: String, reason: String },
 
+    #[error("Cached blocklist '{path}' failed its integrity check: {reason}")]
+    CacheCorrupted { path: PathBuf, reason: String },
+
     #[error("Rule compilation task failed: {0}")]
     CompileTaskFailed(String),
 

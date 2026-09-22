@@ -51,8 +51,6 @@ pub struct FilterStatus {
 /// In-memory snapshot of compiled filter rules.
 #[derive(Default, Debug, Clone)]
 pub struct FilterSnapshot {
-    /// Exact normalized domains to block (retained for backward compatibility).
-    pub exact: FnvHashSet<String>,
     /// Interning pool for domain labels across suffix tries.
     pub interner: LabelInterner,
     /// Allowlist structures (`@@` rules).
@@ -88,7 +86,6 @@ impl FilterSnapshot {
         let mut interner = LabelInterner::new();
         let mut allow_builder = RuleSetBuilder::new();
         let mut block_builder = RuleSetBuilder::new();
-        let mut legacy_exact = FnvHashSet::default();
 
         // 1. Identify all rules marked with $badfilter
         let mut badfilter_set = FnvHashSet::default();
@@ -136,7 +133,6 @@ impl FilterSnapshot {
                 }
 
                 (RuleKind::Block, Pattern::Exact(dom)) => {
-                    legacy_exact.insert(dom.clone());
                     block_builder.add_exact(dom.clone(), rule_id);
                 }
                 (RuleKind::Block, Pattern::Domain(dom)) => {
@@ -166,7 +162,6 @@ impl FilterSnapshot {
             allowlist.dropped_regex_patterns + blocklist.dropped_regex_patterns;
 
         Self {
-            exact: legacy_exact,
             interner,
             allowlist,
             blocklist,
@@ -414,6 +409,14 @@ impl FilterSnapshot {
             &block_candidates,
         )
     }
+}
+
+/// Counts the lists that actually loaded in a reload cycle.
+///
+/// A list recorded as failed (fetch error or rejected during compilation) must
+/// never also count as loaded, or the status overstates protection.
+fn count_loaded_lists(fetched: &[String], failed: &[String]) -> usize {
+    fetched.iter().filter(|name| !failed.contains(name)).count()
 }
 
 /// Computes the next refresh wake-up and the list names that are due.
@@ -688,10 +691,17 @@ impl HostsFilterEngine {
 
     /// Reloads blocklists and custom rules using an updated filtering configuration.
     /// Does not enforce the >50% drop guard so intentional user deletions/edits take effect.
-    /// The new configuration is retained for subsequent scheduled refreshes.
+    ///
+    /// The new configuration is only retained once the reload succeeded: a
+    /// rejected config must not become the source for the next scheduled
+    /// refresh (which would otherwise apply it later, behind the caller's
+    /// back).
     pub async fn reload_with_config(&self, config: &FilteringConfig) -> Result<usize, FilterError> {
+        // Staged load: `self.config` still holds the previous configuration
+        // for the whole attempt, so a rejected candidate is simply dropped.
+        let count = self.reload_internal(config, false, None).await?;
         self.config.store(Arc::new(config.clone()));
-        self.reload_internal(config, false, None).await
+        Ok(count)
     }
 
     /// Refreshes only the named blocklists, keeping rules from all other lists.
@@ -725,7 +735,10 @@ impl HostsFilterEngine {
         }
 
         let mut list_contents = Vec::new();
-        let mut loaded_lists = 0usize;
+        // Names of lists whose content was fetched (from network or cache) in
+        // this cycle. `loaded_lists` is derived from this set minus
+        // `failed_lists` so a list can never be counted as both.
+        let mut fetched_lists = Vec::new();
         let mut failed_lists = Vec::new();
 
         for list in &config.lists {
@@ -745,7 +758,7 @@ impl HostsFilterEngine {
                 .await
             {
                 Ok(content) => {
-                    loaded_lists += 1;
+                    fetched_lists.push(list.name.clone());
                     list_contents.push((list.name.clone(), content));
                 }
                 Err(e) => {
@@ -835,9 +848,9 @@ impl HostsFilterEngine {
             self.set_status(FilterStatus {
                 state: FilterState::Failed,
                 rule_count: self.snapshot.load().rule_count,
+                loaded_lists: count_loaded_lists(&fetched_lists, &failed_lists),
                 failed_lists: failed_lists.clone(),
                 last_error: Some(e.to_string()),
-                ..FilterStatus::default()
             });
             FilterError::CompileTaskFailed(e.to_string())
         })?;
@@ -847,6 +860,7 @@ impl HostsFilterEngine {
             Err(e) => {
                 let prev_count = self.snapshot.load().rule_count;
                 error!(error = %e, "Rejecting filter reload");
+                let loaded_lists = count_loaded_lists(&fetched_lists, &failed_lists);
                 if prev_count == 0 {
                     // Fail closed rather than advertise an over-limit set as
                     // active or silently allow traffic.
@@ -854,17 +868,17 @@ impl HostsFilterEngine {
                     self.set_status(FilterStatus {
                         state: FilterState::Failed,
                         rule_count: 0,
+                        loaded_lists,
                         failed_lists: failed_lists.clone(),
                         last_error: Some(e.to_string()),
-                        ..FilterStatus::default()
                     });
                 } else {
                     self.set_status(FilterStatus {
                         state: FilterState::Ready,
                         rule_count: prev_count,
+                        loaded_lists,
                         failed_lists: failed_lists.clone(),
                         last_error: Some(e.to_string()),
-                        ..FilterStatus::default()
                     });
                 }
                 return Err(e);
@@ -872,6 +886,10 @@ impl HostsFilterEngine {
         };
 
         failed_lists.extend(rejected_lists);
+        // A list rejected during compilation was already counted as fetched;
+        // subtract it here so the status never reports it as both loaded and
+        // failed.
+        let loaded_lists = count_loaded_lists(&fetched_lists, &failed_lists);
 
         let prev_count = self.snapshot.load().rule_count;
         if apply_drop_guard
@@ -1263,9 +1281,22 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::fs::write(&cached_file, "0.0.0.0 cached-ad.com\n")
+        // The cache reader only trusts content whose metadata records matching
+        // integrity signals (WP-3.9).
+        let cached_content = "0.0.0.0 cached-ad.com\n";
+        crate::downloader::save_to_cache(&cached_file, cached_content)
             .await
             .unwrap();
+        crate::subscription::save_metadata(
+            &crate::subscription::meta_path_for_list(&temp_dir, "offline_list"),
+            &crate::subscription::ListMetadata {
+                content_len: Some(cached_content.len() as u64),
+                line_count: Some(cached_content.lines().count()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         let config = FilteringConfig {
             lists: vec![FilterListConfig {
@@ -1771,9 +1802,10 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
-    /// Regression: fail-closed must survive a disabled -> enabled transition.
-    /// The empty snapshot stored while disabled used to keep
-    /// `unavailable = false`, so a subsequent failed load served allow-all.
+    /// Regression: fail-closed must survive a failed reload while the active
+    /// config is enabled. A rejected disabled -> enabled transition must not
+    /// be applied at all (WP-3.10 transactional reload), so the engine stays
+    /// disabled instead of becoming an enabled-but-unavailable engine.
     #[tokio::test]
     async fn test_fail_closed_survives_disabled_to_enabled_transition() {
         let temp_dir =
@@ -1798,18 +1830,38 @@ mod tests {
         assert_eq!(engine.state(), FilterState::Disabled);
         assert!(!engine.unavailable_for_fail_closed());
 
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let probe = Name::from_str("anything.example.").unwrap();
+
+        // The dead list rejects the transition; the rejected config must not
+        // become active, so the engine stays disabled and answers normally.
         assert!(
             engine.reload_with_config(&enabled).await.is_err(),
             "the dead list must fail to load"
         );
-        assert_eq!(engine.state(), FilterState::Failed);
+        assert!(
+            !engine.config.load_full().enabled,
+            "a rejected disabled -> enabled transition must not be retained"
+        );
+        assert!(engine.evaluate(&probe, RecordType::A, &client).is_allowed());
+
+        // Once the active config is enabled (successful load), a later failed
+        // reload must still fail closed instead of serving allow-all.
+        let good = FilteringConfig {
+            enabled: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        engine.reload_with_config(&good).await.unwrap();
+        assert!(engine.config.load_full().enabled);
+        assert!(
+            engine.reload_with_config(&enabled).await.is_err(),
+            "the dead list must still fail"
+        );
         assert!(
             engine.unavailable_for_fail_closed(),
-            "a failed load after enabling must still be fail-closed"
+            "a failed load while enabled must still be fail-closed"
         );
-
-        let client = ClientContext::new("127.0.0.1".parse().unwrap());
-        let probe = Name::from_str("anything.example.").unwrap();
         assert_eq!(
             engine.evaluate(&probe, RecordType::A, &client),
             Verdict::Block(BlockReason::FilterUnavailable)
@@ -1883,6 +1935,118 @@ mod tests {
             ..Default::default()
         }]);
         assert!(engine.group_snapshot("empty").is_none());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Regression (audit 6, WP-3.9): a list rejected during compilation was
+    /// counted in both `loaded_lists` and `failed_lists`, overstating how many
+    /// sources were active.
+    #[tokio::test]
+    async fn test_status_loaded_and_failed_lists_are_mutually_exclusive() {
+        use std::fmt::Write as _;
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_status_count_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let huge_path = temp_dir.join("huge.txt");
+        let good_path = temp_dir.join("good.txt");
+
+        let mut huge = String::new();
+        for i in 0..=MAX_REGEX_PATTERNS {
+            let _ = writeln!(huge, "/^r{i}\\.example$/");
+        }
+        tokio::fs::write(&huge_path, huge).await.unwrap();
+        tokio::fs::write(&good_path, "||good.example^\n")
+            .await
+            .unwrap();
+
+        let config = FilteringConfig {
+            lists: vec![
+                FilterListConfig {
+                    name: "good".to_string(),
+                    url: format!("file://{}", good_path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+                FilterListConfig {
+                    name: "huge".to_string(),
+                    url: format!("file://{}", huge_path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+        let status = engine.status();
+        assert_eq!(status.state, FilterState::Ready);
+        assert_eq!(status.failed_lists, vec!["huge".to_string()]);
+        assert_eq!(
+            status.loaded_lists, 1,
+            "a rejected list must not count as loaded"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Regression (audit 6, WP-3.10): `reload_with_config` used to store the
+    /// candidate config before the load ran, so a rejected config became the
+    /// source for the next scheduled refresh and could take effect later.
+    #[tokio::test]
+    async fn test_rejected_reload_with_config_is_not_retained() {
+        use std::fmt::Write as _;
+        let temp_dir = std::env::temp_dir().join(format!("sito_txn_reload_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let path = temp_dir.join("big-list.txt");
+        let content: String = (0..50).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "||blocked-{i}.example^");
+            acc
+        });
+        tokio::fs::write(&path, content).await.unwrap();
+        let list = FilterListConfig {
+            name: "big".to_string(),
+            url: format!("file://{}", path.display()),
+            enabled: true,
+            refresh_hours: None,
+        };
+
+        let accepted = FilteringConfig {
+            max_rules: 1000,
+            lists: vec![list.clone()],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(accepted.clone(), temp_dir.clone()).await;
+        assert_eq!(engine.rule_count(), 50);
+
+        // Candidate above the cap: rejected, and the previous config must stay.
+        let rejected = FilteringConfig {
+            max_rules: 10,
+            lists: vec![list],
+            ..Default::default()
+        };
+        let err = engine
+            .reload_with_config(&rejected)
+            .await
+            .expect_err("an oversized set must be rejected");
+        assert!(matches!(err, FilterError::TooManyRules { .. }));
+        assert_eq!(
+            engine.config.load_full().max_rules,
+            accepted.max_rules,
+            "the rejected config must not be retained"
+        );
+
+        // The scheduled/manual reload path uses the stored config and must
+        // therefore still succeed.
+        let count = engine.reload().await.unwrap();
+        assert_eq!(count, 50);
+        assert!(
+            engine.status().last_error.is_none(),
+            "the rejected cap must not apply to later reloads: {:?}",
+            engine.status().last_error
+        );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

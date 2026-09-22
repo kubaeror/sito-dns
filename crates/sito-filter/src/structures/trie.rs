@@ -1,6 +1,103 @@
-//! Suffix trie indexing reversed domain labels for high-throughput subdomain matching.
+//! Suffix and prefix tries for high-throughput domain matching.
 
 use super::interner::LabelInterner;
+use fnv::FnvHashMap;
+
+/// Test-only count of trie nodes visited by [`PrefixTrie::lookup_candidates`].
+///
+/// Used by the indexed-lookup regression test; a linear scan over the same
+/// rule set visits one node per configured prefix instead of per domain
+/// character.
+#[cfg(test)]
+pub(crate) static PREFIX_LOOKUP_PROBES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// A single node in the prefix trie.
+#[derive(Default, Debug, Clone)]
+struct PrefixNode {
+    /// Children keyed by the next character of the prefix.
+    children: FnvHashMap<char, u32>,
+    /// Rule IDs whose prefix terminates at this node.
+    rule_ids: Vec<u32>,
+}
+
+/// A character trie matching ABP start-anchored (`|prefix`) rules.
+///
+/// Lookup walks the query domain once and collects every configured prefix
+/// that matches it, so per-query work is bounded by the domain length instead
+/// of the number of configured prefix rules.
+#[derive(Debug, Clone)]
+pub struct PrefixTrie {
+    nodes: Vec<PrefixNode>,
+}
+
+impl Default for PrefixTrie {
+    fn default() -> Self {
+        Self {
+            nodes: vec![PrefixNode::default()],
+        }
+    }
+}
+
+impl PrefixTrie {
+    /// Creates a new empty `PrefixTrie` with a root node.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inserts a prefix pattern, associating it with `rule_id`.
+    pub fn insert(&mut self, prefix: &str, rule_id: u32) {
+        if prefix.is_empty() {
+            return;
+        }
+        let mut node_idx = 0usize;
+        for c in prefix.chars() {
+            let next = if let Some(&idx) = self.nodes[node_idx].children.get(&c) {
+                idx as usize
+            } else {
+                let idx = self.nodes.len() as u32;
+                self.nodes.push(PrefixNode::default());
+                self.nodes[node_idx].children.insert(c, idx);
+                idx as usize
+            };
+            node_idx = next;
+        }
+        self.nodes[node_idx].rule_ids.push(rule_id);
+    }
+
+    /// Appends the rule IDs of every prefix that `domain` starts with.
+    ///
+    /// Matching groups are appended in ascending "lowest rule id" order
+    /// (ties cannot occur: every rule id belongs to exactly one prefix), which
+    /// preserves the candidate precedence of the previous linear scan.
+    pub fn lookup_candidates(&self, domain: &str, candidates: &mut Vec<u32>) {
+        if self.nodes.len() == 1 {
+            return;
+        }
+
+        let mut matched: Vec<&Vec<u32>> = Vec::new();
+        let mut node_idx = 0usize;
+        for c in domain.chars() {
+            #[cfg(test)]
+            PREFIX_LOOKUP_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let Some(&next) = self.nodes[node_idx].children.get(&c) else {
+                break;
+            };
+            node_idx = next as usize;
+            if !self.nodes[node_idx].rule_ids.is_empty() {
+                matched.push(&self.nodes[node_idx].rule_ids);
+            }
+        }
+
+        if matched.len() > 1 {
+            matched.sort_by_key(|rules| rules.iter().copied().min().unwrap_or(u32::MAX));
+        }
+        for rules in matched {
+            candidates.extend_from_slice(rules);
+        }
+    }
+}
 
 /// A single node in the suffix trie.
 #[derive(Default, Debug, Clone)]
@@ -111,6 +208,27 @@ impl SuffixTrie {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_prefix_trie_matches_all_matching_prefixes_in_rule_id_order() {
+        let mut trie = PrefixTrie::new();
+        trie.insert("add", 5);
+        trie.insert("addtracker", 2);
+        trie.insert("ad", 9);
+        trie.insert("zz", 1);
+
+        let mut candidates = Vec::new();
+        trie.lookup_candidates("addtracker.example", &mut candidates);
+        assert_eq!(candidates, vec![2, 5, 9]);
+
+        candidates.clear();
+        trie.lookup_candidates("advert.example", &mut candidates);
+        assert_eq!(candidates, vec![9]);
+
+        candidates.clear();
+        trie.lookup_candidates("nomatch.example", &mut candidates);
+        assert!(candidates.is_empty());
+    }
 
     #[test]
     fn test_suffix_trie_subdomain_matching() {

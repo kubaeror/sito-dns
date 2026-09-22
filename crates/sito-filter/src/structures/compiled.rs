@@ -1,13 +1,29 @@
 //! Compiled rule set indexing exact, trie, substring, and regex rules.
 
 use super::interner::LabelInterner;
-use super::trie::SuffixTrie;
+use super::trie::{PrefixTrie, SuffixTrie};
 use aho_corasick::{AhoCorasick, MatchKind};
 use fnv::FnvHashMap;
 use regex_automata::dfa::Automaton;
 use regex_automata::dfa::dense::{Builder as DfaBuilder, Config as DfaConfig, DFA};
 use regex_automata::{Input, MatchKind as RegexMatchKind, PatternSet};
+use std::cell::RefCell;
 use tracing::{error, warn};
+
+// Reused pattern-match scratch space for the regex DFA batches: a `PatternSet`
+// is sized for the largest batch (`REGEX_BATCH_SIZE`) once per thread and
+// cleared before every search, instead of allocating one per query.
+thread_local! {
+    static REGEX_MATCH_SCRATCH: RefCell<PatternSet> =
+        RefCell::new(PatternSet::new(REGEX_BATCH_SIZE));
+}
+
+// Test-only count of `PatternSet` (re)allocations on the current thread.
+#[cfg(test)]
+thread_local! {
+    static REGEX_MATCH_SET_ALLOCATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Maximum number of regex/wildcard patterns compiled per rule set.
 ///
@@ -116,8 +132,8 @@ pub struct CompiledRuleSet {
     /// Regex patterns that could not be compiled (oversized, invalid or over
     /// the global batch budget).
     pub dropped_regex_patterns: usize,
-    /// Prefix rules: (prefix, list of rule IDs).
-    pub prefixes: Vec<(String, Vec<u32>)>,
+    /// Indexed `|prefix` rules (start-anchored matches).
+    pub prefix_trie: PrefixTrie,
 }
 
 impl CompiledRuleSet {
@@ -139,12 +155,8 @@ impl CompiledRuleSet {
         // 2. Suffix trie match (domain + subdomains)
         self.trie.lookup_candidates(domain, interner, candidates);
 
-        // 3. Prefix match
-        for (prefix, rules) in &self.prefixes {
-            if domain.starts_with(prefix) {
-                candidates.extend_from_slice(rules);
-            }
-        }
+        // 3. Prefix match (indexed; bounded by the domain length)
+        self.prefix_trie.lookup_candidates(domain, candidates);
 
         // 4. Aho-Corasick substring match.
         //
@@ -160,20 +172,33 @@ impl CompiledRuleSet {
             }
         }
 
-        // 5. Regex DFA match (overlapping, reports every matching pattern)
-        for batch in &self.regex_batches {
-            let mut patset = PatternSet::new(batch.dfa.pattern_len());
-            if batch
-                .dfa
-                .try_which_overlapping_matches(&Input::new(domain.as_bytes()), &mut patset)
-                .is_ok()
-            {
-                for pat_idx in patset.iter() {
-                    if let Some(rules) = batch.pattern_to_rules.get(pat_idx.as_usize()) {
-                        candidates.extend_from_slice(rules);
+        // 5. Regex DFA match (overlapping, reports every matching pattern).
+        // The scratch set is reused across queries instead of allocating one
+        // `PatternSet` per batch per query.
+        if !self.regex_batches.is_empty() {
+            REGEX_MATCH_SCRATCH.with(|cell| {
+                let mut patset = cell.borrow_mut();
+                for batch in &self.regex_batches {
+                    if patset.capacity() < batch.dfa.pattern_len() {
+                        #[cfg(test)]
+                        REGEX_MATCH_SET_ALLOCATIONS.with(|count| count.set(count.get() + 1));
+                        *patset = PatternSet::new(batch.dfa.pattern_len());
+                    } else {
+                        patset.clear();
+                    }
+                    if batch
+                        .dfa
+                        .try_which_overlapping_matches(&Input::new(domain.as_bytes()), &mut patset)
+                        .is_ok()
+                    {
+                        for pat_idx in patset.iter() {
+                            if let Some(rules) = batch.pattern_to_rules.get(pat_idx.as_usize()) {
+                                candidates.extend_from_slice(rules);
+                            }
+                        }
                     }
                 }
-            }
+            });
         }
     }
 
@@ -232,15 +257,13 @@ impl RuleSetBuilder {
             trie.insert(&dom, rule_id, interner);
         }
 
-        // 2. Prefixes
-        let mut prefix_map: FnvHashMap<String, Vec<u32>> = FnvHashMap::default();
+        // 2. Prefixes, indexed in a character trie. Candidate precedence is
+        // preserved by `lookup_candidates` (matching groups in lowest-rule-id
+        // order), so it does not depend on hash iteration order.
+        let mut prefix_trie = PrefixTrie::new();
         for (prefix, rule_id) in self.prefixes {
-            prefix_map.entry(prefix).or_default().push(rule_id);
+            prefix_trie.insert(&prefix, rule_id);
         }
-        // Deterministic order (by lowest rule id) so candidate precedence does
-        // not depend on hash iteration order.
-        let mut prefixes: Vec<(String, Vec<u32>)> = prefix_map.into_iter().collect();
-        prefixes.sort_by_key(|(_, rules)| rules.iter().copied().min().unwrap_or(u32::MAX));
 
         // 3. Aho-Corasick for substrings
         let (ac, ac_pattern_to_rules) = if self.substrings.is_empty() {
@@ -353,7 +376,7 @@ impl RuleSetBuilder {
             ac_pattern_to_rules,
             regex_batches,
             dropped_regex_patterns,
-            prefixes,
+            prefix_trie,
         }
     }
 }
@@ -588,6 +611,79 @@ mod tests {
         assert!(
             candidates.contains(&(count - 1)),
             "got candidates: {candidates:?}"
+        );
+    }
+
+    /// Regression (audit 6, WP-3.3): prefix rules were matched with a linear
+    /// scan over every configured prefix on each query. Lookup work must be
+    /// bounded by the queried domain, not by the prefix count.
+    #[test]
+    fn test_prefix_lookup_is_indexed_not_linear() {
+        use crate::structures::trie::PREFIX_LOOKUP_PROBES;
+        use std::sync::atomic::Ordering;
+
+        let mut interner = LabelInterner::new();
+        let mut builder = RuleSetBuilder::new();
+        for i in 0..10_000u32 {
+            builder.add_prefix(format!("adservice-{i}."), i);
+        }
+        let compiled = builder.build(&mut interner);
+
+        // Matching stays correct for the last configured prefix.
+        let mut candidates = Vec::new();
+        compiled.collect_candidates("adservice-9999.example.com", &interner, &mut candidates);
+        assert!(candidates.contains(&9999), "got candidates: {candidates:?}");
+        candidates.clear();
+        compiled.collect_candidates("innocent.example.com", &interner, &mut candidates);
+        assert!(candidates.is_empty(), "got candidates: {candidates:?}");
+
+        // Work is bounded by the domain length (~26 chars), not by the 10 000
+        // prefixes a linear scan would visit.
+        PREFIX_LOOKUP_PROBES.store(0, Ordering::Relaxed);
+        candidates.clear();
+        compiled.collect_candidates("adservice-9999.example.com", &interner, &mut candidates);
+        let probes = PREFIX_LOOKUP_PROBES.load(Ordering::Relaxed);
+        assert!(
+            probes <= 512,
+            "prefix lookup must be indexed, but visited {probes} nodes"
+        );
+    }
+
+    /// Regression (audit 6, WP-3.3): the regex matcher allocated a fresh
+    /// `PatternSet` for every batch on every query. The scratch set must be
+    /// reused (and cleared between batches and queries).
+    #[test]
+    fn test_regex_matching_reuses_scratch_pattern_set() {
+        let mut interner = LabelInterner::new();
+        let mut builder = RuleSetBuilder::new();
+        // Two batches, so both the clear path and the first-use path run.
+        let count = (REGEX_BATCH_SIZE + 5) as u32;
+        for i in 0..count {
+            builder.add_regex(format!("^r{i}\\.example$"), i);
+        }
+        let compiled = builder.build(&mut interner);
+        assert_eq!(compiled.regex_batches.len(), 2);
+        let last = count - 1;
+
+        // Warm up the thread-local scratch set before measuring.
+        let mut candidates = Vec::new();
+        compiled.collect_candidates("r0.example", &interner, &mut candidates);
+
+        REGEX_MATCH_SET_ALLOCATIONS.with(|counter| counter.set(0));
+        for _ in 0..200 {
+            for (domain, expected) in [("r0.example", 0u32), ("r132.example", last)] {
+                candidates.clear();
+                compiled.collect_candidates(domain, &interner, &mut candidates);
+                assert!(
+                    candidates.contains(&expected),
+                    "{domain}: got candidates {candidates:?}"
+                );
+            }
+        }
+        let allocations = REGEX_MATCH_SET_ALLOCATIONS.with(std::cell::Cell::get);
+        assert!(
+            allocations <= 4,
+            "PatternSet scratch space is not reused: {allocations} allocations for 400 queries"
         );
     }
 

@@ -1139,11 +1139,21 @@ impl FilteringConfig {
                 "max_rules must be greater than 0",
             ));
         }
+        let mut seen_names = std::collections::HashSet::new();
         for (i, list) in self.lists.iter().enumerate() {
             if list.name.trim().is_empty() {
                 return Err(ConfigError::validation(
                     format!("filtering.lists[{i}].name"),
                     "filter list name cannot be empty",
+                ));
+            }
+            // List names are the engine's identity (status, per-list refresh,
+            // group references, cache keys); duplicates silently overwrite one
+            // another and must be rejected at config time.
+            if !seen_names.insert(list.name.as_str()) {
+                return Err(ConfigError::validation(
+                    format!("filtering.lists[{i}].name"),
+                    format!("duplicate filter list name '{}'", list.name),
                 ));
             }
             if list.url.trim().is_empty() {
@@ -1358,6 +1368,44 @@ enabled = false
             ConfigError::Validation { field, .. } => assert_eq!(field, "dns.cache.min_ttl"),
             other => panic!("expected validation error on dns.cache.min_ttl, got: {other:?}"),
         }
+    }
+
+    /// Regression (audit 6, WP-3.9): two lists with the same `name` silently
+    /// overwrote each other in the engine; the config must reject them.
+    #[test]
+    fn test_filtering_rejects_duplicate_list_names() {
+        let toml_str = r#"
+config_version = 1
+[upstream]
+servers = ["1.1.1.1"]
+
+[filtering]
+lists = [
+    { name = "ads", url = "https://example.com/a.txt" },
+    { name = "ads", url = "https://example.com/b.txt" },
+]
+"#;
+        let err = Config::from_toml_str(toml_str).unwrap_err();
+        match err {
+            ConfigError::Validation { field, .. } => {
+                assert_eq!(field, "filtering.lists[1].name");
+            }
+            other => panic!("expected validation error on filtering.lists[1].name, got: {other:?}"),
+        }
+
+        // Distinct names in the same positions stay accepted.
+        let ok = r#"
+config_version = 1
+[upstream]
+servers = ["1.1.1.1"]
+
+[filtering]
+lists = [
+    { name = "ads", url = "https://example.com/a.txt" },
+    { name = "trackers", url = "https://example.com/b.txt" },
+]
+"#;
+        Config::from_toml_str(ok).expect("distinct list names must parse");
     }
 
     #[test]
