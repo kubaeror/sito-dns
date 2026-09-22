@@ -1,0 +1,82 @@
+# Fixture for contrib/tests/test_adguard_to_sito.py.
+#
+# Shaped after a real AdGuardHome.yaml and exercising every key the converter
+# used to read from the wrong place:
+#   * statistics.interval is a Go duration string (newer AdGuard releases)
+#   * tls.port_https is the DoH port (not tls.port_dns_over_https)
+#   * filtering.blocked_response_ttl is the blocked-response TTL
+#   * dns.anonymize_client_ip is the client-IP anonymization toggle
+#   * bootstrap_dns contains hostnames/URLs that must not be emitted as IPs
+#   * upstream_dns mixes DoH/DoQ/DoT/plain and an unsupported sdns:// stamp
+dns:
+  bind_hosts:
+    - 0.0.0.0
+  port: 5353
+  anonymize_client_ip: true
+  upstream_dns:
+    - https://dns.quad9.net/dns-query
+    - quic://dns.adguard-dns.com
+    - tls://1.1.1.1
+    - sdns://AQIAAAAAAAAAFDE3Ni4xMDMuMTMwLjEzMDo1NDQzINErR_JS3PLCu_iZEIbq95zkSV2LFsigxDIuUso_OQhzIjIuZG5zY3J5cHQuZGVmYXVsdC5uczEuYWRndWFyZC5jb20
+    - 9.9.9.9
+  bootstrap_dns:
+    - 9.9.9.9:53
+    - https://1.1.1.1/dns-query
+    - dns.quad9.net
+  blocking_mode: custom_ip
+  blocking_ipv4: 192.0.2.1
+  ratelimit: 30
+  cache_enabled: true
+  cache_size: 134217728
+  cache_ttl_min: 30
+  cache_ttl_max: 7200
+  rewrites:
+    - domain: printer.lan
+      answer: 192.168.1.50
+
+tls:
+  enabled: true
+  port_https: 8443
+  port_dns_over_tls: 8853
+  port_dns_over_quic: 8853
+  certificate_path: /etc/sito/cert.pem
+  private_key_path: /etc/sito/key.pem
+
+filtering:
+  enabled: true
+  blocked_response_ttl: 30
+
+statistics:
+  enabled: true
+  interval: 14
+
+querylog:
+  enabled: true
+
+filters:
+  - enabled: true
+    url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
+    name: AdGuard DNS filter
+
+user_rules:
+  - "||tracker.example^"
+
+clients:
+  persistent:
+    - name: Laptop
+      ids:
+        - 192.168.1.20
+      use_global_settings: true
+      filtering_enabled: true
+      upstreams:
+        - https://dns.google/dns-query
+    - name: Guest
+      ids:
+        - aa:bb:cc:dd:ee:ff
+      use_global_settings: true
+      filtering_enabled: false
+      ignore_querylog: true
+      ignore_statistics: true
+
+http:
+  port: 3000

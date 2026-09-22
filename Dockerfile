@@ -1,8 +1,63 @@
 # Build stage (tag kept for readability, digest pinned for supply-chain integrity)
-FROM rust:1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS builder
+#
+# The builder always runs natively on the build host (BUILDPLATFORM) and
+# cross-compiles with the Debian GNU cross toolchains. This keeps the release
+# build (fat LTO) out of QEMU for linux/arm64 and linux/arm/v7, where full
+# binary emulation made it many times slower. Only the C dependencies need the
+# cross compilers; the Rust side is driven by the target triple.
+FROM --platform=$BUILDPLATFORM rust:1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS builder
+
+# BuildKit provides these built-in arguments for the requested target platform.
+ARG TARGETARCH
+ARG TARGETVARIANT
+
+# Map the Docker platform to a Rust target triple and install the matching
+# cross toolchain (amd64 builds natively). Persist the triple so the build step
+# does not repeat the mapping.
+RUN set -eux; \
+    case "${TARGETARCH}${TARGETVARIANT}" in \
+        amd64) \
+            RUST_TARGET="x86_64-unknown-linux-gnu" ;; \
+        arm64) \
+            RUST_TARGET="aarch64-unknown-linux-gnu"; \
+            apt-get update; \
+            apt-get install -y --no-install-recommends \
+                gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross; \
+            rm -rf /var/lib/apt/lists/* ;; \
+        armv7) \
+            RUST_TARGET="armv7-unknown-linux-gnueabihf"; \
+            apt-get update; \
+            apt-get install -y --no-install-recommends \
+                gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf libc6-dev-armhf-cross; \
+            rm -rf /var/lib/apt/lists/* ;; \
+        *) \
+            echo "unsupported Docker platform: ${TARGETARCH}${TARGETVARIANT}" >&2; \
+            exit 1 ;; \
+    esac; \
+    rustup target add "${RUST_TARGET}"; \
+    printf '%s' "${RUST_TARGET}" > /rust-target
+
+# Point cargo, cc-rs and cmake-rs at the cross toolchain for the non-native
+# targets. Underscored variable names are the portable form accepted by both
+# build helpers (CC_/CXX_/AR_ use the target triple with '-' replaced by '_').
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+    AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
+    CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc \
+    CXX_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-g++ \
+    AR_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-ar \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p sito --features "embed-ui,mimalloc"
+# mimalloc is enabled for every architecture (amd64, arm64, armv7), matching
+# the release archives built by .github/workflows/release.yml.
+RUN RUST_TARGET="$(cat /rust-target)" && \
+    cargo build --release --locked -p sito \
+        --features "embed-ui,mimalloc" \
+        --target "${RUST_TARGET}" && \
+    cp "target/${RUST_TARGET}/release/sito" /sito
 # Create the data directory with nonroot ownership. Docker initialises fresh
 # named volumes from the image path, so the volume is writable by uid/gid
 # 65532 without a privileged init step.
@@ -15,7 +70,7 @@ RUN mkdir -p /sito-config && chown 65532:65532 /sito-config && touch /sito-confi
 
 # Runtime stage (tag kept for readability, digest pinned for supply-chain integrity)
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
-COPY --from=builder /src/target/release/sito /usr/bin/sito
+COPY --from=builder /sito /usr/bin/sito
 # Note: running as nonroot on privileged ports (<1024, such as 53, 443, 853) requires NET_BIND_SERVICE capability:
 # In docker run: --cap-add=NET_BIND_SERVICE
 # In docker-compose:

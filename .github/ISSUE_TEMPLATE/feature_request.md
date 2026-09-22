@@ -16,8 +16,8 @@ A clear and concise description of what you want to happen.
 
 ## Plan Alignment
 
-- Does this map to an existing milestone in [docs/phases/README.md](docs/phases/README.md)?
-- Relevant plan section from [docs/dns-server-plan-detailed.md](docs/dns-server-plan-detailed.md) (if applicable):
+- Does this map to an existing milestone in [docs/phases/README.md](../../docs/phases/README.md)?
+- Relevant plan section from [docs/dns-server-plan-detailed.md](../../docs/dns-server-plan-detailed.md) (if applicable):
 
 ## Describe Alternatives You've Considered
 

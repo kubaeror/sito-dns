@@ -95,7 +95,19 @@ jobs:
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@82fc405565b9cf90abfe700ba43b4751ce2fe422 # cargo-fuzz
         with:
-          tool: cargo-fuzz
+          tool: cargo-fuzz@0.13.2
+
+      # Persist the per-target corpus across nightly runs: coverage-guided
+      # fuzzing only converges when it can build on the inputs found by
+      # previous runs. Each run saves a new cache entry (keyed by commit) and
+      # restores the most recent corpus for the target on a miss.
+      - name: Restore fuzz corpus for ${{ matrix.target }}
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
 
       - name: Run fuzzer on ${{ matrix.target }}
         env:

@@ -37,9 +37,31 @@ if [ "${UNINSTALL}" -eq 1 ]; then
         systemctl disable sito || true
         rm -f "${SERVICE_PATH}"
         systemctl daemon-reload || true
+        systemctl reset-failed sito 2>/dev/null || true
     fi
     rm -f "${INSTALL_BIN}" "${INSTALL_BIN}.bak"
     echo "Removed ${INSTALL_BIN} and ${SERVICE_PATH}."
+
+    # Remove the dedicated system user/group when possible. Config and data are
+    # kept on purpose, so this never uses `userdel -r`; if the account is still
+    # running processes the cleanup is skipped with a warning.
+    if id -u sito >/dev/null 2>&1; then
+        if command -v pgrep >/dev/null 2>&1 && pgrep -u sito >/dev/null 2>&1; then
+            echo "Warning: user 'sito' still has running processes; leaving the account in place." >&2
+        elif userdel sito 2>/dev/null; then
+            echo "Removed system user 'sito'."
+        else
+            echo "Warning: could not remove system user 'sito'." >&2
+        fi
+    fi
+    if getent group sito >/dev/null 2>&1; then
+        if groupdel sito 2>/dev/null; then
+            echo "Removed system group 'sito'."
+        else
+            echo "Warning: could not remove system group 'sito' (it may still be in use)." >&2
+        fi
+    fi
+
     echo "Configuration (${CONFIG_DIR}) and data (${DATA_DIR}) were kept."
     exit 0
 fi
@@ -295,12 +317,18 @@ else
     cp -f "${TMP_DIR}/sito" "${INSTALL_BIN}"
 fi
 
-if [ -f "${INSTALL_BIN}" ]; then
+# Restores executable permissions and file capabilities. Called after a
+# successful install and again after a rollback restored the backup binary.
+apply_capabilities() {
     chmod 755 "${INSTALL_BIN}"
     # Grant ambient capabilities to bind privileged ports (53, 443, 853)
     if command -v setcap >/dev/null 2>&1; then
         setcap 'cap_net_bind_service=+ep' "${INSTALL_BIN}" || true
     fi
+}
+
+if [ -f "${INSTALL_BIN}" ]; then
+    apply_capabilities
 fi
 
 # 7. Install systemd service. Prefer the unit shipped in the release archive
@@ -363,19 +391,59 @@ EOF
     echo "Starting sito service..."
     systemctl restart sito || true
 
-    # Post-install health check
+    # Post-install health check. The systemd service and the DNS listener are
+    # the primary checks; the HTTP probe is advisory because the web UI can be
+    # disabled (`web.enabled = false`) or bound to a non-loopback address.
     echo "Performing post-install health check..."
     sleep 2
 
-    WEB_PORT="${SITO_WEB_PORT:-}"
-    if [ -z "${WEB_PORT}" ] && [ -f "${CONFIG_DIR}/config.toml" ]; then
-        WEB_PORT="$(awk '
-            /^\[web\]/ { in_web=1; next }
-            /^\[/ { in_web=0 }
-            in_web && $1 == "port" { gsub(/[^0-9]/, "", $0); print; exit }
-        ' "${CONFIG_DIR}/config.toml")"
+    # Prints "dns_port|web_enabled|web_bind|web_port" for the [dns]/[web]
+    # sections, with the documented defaults when a key or file is missing.
+    read_service_config() {
+        awk '
+            function strip(line) {
+                sub(/#.*/, "", line)
+                return line
+            }
+            function value(line) {
+                sub(/^[^=]*=[[:space:]]*/, "", line)
+                gsub(/["[:space:]]/, "", line)
+                return line
+            }
+            /^\[dns\][[:space:]]*(#.*)?$/ { section="dns"; next }
+            /^\[web\][[:space:]]*(#.*)?$/ { section="web"; next }
+            /^\[/ { section="" }
+            section == "dns" && strip($0) ~ /^[[:space:]]*port[[:space:]]*=/ {
+                dns_port=value(strip($0))
+            }
+            section == "web" && strip($0) ~ /^[[:space:]]*enabled[[:space:]]*=/ {
+                web_enabled=value(strip($0))
+            }
+            section == "web" && strip($0) ~ /^[[:space:]]*bind[[:space:]]*=/ {
+                web_bind=value(strip($0))
+            }
+            section == "web" && strip($0) ~ /^[[:space:]]*port[[:space:]]*=/ {
+                web_port=value(strip($0))
+            }
+            END {
+                if (dns_port == "") dns_port=53
+                if (web_enabled == "") web_enabled="true"
+                if (web_bind == "") web_bind="0.0.0.0"
+                if (web_port == "") web_port=8080
+                print dns_port "|" web_enabled "|" web_bind "|" web_port
+            }
+        ' "$1"
+    }
+
+    CONFIG_FILE="${CONFIG_DIR}/config.toml"
+    DNS_PORT=53
+    WEB_ENABLED="true"
+    WEB_BIND="0.0.0.0"
+    CONFIG_WEB_PORT=""
+    if [ -f "${CONFIG_FILE}" ]; then
+        IFS='|' read -r DNS_PORT WEB_ENABLED WEB_BIND CONFIG_WEB_PORT <<< "$(read_service_config "${CONFIG_FILE}")"
     fi
-    WEB_PORT="${WEB_PORT:-8080}"
+    WEB_PORT="${SITO_WEB_PORT:-${CONFIG_WEB_PORT:-8080}}"
 
     HEALTH_OK=1
     if ! systemctl is-active --quiet sito 2>/dev/null; then
@@ -383,12 +451,43 @@ EOF
         echo "Error: sito service failed to start or is not active!" >&2
     fi
 
-    if command -v curl >/dev/null 2>&1; then
-        if ! curl -fsS "http://localhost:${WEB_PORT}/" >/dev/null 2>&1 && \
-           ! curl -fsS "http://localhost:${WEB_PORT}/wizard" >/dev/null 2>&1; then
-            HEALTH_OK=0
-            echo "Error: sito web server did not respond on http://localhost:${WEB_PORT}" >&2
+    # DNS port check (primary): a config file means setup is complete and the
+    # DNS listeners must be up. Fresh installs have no config yet - listeners
+    # start after the wizard - so the check is skipped there.
+    if [ -f "${CONFIG_FILE}" ] && [ "${DNS_PORT}" != "0" ]; then
+        if command -v ss >/dev/null 2>&1; then
+            # Capture the listener rows instead of piping into `grep -q`:
+            # with `set -o pipefail`, grep exiting early can make the pipeline
+            # fail even when the port is bound (SIGPIPE on ss).
+            DNS_UDP_LISTENERS="$(ss -H -lun "sport = :${DNS_PORT}" 2>/dev/null || true)"
+            DNS_TCP_LISTENERS="$(ss -H -ltn "sport = :${DNS_PORT}" 2>/dev/null || true)"
+            if [ -z "${DNS_UDP_LISTENERS}" ] || [ -z "${DNS_TCP_LISTENERS}" ]; then
+                HEALTH_OK=0
+                echo "Error: sito is not listening on DNS port ${DNS_PORT} (UDP/TCP)!" >&2
+            fi
+        else
+            echo "Notice: 'ss' not found; skipping the DNS port check." >&2
         fi
+    fi
+
+    # HTTP probe (advisory only): probe the configured bind, mapping wildcard
+    # addresses to loopback because the unspecified address is not routable.
+    if [ "${WEB_ENABLED}" = "false" ]; then
+        echo "Notice: web UI is disabled (web.enabled = false); skipping the HTTP probe."
+    elif command -v curl >/dev/null 2>&1; then
+        case "${WEB_BIND}" in
+            0.0.0.0) WEB_PROBE_HOST="127.0.0.1" ;;
+            ::) WEB_PROBE_HOST="[::1]" ;;
+            *:*) WEB_PROBE_HOST="[${WEB_BIND}]" ;;
+            *) WEB_PROBE_HOST="${WEB_BIND}" ;;
+        esac
+        if ! curl -fsS "http://${WEB_PROBE_HOST}:${WEB_PORT}/" >/dev/null 2>&1 && \
+           ! curl -fsS "http://${WEB_PROBE_HOST}:${WEB_PORT}/wizard" >/dev/null 2>&1; then
+            echo "Warning: sito web server did not respond on http://${WEB_PROBE_HOST}:${WEB_PORT} (web.enabled=${WEB_ENABLED}, web.bind=${WEB_BIND})." >&2
+            echo "Warning: DNS service checks passed; verify the web bind/port if the panel is needed." >&2
+        fi
+    else
+        echo "Notice: curl not found; skipping the HTTP probe." >&2
     fi
 
     if [ "${HEALTH_OK}" -eq 0 ]; then
@@ -398,11 +497,12 @@ EOF
         journalctl -u sito -n 50 --no-pager >&2 || true
         echo "" >&2
         echo "Troubleshooting hints:" >&2
-        echo " - Check if port ${WEB_PORT} or port 53 is already in use: ss -tulpn | grep -E ':(${WEB_PORT}|53)'" >&2
+        echo " - Check if port ${DNS_PORT} or port ${WEB_PORT} is already in use: ss -tulpn | grep -E ':(${DNS_PORT}|${WEB_PORT})'" >&2
         echo " - Check system logs: journalctl -u sito -e" >&2
         echo " - Restoring previous binary from ${INSTALL_BIN}.bak (if present)..." >&2
         if [ -f "${INSTALL_BIN}.bak" ]; then
             cp -f "${INSTALL_BIN}.bak" "${INSTALL_BIN}"
+            apply_capabilities
             systemctl restart sito || true
         fi
         exit 1
