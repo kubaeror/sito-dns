@@ -15,6 +15,11 @@ pub struct SlaveSummary {
     pub remote_addr: String,
     pub synced_version: u64,
     pub lag: u64,
+    /// True when this slave reported a version above the master's current one.
+    /// A diverged slave silently ignores every push until the sequence is
+    /// recovered above its version, so its `lag` is pinned to 0 and must not be
+    /// read as "in sync".
+    pub diverged: bool,
     pub last_ping_secs_ago: u64,
     pub connected_at: String,
     pub last_stats: Option<SlaveStatsSummary>,
@@ -48,12 +53,18 @@ pub struct ActiveSlave {
 
 impl ActiveSlave {
     pub fn to_summary(&self, current_version: u64) -> SlaveSummary {
-        let lag = current_version.saturating_sub(self.synced_version);
+        let diverged = self.synced_version > current_version;
+        let lag = if diverged {
+            0
+        } else {
+            current_version.saturating_sub(self.synced_version)
+        };
         SlaveSummary {
             instance: self.instance.clone(),
             remote_addr: self.remote_addr.to_string(),
             synced_version: self.synced_version,
             lag,
+            diverged,
             last_ping_secs_ago: self.last_ping.elapsed().as_secs(),
             connected_at: self.connected_at.to_rfc3339(),
             last_stats: self.last_stats.clone(),

@@ -377,6 +377,18 @@ pub struct HaStatusResponse {
     pub last_synced_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
+    /// True when the master detected a version-continuity violation: a slave
+    /// acknowledged a version above the master's current version, meaning
+    /// every push below the slave's version is silently ignored.
+    #[serde(default)]
+    pub diverged: bool,
+    /// Human-readable reason for `diverged`, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diverged_reason: Option<String>,
+    /// Master only: the Ed25519 public key (hex) that signs replicated
+    /// bundles. Slaves must list it as `master_pubkey`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_pubkey: Option<String>,
 }
 
 /// Statistics reported by a replica slave.
@@ -395,6 +407,10 @@ pub struct HaSlaveSummary {
     pub remote_addr: String,
     pub synced_version: u64,
     pub lag: u64,
+    /// True when this slave reported a version above the master's current one.
+    /// `lag` is pinned to 0 in that case and must not be read as "in sync".
+    #[serde(default)]
+    pub diverged: bool,
     pub last_ping_secs_ago: u64,
     pub connected_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -408,6 +424,7 @@ impl From<sito_ha::SlaveSummary> for HaSlaveSummary {
             remote_addr: s.remote_addr,
             synced_version: s.synced_version,
             lag: s.lag,
+            diverged: s.diverged,
             last_ping_secs_ago: s.last_ping_secs_ago,
             connected_at: s.connected_at,
             last_stats: s.last_stats.map(|st| HaSlaveStatsSummary {
@@ -426,4 +443,11 @@ pub struct HaResyncResponse {
     pub status: String,
     pub role: String,
     pub version: u64,
+    /// Master only: whether an active bundle exists to re-push. `false` means
+    /// the request was accepted but there is nothing to replicate yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_bundle: Option<bool>,
+    /// Master only: connected slaves for which a push was queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slaves_notified: Option<usize>,
 }

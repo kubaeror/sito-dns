@@ -4,6 +4,7 @@ use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use std::path::Path;
+use tracing::warn;
 
 use crate::error::HaError;
 
@@ -40,30 +41,35 @@ impl Ed25519SigningKey {
     }
 
     /// Loads the signing key from `path`, or generates a new one if it does not exist.
-    /// Strict file permissions (0600 on Unix) are enforced on the key file.
+    ///
+    /// Strict file permissions (0600 on Unix) are enforced: the key is created
+    /// with mode 0600 atomically (`O_CREAT|O_EXCL`, so it is never briefly
+    /// world-readable) and an existing key with wider permissions is repaired
+    /// in place.
     pub fn load_or_create(path: &Path) -> Result<Self, HaError> {
-        if path.exists() {
-            let bytes = std::fs::read(path).map_err(|e| {
-                HaError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to read Ed25519 key file '{}': {e}", path.display()),
-                ))
-            })?;
-            Self::from_pkcs8(&bytes)
-        } else {
-            let key = Self::generate()?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+        if let Ok(bytes) = std::fs::read(path) {
+            let key = Self::from_pkcs8(&bytes)?;
+            enforce_private_permissions(path)?;
+            return Ok(key);
+        }
+
+        let key = Self::generate()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match write_private_exclusive(path, key.pkcs8_bytes()) {
+            Ok(()) => Ok(key),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Racing creator won; use its key rather than clobbering it.
+                let bytes = std::fs::read(path)?;
+                let existing = Self::from_pkcs8(&bytes)?;
+                enforce_private_permissions(path)?;
+                Ok(existing)
             }
-            std::fs::write(path, key.pkcs8_bytes())?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(path)?.permissions();
-                perms.set_mode(0o600);
-                std::fs::set_permissions(path, perms)?;
-            }
-            Ok(key)
+            Err(e) => Err(HaError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to write Ed25519 key file '{}': {e}", path.display()),
+            ))),
         }
     }
 
@@ -96,6 +102,60 @@ impl Ed25519SigningKey {
     pub fn public_key_b64(&self) -> String {
         BASE64_STANDARD.encode(self.public_key())
     }
+}
+
+/// Creates `path` with mode 0600 and writes `bytes`, failing if it already
+/// exists. On Unix the file is never observable with wider permissions (the
+/// mode is applied at creation time).
+fn write_private_exclusive(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        if path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "signing key already exists",
+            ));
+        }
+        std::fs::write(path, bytes)
+    }
+}
+
+/// Ensures an existing key file is readable only by its owner (0600).
+fn enforce_private_permissions(path: &Path) -> Result<(), HaError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(path)?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            warn!(
+                path = %path.display(),
+                mode = format!("{mode:o}"),
+                "HA signing key has insecure permissions; tightening to 0600"
+            );
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// Parses an Ed25519 public key from either 64-char hex or 44-char base64 string.
@@ -180,6 +240,22 @@ mod tests {
         // Reload existing
         let key2 = Ed25519SigningKey::load_or_create(&key_path).unwrap();
         assert_eq!(key1.public_key(), key2.public_key());
+
+        // An existing key with wider permissions is repaired on load (a
+        // pre-existing 0644 file must not stay group/world-readable).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let key3 = Ed25519SigningKey::load_or_create(&key_path).unwrap();
+            assert_eq!(key1.public_key(), key3.public_key());
+            let meta = std::fs::metadata(&key_path).unwrap();
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o600,
+                "load_or_create must repair an insecure key file"
+            );
+        }
 
         // Sign and verify
         let message = b"sito-ha-config-bundle-v1";

@@ -7,11 +7,11 @@ This runbook provides step-by-step operational procedures for managing, maintain
 ## 1. Overview and Architecture
 
 `sito` implements an active-passive master/slave replication architecture governed by [ADR-0002](adr/0002-ha-master-slave-push.md):
-- **Master Node**: Accepts administrative REST API mutations and Web UI configurations, generates monotonic configuration bundles, signs them using an Ed25519 private key (`data_dir/ha_signing.key`, permissions `0600`), and pushes updates to connected slaves in real-time over WebSocket with mutual TLS (mTLS) on port `8953`.
+- **Master Node**: Accepts administrative REST API mutations and Web UI configurations, generates monotonic configuration bundles, signs them using an Ed25519 private key (`data_dir/ha_signing.key`, permissions `0600`), and pushes updates to connected slaves in real-time over WebSocket with mutual TLS (mTLS) on port `8953`. The active bundle and its version are persisted to `data_dir/ha_state.toml` (mode `0600`) on every publish.
 - **Slave Nodes**: Connect to the master over WebSocket + mTLS, verify the master's Ed25519 signature and certificate fingerprint, enforce strict monotonic version ordering (`version > have_version`), and apply configuration snapshots atomically.
 - **Continuous Resolution**: Slaves serve DNS queries continuously without downtime. If an invalid or unparsable configuration bundle is received, the slave performs an automatic rollback to its last known good snapshot and enters a `Degraded` state.
 - **Read-Only Enforcement**: Slave REST API endpoints reject mutating operations (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP `409 Conflict` and return the `X-Dnsd-Master: <master_url>` header to redirect operators to the authoritative master.
-- **Statistics Aggregation**: Slaves report traffic and upstream metrics to the master every 30 seconds via `stats_report`. The master merges these metrics in Prometheus tagged by the `instance` label.
+- **Statistics Aggregation**: Slaves report traffic and upstream metrics to the master every 30 seconds via `stats_report`. The master stores the latest report per slave and exposes it through `GET /api/v1/ha/slaves`; replica counters are **not** merged into the master's own Prometheus registry. Scrape each replica's `/metrics` endpoint separately (labels such as `sito_ha_config_version{instance="..."}` identify the node).
 
 ---
 
@@ -51,15 +51,58 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
    # master_pubkey = "..."
    ```
 
-3. **Verify or generate master Ed25519 signing key**:
-   When `sito` starts with `role = "master"`, it automatically generates a new Ed25519 private key at `/var/lib/sito/ha_signing.key` if one does not already exist, with strict POSIX permissions `0600`:
-   ```bash
-   # Verify permissions if generated manually (raw PKCS#8 DER key material)
-   ls -la /var/lib/sito/ha_signing.key
-   # Expected output: -rw------- 1 sito sito ... ha_signing.key
-   ```
+3. **Carry over the master identity and the version sequence**:
+   A promoted slave is already at some configuration version `N` (visible as
+   `version` in `GET /api/v1/ha/status`). Two artifacts decide whether the new
+   master can keep replicating to the remaining slaves:
 
-4. **Restart sito service**:
+   - **Signing key** (`data_dir/ha_signing.key`): bundles are signed with this
+     Ed25519 key. If possible, copy the *old* master's key file to the promoted
+     node (mode `0600`) so the remaining slaves keep trusting
+     `master_pubkey` without changes. A key is generated automatically when
+     the file does not exist, but every slave must then be given the new
+     public key.
+   - **State file** (`data_dir/ha_state.toml`): the persisted active bundle and
+     version. Restoring the old master's file keeps the sequence monotonic.
+     If it is missing or corrupt, the master starts a new sequence but **seeds
+     it from the highest `have_version` reported by an authenticated slave**
+     before publishing, then republishes the active bundle above that version.
+     You can also override the sequence explicitly: stop the service, edit the
+     `version` field in a copy of `ha_state.toml` (JSON, mode `0600`) to a
+     value above the cluster's highest, and start the service.
+
+   To obtain the master public key for the slave configs:
+   ```bash
+   # With the old master still reachable:
+   curl -s http://192.168.1.10:8080/api/v1/ha/status | jq -r .master_pubkey
+
+   # Without it: the promoted master prints the same value in its status once running.
+   ```
+   Never let a promoted master start at a version below what its former peers
+   already applied: they silently ignore every lower push. When that happens
+   the master marks itself in `GET /api/v1/ha/status` with
+   `"diverged": true` plus a `diverged_reason`, and recovers by republishing
+   above the divergent version.
+
+4. **Verify or generate master certificates**:
+   `sito` uses the certificates configured in `[ha] cert`/`key` for mTLS and
+   pins the peer certificate with BLAKE3 fingerprints. If the promoted node
+   uses the old master's certificate and its private key, no slave changes are
+   needed. Otherwise regenerate a certificate suite
+   (`sito ha gen-certs --dir /etc/sito/certs --master --slave`) and distribute
+   the values to every remaining slave:
+   ```toml
+   [ha]
+   master_fingerprint = "blake3:<BLAKE3_FINGERPRINT_OF_NEW_MASTER_CERT>"
+   master_pubkey = "<ED25519_PUBLIC_KEY_OF_NEW_MASTER>"
+   ```
+   Slaves reject TLS connections whose certificate does not match
+   `master_fingerprint` and reject bundles signed by a key other than
+   `master_pubkey`, so both values must be updated together whenever the
+   identity changes. Also add each slave's certificate fingerprint to
+   `pinned_slave_fingerprints` on the promoted master.
+
+5. **Restart sito service**:
    ```bash
    # On systemd:
    systemctl restart sito
@@ -68,35 +111,61 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
    docker compose restart sito-slave
    ```
 
-5. **Verify master status**:
+6. **Verify master status**:
    Query the local status endpoint:
    ```bash
    curl -s http://localhost:8080/api/v1/ha/status | jq .
    ```
-   Expected response:
+   Expected response (master):
    ```json
    {
      "role": "master",
      "instance_name": "sito-master-promoted",
-     "current_version": 1,
-     "connected_slaves": 0,
-     "slaves": []
+     "version": 11,
+     "state": "active",
+     "slaves_connected": 0,
+     "diverged": false,
+     "master_pubkey": "9f2c...64-hex-chars"
    }
    ```
+   `version` must be greater than or equal to the highest version the other
+   slaves had already applied. `diverged` must be `false`; when it is `true`,
+   read `diverged_reason` and follow the recovery steps above before pointing
+   clients at the node.
 
-6. **Update network routing and DHCP**:
+7. **Update network routing and DHCP**:
    Update your router or DHCP server (e.g. MikroTik RouterOS) to point client DNS queries to the new master's IP:
    ```routeros
    /ip dhcp-server network set [find] dns-server=192.168.1.11
    ```
 
-7. **Re-point remaining slaves**:
-   On all other slave nodes, update `master_url` in `/etc/sito/config.toml` to point to the newly promoted master:
+8. **Re-point remaining slaves**:
+   On all other slave nodes, update `master_url` in `/etc/sito/config.toml` to point to the newly promoted master, plus `master_fingerprint` and `master_pubkey` when the identity changed:
    ```toml
    [ha]
    master_url = "wss://192.168.1.11:8953"
+   master_fingerprint = "blake3:<NEW_MASTER_FINGERPRINT>"
+   master_pubkey = "<NEW_MASTER_PUBLIC_KEY>"
    ```
-   Restart the slave service or issue a resync.
+   Restart the slave service or issue a resync. Verify each slave reaches
+   `"state": "synced"` with `"version"` equal to the master's version.
+
+### Secret placeholders in replicated configuration
+
+Replicated configuration may contain `${SECRET:name}` placeholders. On the
+slave they are resolved from the process environment only:
+
+1. `DNSD_SECRET_<name>` (the placeholder text after `SECRET:` is appended
+   verbatim, e.g. `${SECRET:upstream_token}` → `DNSD_SECRET_upstream_token`),
+2. `<name>` as a plain environment variable.
+
+There is no on-disk local secret store. A bundle referencing a secret the
+slave cannot resolve is rejected as a whole (the slave stays `Degraded` and
+keeps its previous configuration), so provision the variables in the service
+environment (e.g. an `EnvironmentFile` for systemd) before pushing the config.
+Node-local secret material (`[clients] client_id_secrets`, RouterOS
+credentials) is stripped from bundles and is never replicated; keep those
+values in each node's own `config.toml`.
 
 ---
 
@@ -226,7 +295,7 @@ When a slave node fails or must be reprovisioned from bare metal:
    ```bash
    curl -s http://localhost:8080/api/v1/ha/status | jq .
    ```
-   The slave will transition through `Connecting` -> `HelloSent` -> `Applying` -> `Synced` in under 2 seconds. Verify that custom rules, rewrites, and client lists match the master.
+   The slave will transition through `Connecting` -> `HelloSent` -> `Applying` -> `Synced` (or `HelloSent` -> `Synced` when it is already at the master's version) in under 2 seconds. Verify that custom rules, rewrites, and client lists match the master. `Degraded` is only cleared by a successful apply or an early ACK for the already-running version.
 
 ---
 
@@ -236,11 +305,13 @@ When a slave node fails or must be reprovisioned from bare metal:
 
 | Symptom | Probable Cause | Action |
 |---|---|---|
-| Slave state is `Degraded` | Configuration apply failed or corrupted bundle | Check the service journal (`journalctl -u sito`) for `apply_config_push` errors. The slave keeps its last good snapshot and reports `Degraded`; fix the configuration on the master and re-push. |
-| Slave state is `Connecting` in loop | Network unreachable, firewall blocking 8953, or mTLS handshake failed | Check `nc -zv 192.168.1.10 8953`. Check TLS certificate expiration or fingerprint mismatch in logs. |
-| `Signature verification failed` | Bundle signature does not match master public key | Verify that the master didn't regenerate `ha_signing.key` without updating slaves. |
+| Slave state is `Degraded` | Configuration apply failed, corrupted bundle, or an unresolvable `${SECRET:...}` placeholder | Check the service journal (`journalctl -u sito`) for `apply_config_push` errors. The slave keeps its last good snapshot and reports `Degraded`; fix the configuration on the master and re-push. The reason is exposed as `degraded_reason` in `GET /api/v1/ha/status`. |
+| Slave state is `Connecting` in loop | Network unreachable, firewall blocking 8953, or mTLS handshake failed/timed out | Check `nc -zv 192.168.1.10 8953`. Check TLS certificate expiration or fingerprint mismatch in logs. |
+| `Signature verification failed` | Bundle signature does not match master public key | Verify that the master didn't regenerate `ha_signing.key` without updating slaves. Compare `master_pubkey` from the master's `/api/v1/ha/status` with the slave config. |
 | `Incoming version <= have_version` | Out of order or replayed bundle | Normal during network blips; master will send latest monotonic version. |
+| Master reports `"diverged": true` | A slave acknowledged a version above the master's current version (promoted slave, lost/corrupt `ha_state.toml`, or forked master) | Read `diverged_reason`. The master automatically republishes above the divergent version; if it persists, restore/promote with a version above the cluster's highest as described in section 2. |
 | API returns `409 Conflict` | Mutation attempted directly on a slave node | Perform configuration edits on the master node indicated in the `X-Dnsd-Master` header. |
+| `POST /api/v1/ha/resync` returns `503` | No HA coordinator/tracker on the node, the replication worker stopped, or the push could not be queued | Check the node's role and `GET /api/v1/ha/status`. A `429` means a resync is already queued; retry shortly. |
 
 ### Diagnostic Commands
 
@@ -253,6 +324,15 @@ When a slave node fails or must be reprovisioned from bare metal:
    ```bash
    curl -s http://192.168.1.11:8080/api/v1/ha/status | jq .
    ```
+   `/ha/status` fields:
+   - Common: `role`, `instance_name`, `version`, `state`.
+   - Master only: `slaves_connected`, `diverged`/`diverged_reason`,
+     `master_pubkey` (hex; slaves must list it as `master_pubkey`).
+   - Slave only: `master_url`, `last_synced_at`, `degraded_reason`.
+   Connected replicas are listed separately by `GET /api/v1/ha/slaves`:
+   `instance`, `remote_addr`, `synced_version`, `lag`, `diverged`,
+   `last_ping_secs_ago`, `connected_at`, `last_stats` (with `window_s`,
+   `queries`, `blocked`, `upstreams_count`).
 3. **Trigger Manual Resynchronization**:
    ```bash
    # From the master:
@@ -261,6 +341,19 @@ When a slave node fails or must be reprovisioned from bare metal:
    # Or from a slave:
    curl -s -X POST http://192.168.1.11:8080/api/v1/ha/resync | jq .
    ```
+   A master response includes the queueing result:
+   ```json
+   {
+     "status": "resync_triggered",
+     "role": "master",
+     "version": 11,
+     "active_bundle": true,
+     "slaves_notified": 2
+   }
+   ```
+   `503 Service Unavailable` means HA is not active on the node, the slave
+   worker is not running, or (master) no connected slave could be queued;
+   `429 Too Many Requests` means a resync request is already pending.
 4. **Inspect Prometheus HA Metrics**:
    ```bash
    curl -s http://192.168.1.10:8080/metrics | grep sito_ha_

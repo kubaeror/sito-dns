@@ -1676,6 +1676,26 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "A resync is already queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "HA replication is not active or the resync could not be queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -3168,8 +3188,23 @@
           "version"
         ],
         "properties": {
+          "active_bundle": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Master only: whether an active bundle exists to re-push. `false` means\nthe request was accepted but there is nothing to replicate yet."
+          },
           "role": {
             "type": "string"
+          },
+          "slaves_notified": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Master only: connected slaves for which a push was queued.",
+            "minimum": 0
           },
           "status": {
             "type": "string"
@@ -3227,6 +3262,10 @@
           "connected_at": {
             "type": "string"
           },
+          "diverged": {
+            "type": "boolean",
+            "description": "True when this slave reported a version above the master's current one.\n`lag` is pinned to 0 in that case and must not be read as \"in sync\"."
+          },
           "instance": {
             "type": "string"
           },
@@ -3277,6 +3316,17 @@
               "null"
             ]
           },
+          "diverged": {
+            "type": "boolean",
+            "description": "True when the master detected a version-continuity violation: a slave\nacknowledged a version above the master's current version, meaning\nevery push below the slave's version is silently ignored."
+          },
+          "diverged_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable reason for `diverged`, when set."
+          },
           "instance_name": {
             "type": "string"
           },
@@ -3285,6 +3335,13 @@
               "string",
               "null"
             ]
+          },
+          "master_pubkey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Master only: the Ed25519 public key (hex) that signs replicated\nbundles. Slaves must list it as `master_pubkey`."
           },
           "master_url": {
             "type": [

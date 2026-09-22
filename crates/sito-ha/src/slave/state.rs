@@ -2,7 +2,6 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -43,7 +42,6 @@ pub struct SlaveStatusTracker {
     pub degraded_reason: Arc<Mutex<Option<String>>>,
     pub last_synced_at: Arc<Mutex<Option<DateTime<Utc>>>>,
     pub master_url: Option<String>,
-    pub local_secrets: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl SlaveStatusTracker {
@@ -55,7 +53,6 @@ impl SlaveStatusTracker {
             degraded_reason: Arc::new(Mutex::new(None)),
             last_synced_at: Arc::new(Mutex::new(None)),
             master_url,
-            local_secrets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -71,12 +68,10 @@ impl SlaveStatusTracker {
         self.current_version.load(Ordering::SeqCst)
     }
 
-    pub fn set_version(&self, version: u64) {
-        self.current_version.store(version, Ordering::SeqCst);
-    }
-
+    /// Records a successful apply (or an early ACK for the already-running
+    /// version) and clears any previous degraded reason.
     pub fn mark_synced(&self, version: u64) {
-        self.set_version(version);
+        self.current_version.store(version, Ordering::SeqCst);
         *self.state.lock().unwrap() = SlaveState::Synced;
         *self.degraded_reason.lock().unwrap() = None;
         *self.last_synced_at.lock().unwrap() = Some(Utc::now());
@@ -85,9 +80,5 @@ impl SlaveStatusTracker {
     pub fn mark_degraded(&self, reason: String) {
         *self.state.lock().unwrap() = SlaveState::Degraded;
         *self.degraded_reason.lock().unwrap() = Some(reason);
-    }
-
-    pub fn register_secret(&self, name: String, value: String) {
-        self.local_secrets.lock().unwrap().insert(name, value);
     }
 }
