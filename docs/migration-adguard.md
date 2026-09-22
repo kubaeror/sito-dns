@@ -22,7 +22,7 @@ Before starting the server, validate the converted configuration against the sit
 sito check-config --config /etc/sito/config.toml
 ```
 If validation passes, the command exits with code `0` and prints
-`Config file '<path>' is valid (listening on port <n>)`.
+`Configuration file '<path>' is valid (listening on port <n>, <n> upstreams, <n> blocklists configured).`
 
 ---
 
@@ -34,7 +34,7 @@ If validation passes, the command exits with code `0` and prints
 | `dns.bootstrap_dns` | `[upstream] bootstrap = [...]` | Bootstrap IP addresses for encrypted upstreams. |
 | `dns.blocking_mode` | `[filtering] blocking_mode = "..."` | `default`/`null_ip` maps to `zero_ip`; `custom_ip` maps to `custom_ip:<blocking_ipv4>`. |
 | `filters` (subscriptions) | `[[filtering.lists]]` | Preserves list name, URL, and enabled status. |
-| `user_rules` (custom rules) | `[filtering] custom_rules = [...]` | 100% ABP syntax compatibility (domain anchors, wildcards, `$badfilter`, `$client`, `$dnsrewrite`). |
+| `user_rules` (custom rules) | `[filtering] custom_rules = [...]` | AdGuard/ABP syntax compatibility (domain anchors, wildcards, `$badfilter`, `$client`, `$dnsrewrite`); see `docs/compatibility.md` for the exact supported subset. |
 | `clients.persistent` | `[[clients.entries]]` | Maps client IDs (IP/CIDR/MAC/ClientID), per-client upstreams, `ignore_querylog`/`ignore_statistics`, and `filtering_enabled` (routed to a generated `no-filtering` group). Per-client parental/safe-browsing toggles have no sito equivalent and are not emitted. |
 | `dns.rewrites` | `[[rewrites.entries]]` | Exact domain and wildcard (`*.example.com`) local DNS overrides. |
 | `tls.certificate_path` | `[tls] cert = "..."` | Direct PEM certificate reuse. |

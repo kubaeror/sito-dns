@@ -361,7 +361,7 @@ cosign verify-blob \
   --certificate sito-v1.7.0-x86_64-unknown-linux-gnu.tar.gz.pem \
   --signature   sito-v1.7.0-x86_64-unknown-linux-gnu.tar.gz.sig \
   --certificate-identity-regexp \
-      '^https://github.com/kubaeror/sito-dns/.github/workflows/release.yml@refs/.*$' \
+      '^https://github.com/kubaeror/sito-dns/\.github/workflows/release\.yml@refs/tags/.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   sito-v1.7.0-x86_64-unknown-linux-gnu.tar.gz
 ```

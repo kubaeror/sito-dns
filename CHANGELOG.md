@@ -107,6 +107,85 @@ the shipped parts; Phase 0 (release blockers) is complete.
 - **Rewrites**: IDN config entries and lookups are normalized to ASCII/
   punycode, so punycode entries (the form the wire and lists use) match.
 
+### HA (Phase 5)
+- **Bundle secrets**: the structured `clients` value is sanitized like
+  `config_toml`, so master client shared secrets are no longer replicated;
+  legacy `[auth]` secret keys are stripped instead of becoming unresolvable
+  `${SECRET:...}` placeholders.
+- **`[tls] key` is no longer masked** (it is a path, not secret material) —
+  this previously made every slave reject pushes for standard TLS configs. The
+  placeholder secret store is documented as environment-only.
+- **Version continuity**: a promoted slave or a lost `ha_state.toml` seeds the
+  master sequence from the highest slave-reported version before publishing;
+  a slave-ahead ACK is logged at error level and surfaced as
+  `diverged`/`diverged_reason` in `/ha/status` (with `master_pubkey` exposed
+  for slave configuration).
+- **Slave state machine**: an already-current reconnect marks `Synced` without
+  clearing `Degraded`; a failed persist is an apply failure (no
+  `applied:true` ACK); TLS/WS handshakes are bounded by a 10 s timeout;
+  WebSocket messages are capped at 1 MiB on both ends; absent `clients`/
+  `rewrites` mean authoritative removal in runtime, snapshot and disk; the
+  bundle list metadata is consumed by the slave.
+- **Hygiene**: signing/cert keys are created 0600 and an existing 0644 file is
+  repaired; `/ha/resync` reports an honest 503/429 instead of always
+  `resync_triggered`; the runbook documents the real status JSON, promotion
+  steps and `ha_state.toml`.
+
+### Upstream (Phase 6.1)
+- **Failover retries on SERVFAIL/REFUSED/NOTIMP** (previously a well-formed
+  SERVFAIL was treated as success, so the default failover strategy gave up
+  while healthy upstreams remained).
+- Retries share one overall `timeout_ms` budget (each sequential attempt gets
+  an equal share of the remainder); failures are attributed to the failing
+  server via `UpstreamQueryError`, health is recorded for every failed
+  candidate, and the active health probe uses a separate (≥5 s) timeout so a
+  slow-but-healthy handshake is not marked down.
+
+### Stats (Phase 7)
+- **qtype metric cardinality is bounded** (known types + `__other__`) instead
+  of up to 65 536 permanent series per protocol/verdict.
+- Retention rollups now populate `top_domains`/`top_clients`/`top_upstreams`
+  and are merged into global/client/upstream stats, so windows longer than the
+  detailed retention no longer silently under-report; `VACUUM` runs after
+  large retention sweeps; "clear query log" folds rows into the rollups first;
+  pagination exposes a real total count.
+- Per-client/per-upstream queries are `LIMIT`-bounded with deterministic
+  labels and expose `X-Total-Count`.
+
+### Filtering robustness (Phase 3, continued)
+- **List cache integrity**: cache writes are atomic (temp + fsync + rename),
+  metadata records content length and line count, and a truncated/mismatched
+  or metadata-less cache is re-fetched instead of trusted. *Migration note:* a
+  cache written by ≤ 1.7.0 lacks the new integrity fields and will be
+  re-downloaded once; with `fail_closed = true` and no network, that first boot
+  answers SERVFAIL until a fetch succeeds.
+- Duplicate filter-list names are rejected by config validation.
+- `reload_with_config` is transactional: a rejected configuration is no longer
+  retained for later scheduled refreshes.
+- Prefix rules are indexed in a trie (no linear scan) and the regex matcher
+  reuses a scratch `PatternSet`.
+- Removed dead `FilterSnapshot.exact`/`legacy_exact` and `parse_hosts`.
+
+### CI / ops / docs (Phases 8 and 10)
+- CI: `clippy --all-targets --all-features`, pre-merge fuzz compilation with a
+  refreshed `fuzz/Cargo.lock`, corpus caching, pinned tool versions, `--locked`
+  cross builds; releases publish on tag pushes only (so cosign identity
+  `refs/tags/*` is verifiable by the installer/updater).
+- Docker: builder cross-compiles from `$BUILDPLATFORM` (no QEMU on fat-LTO),
+  `mimalloc` on every arch, `ha/`/key material excluded from the build context,
+  compose hardening (`no-new-privileges`, read-only rootfs, tmpfs,
+  `start_period`).
+- Installer: the web health probe respects `web.enabled`/`web.bind` (no more
+  rollback of a working upgrade), capabilities are re-applied after a
+  rollback, and uninstall cleans up the user/group.
+- AdGuard converter: correct AdGuard keys (`statistics.interval` as duration,
+  `tls.port_https`, `filtering.blocked_response_ttl`,
+  `dns.anonymize_client_ip`), IP-only bootstrap with warnings, DoH/DoQ schemes
+  preserved, plus a fixture self-test wired into CI.
+- Docs truth pass: config-reference modes/defaults corrected and a hot-reload
+  matrix added, compatibility matrix re-verified against the engine, SECURITY
+  versions, install/migration samples, README wizard claims.
+
 ---
 
 ## [1.7.0] - 2026-09-13

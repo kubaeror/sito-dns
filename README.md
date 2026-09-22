@@ -23,7 +23,7 @@
 | **Memory @ 1M Rules** | **~ 285 MB RSS** (Trie + Interning) | 400 – 800 MB RSS | ~ 350 MB RSS |
 | **Encrypted Transports** | **DoT, DoH (H2), DoQ, DoH3** | DoT, DoH, DoQ | Plain only (requires proxy) |
 | **High Availability (HA)** | **Native mTLS WebSocket Push (<2s)** | External tool (adguardhome-sync) | External tool (gravity-sync) |
-| **Filter Rule Engine** | **Full ABP + all modifiers** | Full ABP + modifiers | Domain regex & wildcards |
+| **Filter Rule Engine** | **ABP/AdGuard syntax (see [compatibility matrix](docs/compatibility.md); `$dnsrewrite` partial)** | Full ABP + modifiers | Domain regex & wildcards |
 | **ReDoS Defense** | **Pure Dense DFA (no backtracking)** | RE2 linear time | POSIX regex (risk of backtrack) |
 | **ACME Certificates** | **Native TLS-ALPN-01 & HTTP-01** | Built-in ACME | External (Certbot) |
 | **RouterOS Integration** | **Native DHCP Lease Sync** | None | None |
@@ -98,13 +98,13 @@ services:
     cap_add:
       - NET_BIND_SERVICE
     ports:
-      - "53:53/udp"
-      - "53:53/tcp"
-      - "853:853/tcp"
-      - "853:853/udp"
-      - "443:443/tcp"
-      - "443:443/udp"
-      - "8080:8080/tcp"
+      - "53:53/udp"       # DNS (UDP)
+      - "53:53/tcp"       # DNS (TCP)
+      - "853:853/tcp"     # DoT (dns.dot_port, default 853)
+      - "853:853/udp"     # DoQ (dns.doq_port, default 0 = disabled)
+      - "443:443/tcp"     # DoH (dns.doh_port, default 443)
+      - "443:443/udp"     # DoH3 (dns.doh3_port, default 443)
+      - "8080:8080/tcp"   # Web UI / REST API (web.port, default 8080)
     volumes:
       # Host bind mounts must be handed to the container user once:
       #   sudo chown -R 65532:65532 ./config
@@ -140,7 +140,7 @@ cargo build --release --locked --features "embed-ui,mimalloc"
 On a fresh installation without a configuration file, **sito** starts in **setup-pending mode** on port `8080` (DNS listener ports 53/853/443 remain closed until initial setup is confirmed).
 
 Open **`http://<server-ip>:8080`** in any browser to launch the 6-section configuration wizard:
-* **Administrator Account:** Set custom admin username and password (or defaults).
+* **Administrator Account:** Set a custom admin username and a password. The wizard rejects the bootstrap password `adminadmin`, passwords shorter than 8 characters, and passwords containing whitespace or control characters; there are no default credentials to fall back on.
 * **DNS Listeners:** Configure IPv4/IPv6 bindings, UDP/TCP, DoT, and DoH ports.
 * **Upstream Resolvers:** Select presets (Cloudflare, Quad9, Google) with live latency testing.
 * **Cache & DNSSEC:** Tune in-memory cache and cryptographic DNSSEC validation.

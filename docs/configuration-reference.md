@@ -2,7 +2,7 @@
 
 This document is the exhaustive configuration reference for **sito v1.7.0**.
 
-`sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the local secret store, then `DNSD_SECRET_<NAME>`, then a bare `<NAME>` environment variable.
+`sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the `DNSD_SECRET_<name>` environment variable, then a bare `<name>` environment variable; there is no on-disk local secret store, and a placeholder that cannot be resolved rejects the whole pushed configuration.
 
 > [!NOTE]
 > The tables below are validated against the Rust config structs in CI (`scripts/check_config_reference.py`); adding a setting without documenting it fails the build.
@@ -113,7 +113,7 @@ ntp = ["local.internal"]
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `mode` | string | `"validate"` | Validation mode. Accepted: `"validate"`/`"strict"` (bogus = SERVFAIL), `"log_only"`/`"log-only"`/`"permissive"`/`"log_fail"` (log and clear AD), `"off"`/`"disabled"`. |
+| `mode` | string | `"validate"` | Validation mode. Accepted: `"validate"`/`"strict"` (bogus = SERVFAIL), `"log_only"`/`"log-only"`/`"permissive"` (log and clear AD), `"off"`/`"disabled"`. |
 | `validate` | boolean | `true` | Enable DNSSEC processing. Validation walks DS/DNSKEY links present in the response and, when the chain is incomplete, resolves the missing DNSKEY/DS records through the configured upstreams (bounded per-query fetch budget). NSEC/NSEC3 denial proofs are enumerated; opt-out NXDOMAIN answers are treated as insecure. |
 | `ntp` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). Alias retained for compatibility; `nta` is the preferred key. |
 | `nta` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). |
@@ -146,7 +146,7 @@ staging = false
 | `tls.key` | string | `None` | Path to PEM-encoded unencrypted PKCS#8 or RSA/EC private key. |
 | `tls.sni_certs` | array of tables | `[]` | Additional certificate/key pairs mapped to specific SNI hostnames. |
 | `acme.enabled` | boolean | `false` | Enables automated certificate issuance via Let's Encrypt / ACME. |
-| `acme.email` | string | `""` | Contact email address for ACME registration. |
+| `acme.email` | string | `None` | Contact email address for ACME registration. |
 | `acme.domains` | array of strings | `[]` | Domain names for ACME TLS-ALPN-01 / HTTP-01 certificates. |
 | `acme.staging` | boolean | `false` | When `true`, uses Let's Encrypt Staging API to avoid rate limits during testing. |
 | `acme.cache_dir` | string | `None` | Directory used to persist ACME account keys and certificates (defaults to `<data_dir>/acme`). |
@@ -177,10 +177,10 @@ servers = ["udp://192.168.1.1:53"]
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `servers` | array of strings | `["tls://..."]` | Upstream resolvers. Schemes: `udp://` or `host:port` (UDP with TCP fallback), `tls://` (DoT), `https://host[:port]/dns-query` (DoH, RFC 8484 with GET fallback), `quic://host[:port]` (DoQ, RFC 9250, default port 853). |
-| `bootstrap` | array of IPs | `["9.9.9.9"]` | Plain IP addresses used to bootstrap resolution of encrypted upstream domain names. |
+| `servers` | array of strings | `["1.1.1.1", "1.0.0.1"]` | Upstream resolvers. Schemes: `udp://` or `host:port` (UDP with TCP fallback), `tls://` (DoT), `https://host[:port]/dns-query` (DoH, RFC 8484 with GET fallback), `quic://host[:port]` (DoQ, RFC 9250, default port 853). |
+| `bootstrap` | array of IPs | `["9.9.9.9", "149.112.112.112"]` | Plain IP addresses used to bootstrap resolution of encrypted upstream domain names. |
 | `strategy` | string | `"failover"` | Forwarding strategy: `"parallel"` (fastest answer wins), `"failover"` (sequential fallback), or `"load_balance"`. |
-| `timeout_ms` | integer | `5000` | Request timeout per upstream query in milliseconds. |
+| `timeout_ms` | integer | `5000` | Overall per-query budget in milliseconds, shared across failover/load-balance retries (each sequential attempt gets an equal share of the remaining budget; parallel races use the full budget). |
 | `probe_domain` | string | `"example.com"` | Test domain used for periodic health-checking of upstreams. |
 | `pool_size` | integer | `4` | Number of persistent TCP/TLS connections maintained per upstream endpoint. |
 | `per_domain` | array of tables | `[]` | Domain-specific upstream forwarder rules (e.g., routing LAN domains to internal router). |
@@ -269,7 +269,7 @@ schedule = "0 0 15-21 * * MON-FRI"
 
 ```toml
 [rewrites]
-auto_ptr = true
+auto_ptr = true   # opt-in; the section default is false (see note below)
 ttl = 60
 
 [[rewrites.entries]]
@@ -281,9 +281,16 @@ exception_clients = ["admin-laptop"]
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `auto_ptr` | boolean | `true` | Automatically synthesize reverse PTR records (`in-addr.arpa` / `ip6.arpa`) for local A/AAAA rewrites in RFC 1918 / ULA ranges. |
+| `auto_ptr` | boolean | `false` | Automatically synthesize reverse PTR records (`in-addr.arpa` / `ip6.arpa`) for local A/AAAA rewrites in RFC 1918 / ULA ranges. See the note below on the serde/section default divergence; set it explicitly. |
 | `ttl` | integer | `60` | TTL for synthesized rewrite records. |
 | `entries` | array of tables | `[]` | Local record rewrites (`domain`, `type` (`A`/`AAAA`/`CNAME`/`PTR`/`TXT`), `answer`, and optional `exception_clients`). |
+
+> [!NOTE]
+> `auto_ptr` currently has two defaults in the code: an absent `[rewrites]`
+> table (and `--no-setup` boots) uses `false`, while a `[rewrites]` table that
+> is present but omits the key applies `true` through the serde field default.
+> The table above documents the section default; set `auto_ptr` explicitly to
+> avoid relying on either path.
 
 ---
 
@@ -384,7 +391,7 @@ interval_s = 300
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Enable automated client discovery from RouterOS DHCP server. |
-| `url` | string | `""` | Base URL of RouterOS REST API (`https://router.lan`). |
+| `url` | string | `"https://192.168.1.1"` | Base URL of RouterOS REST API (`https://router.lan`). |
 | `token_env` | string | `"MIKROTIK_API_TOKEN"` | Environment variable containing the RouterOS API token. |
 | `username` | string | `None` | Username for HTTP basic authentication when no token is used. |
 | `password` | string | `None` | Password for HTTP basic authentication (prefer `password_env` to keep secrets out of the config). |
@@ -419,3 +426,55 @@ url = "https://lists.example.com/services.json"
 |---|---|---|---|
 | `refresh_hours` | integer | `24` | Default refresh interval in hours for categories without an override (must be greater than 0). |
 | `categories` | table (map of category → source) | `{}` | Sources keyed by category id (`adult`, `gambling`, `services`, or any custom parental category). Each entry has a required `url` (`https://`, `http://` or `file://`), an optional `refresh_hours` override and an optional `license` string for operator reference. Refreshed domain lists replace the bundled content of that category; `services` expects service JSON. |
+
+---
+
+## 16. Hot Reload Matrix
+
+The running server watches the file passed to `--config` (the CLI default is
+the relative `config.toml`; the systemd unit and container image pass
+`/etc/sito/config.toml`) and re-applies the settings below in-process. A
+configuration that cannot be parsed or validated is rejected as a whole: the
+previous settings stay active and the error is logged. The REST API reports
+restart-only changes in the `restart_required` field of `PUT /api/v1/config`
+and `POST /api/v1/config/reload`.
+
+### 16.1 Applied live (no restart)
+
+| Setting | How it is applied |
+|---|---|
+| `server.log_level` | Log-level filter reloaded. |
+| `server.update_require_signature` | Read when an update is started, not at boot. |
+| `web.metrics_auth`, `web.trusted_proxies` | Read from the live configuration when a request is handled. |
+| `dns.bind`, `dns.port`, `dns.dot_port`, `dns.doh_port`, `dns.doq_port`, `dns.doh3_port`, `dns.doh_dedicated_hostname`, `dns.dot_padding`, `dns.edns_udp_size`, `dns.max_tcp_connections`, `dns.allow_plaintext_doh` | DNS listeners are stopped and rebound in-process when the listener plan changes; a failed rebind restores the previous bindings. TLS listeners need the acceptors created at startup. |
+| `dns.rate_limit_per_ip` | Live rate limiters updated. |
+| `dns.cache.enabled`, `dns.cache.size_mb`, `dns.cache.min_ttl`, `dns.cache.max_ttl`, `dns.cache.negative_ttl_max`, `dns.cache.prefetch`, `dns.cache.serve_stale_hours` | Cache configuration updated. |
+| `dns.dnssec.mode`, `dns.dnssec.validate`, `dns.dnssec.ntp`, `dns.dnssec.nta`, `dns.dnssec.trust_anchors` | DNSSEC validator swapped for the new configuration. |
+| `upstream.servers`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt. |
+| `filtering.enabled`, `filtering.refresh_interval_hours`, `filtering.blocking_mode`, `filtering.blocking_ttl`, `filtering.cname_cloaking`, `filtering.fail_closed`, `filtering.anti_doh_bypass`, `filtering.max_rules`, `filtering.lists`, `filtering.custom_rules` | Filter engine reloaded with the new lists/rules; cached answers are flushed. List downloads continue asynchronously after the reload. |
+| `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names` | Client registry, per-group rule sets and per-client upstream scopes rebuilt. |
+| `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |
+| `privacy.anonymize_querylog` | Query-log writer updated. |
+| `stats.retention_days` | Re-read on the next retention sweep (every 24 h). |
+
+### 16.2 Requires a restart
+
+| Setting | Why |
+|---|---|
+| `server.role`, `server.instance_name`, `server.data_dir`, `server.log_format` | Read once at process start. |
+| `upstream.bootstrap` | The file watcher reuses the bootstrap resolver created at startup; `POST /api/v1/config/reload` rebuilds it immediately, but a config-file edit alone needs a restart. |
+| `web.enabled`, `web.bind`, `web.port` | The admin HTTP listener is bound at startup. |
+| `auth.session_ttl_hours`, `auth.login_rate_limit`, `auth.session_persist`, `auth.token_default_ttl_days` | Auth manager is created at startup. |
+| `tls.cert`, `tls.key`, `tls.sni_certs`, `acme.*` | TLS/ACME setup is initialized at startup. (Certificate file *contents* are re-read by the certificate watcher; changing the configured paths needs a restart.) |
+| `ha.*` | HA replication tasks are created at startup. |
+| `integrations.mikrotik.*`, `integrations.lists.*` | Integration sync/refresh tasks are spawned at startup. |
+
+> [!NOTE]
+> The REST API's `restart_required` list is coarser than this matrix: it marks
+> whole sections (`web`, `auth`, `ha`, …) and `dns.doh_dedicated_hostname` as
+> restart-only. `dns.doh_dedicated_hostname`, `web.metrics_auth` and
+> `web.trusted_proxies` actually take effect without a restart (listener
+> rebind and per-request reads respectively).
+>
+> `config_version` is evaluated whenever the file is loaded; only version `1`
+> is accepted.
