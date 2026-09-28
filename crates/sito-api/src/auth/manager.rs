@@ -5,6 +5,7 @@ use crate::auth::password::{hash_password, verify_password};
 use crate::auth::session::{DEFAULT_SESSION_TTL_SECS, Session};
 use crate::auth::token::{ApiTokenMeta, CreateTokenResponse, Role, generate_token, hash_token};
 use crate::auth::totp::{TotpConfig, TotpSetupResponse};
+use crate::models::UserDto;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -184,9 +185,9 @@ async fn verify_password_blocking(password: String, hash: String) -> bool {
 }
 
 /// Atomically writes a secret file with owner-only permissions.
-fn atomic_write_secret(path: &Path, content: &str) {
+fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
 
     let tmp_path = path.with_extension(format!("tmp.{}", rand::random::<u32>()));
@@ -214,10 +215,37 @@ fn atomic_write_secret(path: &Path, content: &str) {
         Ok(())
     })();
 
-    if let Err(e) = write_res {
+    if let Err(e) = &write_res {
         tracing::error!("Failed to persist {}: {e}", path.display());
         let _ = std::fs::remove_file(&tmp_path);
     }
+    write_res
+}
+
+/// Atomically writes a secret file with owner-only permissions, logging errors.
+fn atomic_write_secret(path: &Path, content: &str) {
+    let _ = write_secret_file(path, content);
+}
+
+/// Path of the file holding the global user-secret generation counter.
+fn auth_generation_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("auth_generation")
+}
+
+/// Reads the persisted user-secret generation (`0` when no file exists).
+fn read_auth_generation(data_dir: &Path) -> u64 {
+    std::fs::read_to_string(auth_generation_path(data_dir))
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Rotates the global user-secret generation so every session/token issued
+/// before the rotation is rejected even if its file survives.
+pub fn rotate_auth_generation(data_dir: &Path) -> std::io::Result<u64> {
+    let next = read_auth_generation(data_dir).saturating_add(1);
+    write_secret_file(&auth_generation_path(data_dir), &next.to_string())?;
+    Ok(next)
 }
 
 /// Backs up a corrupt state file so operators can inspect it after recovery.
@@ -273,6 +301,8 @@ pub struct AuthManager {
     tokens_path: Option<PathBuf>,
     tokens_dirty: Arc<AtomicBool>,
     token_default_ttl_days: u64,
+    /// Global user-secret generation; sessions/tokens must match it to be valid.
+    generation: u64,
 }
 
 impl Default for AuthManager {
@@ -388,6 +418,7 @@ impl AuthManager {
             (None, None)
         };
 
+        let generation = data_dir.map_or(0, read_auth_generation);
         let mgr = Self {
             users: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -408,6 +439,7 @@ impl AuthManager {
             tokens_path,
             tokens_dirty: Arc::new(AtomicBool::new(false)),
             token_default_ttl_days,
+            generation,
         };
 
         if let Some(ref path) = mgr.users_path {
@@ -531,6 +563,18 @@ impl AuthManager {
             let backup_path = path.with_file_name(backup_name);
             let _ = std::fs::copy(&path, &backup_path);
         }
+        // Rotate the user-secret generation *before* installing the new
+        // credentials so every live session and API token is rejected as soon
+        // as the reset takes effect, and remove the persisted stores.
+        let generation = rotate_auth_generation(data_dir.as_ref())?;
+        for name in ["sessions.toml", "tokens.toml"] {
+            let store = data_dir.as_ref().join(name);
+            if store.exists() {
+                std::fs::remove_file(&store)?;
+                tracing::info!(path = %store.display(), "Removed persisted auth store on admin reset");
+            }
+        }
+
         let mgr = Self {
             users: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -551,26 +595,42 @@ impl AuthManager {
             tokens_path: None,
             tokens_dirty: Arc::new(AtomicBool::new(false)),
             token_default_ttl_days: 0,
+            generation,
         };
         mgr.create_user_internal("admin", new_password, Role::Admin);
         mgr.save_users();
         Ok(path)
     }
 
-    fn save_users(&self) {
-        let Some(ref path) = self.users_path else {
-            return;
-        };
+    /// Serializes the current user accounts to TOML, returning the target path.
+    fn users_toml(&self) -> Option<(PathBuf, String)> {
+        let path = self.users_path.clone()?;
         let users_list: Vec<UserAccount> = {
             let users = lock(&self.users);
             users.values().cloned().collect()
         };
         let file_content = UsersFile { users: users_list };
-        let Ok(toml_str) = toml::to_string_pretty(&file_content) else {
-            tracing::error!("Failed to serialize users to TOML");
+        let toml_str = toml::to_string_pretty(&file_content).ok()?;
+        Some((path, toml_str))
+    }
+
+    fn save_users(&self) {
+        if let Some((path, toml_str)) = self.users_toml() {
+            atomic_write_secret(&path, &toml_str);
+        }
+    }
+
+    /// Persists users on the blocking pool so async handlers never perform
+    /// blocking file IO on the runtime worker.
+    async fn save_users_async(&self) {
+        let Some((path, toml_str)) = self.users_toml() else {
             return;
         };
-        atomic_write_secret(path, &toml_str);
+        match tokio::task::spawn_blocking(move || write_secret_file(&path, &toml_str)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("Failed to persist users file: {e}"),
+            Err(e) => tracing::error!("Users persistence task failed: {e}"),
+        }
     }
 
     fn save_sessions(&self) {
@@ -613,6 +673,13 @@ impl AuthManager {
             Ok(file) => {
                 let mut sessions = lock(&self.sessions);
                 for mut session in file.sessions {
+                    if session.generation != self.generation {
+                        tracing::warn!(
+                            session = %session.id,
+                            "Rejecting persisted session issued under a previous auth generation"
+                        );
+                        continue;
+                    }
                     if !session.is_expired() {
                         session.ensure_csrf_token();
                         sessions.insert(session.id.clone(), session);
@@ -651,6 +718,17 @@ impl AuthManager {
                     .tokens
                     .into_iter()
                     .filter(|token| token.expires_at.is_none_or(|exp| now < exp))
+                    .filter(|token| {
+                        if token.generation == self.generation {
+                            true
+                        } else {
+                            tracing::warn!(
+                                token = %token.id,
+                                "Rejecting persisted API token issued under a previous auth generation"
+                            );
+                            false
+                        }
+                    })
                     .collect();
                 loaded.sort_by_key(|t| std::cmp::Reverse(t.created_at));
                 for token in loaded {
@@ -813,6 +891,56 @@ impl AuthManager {
         lock(&self.users).contains_key(username)
     }
 
+    /// Lists user accounts (never includes password hashes or TOTP secrets).
+    pub fn list_users(&self) -> Vec<UserDto> {
+        let mut users: Vec<UserDto> = lock(&self.users)
+            .values()
+            .map(|u| UserDto {
+                username: u.username.clone(),
+                role: u.role.to_string(),
+                totp_enabled: u.totp.as_ref().is_some_and(|t| t.enabled),
+            })
+            .collect();
+        users.sort_by(|a, b| a.username.cmp(&b.username));
+        users
+    }
+
+    /// Returns the role of a user, if the account exists.
+    pub fn role_of(&self, username: &str) -> Option<Role> {
+        lock(&self.users).get(username).map(|u| u.role)
+    }
+
+    /// Number of accounts with the Admin role.
+    pub fn admin_count(&self) -> usize {
+        lock(&self.users)
+            .values()
+            .filter(|u| u.role == Role::Admin)
+            .count()
+    }
+
+    /// Updates a user's role, revoking their sessions (a role change must take
+    /// effect immediately). Returns false when the user does not exist.
+    pub fn set_user_role(&self, username: &str, role: Role) -> bool {
+        let changed = {
+            let mut users = lock(&self.users);
+            match users.get_mut(username) {
+                Some(user) => {
+                    if user.role == role {
+                        return true;
+                    }
+                    user.role = role;
+                    true
+                }
+                None => false,
+            }
+        };
+        if changed {
+            self.purge_user_sessions(username);
+            self.save_users();
+        }
+        changed
+    }
+
     /// Deletes a user account by username. Returns true if the user existed and was removed.
     pub fn delete_user(&self, username: &str) -> bool {
         let removed = lock(&self.users).remove(username).is_some();
@@ -861,7 +989,7 @@ impl AuthManager {
             // Overwriting an account (new password/role) revokes its sessions.
             self.purge_user_sessions(username);
         }
-        self.save_users();
+        self.save_users_async().await;
     }
 
     /// Updates password for an existing user and invalidates their sessions.
@@ -870,19 +998,26 @@ impl AuthManager {
             return false;
         };
 
-        let mut users = lock(&self.users);
-        if let Some(user) = users.get_mut(username) {
-            user.password_hash = hash;
-            drop(users);
-            if username == "admin" {
-                self.default_admin_active
-                    .store(is_default, Ordering::SeqCst);
+        let updated = {
+            let mut users = lock(&self.users);
+            match users.get_mut(username) {
+                Some(user) => {
+                    user.password_hash = hash;
+                    true
+                }
+                None => false,
             }
-            self.save_users();
-            self.purge_user_sessions(username);
-            return true;
+        };
+        if !updated {
+            return false;
         }
-        false
+        if username == "admin" {
+            self.default_admin_active
+                .store(is_default, Ordering::SeqCst);
+        }
+        self.save_users_async().await;
+        self.purge_user_sessions(username);
+        true
     }
 
     /// Verifies a user's current password without holding the users lock
@@ -915,6 +1050,7 @@ impl AuthManager {
     }
 
     fn insert_session(&self, session: Session) {
+        let session = session.with_generation(self.generation);
         let mut sessions = lock(&self.sessions);
         if !sessions.contains_key(&session.id) && sessions.len() >= MAX_SESSIONS {
             sessions.retain(|_, s| !s.is_expired());
@@ -1230,7 +1366,7 @@ impl AuthManager {
             };
             user.totp = Some(config);
         }
-        self.save_users();
+        self.save_users_async().await;
         // Changing the second factor invalidates existing sessions.
         self.purge_user_sessions(username);
         true
@@ -1269,12 +1405,13 @@ impl AuthManager {
             return false;
         };
         if ok {
-            let mut users = lock(&self.users);
-            if let Some(user) = users.get_mut(username) {
-                user.totp = Some(updated);
+            {
+                let mut users = lock(&self.users);
+                if let Some(user) = users.get_mut(username) {
+                    user.totp = Some(updated);
+                }
             }
-            drop(users);
-            self.save_users();
+            self.save_users_async().await;
         }
         ok
     }
@@ -1297,6 +1434,10 @@ impl AuthManager {
     pub fn validate_session(&self, session_id: &str) -> Option<Session> {
         let mut sessions = lock(&self.sessions);
         if let Some(session) = sessions.get(session_id) {
+            if session.generation != self.generation {
+                sessions.remove(session_id);
+                return None;
+            }
             if session.is_expired() {
                 sessions.remove(session_id);
                 None
@@ -1319,6 +1460,7 @@ impl AuthManager {
     /// Creates a new API token with the specified scope.
     pub fn create_token(&self, name: &str, scope: Role) -> (ApiTokenMeta, CreateTokenResponse) {
         let (mut meta, resp) = generate_token(name, scope);
+        meta.generation = self.generation;
         if self.token_default_ttl_days > 0 {
             let ttl_secs = i64::try_from(self.token_default_ttl_days)
                 .unwrap_or(i64::MAX / 86_400)
@@ -1383,6 +1525,15 @@ impl AuthManager {
         }
 
         if let Some(key) = matched_key {
+            if tokens
+                .get(&key)
+                .is_some_and(|meta| meta.generation != self.generation)
+            {
+                tokens.remove(&key);
+                drop(tokens);
+                self.save_tokens();
+                return None;
+            }
             if tokens
                 .get(&key)
                 .and_then(|meta| meta.expires_at)
@@ -2136,5 +2287,109 @@ mod tests {
         let (meta, resp) = mgr.create_token("post-poison", Role::Viewer);
         assert!(mgr.validate_token(&resp.token).is_some());
         assert!(mgr.delete_token(&meta.id));
+    }
+
+    /// WP-4.4: `reset-admin` must invalidate every live session and API token,
+    /// not just replace the password.
+    #[tokio::test]
+    async fn test_reset_admin_credentials_invalidates_sessions_and_tokens() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_auth_reset_revoke_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let (session_id, token_plaintext, token_hash) = {
+            let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+            let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1").await
+            else {
+                panic!("login failed");
+            };
+            let (_meta, resp) = mgr.create_token("ci", Role::Operator);
+            assert!(mgr.validate_session(&session.id).is_some());
+            assert!(mgr.validate_token(&resp.token).is_some());
+            let token_hash = hash_token(&resp.token);
+            (session.id, resp.token, token_hash)
+        };
+
+        AuthManager::reset_admin_credentials(&temp_dir, "resetpassword1").unwrap();
+
+        // The persisted stores are removed on reset.
+        assert!(!temp_dir.join("sessions.toml").exists());
+        assert!(!temp_dir.join("tokens.toml").exists());
+
+        // Even if an attacker restores stale stores, the rotated generation
+        // rejects them.
+        std::fs::write(
+            temp_dir.join("sessions.toml"),
+            format!(
+                "[[sessions]]\nid = \"{session_id}\"\nusername = \"admin\"\nrole = \"admin\"\ncreated_at = 0\nexpires_at = {}\ncsrf_token = \"deadbeef\"\ngeneration = 0\n",
+                i64::MAX
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("tokens.toml"),
+            format!(
+                "[[tokens]]\nid = \"tok_stale\"\nname = \"ci\"\nhash = \"{token_hash}\"\nscope = \"operator\"\ncreated_at = 0\ngeneration = 0\n"
+            ),
+        )
+        .unwrap();
+
+        let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        assert!(
+            mgr.validate_session(&session_id).is_none(),
+            "a session from the previous generation must be rejected"
+        );
+        assert!(
+            mgr.validate_token(&token_plaintext).is_none(),
+            "a token from the previous generation must be rejected"
+        );
+        // The new credentials work.
+        assert!(matches!(
+            mgr.login("admin", "resetpassword1", "127.0.0.1").await,
+            LoginResult::Success(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-4.4: changing a password revokes that user's sessions (already) and
+    /// role changes take effect immediately.
+    #[tokio::test]
+    async fn test_role_change_and_admin_guards() {
+        let mgr = AuthManager::new();
+        mgr.create_user("ops", "OperatorPass1", Role::Operator)
+            .await;
+        assert_eq!(mgr.admin_count(), 1);
+        assert_eq!(mgr.role_of("ops"), Some(Role::Operator));
+
+        let LoginResult::Success(session) = mgr.login("ops", "OperatorPass1", "127.0.0.1").await
+        else {
+            panic!("login failed");
+        };
+        assert!(mgr.set_user_role("ops", Role::Viewer));
+        assert_eq!(mgr.role_of("ops"), Some(Role::Viewer));
+        assert!(
+            mgr.validate_session(&session.id).is_none(),
+            "a role change must revoke existing sessions"
+        );
+
+        // Unknown user.
+        assert!(!mgr.set_user_role("ghost", Role::Admin));
+        assert_eq!(mgr.list_users().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod send_checks {
+    use super::*;
+
+    #[test]
+    fn test_auth_futures_are_send() {
+        fn assert_send<F: std::future::Future + Send>(_f: F) {}
+        let mgr = AuthManager::new();
+        assert_send(mgr.update_user_password("admin", "x"));
+        assert_send(mgr.verify_second_factor("admin", "x"));
+        assert_send(mgr.confirm_totp_setup("admin", "x"));
+        assert_send(mgr.create_user("a", "b", Role::Viewer));
     }
 }

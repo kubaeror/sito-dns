@@ -88,7 +88,7 @@ pub(crate) async fn save_rewrite_store(
     // Update active rewrite table
     let new_table = sito_rewrites::RewriteTable::new(store.cfg.clone());
     ctx.set_rewrites(new_table);
-    crate::publish_bundle(ctx);
+    crate::publish_bundle(ctx).await;
     Ok(())
 }
 

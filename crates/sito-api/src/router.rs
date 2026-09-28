@@ -181,6 +181,14 @@ pub async fn setup_pending_middleware(
     }
 
     if setup_pending {
+        // When user accounts already exist (missing `config.toml` but a valid
+        // `users.toml`), the deployment is not in first-boot state: allow the
+        // operator to log in instead of forcing the wizard on every route.
+        let first_run = ctx.auth_mgr.is_first_run();
+        let login_allowed = !first_run && !token_required;
+
+        let login_path = path == "/login" || path == "/ui/login";
+        let auth_api = path.starts_with("/api/v1/auth");
         if path.starts_with("/wizard")
             || path.starts_with("/ui/wizard")
             || path.starts_with("/static/")
@@ -188,6 +196,7 @@ pub async fn setup_pending_middleware(
             || path == "/ui/upstreams/test"
             || path == "/health"
             || path == "/status"
+            || (login_allowed && (login_path || auth_api))
         {
             return next.run(request).await;
         }
@@ -196,11 +205,8 @@ pub async fn setup_pending_middleware(
             return (StatusCode::SERVICE_UNAVAILABLE, "Setup not completed").into_response();
         }
 
-        return (
-            StatusCode::FOUND,
-            [(axum::http::header::LOCATION, "/wizard")],
-        )
-            .into_response();
+        let target = if login_allowed { "/login" } else { "/wizard" };
+        return (StatusCode::FOUND, [(axum::http::header::LOCATION, target)]).into_response();
     }
 
     next.run(request).await
@@ -238,6 +244,20 @@ async fn redirect_upstream_config() -> Response {
 
 /// Constructs the complete administrative HTTP router.
 pub fn create_router(ctx: ServerContext) -> Router {
+    create_router_inner(ctx, crate::config_apply::ApplyHooks::default())
+}
+
+/// Constructs the router with [`crate::config_apply::ConfigApplyHooks`] so the
+/// configuration write paths can apply the components owned by the server
+/// binary (DNSSEC, scoped upstreams, rate limiters, listeners, log level).
+pub fn create_router_with_hooks(
+    ctx: ServerContext,
+    hooks: crate::config_apply::ApplyHooks,
+) -> Router {
+    create_router_inner(ctx, hooks)
+}
+
+fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHooks) -> Router {
     let api_v1 = Router::new()
         // System status
         .route("/status", get(status::get_status))
@@ -326,6 +346,18 @@ pub fn create_router(ctx: ServerContext) -> Router {
             get(auth_handlers::list_tokens).post(auth_handlers::create_token),
         )
         .route("/auth/tokens/{id}", delete(auth_handlers::delete_token))
+        .route(
+            "/auth/users",
+            get(auth_handlers::list_users).post(auth_handlers::create_user),
+        )
+        .route(
+            "/auth/users/{username}",
+            put(auth_handlers::update_user).delete(auth_handlers::delete_user),
+        )
+        .route(
+            "/auth/change-password",
+            post(auth_handlers::change_password),
+        )
         // Configuration
         .route(
             "/config",
@@ -377,12 +409,13 @@ pub fn create_router(ctx: ServerContext) -> Router {
         ))
         .with_state(ctx.clone());
 
-    app.layer(axum::middleware::from_fn_with_state(
-        ctx.clone(),
-        crate::security::csrf_protection_middleware,
-    ))
-    .layer(axum::middleware::from_fn_with_state(
-        ctx,
-        crate::security::security_headers_middleware,
-    ))
+    app.layer(axum::Extension(hooks))
+        .layer(axum::middleware::from_fn_with_state(
+            ctx.clone(),
+            crate::security::csrf_protection_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            ctx,
+            crate::security::security_headers_middleware,
+        ))
 }

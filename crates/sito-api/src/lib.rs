@@ -8,6 +8,7 @@
 //! - Real-time query log streaming over WebSockets
 
 pub mod auth;
+pub mod config_apply;
 pub mod config_validation;
 pub mod config_writer;
 pub mod error;
@@ -20,13 +21,16 @@ pub mod security;
 pub mod state;
 pub mod updater;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 #[cfg(feature = "embed-ui")]
 pub mod ui;
 
 pub use auth::*;
 pub use error::ProblemDetails;
 pub use openapi::ApiDoc;
-pub use router::create_router;
+pub use router::{create_router, create_router_with_hooks};
 pub use state::{ServerContext, publish_bundle};
 
 #[cfg(test)]

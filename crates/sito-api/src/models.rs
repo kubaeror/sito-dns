@@ -98,6 +98,9 @@ pub struct ClientDto {
     pub subnet: Vec<String>,
     #[serde(default = "default_group")]
     pub group: String,
+    /// Shared DoH-path/DoT-SNI secret. On `GET` responses this is only ever
+    /// populated when the caller explicitly requested a reveal; otherwise it
+    /// is `None` and `has_secret`/`secret_hint` describe the stored value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doh_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +118,12 @@ pub struct ClientDto {
     /// Whether the client is a trusted resolver; only changed when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted: Option<bool>,
+    /// Response only: a shared secret is stored for this client.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_secret: bool,
+    /// Response only: masked hint (`last4`) for the stored shared secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_hint: Option<String>,
 }
 
 /// Partial update for a client. Fields that are absent keep their current
@@ -320,10 +329,13 @@ pub struct LoginRequest {
 }
 
 /// Login response.
+///
+/// The session itself is delivered as an HttpOnly `Set-Cookie` header; it is
+/// deliberately never echoed in the JSON body. The TOTP `partial_token` is
+/// returned only to clients that opt in with `X-Sito-Token-Delivery: body`
+/// (CLI/API consumers); browser clients receive it as an HttpOnly cookie.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LoginResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -356,11 +368,71 @@ pub struct DisableTotpRequest {
     pub code: Option<String>,
 }
 
-/// Request to create an API token.
+/// Request to create or update an API token.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateTokenRequest {
     pub name: String,
     pub scope: String,
+}
+
+/// API token metadata safe for API/UI responses (never includes the hash).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ApiTokenDto {
+    pub id: String,
+    pub name: String,
+    pub scope: String,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+impl From<&crate::auth::token::ApiTokenMeta> for ApiTokenDto {
+    fn from(meta: &crate::auth::token::ApiTokenMeta) -> Self {
+        Self {
+            id: meta.id.clone(),
+            name: meta.name.clone(),
+            scope: meta.scope.to_string(),
+            created_at: meta.created_at,
+            last_used: meta.last_used,
+            expires_at: meta.expires_at,
+        }
+    }
+}
+
+/// User account record (never includes password hashes or TOTP secrets).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserDto {
+    pub username: String,
+    pub role: String,
+    pub totp_enabled: bool,
+}
+
+/// Request to create a local user account.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateUserRequest {
+    pub username: String,
+    pub password: String,
+    pub role: String,
+}
+
+/// Request to change a user's role.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateUserRequest {
+    pub role: String,
+}
+
+/// Request to change a password. The caller must either prove knowledge of the
+/// current password (self-service) or be an Admin overriding another account
+/// (`username` set, audited).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ChangePasswordRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_password: Option<String>,
+    pub new_password: String,
 }
 
 /// HA cluster status response for `GET /api/v1/ha/status`.

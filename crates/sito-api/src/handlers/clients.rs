@@ -5,6 +5,7 @@
 //! `ip`/`mac`/`subnet`/`doh_path`/`dot_sni` fields is supplied.
 
 use crate::auth::RequireOperator;
+use crate::auth::token::Role;
 use crate::config_writer::save_config_atomic;
 use crate::error::ProblemDetails;
 use crate::models::{
@@ -13,8 +14,26 @@ use crate::models::{
 };
 use crate::state::ServerContext;
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
+use serde::Deserialize;
 use sito_clients::{BlockedServiceConfig, ClientEntryConfig, ClientGroupConfig, ClientsConfig};
+
+/// Query parameters for the client detail endpoint.
+#[derive(Debug, Clone, Default, Deserialize, utoipa::IntoParams)]
+pub struct ClientRevealQuery {
+    /// `1`/`true` reveals the stored shared secret. Admin-only and audited.
+    #[serde(default)]
+    pub reveal: Option<String>,
+}
+
+impl ClientRevealQuery {
+    fn wants_reveal(&self) -> bool {
+        self.reveal.as_deref().is_some_and(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        })
+    }
+}
 
 fn load_clients_config(ctx: &ServerContext) -> ClientsConfig {
     ctx.config
@@ -44,7 +63,7 @@ async fn save_clients_config(
         ctx.clients.load().routeros_leases_store(),
     );
     ctx.set_clients(new_reg);
-    crate::publish_bundle(ctx);
+    crate::publish_bundle(ctx).await;
     Ok(())
 }
 
@@ -104,23 +123,49 @@ fn build_ids(
     ids
 }
 
-fn client_to_dto(entry: &ClientEntryConfig, secret: Option<&String>) -> ClientDto {
+/// Marker returned in place of a stored shared secret.
+pub const SECRET_MASK: &str = "***";
+
+/// True when a value is the masked marker (optionally followed by a hint).
+fn is_secret_mask(value: &str) -> bool {
+    value.trim_start().starts_with(SECRET_MASK)
+}
+
+/// Masked hint for a stored secret: marker plus its last four characters.
+fn secret_hint(secret: &str) -> String {
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() <= 4 {
+        SECRET_MASK.to_string()
+    } else {
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{SECRET_MASK}{tail}")
+    }
+}
+
+fn client_to_dto(entry: &ClientEntryConfig, secret: Option<&String>, reveal: bool) -> ClientDto {
     let (ip, mac, subnet, legacy_doh_path, dot_sni) = classify_ids(entry.ids.clone());
+    let (doh_path, has_secret, secret_hint) = match secret {
+        Some(secret) if reveal => (Some(secret.clone()), true, None),
+        Some(secret) => (None, true, Some(secret_hint(secret))),
+        // Legacy path identifiers stored in `ids` are only shown; the shared
+        // secret is the only path/SNI identity accepted by the registry.
+        None => (legacy_doh_path, false, None),
+    };
     ClientDto {
         name: entry.name.clone(),
         ip,
         mac,
         subnet,
         group: entry.group.clone(),
-        // The shared secret is the only path/SNI identity accepted by the
-        // registry; legacy path identifiers stored in `ids` are only shown.
-        doh_path: secret.cloned().or(legacy_doh_path),
+        doh_path,
         dot_sni,
         ignore_query_log: entry.ignore_query_log,
         ignore_stats: entry.ignore_stats,
         use_global_upstreams: Some(entry.use_global_upstreams),
         upstreams: entry.upstreams.clone(),
         trusted: Some(entry.trusted),
+        has_secret,
+        secret_hint,
     }
 }
 
@@ -141,11 +186,13 @@ fn ensure_secret_available(
 }
 
 /// Extracts the shared secret from the DTO's `doh_path`/`dot_sni` inputs.
+/// Masked values (`***...`) are treated as "not supplied" so a GET→PUT
+/// round-trip cannot overwrite the stored secret with a marker.
 fn payload_secret(doh_path: Option<&String>, dot_sni: Option<&String>) -> Option<String> {
     doh_path
         .or(dot_sni)
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && !is_secret_mask(s))
 }
 
 fn group_to_dto(name: &str, group: &ClientGroupConfig) -> ClientGroupDto {
@@ -182,7 +229,7 @@ pub async fn get_clients(
     Json(
         cfg.entries
             .iter()
-            .map(|entry| client_to_dto(entry, cfg.client_id_secrets.get(&entry.name)))
+            .map(|entry| client_to_dto(entry, cfg.client_id_secrets.get(&entry.name), false))
             .collect(),
     )
 }
@@ -237,15 +284,17 @@ pub async fn create_client(
     Ok(Json(client_to_dto(
         &entry,
         cfg.client_id_secrets.get(&entry.name),
+        false,
     )))
 }
 
 #[utoipa::path(
     get,
     path = "/api/v1/clients/{name}",
-    params(("name" = String, Path, description = "Client name")),
+    params(("name" = String, Path, description = "Client name"), ClientRevealQuery),
     responses(
-        (status = 200, description = "Client details retrieved", body = ClientDto),
+        (status = 200, description = "Client details retrieved (shared secret replaced by a marker unless ?reveal=1)", body = ClientDto),
+        (status = 403, description = "Revealing a secret requires the Admin role"),
         (status = 404, description = "Not Found"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
@@ -254,10 +303,25 @@ pub async fn create_client(
 )]
 #[allow(clippy::unused_async)]
 pub async fn get_client_by_name(
-    _operator: RequireOperator,
+    operator: RequireOperator,
     State(ctx): State<ServerContext>,
     Path(name): Path<String>,
+    Query(query): Query<ClientRevealQuery>,
 ) -> Result<Json<ClientDto>, ProblemDetails> {
+    let reveal = query.wants_reveal();
+    if reveal && operator.role < Role::Admin {
+        return Err(ProblemDetails::forbidden(
+            "Revealing a client shared secret requires the Admin role",
+        ));
+    }
+    if reveal {
+        tracing::warn!(
+            actor = %operator.username,
+            client = %name,
+            "Client shared secret revealed via API"
+        );
+    }
+
     let cfg = load_clients_config(&ctx);
     let Some(c) = cfg.entries.iter().find(|e| e.name == name) else {
         return Err(ProblemDetails::not_found(format!(
@@ -265,7 +329,11 @@ pub async fn get_client_by_name(
         )));
     };
 
-    Ok(Json(client_to_dto(c, cfg.client_id_secrets.get(&c.name))))
+    Ok(Json(client_to_dto(
+        c,
+        cfg.client_id_secrets.get(&c.name),
+        reveal,
+    )))
 }
 
 #[utoipa::path(
@@ -308,11 +376,14 @@ pub async fn update_client(
         )));
     }
 
+    let mask_echoed = |value: &Option<String>| value.as_deref().is_some_and(is_secret_mask);
+    let doh_supplied = payload.doh_path.is_some() && !mask_echoed(&payload.doh_path);
+    let sni_supplied = payload.dot_sni.is_some() && !mask_echoed(&payload.dot_sni);
     let replace_ids = !payload.ip.is_empty()
         || !payload.mac.is_empty()
         || !payload.subnet.is_empty()
-        || payload.doh_path.is_some()
-        || payload.dot_sni.is_some();
+        || doh_supplied
+        || sni_supplied;
     let secret_input = payload_secret(payload.doh_path.as_ref(), payload.dot_sni.as_ref());
     let ids = if replace_ids {
         build_ids(&payload.ip, &payload.mac, &payload.subnet, None, None)
@@ -354,6 +425,7 @@ pub async fn update_client(
     Ok(Json(client_to_dto(
         &entry,
         cfg.client_id_secrets.get(&entry.name),
+        false,
     )))
 }
 
@@ -698,6 +770,16 @@ mod tests {
         })
     }
 
+    /// An Operator extractor carrying the Admin role (the client-detail
+    /// handler admits Operators and gates `?reveal=1` on `role >= Admin`).
+    fn admin() -> RequireOperator {
+        RequireOperator(AuthUser {
+            username: "admin".to_string(),
+            role: Role::Admin,
+            token_id: None,
+        })
+    }
+
     #[tokio::test]
     async fn test_partial_update_preserves_fields_and_rejects_duplicate_rename() {
         let temp_dir =
@@ -788,6 +870,8 @@ mod tests {
             use_global_upstreams: None,
             upstreams: None,
             trusted: None,
+            has_secret: false,
+            secret_hint: None,
         };
 
         // The secret is trimmed, stored in client_id_secrets and never in ids.
@@ -799,13 +883,44 @@ mod tests {
         .await
         .unwrap()
         .0;
-        assert_eq!(created.doh_path.as_deref(), Some("super-secret"));
+        // The response must not echo the plaintext secret.
+        assert_eq!(created.doh_path, None);
+        assert!(created.has_secret);
+        assert_eq!(created.secret_hint.as_deref(), Some("***cret"));
         let cfg = load_clients_config(&ctx);
         assert_eq!(
             cfg.client_id_secrets.get("phone").map(String::as_str),
             Some("super-secret")
         );
         assert!(!cfg.entries[0].ids.iter().any(|id| id.contains("secret")));
+
+        // GET must not leak the plaintext either; ?reveal=1 is Admin-only.
+        let listed = get_clients(operator(), State(ctx.clone())).await.0;
+        assert_eq!(listed[0].doh_path, None);
+        assert!(listed[0].has_secret);
+        let revealed = get_client_by_name(
+            operator(),
+            State(ctx.clone()),
+            Path("phone".to_string()),
+            Query(ClientRevealQuery {
+                reveal: Some("1".to_string()),
+            }),
+        )
+        .await
+        .expect_err("Operator must not be able to reveal a secret");
+        assert_eq!(revealed.status, 403);
+        let revealed = get_client_by_name(
+            admin(),
+            State(ctx.clone()),
+            Path("phone".to_string()),
+            Query(ClientRevealQuery {
+                reveal: Some("1".to_string()),
+            }),
+        )
+        .await
+        .expect("Admin can reveal the secret")
+        .0;
+        assert_eq!(revealed.doh_path.as_deref(), Some("super-secret"));
 
         // Reusing a secret for another entry is rejected.
         let conflict = create_client(
@@ -852,6 +967,32 @@ mod tests {
                 .client_id_secrets
                 .contains_key("phone")
         );
+
+        // A masked echo in an update must preserve the stored secret.
+        let updated = update_client(
+            operator(),
+            State(ctx.clone()),
+            Path("phone".to_string()),
+            Json(UpdateClientRequest {
+                doh_path: Some("***cret".to_string()),
+                group: Some("kids".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(updated.group, "kids");
+        assert!(updated.has_secret);
+        assert_eq!(
+            load_clients_config(&ctx)
+                .client_id_secrets
+                .get("phone")
+                .map(String::as_str),
+            Some("second-secret"),
+            "a masked value must never overwrite the stored secret"
+        );
+
         let _ = delete_client(operator(), State(ctx.clone()), Path("phone".to_string()))
             .await
             .unwrap();

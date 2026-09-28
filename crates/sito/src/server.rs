@@ -448,22 +448,96 @@ async fn init_runtime_components(
 
 /// Handles shared with [`run_config_watcher`].
 struct ConfigWatcher {
-    config_path: PathBuf,
-    runtime: Arc<sito_runtime::RuntimeState>,
+    ctx: sito_api::ServerContext,
+    /// Hook-owned components shared with the REST/UI config write paths.
+    hooks: Arc<ServerApplyHooks>,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
+/// Applies the components that are not reachable through [`ServerContext`]:
+/// DNSSEC validator, per-client scoped upstreams, rate limiters, DNS listener
+/// rebind and the log level. Shared by the file watcher and the API/UI config
+/// write paths through [`sito_api::config_apply::ConfigApplyHooks`].
+struct ServerApplyHooks {
+    filter: Arc<HostsFilterEngine>,
+    dnssec: Arc<ArcSwap<DnssecValidator>>,
+    scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>>,
+    bootstrap: BootstrapResolver,
     rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
     listener_manager: Arc<tokio::sync::Mutex<Option<DnsListenerManager>>>,
     listener_acceptors: Arc<tokio::sync::Mutex<Option<ListenerAcceptors>>>,
     pipeline: Arc<DnsPipeline>,
-    filter: Arc<HostsFilterEngine>,
-    coordinator: Option<sito_ha::MasterCoordinator>,
-    upstream: Arc<UpstreamManager>,
-    bootstrap: BootstrapResolver,
-    querylog: sito_stats::QueryLogSender,
-    cache: Arc<DnsCache>,
-    dnssec: Arc<ArcSwap<DnssecValidator>>,
-    scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>>,
-    metrics: sito_stats::MetricsRegistry,
-    shutdown_rx: watch::Receiver<bool>,
+}
+
+impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
+    fn apply<'a>(
+        &'a self,
+        cfg: &'a Config,
+        clients: &'a sito_clients::ClientsConfig,
+    ) -> sito_api::config_apply::ApplyFuture<'a> {
+        Box::pin(async move {
+            if crate::logging::reload_level(&cfg.server.log_level) {
+                info!(
+                    level = %cfg.server.log_level,
+                    "Applied hot-reloaded log level"
+                );
+            }
+
+            // Per-group rule sets must follow the client policy snapshot.
+            self.filter.set_group_rules(group_rule_sets(clients));
+
+            // DNSSEC settings are not read through the config snapshot at query
+            // time; swap the validator so mode/anchors/NTAs apply immediately.
+            self.dnssec
+                .store(Arc::new(DnssecValidator::from_config(&cfg.dns.dnssec)));
+
+            // Rebuild per-client upstream scopes, reusing managers whose
+            // upstream set is unchanged.
+            let rebuilt_scoped = {
+                let existing = self.scoped_upstreams.load_full();
+                build_scoped_upstreams(cfg, &self.bootstrap, clients, &existing).await
+            };
+            self.scoped_upstreams.store(Arc::new(rebuilt_scoped));
+
+            if let Ok(limiters) = self.rate_limiters.lock() {
+                for limiter in limiters.iter() {
+                    limiter.set_rate(cfg.dns.rate_limit_per_ip);
+                }
+            }
+
+            // Rebind listeners when bind/port/related settings change. The
+            // manager stays in the slot across failures so a later event can
+            // retry instead of orphaning the server.
+            {
+                let mut slot = self.listener_manager.lock().await;
+                if let Some(manager) = slot.as_mut()
+                    && manager.needs_restart(cfg)
+                {
+                    let acceptors = self.listener_acceptors.lock().await.clone();
+                    if let Some(acceptors) = acceptors {
+                        info!("DNS listener bindings changed; rebinding in-process");
+                        if let Err(e) = manager
+                            .restart(
+                                cfg,
+                                self.pipeline.clone(),
+                                acceptors,
+                                self.rate_limiters.clone(),
+                            )
+                            .await
+                        {
+                            return Err(sito_api::error::ProblemDetails::internal_error(format!(
+                                "Failed to rebind DNS listeners: {e}"
+                            )));
+                        }
+                    } else {
+                        warn!("Listener TLS acceptors unavailable; keeping current listeners");
+                    }
+                }
+            }
+
+            Ok(())
+        })
+    }
 }
 
 /// Watches the configuration file and applies hot reloads in-process. Returns
@@ -471,23 +545,11 @@ struct ConfigWatcher {
 /// the watched directory disappears.
 async fn run_config_watcher(watcher: ConfigWatcher) {
     let ConfigWatcher {
-        config_path: watcher_config_path,
-        runtime: watcher_runtime,
-        rate_limiters: watcher_rate_limiters,
-        listener_manager: watcher_listener_manager,
-        listener_acceptors: watcher_listener_acceptors,
-        pipeline: watcher_pipeline,
-        filter: watcher_filter,
-        coordinator: watcher_coordinator,
-        upstream: watcher_upstream,
-        bootstrap: watcher_bootstrap,
-        querylog: watcher_querylog,
-        cache: watcher_cache,
-        dnssec: watcher_dnssec,
-        scoped_upstreams: watcher_scoped_upstreams,
-        metrics: watcher_metrics,
+        ctx,
+        hooks,
         shutdown_rx: mut watcher_shutdown_rx,
     } = watcher;
+    let watcher_config_path = ctx.config_path.clone();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let event_filter_path = watcher_config_path.clone();
@@ -540,166 +602,33 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
                 match tokio::fs::read_to_string(&watcher_config_path).await {
                     Ok(content) => match Config::from_toml_str(&content) {
                         Ok(new_cfg) => {
-                            if let Err(e) = validate_typed_sections(&new_cfg) {
-                                error!(
-                                    error = %e,
-                                    "Rejecting config hot-reload: invalid configuration section"
-                                );
-                                continue;
-                            }
                             info!("Detected configuration file change, hot-reloading");
-                            if crate::logging::reload_level(&new_cfg.server.log_level) {
-                                info!(
-                                    level = %new_cfg.server.log_level,
-                                    "Applied hot-reloaded log level"
-                                );
-                            }
-                            let filter_started = std::time::Instant::now();
-                            match watcher_filter.reload_with_config(&new_cfg.filtering).await {
-                                Ok(_) => {
-                                    watcher_metrics
-                                        .set_filter_rules(watcher_filter.rule_count());
-                                    watcher_metrics.observe_filter_compile(
-                                        filter_started.elapsed().as_secs_f64(),
-                                    );
-                                    // Filter rules changed: previously allowed
-                                    // responses may now be blocked, so cached
-                                    // entries must not outlive the old rules.
-                                    watcher_cache.flush();
-                                }
-                                Err(e) => {
-                                    error!(error = %e, "Failed to hot-reload filter configuration");
-                                }
-                            }
-                            let new_rewrites_cfg = match rewrites_from_config(&new_cfg) {
-                                Ok(cfg) => cfg,
-                                Err(e) => {
-                                    error!(error = %e, "Rejecting config hot-reload");
-                                    continue;
-                                }
-                            };
-                            let new_rewrites =
-                                sito_rewrites::RewriteTable::new(new_rewrites_cfg);
-
-                            let new_clients_cfg = match clients_from_config(&new_cfg) {
-                                Ok(cfg) => cfg,
-                                Err(e) => {
-                                    error!(error = %e, "Rejecting config hot-reload");
-                                    continue;
-                                }
-                            };
-                            // Refresh per-group rule sets after both the lists
-                            // and the group policy have been re-read.
-                            watcher_filter.set_group_rules(group_rule_sets(&new_clients_cfg));
-                            // Carry the RouterOS lease store across the reload so
-                            // the running sync task keeps feeding the new registry.
-                            let leases = watcher_runtime
-                                .snapshot()
-                                .clients
-                                .routeros_leases_store();
-                            let new_clients = sito_clients::ClientRegistry::with_routeros_leases(
-                                new_clients_cfg.clone(),
-                                leases,
-                            );
-
-                            // DNSSEC settings are not read through the config
-                            // snapshot at query time; swap the validator so
-                            // mode/anchors/NTAs apply immediately.
-                            watcher_dnssec.store(Arc::new(DnssecValidator::from_config(
-                                &new_cfg.dns.dnssec,
-                            )));
-
-                            // Rebuild per-client upstream scopes, reusing
-                            // managers whose upstream set is unchanged.
-                            let rebuilt_scoped = {
-                                let existing = watcher_scoped_upstreams.load_full();
-                                build_scoped_upstreams(
-                                    &new_cfg,
-                                    &watcher_bootstrap,
-                                    &new_clients_cfg,
-                                    &existing,
-                                )
-                                .await
-                            };
-                            watcher_scoped_upstreams.store(Arc::new(rebuilt_scoped));
-
-                            if let Err(e) = watcher_upstream
-                                .reload(&new_cfg.upstream, &watcher_bootstrap)
-                                .await
+                            // Same apply/validate pipeline as every API write
+                            // path; a rejected configuration leaves the running
+                            // components untouched.
+                            match sito_api::config_apply::apply_full_config(
+                                &ctx,
+                                &new_cfg,
+                                sito_api::config_apply::FilterApply::Sync,
+                                Some(&*hooks),
+                            )
+                            .await
                             {
-                                warn!("Failed to hot-reload upstream configuration: {e}");
-                            }
-                            watcher_querylog
-                                .set_anonymize(new_cfg.privacy.anonymize_querylog);
-                            watcher_cache.update_config(new_cfg.dns.cache.clone()).await;
-                            if let Ok(limiters) = watcher_rate_limiters.lock() {
-                                for limiter in limiters.iter() {
-                                    limiter.set_rate(new_cfg.dns.rate_limit_per_ip);
-                                }
-                            }
-
-                            // Publish config, clients and rewrites together so a
-                            // query cannot observe a half-applied reload.
-                            watcher_runtime.replace(sito_runtime::RuntimeSnapshot {
-                                config: Arc::new(new_cfg.clone()),
-                                clients: Arc::new(new_clients),
-                                rewrites: Arc::new(new_rewrites),
-                            });
-
-                            // Rebind listeners when bind/port/related settings change.
-                            // The manager stays in the slot across failures so a
-                            // later event can retry instead of orphaning the server.
-                            {
-                                let mut slot = watcher_listener_manager.lock().await;
-                                if let Some(manager) = slot.as_mut()
-                                    && manager.needs_restart(&new_cfg)
-                                {
-                                    let acceptors =
-                                        watcher_listener_acceptors.lock().await.clone();
-                                    if let Some(acceptors) = acceptors {
-                                        info!("DNS listener bindings changed; rebinding in-process");
-                                        if let Err(e) = manager
-                                            .restart(
-                                                &new_cfg,
-                                                watcher_pipeline.clone(),
-                                                acceptors,
-                                                watcher_rate_limiters.clone(),
-                                            )
-                                            .await
-                                        {
-                                            error!("Failed to rebind DNS listeners: {e}");
-                                        }
-                                    } else {
+                                Ok(report) => {
+                                    if !report.restart_required.is_empty() {
                                         warn!(
-                                            "Listener TLS acceptors unavailable; keeping current listeners"
+                                            fields = ?report.restart_required,
+                                            "Configuration hot-reloaded; these settings need a restart to take effect"
                                         );
                                     }
+                                    ctx.publish_bundle().await;
                                 }
-                            }
-
-                            if let Some(ref coord) = watcher_coordinator {
-                                let next_version = coord.get_current_version() + 1;
-                                let sanitized_toml = sito_ha::sanitize_config_for_bundle(&content).unwrap_or_default();
-                                let list_metadata = new_cfg.filtering.lists.iter().map(|l| sito_ha::FilterListMetadata {
-                                    name: l.name.clone(),
-                                    url: l.url.clone(),
-                                    enabled: l.enabled,
-                                    refresh_hours: l.refresh_hours,
-                                }).collect();
-
-                                #[allow(clippy::cast_sign_loss)]
-                                let new_bundle = sito_ha::ConfigBundle {
-                                    version: next_version,
-                                    timestamp: chrono::Utc::now().timestamp_millis() as u64,
-                                    config_toml: sanitized_toml,
-                                    custom_rules: new_cfg.filtering.custom_rules.clone(),
-                                    rewrites: new_cfg.rewrites.clone(),
-                                    clients: new_cfg.clients.clone(),
-                                    lists: list_metadata,
-                                };
-
-                                if let Err(e) = coord.update_bundle(new_bundle) {
-                                    warn!("Failed to broadcast updated bundle to slaves: {e}");
+                                Err(e) => {
+                                    error!(
+                                        status = e.status,
+                                        detail = %e.detail,
+                                        "Rejecting config hot-reload: configuration cannot be applied"
+                                    );
                                 }
                             }
                         }
@@ -886,6 +815,27 @@ pub async fn run_server_full(
         None
     };
 
+    // Rate limiters created by listeners; shared so hot reloads can update them.
+    let rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Listener generation and TLS acceptors, shared so bind/port changes can be
+    // applied in-process by the watcher and the API/UI config write paths.
+    let listener_manager: Arc<tokio::sync::Mutex<Option<DnsListenerManager>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let listener_acceptors: Arc<tokio::sync::Mutex<Option<ListenerAcceptors>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    let apply_hooks = Arc::new(ServerApplyHooks {
+        filter: filter_engine.clone(),
+        dnssec: dnssec_swap.clone(),
+        scoped_upstreams: scoped_upstreams.clone(),
+        bootstrap: bootstrap.clone(),
+        rate_limiters: rate_limiters.clone(),
+        listener_manager: listener_manager.clone(),
+        listener_acceptors: listener_acceptors.clone(),
+        pipeline: pipeline.clone(),
+    });
+
     let server_ctx = sito_api::ServerContext {
         config: config_arc.clone(),
         runtime: runtime.clone(),
@@ -909,7 +859,10 @@ pub async fn run_server_full(
         dns_starter,
     };
 
-    let api_router = sito_api::create_router(server_ctx);
+    let api_router = sito_api::create_router_with_hooks(
+        server_ctx.clone(),
+        sito_api::config_apply::ApplyHooks::new(apply_hooks.clone()),
+    );
     let web_cfg = config_arc.load().get_web_config();
     if web_cfg.enabled {
         let web_addr = SocketAddr::new(web_cfg.bind, web_cfg.port);
@@ -965,33 +918,11 @@ pub async fn run_server_full(
         }
     });
 
-    // Rate limiters created by listeners; shared so the watcher can hot-update.
-    let rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    // Listener generation and TLS acceptors, shared with the config watcher so
-    // bind/port changes can be applied in-process.
-    let listener_manager: Arc<tokio::sync::Mutex<Option<DnsListenerManager>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-    let listener_acceptors: Arc<tokio::sync::Mutex<Option<ListenerAcceptors>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-
-    // Spawn config file watcher for hot-reload
+    // Spawn config file watcher for hot-reload. It shares the same
+    // apply/validate pipeline and hook components as the API/UI write paths.
     tokio::spawn(run_config_watcher(ConfigWatcher {
-        config_path: config_path_buf.clone(),
-        runtime: runtime.clone(),
-        rate_limiters: rate_limiters.clone(),
-        listener_manager: listener_manager.clone(),
-        listener_acceptors: listener_acceptors.clone(),
-        pipeline: pipeline.clone(),
-        filter: filter_engine.clone(),
-        coordinator: master_coordinator.clone(),
-        upstream: upstream_manager.clone(),
-        bootstrap: bootstrap.clone(),
-        querylog: querylog_sender.clone(),
-        cache: cache.clone(),
-        dnssec: dnssec_swap.clone(),
-        scoped_upstreams: scoped_upstreams.clone(),
-        metrics: metrics.clone(),
+        ctx: server_ctx,
+        hooks: apply_hooks,
         shutdown_rx: shutdown_rx.clone(),
     }));
 

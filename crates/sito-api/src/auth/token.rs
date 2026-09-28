@@ -58,6 +58,10 @@ pub struct ApiTokenMeta {
     /// Unix timestamp after which the token is rejected (`None` = no expiry).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
+    /// User-secret generation the token was issued under; a global reset
+    /// invalidates tokens even if their persisted file survives.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// Response returned when creating an API token.
@@ -92,6 +96,7 @@ pub fn generate_token(name: &str, scope: Role) -> (ApiTokenMeta, CreateTokenResp
         created_at: now,
         last_used: None,
         expires_at: None,
+        generation: 0,
     };
 
     let response = CreateTokenResponse {

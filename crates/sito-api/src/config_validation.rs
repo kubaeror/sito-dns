@@ -42,6 +42,29 @@ pub fn validate_typed_sections(config: &Config) -> anyhow::Result<()> {
             .clone()
             .try_into()
             .map_err(|e| anyhow::anyhow!("invalid [web] configuration: {e}"))?;
+        // Admin-scheme settings (unknown to the typed WebConfig so they stay
+        // forward-compatible) are validated here.
+        if let Some(public_url) = value.get("public_url") {
+            let url = public_url.as_str().ok_or_else(|| {
+                anyhow::anyhow!("invalid [web] configuration: public_url must be a string")
+            })?;
+            let scheme_ok = url.split_once("://").is_some_and(|(scheme, rest)| {
+                !rest.is_empty()
+                    && (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+            });
+            if !scheme_ok {
+                return Err(anyhow::anyhow!(
+                    "invalid [web] configuration: public_url '{url}' must start with http:// or https://"
+                ));
+            }
+        }
+        if let Some(flag) = value.get("tls_terminated_by_proxy")
+            && !flag.is_bool()
+        {
+            return Err(anyhow::anyhow!(
+                "invalid [web] configuration: tls_terminated_by_proxy must be a boolean"
+            ));
+        }
     }
     if let Some(value) = config.auth.as_ref() {
         let _: sito_core::config::AuthConfig = value
@@ -87,5 +110,31 @@ mod tests {
         )
         .expect("parses");
         validate_typed_sections(&config).expect("valid sections");
+    }
+
+    #[test]
+    fn test_validates_admin_scheme_settings() {
+        let valid = Config::from_toml_str(
+            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[web]\npublic_url = \"https://dns.example.com\"\ntls_terminated_by_proxy = true\n",
+        )
+        .expect("parses");
+        validate_typed_sections(&valid).expect("valid admin scheme settings");
+
+        let bad_url = Config::from_toml_str(
+            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[web]\npublic_url = \"ftp://dns.example.com\"\n",
+        )
+        .expect("parses");
+        let err = validate_typed_sections(&bad_url).expect_err("ftp scheme rejected");
+        assert!(err.to_string().contains("public_url"), "got: {err}");
+
+        let bad_flag = Config::from_toml_str(
+            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[web]\ntls_terminated_by_proxy = \"yes\"\n",
+        )
+        .expect("parses");
+        let err = validate_typed_sections(&bad_flag).expect_err("non-bool rejected");
+        assert!(
+            err.to_string().contains("tls_terminated_by_proxy"),
+            "got: {err}"
+        );
     }
 }
