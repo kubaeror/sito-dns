@@ -727,7 +727,9 @@ impl QueryHandler for DnsPipeline {
         let rewrites = &runtime_snapshot.rewrites;
 
         let mut client = client;
-        let now = chrono::Utc::now();
+        // Evaluate schedules against the configured `clients.timezone`
+        // (default: the system-local zone) instead of UTC.
+        let now = clients.now();
         let policy = clients.resolve(&mut client, now);
 
         // Per-client upstream scope (falls back to the global manager).

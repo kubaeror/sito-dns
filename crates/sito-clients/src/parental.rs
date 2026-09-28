@@ -160,9 +160,18 @@ impl ParentalRegistry {
     }
 
     /// Replaces the content of a category with a newline-delimited text list.
-    pub fn set_category_list(&mut self, category: &str, content: &str) {
-        self.categories.remove(&category.to_ascii_lowercase());
+    ///
+    /// Returns the number of distinct domains stored. Malformed lines,
+    /// hosts-file IP addresses and ignored boilerplate hostnames are not
+    /// counted, so callers can use the result as an accurate entry count and
+    /// as the baseline for truncation guards.
+    pub fn set_category_list(&mut self, category: &str, content: &str) -> u64 {
+        let key = category.to_ascii_lowercase();
+        self.categories.remove(&key);
         self.add_category_list(category, content);
+        self.categories
+            .get(&key)
+            .map_or(0, |domains| domains.len() as u64)
     }
 
     /// Add or append domains from a newline-delimited text list to a category.

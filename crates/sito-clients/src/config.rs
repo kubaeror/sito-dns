@@ -5,10 +5,28 @@ use std::collections::HashMap;
 
 use crate::safe_search::YouTubeSafeSearchMode;
 use crate::schedule::Schedule;
+use crate::timezone::ClientTimeZone;
 
 /// Clients configuration section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ClientsConfig {
+    /// Timezone used to evaluate group and blocked-service cron schedules
+    /// (default: `"local"`, the host's system timezone).
+    ///
+    /// Accepted values:
+    /// - `"local"` (default) or `"system"` — the host's system timezone,
+    ///   resolved for each evaluated timestamp (DST-aware).
+    /// - `"UTC"`, `"GMT"` or `"Z"`.
+    /// - a fixed numeric UTC offset such as `"+02:00"`, `"-05:30"`, `"+0530"`
+    ///   or `"UTC+2"` — no DST transitions.
+    ///
+    /// IANA zone names (`"Europe/Warsaw"`) are rejected at config-parse time
+    /// because this build does not link a timezone database (`chrono-tz` is
+    /// not a workspace dependency); use a fixed offset instead. Before this
+    /// setting existed, schedules were always evaluated in UTC, so a window
+    /// like `0 0 15-21 * * MON-FRI` silently shifted by the host's UTC offset.
+    #[serde(default, skip_serializing_if = "ClientTimeZone::is_local")]
+    pub timezone: ClientTimeZone,
     #[serde(default)]
     pub entries: Vec<ClientEntryConfig>,
     #[serde(default)]

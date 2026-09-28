@@ -13,8 +13,16 @@
 //! Expressions containing ranges/lists/steps in the hour or minute fields are
 //! widened to the matching window (e.g. `0 0 15-21 * * MON-FRI` is active all
 //! through 15:00-21:59). Use `0 0 9-17 * * *`-style ranges for time windows.
+//!
+//! # Timezone
+//!
+//! [`Schedule::is_active`] evaluates against the wall clock of the timestamp
+//! it is given; the timestamp's timezone is honored (its `DateTime<Tz>` local
+//! fields are matched). Callers convert the configured `clients.timezone`
+//! first — see [`crate::timezone::ClientTimeZone`] and
+//! [`crate::registry::ClientRegistry::resolve`].
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone};
 use croner::Cron;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -111,11 +119,18 @@ impl Schedule {
 
     /// Check if the schedule is active at the specified timestamp.
     ///
+    /// The timestamp's timezone determines the wall clock the cron fields are
+    /// matched against: pass the instant converted to the configured
+    /// `clients.timezone` (see [`crate::timezone::ClientTimeZone`]).
+    ///
     /// Evaluation fails closed: if `croner` cannot evaluate the expression at
     /// this instant (e.g. due to a clock/date edge case), the schedule is
     /// treated as active so filtering/safe-search policy remains enforced and
     /// a warning is logged. This never silently disables a policy.
-    pub fn is_active(&self, timestamp: &DateTime<Utc>) -> bool {
+    pub fn is_active<Tz: TimeZone>(&self, timestamp: &DateTime<Tz>) -> bool
+    where
+        Tz::Offset: fmt::Display,
+    {
         if let Some(ref window) = self.window_cron
             && let Ok(matching) = window.is_time_matching(timestamp)
             && matching
@@ -442,7 +457,7 @@ fn build_window_cron(expr: &str) -> Option<Cron> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn test_valid_6_field_cron() {
@@ -556,6 +571,35 @@ mod tests {
         // 6. Weekend check: 16:00:00 Saturday 2026-09-12 -> inactive
         let t_weekend = Utc.with_ymd_and_hms(2026, 9, 12, 16, 0, 0).unwrap();
         assert!(!schedule.is_active(&t_weekend), "Saturday must be inactive");
+    }
+
+    #[test]
+    fn test_is_active_honors_timestamp_timezone() {
+        use chrono::{FixedOffset, Timelike};
+
+        // 15:00-21:59 local, Monday-Friday.
+        let schedule = Schedule::parse("0 0 15-21 * * MON-FRI").unwrap();
+
+        // Same instant: 10:00 UTC is 15:00 at UTC+05:00.
+        let at_10_utc = Utc.with_ymd_and_hms(2026, 9, 7, 10, 0, 0).unwrap();
+        assert!(
+            !schedule.is_active(&at_10_utc),
+            "10:00 UTC must not match a 15:00 local window"
+        );
+
+        let plus_five = FixedOffset::east_opt(5 * 3600).unwrap();
+        let at_15_plus_five = at_10_utc.with_timezone(&plus_five);
+        assert_eq!(at_15_plus_five.hour(), 15);
+        assert!(
+            schedule.is_active(&at_15_plus_five),
+            "15:00 at UTC+05:00 must match the configured window"
+        );
+
+        // The same wall-clock fields in a Western zone are outside the window.
+        let minus_five = FixedOffset::west_opt(5 * 3600).unwrap();
+        let at_05_minus_five = at_10_utc.with_timezone(&minus_five);
+        assert_eq!(at_05_minus_five.hour(), 5);
+        assert!(!schedule.is_active(&at_05_minus_five));
     }
 
     #[test]
