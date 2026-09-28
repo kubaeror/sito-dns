@@ -116,6 +116,53 @@ fn decode_base64url(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
 }
 
+/// Decodes one form-urlencoded component (`+` is a space, `%XX` escapes are
+/// percent-decoded).
+fn form_url_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let high = (bytes[i + 1] as char).to_digit(16);
+                let low = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(high), Some(low)) = (high, low) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    out.push((high * 16 + low) as u8);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Extracts the `dns` query parameter with the same form-urlencoded semantics
+/// as the DoH (axum) path: percent-encoded values are decoded and the last
+/// occurrence wins when the parameter is repeated.
+fn decode_dns_query_param(query: &str) -> Option<String> {
+    let mut value = None;
+    for pair in query.split('&') {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        if form_url_decode(raw_key) == "dns" {
+            value = Some(form_url_decode(raw_value));
+        }
+    }
+    value
+}
+
 /// Start the DNS over HTTP/3 (DoH3) listener.
 pub async fn start_doh3_listener<H: QueryHandler + 'static>(
     config: Doh3Config,
@@ -143,7 +190,7 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
     let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
         Arc::new(RateLimiter::new(
             config.rate_limit_per_ip,
-            config.rate_limit_per_ip * 2,
+            RateLimiter::burst_for_rate(config.rate_limit_per_ip),
         ))
     });
     rate_limiter.spawn_pruner(shutdown_rx.clone());
@@ -381,16 +428,7 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                     }
                                     http::Method::GET => {
                                         let query_str = req.uri().query().unwrap_or("");
-                                        let mut dns_param = None;
-                                        for pair in query_str.split('&') {
-                                            if let Some((k, v)) = pair.split_once('=')
-                                                && k == "dns" {
-                                                    dns_param = Some(v);
-                                                    break;
-                                                }
-                                        }
-
-                                        let Some(param) = dns_param else {
+                                        let Some(param) = decode_dns_query_param(query_str) else {
                                             let resp = http::Response::builder()
                                                 .status(http::StatusCode::BAD_REQUEST)
                                                 .body(())
@@ -400,7 +438,7 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                             return;
                                         };
 
-                                        match decode_base64url(param) {
+                                        match decode_base64url(&param) {
                                             Ok(b) if b.len() <= MAX_DOH3_BODY_BYTES => b,
                                             Ok(_) => {
                                                 let resp = http::Response::builder()
@@ -671,10 +709,64 @@ mod tests {
         let get_dns_resp = decode_message(&get_body).unwrap();
         assert_eq!(get_dns_resp.metadata.id, 8001);
 
+        // 3. GET with percent-encoded base64 padding (`%3D`): the DoH (axum)
+        // path percent-decodes the query parameter, so DoH3 must too.
+        let padded = base64::engine::general_purpose::URL_SAFE.encode(&wire_query);
+        assert!(
+            padded.contains('='),
+            "test fixture must produce base64 padding to exercise %3D decoding"
+        );
+        let percent_encoded = padded.replace('=', "%3D");
+        let req_percent = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(format!("https://localhost/dns-query?dns={percent_encoded}"))
+            .header(http::header::ACCEPT, "application/dns-message")
+            .body(())
+            .unwrap();
+
+        let mut percent_stream = send_request.send_request(req_percent).await.unwrap();
+        percent_stream.finish().await.unwrap();
+
+        let percent_resp = percent_stream.recv_response().await.unwrap();
+        assert_eq!(percent_resp.status(), http::StatusCode::OK);
+
+        let mut percent_body = Vec::new();
+        while let Some(mut chunk) = percent_stream.recv_data().await.unwrap() {
+            percent_body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
+        }
+        let percent_dns_resp = decode_message(&percent_body).unwrap();
+        assert_eq!(percent_dns_resp.metadata.id, 8001);
+
         drop(send_request);
         driver_task.abort();
         let _ = shutdown_tx.send(true);
         let _ = listener_handle.await;
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Regression: the GET `dns` parameter used to be split on `&`/`=` without
+    /// percent-decoding, so a `%3D`-encoded (padded) base64 value was rejected
+    /// even though the DoH path accepts it.
+    #[test]
+    fn test_doh3_get_dns_param_decoding_matches_doh() {
+        assert_eq!(decode_dns_query_param("dns=abc"), Some("abc".to_string()));
+        // Percent-encoded '=' (base64 padding) must survive decoding.
+        assert_eq!(
+            decode_dns_query_param("dns=ab%3D%3D"),
+            Some("ab==".to_string())
+        );
+        // Percent-encoded key.
+        assert_eq!(decode_dns_query_param("%64ns=abc"), Some("abc".to_string()));
+        // `+` is a space in form-urlencoded data.
+        assert_eq!(decode_dns_query_param("dns=a+b"), Some("a b".to_string()));
+        // The last occurrence wins, matching the DoH HashMap extractor.
+        assert_eq!(
+            decode_dns_query_param("dns=first&dns=second"),
+            Some("second".to_string())
+        );
+        // A value containing '=' is not truncated.
+        assert_eq!(decode_dns_query_param("dns=a=b"), Some("a=b".to_string()));
+        assert_eq!(decode_dns_query_param("other=abc"), None);
+        assert_eq!(decode_dns_query_param(""), None);
     }
 }

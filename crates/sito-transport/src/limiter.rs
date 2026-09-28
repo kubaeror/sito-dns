@@ -50,11 +50,18 @@ impl RateLimiter {
         }
     }
 
+    /// Burst allowance derived from a configured per-IP rate (twice the rate),
+    /// saturating instead of overflowing for extreme configuration values.
+    #[must_use]
+    pub const fn burst_for_rate(rate_per_sec: u32) -> u32 {
+        rate_per_sec.saturating_mul(2)
+    }
+
     /// Applies a new rate limit. `rate_per_sec = 0` disables limiting.
     pub fn set_rate(&self, rate_per_sec: u32) {
         self.rate_per_sec.store(rate_per_sec, Ordering::Relaxed);
         self.burst
-            .store(rate_per_sec.saturating_mul(2).max(1), Ordering::Relaxed);
+            .store(Self::burst_for_rate(rate_per_sec).max(1), Ordering::Relaxed);
     }
 
     /// Check if a request from the given IP is allowed.
@@ -193,6 +200,16 @@ mod tests {
         for _ in 0..100 {
             assert!(limiter.check(ip));
         }
+    }
+
+    /// Regression: the derived burst must saturate for extreme configured
+    /// rates instead of overflowing (which panicked in debug builds).
+    #[test]
+    fn test_rate_limiter_burst_for_rate_saturates() {
+        assert_eq!(RateLimiter::burst_for_rate(0), 0);
+        assert_eq!(RateLimiter::burst_for_rate(20), 40);
+        assert_eq!(RateLimiter::burst_for_rate(u32::MAX / 2), u32::MAX - 1);
+        assert_eq!(RateLimiter::burst_for_rate(u32::MAX), u32::MAX);
     }
 
     #[test]

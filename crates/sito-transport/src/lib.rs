@@ -1298,4 +1298,129 @@ mod tests {
                 .expect("UDP worker task panicked");
         }
     }
+
+    /// Regression: every listener derives its rate-limiter burst from
+    /// `rate_limit_per_ip`. The previous `rate_limit_per_ip * 2` overflowed
+    /// (panicking in debug builds) for extreme configured rates; starting a
+    /// listener with `u32::MAX` must be safe.
+    #[tokio::test]
+    async fn test_extreme_rate_limit_does_not_overflow_any_listener() {
+        use crate::tls::generate_test_cert;
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_rate_limit_overflow_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+        let server_config =
+            load_server_config(&cert_file, &key_file, &[], vec![b"dot".to_vec()]).unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // UDP
+        let udp_probe = create_reuseport_udp_socket(&"127.0.0.1:0".parse().unwrap()).unwrap();
+        let udp_port = udp_probe.local_addr().unwrap().port();
+        drop(udp_probe);
+        let udp_handles = start_udp_listener(
+            &UdpConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], udp_port)),
+                worker_count: 1,
+                edns_udp_size: 1232,
+                rate_limit_per_ip: u32::MAX,
+                rate_limiter: None,
+            },
+            &handler,
+            &shutdown_rx,
+        )
+        .unwrap();
+
+        // TCP
+        let tcp_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp_probe.local_addr().unwrap().port();
+        drop(tcp_probe);
+        let tcp_handle = start_tcp_listener(
+            TcpConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], tcp_port)),
+                rate_limit_per_ip: u32::MAX,
+                rate_limiter: None,
+                ..TcpConfig::default()
+            },
+            handler.clone(),
+            shutdown_rx.clone(),
+        )
+        .await
+        .unwrap();
+
+        // DoT
+        let dot_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dot_port = dot_probe.local_addr().unwrap().port();
+        drop(dot_probe);
+        let mut dot_config = DotConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], dot_port)),
+            acceptor_mgr.clone(),
+        );
+        dot_config.rate_limit_per_ip = u32::MAX;
+        dot_config.rate_limiter = None;
+        let dot_handle = start_dot_listener(dot_config, handler.clone(), shutdown_rx.clone())
+            .await
+            .unwrap();
+
+        // DoH (plaintext: no TLS acceptor needed)
+        let doh_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let doh_port = doh_probe.local_addr().unwrap().port();
+        drop(doh_probe);
+        let mut doh_config = DohConfig::new(SocketAddr::from(([127, 0, 0, 1], doh_port)), None);
+        doh_config.rate_limit_per_ip = u32::MAX;
+        doh_config.rate_limiter = None;
+        let doh_handle = start_doh_listener(doh_config, handler.clone(), shutdown_rx.clone())
+            .await
+            .unwrap();
+
+        // DoQ
+        let doq_probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let doq_port = doq_probe.local_addr().unwrap().port();
+        drop(doq_probe);
+        let mut doq_config = DoqConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], doq_port)),
+            Some(acceptor_mgr.clone()),
+        );
+        doq_config.rate_limit_per_ip = u32::MAX;
+        doq_config.rate_limiter = None;
+        let doq_handle = start_doq_listener(doq_config, handler.clone(), shutdown_rx.clone())
+            .await
+            .unwrap();
+
+        // DoH3
+        let doh3_probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let doh3_port = doh3_probe.local_addr().unwrap().port();
+        drop(doh3_probe);
+        let mut doh3_config = Doh3Config::new(
+            SocketAddr::from(([127, 0, 0, 1], doh3_port)),
+            Some(acceptor_mgr),
+        );
+        doh3_config.rate_limit_per_ip = u32::MAX;
+        doh3_config.rate_limiter = None;
+        let doh3_handle = start_doh3_listener(doh3_config, handler, shutdown_rx)
+            .await
+            .unwrap();
+
+        let _ = shutdown_tx.send(true);
+        for handle in [tcp_handle, dot_handle, doh_handle, doq_handle, doh3_handle] {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        }
+        for handle in udp_handles {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

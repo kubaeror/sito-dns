@@ -426,7 +426,7 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
         rate_limiter: config.rate_limiter.clone().unwrap_or_else(|| {
             Arc::new(RateLimiter::new(
                 config.rate_limit_per_ip,
-                config.rate_limit_per_ip * 2,
+                RateLimiter::burst_for_rate(config.rate_limit_per_ip),
             ))
         }),
         alt_svc_header,
@@ -616,6 +616,85 @@ mod tests {
         assert_eq!(observed.ip, std::net::Ipv4Addr::LOCALHOST);
         assert_eq!(observed.proto, "doh");
 
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
+    /// Alt-Svc must only be advertised when a DoH3 port is configured; the
+    /// default `DohConfig::new` advertises 443, and `alt_svc_port = None`
+    /// (no DoH3 listener) must produce no header at all.
+    #[tokio::test]
+    async fn test_alt_svc_header_matches_doh3_port_configuration() {
+        use sito_proto::{Message, MessageType, Name, OpCode, Query, RecordType};
+        use std::str::FromStr;
+        use tokio::net::TcpListener;
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let mut query = Message::new(9001, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("alt-svc.example.").unwrap(),
+            RecordType::A,
+        ));
+        let wire = encode_message(&query).unwrap();
+
+        let post = |addr: SocketAddr, wire: Vec<u8>| async move {
+            reqwest::Client::new()
+                .post(format!("http://{addr}/dns-query"))
+                .header("Content-Type", "application/dns-message")
+                .body(wire)
+                .send()
+                .await
+                .unwrap()
+        };
+
+        // No DoH3 port configured: no Alt-Svc advertisement.
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = start_doh_listener(
+            DohConfig::new(addr, None).with_alt_svc_port(None),
+            Arc::clone(&handler),
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+
+        let resp = post(addr, wire.clone()).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert!(
+            resp.headers().get("alt-svc").is_none(),
+            "Alt-Svc must not be advertised without a DoH3 port"
+        );
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+
+        // Configured DoH3 port: advertised as h3.
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = start_doh_listener(
+            DohConfig::new(addr, None).with_alt_svc_port(Some(8443)),
+            handler,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+
+        let resp = post(addr, wire).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("alt-svc").map(|v| v.to_str().unwrap()),
+            Some("h3=\":8443\"; ma=86400")
+        );
         let _ = shutdown_tx.send(true);
         handle.await.unwrap();
     }

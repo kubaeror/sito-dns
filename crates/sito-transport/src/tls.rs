@@ -13,7 +13,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio_rustls::TlsAcceptor;
@@ -385,11 +385,72 @@ impl TlsAcceptorManager {
 
 /// Filesystem watcher that automatically reloads TLS certificates on modification.
 pub struct CertWatcher {
-    _watcher: RecommendedWatcher,
+    _watcher: Arc<Mutex<RecommendedWatcher>>,
+}
+
+/// Makes `path` absolute without resolving symlinks: notify reports event
+/// paths in the form they were watched, and a symlinked certificate path must
+/// still match its own events.
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    }
+}
+
+/// Registers a direct watch on each file (in-place rewrites) plus a
+/// non-recursive watch on its parent directory (atomic replacements via
+/// rename, which destroy the direct file watch on Linux).
+///
+/// Every failure is logged at `error` level and does not abort the remaining
+/// watches: a silently disabled certificate reload is worse than a noisy log.
+fn register_watches(watcher: &mut RecommendedWatcher, files: &[PathBuf]) -> usize {
+    let mut registered = 0usize;
+    let mut dirs_done: Vec<PathBuf> = Vec::new();
+
+    for file in files {
+        if file.exists() {
+            match watcher.watch(file, RecursiveMode::NonRecursive) {
+                Ok(()) => registered += 1,
+                Err(e) => error!(
+                    path = %file.display(),
+                    error = %e,
+                    "Failed to watch TLS certificate/key file; automatic reload \
+                     will not see in-place changes to it"
+                ),
+            }
+        }
+
+        let Some(parent) = file.parent() else {
+            continue;
+        };
+        if dirs_done.iter().any(|dir| dir == parent) {
+            continue;
+        }
+        match watcher.watch(parent, RecursiveMode::NonRecursive) {
+            Ok(()) => registered += 1,
+            Err(e) => error!(
+                path = %parent.display(),
+                error = %e,
+                "Failed to watch TLS certificate directory; automatic reload \
+                 will not see atomic certificate replacements"
+            ),
+        }
+        dirs_done.push(parent.to_path_buf());
+    }
+
+    registered
 }
 
 impl CertWatcher {
     /// Start watching certificate and key files for changes and automatically reload the acceptor.
+    ///
+    /// The configured files are watched directly (in-place rewrites) and their
+    /// parent directories are watched for rename/create events (atomic
+    /// replacements), with events filtered to the configured paths so
+    /// unrelated directory activity does not trigger reloads. Watch setup and
+    /// runtime errors are logged at `error` level.
     pub fn start(
         cert_path: &Path,
         key_path: &Path,
@@ -401,45 +462,67 @@ impl CertWatcher {
         // (e.g. ACME renewal) do not silently drop virtual-host certificates.
         acceptor_mgr.set_sni_certs(sni_certs.to_vec());
 
+        // Every file whose change must trigger a reload (primary cert/key plus
+        // virtual-host pairs), as absolute paths so they compare equal to
+        // notify's event paths.
+        let mut watched_files: Vec<PathBuf> = Vec::with_capacity(2 + sni_certs.len() * 2);
+        for path in std::iter::once(cert_path)
+            .chain(std::iter::once(key_path))
+            .chain(
+                sni_certs
+                    .iter()
+                    .flat_map(|(_, cert, key)| [cert.as_path(), key.as_path()]),
+            )
+        {
+            let absolute = absolute_path(path);
+            if !watched_files.contains(&absolute) {
+                watched_files.push(absolute);
+            }
+        }
+
         let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(16);
+        let event_paths = watched_files.clone();
 
         let mut watcher = RecommendedWatcher::new(
-            move |res: Result<Event, notify::Error>| {
-                if let Ok(event) = res
-                    && (event.kind.is_modify() || event.kind.is_create())
-                {
-                    let _ = tx.blocking_send(());
+            move |res: Result<Event, notify::Error>| match res {
+                Ok(event) => {
+                    // Only changes to the configured files matter; a directory
+                    // watch would otherwise reload on every unrelated file.
+                    let relevant = event.paths.iter().any(|path| event_paths.contains(path));
+                    if relevant
+                        && (event.kind.is_modify()
+                            || event.kind.is_create()
+                            || event.kind.is_remove())
+                    {
+                        // Never block the notify event loop: a full channel
+                        // means the reload task already has pending wake-ups,
+                        // and it re-reads the current files when it runs.
+                        let _ = tx.try_send(());
+                    }
                 }
+                Err(e) => error!(
+                    error = %e,
+                    "TLS certificate watcher reported an error; certificate \
+                     reload may be disabled"
+                ),
             },
             notify::Config::default(),
         )
         .map_err(|e| TlsError::Watch(e.to_string()))?;
 
-        // Watch parent directory of cert and key
-        if let Some(parent) = cert_path.parent() {
-            let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
-        } else {
-            let _ = watcher.watch(cert_path, RecursiveMode::NonRecursive);
-        }
-        if let Some(parent) = key_path.parent() {
-            let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
-        } else {
-            let _ = watcher.watch(key_path, RecursiveMode::NonRecursive);
-        }
+        register_watches(&mut watcher, &watched_files);
 
-        for (_, sni_cert, sni_key) in sni_certs {
-            if let Some(parent) = sni_cert.parent() {
-                let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
-            }
-            if let Some(parent) = sni_key.parent() {
-                let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
-            }
-        }
+        let watcher = Arc::new(Mutex::new(watcher));
+        // The reload task only borrows the watcher: holding an `Arc` there
+        // would keep the watcher (and its inotify event loop) alive after the
+        // `CertWatcher` is dropped.
+        let task_watcher = Arc::downgrade(&watcher);
 
         let cert_path_clone = cert_path.to_path_buf();
         let key_path_clone = key_path.to_path_buf();
         let sni_certs_clone = sni_certs.to_vec();
         let alpn_clone = alpn_protocols.to_vec();
+        let task_files = watched_files.clone();
 
         tokio::spawn(async move {
             while (rx.recv().await).is_some() {
@@ -452,6 +535,14 @@ impl CertWatcher {
                     key = %key_path_clone.display(),
                     "Detected change in TLS certificate/key files; reloading..."
                 );
+
+                // An atomic replacement removes the direct file watch on
+                // Linux; re-register it so later in-place changes are still
+                // noticed.
+                if let Some(watcher) = task_watcher.upgrade() {
+                    let mut watcher = watcher.lock().unwrap_or_else(PoisonError::into_inner);
+                    register_watches(&mut watcher, &task_files);
+                }
 
                 match load_server_config_with_challenges(
                     &cert_path_clone,
@@ -630,6 +721,195 @@ mod tests {
         // Active connection reference still valid and distinct
         let new_config_ref = mgr.current_config();
         assert!(!Arc::ptr_eq(&initial_config_ref, &new_config_ref));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Minimal `tracing::Subscriber` that records error-level events, so the
+    /// watcher's loud failure logging can be asserted without adding a logging
+    /// test dependency.
+    #[derive(Clone, Default)]
+    struct ErrorLog {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ErrorLog {
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    /// Renders all of an event's fields into a string.
+    struct FieldCollector<'a>(&'a mut String);
+
+    impl tracing::field::Visit for FieldCollector<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            let _ = write!(self.0, "{field}={value:?}");
+        }
+    }
+
+    impl tracing::subscriber::Subscriber for ErrorLog {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::ERROR
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() != tracing::Level::ERROR {
+                return;
+            }
+            let mut fields = String::new();
+            event.record(&mut FieldCollector(&mut fields));
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("{}: {fields}", event.metadata().target()));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Waits until the manager's config `Arc` is replaced, failing the test
+    /// after a bounded timeout.
+    async fn wait_for_reload(
+        mgr: &TlsAcceptorManager,
+        previous: &Arc<ServerConfig>,
+    ) -> Arc<ServerConfig> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = mgr.current_config();
+            if !Arc::ptr_eq(previous, &current) {
+                return current;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "TLS certificate reload did not happen within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn start_test_watcher(
+        name: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, TlsAcceptorManager, CertWatcher) {
+        let temp_dir = create_test_dir(name);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+
+        let config = load_server_config(&cert_file, &key_file, &[], vec![b"dot".to_vec()]).unwrap();
+        let mgr = TlsAcceptorManager::new(config);
+        let watcher =
+            CertWatcher::start(&cert_file, &key_file, &[], &[b"dot".to_vec()], mgr.clone())
+                .unwrap();
+        (temp_dir, cert_file, key_file, mgr, watcher)
+    }
+
+    /// Regression: the watcher must only react to the configured certificate
+    /// files. The previous implementation watched the whole parent directory
+    /// and reloaded when any file there was created or modified.
+    #[tokio::test]
+    async fn test_cert_watcher_ignores_unrelated_directory_changes() {
+        let (temp_dir, _cert_file, _key_file, mgr, _watcher) =
+            start_test_watcher("watch_unrelated");
+
+        let before = mgr.current_config();
+        std::fs::write(temp_dir.join("unrelated.txt"), b"hello").unwrap();
+        std::fs::write(temp_dir.join("unrelated.pem"), b"world").unwrap();
+
+        // Longer than the 200 ms reload debounce.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            Arc::ptr_eq(&before, &mgr.current_config()),
+            "unrelated files in the certificate directory must not trigger a reload"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Behavior preserved from the previous watcher: an atomic replacement
+    /// (temp file + rename) must trigger a reload, and a later in-place edit
+    /// must too. On Linux the directory watch also reports child events, so
+    /// this test passes with the old directory-only logic as well; the
+    /// regression tests for the rework are the path-filtering and
+    /// error-logging ones above/below.
+    #[tokio::test]
+    async fn test_cert_watcher_reloads_on_atomic_rename_and_later_in_place_edit() {
+        let (temp_dir, cert_file, key_file, mgr, _watcher) = start_test_watcher("watch_rename");
+
+        let before = mgr.current_config();
+
+        let (c2, k2) = generate_test_cert(&["replaced.local"]);
+        std::fs::write(temp_dir.join("cert.pem.tmp"), c2).unwrap();
+        std::fs::write(temp_dir.join("key.pem.tmp"), k2).unwrap();
+        std::fs::rename(temp_dir.join("cert.pem.tmp"), &cert_file).unwrap();
+        std::fs::rename(temp_dir.join("key.pem.tmp"), &key_file).unwrap();
+
+        let after_rename = wait_for_reload(&mgr, &before).await;
+
+        let (c3, k3) = generate_test_cert(&["in-place.local"]);
+        std::fs::write(&cert_file, c3).unwrap();
+        std::fs::write(&key_file, k3).unwrap();
+
+        let after_edit = wait_for_reload(&mgr, &after_rename).await;
+        assert!(!Arc::ptr_eq(&after_rename, &after_edit));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Regression: a failed `watch()` used to be silently ignored, so a
+    /// disabled certificate reload was invisible. It must be logged at `error`
+    /// level; startup still succeeds and the previous config stays active.
+    #[tokio::test]
+    async fn test_cert_watcher_logs_setup_errors() {
+        let logs = ErrorLog::default();
+        let _guard = tracing::subscriber::set_default(logs.clone());
+
+        let temp_dir = create_test_dir("watch_log");
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+        let config = load_server_config(&cert_file, &key_file, &[], vec![b"dot".to_vec()]).unwrap();
+        let mgr = TlsAcceptorManager::new(config);
+
+        // Point the watcher at a directory that does not exist: every watch
+        // registration fails.
+        let missing = temp_dir.join("missing");
+        let watcher = CertWatcher::start(
+            &missing.join("cert.pem"),
+            &missing.join("key.pem"),
+            &[],
+            &[b"dot".to_vec()],
+            mgr,
+        );
+        assert!(
+            watcher.is_ok(),
+            "watcher startup must not fail when watches cannot be registered"
+        );
+        drop(watcher);
+
+        let errors = logs.events();
+        assert!(
+            errors.iter().any(|e| e.starts_with("sito_transport::tls")),
+            "expected an error-level log for the failed watch, got {errors:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

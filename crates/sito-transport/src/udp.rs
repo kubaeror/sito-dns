@@ -109,7 +109,7 @@ pub fn start_udp_listener<H: QueryHandler>(
     let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
         Arc::new(RateLimiter::new(
             config.rate_limit_per_ip,
-            config.rate_limit_per_ip * 2,
+            RateLimiter::burst_for_rate(config.rate_limit_per_ip),
         ))
     });
     let mut tasks = Vec::new();

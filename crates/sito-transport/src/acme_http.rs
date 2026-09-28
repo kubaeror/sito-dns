@@ -3,7 +3,7 @@
 //! Serves only `/.well-known/acme-challenge/{token}` so ACME validators can
 //! reach the challenge on port 80 without exposing the general DoH listener.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use dashmap::DashMap;
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Clone)]
 struct ChallengeState {
@@ -35,14 +35,98 @@ async fn challenge_response(
     }
 }
 
-/// Starts the ACME HTTP-01 listener and returns its join handle.
+/// Starts the ACME HTTP-01 listener and returns a join handle for its
+/// serving task(s).
+///
+/// When `bind_addr` is a wildcard address, the opposite wildcard family is
+/// bound as well (`[::]` with `IPV6_V6ONLY` for an IPv4 wildcard, `0.0.0.0`
+/// for an IPv6 wildcard) so validators reach the challenge over both address
+/// families. A failure to bind one family is logged and never disables the
+/// other; an error is only returned when no address could be bound.
 pub async fn start_acme_http01_listener(
     bind_addr: SocketAddr,
     challenges: Arc<DashMap<String, String>>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
-    let listener = TcpListener::bind(bind_addr).await?;
-    start_acme_http01_listener_on(listener, challenges, shutdown_rx)
+    let mut listeners = Vec::with_capacity(2);
+    let mut first_error = None;
+
+    match crate::net::bind_tcp_listener(bind_addr) {
+        Ok(listener) => listeners.push(listener),
+        Err(e) => {
+            warn!(
+                addr = %bind_addr,
+                error = %e,
+                "ACME HTTP-01 listener failed to bind address"
+            );
+            first_error = Some(e);
+        }
+    }
+
+    if bind_addr.ip().is_unspecified() {
+        // Bind the port the primary listener actually got: with `port = 0`
+        // the two families must still share one port.
+        let port = listeners
+            .first()
+            .and_then(|listener| listener.local_addr().ok())
+            .map_or(bind_addr.port(), |addr| addr.port());
+        let secondary = match bind_addr {
+            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+        };
+        match crate::net::bind_tcp_listener(secondary) {
+            Ok(listener) => listeners.push(listener),
+            Err(e) => warn!(
+                addr = %secondary,
+                error = %e,
+                "ACME HTTP-01 listener failed to bind the additional address; \
+                 continuing with the other family"
+            ),
+        }
+    }
+
+    if listeners.is_empty() {
+        return Err(first_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "no ACME HTTP-01 address could be bound",
+            )
+        }));
+    }
+
+    let mut handles = Vec::with_capacity(listeners.len());
+    for listener in listeners {
+        match start_acme_http01_listener_on(listener, Arc::clone(&challenges), shutdown_rx.clone())
+        {
+            Ok(handle) => handles.push(handle),
+            Err(e) => error!(
+                error = %e,
+                "ACME HTTP-01 listener failed to start on a bound address"
+            ),
+        }
+    }
+
+    if handles.is_empty() {
+        return Err(first_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "no ACME HTTP-01 address could be served",
+            )
+        }));
+    }
+
+    // A single family keeps the historical one-handle return; both families
+    // are supervised behind one handle (shutdown is driven by the watch
+    // channel the caller passed in).
+    if handles.len() == 1 {
+        return Ok(handles.remove(0));
+    }
+
+    Ok(tokio::spawn(async move {
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }))
 }
 
 /// Serves ACME HTTP-01 challenges on an already-bound listener.
@@ -126,6 +210,73 @@ mod tests {
         // No other routes are exposed.
         let (status, _) = http_get(addr, "/dns-query").await;
         assert_eq!(status, 404);
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    /// Regression: the HTTP-01 listener must also bind the IPv6 wildcard (with
+    /// `IPV6_V6ONLY`) so validators that reach the challenge over IPv6 are
+    /// served; previously only `0.0.0.0` was bound.
+    #[tokio::test]
+    async fn test_acme_http01_listener_binds_both_wildcard_families() {
+        let challenges: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        challenges.insert("known-token".to_string(), "key-auth-value".to_string());
+
+        // Pick a port that is free on both families.
+        let port = loop {
+            let probe = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            // Release the v4 probe first: a dual-stack `[::]` bind conflicts
+            // with an actively-listening `0.0.0.0` socket.
+            drop(probe);
+            match std::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)) {
+                Ok(v6) => {
+                    drop(v6);
+                    break port;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+                // No IPv6 on this host: the v4 assertion below is the only one.
+                Err(_) => break port,
+            }
+        };
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = start_acme_http01_listener(
+            SocketAddr::from(([0, 0, 0, 0], port)),
+            Arc::clone(&challenges),
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            http_get(
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                "/.well-known/acme-challenge/known-token",
+            ),
+        )
+        .await
+        .expect("IPv4 challenge request timed out");
+        assert_eq!(status, 200);
+        assert_eq!(body, "key-auth-value");
+
+        // IPv6 is optional on the host; only assert when the v6 wildcard can
+        // be bound at all (the listener tolerates a v6 bind failure by design).
+        if std::net::TcpListener::bind("[::]:0").is_ok() {
+            let (status, body) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                http_get(
+                    SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+                    "/.well-known/acme-challenge/known-token",
+                ),
+            )
+            .await
+            .expect("IPv6 challenge request timed out");
+            assert_eq!(status, 200, "IPv6 validators must reach the challenge");
+            assert_eq!(body, "key-auth-value");
+        }
 
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;

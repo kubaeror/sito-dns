@@ -21,6 +21,7 @@ use crate::tls::TlsAcceptorManager;
 /// Maximum DNS message size accepted over a DoQ stream (RFC 9250, 2-octet
 /// length prefix; the DNS-over-TCP ceiling is 65535 bytes).
 /// RFC 9250 §4.3 DoQ stream error codes used when abandoning a stream.
+const DOQ_INTERNAL_ERROR: u32 = 1;
 const DOQ_PROTOCOL_ERROR: u32 = 2;
 const DOQ_EXCESSIVE_LOAD: u32 = 4;
 
@@ -117,7 +118,7 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
     let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
         Arc::new(RateLimiter::new(
             config.rate_limit_per_ip,
-            config.rate_limit_per_ip * 2,
+            RateLimiter::burst_for_rate(config.rate_limit_per_ip),
         ))
     });
     rate_limiter.spawn_pruner(shutdown_rx.clone());
@@ -174,19 +175,24 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                         trace!("DoQ QUIC connection established from {}", peer_addr);
 
                         // Process incoming bidirectional streams (RFC 9250 section 4.2)
-                        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        while let Ok((send, recv)) = conn.accept_bi().await {
                             let handler = Arc::clone(&handler);
                             let sni = sni.clone();
                             let stream_limiter = Arc::clone(&rate_limiter);
 
                             tokio::spawn(async move {
+                              let mut send = send;
+                              let mut recv = recv;
                               let timed = tokio::time::timeout(
                                 STREAM_TIMEOUT,
-                                async move {
+                                async {
                                 // RFC 9250: Each stream carries a single query preceded by a 2-octet length prefix
                                 let mut len_buf = [0u8; 2];
                                 if let Err(e) = recv.read_exact(&mut len_buf).await {
                                     trace!("DoQ stream failed reading length prefix from {}: {}", peer_addr, e);
+                                    // RFC 9250 §4.3: abandon the stream explicitly
+                                    // instead of leaving the client waiting.
+                                    let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
                                     return;
                                 }
 
@@ -200,6 +206,7 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                 let mut query_buf = vec![0u8; query_len];
                                 if let Err(e) = recv.read_exact(&mut query_buf).await {
                                     warn!("DoQ stream failed reading query body from {}: {}", peer_addr, e);
+                                    let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
                                     return;
                                 }
 
@@ -257,6 +264,11 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                                     let Some(truncated) =
                                                         truncate_for_framing(&encoded)
                                                     else {
+                                                        warn!(
+                                                            "DoQ response from {} could not be truncated to fit the 65535-byte limit",
+                                                            peer_addr
+                                                        );
+                                                        let _ = send.reset(DOQ_INTERNAL_ERROR.into());
                                                         return;
                                                     };
                                                     truncated
@@ -264,8 +276,11 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                                     encoded
                                                 };
                                             let Some(resp_len) = frame_prefix(encoded.len()) else {
+                                                let _ = send.reset(DOQ_INTERNAL_ERROR.into());
                                                 return;
                                             };
+                                            // A write error means the peer already
+                                            // abandoned the stream; no reset needed.
                                             if let Err(e) = send.write_all(&resp_len).await {
                                                 trace!("DoQ write length error to {}: {}", peer_addr, e);
                                                 return;
@@ -278,6 +293,7 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                         }
                                         Err(e) => {
                                             warn!("DoQ failed to encode response to {}: {}", peer_addr, e);
+                                            let _ = send.reset(DOQ_INTERNAL_ERROR.into());
                                         }
                                     }
                                 }
@@ -286,6 +302,10 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                               .await;
                               if timed.is_err() {
                                   debug!("DoQ stream from {} timed out", peer_addr);
+                                  // A client that never completes the length
+                                  // prefix/body gets an explicit protocol error
+                                  // instead of a silently finished stream.
+                                  let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
                               }
                             });
                         }
@@ -534,6 +554,109 @@ mod tests {
             .read_exact(&mut resp_len_buf)
             .await
             .expect_err("a non-zero message ID must be rejected");
+        match err {
+            quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)) => {
+                assert_eq!(code.into_inner(), u64::from(DOQ_PROTOCOL_ERROR));
+            }
+            other => panic!("expected a DOQ_PROTOCOL_ERROR reset, got {other:?}"),
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Regression: a stream whose length prefix or body is truncated used to
+    /// be abandoned silently (the send side was merely finished), so the
+    /// client saw a clean, empty stream instead of an RFC 9250 protocol error.
+    #[tokio::test]
+    async fn test_doq_truncated_stream_is_reset_with_protocol_error() {
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_doq_test_trunc_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        std::fs::write(&cert_file, &cert_pem).unwrap();
+        std::fs::write(&key_file, &key_pem).unwrap();
+
+        let server_config =
+            crate::tls::load_server_config(&cert_file, &key_file, &[], vec![b"doq".to_vec()])
+                .unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = udp_socket.local_addr().unwrap().port();
+        drop(udp_socket);
+
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let _handle = start_doq_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
+        root_store.add(cert_der).unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"doq".to_vec()];
+
+        let quic_client_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls)).unwrap();
+        let client_cfg = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
+
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_cfg);
+
+        let conn = client_endpoint
+            .connect(actual_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+
+        // 1. Truncated length prefix: only one of the two prefix octets.
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[0x00]).await.unwrap();
+        send.finish().unwrap();
+
+        let mut resp_len_buf = [0u8; 2];
+        let err = recv
+            .read_exact(&mut resp_len_buf)
+            .await
+            .expect_err("a truncated length prefix must be rejected");
+        match err {
+            quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)) => {
+                assert_eq!(code.into_inner(), u64::from(DOQ_PROTOCOL_ERROR));
+            }
+            other => panic!("expected a DOQ_PROTOCOL_ERROR reset, got {other:?}"),
+        }
+
+        // 2. Truncated body: the length prefix promises more bytes than sent.
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[0x00, 0x40]).await.unwrap();
+        send.write_all(&[0u8; 3]).await.unwrap();
+        send.finish().unwrap();
+
+        let mut resp_len_buf = [0u8; 2];
+        let err = recv
+            .read_exact(&mut resp_len_buf)
+            .await
+            .expect_err("a truncated query body must be rejected");
         match err {
             quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)) => {
                 assert_eq!(code.into_inner(), u64::from(DOQ_PROTOCOL_ERROR));
