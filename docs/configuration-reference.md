@@ -71,7 +71,7 @@ allow_plaintext_doh = false
 | `doh_dedicated_hostname` | string | `""` | When set, DoH/DoH3 requests whose Host/authority does not match are rejected with `421 Misdirected Request`. Empty allows any hostname. |
 | `dot_padding` | boolean | `false` | RFC 7830/8467 padding on DoT responses to mitigate traffic analysis. |
 | `edns_udp_size` | integer | `1232` | Maximum EDNS0 UDP buffer size (1232 bytes prevents IPv6 fragmentation). |
-| `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual client IP. `0` disables rate limiting. |
+| `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual client IP (`0` disables rate limiting; maximum `1000000`). |
 | `max_tcp_connections` | integer | `256` | Maximum concurrent TCP, DoT, and DoH client connections. |
 | `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
@@ -262,6 +262,7 @@ schedule = "0 0 15-21 * * MON-FRI"
 | `groups` | table (map of name → group) | `{}` | Policy groups keyed by group name, e.g. `[clients.groups.kids]`, with optional `[[clients.groups.<name>.blocked_services]]` entries. Group fields: description (optional operator note), filtering, lists, custom_rules, safe_search, safe_search_youtube, parental, parental_categories, schedule_enabled, schedule, blocked_services. |
 | `client_id_secrets` | table (map of entry name → secret) | `{}` | Shared secrets accepted as the first DoT SNI label (`<secret>.dns.example.com`) or the DoH path segment (`/dns-query/<secret>`). Empty disables path/SNI identification. |
 | `trust_routeros_lease_names` | boolean | `false` | Trust RouterOS DHCP lease host names/comments for client identification. Off by default because lease data is client-controlled. |
+| `timezone` | string | `"local"` | Timezone used to evaluate client schedules and time-of-day rules. `"local"`/`"system"` uses the host zone (DST-aware); `"UTC"` and fixed offsets (`"+02:00"`, `"-05:30"`, `"+0530"`, `"UTC+2"`) are also accepted. IANA names are not supported (no tzdb dependency); schedules in UTC-only deployments should set this explicitly. |
 
 ---
 
@@ -281,16 +282,9 @@ exception_clients = ["admin-laptop"]
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `auto_ptr` | boolean | `false` | Automatically synthesize reverse PTR records (`in-addr.arpa` / `ip6.arpa`) for local A/AAAA rewrites in RFC 1918 / ULA ranges. See the note below on the serde/section default divergence; set it explicitly. |
+| `auto_ptr` | boolean | `false` | Automatically synthesize reverse PTR records (`in-addr.arpa` / `ip6.arpa`) for local A/AAAA rewrites in RFC 1918 / ULA ranges. Opt-in. |
 | `ttl` | integer | `60` | TTL for synthesized rewrite records. |
 | `entries` | array of tables | `[]` | Local record rewrites (`domain`, `type` (`A`/`AAAA`/`CNAME`/`PTR`/`TXT`), `answer`, and optional `exception_clients`). |
-
-> [!NOTE]
-> `auto_ptr` currently has two defaults in the code: an absent `[rewrites]`
-> table (and `--no-setup` boots) uses `false`, while a `[rewrites]` table that
-> is present but omits the key applies `true` through the serde field default.
-> The table above documents the section default; set `auto_ptr` explicitly to
-> avoid relying on either path.
 
 ---
 
@@ -314,14 +308,27 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `web.enabled` | boolean | `true` | Enable the web dashboard and REST API. |
-| `web.port` | integer | `8080` | Port for the Web Dashboard and REST API (`/api/v1/`). |
+| `web.port` | integer | `8080` | Port for the Web Dashboard and REST API (`/api/v1/`; must be ≥ 1). |
 | `web.bind` | string (IP address) | `"0.0.0.0"` | Bind address for the web server. |
 | `web.metrics_auth` | boolean | `true` | Require authentication (token or session) for `/metrics`. |
 | `web.trusted_proxies`| array of IP addresses | `[]` | Individual proxy IPs trusted to supply `X-Forwarded-For`/`X-Forwarded-Proto` (CIDR is **not** supported here). |
-| `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required. |
+| `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required (must be ≥ 1). |
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
 | `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL; corrupt stores are backed up and start empty. Use `sito reset-sessions` to invalidate everything. |
 | `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
+
+Two additional `[web]` keys are read from the raw table:
+
+* `web.public_url` (string, unset) — external URL of the admin UI. Its scheme
+  decides `Secure` cookies, HSTS and the expected CSRF origin. Set it when the
+  UI is reached through a reverse proxy; it is authoritative over request
+  headers and over the DNS `[tls]` certificate settings.
+* `web.tls_terminated_by_proxy` (boolean, `false`) — TLS is terminated by a
+  trusted reverse proxy in front of the server (the immediate peer must be in
+  `web.trusted_proxies` or `X-Forwarded-Proto` is ignored).
+
+The admin scheme is never derived from the DNS DoT/DoH certificate config.
+
 
 ---
 
@@ -338,7 +345,7 @@ anonymize_querylog = false
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `stats.retention_days` | integer | `90` | Days to keep detailed per-query records before automated pruning and hourly aggregation (alias: `query_log_retention_days`). |
+| `stats.retention_days` | integer | `90` | Days to keep detailed per-query records before automated pruning and hourly aggregation (must be ≥ 1; alias: `query_log_retention_days`). |
 | `privacy.anonymize_querylog` | boolean | `false` | Mask client IPs (/24 for IPv4, /56 for IPv6) before persisting to database and before live-tail broadcast. |
 
 > Query logging is always enabled when `[stats]` is present; Prometheus metrics are always exposed on `/metrics` and protected according to `web.metrics_auth`.
@@ -424,7 +431,7 @@ url = "https://lists.example.com/services.json"
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `refresh_hours` | integer | `24` | Default refresh interval in hours for categories without an override (must be greater than 0). |
+| `refresh_hours` | integer | `24` | Default refresh interval in hours for categories without an override (must be ≥ 1). |
 | `categories` | table (map of category → source) | `{}` | Sources keyed by category id (`adult`, `gambling`, `services`, or any custom parental category). Each entry has a required `url` (`https://`, `http://` or `file://`), an optional `refresh_hours` override and an optional `license` string for operator reference. Refreshed domain lists replace the bundled content of that category; `services` expects service JSON. |
 
 ---
@@ -445,14 +452,14 @@ and `POST /api/v1/config/reload`.
 |---|---|
 | `server.log_level` | Log-level filter reloaded. |
 | `server.update_require_signature` | Read when an update is started, not at boot. |
-| `web.metrics_auth`, `web.trusted_proxies` | Read from the live configuration when a request is handled. |
+| `web.metrics_auth`, `web.trusted_proxies`, `web.public_url`, `web.tls_terminated_by_proxy` | Read from the live configuration when a request is handled. |
 | `dns.bind`, `dns.port`, `dns.dot_port`, `dns.doh_port`, `dns.doq_port`, `dns.doh3_port`, `dns.doh_dedicated_hostname`, `dns.dot_padding`, `dns.edns_udp_size`, `dns.max_tcp_connections`, `dns.allow_plaintext_doh` | DNS listeners are stopped and rebound in-process when the listener plan changes; a failed rebind restores the previous bindings. TLS listeners need the acceptors created at startup. |
 | `dns.rate_limit_per_ip` | Live rate limiters updated. |
 | `dns.cache.enabled`, `dns.cache.size_mb`, `dns.cache.min_ttl`, `dns.cache.max_ttl`, `dns.cache.negative_ttl_max`, `dns.cache.prefetch`, `dns.cache.serve_stale_hours` | Cache configuration updated. |
 | `dns.dnssec.mode`, `dns.dnssec.validate`, `dns.dnssec.ntp`, `dns.dnssec.nta`, `dns.dnssec.trust_anchors` | DNSSEC validator swapped for the new configuration. |
 | `upstream.servers`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt. |
 | `filtering.enabled`, `filtering.refresh_interval_hours`, `filtering.blocking_mode`, `filtering.blocking_ttl`, `filtering.cname_cloaking`, `filtering.fail_closed`, `filtering.anti_doh_bypass`, `filtering.max_rules`, `filtering.lists`, `filtering.custom_rules` | Filter engine reloaded with the new lists/rules; cached answers are flushed. List downloads continue asynchronously after the reload. |
-| `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names` | Client registry, per-group rule sets and per-client upstream scopes rebuilt. |
+| `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
 | `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |
 | `privacy.anonymize_querylog` | Query-log writer updated. |
 | `stats.retention_days` | Re-read on the next retention sweep (every 24 h). |
@@ -470,11 +477,16 @@ and `POST /api/v1/config/reload`.
 | `integrations.mikrotik.*`, `integrations.lists.*` | Integration sync/refresh tasks are spawned at startup. |
 
 > [!NOTE]
-> The REST API's `restart_required` list is coarser than this matrix: it marks
-> whole sections (`web`, `auth`, `ha`, …) and `dns.doh_dedicated_hostname` as
-> restart-only. `dns.doh_dedicated_hostname`, `web.metrics_auth` and
-> `web.trusted_proxies` actually take effect without a restart (listener
-> rebind and per-request reads respectively).
+> `restart_required` is computed from the same change matrix as the table
+> above: `[server]` except `log_level`, `[auth]`, the web listener fields
+> (`enabled`/`bind`/`port`), `[tls]`, `[acme]`, `[ha]` and `[integrations]`.
+> Everything else applies live. Editing a config file also logs a warning for
+> restart-only changes (the watcher applies the rest).
+>
+> Same-transport port collisions are rejected at validation: `dns.dot_port`
+> with `dns.doh_port` (both TCP) and `dns.doq_port` with `dns.doh3_port` (both
+> UDP) must differ, as must any of them with `dns.port`. `dot_port` and
+> `doq_port` may share a number (different protocols).
 >
 > `config_version` is evaluated whenever the file is loaded; only version `1`
 > is accepted.

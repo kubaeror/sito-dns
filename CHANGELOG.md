@@ -186,6 +186,51 @@ the shipped parts; Phase 0 (release blockers) is complete.
   matrix added, compatibility matrix re-verified against the engine, SECURITY
   versions, install/migration samples, README wizard claims.
 
+### Clients (Phase 3.7)
+- Schedules evaluate in a configurable timezone (`clients.timezone`, default
+  `"local"`; `"UTC"` and fixed offsets accepted) instead of always UTC.
+- MAC resolution no longer reads `/proc/net/arp` on the query hot path
+  (background snapshot + bounded positive/negative caches; ARP is skipped
+  entirely when no client uses MAC identity).
+- RouterOS only trusts `status = "bound"` leases; a failed client build no
+  longer downgrades settings or panics; a missing `password_env` errors
+  instead of sending an empty password.
+- `unidentified_clients` is bounded (1024 entries, 24 h retention);
+  runtime-list drop guards count parsed entries instead of raw lines.
+
+### API / UI / auth (Phase 4)
+- The admin scheme is no longer derived from the DNS TLS certificate config:
+  `web.public_url`/`web.tls_terminated_by_proxy` or a trusted proxy's
+  `X-Forwarded-Proto` decide `Secure` cookies, HSTS and CSRF origins.
+- Secret handling: path-aware TOML masking (valid round-trip, includes
+  `client_id_secrets`), client secrets returned as markers with an Admin-only
+  audited reveal, no token hashes or session ids in API bodies, UI client
+  deletion removes the shared secret, backup/restore files are 0600.
+- `reset-admin`/`reset-sessions` rotate the auth generation and delete
+  persisted sessions/tokens; user management and change-password endpoints;
+  the missing-config/existing-users deadlock is resolved; CSRF double-submit
+  enforcement; TOTP backup codes use fast digests; the UI probe requires
+  Operator.
+- One apply/validate pipeline is shared by the watcher, API, UI and wizard
+  (deep upstream validation, persist-after-apply with rollback, truthful
+  `restart_required`); the wizard fetches blocklists asynchronously.
+- `--no-setup` without a config generates a random admin password and binds
+  the UI to loopback (existing `users.toml` credentials are kept untouched).
+
+### Configuration (Phase 6.5)
+- `rewrites.auto_ptr` now has a single default (`false`) for both serde and
+  `Default`.
+- Stricter validation: `rate_limit_per_ip` upper bound, `retention_days >= 1`,
+  `web.port >= 1`, `session_ttl_hours >= 1`, `refresh_hours >= 1`, valid
+  `probe_domain`, non-empty per-domain rules, and same-transport DNS port
+  collisions are rejected.
+
+### Transport (Phase 2 tail)
+- ACME HTTP-01 binds both wildcard families; the certificate watcher watches
+  the configured files (not the whole directory), survives atomic renames and
+  logs watch errors; DoH3 GET matches DoH decoding; DoQ resets timed-out and
+  truncated streams with RFC 9250 error codes; rate-limiter bursts saturate.
+
 ---
 
 ## [1.7.0] - 2026-09-13
