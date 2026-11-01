@@ -12,7 +12,16 @@ feature-depth = 1
 
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # `zip` is a BUILD dependency of utoipa-swagger-ui, used only to unpack
+    # the Swagger UI static assets that are embedded in that crate. It never
+    # processes user-controlled archives at runtime. The fixes require zip 9
+    # (via utoipa-swagger-ui 10 and utoipa 6), a breaking major upgrade that is
+    # scheduled separately; track RUSTSEC-2026-0367/0368/0369.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+]
 
 [licenses]
 allow = [

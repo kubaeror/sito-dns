@@ -273,6 +273,29 @@ the shipped parts; Phase 0 (release blockers) is complete.
 - Synthesized block/rewrite/error responses preserve the client's CD and DO
   bits, and prefetch never caches AD=1 without local validation.
 
+### Filtering semantics completion (WP-3.5)
+- `$dnsrewrite` now synthesizes PTR and TXT (with 255-byte TXT chunking) in
+  addition to A/AAAA/CNAME, aggregates every matching rewrite for an owner,
+  and honours AdGuard cancellation: `@@...$dnsrewrite` cancels all matching
+  rewrites and `@@...$dnsrewrite=value` cancels only that value (an
+  `$important` cancellation also cancels standard rewrites). Unsupported
+  record types are rejected at parse time with a warning instead of silently
+  answering NODATA.
+- `$client` supports quoted names and `\,`/`\|` escapes (spaces, commas,
+  pipes), while negation and CIDR matching are unchanged.
+
+### Dependencies
+- Security updates: `rustls` 0.23.46, `ctutils` 0.4.7, `rustls-webpki`
+  0.103.16, `webpki-roots` 1.0.11, `tokio` 1.54.1 (RUSTSEC-2026-0285/0346/0347/
+  0348/0349/0381/0382/0385/0386).
+- Patch updates: `hickory-proto` 0.26.3, `clap` 4.6.7, `reqwest` 0.13.5,
+  `quinn` 0.11.12, `quinn-proto` 0.11.19, `rand` 0.10.3, `toml` 1.1.8.
+- Accepted, documented in `deny.toml`: `zip` 3.x is a build dependency of
+  `utoipa-swagger-ui` 9 used only to unpack the crate's bundled Swagger UI
+  assets (never user archives at runtime). The fixes require `zip` 9 via
+  `utoipa-swagger-ui` 10 / `utoipa` 6, a breaking major upgrade scheduled
+  separately (RUSTSEC-2026-0367/0368/0369).
+
 ---
 
 ## [1.7.0] - 2026-09-13
