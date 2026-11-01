@@ -5,11 +5,25 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased] — Audit 6 remediation
+## [1.8.0] - 2026-11-01
 
-Full findings: independent audit of v1.7.0 (audit 6). Remediation plan:
-`/home/ubuntu/.opencode/plan/sito-dns-remediation-plan.md`. This section tracks
-the shipped parts; Phase 0 (release blockers) is complete.
+Independent audit 6 remediation. This release fixes every P0 and P1 finding
+from the v1.7.0 audit: DNSSEC validation bypass/SERVFAIL regressions, the
+default dual-stack startup failure, TLS advisories, transport hardening,
+per-group filtering, the config apply/validation pipeline, API/UI secret and
+session handling, HA replication state/version continuity, cache/DNSSEC
+response correctness, stats cardinality and retention, CI/ops and docs truth.
+
+Migration notes:
+- Filter list caches written by <= 1.7.0 lack integrity metadata and are
+  re-downloaded once; with `fail_closed = true` and no network the first boot
+  answers SERVFAIL until a fetch succeeds.
+- `upstream.timeout_ms` is now the overall per-query retry budget (shared by
+  failover/load-balance attempts), not a per-attempt timeout.
+- Behavior changes: DNSSEC Insecure/Bogus policy, HA persist-before-ACK,
+  per-group rules now active, `clients.timezone` (default `local`),
+  `upstream.ecs` (default `off`), `rewrites.auto_ptr` (default `false`),
+  `$dnsrewrite` PTR/TXT/aggregation/cancellation.
 
 ### Critical (P0)
 - **DNSSEC validation bypass via key-tag collision**: trust was keyed on the

@@ -10,8 +10,8 @@ We release security patches and vulnerability fixes for the **current minor rele
 
 | Release Line | Supported Status | Notes |
 |---|---|---|
-| `1.7.x` (current) | :white_check_mark: Supported | Active development |
-| Prior minor release (`1.6.x`) | :white_check_mark: Supported | Critical security fixes only |
+| `1.8.x` (current) | :white_check_mark: Supported | Active development |
+| Prior minor release (`1.7.x`) | :white_check_mark: Supported | Critical security fixes only |
 | Older releases | :x: Unsupported | Upgrade recommended |
 
 Patch releases within a supported line are published from `main` and tagged
