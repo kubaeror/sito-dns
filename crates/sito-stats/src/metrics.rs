@@ -25,6 +25,7 @@ const LATENCY_BUCKETS: &[f64] = &[
 struct HistogramState {
     counts: Vec<u64>,
     sum: f64,
+    sum_ns: u128,
     count: u64,
 }
 
@@ -39,6 +40,7 @@ impl HistogramState {
         Self {
             counts: vec![0; LATENCY_BUCKETS.len()],
             sum: 0.0,
+            sum_ns: 0,
             count: 0,
         }
     }
@@ -46,6 +48,11 @@ impl HistogramState {
     fn observe(&mut self, val: f64) {
         self.count += 1;
         self.sum += val;
+        if val.is_finite() && val > 0.0 {
+            self.sum_ns = self
+                .sum_ns
+                .saturating_add((val * 1_000_000_000.0).round() as u128);
+        }
         for (i, &bucket) in LATENCY_BUCKETS.iter().enumerate() {
             if val <= bucket {
                 self.counts[i] += 1;
@@ -499,6 +506,11 @@ impl MetricsRegistry {
     }
 
     /// Returns a map of upstream identifiers to (rtt_ms, total_errors).
+    ///
+    /// Both values are **lifetime** measurements: the mean of every RTT sample
+    /// observed since process start and the total error count. Callers that
+    /// need a window-scoped view (e.g. periodic reports) must take two
+    /// [`Self::snapshot`]s and use [`MetricsSnapshot::delta_since`].
     pub fn get_upstream_reports(&self) -> std::collections::HashMap<String, (f64, u64)> {
         let mut res = std::collections::HashMap::new();
         {
@@ -530,6 +542,70 @@ impl MetricsRegistry {
             }
         }
         res
+    }
+
+    /// Captures the lifetime counters and RTT accumulators that back periodic
+    /// window reports.
+    ///
+    /// Take a snapshot, then for each later report call
+    /// [`MetricsSnapshot::delta_since`] with the previous snapshot to obtain
+    /// the activity observed since then. Unlike [`Self::get_upstream_reports`],
+    /// RTT samples are carried as a sum and a sample count, so a window mean
+    /// never mixes in samples taken before the window.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        let mut queries_total = 0u64;
+        let mut blocked_total = 0u64;
+        {
+            let map = self
+                .queries_total
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (&(_proto, _qtype, verdict), count) in map.iter() {
+                let count = count.load(Ordering::Relaxed);
+                queries_total += count;
+                if self.labels.label(verdict).as_ref() == "blocked" {
+                    blocked_total += count;
+                }
+            }
+        }
+
+        let mut upstreams: HashMap<String, UpstreamSnapshot> = HashMap::new();
+        {
+            let map = self
+                .upstream_rtt
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (&upstream, hist) in map.iter() {
+                let hist = hist.lock().unwrap_or_else(PoisonError::into_inner);
+                upstreams.insert(
+                    self.labels.label(upstream).to_string(),
+                    UpstreamSnapshot {
+                        rtt_sum_secs: hist.sum,
+                        rtt_sum_ns: hist.sum_ns,
+                        rtt_count: hist.count,
+                        errors_total: 0,
+                    },
+                );
+            }
+        }
+        {
+            let map = self
+                .upstream_errors
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (&(upstream, _kind), count) in map.iter() {
+                upstreams
+                    .entry(self.labels.label(upstream).to_string())
+                    .or_default()
+                    .errors_total += count.load(Ordering::Relaxed);
+            }
+        }
+
+        MetricsSnapshot {
+            queries_total,
+            blocked_total,
+            upstreams,
+        }
     }
 
     /// Generates the Prometheus text exposition representation conforming to Table 14.2.
@@ -996,6 +1072,151 @@ impl MetricsRegistry {
     }
 }
 
+/// Point-in-time copy of the monotonic counters that back window reports.
+///
+/// Registry counters only ever grow while the process lives, so the difference
+/// between two snapshots is a window-scoped measurement; see
+/// [`MetricsSnapshot::delta_since`].
+#[derive(Debug, Clone, Default)]
+pub struct MetricsSnapshot {
+    queries_total: u64,
+    blocked_total: u64,
+    upstreams: HashMap<String, UpstreamSnapshot>,
+}
+
+impl MetricsSnapshot {
+    /// Lifetime query total at snapshot time.
+    pub fn queries_total(&self) -> u64 {
+        self.queries_total
+    }
+
+    /// Lifetime blocked-query total at snapshot time.
+    pub fn blocked_total(&self) -> u64 {
+        self.blocked_total
+    }
+
+    /// Per-upstream lifetime accumulators at snapshot time.
+    pub fn upstreams(&self) -> &HashMap<String, UpstreamSnapshot> {
+        &self.upstreams
+    }
+
+    /// Computes the window-scoped difference between `self` (newer) and
+    /// `previous` (older).
+    ///
+    /// A counter that went backwards is treated as reset (process restart or a
+    /// replaced registry), and the newer reading is then reported as the whole
+    /// window instead of saturating to zero. A reset loses the pre-reset part
+    /// of the window, which is the only honest choice without persistent
+    /// counters.
+    pub fn delta_since(&self, previous: &MetricsSnapshot) -> MetricsDelta {
+        let mut upstreams = HashMap::with_capacity(self.upstreams.len());
+        for (name, current) in &self.upstreams {
+            let prior = previous.upstreams.get(name);
+            let (rtt_sum_secs, rtt_count) = match prior {
+                Some(p)
+                    if current.rtt_count >= p.rtt_count && current.rtt_sum_ns >= p.rtt_sum_ns =>
+                {
+                    (
+                        (current.rtt_sum_ns - p.rtt_sum_ns) as f64 / 1_000_000_000.0,
+                        current.rtt_count - p.rtt_count,
+                    )
+                }
+                // Missing or reset accumulator: the current values belong to
+                // this window.
+                _ => (current.rtt_sum_secs, current.rtt_count),
+            };
+            let errors = match prior {
+                Some(p) => counter_delta(current.errors_total, p.errors_total),
+                None => current.errors_total,
+            };
+            upstreams.insert(
+                name.clone(),
+                UpstreamDelta {
+                    rtt_sum_secs,
+                    rtt_count,
+                    errors,
+                },
+            );
+        }
+
+        MetricsDelta {
+            queries: counter_delta(self.queries_total, previous.queries_total),
+            blocked: counter_delta(self.blocked_total, previous.blocked_total),
+            upstreams,
+        }
+    }
+}
+
+/// Per-upstream lifetime accumulators captured by [`MetricsRegistry::snapshot`].
+#[derive(Debug, Clone, Default)]
+pub struct UpstreamSnapshot {
+    rtt_sum_secs: f64,
+    rtt_sum_ns: u128,
+    rtt_count: u64,
+    errors_total: u64,
+}
+
+impl UpstreamSnapshot {
+    /// Sum of every RTT sample in seconds.
+    pub fn rtt_sum_secs(&self) -> f64 {
+        self.rtt_sum_secs
+    }
+
+    /// Number of RTT samples.
+    pub fn rtt_count(&self) -> u64 {
+        self.rtt_count
+    }
+
+    /// Lifetime error total.
+    pub fn errors_total(&self) -> u64 {
+        self.errors_total
+    }
+}
+
+/// Window-scoped difference between two [`MetricsSnapshot`]s.
+#[derive(Debug, Clone, Default)]
+pub struct MetricsDelta {
+    /// Queries observed in the window.
+    pub queries: u64,
+    /// Blocked queries observed in the window.
+    pub blocked: u64,
+    /// Per-upstream measurements observed in the window.
+    pub upstreams: HashMap<String, UpstreamDelta>,
+}
+
+/// Window-scoped per-upstream measurements.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UpstreamDelta {
+    /// Sum of RTT samples observed in the window, in seconds.
+    pub rtt_sum_secs: f64,
+    /// Number of RTT samples observed in the window.
+    pub rtt_count: u64,
+    /// Errors observed in the window.
+    pub errors: u64,
+}
+
+impl UpstreamDelta {
+    /// Mean RTT over the window in milliseconds (`0.0` when there is no
+    /// sample).
+    pub fn mean_rtt_ms(&self) -> f64 {
+        if self.rtt_count == 0 {
+            0.0
+        } else {
+            (self.rtt_sum_secs / self.rtt_count as f64) * 1000.0
+        }
+    }
+}
+
+/// Subtracts two monotonic counter readings, treating a decrease as a reset:
+/// the newer reading then belongs entirely to the current window.
+fn counter_delta(current: u64, previous: u64) -> u64 {
+    if current >= previous {
+        current - previous
+    } else {
+        current
+    }
+}
+
 /// Escapes a Prometheus label value per the exposition format spec.
 fn escape_label_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
@@ -1335,6 +1556,59 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         assert!(rendered.contains("sito_filter_rules{list=\"total\"} 42"));
         assert!(rendered.contains("sito_filter_compile_seconds_count 1"));
         assert!(rendered.contains("sito_filter_compile_seconds_sum 0.25"));
+    }
+
+    /// Regression for audit WP-7.3: [`MetricsSnapshot::delta_since`] must
+    /// return window-scoped differences from lifetime counters, including
+    /// upstream RTT (sum + samples) and error totals, and must treat a
+    /// counter going backwards as a reset instead of saturating to zero.
+    #[test]
+    fn test_snapshot_delta_is_window_scoped_and_reset_safe() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.inc_queries("udp", 1, "allowed");
+        reg.inc_queries("udp", 28, "blocked");
+        reg.observe_upstream_rtt("8.8.8.8:53", 0.020);
+        reg.observe_upstream_rtt("8.8.8.8:53", 0.030);
+        reg.inc_upstream_errors("8.8.8.8:53", "timeout");
+        let previous = reg.snapshot();
+        assert_eq!(previous.queries_total(), 2);
+        assert_eq!(previous.blocked_total(), 1);
+
+        // No new activity: the delta is zero even though lifetime totals are
+        // non-zero.
+        let delta = reg.snapshot().delta_since(&previous);
+        assert_eq!(delta.queries, 0);
+        assert_eq!(delta.blocked, 0);
+        let upstream = &delta.upstreams["8.8.8.8:53"];
+        assert_eq!(upstream.rtt_count, 0);
+        assert_eq!(upstream.errors, 0);
+        assert!(upstream.mean_rtt_ms().abs() < f64::EPSILON);
+
+        // New activity is measured from the previous snapshot only: the mean
+        // must exclude the two pre-window RTT samples.
+        reg.inc_queries("udp", 28, "allowed");
+        reg.observe_upstream_rtt("8.8.8.8:53", 0.040);
+        reg.inc_upstream_errors("8.8.8.8:53", "network");
+        let delta = reg.snapshot().delta_since(&previous);
+        assert_eq!(delta.queries, 1);
+        assert_eq!(delta.blocked, 0);
+        let upstream = &delta.upstreams["8.8.8.8:53"];
+        assert_eq!(upstream.rtt_count, 1);
+        assert!((upstream.mean_rtt_ms() - 40.0).abs() < 1e-6);
+        assert_eq!(upstream.errors, 1);
+
+        // A replaced registry (process restart / metrics swap) restarts the
+        // counters; the newer reading is the whole window, not zero.
+        let reset = MetricsRegistry::new("1.0.0", "test");
+        reset.inc_queries("udp", 1, "allowed");
+        reset.observe_upstream_rtt("8.8.8.8:53", 0.005);
+        let delta = reset.snapshot().delta_since(&previous);
+        assert_eq!(delta.queries, 1);
+        assert_eq!(delta.blocked, 0);
+        let upstream = &delta.upstreams["8.8.8.8:53"];
+        assert_eq!(upstream.rtt_count, 1);
+        assert_eq!(upstream.errors, 0);
+        assert!((upstream.mean_rtt_ms() - 5.0).abs() < 1e-6);
     }
 }
 

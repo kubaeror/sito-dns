@@ -5,7 +5,7 @@ use rustls::pki_types::ServerName;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio_rustls::TlsConnector;
@@ -17,6 +17,7 @@ use sito_core::config::{Config, FilterListConfig};
 use sito_filter::HostsFilterEngine;
 use sito_rewrites::{RewriteTable, RewritesConfig};
 use sito_stats::MetricsRegistry;
+use sito_stats::metrics::MetricsSnapshot;
 
 use crate::bundle::{ConfigBundle, substitute_secrets, verify_and_unpack_push};
 use crate::config::HaConfig;
@@ -684,7 +685,13 @@ where
         Duration::from_secs(stats_interval_secs),
     );
     stats_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let (mut last_queries, mut last_blocked) = handles.metrics.get_queries_and_blocked();
+    // Registry counters are lifetime totals: remember the previous snapshot
+    // and report window-scoped deltas instead of mislabelling lifetime values
+    // as a `window_s` measurement. `window_started_at` tracks the real length
+    // of each reporting window (which can exceed the ticker interval when the
+    // session loop is delayed).
+    let mut window_started_at = Instant::now();
+    let mut last_stats_snapshot = handles.metrics.snapshot();
     // See `spawn_slave_worker`: a closed channel must disable the branch
     // instead of resolving `None` forever.
     let mut resync_open = true;
@@ -716,25 +723,14 @@ where
             }
 
             _ = stats_ticker.tick() => {
-                // Collect stats from handles and emit periodic StatsReport
-                let (total_q, total_b) = handles.metrics.get_queries_and_blocked();
-                let queries = total_q.saturating_sub(last_queries);
-                let blocked = total_b.saturating_sub(last_blocked);
-                last_queries = total_q;
-                last_blocked = total_b;
-
-                let upstream_reports = handles.metrics.get_upstream_reports();
-                let mut upstreams = HashMap::new();
-                for (name, (rtt_ms, errors)) in upstream_reports {
-                    upstreams.insert(name, UpstreamReport { rtt_ms, errors });
-                }
-
-                let stats = HaMessage::StatsReport {
-                    window_s: stats_interval_secs,
-                    queries,
-                    blocked,
-                    upstreams,
-                };
+                // Report the activity observed since the previous report; the
+                // registry only exposes lifetime totals and lifetime upstream
+                // RTT accumulators.
+                let window_s = window_started_at.elapsed().as_secs().max(1);
+                window_started_at = Instant::now();
+                let (stats, snapshot) =
+                    build_stats_report(&handles.metrics, &last_stats_snapshot, window_s);
+                last_stats_snapshot = snapshot;
                 if let Ok(json) = stats.to_json() {
                     let _ = ws_stream.send(WsMessage::Text(json.into())).await;
                 }
@@ -771,6 +767,45 @@ where
     }
 
     Ok(())
+}
+
+/// Builds a window-scoped stats report from the registry and the snapshot
+/// taken at the previous report.
+///
+/// The registry only exposes lifetime counters and lifetime upstream RTT
+/// accumulators; sending those under a `window_s` label would misreport them
+/// as recent activity (audit WP-7.3). The report therefore carries deltas
+/// since the previous report, including per-upstream RTT samples and upstream
+/// error counts. Returns the message to send and the snapshot to pass to the
+/// next call.
+fn build_stats_report(
+    metrics: &MetricsRegistry,
+    previous: &MetricsSnapshot,
+    window_s: u64,
+) -> (HaMessage, MetricsSnapshot) {
+    let snapshot = metrics.snapshot();
+    let delta = snapshot.delta_since(previous);
+
+    let mut upstreams = HashMap::with_capacity(delta.upstreams.len());
+    for (name, upstream) in &delta.upstreams {
+        upstreams.insert(
+            name.clone(),
+            UpstreamReport {
+                rtt_ms: upstream.mean_rtt_ms(),
+                errors: upstream.errors,
+            },
+        );
+    }
+
+    (
+        HaMessage::StatsReport {
+            window_s,
+            queries: delta.queries,
+            blocked: delta.blocked,
+            upstreams,
+        },
+        snapshot,
+    )
 }
 
 async fn handle_master_message<S>(
@@ -1529,5 +1564,78 @@ client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Regression for audit WP-7.3: the metrics registry only holds lifetime
+    /// counters and lifetime upstream RTT accumulators, so a report labelled
+    /// with `window_s` must carry deltas since the previous report instead of
+    /// those lifetime values. Before the fix, `upstreams[*].rtt_ms`/`errors`
+    /// were the lifetime mean/total, so the idle second window below would
+    /// repeat them instead of reporting zero.
+    #[test]
+    fn test_stats_report_carries_window_deltas_not_lifetime_totals() {
+        let metrics = MetricsRegistry::new("0.1.0", "test");
+
+        // Activity before the first snapshot is outside every report window.
+        metrics.inc_queries("udp", 1, "allowed");
+        metrics.inc_queries("udp", 1, "blocked");
+        metrics.observe_upstream_rtt("1.1.1.1:53", 0.020);
+        metrics.inc_upstream_errors("1.1.1.1:53", "timeout");
+        let initial = metrics.snapshot();
+
+        // Window 1: three queries (one blocked), one 30 ms RTT sample, one error.
+        metrics.inc_queries("udp", 1, "allowed");
+        metrics.inc_queries("udp", 28, "allowed");
+        metrics.inc_queries("udp", 1, "blocked");
+        metrics.observe_upstream_rtt("1.1.1.1:53", 0.030);
+        metrics.inc_upstream_errors("1.1.1.1:53", "timeout");
+
+        let (report, snapshot) = build_stats_report(&metrics, &initial, 30);
+        match &report {
+            HaMessage::StatsReport {
+                window_s,
+                queries,
+                blocked,
+                upstreams,
+            } => {
+                assert_eq!(*window_s, 30);
+                assert_eq!(
+                    *queries, 3,
+                    "only queries since the previous snapshot belong to the window"
+                );
+                assert_eq!(*blocked, 1);
+                let upstream = upstreams.get("1.1.1.1:53").expect("upstream report");
+                assert!(
+                    (upstream.rtt_ms - 30.0).abs() < 1e-6,
+                    "window mean must not mix in pre-window samples: {}",
+                    upstream.rtt_ms
+                );
+                assert_eq!(upstream.errors, 1);
+            }
+            other => panic!("expected a StatsReport, got {other:?}"),
+        }
+
+        // Window 2: no new activity. The lifetime totals are still non-zero, so
+        // a report built from them would fail every assertion below.
+        let (report, _snapshot) = build_stats_report(&metrics, &snapshot, 30);
+        match &report {
+            HaMessage::StatsReport {
+                queries,
+                blocked,
+                upstreams,
+                ..
+            } => {
+                assert_eq!(*queries, 0);
+                assert_eq!(*blocked, 0);
+                let upstream = upstreams.get("1.1.1.1:53").expect("upstream report");
+                assert!(
+                    upstream.rtt_ms.abs() < f64::EPSILON,
+                    "an idle window must report no RTT samples, got {}",
+                    upstream.rtt_ms
+                );
+                assert_eq!(upstream.errors, 0);
+            }
+            other => panic!("expected a StatsReport, got {other:?}"),
+        }
     }
 }

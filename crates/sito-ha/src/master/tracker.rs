@@ -25,7 +25,11 @@ pub struct SlaveSummary {
     pub last_stats: Option<SlaveStatsSummary>,
 }
 
-/// Aggregated stats snapshot reported by a slave node.
+/// Aggregated stats snapshot reported by a slave node for its last reporting
+/// window.
+///
+/// `window_s` is the actual length of that window and `queries`/`blocked` are
+/// the activity observed in it (deltas, not lifetime totals).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlaveStatsSummary {
     pub window_s: u64,
