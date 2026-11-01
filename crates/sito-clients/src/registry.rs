@@ -177,12 +177,29 @@ impl ClientRegistry {
             if ctx.id.is_none() {
                 ctx.id = Some(ClientId::new(&entry.name));
             }
+            if ctx.mac.is_none() {
+                ctx.mac = self.resolve_known_mac(ctx.ip, entry);
+            }
 
             return self.build_effective_policy(Some(entry), now);
         }
 
         // 2. Unknown client fallback
         self.build_effective_policy(None, now)
+    }
+
+    fn resolve_known_mac(&self, ip: IpAddr, entry: &ClientEntryConfig) -> Option<String> {
+        if !self.index.macs.is_empty()
+            && let Some(mac) = self.mac_resolver.resolve_mac(ip)
+        {
+            return Some(mac);
+        }
+        if let Ok(leases) = self.routeros_leases.read()
+            && let Some(lease) = leases.iter().find(|l| l.ip == Some(ip))
+        {
+            return Some(lease.mac.clone());
+        }
+        entry.ids.iter().find_map(|id| normalize_mac_id(id))
     }
 
     fn identify(
@@ -222,11 +239,17 @@ impl ClientRegistry {
         None
     }
 
-    fn entry_for_secret(&self, secret: &str) -> Option<&ClientEntryConfig> {
-        self.index
-            .secrets
-            .get(secret)
-            .and_then(|&idx| self.config.entries.get(idx))
+    fn entry_for_secret(&self, candidate: &str) -> Option<&ClientEntryConfig> {
+        let mut matched_idx: Option<usize> = None;
+        for (secret, &idx) in &self.index.secrets {
+            if constant_time_eq(secret.as_bytes(), candidate.as_bytes()) {
+                match matched_idx {
+                    Some(prev) if prev <= idx => {}
+                    _ => matched_idx = Some(idx),
+                }
+            }
+        }
+        matched_idx.and_then(|idx| self.config.entries.get(idx))
     }
 
     fn match_by_client_id_or_sni(&self, ctx: &ClientContext) -> Option<&ClientEntryConfig> {
@@ -398,7 +421,6 @@ impl ClientRegistry {
 
         if let Some(e) = entry {
             policy.client_name = Some(e.name.clone());
-            policy.ids.clone_from(&e.ids);
             policy.ignore_query_log = e.ignore_query_log;
             policy.ignore_stats = e.ignore_stats;
             policy.use_global_upstreams = e.use_global_upstreams;
@@ -450,16 +472,25 @@ impl ClientRegistry {
     }
 }
 
-/// Extract {id} from {id}.dns.domain.
+/// Extract `{id}` from `{id}.dns.domain` or `{id}.domain.tld` (at least 3 labels).
 pub fn extract_id_from_sni(sni: &str) -> Option<&str> {
-    let parts: Vec<&str> = sni.split('.').collect();
-    if parts.len() >= 3 && parts[1] == "dns" {
-        return Some(parts[0]);
-    }
-    if parts.len() >= 2 {
+    let trimmed = sni.trim_end_matches('.');
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.len() >= 3 && !parts[0].is_empty() {
         return Some(parts[0]);
     }
     None
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Extract and sanitize ClientID from URL path (e.g. `/dns-query/{client_id}`).
@@ -1026,5 +1057,25 @@ schedule = "0 0 15-21 * * MON-FRI"
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].ip, new_ip);
         assert_eq!(list[0].last_seen, base + TimeDelta::hours(25));
+    }
+
+    #[test]
+    fn test_mac_populated_on_ip_and_secret_matches() {
+        let reg = ClientRegistry::new(sample_config());
+        let ip = IpAddr::from_str("192.168.1.20").unwrap();
+        let mut ctx = ClientContext::new(ip);
+        let policy = reg.resolve(&mut ctx, reg.now());
+        assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
+        assert_eq!(ctx.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+    }
+
+    #[test]
+    fn test_two_label_sni_does_not_extract_client_id() {
+        assert_eq!(extract_id_from_sni("dns.google"), None);
+        assert_eq!(extract_id_from_sni("example.com."), None);
+        assert_eq!(
+            extract_id_from_sni("client1.dns.example.com"),
+            Some("client1")
+        );
     }
 }

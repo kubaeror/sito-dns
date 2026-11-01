@@ -409,15 +409,15 @@ fn build_window_cron(expr: &str) -> Option<Cron> {
     if parts.len() == 6 {
         // [sec, min, hour, dom, mon, dow]
         let (sec, min, hour) = (parts[0], parts[1], parts[2]);
-        if sec == "0" && min == "0" && is_range(hour) {
+        if sec == "0" && (min == "0" || min == "*") && is_range(hour) {
             // e.g. `0 0 15-21 * * MON-FRI` -> active for all of hours 15-21.
             let mut window_parts = parts.clone();
             window_parts[0] = "*";
             window_parts[1] = "*";
             return Cron::from_str(&window_parts.join(" ")).ok();
         }
-        if sec == "0" && is_range(min) {
-            // e.g. `0 15-30 10 * * *` -> active for all of minutes 15-30 in hour 10.
+        if sec == "0" && (min == "*" || is_range(min)) {
+            // e.g. `0 15-30 10 * * *` or `0 * 10 * * *` -> active across all seconds of matching minutes.
             let mut window_parts = parts.clone();
             window_parts[0] = "*";
             return Cron::from_str(&window_parts.join(" ")).ok();
@@ -429,10 +429,14 @@ fn build_window_cron(expr: &str) -> Option<Cron> {
         // [min, hour, dom, mon, dow]
         let (min, hour) = (parts[0], parts[1]);
 
-        // `* * * * *` means "every minute": for a schedule check at arbitrary
-        // seconds this must be treated as always active.
-        if min == "*" && hour == "*" {
-            return Cron::from_str("* * * * * *").ok();
+        // Any 5-field schedule with `*` in the minute field (e.g. `* * * * *`,
+        // `* 15-21 * * MON-FRI`, `* 9 * * *`, `* * * * MON-FRI`) means every
+        // minute of the matching hours/days and must be active across all 60
+        // seconds of each matching minute.
+        if min == "*" {
+            let mut window_parts = vec!["*"];
+            window_parts.extend_from_slice(&parts);
+            return Cron::from_str(&window_parts.join(" ")).ok();
         }
 
         // Only widen to an hour window when the hour is an explicit range/list,
@@ -708,5 +712,17 @@ mod tests {
         assert!(fail_closed_on_error(CronError::InvalidPattern(
             "unreachable".to_string()
         )));
+    }
+
+    #[test]
+    fn test_five_field_wildcard_minute_window_is_active_across_all_seconds() {
+        let schedule = Schedule::parse("* 15-21 * * MON-FRI").unwrap();
+        let mid_second = Utc.with_ymd_and_hms(2026, 9, 7, 16, 20, 37).unwrap();
+        assert!(
+            schedule.is_active(&mid_second),
+            "5-field `* 15-21 * * MON-FRI` must match non-zero seconds within the window"
+        );
+        let outside = Utc.with_ymd_and_hms(2026, 9, 7, 22, 0, 15).unwrap();
+        assert!(!schedule.is_active(&outside));
     }
 }

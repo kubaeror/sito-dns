@@ -252,6 +252,7 @@ fn build_routeros_client_with_timeout(
 ) -> Result<reqwest::Client, RouterOsError> {
     reqwest::Client::builder()
         .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(config.allow_invalid_certs)
         .build()
         .map_err(|e| RouterOsError::ClientBuild(e.to_string()))

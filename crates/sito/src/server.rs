@@ -645,6 +645,28 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
     }
 }
 
+/// Loads the embedded parental-control and service-blocking registries.
+///
+/// Uses the non-panicking `try_bundled()` loaders: corrupted embedded data is
+/// a packaging/build defect, so startup must be able to report it and exit
+/// cleanly instead of aborting with a panic.
+fn load_bundled_registries() -> anyhow::Result<(
+    Arc<sito_clients::ParentalRegistry>,
+    Arc<sito_clients::ServiceRegistry>,
+)> {
+    let parental = sito_clients::ParentalRegistry::try_bundled().map_err(|e| {
+        anyhow::anyhow!(
+            "failed to load embedded parental-control lists (corrupt bundled data): {e}"
+        )
+    })?;
+    let services = sito_clients::ServiceRegistry::try_bundled().map_err(|e| {
+        anyhow::anyhow!(
+            "failed to load embedded service-blocking rules (corrupt bundled data): {e}"
+        )
+    })?;
+    Ok((Arc::new(parental), Arc::new(services)))
+}
+
 /// Runs the complete sito DNS server with graceful shutdown handling.
 pub async fn run_server(config: Config) -> anyhow::Result<()> {
     let config_path = config.server.data_dir.join("config.toml");
@@ -705,8 +727,7 @@ pub async fn run_server_full(
     let client_registry = Arc::new(sito_clients::ClientRegistry::new(clients_config));
 
     // Initialize parental and service registries
-    let parental_registry = Arc::new(sito_clients::ParentalRegistry::bundled());
-    let service_registry = Arc::new(sito_clients::ServiceRegistry::bundled());
+    let (parental_registry, service_registry) = load_bundled_registries()?;
     let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
         parental_registry.clone(),
         service_registry.clone(),
@@ -1081,7 +1102,11 @@ async fn init_tls_and_acme(
     let (effective_cert, effective_key) = match (cert_file, key_file) {
         (Some(c), Some(k)) => (Some(c), Some(k)),
         _ if is_acme_enabled => {
-            let acme = acme_cfg.as_ref().unwrap();
+            let Some(acme) = acme_cfg.as_ref() else {
+                // `is_acme_enabled` is derived from `acme_cfg`; this guard
+                // keeps the startup path panic-free even if that changes.
+                anyhow::bail!("ACME is enabled but the ACME configuration is missing");
+            };
             let storage_dir = acme
                 .cache_dir
                 .clone()
@@ -1695,6 +1720,23 @@ mod tests {
             Some(std::ffi::OsStr::new("config.toml"))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_bundled_registries_load_without_panicking() {
+        // Startup must use the fallible loaders: corrupt embedded data has to
+        // surface as a startup error, not a panic. This pins that the shipped
+        // bundled data loads cleanly through that path.
+        let (parental, services) =
+            load_bundled_registries().expect("embedded bundled lists must load");
+        assert!(
+            !parental.lists().is_empty(),
+            "parental lists must be present"
+        );
+        assert!(
+            services.service_count() > 0,
+            "service rules must be present"
+        );
     }
 
     #[tokio::test]
