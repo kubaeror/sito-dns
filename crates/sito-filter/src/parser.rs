@@ -4,6 +4,7 @@ use hickory_proto::rr::RecordType;
 use sito_core::client::ClientContext;
 use sito_proto::normalize_domain;
 use std::fmt;
+use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use tracing::warn;
@@ -102,9 +103,33 @@ impl fmt::Display for ClientMatcher {
         match self {
             Self::Ip(ip) => write!(f, "{ip}"),
             Self::Cidr { ip, prefix } => write!(f, "{ip}/{prefix}"),
-            Self::Name(name) => write!(f, "{name}"),
+            Self::Name(name) => {
+                // Quote names that contain separators or characters with a
+                // special meaning in a modifier list so the canonical form
+                // (used for `$badfilter` deduplication) stays unambiguous.
+                if !needs_client_quoting(name) {
+                    return write!(f, "{name}");
+                }
+                f.write_char('\'')?;
+                for ch in name.chars() {
+                    if matches!(ch, '\'' | '"' | '\\' | ',' | '|') {
+                        f.write_char('\\')?;
+                    }
+                    f.write_char(ch)?;
+                }
+                f.write_char('\'')
+            }
         }
     }
+}
+
+/// Whether a client name must be quoted to be unambiguously serialized.
+fn needs_client_quoting(name: &str) -> bool {
+    name.is_empty()
+        || name.starts_with('~')
+        || name
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\' | ',' | '|'))
 }
 
 /// Verifies whether `target` IP falls within `net_ip/prefix` CIDR block.
@@ -339,23 +364,170 @@ pub fn compute_canonical(kind: RuleKind, pattern: &Pattern, modifiers: &RuleModi
     s
 }
 
+/// Whether a quote character at this position starts a quoted value.
+///
+/// Quotes are only honoured at the start of a value (after `=`, `|` or `~`) so
+/// an apostrophe inside unquoted data (e.g. `TXT;don't`) does not swallow the
+/// remaining modifiers.
+fn quote_can_open(quote: Option<char>, prev: Option<char>) -> bool {
+    quote.is_none() && matches!(prev, None | Some(',' | '=' | '|' | '~'))
+}
+
+/// Splits a modifier list on commas that are neither quoted nor escaped.
+///
+/// AdGuard allows quoting modifier values (`$client='John, Doe'`) and escaping
+/// separators (`\,`, `\|`); splitting on every comma would truncate such a
+/// value and silently drop the rule. The original escape sequences are kept
+/// here and removed by the modifier-specific parser.
+fn split_modifier_list(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut prev: Option<char> = None;
+    for (idx, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            prev = Some(ch);
+            continue;
+        }
+        match ch {
+            '\\' => {
+                escaped = true;
+                prev = Some(ch);
+            }
+            '\'' | '"' if quote == Some(ch) => {
+                quote = None;
+                prev = Some(ch);
+            }
+            '\'' | '"' if quote_can_open(quote, prev) => {
+                quote = Some(ch);
+                prev = Some(ch);
+            }
+            ',' if quote.is_none() => {
+                parts.push(&value[start..idx]);
+                start = idx + ch.len_utf8();
+                prev = Some(ch);
+            }
+            c if c.is_whitespace() => {}
+            c => prev = Some(c),
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+/// Splits a `|`-separated client value outside quotes and escapes.
+fn split_client_tokens(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut prev: Option<char> = None;
+    for (idx, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            prev = Some(ch);
+            continue;
+        }
+        match ch {
+            '\\' => {
+                escaped = true;
+                prev = Some(ch);
+            }
+            '\'' | '"' if quote == Some(ch) => {
+                quote = None;
+                prev = Some(ch);
+            }
+            '\'' | '"' if quote_can_open(quote, prev) => {
+                quote = Some(ch);
+                prev = Some(ch);
+            }
+            '|' if quote.is_none() => {
+                parts.push(&value[start..idx]);
+                start = idx + ch.len_utf8();
+                prev = Some(ch);
+            }
+            c if c.is_whitespace() => {}
+            c => prev = Some(c),
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+/// Removes one layer of ASCII single/double quotes and unescapes `\x`
+/// sequences from a client token.
+///
+/// Returns `None` for an unterminated quote, trailing garbage after the closing
+/// quote, a dangling escape, or an empty name so the caller can reject the rule
+/// instead of widening it to all clients.
+fn parse_client_token(token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+
+    let quoted = token.starts_with('\'') || token.starts_with('"');
+    let inner = if quoted {
+        let quote = token.chars().next()?;
+        let mut escaped = false;
+        let mut closing = None;
+        for (idx, ch) in token.char_indices().skip(1) {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == quote {
+                closing = Some(idx);
+                break;
+            }
+        }
+        let closing = closing?;
+        if !token[closing + quote.len_utf8()..].trim().is_empty() {
+            return None;
+        }
+        &token[quote.len_utf8()..closing]
+    } else {
+        token
+    };
+
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            out.push(chars.next()?);
+        } else {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 /// Parses a `$client` modifier value (e.g. `192.168.1.1|~laptop|10.0.0.0/8`).
 ///
 /// Values are separated with `|`; the enclosing modifier list uses commas.
-/// Returns `None` when any token cannot be parsed so the caller can skip the
-/// whole rule instead of silently dropping the client restriction.
+/// AdGuard quoting (`$client='John, Doe'`) and escaping (`\,`, `\|`, `\'`) are
+/// supported; `~` negation must be placed outside the quotes. Returns `None`
+/// when any token cannot be parsed so the caller can skip the whole rule
+/// instead of silently dropping the client restriction.
 fn parse_client_filter(value: &str) -> Option<ClientFilter> {
     let mut filter = ClientFilter::default();
-    for token in value.split('|') {
+    for token in split_client_tokens(value) {
         let token = token.trim();
         if token.is_empty() {
             continue;
         }
-        let (is_neg, item) = if let Some(stripped) = token.strip_prefix('~') {
+        let (is_neg, item_raw) = if let Some(stripped) = token.strip_prefix('~') {
             (true, stripped.trim())
         } else {
             (false, token)
         };
+        let item = parse_client_token(item_raw)?;
 
         let matcher = if item.contains('/') {
             // CIDR
@@ -378,7 +550,7 @@ fn parse_client_filter(value: &str) -> Option<ClientFilter> {
         } else if let Ok(ip) = item.parse::<IpAddr>() {
             ClientMatcher::Ip(ip)
         } else {
-            ClientMatcher::Name(item.to_string())
+            ClientMatcher::Name(item)
         };
 
         if is_neg {
@@ -484,7 +656,13 @@ fn infer_rewrite_type(value: &str) -> Option<(String, String)> {
     Some(("CNAME".to_string(), value.to_string()))
 }
 
+/// Record types the DNS pipeline can synthesize for `$dnsrewrite`.
+const SUPPORTED_DNSREWRITE_TYPES: &[&str] = &["A", "AAAA", "CNAME", "PTR", "TXT"];
+
 /// Validates an explicit `rcode;rtype;value` combination.
+///
+/// Record types the pipeline cannot synthesize are rejected here (with a
+/// warning) instead of being accepted and silently answered as NODATA.
 fn validate_rewrite(
     rcode: String,
     rtype: Option<String>,
@@ -509,6 +687,13 @@ fn validate_rewrite(
             if RecordType::from_str(rtype.as_str()).is_err() {
                 return None;
             }
+            if !SUPPORTED_DNSREWRITE_TYPES.contains(&rtype.as_str()) {
+                warn!(
+                    record_type = %rtype,
+                    "Unsupported $dnsrewrite record type; skipping rule"
+                );
+                return None;
+            }
             match rtype.as_str() {
                 "A" => {
                     value.parse::<Ipv4Addr>().ok()?;
@@ -516,14 +701,15 @@ fn validate_rewrite(
                 "AAAA" => {
                     value.parse::<Ipv6Addr>().ok()?;
                 }
-                "CNAME" | "PTR" | "NS" => {
+                "CNAME" | "PTR" => {
                     normalize_domain(&value).ok()?;
                 }
-                _ => {
-                    if value.trim().is_empty() {
+                "TXT" => {
+                    if value.is_empty() {
                         return None;
                     }
                 }
+                _ => return None,
             }
             Some(DnsRewriteRule {
                 rcode,
@@ -547,14 +733,15 @@ fn parse_dnsrewrite(value: &str) -> Option<DnsRewriteRule> {
     }
 
     if trimmed.contains(';') {
-        // Standard syntax: rcode;rtype;value
-        let parts: Vec<&str> = trimmed.split(';').map(str::trim).collect();
-        let rcode = parts.first()?.to_ascii_uppercase();
+        // Standard syntax: rcode;rtype;value. The value keeps any remaining
+        // semicolons so TXT data such as `NOERROR;TXT;a;b` is not truncated.
+        let mut parts = trimmed.splitn(3, ';');
+        let rcode = parts.next()?.trim().to_ascii_uppercase();
         if !is_valid_rcode(&rcode) {
             return None;
         }
-        let rtype_raw = parts.get(1).copied().unwrap_or("");
-        let value_raw = parts.get(2).copied().unwrap_or("");
+        let rtype_raw = parts.next().unwrap_or("").trim();
+        let value_raw = parts.next().unwrap_or("").trim();
         let rtype = if rtype_raw.is_empty() {
             None
         } else {
@@ -588,14 +775,15 @@ fn parse_dnsrewrite(value: &str) -> Option<DnsRewriteRule> {
 
 /// Parses options following `$` in an adblock rule.
 ///
-/// Modifiers are comma-separated. Unknown/unsupported modifiers (e.g. browser
-/// cosmetics like `$image`) or unparsable modifier values produce an error so
-/// the caller skips the whole rule: a rule must never be widened (for example
-/// a client-scoped block becoming global) because one modifier failed.
-fn parse_modifiers(options_str: &str) -> Result<RuleModifiers, String> {
+/// Modifiers are comma-separated (commas inside quotes or escaped with `\` do
+/// not split). Unknown/unsupported modifiers (e.g. browser cosmetics like
+/// `$image`) or unparsable modifier values produce an error so the caller skips
+/// the whole rule: a rule must never be widened (for example a client-scoped
+/// block becoming global) because one modifier failed.
+fn parse_modifiers(options_str: &str, kind: RuleKind) -> Result<RuleModifiers, String> {
     let mut modifiers = RuleModifiers::default();
 
-    for opt in options_str.split(',') {
+    for opt in split_modifier_list(options_str) {
         let opt = opt.trim();
         if opt.is_empty() {
             continue;
@@ -634,11 +822,25 @@ fn parse_modifiers(options_str: &str) -> Result<RuleModifiers, String> {
                 parse_denyallow(&val).ok_or_else(|| format!("invalid $denyallow value '{val}'"))?,
             );
         } else if key.eq_ignore_ascii_case("dnsrewrite") {
-            let val = require_value(value)?;
-            modifiers.dnsrewrite = Some(
-                parse_dnsrewrite(&val)
-                    .ok_or_else(|| format!("invalid $dnsrewrite value '{val}'"))?,
-            );
+            // A bare `$dnsrewrite` is only meaningful on an exception rule,
+            // where it cancels every matching rewrite (AdGuard semantics).
+            // On a blocking rule it has no valid value and is rejected.
+            match value.filter(|v| !v.is_empty()) {
+                Some(val) => {
+                    modifiers.dnsrewrite = Some(
+                        parse_dnsrewrite(val)
+                            .ok_or_else(|| format!("invalid $dnsrewrite value '{val}'"))?,
+                    );
+                }
+                None if kind == RuleKind::Allow => {
+                    modifiers.dnsrewrite = Some(DnsRewriteRule {
+                        rcode: "NOERROR".to_string(),
+                        rtype: None,
+                        value: None,
+                    });
+                }
+                None => return Err("modifier 'dnsrewrite' requires a value".to_string()),
+            }
         } else {
             // Unknown or unsupported browser modifier (e.g. $script, $image, $third-party)
             return Err(format!("unsupported or unknown modifier '{opt}'"));
@@ -741,7 +943,7 @@ pub fn parse_line(line: &str, source: &str, line_number: u32) -> Option<Rule> {
     };
 
     let modifiers = if let Some(opts) = options_part {
-        match parse_modifiers(opts) {
+        match parse_modifiers(opts, kind) {
             Ok(modifiers) => modifiers,
             Err(reason) => {
                 warn!(

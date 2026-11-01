@@ -2,7 +2,7 @@
 
 use crate::downloader::ListDownloader;
 use crate::error::FilterError;
-use crate::parser::{Pattern, Rule, RuleKind, parse_rules};
+use crate::parser::{DnsRewriteRule, Pattern, Rule, RuleKind, parse_rules};
 use crate::structures::{
     CompiledRuleSet, LabelInterner, MAX_REGEX_PATTERN_BYTES, MAX_REGEX_PATTERNS, RuleSetBuilder,
 };
@@ -187,6 +187,11 @@ impl FilterSnapshot {
             if !rule.modifiers.important {
                 continue;
             }
+            // An exception carrying `$dnsrewrite` cancels a rewrite; it is not
+            // an allow verdict for ordinary block rules.
+            if rule.modifiers.dnsrewrite.is_some() {
+                continue;
+            }
             if let Some(client_filter) = &rule.modifiers.client
                 && !client_filter.matches(client)
             {
@@ -267,6 +272,10 @@ impl FilterSnapshot {
         for &rule_id in allow_candidates {
             let rule = &self.rules[rule_id as usize];
             if rule.modifiers.important {
+                continue;
+            }
+            // `@@...$dnsrewrite` is a rewrite cancellation, never an allow.
+            if rule.modifiers.dnsrewrite.is_some() {
                 continue;
             }
             if let Some(client_filter) = &rule.modifiers.client
@@ -409,6 +418,161 @@ impl FilterSnapshot {
             &block_candidates,
         )
     }
+
+    /// Collects every `$dnsrewrite` rule from the matching `$important` or
+    /// standard block candidates.
+    ///
+    /// AdGuard returns *all* A/AAAA values contributed by matching rewrite
+    /// rules, so the caller must aggregate the whole list instead of using only
+    /// the first verdict. `important` selects the precedence tier.
+    pub fn collect_rewrite_rules(
+        &self,
+        domain: &str,
+        qtype: RecordType,
+        client: &ClientContext,
+        block_candidates: &[u32],
+        important: bool,
+    ) -> Vec<DnsRewriteRule> {
+        let mut rules = Vec::new();
+        for &rule_id in block_candidates {
+            let rule = &self.rules[rule_id as usize];
+            if rule.modifiers.important != important {
+                continue;
+            }
+            if !modifier_scope_matches(rule, domain, qtype, client) {
+                continue;
+            }
+            if let Some(rewrite) = &rule.modifiers.dnsrewrite {
+                rules.push(rewrite.clone());
+            }
+        }
+        rules
+    }
+
+    /// Collects the `@@...$dnsrewrite` exception rules that cancel rewrites.
+    ///
+    /// A value-less exception cancels every rewrite for the owner; one with a
+    /// value cancels only the identical rewrite (AdGuard semantics).
+    pub fn collect_rewrite_cancellations(
+        &self,
+        domain: &str,
+        qtype: RecordType,
+        client: &ClientContext,
+        allow_candidates: &[u32],
+        important: bool,
+    ) -> Vec<DnsRewriteRule> {
+        let mut cancellations = Vec::new();
+        for &rule_id in allow_candidates {
+            let rule = &self.rules[rule_id as usize];
+            if rule.modifiers.important != important {
+                continue;
+            }
+            if !modifier_scope_matches(rule, domain, qtype, client) {
+                continue;
+            }
+            if let Some(rewrite) = &rule.modifiers.dnsrewrite {
+                cancellations.push(rewrite.clone());
+            }
+        }
+        cancellations
+    }
+}
+
+/// Applies `$client`, `$dnstype` and `$denyallow` scope checks shared by the
+/// rewrite collectors.
+fn modifier_scope_matches(
+    rule: &Rule,
+    domain: &str,
+    qtype: RecordType,
+    client: &ClientContext,
+) -> bool {
+    if rule.modifiers.denyallow_matches(domain) {
+        return false;
+    }
+    if let Some(client_filter) = &rule.modifiers.client
+        && !client_filter.matches(client)
+    {
+        return false;
+    }
+    if let Some(dnstype_filter) = &rule.modifiers.dnstype
+        && !dnstype_filter.matches(qtype)
+    {
+        return false;
+    }
+    true
+}
+
+/// Whether a cancellation rule cancels every rewrite for the owner.
+fn cancels_all(rule: &DnsRewriteRule) -> bool {
+    rule.rtype.is_none()
+        && rule.value.is_none()
+        && (rule.rcode.is_empty() || rule.rcode.eq_ignore_ascii_case("NOERROR"))
+}
+
+/// Compares two rewrite rules for cancellation purposes.
+///
+/// `A`/`AAAA` values compare as parsed addresses, domain-valued types compare
+/// after normalization, and TXT data compares byte-for-byte.
+fn same_rewrite(a: &DnsRewriteRule, b: &DnsRewriteRule) -> bool {
+    let rcode_eq = |x: &str, y: &str| {
+        let x = if x.is_empty() { "NOERROR" } else { x };
+        let y = if y.is_empty() { "NOERROR" } else { y };
+        x.eq_ignore_ascii_case(y)
+    };
+    let rtype_eq = match (&a.rtype, &b.rtype) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+        _ => false,
+    };
+    if !rcode_eq(&a.rcode, &b.rcode) || !rtype_eq {
+        return false;
+    }
+    let Some(rtype) = a.rtype.as_deref().map(str::to_ascii_uppercase) else {
+        return a.value.is_none() && b.value.is_none();
+    };
+    let (Some(av), Some(bv)) = (a.value.as_deref(), b.value.as_deref()) else {
+        return false;
+    };
+    match rtype.as_str() {
+        "A" | "AAAA" => match (
+            av.parse::<std::net::IpAddr>(),
+            bv.parse::<std::net::IpAddr>(),
+        ) {
+            (Ok(aip), Ok(bip)) => aip == bip,
+            _ => av == bv,
+        },
+        "CNAME" | "PTR" => normalize_domain(av)
+            .ok()
+            .zip(normalize_domain(bv).ok())
+            .is_some_and(|(x, y)| x.eq_ignore_ascii_case(&y)),
+        _ => av == bv,
+    }
+}
+
+/// Removes cancelled and duplicate entries from an aggregated rewrite list.
+///
+/// Cancellations are applied in rule order; a later value-less cancellation
+/// clears everything collected so far, matching AdGuard's "unblock all DNS
+/// rewrite rules" exception. Identical values contributed by several lists are
+/// emitted once.
+pub fn apply_rewrite_cancellations(
+    rules: &mut Vec<DnsRewriteRule>,
+    cancellations: &[DnsRewriteRule],
+) {
+    for cancel in cancellations {
+        if cancels_all(cancel) {
+            rules.clear();
+        } else {
+            rules.retain(|rule| !same_rewrite(cancel, rule));
+        }
+    }
+    let mut unique: Vec<DnsRewriteRule> = Vec::with_capacity(rules.len());
+    for rule in rules.drain(..) {
+        if !unique.iter().any(|seen| same_rewrite(seen, &rule)) {
+            unique.push(rule);
+        }
+    }
+    *rules = unique;
 }
 
 /// Counts the lists that actually loaded in a reload cycle.

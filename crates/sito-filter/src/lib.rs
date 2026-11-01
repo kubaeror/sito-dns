@@ -13,7 +13,10 @@ pub mod subscription;
 
 pub use anti_bypass::AntiBypassRegistry;
 pub use downloader::ListDownloader;
-pub use engine::{FilterSnapshot, FilterState, FilterStatus, GroupRuleSet, HostsFilterEngine};
+pub use engine::{
+    FilterSnapshot, FilterState, FilterStatus, GroupRuleSet, HostsFilterEngine,
+    apply_rewrite_cancellations,
+};
 pub use error::FilterError;
-pub use parser::{Pattern, Rule, RuleKind, RuleModifiers, parse_rules};
+pub use parser::{DnsRewriteRule, Pattern, Rule, RuleKind, RuleModifiers, parse_rules};
 pub use subscription::{ListMetadata, SubscriptionFetcher};

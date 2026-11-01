@@ -3,7 +3,7 @@
 use arc_swap::ArcSwap;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
-use hickory_proto::rr::rdata::{A, AAAA, CNAME};
+use hickory_proto::rr::rdata::{A, AAAA, CNAME, PTR, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use sito_cache::{DnsCache, ValidationStatus};
 use sito_clients::{
@@ -12,9 +12,9 @@ use sito_clients::{
 };
 use sito_core::client::ClientContext;
 use sito_core::config::{Config, UpstreamEcs};
-use sito_core::verdict::{RewriteAction, Verdict};
+use sito_core::verdict::Verdict;
 use sito_dnssec::DnssecValidator;
-use sito_filter::{AntiBypassRegistry, HostsFilterEngine};
+use sito_filter::{AntiBypassRegistry, DnsRewriteRule, FilterSnapshot, HostsFilterEngine};
 use sito_proto::synthesize_blocked_response;
 use sito_proto::wire::{synthesize_cname_response, synthesize_records_response};
 use sito_rewrites::RewriteTable;
@@ -331,55 +331,84 @@ fn make_blocked_response(
     blocked_resp
 }
 
-/// Builds a synthesized response for an ABP `$dnsrewrite` action.
-fn make_rewrite_response(query: &Message, action: &RewriteAction, query_id: u16) -> Message {
-    let RewriteAction::DnsRewrite {
-        rcode,
-        rtype,
-        value,
-    } = action
-    else {
-        // `SynthesizeAnswer` is not emitted by the current filter engine; return
-        // a plain NOERROR response for the query instead.
-        let mut resp = Message::new(query_id, MessageType::Response, query.metadata.op_code);
-        copy_query_response_flags(&mut resp, query);
-        return resp;
-    };
+/// Splits TXT data into the 255-byte character-strings a DNS TXT record allows.
+fn txt_chunks(value: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < value.len() {
+        let mut end = (start + 255).min(value.len());
+        while end > start && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(value[start..end].to_string());
+        start = end;
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
 
+/// Builds a synthesized response for all matching ABP `$dnsrewrite` rules.
+///
+/// AdGuard aggregates every matching rewrite for an owner: two `A` rewrites
+/// produce two answer records. A non-`NOERROR` rcode is exclusive and wins over
+/// any record synthesis.
+fn make_rewrite_response(query: &Message, rules: &[DnsRewriteRule], query_id: u16) -> Message {
     let mut resp = Message::new(query_id, MessageType::Response, query.metadata.op_code);
     copy_query_response_flags(&mut resp, query);
 
-    resp.metadata.response_code = match rcode.to_ascii_uppercase().as_str() {
-        "NXDOMAIN" => ResponseCode::NXDomain,
-        "REFUSED" => ResponseCode::Refused,
-        "SERVFAIL" => ResponseCode::ServFail,
-        "FORMERR" => ResponseCode::FormErr,
-        "NOTIMP" => ResponseCode::NotImp,
+    let rcode = rules
+        .iter()
+        .map(|rule| rule.rcode.trim())
+        .find(|rcode| !rcode.is_empty() && !rcode.eq_ignore_ascii_case("NOERROR"));
+    resp.metadata.response_code = match rcode.map(str::to_ascii_uppercase).as_deref() {
+        Some("NXDOMAIN") => ResponseCode::NXDomain,
+        Some("REFUSED") => ResponseCode::Refused,
+        Some("SERVFAIL") => ResponseCode::ServFail,
+        Some("FORMERR") => ResponseCode::FormErr,
+        Some("NOTIMP") => ResponseCode::NotImp,
         _ => ResponseCode::NoError,
     };
 
     if resp.metadata.response_code == ResponseCode::NoError
-        && let (Some(rtype), Some(value)) = (rtype.as_deref(), value.as_deref())
         && let Some(question) = query.queries.first()
     {
-        let rtype = rtype.to_ascii_uppercase();
-        let rdata = match rtype.as_str() {
-            "A" => value
-                .parse::<std::net::Ipv4Addr>()
-                .ok()
-                .map(|ip| RData::A(A(ip))),
-            "AAAA" => value
-                .parse::<std::net::Ipv6Addr>()
-                .ok()
-                .map(|ip| RData::AAAA(AAAA(ip))),
-            "CNAME" => Name::from_str(value.trim_end_matches('.'))
-                .ok()
-                .map(|name| RData::CNAME(CNAME(name))),
-            _ => None,
-        };
-        if let Some(rdata) = rdata {
-            let record = Record::from_rdata(question.name().clone(), 60, rdata);
-            resp.answers.push(record);
+        for rule in rules {
+            let (Some(rtype), Some(value)) = (rule.rtype.as_deref(), rule.value.as_deref()) else {
+                continue;
+            };
+            let rtype = rtype.to_ascii_uppercase();
+            let rdata = match rtype.as_str() {
+                "A" => value
+                    .parse::<std::net::Ipv4Addr>()
+                    .ok()
+                    .map(|ip| RData::A(A(ip))),
+                "AAAA" => value
+                    .parse::<std::net::Ipv6Addr>()
+                    .ok()
+                    .map(|ip| RData::AAAA(AAAA(ip))),
+                "CNAME" => Name::from_str(value.trim_end_matches('.'))
+                    .ok()
+                    .map(|name| RData::CNAME(CNAME(name))),
+                "PTR" => Name::from_str(value.trim_end_matches('.'))
+                    .ok()
+                    .map(|name| RData::PTR(PTR(name))),
+                "TXT" => Some(RData::TXT(TXT::new(txt_chunks(value)))),
+                other => {
+                    // The parser rejects unsupported `$dnsrewrite` types; this
+                    // only guards programmatically constructed rules.
+                    warn!(
+                        record_type = other,
+                        "Unsupported $dnsrewrite record type; omitting record"
+                    );
+                    None
+                }
+            };
+            if let Some(rdata) = rdata {
+                let record = Record::from_rdata(question.name().clone(), 60, rdata);
+                resp.answers.push(record);
+            }
         }
     }
 
@@ -435,6 +464,48 @@ fn combine_standard_verdicts(global: Verdict, group: Option<Verdict>) -> Verdict
         return block;
     }
     Verdict::Allow(None)
+}
+
+/// Aggregates all matching `$dnsrewrite` rules from the global and per-group
+/// snapshots and applies their `@@...$dnsrewrite` exceptions.
+///
+/// Rewrites and cancellations from every applicable set are merged before
+/// cancellation so a group exception can disable a global rewrite (and vice
+/// versa), matching AdGuard's "all lists are one rule set" model.
+fn effective_rewrites(
+    sets: &[(&FilterSnapshot, &FilterCandidates)],
+    domain: &str,
+    qtype: RecordType,
+    client: &ClientContext,
+    important: bool,
+) -> Vec<DnsRewriteRule> {
+    let mut rules = Vec::new();
+    let mut cancellations = Vec::new();
+    // An `$important` cancellation outranks standard rewrite rules, so the
+    // standard tier must also consult important exceptions. The important tier
+    // only honours important cancellations (a standard exception cannot
+    // override an important rewrite).
+    let cancellation_tiers: &[bool] = if important { &[true] } else { &[false, true] };
+    for (snapshot, candidates) in sets {
+        rules.extend(snapshot.collect_rewrite_rules(
+            domain,
+            qtype,
+            client,
+            &candidates.block,
+            important,
+        ));
+        for &tier in cancellation_tiers {
+            cancellations.extend(snapshot.collect_rewrite_cancellations(
+                domain,
+                qtype,
+                client,
+                &candidates.allow,
+                tier,
+            ));
+        }
+    }
+    sito_filter::apply_rewrite_cancellations(&mut rules, &cancellations);
+    rules
 }
 
 /// Normalizes a query name to its ASCII/punycode, lowercased form.
@@ -761,9 +832,26 @@ impl DnsPipeline {
                     query, config, query_id, domain_str, qtype, rule, source,
                 ))
             }
-            Verdict::Rewrite(action) => {
-                debug!(qname = %domain_str, "Query rewritten by standard filter rule");
-                let resp = make_rewrite_response(query, &action, query_id);
+            Verdict::Rewrite(_) => {
+                // Aggregate every matching rewrite for this owner (AdGuard
+                // returns all A/AAAA values) and let `@@...$dnsrewrite`
+                // exceptions cancel them. A fully cancelled rewrite falls
+                // through to normal resolution.
+                let mut sets: Vec<(&FilterSnapshot, &FilterCandidates)> =
+                    vec![(snapshot, candidates)];
+                if let Some((group_snapshot, group_candidates)) = group {
+                    sets.push((group_snapshot, group_candidates));
+                }
+                let rewrites = effective_rewrites(&sets, normalized_domain, qtype, client, false);
+                if rewrites.is_empty() {
+                    debug!(
+                        qname = %domain_str,
+                        "DNS rewrite cancelled by an exception rule"
+                    );
+                    return None;
+                }
+                debug!(qname = %domain_str, count = rewrites.len(), "Query rewritten by standard filter rule");
+                let resp = make_rewrite_response(query, &rewrites, query_id);
                 Some(QueryOutcome::rewritten(resp, domain_str.to_string(), qtype))
             }
             Verdict::Allow(_) => None,
@@ -1263,10 +1351,33 @@ impl QueryHandler for DnsPipeline {
                             source,
                         );
                     }
-                    Verdict::Rewrite(action) => {
-                        debug!(qname = %qname, "Query rewritten by $important rule");
-                        let resp = make_rewrite_response(&query, &action, query_id);
-                        return QueryOutcome::rewritten(resp, domain_str, qtype);
+                    Verdict::Rewrite(_) => {
+                        let mut sets: Vec<(&FilterSnapshot, &FilterCandidates)> = Vec::new();
+                        if let Some(snapshot) = filter_snapshot.as_ref() {
+                            sets.push((snapshot, &filter_candidates));
+                        }
+                        if let (Some(group), Some(candidates)) =
+                            (group_snapshot.as_ref(), group_candidates.as_ref())
+                        {
+                            sets.push((group, candidates));
+                        }
+                        let rewrites = effective_rewrites(
+                            &sets,
+                            &normalized_domain,
+                            qtype,
+                            &client,
+                            true,
+                        );
+                        if rewrites.is_empty() {
+                            debug!(
+                                qname = %qname,
+                                "Important DNS rewrite cancelled by an exception rule"
+                            );
+                        } else {
+                            debug!(qname = %qname, count = rewrites.len(), "Query rewritten by $important rule");
+                            let resp = make_rewrite_response(&query, &rewrites, query_id);
+                            return QueryOutcome::rewritten(resp, domain_str, qtype);
+                        }
                     }
                     Verdict::Allow(_) => {
                         // $important allow overrides rewrites and all standard blocks.
@@ -1686,6 +1797,173 @@ mod tests {
     use super::*;
     use sito_core::client::ClientContext;
     use sito_core::config::FilteringConfig;
+
+    fn rewrite_rule(rcode: &str, rtype: Option<&str>, value: Option<&str>) -> DnsRewriteRule {
+        DnsRewriteRule {
+            rcode: rcode.to_string(),
+            rtype: rtype.map(str::to_string),
+            value: value.map(str::to_string),
+        }
+    }
+
+    fn rewrite_query(name: &str, qtype: RecordType) -> Message {
+        use hickory_proto::op::Query;
+        let mut query = Message::new(42, MessageType::Query, OpCode::Query);
+        query
+            .queries
+            .push(Query::query(Name::from_str(name).unwrap(), qtype));
+        query
+    }
+
+    #[test]
+    fn test_make_rewrite_response_synthesizes_ptr_txt_and_aggregates() {
+        let query = rewrite_query("4.3.2.1.in-addr.arpa.", RecordType::PTR);
+        let long_txt = "x".repeat(300);
+        let rules = vec![
+            rewrite_rule("NOERROR", Some("A"), Some("10.0.0.1")),
+            rewrite_rule("NOERROR", Some("A"), Some("10.0.0.2")),
+            rewrite_rule("NOERROR", Some("PTR"), Some("printer.lan.")),
+            rewrite_rule("NOERROR", Some("TXT"), Some("hello")),
+            rewrite_rule("NOERROR", Some("TXT"), Some(&long_txt)),
+        ];
+
+        let resp = make_rewrite_response(&query, &rules, 7);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.metadata.id, 7);
+        assert_eq!(
+            resp.answers.len(),
+            5,
+            "all matching rewrites are synthesized"
+        );
+
+        let a_values: Vec<_> = resp
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            a_values,
+            vec![
+                std::net::Ipv4Addr::new(10, 0, 0, 1),
+                std::net::Ipv4Addr::new(10, 0, 0, 2)
+            ]
+        );
+
+        assert!(
+            resp.answers.iter().any(|record| {
+                matches!(&record.data, RData::PTR(ptr) if ptr.0.to_ascii().trim_end_matches('.') == "printer.lan")
+            }),
+            "missing PTR record: {:?}",
+            resp.answers
+        );
+
+        let txt_chunk_counts: Vec<usize> = resp
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::TXT(txt) => Some(txt.txt_data.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            txt_chunk_counts,
+            vec![1, 2],
+            "long TXT is split at 255 bytes"
+        );
+    }
+
+    #[test]
+    fn test_make_rewrite_response_rcode_wins_over_records() {
+        let query = rewrite_query("rewrite.example.", RecordType::A);
+        let rules = vec![
+            rewrite_rule("NOERROR", Some("A"), Some("1.2.3.4")),
+            rewrite_rule("NXDOMAIN", None, None),
+        ];
+        let resp = make_rewrite_response(&query, &rules, 9);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
+        assert!(resp.answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_aggregates_and_cancels_dnsrewrite() {
+        use std::sync::atomic::Ordering;
+
+        let mut config = Config::default();
+        config.filtering.custom_rules = vec![
+            "||rewrite-pipeline.example^$dnsrewrite=1.2.3.4".to_string(),
+            "||rewrite-pipeline.example^$dnsrewrite=5.6.7.8".to_string(),
+            "||rewrite-cancelled.example^$dnsrewrite=1.2.3.4".to_string(),
+            "@@||rewrite-cancelled.example^$dnsrewrite".to_string(),
+            "||rewrite-important-cancelled.example^$dnsrewrite=9.9.9.9".to_string(),
+            "@@||rewrite-important-cancelled.example^$dnsrewrite,important".to_string(),
+        ];
+        let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+        // Both A values are returned in one synthesized answer.
+        let resp = pipeline
+            .handle(
+                rewrite_query("rewrite-pipeline.example.", RecordType::A),
+                client.clone(),
+            )
+            .await
+            .unwrap();
+        let a_values: Vec<_> = resp
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            a_values,
+            vec![
+                std::net::Ipv4Addr::new(1, 2, 3, 4),
+                std::net::Ipv4Addr::new(5, 6, 7, 8)
+            ]
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a rewrite must not query upstream"
+        );
+
+        // The bare `@@...$dnsrewrite` exception cancels the rewrite and the
+        // query is resolved normally.
+        let resp = pipeline
+            .handle(
+                rewrite_query("rewrite-cancelled.example.", RecordType::A),
+                client.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.answers.len(), 1);
+        assert!(
+            matches!(resp.answers[0].data, RData::A(A(ip)) if ip == std::net::Ipv4Addr::new(203, 0, 113, 9))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // An `$important` cancellation-only exception outranks a standard
+        // rewrite, so the query also resolves upstream.
+        let resp = pipeline
+            .handle(
+                rewrite_query("rewrite-important-cancelled.example.", RecordType::A),
+                client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.answers.len(), 1);
+        assert!(
+            matches!(resp.answers[0].data, RData::A(A(ip)) if ip == std::net::Ipv4Addr::new(203, 0, 113, 9))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
 
     /// Collects candidates exactly like [`DnsPipeline::handle`] does and
     /// compares the resulting verdicts with the engine's own `evaluate*`
