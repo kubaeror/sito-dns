@@ -1004,6 +1004,21 @@ pub enum UpstreamStrategy {
     LoadBalance,
 }
 
+/// Policy for forwarding the RFC 7871 EDNS Client Subnet option upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamEcs {
+    /// Strip client ECS options before forwarding. Upstreams only see this
+    /// resolver's address, and all clients share one cache entry per question.
+    #[default]
+    Off,
+    /// Forward client ECS options after validation and prefix clamping
+    /// (IPv4 /24, IPv6 /56, source prefix 0 is dropped). This improves CDN
+    /// accuracy for the client's network but discloses a coarse location
+    /// hint to the upstream resolver and splits cache entries per subnet.
+    Forward,
+}
+
 /// Per-domain upstream forwarder routing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerDomainUpstream {
@@ -1028,6 +1043,16 @@ pub struct UpstreamConfig {
     pub probe_domain: String,
     #[serde(default = "default_upstream_pool_size")]
     pub pool_size: usize,
+    /// EDNS Client Subnet (ECS) forwarding policy.
+    ///
+    /// `"off"` (default) strips client ECS options, so upstream resolvers only
+    /// see this resolver's address and all clients share the same cache
+    /// entries. `"forward"` forwards client ECS after clamping prefix lengths
+    /// (IPv4 /24, IPv6 /56) and dropping a zero source prefix; this improves
+    /// CDN locality but discloses a coarse client-location hint to the
+    /// upstream and splits the cache by subnet.
+    #[serde(default)]
+    pub ecs: UpstreamEcs,
     /// Per-domain routing rules. Each rule must list at least one non-empty
     /// domain (otherwise it can never match) and one non-empty server
     /// (otherwise matching queries would fail closed with SERVFAIL).
@@ -1063,6 +1088,7 @@ impl Default for UpstreamConfig {
             timeout_ms: default_upstream_timeout_ms(),
             probe_domain: default_upstream_probe_domain(),
             pool_size: default_upstream_pool_size(),
+            ecs: UpstreamEcs::default(),
             per_domain: Vec::new(),
         }
     }
@@ -1547,6 +1573,20 @@ enabled = false
             ConfigError::Validation { field, .. } => assert_eq!(field, "dns.cache.min_ttl"),
             other => panic!("expected validation error on dns.cache.min_ttl, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_upstream_ecs_policy_defaults_off_and_parses_forward() {
+        let base = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+        let default = Config::from_toml_str(base).expect("default config");
+        assert_eq!(default.upstream.ecs, UpstreamEcs::Off);
+
+        let forward =
+            Config::from_toml_str(&format!("{base}ecs = \"forward\"\n")).expect("forward config");
+        assert_eq!(forward.upstream.ecs, UpstreamEcs::Forward);
+
+        let invalid = Config::from_toml_str(&format!("{base}ecs = \"sometimes\"\n"));
+        assert!(invalid.is_err(), "unknown ECS policy must be rejected");
     }
 
     /// Regression (audit 6, WP-3.9): two lists with the same `name` silently

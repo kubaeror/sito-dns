@@ -1,16 +1,17 @@
 //! DNS query execution pipeline.
 
 use arc_swap::ArcSwap;
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::op::{Edns, Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
-use sito_cache::DnsCache;
+use sito_cache::{DnsCache, ValidationStatus};
 use sito_clients::{
     ClientRegistry, EffectivePolicy, ParentalRegistry, RuntimeLists, ServiceRegistry,
     match_safe_search,
 };
 use sito_core::client::ClientContext;
-use sito_core::config::Config;
+use sito_core::config::{Config, UpstreamEcs};
 use sito_core::verdict::{RewriteAction, Verdict};
 use sito_dnssec::DnssecValidator;
 use sito_filter::{AntiBypassRegistry, HostsFilterEngine};
@@ -34,6 +35,169 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// Whether a query carried the DNSSEC OK (DO) bit.
+fn query_has_do(query: &Message) -> bool {
+    query
+        .edns
+        .as_ref()
+        .is_some_and(|edns| edns.flags().dnssec_ok)
+}
+
+/// Copies the query-derived metadata (ID/opcode are set by the caller) that
+/// every synthesized or error response must echo: RD, CD, the question and a
+/// minimal OPT record with the client's DO bit.
+fn copy_query_response_flags(response: &mut Message, query: &Message) {
+    response.metadata.recursion_desired = query.metadata.recursion_desired;
+    response.metadata.recursion_available = true;
+    response.metadata.checking_disabled = query.metadata.checking_disabled;
+    response.queries.clone_from(&query.queries);
+    if let Some(client_edns) = &query.edns {
+        let mut edns = Edns::new();
+        edns.set_max_payload(client_edns.max_payload());
+        edns.set_dnssec_ok(client_edns.flags().dnssec_ok);
+        response.set_edns(edns);
+    }
+}
+
+/// Builds an error/synthesized response that preserves the query's opcode,
+/// question, CD bit and EDNS/DO signalling.
+fn error_response(query: &Message, response_code: ResponseCode) -> Message {
+    let mut response = Message::new(
+        query.metadata.id,
+        MessageType::Response,
+        query.metadata.op_code,
+    );
+    response.metadata.response_code = response_code;
+    copy_query_response_flags(&mut response, query);
+    response
+}
+
+/// Strips DNSSEC records and DO-dependent EDNS options from a response.
+///
+/// RFC 3225: clients that did not set DO must not receive RRSIG/NSEC/NSEC3/
+/// DNSKEY material. The same shaping is applied before such a response is
+/// cached so a DO=0 cache entry never carries DNSSEC data.
+fn strip_dnssec_records(response: &mut Message) {
+    let is_dnssec_type = |record: &Record| {
+        matches!(
+            record.record_type(),
+            RecordType::RRSIG | RecordType::NSEC | RecordType::NSEC3 | RecordType::DNSKEY
+        )
+    };
+    response.answers.retain(|record| !is_dnssec_type(record));
+    response
+        .authorities
+        .retain(|record| !is_dnssec_type(record));
+    response
+        .additionals
+        .retain(|record| !is_dnssec_type(record));
+    if let Some(edns) = response.edns.as_mut() {
+        // DAU/DHU/N3U only make sense for DNSSEC-aware clients.
+        edns.options_mut().remove(EdnsCode::DAU);
+        edns.options_mut().remove(EdnsCode::DHU);
+        edns.options_mut().remove(EdnsCode::N3U);
+    }
+}
+
+/// Masks the host bits of an address so the cache key and the forwarded ECS
+/// option describe the same network prefix.
+fn truncate_ip(addr: IpAddr, prefix: u8) -> IpAddr {
+    match addr {
+        IpAddr::V4(v4) if prefix < 32 => {
+            let mask = u32::MAX << (32 - u32::from(prefix));
+            IpAddr::V4((u32::from(v4) & mask).into())
+        }
+        IpAddr::V6(v6) if prefix < 128 => {
+            let mask = u128::MAX << (128 - u32::from(prefix));
+            IpAddr::V6((u128::from(v6) & mask).into())
+        }
+        other => other,
+    }
+}
+
+/// Applies the configured ECS policy to an outbound/cache query.
+///
+/// `off` removes the client's ECS option entirely (privacy-preserving and
+/// cache-friendly); `forward` validates the prefix, clamps it to /24 (IPv4)
+/// or /56 (IPv6), clears the scope and zeroes host bits. A zero-length source
+/// prefix (RFC 7871 opt-out) is never forwarded.
+fn apply_ecs_policy(query: &mut Message, policy: UpstreamEcs) {
+    let Some(edns) = query.edns.as_mut() else {
+        return;
+    };
+    let subnet = match edns.option(EdnsCode::Subnet).cloned() {
+        Some(EdnsOption::Subnet(subnet)) => Some(subnet),
+        _ => None,
+    };
+    edns.options_mut().remove(EdnsCode::Subnet);
+    if policy == UpstreamEcs::Off {
+        return;
+    }
+    let Some(subnet) = subnet else {
+        return;
+    };
+    if subnet.source_prefix() == 0 {
+        return;
+    }
+    let (max_prefix, bits) = match subnet.addr() {
+        IpAddr::V4(_) => (24u8, 32u8),
+        IpAddr::V6(_) => (56u8, 128u8),
+    };
+    let prefix = subnet.source_prefix().min(max_prefix).min(bits);
+    if prefix == 0 {
+        return;
+    }
+    let clamped = ClientSubnet::new(truncate_ip(subnet.addr(), prefix), prefix, 0);
+    edns.options_mut().insert(EdnsOption::Subnet(clamped));
+}
+
+/// Builds the query used for cache lookups/inserts: the client's DO/CD/opcode
+/// flags plus the ECS actually forwarded upstream (`off` deduplicates keys,
+/// `forward` keys on the clamped subnet).
+fn build_cache_query(query: &Message, config: &Config) -> Message {
+    let mut cache_query = query.clone();
+    apply_ecs_policy(&mut cache_query, config.upstream.ecs);
+    cache_query
+}
+
+/// Builds the query sent upstream, optionally forcing DO so validation has
+/// signatures to check.
+fn build_upstream_query(query: &Message, config: &Config, force_dnssec: bool) -> Message {
+    let mut upstream_query = query.clone();
+    if force_dnssec {
+        let mut edns = upstream_query.edns.clone().unwrap_or_default();
+        edns.set_dnssec_ok(true);
+        edns.set_max_payload(config.dns.edns_udp_size.max(1232));
+        upstream_query.set_edns(edns);
+    }
+    apply_ecs_policy(&mut upstream_query, config.upstream.ecs);
+    upstream_query
+}
+
+/// Maps a DNSSEC validation outcome onto the status stored in the cache.
+fn validation_status(outcome: Option<&sito_dnssec::ValidationOutcome>) -> ValidationStatus {
+    match outcome {
+        Some(sito_dnssec::ValidationOutcome::Secure) => ValidationStatus::Secure,
+        Some(
+            sito_dnssec::ValidationOutcome::Insecure | sito_dnssec::ValidationOutcome::NtaBypass,
+        ) => ValidationStatus::Insecure,
+        Some(
+            sito_dnssec::ValidationOutcome::Indeterminate
+            | sito_dnssec::ValidationOutcome::Bogus { .. },
+        ) => ValidationStatus::Indeterminate,
+        None => ValidationStatus::Unchecked,
+    }
+}
+
+/// Whether a cached entry may be served while local validation is active.
+///
+/// `Unchecked` entries (CD=1 / validation disabled) must never be served when
+/// a CD=0 query expects the resolver to have validated the answer. Insecure
+/// and Indeterminate entries are legitimate but are always served with AD=0.
+fn cache_entry_servable(status: ValidationStatus, validation_active: bool) -> bool {
+    !validation_active || status != ValidationStatus::Unchecked
 }
 
 /// Outcome of executing a query through the DNS pipeline.
@@ -113,31 +277,34 @@ impl QueryOutcome {
         }
     }
 
-    fn formerr(query_id: u16) -> Self {
-        let mut err_resp = Message::new(query_id, MessageType::Response, OpCode::Query);
-        err_resp.metadata.response_code = ResponseCode::FormErr;
-        Self {
-            response: Some(err_resp),
-            verdict: "formerr",
-            rule: None,
-            source: None,
-            upstream: None,
-            from_cache: false,
-            domain_str: String::new(),
-            qtype: RecordType::A,
-            dnssec: None,
-        }
+    fn formerr(query: &Message) -> Self {
+        Self::error(
+            query,
+            ResponseCode::FormErr,
+            "formerr",
+            String::new(),
+            RecordType::A,
+        )
     }
 
-    fn servfail(query_id: u16, query: &Message, domain_str: String, qtype: RecordType) -> Self {
-        let mut err_resp = Message::new(query_id, MessageType::Response, OpCode::Query);
-        err_resp.metadata.response_code = ResponseCode::ServFail;
-        err_resp.metadata.recursion_desired = query.metadata.recursion_desired;
-        err_resp.metadata.recursion_available = true;
-        err_resp.queries.clone_from(&query.queries);
+    fn notimp(query: &Message, domain_str: String, qtype: RecordType) -> Self {
+        Self::error(query, ResponseCode::NotImp, "notimp", domain_str, qtype)
+    }
+
+    fn badvers(query: &Message, domain_str: String, qtype: RecordType) -> Self {
+        Self::error(query, ResponseCode::BADVERS, "badvers", domain_str, qtype)
+    }
+
+    fn error(
+        query: &Message,
+        response_code: ResponseCode,
+        verdict: &'static str,
+        domain_str: String,
+        qtype: RecordType,
+    ) -> Self {
         Self {
-            response: Some(err_resp),
-            verdict: "servfail",
+            response: Some(error_response(query, response_code)),
+            verdict,
             rule: None,
             source: None,
             upstream: None,
@@ -146,6 +313,10 @@ impl QueryOutcome {
             qtype,
             dnssec: None,
         }
+    }
+
+    fn servfail(query: &Message, domain_str: String, qtype: RecordType) -> Self {
+        Self::error(query, ResponseCode::ServFail, "servfail", domain_str, qtype)
     }
 }
 
@@ -170,17 +341,13 @@ fn make_rewrite_response(query: &Message, action: &RewriteAction, query_id: u16)
     else {
         // `SynthesizeAnswer` is not emitted by the current filter engine; return
         // a plain NOERROR response for the query instead.
-        let mut resp = Message::new(query_id, MessageType::Response, OpCode::Query);
-        resp.metadata.recursion_desired = query.metadata.recursion_desired;
-        resp.metadata.recursion_available = true;
-        resp.queries.clone_from(&query.queries);
+        let mut resp = Message::new(query_id, MessageType::Response, query.metadata.op_code);
+        copy_query_response_flags(&mut resp, query);
         return resp;
     };
 
-    let mut resp = Message::new(query_id, MessageType::Response, OpCode::Query);
-    resp.metadata.recursion_desired = query.metadata.recursion_desired;
-    resp.metadata.recursion_available = true;
-    resp.queries.clone_from(&query.queries);
+    let mut resp = Message::new(query_id, MessageType::Response, query.metadata.op_code);
+    copy_query_response_flags(&mut resp, query);
 
     resp.metadata.response_code = match rcode.to_ascii_uppercase().as_str() {
         "NXDOMAIN" => ResponseCode::NXDomain,
@@ -739,19 +906,30 @@ impl DnsPipeline {
         false
     }
 
-    /// Cache lookup honouring the DNSSEC-aware client guard.
+    /// Cache lookup honouring the stored validation status.
     ///
-    /// A DNSSEC-aware client must never be served an unvalidated entry while
-    /// validation is enabled: such a lookup is treated as a miss so the query
-    /// is re-resolved upstream.
-    async fn cached_response(&self, query: &Message, client_wants_dnssec: bool) -> Option<Message> {
-        let response = self.cache.get_for_query(query).await?;
-        if client_wants_dnssec
-            && self.dnssec.load().mode != sito_dnssec::DnssecMode::Disabled
-            && !response.metadata.authentic_data
-        {
-            debug!("Ignoring non-validated cache entry for DNSSEC-aware client");
+    /// While local validation is active, an `Unchecked` entry must never be
+    /// served (it was cached by a CD=1 query or while validation was off).
+    /// `Insecure`/`Indeterminate` entries are legitimate answers for unsigned
+    /// or inconclusive data: they are served to DNSSEC-aware clients with AD=0
+    /// instead of forcing an upstream re-resolution. DO=0 clients additionally
+    /// never see DNSSEC records.
+    async fn cached_response(
+        &self,
+        cache_query: &Message,
+        validation_active: bool,
+        client_wants_dnssec: bool,
+    ) -> Option<Message> {
+        let (mut response, status) = self.cache.get_for_query_with_status(cache_query).await?;
+        if !cache_entry_servable(status, validation_active) {
+            debug!("Ignoring unchecked cache entry while DNSSEC validation is active");
             return None;
+        }
+        if !status.is_secure() {
+            response.metadata.authentic_data = false;
+        }
+        if !client_wants_dnssec {
+            strip_dnssec_records(&mut response);
         }
         Some(response)
     }
@@ -762,6 +940,7 @@ impl DnsPipeline {
     async fn cache_hit_outcome(
         &self,
         query: &Message,
+        cache_query: &Message,
         mut cached_resp: Message,
         qname: &Name,
         qtype: RecordType,
@@ -786,52 +965,60 @@ impl DnsPipeline {
         }
 
         debug!(qname = %qname, qtype = ?qtype, "Cache hit");
-        if self.cache.should_prefetch_for_query(query).await
+        if self.cache.should_prefetch_for_query(cache_query).await
             && let Ok(permit) = Arc::clone(&self.prefetch_semaphore).try_acquire_owned()
         {
             let bg_upstream = Arc::clone(effective_upstream);
             let bg_cache = Arc::clone(&self.cache);
-            let mut bg_query = query.clone();
+            // Start from the cache query so ECS policy and DO are identical to
+            // the entry being refreshed.
+            let mut bg_query = cache_query.clone();
             // Never propagate a client's CD=1 flag into the background refresh:
             // the shared cache must always be validated when DNSSEC is enabled
             // so a CD=1 query cannot poison cached answers for CD=0 clients.
             bg_query.metadata.checking_disabled = false;
+            let bg_wants_dnssec = query_has_do(&bg_query);
             let dnssec_mode = self.dnssec.load().mode;
             let bg_validator = if dnssec_mode == sito_dnssec::DnssecMode::Disabled {
                 None
             } else {
                 Some(self.dnssec.load_full())
             };
-            let bg_resolve_query = if dnssec_mode == sito_dnssec::DnssecMode::Disabled {
-                bg_query.clone()
-            } else {
-                let mut q = bg_query.clone();
-                let mut edns = q.edns.clone().unwrap_or_default();
-                edns.set_dnssec_ok(true);
-                edns.set_max_payload(config.dns.edns_udp_size.max(1232));
-                q.set_edns(edns);
-                q
-            };
+            let bg_resolve_query = build_upstream_query(
+                &bg_query,
+                config,
+                dnssec_mode != sito_dnssec::DnssecMode::Disabled,
+            );
             tokio::spawn(async move {
                 let _permit = permit;
                 let Ok(mut resp) = bg_upstream.resolve(&bg_resolve_query).await else {
                     return;
                 };
-                if let Some(validator) = bg_validator {
+                let bg_status = if let Some(validator) = bg_validator {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as u32;
                     let key_fetcher =
                         sito_upstream::UpstreamKeyFetcher::new(Arc::clone(&bg_upstream));
-                    let _ = validator
+                    let outcome = validator
                         .validate_with_key_fetcher(&mut resp, None, now, &key_fetcher)
                         .await;
+                    validation_status(Some(&outcome))
+                } else {
+                    // No local validation ran: never trust an upstream AD bit.
+                    resp.metadata.authentic_data = false;
+                    ValidationStatus::Unchecked
+                };
+                if !bg_wants_dnssec {
+                    strip_dnssec_records(&mut resp);
                 }
                 if resp.metadata.response_code == ResponseCode::NoError
                     || resp.metadata.response_code == ResponseCode::NXDomain
                 {
-                    bg_cache.insert(&bg_query, &resp).await;
+                    bg_cache
+                        .insert_with_status(&bg_query, &resp, bg_status)
+                        .await;
                 }
             });
         }
@@ -916,15 +1103,12 @@ impl QueryHandler for DnsPipeline {
 
         // The client must signal DNSSEC awareness (DO bit or AD bit) before we
         // may assert AD on the response (RFC 6840 section 5.7).
-        let client_wants_dnssec = query
-            .edns
-            .as_ref()
-            .is_some_and(|edns| edns.flags().dnssec_ok);
+        let client_wants_dnssec = query_has_do(&query);
         let client_accepts_ad = client_wants_dnssec || query.metadata.authentic_data;
 
         let outcome = async {
             let Some(first_query) = query.queries.first() else {
-                return QueryOutcome::formerr(query_id);
+                return QueryOutcome::formerr(&query);
             };
 
             let qname = first_query.name();
@@ -933,6 +1117,24 @@ impl QueryHandler for DnsPipeline {
             // per-domain routing are all stored as punycode. `to_utf8` would
             // UTS46-decode `xn--` labels and never match an IDN rule.
             let domain_str = qname.to_ascii().to_lowercase();
+
+            // RFC 6891 §6.1.3: a request with an unsupported EDNS version is
+            // answered with BADVERS and an empty OPT record at version 0.
+            if query.edns.as_ref().is_some_and(|edns| edns.version() > 0) {
+                return QueryOutcome::badvers(&query, domain_str, qtype);
+            }
+            // Only standard queries can be resolved/filtered/cached here.
+            if query.metadata.op_code != OpCode::Query {
+                return QueryOutcome::notimp(&query, domain_str, qtype);
+            }
+
+            let dnssec_mode = self.dnssec.load().mode;
+            let validation_active = !query.metadata.checking_disabled
+                && dnssec_mode != sito_dnssec::DnssecMode::Disabled;
+            // Cache lookups/inserts use the same ECS policy as the upstream
+            // query, so "off" deduplicates clients and "forward" keys on the
+            // clamped subnet.
+            let cache_query = build_cache_query(&query, config);
 
             // Both the global `filtering.enabled` switch and the client's
             // effective group policy must be enabled for filtering to run.
@@ -956,7 +1158,7 @@ impl QueryHandler for DnsPipeline {
                         domain = %normalized,
                         "Filtering enabled but no rule snapshot has loaded; failing closed"
                     );
-                    return QueryOutcome::servfail(query_id, &query, domain_str, qtype);
+                    return QueryOutcome::servfail(&query, domain_str, qtype);
                 }
                 let mut candidates = FilterCandidates::default();
                 snapshot.allowlist.collect_candidates(
@@ -1132,7 +1334,10 @@ impl QueryHandler for DnsPipeline {
             // block finishes, i.e. across the upstream resolution and the
             // cache insert below.
             let _cache_single_flight: Option<sito_cache::SingleFlightGuard> = if cache_enabled {
-                if let Some(cached_resp) = self.cached_response(&query, client_wants_dnssec).await {
+                if let Some(cached_resp) = self
+                    .cached_response(&cache_query, validation_active, client_wants_dnssec)
+                    .await
+                {
                     if cname_uncloaking_active
                         && self.cname_target_blocked(&cached_resp, qtype, &client, &policy)
                     {
@@ -1153,6 +1358,7 @@ impl QueryHandler for DnsPipeline {
                     return self
                         .cache_hit_outcome(
                             &query,
+                            &cache_query,
                             cached_resp,
                             qname,
                             qtype,
@@ -1171,8 +1377,11 @@ impl QueryHandler for DnsPipeline {
 
                 // Single-flight: serialize concurrent misses for the same key
                 // so only one query goes upstream (anti-stampede).
-                let flight = self.cache.single_flight_for_query(&query).await;
-                if let Some(cached_resp) = self.cached_response(&query, client_wants_dnssec).await {
+                let flight = self.cache.single_flight_for_query(&cache_query).await;
+                if let Some(cached_resp) = self
+                    .cached_response(&cache_query, validation_active, client_wants_dnssec)
+                    .await
+                {
                     // A concurrent query populated the entry while we waited.
                     if cname_uncloaking_active
                         && self.cname_target_blocked(&cached_resp, qtype, &client, &policy)
@@ -1194,6 +1403,7 @@ impl QueryHandler for DnsPipeline {
                     return self
                         .cache_hit_outcome(
                             &query,
+                            &cache_query,
                             cached_resp,
                             qname,
                             qtype,
@@ -1212,17 +1422,12 @@ impl QueryHandler for DnsPipeline {
 
             // 6. Upstream resolution
             // Force the DNSSEC OK bit when validation is enabled so upstreams
-            // return RRSIGs even for non-DO clients.
-            let upstream_query = if self.dnssec.load().mode == sito_dnssec::DnssecMode::Disabled {
-                query.clone()
-            } else {
-                let mut q = query.clone();
-                let mut edns = q.edns.clone().unwrap_or_default();
-                edns.set_dnssec_ok(true);
-                edns.set_max_payload(config.dns.edns_udp_size.max(1232));
-                q.set_edns(edns);
-                q
-            };
+            // return RRSIGs even for non-DO clients, and apply the ECS policy.
+            let upstream_query = build_upstream_query(
+                &query,
+                config,
+                dnssec_mode != sito_dnssec::DnssecMode::Disabled,
+            );
             let upstream_start = std::time::Instant::now();
             match effective_upstream
                 .resolve_with_upstream(&upstream_query)
@@ -1277,12 +1482,7 @@ impl QueryHandler for DnsPipeline {
                     // CD=1 means the client takes responsibility for
                     // validation: never SERVFAIL on DNSSEC grounds and never
                     // assert AD. The same applies when validation is disabled.
-                    let dnssec_outcome = if query.metadata.checking_disabled
-                        || self.dnssec.load().mode == sito_dnssec::DnssecMode::Disabled
-                    {
-                        upstream_resp.metadata.authentic_data = false;
-                        None
-                    } else {
+                    let dnssec_outcome = if validation_active {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -1310,16 +1510,28 @@ impl QueryHandler for DnsPipeline {
                             );
                         }
                         Some(outcome)
+                    } else {
+                        upstream_resp.metadata.authentic_data = false;
+                        None
                     };
                     let dnssec_str = dnssec_outcome
                         .as_ref()
                         .map(sito_dnssec::ValidationOutcome::as_str);
+                    let cache_status = validation_status(dnssec_outcome.as_ref());
+
+                    // A DO=0 client must never receive DNSSEC records, and the
+                    // stripped form is what gets cached under the DO=0 key.
+                    if !client_wants_dnssec {
+                        strip_dnssec_records(&mut upstream_resp);
+                    }
 
                     if cache_enabled
                         && (upstream_resp.metadata.response_code == ResponseCode::NoError
                             || upstream_resp.metadata.response_code == ResponseCode::NXDomain)
                     {
-                        self.cache.insert(&query, &upstream_resp).await;
+                        self.cache
+                            .insert_with_status(&cache_query, &upstream_resp, cache_status)
+                            .await;
                         if let Some(ref m) = self.metrics {
                             m.set_cache_size_bytes(
                                 i64::try_from(self.cache.weighted_size()).unwrap_or(i64::MAX),
@@ -1351,7 +1563,8 @@ impl QueryHandler for DnsPipeline {
 
                     if cache_enabled
                         && config.dns.cache.serve_stale_hours > 0
-                        && let Some(mut stale_resp) = self.cache.get_stale_for_query(&query).await
+                        && let Some(mut stale_resp) =
+                            self.cache.get_stale_for_query(&cache_query).await
                     {
                         if bypass_check_needed
                             && let Some(outcome) = self.anti_doh_blocked_by_answers(
@@ -1404,7 +1617,7 @@ impl QueryHandler for DnsPipeline {
                         };
                     }
 
-                    QueryOutcome::servfail(query_id, &query, domain_str, qtype)
+                    QueryOutcome::servfail(&query, domain_str, qtype)
                 }
             }
         }
@@ -1617,5 +1830,408 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Builds a pipeline backed by a UDP mock that answers every query with an
+    /// A record and (dishonestly) AD=1, counting upstream calls.
+    async fn test_pipeline(
+        mut config: Config,
+    ) -> (
+        DnsPipeline,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::path::PathBuf,
+    ) {
+        use sito_clients::{ClientRegistry, ClientsConfig, ParentalRegistry, ServiceRegistry};
+        use sito_filter::HostsFilterEngine;
+        use sito_rewrites::{RewriteTable, RewritesConfig};
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+        use std::sync::atomic::AtomicUsize;
+
+        let mock_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_socket.local_addr().unwrap();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let call_counter = std::sync::Arc::clone(&calls);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((len, src)) = mock_socket.recv_from(&mut buf).await {
+                if let Ok(query) = sito_proto::decode_message(&buf[..len]) {
+                    call_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut resp =
+                        Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                    resp.metadata.response_code = ResponseCode::NoError;
+                    // A compromised upstream: AD=1 without any signature.
+                    resp.metadata.authentic_data = true;
+                    resp.queries = query.queries.clone();
+                    if let Some(question) = query.queries.first() {
+                        resp.answers.push(Record::from_rdata(
+                            question.name().clone(),
+                            300,
+                            RData::A(A(std::net::Ipv4Addr::new(203, 0, 113, 9))),
+                        ));
+                    }
+                    let encoded = sito_proto::encode_message(&resp).unwrap();
+                    let _ = mock_socket.send_to(&encoded, src).await;
+                }
+            }
+        });
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito-pipeline-audit6-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        config.server.data_dir = temp_dir.clone();
+        config.upstream.servers = vec![mock_addr.to_string()];
+        config.dns.cache.enabled = true;
+
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let cache = std::sync::Arc::new(DnsCache::new(config.dns.cache.clone()));
+        let filter = std::sync::Arc::new(
+            HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
+        );
+        let pipeline = DnsPipeline::new(
+            std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(config.clone()))),
+            filter,
+            cache,
+            upstream,
+            std::sync::Arc::new(sito_dnssec::DnssecValidator::from_config(
+                &config.dns.dnssec,
+            )),
+            std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(ClientRegistry::new(
+                ClientsConfig::default(),
+            )))),
+            std::sync::Arc::new(ParentalRegistry::bundled()),
+            std::sync::Arc::new(ServiceRegistry::bundled()),
+            std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(RewriteTable::new(
+                RewritesConfig::default(),
+            )))),
+            std::sync::Arc::new(AtomicUsize::new(0)),
+        );
+        (pipeline, calls, temp_dir)
+    }
+
+    fn do_query(id: u16, name: &Name) -> Message {
+        let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+        query
+            .queries
+            .push(hickory_proto::op::Query::query(name.clone(), RecordType::A));
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        query.set_edns(edns);
+        query
+    }
+
+    #[tokio::test]
+    async fn test_opcode_notimp_and_edns_badvers() {
+        let config = Config::default();
+        let (pipeline, _calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("example.com.").unwrap();
+
+        let mut notify = Message::new(1, MessageType::Query, OpCode::Notify);
+        notify
+            .queries
+            .push(hickory_proto::op::Query::query(name.clone(), RecordType::A));
+        let resp = pipeline.handle(notify, client.clone()).await.unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NotImp);
+        assert_eq!(resp.metadata.op_code, OpCode::Notify);
+
+        let mut update = Message::new(2, MessageType::Query, OpCode::Update);
+        update
+            .queries
+            .push(hickory_proto::op::Query::query(name.clone(), RecordType::A));
+        let resp = pipeline.handle(update, client.clone()).await.unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NotImp);
+
+        let mut v1 = Message::new(3, MessageType::Query, OpCode::Query);
+        v1.queries
+            .push(hickory_proto::op::Query::query(name.clone(), RecordType::A));
+        let mut edns = Edns::new();
+        edns.set_version(1);
+        edns.set_dnssec_ok(true);
+        v1.set_edns(edns);
+        let resp = pipeline.handle(v1, client).await.unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::BADVERS);
+        let resp_edns = resp.edns.expect("BADVERS must carry an OPT record");
+        assert_eq!(resp_edns.version(), 0);
+        assert!(resp_edns.options().options.is_empty());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_do_client_gets_insecure_cache_hit_with_ad_zero() {
+        let config = Config::default();
+        let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("unsigned.example.").unwrap();
+        let query = do_query(11, &name);
+
+        let mut cached = Message::response(11, OpCode::Query);
+        cached.queries = query.queries.clone();
+        cached.answers.push(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 11))),
+        ));
+        cached.metadata.authentic_data = false;
+        pipeline
+            .cache
+            .insert_with_status(&query, &cached, ValidationStatus::Insecure)
+            .await;
+
+        let resp = pipeline.handle(query, client.clone()).await.unwrap();
+        assert_eq!(resp.answers.len(), 1);
+        assert!(
+            !resp.metadata.authentic_data,
+            "Insecure entries must serve AD=0"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a DO=1 client must hit the Insecure cache entry instead of re-querying"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_do_client_never_served_unchecked_cache_entry() {
+        let config = Config::default();
+        let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("unchecked.example.").unwrap();
+        let query = do_query(12, &name);
+
+        let mut cached = Message::response(12, OpCode::Query);
+        cached.queries = query.queries.clone();
+        cached.answers.push(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 12))),
+        ));
+        // Forged: an entry cached without validation must never be trusted.
+        cached.metadata.authentic_data = true;
+        pipeline
+            .cache
+            .insert_with_status(&query, &cached, ValidationStatus::Unchecked)
+            .await;
+
+        let resp = pipeline.handle(query, client.clone()).await.unwrap();
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "an Unchecked entry must not be served while validation is active"
+        );
+        assert!(
+            !resp.metadata.authentic_data,
+            "the upstream AD bit must be replaced by local validation"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_do0_response_is_stripped_and_cache_key_stays_do0() {
+        let mut config = Config::default();
+        config.dns.dnssec.mode = "disabled".to_string();
+        config.dns.dnssec.validate = false;
+        let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("rrsig.example.").unwrap();
+
+        // Mock upstream signature record appended by injecting it into the
+        // cached response is not possible here; instead assert the DO=0 key is
+        // separate from the DO=1 key by observing a second upstream call.
+        let mut plain = Message::new(13, MessageType::Query, OpCode::Query);
+        plain
+            .queries
+            .push(hickory_proto::op::Query::query(name.clone(), RecordType::A));
+        let resp = pipeline
+            .handle(plain.clone(), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!resp.metadata.authentic_data);
+
+        // Same question with DO=1 must not reuse the DO=0 entry.
+        let mut do_query = plain.clone();
+        do_query.metadata.id = 14;
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        do_query.set_edns(edns);
+        let _ = pipeline.handle(do_query, client).await.unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "DO=1 responses must be cached separately from DO=0 entries"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_clears_ad_when_no_validation_ran() {
+        let mut config = Config::default();
+        config.dns.dnssec.mode = "disabled".to_string();
+        config.dns.dnssec.validate = false;
+        config.dns.cache.prefetch = true;
+        config.dns.cache.min_ttl = 5;
+        config.dns.cache.max_ttl = 10;
+        let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("prefetch-ad.example.").unwrap();
+
+        for id in 1..=3 {
+            let resp = pipeline
+                .handle(do_query(id, &name), client.clone())
+                .await
+                .unwrap();
+            assert!(
+                !resp.metadata.authentic_data,
+                "primary path never asserts AD without local validation"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "prefetch is expected to have re-queried the upstream"
+        );
+
+        // Inspect the entry itself: the prefetch writer must clear AD, not
+        // merely rely on the read path to mask it.
+        let (cached, _) = pipeline
+            .cache
+            .get_for_query_with_status(&do_query(4, &name))
+            .await
+            .expect("prefetched entry present");
+        assert!(
+            !cached.metadata.authentic_data,
+            "a prefetched entry must have AD cleared when no local validation ran"
+        );
+
+        let resp = pipeline.handle(do_query(4, &name), client).await.unwrap();
+        assert!(!resp.metadata.authentic_data);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[test]
+    fn test_strip_dnssec_records_for_do0_clients() {
+        use hickory_proto::rr::rdata::NULL;
+        use sito_proto::rdata::opt::EdnsCode;
+
+        let name = Name::from_str("dnssec.example.").unwrap();
+        let mut response = Message::new(21, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(hickory_proto::op::Query::query(name.clone(), RecordType::A));
+        response.answers.push(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 21))),
+        ));
+        for record_type in [
+            RecordType::RRSIG,
+            RecordType::NSEC,
+            RecordType::NSEC3,
+            RecordType::DNSKEY,
+        ] {
+            response.answers.push(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::Unknown {
+                    code: record_type,
+                    rdata: NULL::default(),
+                },
+            ));
+        }
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(u16::from(EdnsCode::DAU), vec![]));
+        response.set_edns(edns);
+
+        strip_dnssec_records(&mut response);
+        assert_eq!(
+            response.answers.len(),
+            1,
+            "only the A record may remain after DO=0 shaping"
+        );
+        assert_eq!(response.answers[0].record_type(), RecordType::A);
+        assert!(
+            response
+                .edns
+                .as_ref()
+                .is_some_and(|e| e.option(EdnsCode::DAU).is_none()),
+            "DO-dependent EDNS options must be stripped"
+        );
+    }
+
+    #[test]
+    fn test_ecs_policy_off_strips_and_forward_clamps() {
+        use hickory_proto::rr::rdata::opt::ClientSubnet;
+        use sito_cache::CacheKey;
+
+        let name = Name::from_str("ecs.example.").unwrap();
+        let mut query = Message::new(1, MessageType::Query, OpCode::Query);
+        query
+            .queries
+            .push(hickory_proto::op::Query::query(name, RecordType::A));
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Subnet(ClientSubnet::new(
+                "192.0.2.55".parse().unwrap(),
+                32,
+                0,
+            )));
+        query.set_edns(edns);
+
+        let mut off_config = Config::default();
+        off_config.upstream.ecs = UpstreamEcs::Off;
+        let off = build_cache_query(&query, &off_config);
+        assert!(
+            off.edns
+                .as_ref()
+                .is_some_and(|e| e.option(EdnsCode::Subnet).is_none()),
+            "ECS off must strip the client option"
+        );
+
+        let mut forward_config = Config::default();
+        forward_config.upstream.ecs = UpstreamEcs::Forward;
+        let forwarded = build_cache_query(&query, &forward_config);
+        let subnet = match forwarded
+            .edns
+            .as_ref()
+            .and_then(|e| e.option(EdnsCode::Subnet))
+        {
+            Some(EdnsOption::Subnet(subnet)) => *subnet,
+            other => panic!("expected ECS option, got {other:?}"),
+        };
+        assert_eq!(subnet.source_prefix(), 24, "IPv4 ECS must clamp to /24");
+        assert_eq!(subnet.scope_prefix(), 0);
+        assert_eq!(subnet.addr().to_string(), "192.0.2.0");
+
+        // Two clients in the same /24 share one cache key.
+        let mut sibling = query.clone();
+        if let Some(edns) = sibling.edns.as_mut() {
+            edns.options_mut().remove(EdnsCode::Subnet);
+            edns.options_mut()
+                .insert(EdnsOption::Subnet(ClientSubnet::new(
+                    "192.0.2.200".parse().unwrap(),
+                    24,
+                    0,
+                )));
+        }
+        let sibling_forwarded = build_cache_query(&sibling, &forward_config);
+        assert_eq!(
+            CacheKey::from_query(&forwarded),
+            CacheKey::from_query(&sibling_forwarded),
+            "clamped ECS must deduplicate cache keys"
+        );
     }
 }

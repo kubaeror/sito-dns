@@ -1667,6 +1667,7 @@ mod tests {
             probe_domain: "cloudflare.com".to_string(),
             pool_size: 2,
             per_domain: vec![],
+            ecs: Default::default(),
         };
 
         manager.reload(&new_config, &bootstrap).await.unwrap();
@@ -1691,6 +1692,7 @@ mod tests {
             probe_domain: "cloudflare.com".to_string(),
             pool_size: 2,
             per_domain: vec![],
+            ecs: Default::default(),
         };
         let manager = UpstreamManager::from_config(&config, &bootstrap).await;
         assert!(
@@ -1903,6 +1905,7 @@ mod tests {
             probe_domain: "example.com".to_string(),
             pool_size: 1,
             per_domain: vec![],
+            ecs: Default::default(),
         };
         manager.reload(&config, &bootstrap).await.unwrap();
 

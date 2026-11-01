@@ -182,6 +182,7 @@ servers = ["udp://192.168.1.1:53"]
 | `strategy` | string | `"failover"` | Forwarding strategy: `"parallel"` (fastest answer wins), `"failover"` (sequential fallback), or `"load_balance"`. |
 | `timeout_ms` | integer | `5000` | Overall per-query budget in milliseconds, shared across failover/load-balance retries (each sequential attempt gets an equal share of the remaining budget; parallel races use the full budget). |
 | `probe_domain` | string | `"example.com"` | Test domain used for periodic health-checking of upstreams. |
+| `ecs` | string | `"off"` | EDNS Client Subnet policy: `"off"` strips client ECS before forwarding and deduplicates cache keys; `"forward"` forwards ECS after clamping IPv4 to /24 and IPv6 to /56 (zero source prefixes dropped). Forwarding can improve CDN locality but discloses a coarse client-location hint and splits cache entries by subnet. |
 | `pool_size` | integer | `4` | Number of persistent TCP/TLS connections maintained per upstream endpoint. |
 | `per_domain` | array of tables | `[]` | Domain-specific upstream forwarder rules (e.g., routing LAN domains to internal router). |
 
@@ -457,7 +458,7 @@ and `POST /api/v1/config/reload`.
 | `dns.rate_limit_per_ip` | Live rate limiters updated. |
 | `dns.cache.enabled`, `dns.cache.size_mb`, `dns.cache.min_ttl`, `dns.cache.max_ttl`, `dns.cache.negative_ttl_max`, `dns.cache.prefetch`, `dns.cache.serve_stale_hours` | Cache configuration updated. |
 | `dns.dnssec.mode`, `dns.dnssec.validate`, `dns.dnssec.ntp`, `dns.dnssec.nta`, `dns.dnssec.trust_anchors` | DNSSEC validator swapped for the new configuration. |
-| `upstream.servers`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt. |
+| `upstream.servers`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.ecs`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt. |
 | `filtering.enabled`, `filtering.refresh_interval_hours`, `filtering.blocking_mode`, `filtering.blocking_ttl`, `filtering.cname_cloaking`, `filtering.fail_closed`, `filtering.anti_doh_bypass`, `filtering.max_rules`, `filtering.lists`, `filtering.custom_rules` | Filter engine reloaded with the new lists/rules; cached answers are flushed. List downloads continue asynchronously after the reload. |
 | `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
 | `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |

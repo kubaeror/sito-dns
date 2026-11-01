@@ -253,6 +253,26 @@ the shipped parts; Phase 0 (release blockers) is complete.
   verifies the committed spec; RouterOS disables redirects; schedule window
   parsing handles wildcard minutes.
 
+### Cache and response shaping (Phase 6.2–6.4)
+- Negative cache TTLs are clamped by the SOA MINIMUM and the remaining CNAME
+  chain TTLs, decremented on serve, and the SOA owner is bailiwick-checked.
+- Cache entries carry a validation status (`Secure`/`Insecure`/`Indeterminate`/
+  `Unchecked`); unsigned answers are now served from cache to DNSSEC-aware
+  clients with AD=0 instead of being bypassed (which amplified upstream traffic
+  and key fetches), while `Unchecked` entries are never served when validation
+  is enabled.
+- The cache key includes the opcode and handles the root name; `invalidate "."`
+  flushes everything.
+- Non-Query opcodes answer NOTIMP and EDNS versions above 0 answer BADVERS.
+- RRSIG/NSEC/NSEC3/DNSKEY and DO-dependent EDNS options are stripped for
+  clients that did not set DO; DO=1 responses are cached only under the DO=1
+  key.
+- New `upstream.ecs = "off" | "forward"` policy (default `off`): strip client
+  ECS or forward it clamped to /24 (IPv4) and /56 (IPv6); cache keys follow the
+  same policy.
+- Synthesized block/rewrite/error responses preserve the client's CD and DO
+  bits, and prefetch never caches AD=1 without local validation.
+
 ---
 
 ## [1.7.0] - 2026-09-13
