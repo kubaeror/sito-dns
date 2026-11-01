@@ -118,7 +118,11 @@ pub fn start_udp_listener<H: QueryHandler>(
     for worker_id in 0..config.worker_count {
         let std_socket = create_reuseport_udp_socket(&config.bind_addr)?;
         let local_addr = std_socket.local_addr()?;
-        let async_fd = Arc::new(AsyncFd::new(std_socket)?);
+        // SAFETY: `std_socket` is moved into the `AsyncFd` and is never
+        // closed, replaced or duplicated through another handle while it is
+        // owned; `register` is the I/O-safety-preserving constructor
+        // (`AsyncFd::new` is deprecated as unsound).
+        let async_fd = Arc::new(unsafe { AsyncFd::register(std_socket) }?);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(1024));
 
         let handler = Arc::clone(handler);

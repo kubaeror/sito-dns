@@ -419,8 +419,15 @@ mod tests {
         );
     }
 
+    /// Serializes tests that assert on the process-global ARP read counter;
+    /// another test's background refresher could otherwise bump it mid-assert.
+    static ARP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_query_path_never_reads_proc_net_arp() {
+        let _guard = ARP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = ARP_FILE_READS.load(std::sync::atomic::Ordering::SeqCst);
 
         let resolver = MacResolver::new();
@@ -450,6 +457,9 @@ mod tests {
 
     #[test]
     fn test_arp_snapshot_refresh_is_the_only_reader() {
+        let _guard = ARP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = ARP_FILE_READS.load(std::sync::atomic::Ordering::SeqCst);
         let resolver = MacResolver::new();
         let _ = resolver.refresh_arp_now();
