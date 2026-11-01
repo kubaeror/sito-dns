@@ -188,8 +188,8 @@ impl RewriteTable {
             }
         }
 
-        // 2. Check exact CNAME if requested qtype is A or AAAA
-        if (qtype == RecordType::A || qtype == RecordType::AAAA)
+        // 2. Check exact CNAME (when qtype == CNAME, step 1 already returned it)
+        if qtype != RecordType::CNAME
             && let Some(rules) = self.exact.get(&(qname_str.clone(), RecordType::CNAME))
         {
             for rule in rules {
@@ -825,11 +825,17 @@ entries = [
         assert_eq!(answers[1].record_type(), RecordType::A);
         assert_eq!(answers[1].data, RData::A(A(Ipv4Addr::new(192, 168, 1, 1))));
 
-        // External CNAME returns only CNAME
+        // External CNAME returns only CNAME (including for non-A/AAAA types like HTTPS/TXT)
         let qname_ext = Name::from_str("external.lan.").unwrap();
         let answers_ext = table.lookup(&qname_ext, RecordType::A, &client).unwrap();
         assert_eq!(answers_ext.len(), 1);
         assert_eq!(answers_ext[0].record_type(), RecordType::CNAME);
+
+        let answers_https = table
+            .lookup(&qname_ext, RecordType::HTTPS, &client)
+            .unwrap();
+        assert_eq!(answers_https.len(), 1);
+        assert_eq!(answers_https[0].record_type(), RecordType::CNAME);
     }
 
     #[test]

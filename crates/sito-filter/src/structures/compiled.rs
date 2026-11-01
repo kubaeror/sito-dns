@@ -89,8 +89,13 @@ fn build_regex_batch(
 
 /// Converts an ABP wildcard string into an anchored regex pattern.
 pub fn wildcard_to_regex(wildcard: &str) -> String {
-    let mut regex = String::from("^");
-    for c in wildcard.chars() {
+    let (mut regex, body) = if let Some(rest) = wildcard.strip_prefix("||") {
+        (String::from("^(?:.*\\.)?"), rest)
+    } else {
+        (String::from("^"), wildcard)
+    };
+    let body = body.strip_suffix('^').unwrap_or(body);
+    for c in body.chars() {
         match c {
             '*' => regex.push_str(".*"),
             '?' => regex.push('.'),

@@ -592,6 +592,7 @@ impl HostsFilterEngine {
     /// the pipeline does not evaluate an empty set.
     fn rebuild_group_snapshots(&self, list_rules: &FnvHashMap<String, Vec<Rule>>) {
         let defs = self.group_defs.load();
+        let max_rules = self.config.load().max_rules;
         let mut compiled = FnvHashMap::default();
         for def in defs.iter() {
             let mut rules = Vec::new();
@@ -616,6 +617,26 @@ impl HostsFilterEngine {
                     );
                 }
                 rules.extend(parsed);
+            }
+            if rules.is_empty() {
+                continue;
+            }
+            if rules.len() > max_rules {
+                error!(
+                    group = %def.name,
+                    parsed = rules.len(),
+                    limit = max_rules,
+                    "Group filter rule set exceeds filtering.max_rules; truncating to limit"
+                );
+                rules.truncate(max_rules);
+            }
+            if let Some(reason) = regex_load_exceeds_limits(&rules) {
+                error!(
+                    group = %def.name,
+                    reason = %reason,
+                    "Group filter rule set exceeds regex compilation limits; skipping group regexes"
+                );
+                rules.retain(|r| !matches!(r.pattern, Pattern::Regex(_) | Pattern::Wildcard(_)));
             }
             if rules.is_empty() {
                 continue;
@@ -807,6 +828,19 @@ impl HostsFilterEngine {
                 map.insert(name, rules);
             }
 
+            let mut parsed_custom = Vec::new();
+            for rule_text in &custom_rules {
+                let (rules, _) = parse_rules(rule_text, "custom");
+                parsed_custom.extend(rules);
+            }
+            if let Some(reason) = regex_load_exceeds_limits(&parsed_custom) {
+                error!(
+                    reason = %reason,
+                    "Rejecting custom_rules with excessive regex pattern load"
+                );
+                return Err(FilterError::CompileTaskFailed(reason));
+            }
+
             // Deterministic rule-id assignment: lists sorted by name, rule
             // order preserved within each list, custom rules last (config
             // order). Candidate precedence (first match wins) therefore stays
@@ -814,30 +848,27 @@ impl HostsFilterEngine {
             let mut names: Vec<&String> = map.keys().collect();
             names.sort_unstable();
             let parsed_rules: usize = map.values().map(Vec::len).sum();
+            let total_candidate_rules = parsed_rules + parsed_custom.len();
             // Bound the materialised rule set: a hostile 64 MiB list can
             // hold tens of millions of minimal lines, and every rule is
             // materialised several times. Rejecting the reload keeps the
             // previous snapshot instead of OOM-killing the daemon.
-            if parsed_rules + custom_rules.len() > max_rules {
+            if total_candidate_rules > max_rules {
                 error!(
-                    parsed = parsed_rules + custom_rules.len(),
+                    parsed = total_candidate_rules,
                     limit = max_rules,
                     "Filter rule set exceeds filtering.max_rules"
                 );
                 return Err(FilterError::TooManyRules {
-                    count: parsed_rules + custom_rules.len(),
+                    count: total_candidate_rules,
                     limit: max_rules,
                 });
             }
-            let total_rules = parsed_rules;
-            let mut all_rules = Vec::with_capacity(total_rules + custom_rules.len());
+            let mut all_rules = Vec::with_capacity(total_candidate_rules);
             for name in names {
                 all_rules.extend(map[name].iter().cloned());
             }
-            for rule_text in &custom_rules {
-                let (rules, _) = parse_rules(rule_text, "custom");
-                all_rules.extend(rules);
-            }
+            all_rules.extend(parsed_custom);
             let snapshot = FilterSnapshot::compile(all_rules);
             let count = snapshot.rule_count;
             Ok((snapshot, count, map, rejected))

@@ -805,8 +805,15 @@ fn parse_pattern(raw_pattern: &str) -> Option<Pattern> {
         }
         if domain_cleaned.contains('*') {
             // Query domains are lowercased; keep wildcard anchors in the same
-            // case space so matching stays case-insensitive.
-            return Some(Pattern::Wildcard(domain_cleaned.to_ascii_lowercase()));
+            // case space so matching stays case-insensitive. Keep the `||`
+            // prefix when the pattern does not already start with `*` so
+            // `wildcard_to_regex` anchors at either the domain start or a
+            // subdomain dot boundary (`^(?:.*\.)?`).
+            let lower = domain_cleaned.to_ascii_lowercase();
+            if lower.starts_with('*') {
+                return Some(Pattern::Wildcard(lower));
+            }
+            return Some(Pattern::Wildcard(format!("||{lower}")));
         }
         let normalized = normalize_domain(domain_cleaned).ok()?;
         return Some(Pattern::Domain(normalized));
@@ -814,6 +821,19 @@ fn parse_pattern(raw_pattern: &str) -> Option<Pattern> {
 
     // Prefix anchor: `|prefix`
     if let Some(prefix_part) = p.strip_prefix('|') {
+        if prefix_part.contains('/') {
+            return None;
+        }
+        if let Some(exact_part) = prefix_part.strip_suffix('^')
+            && !exact_part.contains('*')
+        {
+            let normalized = normalize_domain(exact_part).ok()?;
+            return Some(Pattern::Exact(normalized));
+        }
+        if prefix_part.contains('*') {
+            let cleaned = prefix_part.strip_suffix('^').unwrap_or(prefix_part);
+            return Some(Pattern::Wildcard(cleaned.to_ascii_lowercase()));
+        }
         return Some(Pattern::Prefix(prefix_part.to_ascii_lowercase()));
     }
 
