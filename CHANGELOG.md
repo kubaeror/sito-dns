@@ -231,6 +231,28 @@ the shipped parts; Phase 0 (release blockers) is complete.
   logs watch errors; DoH3 GET matches DoH decoding; DoQ resets timed-out and
   truncated streams with RFC 9250 error codes; rate-limiter bursts saturate.
 
+### Follow-up hardening (wave 4)
+- **DNSSEC**: DS/DNSKEY trust-link signatures outside their validity window are
+  Bogus with the correct EDE; a validated CNAME chain crossing into an unsigned
+  zone is Insecure (not SERVFAIL); NSEC closest-encloser and NSEC3 DS-NODATA /
+  wildcard / opt-out / next-closer proofs were corrected; bogus-reason metric
+  cardinality is bounded.
+- **Filtering/rewrites**: `||wildcard` patterns anchor at domain/subdomain
+  boundaries, `|exact^` is exact, path rules are inert, and rewrite CNAMEs are
+  synthesized for every query type.
+- **Pipeline**: CNAME uncloaking now re-checks `$important`, parental, service
+  and combined global+group rules on the target; filtering requires both the
+  global switch and the client policy; prefetch no longer propagates CD=1 into
+  the shared cache; block metrics carry rule/list labels.
+- **HA statistics**: slaves report real window deltas (queries, blocked,
+  upstream RTT/errors) instead of lifetime totals labelled as a 30 s window;
+  query-log anonymization is applied once at ingest.
+- **Cleanup**: removed the write-only `EffectivePolicy.ids`; startup uses the
+  fallible bundled-list loaders (no panic on corrupt embedded data); the
+  OpenAPI export writes only with `SITO_UPDATE_OPENAPI=1` and otherwise
+  verifies the committed spec; RouterOS disables redirects; schedule window
+  parsing handles wildcard minutes.
+
 ---
 
 ## [1.7.0] - 2026-09-13

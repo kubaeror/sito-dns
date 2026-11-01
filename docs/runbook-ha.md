@@ -331,8 +331,10 @@ When a slave node fails or must be reprovisioned from bare metal:
    - Slave only: `master_url`, `last_synced_at`, `degraded_reason`.
    Connected replicas are listed separately by `GET /api/v1/ha/slaves`:
    `instance`, `remote_addr`, `synced_version`, `lag`, `diverged`,
-   `last_ping_secs_ago`, `connected_at`, `last_stats` (with `window_s`,
-   `queries`, `blocked`, `upstreams_count`).
+   `last_ping_secs_ago`, `connected_at`, `last_stats` (with `window_s` — the
+   measured interval since the previous report — and window-scoped `queries`,
+   `blocked`, `upstreams_count`; upstream RTT/error figures in the report are
+   also window deltas, not lifetime totals).
 3. **Trigger Manual Resynchronization**:
    ```bash
    # From the master:

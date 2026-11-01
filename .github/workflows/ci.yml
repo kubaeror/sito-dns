@@ -53,6 +53,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Run tests
+        env:
+          # The OpenAPI export test writes docs/openapi.json only when this is
+          # set; the diff below then verifies the committed spec is current.
+          SITO_UPDATE_OPENAPI: "1"
         run: cargo test --workspace --all-features --locked
       - name: Verify docs/openapi.json is up to date
         run: git diff --exit-code docs/openapi.json
