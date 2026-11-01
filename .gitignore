@@ -2,6 +2,14 @@
 target/
 **/*.rs.bk
 
+# Fuzzing (generated corpora and crash artifacts)
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/target/
+
+# Docker Compose HA runtime state (may contain tokens/pins)
+ha/
+
 # Node / Frontend
 node_modules/
 *.tsbuildinfo

@@ -1,96 +1,87 @@
-# Security Review and Threat Model Audit (v1.0.0)
+# Security Review and Threat Model (current)
 
-This document provides a comprehensive security review of **sito v1.0.0**, detailing the audit findings, defensive mechanisms, and verification procedures across all critical attack vectors identified in **Plan Section 18** and **Phase M9.3**.
+This document summarizes the **implemented** security controls and known
+limitations of the current tree. It replaces an earlier v1.0.0/v1.2.1 audit
+record whose claims had drifted from the code. Point-in-time audits with
+`file:line` evidence and remediation status live in:
 
----
+* [`docs/audit5.md`](audit5.md) — most recent independent audit (v1.6.0).
+* [`docs/audit4-followup-plan.md`](audit4-followup-plan.md) — previous batch.
 
-## 1. Security Audit Checklist
-
-| Domain | Control / Verification | Implementation Reference | Status |
-|---|---|---|---|
-| **Supply Chain** | `cargo deny check` & `cargo audit` clean | `deny.toml`, root `Cargo.lock` | **VERIFIED** |
-| **SSRF** | URL scheme allowlist (`http`, `https`, `file`) | `sito-filter::downloader`, `sito-core::config` | **VERIFIED** |
-| **ReDoS** | Strict DFA compile budgets; zero backtracking | `sito-filter::structures::compiled` | **VERIFIED** |
-| **Auth Timing** | Constant-time password, token & backup code checks | `sito-api::auth::manager`, `subtle` | **VERIFIED** |
-| **DoS / Flooding** | Per-IP token bucket limiter, connection caps | `sito-transport::limiter`, `sito-transport::tcp` | **VERIFIED** |
-| **Secret Leakage** | Zero credentials in logs, errors, or HA bundles | `sito-stats`, `sito-api::error`, `sito-ha` | **VERIFIED** |
-| **TLS Hardening** | TLS 1.2+ mandatory; TLS < 1.2 rejected; AEAD ciphers | `sito-transport::tls` | **VERIFIED** |
+Everything below is verifiable in the source; the referenced modules are the
+implementation of record.
 
 ---
 
-## 2. Detailed Threat Analysis & Mitigations
+## 1. Control summary
 
-### 2.1 Server-Side Request Forgery (SSRF) Protection
-* **Threat:** Malicious blocklist subscription URLs (e.g., `gopher://`, `dict://`, `file:///etc/shadow`, `ldap://`) passed via API or configuration to pivot inside private network perimeters or read local system files.
-* **Mitigations Implemented:**
-  1. **Strict Scheme Allowlist:** In `FilteringConfig::validate()` and `sito-filter::downloader`, URLs are restricted to `http://`, `https://`, and `file://`. Any URL containing unapproved protocols is rejected at configuration validation time with HTTP 400 Bad Request.
-  2. **File URI Sandboxing:** `file://` URIs are intended for local list mounts (e.g., in Docker or air-gapped homelabs) and require file system read permissions of the unprivileged `sito` daemon user.
-  3. **LAN Subscription Documentation:** Subscriptions are permitted to contact LAN IPs (RFC 1918 / ULA) because users commonly host custom lists on internal Pi-hole or RouterOS HTTP servers. When deployed in untrusted multi-tenant environments, operators may enforce network namespace egress firewalls.
-
-### 2.2 Regular Expression Denial of Service (ReDoS) Protection
-* **Threat:** User-supplied custom regular expressions in blocklists (e.g., `/(a+)+$/` or nested quantifiers) causing exponential backtracking in regex engines, freezing worker threads.
-* **Mitigations Implemented:**
-  1. **Deterministic Finite Automata (DFA):** All user regex patterns and ABP wildcards are compiled exclusively using `regex-automata` dense DFAs. DFAs execute in strictly deterministic linear time $O(N)$ proportional only to the length of the query domain string, completely eliminating algorithmic backtracking.
-  2. **DFA Memory Compilation Ceiling:** A hard memory limit of 10 MB is enforced on DFA state graphs during compilation (`dense::Config::new().dfa_size_limit(Some(10 * 1024 * 1024))`). Any adversarial pattern attempting state explosion is rejected cleanly without crashing or starving heap memory.
-
-### 2.3 Constant-Time Authentication & Timing Attack Protection
-* **Threat:** Statistical timing analysis of password verification, API bearer token validation, or TOTP backup code matching to infer secret contents character-by-character.
-* **Mitigations Implemented:**
-  1. **Argon2id for Passwords:** Passwords utilize Argon2id ($m=64\text{ MiB}, t=3, p=4$) with salt generation via cryptographically secure OS RNG (`OsRng`). The `argon2` crate internally performs constant-time hash comparison via the `subtle` crate.
-  2. **API Token Lookup:** `sito-api::auth::manager::validate_token` compares the Blake3 hash of the provided bearer token against stored token hashes using `subtle::ConstantTimeEq` across all registered entries, eliminating hash-comparison timing leaks.
-  3. **TOTP Backup Codes:** One-time recovery codes are verified using `subtle::ConstantTimeEq` against stored Blake3 hashes before removal.
-
-### 2.4 Denial of Service (DoS) & Resource Exhaustion Controls
-* **Threat:** Flooding DNS listeners or Web API with high-frequency queries or opening thousands of idle TCP connections to exhaust system memory and file descriptors.
-* **Mitigations Implemented:**
-  1. **DNS Rate Limiter:** Per-IP token bucket limiter (`dns.rate_limit_per_ip`, default 20 QPS with burst allowance) implemented with high-speed lockless atomics in `sito-transport::limiter`.
-  2. **TCP Connection Limits:** `dns.max_tcp_connections` (default 256) bounds concurrent TCP, DoT, and DoH connections using Tokio `Semaphore`. Exceeding connections are dropped or refused immediately.
-  3. **Connection Timeouts:** Strict 10-second idle connection timeouts on TCP and DoT sockets prevent slowloris connection starvation.
-  4. **Login Brute-Force Lockout:** IP-based and user-based lockout in `sito-api::auth::lockout`: 5 consecutive failed login attempts trigger an immediate 15-minute lockout.
-
-### 2.5 Zero Secret Leakage Invariant
-* **Threat:** Accidental exposure of API tokens, session cookies, database credentials, or HA TLS private keys in query logs, error bodies, or replication snapshots.
-* **Mitigations Implemented:**
-  1. **Sanitized Query Logs:** SQLite `query_log` schema stores only DNS wire parameters (`qname`, `qtype`, `client_ip`, `verdict`, `rule`, `elapsed_us`). HTTP request headers, Authorization headers, and session cookies are never logged.
-  2. **RFC 7807 Error Responses:** REST API errors return sanitized `application/problem+json` envelopes. Internal stack traces, raw SQL queries, and local absolute filesystem paths are stripped from HTTP response bodies.
-  3. **High-Availability Secret Redaction:** In `sito-ha`, master-to-slave config replication bundles strip sensitive sections (`web.key`, `integrations.mikrotik.token_env`, `auth` user password hashes) and replace them with `${SECRET:*}` placeholders.
-
-### 2.6 TLS Hardening & Modern Protocol Enforcement
-* **Threat:** Man-in-the-middle downgrade attacks against encrypted transports using legacy SSLv3, TLS 1.0, or TLS 1.1 protocols with insecure ciphers (RC4, 3DES, CBC mode).
-* **Mitigations Implemented:**
-  1. **Minimum TLS 1.2:** Transports configured through `rustls` strictly enforce TLS 1.2 and TLS 1.3. Protocols prior to TLS 1.2 are entirely disabled at the library level and cannot be negotiated by connecting clients.
-  2. **AEAD Cipher Suites:** Only authenticated encryption with associated data (AEAD) ciphers (such as TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256) are supported.
+| Domain | Control | Implementation |
+|---|---|---|
+| **SSRF** | Subscription schemes restricted to `http://`, `https://`, `file://`. HTTP fetches disable redirects and proxies, resolve and pin the target address, and deny loopback, RFC 1918/ULA, link-local/metadata (including CGNAT, reserved, documentation, and IPv4 embeddings via IPv4-mapped, NAT64, 6to4 and Teredo). `file://` is allowlisted to the data directory plus explicit programmatic roots, rejecting pseudo-filesystems. | `sito-filter::subscription`, `sito-core::config` |
+| **ReDoS** | User regex and ABP wildcards compile to dense DFAs with hard budgets (≤ 10k patterns, ≤ 4 MiB pattern bytes, ≤ 16 KiB per pattern, ≤ 10 MiB DFA) and a bounded per-pattern fallback. Linear-time matching, no backtracking. | `sito-filter::structures::compiled` |
+| **Auth timing** | Argon2id ($m=64$ MiB, $t=3$, $p=4$) for passwords and TOTP backup codes; constant-time comparisons (`subtle`) for API tokens, session cookies, setup tokens and TOTP codes. | `sito-api::auth` |
+| **2FA** | TOTP with replay cache, Argon2id-hashed backup codes, lockout and IP throttling; verification serialized so codes/backup codes are single-use under concurrency. | `sito-api::auth::manager`, `auth::totp` |
+| **First boot** | One-time setup token (CSPRNG, console-printed, per-IP rate-limited) gates the wizard until setup completes; the token is not pruned while first-run is pending. | `sito-api::auth::manager`, `sito-api::router` |
+| **CSRF / browser** | Strict same-origin `Origin`/`Referer` checks (missing origin fails closed for cookie sessions), session-bound CSRF tokens for mutating requests, `__Host-` cookies on TLS, `HttpOnly`, `SameSite=Strict`, `no-store` on auth/config responses, CSP/HSTS/X-Frame-Options/nosniff. | `sito-api::security`, `auth::session` |
+| **DoS / flooding** | One shared per-client token bucket across UDP/TCP/DoT/DoH/DoQ/DoH3, checked per query; connection caps; TLS/handshake and write timeouts; bounded per-connection pipelining; bounded rate-limiter tables; UDP truncation to the negotiated EDNS size. | `sito-transport`, `crates/sito/src/server.rs` |
+| **HA security** | mTLS with certificate pinning (optional explicit insecure WS for isolated networks), constant-time shared-token check, Ed25519-signed bundles with monotonic versions, handshake timeout and connection cap on the master listener, per-session identity so stale connections cannot mutate live state. | `sito-ha` |
+| **Secrets** | HA bundles strip TLS/web keys, auth hashes/tokens, RouterOS credentials and per-client shared secrets (`${SECRET:*}` placeholders where applicable; node-local values are restored on the slave). Config/users/tokens/sessions and ACME keys are written 0600 atomically. Headers and cookies are never logged. | `sito-ha::bundle`, `sito-api::config_writer`, `sito-transport::acme` |
+| **TLS** | rustls-only, TLS 1.2/1.3, AEAD cipher suites, RPK/SNI certificate support, atomic certificate reload, native ACME (TLS-ALPN-01 and HTTP-01). No SSLv3/TLS 1.0/1.1 or CBC/RC4 negotiation paths. | `sito-transport::tls`, `::acme` |
+| **DNSSEC** | Fail-closed validation with trust-anchor chains, DS/DNSKEY walking, NSEC/NSEC3 denial proofs (including wildcard denial), algorithm/digest policy, key-cache bounds, CD/DO semantics and AD only for validated answers. | `sito-dnssec` |
+| **Supply chain** | `cargo deny` (advisories/bans/licenses/sources) in CI, SHA-pinned GitHub Actions, digest-pinned container bases, signed (cosign) release archives verified by the installer and the self-updater; updater signatures are required by default with the identity pinned to the release workflow on tag refs. | `deny.toml`, `.github/workflows`, `contrib/install.sh`, `sito-api::updater` |
+| **API integrity** | Config writes run the same deep typed-section validation as startup, invalid configs are rejected before persisting, restore archives are decompression-capped, tokens expire by default (90 days), deleting a user revokes sessions. | `sito-api::config_validation`, `handlers::config`, `auth::manager` |
 
 ---
 
-## 3. v1.2.1 Security & Architecture Audit Remediation
+## 2. Threat notes
 
-Following the comprehensive code and architecture audit (`/docs/audit.md`), all 24 identified items across P0 through P3 severity levels were remediated and verified:
+* **Malicious upstream / on-path attacker:** DNSSEC validation is
+  non-bypassable in `validate`/`strict` modes, prefetch re-validates before
+  caching, and cross-zone signatures are rejected. A chain that cannot be
+  proven fails closed.
+* **Malicious subscription lists:** list parsing is fail-closed for regex
+  budgets; hostile prefix/ACL load is bounded by the per-list byte cap and the
+  parse pipeline never panics (fuzz-tested).
+* **Compromised client identity claims:** DoH path segments and DoT/DoQ SNI
+  only identify a client when they match a configured shared secret; filter
+  `$client=` matching uses only registry-resolved identity.
+* **First-boot exposure:** the web UI binds `0.0.0.0:8080` during setup but no
+  DNS listener is bound and the wizard is token-gated. Operators exposing the
+  setup endpoint beyond a trusted network should treat the printed token as
+  the only credential until setup completes.
+* **Container isolation:** images run as nonroot (uid/gid 65532) with
+  `NET_BIND_SERVICE` required for ports < 1024; `/var/lib/sito` and `/etc/sito`
+  are owned by that uid so fresh named volumes are writable.
 
-| Issue | Severity | Description | Mitigation Implemented |
-|---|---|---|---|
-| **P0-1** | Critical | Setup wizard mutation without auth | Restricted `/ui/wizard` and `/ui/wizard/complete` to first-run setup or authenticated admin sessions; returns HTTP 403 once initialized. |
-| **P0-2** | Critical | Users not persisted across reboots | Persisted user database to `<data_dir>/users.toml` (0600, corrupt/missing file fails closed) and restored accounts on daemon startup. Note: `auth.user`/`auth.role` config keys are not supported; roles are assigned per account in `users.toml`. |
-| **P0-3** | Critical | Updater accepted missing checksums | Enforced mandatory SHA256 checksum verification from `SHA256SUMS`, authenticated `/api/v1/system/update/check`, and restricted repo querying to `kubaeror/sito-dns`. |
-| **P0-4** | Critical | Installer generated incomplete config | Added default sections to generated configuration files and surfaced parsing warnings for corrupted sections. |
-| **P0-5** | Critical | Config and rewrites required daemon restart | Wired `ArcSwap` handles into the DNS query pipeline to allow instant, zero-downtime hot-reloading of config, rewrites, and client groups. |
-| **P1-6** | High | TTL clamping could produce invalid states | Enforced defensive TTL clamping and validated `negative_ttl_max >= min_ttl` at configuration validation time. |
-| **P1-7** | High | UDP head-of-line blocking under slow upstream | Spawned concurrent Tokio worker tasks per received UDP packet bounded by a high-capacity semaphore. |
-| **P1-8** | High | Unauthenticated HA slave replication | Mandated TLS certificate pinning for HA sync, rejected plain WebSockets by default, and required pre-shared token authentication for replicas. |
-| **P1-9** | High | Plain HTTP cookie leaks | Dynamically set the `Secure` flag on session cookies when served over TLS, and logged security warnings when binding plain HTTP to non-loopback addresses. |
-| **P1-10** | High | Memory exhaustion in auth state maps | Bounded lockout, session, and TOTP maps with maximum capacity limits and spawned a background pruner task running every 5 minutes. |
-| **P1-11** | High | Missing RBAC on metrics and UI mutations | Enforced strict role-based access control across all mutating UI routes and `/metrics`; documented OpenAPI documentation endpoints. |
-| **P2-12** | Medium | Hourly stats double counting | Added persistent watermark tracking in SQLite to prevent reprocessing query log rows during aggregation. |
-| **P2-13** | Medium | Query log SQL string interpolation | Converted dynamic query log filter construction to parameterized `sqlx::QueryBuilder` with `push_bind`. |
-| **P2-14** | Medium | Installer checksum failure ignored | Hardened `contrib/install.sh` to abort with non-zero exit code if SHA256SUMS is missing or fails validation. |
-| **P2-15** | Medium | Dead `refresh_hours` configuration | Fixed in follow-up WP-4: per-list `refresh_hours` now drives the refresh scheduler (nearest-due wake-ups, partial reload keeping other lists); lists without it use the global `filtering.refresh_interval_hours`. |
-| **P2-16** | Medium | DNSSEC mode unchecked | Validated DNSSEC mode at startup (accepted: `validate`/`strict`, `log_only`/`log-only`/`permissive`/`log_fail`, `off`/`disabled`) and logged validation outcomes in query logs. Full DS/DNSKEY chain walking remains future work. |
-| **P2-17** | Medium | Query logs dropped on graceful shutdown | Flushed and awaited query log background writer completion during server graceful shutdown. |
-| **P2-18** | Medium | Rule drop guard prevented deliberate deletions | Restricted drop-guard threshold checks exclusively to automated background refreshes. |
-| **P2-19** | Medium | Upstream bootstrap panic on empty list | Safely handled bootstrap resolution candidates using `.first()` rather than direct index slicing. |
-| **P2-20** | Medium | Upstream documentation and UI labels drift | Aligned UI labels, sample configs, and documentation to supported `tls://` and UDP upstream protocols. |
-| **P3-21** | Low | Code duplication and unrouted endpoints | Refactored pipeline with `QueryOutcome`, bounded prefetch tasks with a semaphore, consolidated HTML escapers, and routed missing client/rewrite endpoints. |
-| **P3-22** | Low | Unmodeled config keys omitted | Documented in configuration reference and changelog that atomic saves preserve modeled fields. |
-| **P3-23** | Low | Systemd sandbox permissions | Added `MemoryDenyWriteExecute`, `ProtectKernelTunables`, `ProtectKernelModules`, `ProtectControlGroups`, and `SystemCallFilter=@system-service` hardening directives to systemd unit. |
-| **P3-24** | Low | Missing axum json feature dependency | Explicitly added `"json"` feature to workspace `axum` dependency. |
+---
 
+## 3. Verification
+
+```bash
+cargo test --workspace --all-features
+cargo clippy --workspace --all-features --all-targets -- -D warnings
+cargo deny check
+python3 scripts/check_config_reference.py
+```
+
+Fuzzing targets (`fuzz/`) cover DNS wire parsing, ABP parsing, TOML config,
+client IDs, DNSSEC responses and HA bundles; `nightly-fuzz.yml` runs them with
+a pinned nightly toolchain.
+
+---
+
+## 4. Known accepted limitations
+
+* The deprecated `?token=` query parameter is accepted **only** on the
+  WebSocket upgrade when no `Authorization` header is present, logs a warning,
+  and is scheduled for removal in 2.0. Use `Authorization` headers or
+  `__Host-` session cookies.
+* Rate-limiting budgets are enforced per client IP, not per authenticated
+  account.
+* `auth.token_default_ttl_days = 0` disables token expiry for operators who
+  explicitly opt out; the default is 90 days.
+* DNSSEC wildcard denial requires complete NSEC/NSEC3 proofs; responses whose
+  proofs are incomplete are treated as `Bogus` (fail closed) rather than
+  downgraded to `Insecure`.
+* Self-update under systemd requires running `sito update` as root with the
+  service stopped (the unit keeps `ProtectSystem=strict`).

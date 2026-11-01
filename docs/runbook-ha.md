@@ -6,7 +6,7 @@ This runbook provides step-by-step operational procedures for managing, maintain
 
 ## 1. Overview and Architecture
 
-`sito` implements an active-passive master/slave replication architecture governed by [ADR-0002](adr/0002-ha-master-slave-push-no-raft.md):
+`sito` implements an active-passive master/slave replication architecture governed by [ADR-0002](adr/0002-ha-master-slave-push.md):
 - **Master Node**: Accepts administrative REST API mutations and Web UI configurations, generates monotonic configuration bundles, signs them using an Ed25519 private key (`data_dir/ha_signing.key`, permissions `0600`), and pushes updates to connected slaves in real-time over WebSocket with mutual TLS (mTLS) on port `8953`.
 - **Slave Nodes**: Connect to the master over WebSocket + mTLS, verify the master's Ed25519 signature and certificate fingerprint, enforce strict monotonic version ordering (`version > have_version`), and apply configuration snapshots atomically.
 - **Continuous Resolution**: Slaves serve DNS queries continuously without downtime. If an invalid or unparsable configuration bundle is received, the slave performs an automatic rollback to its last known good snapshot and enters a `Degraded` state.
@@ -54,9 +54,9 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
 3. **Verify or generate master Ed25519 signing key**:
    When `sito` starts with `role = "master"`, it automatically generates a new Ed25519 private key at `/var/lib/sito/ha_signing.key` if one does not already exist, with strict POSIX permissions `0600`:
    ```bash
-   # Verify permissions if generated manually
+   # Verify permissions if generated manually (raw PKCS#8 DER key material)
    ls -la /var/lib/sito/ha_signing.key
-   # Expected output: -rw------- 1 sito sito 85 ... ha_signing.key
+   # Expected output: -rw------- 1 sito sito ... ha_signing.key
    ```
 
 4. **Restart sito service**:
@@ -236,7 +236,7 @@ When a slave node fails or must be reprovisioned from bare metal:
 
 | Symptom | Probable Cause | Action |
 |---|---|---|
-| Slave state is `Degraded` | Configuration apply failed or corrupted bundle | Check `/var/log/sito` for `apply_config_push: parse error`. Slave automatically rolled back to prior working config. Fix syntax on master and re-push. |
+| Slave state is `Degraded` | Configuration apply failed or corrupted bundle | Check the service journal (`journalctl -u sito`) for `apply_config_push` errors. The slave keeps its last good snapshot and reports `Degraded`; fix the configuration on the master and re-push. |
 | Slave state is `Connecting` in loop | Network unreachable, firewall blocking 8953, or mTLS handshake failed | Check `nc -zv 192.168.1.10 8953`. Check TLS certificate expiration or fingerprint mismatch in logs. |
 | `Signature verification failed` | Bundle signature does not match master public key | Verify that the master didn't regenerate `ha_signing.key` without updating slaves. |
 | `Incoming version <= have_version` | Out of order or replayed bundle | Normal during network blips; master will send latest monotonic version. |
@@ -266,9 +266,11 @@ When a slave node fails or must be reprovisioned from bare metal:
    curl -s http://192.168.1.10:8080/metrics | grep sito_ha_
    ```
    Look for:
-    - `sito_ha_slaves_connected`: Number of active slaves connected.
-    - `sito_ha_config_version{instance="sito-master"}`: Current config version.
-    - `sito_ha_replication_lag_seconds{slave="sito-slave-1"}`: Replication delay.
+    - `sito_ha_slaves_connected`: Number of active slaves connected to this master.
+    - `sito_ha_config_version{instance="..."}`: Published configuration version per
+      node (the master plus each replica's last acknowledged version). Lag is the
+      difference between the master's version and a slave's reported version; it
+      is not exported as a separate per-slave metric.
 
 ---
 

@@ -390,6 +390,17 @@ impl DnsCache {
             return;
         }
 
+        // Bailiwick: every answer record must belong to the query name or a
+        // CNAME chain reachable from it. Otherwise a spoofed upstream could
+        // inject an unrelated RRset under this cache key.
+        if !answer_owners_are_relevant(first_query.name(), response) {
+            warn!(
+                qname = %key.qname,
+                "Refusing to cache response with out-of-bailiwick answer owners"
+            );
+            return;
+        }
+
         // NODATA detection (RFC 2308): a NoError answer without an RRset of
         // the queried type is negative, including CNAME-only chains that never
         // reach the requested type.
@@ -516,6 +527,37 @@ fn clear_dnssec_material(response: &mut Message) {
     response
         .additionals
         .retain(|record| record.record_type() != RecordType::RRSIG);
+}
+
+/// Returns true when every answer record's owner is the query name or a CNAME
+/// target reachable from it (bounded walk, cycles stop the walk).
+fn answer_owners_are_relevant(qname: &Name, response: &Message) -> bool {
+    let mut relevant: Vec<Name> = Vec::new();
+    let mut current = qname.clone();
+    for _ in 0..16 {
+        if relevant.contains(&current) {
+            break;
+        }
+        relevant.push(current.clone());
+        let next = response.answers.iter().find_map(|record| {
+            if record.record_type() == RecordType::CNAME && record.name == current {
+                match &record.data {
+                    RData::CNAME(cname) => Some(cname.0.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        });
+        match next {
+            Some(target) => current = target,
+            None => break,
+        }
+    }
+    response
+        .answers
+        .iter()
+        .all(|record| relevant.contains(&record.name))
 }
 
 /// Derives the RFC 2308 negative TTL from the SOA record in `authorities`

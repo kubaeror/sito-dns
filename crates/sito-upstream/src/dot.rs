@@ -21,6 +21,11 @@ use sito_proto::{Message, decode_message, encode_message};
 /// Idle pooled connections older than this are discarded instead of reused.
 const POOL_IDLE_TTL: Duration = Duration::from_secs(30);
 
+/// Maximum number of simultaneously outstanding *new* DoT connections. Bounds
+/// outbound FD/TLS-handshake amplification when the upstream is slow or the
+/// query flood is large; pooled connections are reused without a permit.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
 struct PooledConnection {
     stream: TlsStream<TcpStream>,
     idle_since: Instant,
@@ -34,6 +39,7 @@ pub struct DotUpstream {
     pool_size: usize,
     connector: TlsConnector,
     pool: Mutex<Vec<PooledConnection>>,
+    connect_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl DotUpstream {
@@ -47,9 +53,15 @@ impl DotUpstream {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let mut client_config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        // Select the ring provider explicitly: the workspace feature graph
+        // enables both `ring` and `aws_lc_rs` (reqwest/hyper-rustls), so the
+        // ambiguous `ClientConfig::builder()` panics at runtime.
+        let mut client_config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| UpstreamError::Tls(format!("unsupported TLS protocol versions: {e}")))?
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
 
         client_config.alpn_protocols = vec![b"dot".to_vec()];
 
@@ -62,6 +74,7 @@ impl DotUpstream {
             pool_size: pool_size.max(1),
             connector,
             pool: Mutex::new(Vec::new()),
+            connect_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         })
     }
 
@@ -80,6 +93,7 @@ impl DotUpstream {
             pool_size: pool_size.max(1),
             connector: TlsConnector::from(Arc::new(client_config)),
             pool: Mutex::new(Vec::new()),
+            connect_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         }
     }
 
@@ -217,8 +231,25 @@ impl Upstream for DotUpstream {
             }
         }
 
+        // Bound newly opened connections; pooled reuse is not limited.
+        let permit = match timeout(
+            self.query_timeout,
+            Arc::clone(&self.connect_semaphore).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(UpstreamError::BadResponse(
+                    "DoT connection limiter closed".to_string(),
+                ));
+            }
+            Err(_) => return Err(UpstreamError::Timeout),
+        };
         let conn = self.connect_tls().await?;
-        self.query_on_connection(conn, msg, &encoded).await
+        let result = self.query_on_connection(conn, msg, &encoded).await;
+        drop(permit);
+        result
     }
 }
 
@@ -300,6 +331,21 @@ mod tests {
         });
 
         (addr, cert_der)
+    }
+
+    #[test]
+    fn test_dot_upstream_new_does_not_panic_on_ambiguous_crypto_providers() {
+        // Regression: the workspace enables both rustls `ring` and `aws_lc_rs`
+        // (pulled in by reqwest). `ClientConfig::builder()` aborts the process
+        // in that configuration; construction must select the ring provider.
+        let upstream = DotUpstream::new(
+            "127.0.0.1:853".parse().unwrap(),
+            "dns.example.com".to_string(),
+            Duration::from_secs(2),
+            4,
+        )
+        .expect("DotUpstream::new must succeed with both providers enabled");
+        assert_eq!(upstream.server_name(), "dns.example.com");
     }
 
     #[tokio::test]

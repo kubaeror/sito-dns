@@ -40,6 +40,10 @@ pub struct ActiveSlave {
     pub sender: mpsc::Sender<HaMessage>,
     /// Capabilities advertised in the slave's Hello (e.g. `stats-v1`).
     pub capabilities: Vec<String>,
+    /// Monotonic id of the connection that registered this entry. A
+    /// reconnecting slave replaces the entry; the superseded session must not
+    /// remove or update the newer one during cleanup.
+    pub connection_id: u64,
 }
 
 impl ActiveSlave {

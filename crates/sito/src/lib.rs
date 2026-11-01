@@ -860,6 +860,45 @@ mod tests {
         }
         assert!(rebound, "server did not rebind to the new DNS port");
 
+        // Point the config at an occupied UDP port: the rebind must fail and
+        // the previous listeners must be restored.
+        let blocker = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let blocked_port = blocker.local_addr().unwrap().port();
+        config.dns.port = blocked_port;
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&config).expect("serialize config"),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            query_port(second_port).await,
+            "previous listeners must be restored after a failed rebind"
+        );
+
+        // A later valid change must still apply: a failed rebind must not
+        // permanently orphan the listener manager.
+        let third_port = reserve_udp_port();
+        config.dns.port = third_port;
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&config).expect("serialize config"),
+        )
+        .unwrap();
+        let mut rebound_again = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if query_port(third_port).await {
+                rebound_again = true;
+                break;
+            }
+        }
+        assert!(
+            rebound_again,
+            "a failed rebind must not permanently orphan the listener manager"
+        );
+        drop(blocker);
+
         let _ = shutdown_tx.send(());
         let result = tokio::time::timeout(Duration::from_secs(8), server_task).await;
         assert!(result.is_ok(), "server failed to shut down after rebind");
@@ -1086,6 +1125,236 @@ mod tests {
         assert!(
             ttl_second < ttl_first,
             "Negative TTL must decrement over time (first: {ttl_first}, second: {ttl_second})"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_cname_uncloaking_applies_to_cache_hits() {
+        use hickory_proto::rr::rdata::CNAME;
+
+        let temp_dir = std::env::temp_dir().join(format!("sito_cname_hit_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mock_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while let Ok((len, src)) = mock_socket.recv_from(&mut buf).await {
+                if let Ok(query) = sito_proto::decode_message(&buf[..len]) {
+                    let mut resp =
+                        Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                    resp.metadata.response_code = ResponseCode::NoError;
+                    resp.queries = query.queries.clone();
+                    if let Some(q) = query.queries.first() {
+                        let target = Name::from_str("cloaked.adnetwork.com.").unwrap();
+                        resp.answers.push(Record::from_rdata(
+                            q.name().clone(),
+                            300,
+                            RData::CNAME(CNAME(target.clone())),
+                        ));
+                        resp.answers.push(Record::from_rdata(
+                            target,
+                            300,
+                            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+                        ));
+                    }
+                    let encoded = sito_proto::encode_message(&resp).unwrap();
+                    let _ = mock_socket.send_to(&encoded, src).await;
+                }
+            }
+        });
+
+        // Start with no blocking rules so the chain response is cached.
+        let mut config = Config::default();
+        config.server.data_dir = temp_dir.clone();
+        config.upstream.servers = vec![mock_addr.to_string()];
+        config.filtering.cname_cloaking = true;
+
+        let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
+        let upstream = Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let cache = Arc::new(DnsCache::new(config.dns.cache.clone()));
+        let filter = Arc::new(
+            HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
+        );
+        let pipeline = DnsPipeline::new(
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(config.clone()))),
+            Arc::clone(&filter),
+            Arc::clone(&cache),
+            upstream,
+            Arc::new(sito_dnssec::DnssecValidator::from_config(
+                &config.dns.dnssec,
+            )),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(ClientRegistry::new(
+                ClientsConfig::default(),
+            )))),
+            Arc::new(ParentalRegistry::bundled()),
+            Arc::new(ServiceRegistry::bundled()),
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(RewriteTable::new(
+                RewritesConfig::default(),
+            )))),
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("track.company.com.").unwrap();
+        let make_query = |id: u16| {
+            let mut q = Message::new(id, MessageType::Query, OpCode::Query);
+            q.queries.push(Query::query(name.clone(), RecordType::A));
+            q
+        };
+
+        // First pass: allowed and cached.
+        let first = pipeline
+            .handle(make_query(1), client.clone())
+            .await
+            .unwrap();
+        assert!(
+            first.answers.iter().any(|record| {
+                matches!(&record.data, RData::A(a) if a.0 == Ipv4Addr::new(1, 2, 3, 4))
+            }),
+            "unblocked CNAME chain must be returned: {:?}",
+            first.answers
+        );
+
+        // Rules change after the entry was cached.
+        let mut blocked = config.filtering.clone();
+        blocked.custom_rules = vec!["||adnetwork.com^".to_string()];
+        filter.reload_with_config(&blocked).await.unwrap();
+
+        // Cache hit must still run the CNAME uncloaking check.
+        let second = pipeline.handle(make_query(2), client).await.unwrap();
+        assert_eq!(second.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(second.answers.len(), 1);
+        assert_eq!(
+            second.answers[0].data,
+            RData::A(A(Ipv4Addr::UNSPECIFIED)),
+            "cached CNAME chains must be re-evaluated against current rules"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_prefetch_validates_before_cache_insert() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_prefetch_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mock_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_socket.local_addr().unwrap();
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&upstream_calls);
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while let Ok((len, src)) = mock_socket.recv_from(&mut buf).await {
+                if let Ok(query) = sito_proto::decode_message(&buf[..len]) {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut resp =
+                        Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                    resp.metadata.response_code = ResponseCode::NoError;
+                    // Malicious/compromised upstream: assert AD=1 without any
+                    // RRSIG or DNSKEY material.
+                    resp.metadata.authentic_data = true;
+                    resp.queries = query.queries.clone();
+                    if let Some(q) = query.queries.first() {
+                        resp.answers.push(Record::from_rdata(
+                            q.name().clone(),
+                            10,
+                            RData::A(A(Ipv4Addr::new(203, 0, 113, 9))),
+                        ));
+                    }
+                    let encoded = sito_proto::encode_message(&resp).unwrap();
+                    let _ = mock_socket.send_to(&encoded, src).await;
+                }
+            }
+        });
+
+        let mut config = Config::default();
+        config.server.data_dir = temp_dir.clone();
+        config.upstream.servers = vec![mock_addr.to_string()];
+        config.dns.cache.enabled = true;
+        config.dns.cache.prefetch = true;
+        config.dns.cache.min_ttl = 5;
+        config.dns.dnssec.validate = true;
+
+        let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
+        let upstream = Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let cache = Arc::new(DnsCache::new(config.dns.cache.clone()));
+        let filter = Arc::new(
+            HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
+        );
+        let dnssec = Arc::new(sito_dnssec::DnssecValidator::from_config(
+            &config.dns.dnssec,
+        ));
+        let clients = Arc::new(ClientRegistry::new(ClientsConfig::default()));
+        let parental = Arc::new(ParentalRegistry::bundled());
+        let services = Arc::new(ServiceRegistry::bundled());
+        let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
+
+        let pipeline = DnsPipeline::new(
+            Arc::new(arc_swap::ArcSwap::new(Arc::new(config.clone()))),
+            filter,
+            cache,
+            upstream,
+            dnssec,
+            Arc::new(arc_swap::ArcSwap::new(clients)),
+            parental,
+            services,
+            Arc::new(arc_swap::ArcSwap::new(rewrites)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("prefetch.example.com.").unwrap();
+        let make_query = |id: u16| {
+            let mut q = Message::new(id, MessageType::Query, OpCode::Query);
+            q.queries.push(Query::query(name.clone(), RecordType::A));
+            q
+        };
+
+        // Miss: upstream answer must not assert AD (no RRSIGs to validate).
+        let first = pipeline
+            .handle(make_query(1), client.clone())
+            .await
+            .unwrap();
+        assert!(!first.metadata.authentic_data);
+
+        // Hits 1 and 2 build the prefetch trigger (hits >= 2, TTL <= 10s).
+        for id in 2..4 {
+            let hit = pipeline
+                .handle(make_query(id), client.clone())
+                .await
+                .unwrap();
+            assert!(!hit.metadata.authentic_data);
+        }
+
+        // Let the background prefetch validate and replace the entry.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            upstream_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "prefetch is expected to have re-queried the upstream"
+        );
+
+        // A client signalling AD interest must never be served the attacker's
+        // AD=1 from the prefetched entry. Before validation was added here the
+        // refreshed response was cached verbatim and served as authentic.
+        let mut ad_query = make_query(4);
+        ad_query.metadata.authentic_data = true;
+        let ad_resp = pipeline.handle(ad_query, client).await.unwrap();
+        assert!(
+            !ad_resp.metadata.authentic_data,
+            "prefetched cache entries must be DNSSEC-validated before insert"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

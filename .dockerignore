@@ -1,4 +1,12 @@
 target/
+fuzz/target/
 .git/
+.github/
 data/
+docs/
+scripts/
+.opencode/
+docker-compose*.yml
 *.log
+__pycache__/
+*.pyc

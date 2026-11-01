@@ -24,6 +24,9 @@ pub const DEFAULT_QUERYLOG_LIMIT: usize = 100;
 /// Maximum REST query-log requests per client IP within `REST_RATE_WINDOW`.
 const REST_RATE_LIMIT: u32 = 120;
 const REST_RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Maximum tracked client IPs in the REST rate limiter. Bounds memory when
+/// many distinct (possibly spoofed) addresses hit the endpoint.
+const MAX_REST_RATE_BUCKETS: usize = 8_192;
 /// Maximum WebSocket entries forwarded per second (excess entries are dropped
 /// to keep one slow viewer from pinning a CPU).
 const WS_MAX_ENTRIES_PER_SECOND: u32 = 200;
@@ -52,6 +55,12 @@ fn rest_rate_limited(client_ip: &str) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = Instant::now();
     buckets.retain(|_, (start, _)| now.duration_since(*start) <= REST_RATE_WINDOW);
+    if buckets.len() >= MAX_REST_RATE_BUCKETS && !buckets.contains_key(client_ip) {
+        // Evict one (typically stale) bucket to keep the table bounded.
+        if let Some(victim) = buckets.keys().next().cloned() {
+            buckets.remove(&victim);
+        }
+    }
     let entry = buckets.entry(client_ip.to_string()).or_insert((now, 0));
     if now.duration_since(entry.0) > REST_RATE_WINDOW {
         *entry = (now, 0);

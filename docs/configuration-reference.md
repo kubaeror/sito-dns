@@ -1,8 +1,8 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v1.6.0**.
+This document is the exhaustive configuration reference for **sito v1.7.0**.
 
-`sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. Only `DNSD_SECRET_<NAME>` variables are used to resolve HA secret placeholders.
+`sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the local secret store, then `DNSD_SECRET_<NAME>`, then a bare `<NAME>` environment variable.
 
 > [!NOTE]
 > The tables below are validated against the Rust config structs in CI (`scripts/check_config_reference.py`); adding a setting without documenting it fails the build.
@@ -28,7 +28,7 @@ instance_name = "sito-main"            # Unique identifier in cluster
 data_dir = "/var/lib/sito"             # Base path for database, caches, and state
 log_level = "info"                     # "trace" | "debug" | "info" | "warn" | "error"
 log_format = "json"                    # "pretty" | "json"
-update_require_signature = false       # require cosign-verified release signatures for self-update
+update_require_signature = true        # require cosign-verified release signatures for self-update
 ```
 
 | Key | Type | Default | Description |
@@ -38,7 +38,7 @@ update_require_signature = false       # require cosign-verified release signatu
 | `data_dir` | string | `"/var/lib/sito"` | Directory where the persistent SQLite DB (`stats.db`), list caches, and TLS state are stored. |
 | `log_level` | string | `"info"` | Logging verbosity: `"trace"`, `"debug"`, `"info"`, `"warn"`, or `"error"`. |
 | `log_format` | string | `"json"` | Formatting for stdout logs: `"pretty"` (human readable with colors) or `"json"` (structured). |
-| `update_require_signature` | boolean | `false` | When `true`, in-app updates and `sito update` require a valid cosign signature (`.sig`/`.pem` assets). A signature that is present is always verified even when this is `false`; when `true`, a missing signature or missing `cosign` binary aborts the update. |
+| `update_require_signature` | boolean | `true` | When `true`, in-app updates and `sito update` require a valid cosign signature (`.sig`/`.pem` assets). A signature that is present is always verified even when this is `false`; when `true`, a missing signature or missing `cosign` binary aborts the update. Set to `false` only if you intentionally accept same-origin SHA-256-only integrity. |
 
 ---
 
@@ -196,6 +196,7 @@ refresh_interval_hours = 24
 blocking_mode = "zero_ip"              # "zero_ip" | "nxdomain" | "refused" | "null_rdata" | "custom_ip:x.x.x.x"
 blocking_ttl = 10
 cname_cloaking = true
+fail_closed = true
 anti_doh_bypass = "block_all"          # "off" | "block_all" | "block_except_trusted"
 custom_rules = [
     "||badtracker.com^",
@@ -215,6 +216,7 @@ enabled = true
 | `blocking_mode` | string | `"zero_ip"` | DNS answer returned for blocked domains: `"zero_ip"` (`0.0.0.0` / `::`), `"nxdomain"`, `"refused"`, `"null_rdata"`, or `"custom_ip:<ip>"`. |
 | `blocking_ttl` | integer | `10` | TTL in seconds returned on blocked responses (low TTL allows rapid unblocking). |
 | `cname_cloaking` | boolean | `true` | Follow CNAME chains upstream and apply filter rules against intermediate canonical names. |
+| `fail_closed` | boolean | `true` | Answer SERVFAIL while filtering is enabled but no rule snapshot has ever loaded (e.g. every list failed at boot), instead of silently allowing traffic. |
 | `anti_doh_bypass` | string | `"off"` | Block known public DoH/DoT resolvers to enforce network-wide filtering: `"off"`, `"block_all"`, or `"block_except_trusted"`. |
 | `custom_rules` | array of strings | `[]` | In-line custom ABP / AdGuard filter rules. |
 | `lists` | array of tables | `[]` | Subscription lists to download and compile (`name`, `url`, `enabled`). Schemes: `http://`, `https://`, `file://`. Global `refresh_interval_hours` controls update frequency. |
@@ -234,6 +236,7 @@ ignore_query_log = false
 trusted = false
 
 [clients.groups.kids]
+description = "Kids devices (parental policy)"
 filtering = true
 lists = ["OISD"]
 custom_rules = ["||fortnite.com^$important"]
@@ -255,7 +258,7 @@ schedule = "0 0 15-21 * * MON-FRI"
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `entries` | array of tables | `[]` | Client definitions mapping IP addresses, plus shared-secret DoT SNI / DoH path identifiers and MAC addresses, to groups. Available entry keys: `name`, `ids`, `group`, `ignore_query_log`, `ignore_stats` (skip Prometheus counters), `use_global_upstreams`, `upstreams` (when `use_global_upstreams = false`, the client resolves through these servers only and its answers bypass the shared cache), `trusted`. Display names and `ids` never authenticate a client on their own. |
-| `groups` | table (map of name → group) | `{}` | Policy groups keyed by group name, e.g. `[clients.groups.kids]`, with optional `[[clients.groups.<name>.blocked_services]]` entries. |
+| `groups` | table (map of name → group) | `{}` | Policy groups keyed by group name, e.g. `[clients.groups.kids]`, with optional `[[clients.groups.<name>.blocked_services]]` entries. Group fields: description (optional operator note), filtering, lists, custom_rules, safe_search, safe_search_youtube, parental, parental_categories, schedule_enabled, schedule, blocked_services. |
 | `client_id_secrets` | table (map of entry name → secret) | `{}` | Shared secrets accepted as the first DoT SNI label (`<secret>.dns.example.com`) or the DoH path segment (`/dns-query/<secret>`). Empty disables path/SNI identification. |
 | `trust_routeros_lease_names` | boolean | `false` | Trust RouterOS DHCP lease host names/comments for client identification. Off by default because lease data is client-controlled. |
 
@@ -297,7 +300,7 @@ trusted_proxies = ["10.0.0.1", "192.168.1.10"]   # individual proxy IPs
 session_ttl_hours = 24
 login_rate_limit = 5
 session_persist = true          # persist sessions/tokens across restarts
-token_default_ttl_days = 0      # 0 = API tokens never expire
+token_default_ttl_days = 90     # 0 = API tokens never expire
 ```
 
 | Key | Type | Default | Description |
@@ -310,7 +313,7 @@ token_default_ttl_days = 0      # 0 = API tokens never expire
 | `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required. |
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
 | `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL; corrupt stores are backed up and start empty. Use `sito reset-sessions` to invalidate everything. |
-| `auth.token_default_ttl_days` | integer | `0` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
+| `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
 
 ---
 

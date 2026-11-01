@@ -81,8 +81,11 @@ impl CacheKey {
 }
 
 fn normalize_name(name: &Name) -> String {
-    let raw_name = name.to_string();
-    normalize_domain(&raw_name).unwrap_or_else(|_| raw_name.to_ascii_lowercase())
+    // Use the ASCII/punycode form: `Display`/`to_utf8` UTS46-decodes `xn--`
+    // labels, which would key IDN queries under a Unicode variant that
+    // `invalidate_domain` (punycode-normalized) can never evict.
+    let ascii = name.to_ascii();
+    normalize_domain(&ascii).unwrap_or_else(|_| ascii.trim_end_matches('.').to_ascii_lowercase())
 }
 
 /// Extracts the RFC 7871 Client Subnet option from the query's EDNS record.
@@ -111,6 +114,15 @@ mod tests {
         assert!(!key.dnssec_ok);
         assert!(!key.checking_disabled);
         assert!(key.ecs.is_none());
+    }
+
+    #[test]
+    fn test_idn_query_is_keyed_by_punycode() {
+        // `münchen.de` on the wire is `xn--mnchen-3ya.de`; the key must use
+        // the punycode form so `invalidate_domain("münchen.de")` can evict it.
+        let name = Name::from_str("xn--mnchen-3ya.de.").unwrap();
+        let key = CacheKey::new(&name, RecordType::A, DNSClass::IN);
+        assert_eq!(key.qname, "xn--mnchen-3ya.de");
     }
 
     #[test]

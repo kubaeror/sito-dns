@@ -85,8 +85,27 @@ pub fn cache_path_for_list(data_dir: &Path, list_name: &str) -> PathBuf {
         .join(format!("{}.txt", cache_key_for_list(list_name)))
 }
 
-/// Reads list content from disk cache.
+/// Reads list content from disk cache, applying the default size cap.
 pub async fn read_from_cache(path: &Path) -> Result<String, FilterError> {
+    read_from_cache_capped(path, DEFAULT_MAX_LIST_BYTES).await
+}
+
+/// Reads list content from disk cache, rejecting files larger than
+/// `max_bytes` before reading them into memory.
+pub async fn read_from_cache_capped(path: &Path, max_bytes: usize) -> Result<String, FilterError> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| FilterError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+    if metadata.len() > max_bytes as u64 {
+        return Err(FilterError::ListTooLarge {
+            list: path.display().to_string(),
+            size: usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+            limit: max_bytes,
+        });
+    }
     tokio::fs::read_to_string(path)
         .await
         .map_err(|e| FilterError::Io {
@@ -128,6 +147,24 @@ mod tests {
 
         let read_back = read_from_cache(&cache_file).await.unwrap();
         assert_eq!(read_back, content);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_cache_read_rejects_oversized_file() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_cache_cap_test_{}", std::process::id()));
+        let cache_file = cache_path_for_list(&temp_dir, "Oversized");
+        save_to_cache(&cache_file, "0123456789").await.unwrap();
+
+        let err = read_from_cache_capped(&cache_file, 4)
+            .await
+            .expect_err("files over the cap must be rejected");
+        assert!(
+            matches!(err, FilterError::ListTooLarge { limit: 4, .. }),
+            "unexpected error: {err}"
+        );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

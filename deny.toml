@@ -11,6 +11,7 @@ targets = [
 feature-depth = 1
 
 [advisories]
+version = 2
 ignore = []
 
 [licenses]

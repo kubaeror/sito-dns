@@ -46,12 +46,31 @@ pub fn covers(record: &NsecRecord<'_>, qname: &Name) -> bool {
     }
 }
 
+/// True when the NSEC bitmap denies `qtype` (and CNAME) at its owner.
+///
+/// An NSEC at a delegation point from the parent zone (NS without SOA) denies
+/// the type only for the parent, not for the child zone that owns the name.
+fn denies_type(record: &NsecRecord<'_>, qtype: RecordType) -> bool {
+    let types = record.rdata.type_set();
+    if types.contains(qtype) || types.contains(RecordType::CNAME) {
+        return false;
+    }
+    !types.contains(RecordType::NS) || types.contains(RecordType::SOA)
+}
+
 /// Enumerates an NSEC denial proof for a negative response.
 ///
-/// Only records whose owner is inside `signer_zone` are considered. For
-/// NXDOMAIN the proof is an NSEC covering `qname`; for NODATA (including
-/// wildcard NODATA) it is an NSEC at `qname` whose bitmap denies both the
-/// queried type and CNAME.
+/// Only records whose owner is inside `signer_zone` are considered.
+///
+/// * NXDOMAIN (RFC 4035 §5.4): the qname must be covered by an NSEC and no
+///   NSEC may match it, and the wildcard `*.<closest encloser>` must also be
+///   covered so a wildcard cannot have synthesized the name. The closest
+///   encloser is the longest ancestor of `qname` that is an NSEC owner, or the
+///   signer zone apex (which always exists).
+/// * NODATA: either an NSEC at `qname` whose bitmap denies the queried type
+///   and CNAME, or a wildcard NODATA proof (`*.<ancestor>` denies the type)
+///   together with an NSEC covering `qname` to prove the exact name does not
+///   exist.
 #[must_use]
 pub fn evaluate_nsec_denial(
     records: &[NsecRecord<'_>],
@@ -63,31 +82,61 @@ pub fn evaluate_nsec_denial(
     if !signer_zone.zone_of(qname) {
         return NsecDenial::Incomplete;
     }
-    let relevant = records
+    let relevant: Vec<&NsecRecord<'_>> = records
         .iter()
-        .filter(|record| signer_zone.zone_of(record.owner));
-    let proven = if nxdomain {
-        relevant.into_iter().any(|record| covers(record, qname))
-    } else {
-        relevant.into_iter().any(|record| {
-            if *record.owner != *qname {
-                return false;
+        .filter(|record| signer_zone.zone_of(record.owner))
+        .collect();
+
+    if nxdomain {
+        // The exact name must not exist and must be covered by an NSEC.
+        if relevant.iter().any(|record| record.owner == qname) {
+            return NsecDenial::Incomplete;
+        }
+        if !relevant.iter().any(|record| covers(record, qname)) {
+            return NsecDenial::Incomplete;
+        }
+
+        // Longest existing ancestor: an NSEC owner, else the zone apex.
+        let mut closest = signer_zone.clone();
+        for record in &relevant {
+            let owner = record.owner;
+            if owner != qname && owner.num_labels() > closest.num_labels() && owner.zone_of(qname) {
+                closest = owner.clone();
             }
-            let types = record.rdata.type_set();
-            if types.contains(qtype) || types.contains(RecordType::CNAME) {
-                return false;
-            }
-            // An NSEC at a delegation point from the parent zone (NS without
-            // SOA) denies the type only for the parent, not for the child
-            // zone that actually owns the name.
-            !types.contains(RecordType::NS) || types.contains(RecordType::SOA)
-        })
-    };
-    if proven {
-        NsecDenial::Secure
-    } else {
-        NsecDenial::Incomplete
+        }
+
+        // No wildcard may have synthesized the name.
+        let Ok(wildcard) = Name::from_ascii(format!("*.{}", closest.to_ascii())) else {
+            return NsecDenial::Incomplete;
+        };
+        if !relevant.iter().any(|record| covers(record, &wildcard)) {
+            return NsecDenial::Incomplete;
+        }
+        return NsecDenial::Secure;
     }
+
+    // Exact NODATA: an NSEC at the queried name denying the type.
+    if relevant
+        .iter()
+        .any(|record| record.owner == qname && denies_type(record, qtype))
+    {
+        return NsecDenial::Secure;
+    }
+
+    // Wildcard NODATA: the wildcard covering the name denies the type, and
+    // the exact name is proven absent by an NSEC covering it.
+    let exact_name_absent = relevant.iter().any(|record| covers(record, qname));
+    if exact_name_absent
+        && relevant.iter().any(|record| {
+            record.owner.is_wildcard()
+                && denies_type(record, qtype)
+                && record.owner.base_name().zone_of(qname)
+        })
+    {
+        return NsecDenial::Secure;
+    }
+
+    NsecDenial::Incomplete
 }
 
 #[cfg(test)]
@@ -104,6 +153,44 @@ mod tests {
 
     #[test]
     fn test_nxdomain_cover_is_secure() {
+        // [a -> c] covers b; [example -> a] covers the wildcard *.example.
+        let (owner, rdata) = nsec(
+            "a.example.",
+            "c.example.",
+            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+        );
+        let (wildcard_owner, wildcard_rdata) = nsec(
+            "example.",
+            "a.example.",
+            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+        );
+        let qname = Name::from_str("b.example.").unwrap();
+        let records = [
+            NsecRecord {
+                owner: &owner,
+                rdata: &rdata,
+            },
+            NsecRecord {
+                owner: &wildcard_owner,
+                rdata: &wildcard_rdata,
+            },
+        ];
+        assert_eq!(
+            evaluate_nsec_denial(
+                &records,
+                &qname,
+                RecordType::A,
+                true,
+                &Name::from_str("example.").unwrap()
+            ),
+            NsecDenial::Secure
+        );
+    }
+
+    #[test]
+    fn test_nxdomain_without_wildcard_denial_is_incomplete() {
+        // Only the qname is covered; nothing proves that *.example does not
+        // exist, so a wildcard could have synthesized the answer.
         let (owner, rdata) = nsec(
             "a.example.",
             "c.example.",
@@ -122,22 +209,34 @@ mod tests {
                 true,
                 &Name::from_str("example.").unwrap()
             ),
-            NsecDenial::Secure
+            NsecDenial::Incomplete
         );
     }
 
     #[test]
     fn test_wrap_cover_is_secure() {
+        // [z -> example] wraps and covers zz; [example -> a] covers *.example.
         let (owner, rdata) = nsec(
             "z.example.",
             "example.",
             &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
         );
+        let (wildcard_owner, wildcard_rdata) = nsec(
+            "example.",
+            "a.example.",
+            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+        );
         let qname = Name::from_str("zz.example.").unwrap();
-        let records = [NsecRecord {
-            owner: &owner,
-            rdata: &rdata,
-        }];
+        let records = [
+            NsecRecord {
+                owner: &owner,
+                rdata: &rdata,
+            },
+            NsecRecord {
+                owner: &wildcard_owner,
+                rdata: &wildcard_rdata,
+            },
+        ];
         assert_eq!(
             evaluate_nsec_denial(
                 &records,
@@ -285,6 +384,83 @@ mod tests {
                 &Name::from_str("example.").unwrap()
             ),
             NsecDenial::Secure
+        );
+    }
+
+    #[test]
+    fn test_wildcard_nodata_is_secure() {
+        // `*.example` exists but denies A; `a.example -> c.example` proves the
+        // exact queried name (`b.example`) does not exist.
+        let zone = Name::from_str("example.").unwrap();
+        let qname = Name::from_str("b.example.").unwrap();
+        let (wildcard_owner, wildcard_rdata) = nsec(
+            "*.example.",
+            "c.example.",
+            &[RecordType::SOA, RecordType::NSEC, RecordType::RRSIG],
+        );
+        let (cover_owner, cover_rdata) = nsec(
+            "a.example.",
+            "c.example.",
+            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+        );
+        let records = [
+            NsecRecord {
+                owner: &wildcard_owner,
+                rdata: &wildcard_rdata,
+            },
+            NsecRecord {
+                owner: &cover_owner,
+                rdata: &cover_rdata,
+            },
+        ];
+        assert_eq!(
+            evaluate_nsec_denial(&records, &qname, RecordType::A, false, &zone),
+            NsecDenial::Secure
+        );
+
+        // If the wildcard bitmap includes A, no wildcard NODATA is proven.
+        let (_, with_a) = nsec(
+            "*.example.",
+            "c.example.",
+            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+        );
+        assert!(with_a.type_set().contains(RecordType::A));
+        assert!(!denies_type(
+            &NsecRecord {
+                owner: &wildcard_owner,
+                rdata: &with_a,
+            },
+            RecordType::A
+        ));
+        let records = [
+            NsecRecord {
+                owner: &wildcard_owner,
+                rdata: &with_a,
+            },
+            NsecRecord {
+                owner: &cover_owner,
+                rdata: &cover_rdata,
+            },
+        ];
+        assert_eq!(
+            evaluate_nsec_denial(&records, &qname, RecordType::A, false, &zone),
+            NsecDenial::Incomplete
+        );
+
+        // A wildcard whose NSEC range does not cover the queried name proves
+        // nothing about the exact name: the response stays Incomplete.
+        let (other_owner, other_rdata) = nsec(
+            "*.example.",
+            "aa.example.",
+            &[RecordType::SOA, RecordType::NSEC, RecordType::RRSIG],
+        );
+        let records = [NsecRecord {
+            owner: &other_owner,
+            rdata: &other_rdata,
+        }];
+        assert_eq!(
+            evaluate_nsec_denial(&records, &qname, RecordType::A, false, &zone),
+            NsecDenial::Incomplete
         );
     }
 }

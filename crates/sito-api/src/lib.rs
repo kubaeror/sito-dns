@@ -8,6 +8,7 @@
 //! - Real-time query log streaming over WebSockets
 
 pub mod auth;
+pub mod config_validation;
 pub mod config_writer;
 pub mod error;
 pub mod handlers;

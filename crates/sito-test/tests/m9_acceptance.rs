@@ -237,7 +237,8 @@ dns:
   bootstrap_dns:
     - 9.9.9.9
     - 1.1.1.1
-  blocking_mode: null_ip
+  blocking_mode: custom_ip
+  blocking_ipv4: 10.0.0.5
   cache_size: 67108864
   cache_ttl_min: 60
   cache_ttl_max: 86400
@@ -253,6 +254,12 @@ filters:
 user_rules:
   - "||tracker.example.com^"
   - "@@||safe.example.com^"
+  - '/^ad\d+\.example\.com$/'
+clients:
+  persistent:
+    - name: "kids-tablet"
+      ids: ["192.168.1.50"]
+      filtering_enabled: false
 http:
   port: 8081
 querylog:
@@ -290,8 +297,35 @@ querylog:
 
     assert_eq!(parsed_config.dns.port, 5354);
     assert_eq!(parsed_config.upstream.servers.len(), 2);
-    assert_eq!(parsed_config.filtering.custom_rules.len(), 2);
+    assert_eq!(parsed_config.filtering.custom_rules.len(), 3);
     assert_eq!(parsed_config.filtering.lists.len(), 1);
+
+    // custom_ip must carry the AdGuard blocking address, not the bare mode.
+    assert!(
+        format!("{:?}", parsed_config.filtering.blocking_mode).contains("10.0.0.5"),
+        "custom blocking IP must be preserved: {:?}",
+        parsed_config.filtering.blocking_mode
+    );
+    // Backslashes in regex rules must survive as valid TOML.
+    assert!(
+        parsed_config.filtering.custom_rules[2].contains(r"\d"),
+        "regex escaping must survive conversion: {}",
+        parsed_config.filtering.custom_rules[2]
+    );
+    // A client with filtering disabled is routed to the generated group.
+    let clients: sito_clients::ClientsConfig = parsed_config
+        .clients
+        .as_ref()
+        .expect("clients section")
+        .clone()
+        .try_into()
+        .expect("clients must parse");
+    let kids = clients
+        .entries
+        .iter()
+        .find(|e| e.name == "kids-tablet")
+        .expect("client migrated");
+    assert_eq!(kids.group, "no-filtering");
 
     let _ = fs::remove_dir_all(temp_dir);
 }

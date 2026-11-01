@@ -52,6 +52,9 @@ pub enum BlockReason {
     Parental,
     Service(String),
     AntiDohBypass,
+    /// Filtering is enabled with `fail_closed` but no rule snapshot has ever
+    /// loaded; the query must not be silently allowed.
+    FilterUnavailable,
 }
 
 /// Action to perform when rewriting a DNS query or response.

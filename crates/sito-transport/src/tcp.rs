@@ -98,18 +98,23 @@ pub async fn start_tcp_listener<H: QueryHandler>(
                         continue;
                     };
 
-                    let client_ip = peer_addr.ip();
-                    if !rate_limiter.check(client_ip) {
-                        debug!("TCP rate limit exceeded for client {}", client_ip);
-                        continue;
-                    }
-
+                    // Rate limiting is per query (see handle_tcp_connection):
+                    // the connection cap above already bounds connection setup.
                     let handler = Arc::clone(&handler);
                     let idle_timeout = config.idle_timeout;
+                    let connection_limiter = Arc::clone(&rate_limiter);
 
                     tokio::spawn(async move {
                         let _permit = permit; // Holds connection slot until task ends
-                        if let Err(e) = handle_tcp_connection(stream, peer_addr, handler, idle_timeout).await {
+                        if let Err(e) = handle_tcp_connection(
+                            stream,
+                            peer_addr,
+                            handler,
+                            idle_timeout,
+                            connection_limiter,
+                        )
+                        .await
+                        {
                             trace!("TCP connection from {} closed with info: {}", peer_addr, e);
                         }
                     });
@@ -126,6 +131,7 @@ async fn handle_tcp_connection<H: QueryHandler>(
     peer_addr: SocketAddr,
     handler: Arc<H>,
     idle_timeout: Duration,
+    rate_limiter: Arc<RateLimiter>,
 ) -> std::io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
@@ -215,6 +221,16 @@ async fn handle_tcp_connection<H: QueryHandler>(
                 debug!("TCP read body timeout for {}", peer_addr);
                 break;
             }
+        }
+
+        // Per-query budget: the accept-time check alone lets one connection
+        // issue unlimited queries.
+        if !rate_limiter.check(client_ip) {
+            debug!(
+                "TCP per-query rate limit exceeded for client {}; dropping query",
+                client_ip
+            );
+            continue;
         }
 
         let query = match decode_message(&msg_buf) {

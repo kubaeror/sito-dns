@@ -7,6 +7,11 @@ RUN cargo build --release --locked -p sito --features "embed-ui,mimalloc"
 # named volumes from the image path, so the volume is writable by uid/gid
 # 65532 without a privileged init step.
 RUN mkdir -p /sito-data && chown 65532:65532 /sito-data && touch /sito-data/.keep
+# The setup wizard persists config.toml under /etc/sito. Create that path with
+# nonroot ownership so fresh named volumes (and the image path itself) are
+# writable without a privileged init step. Bind mounts still need a one-time
+# `chown 65532:65532` on the host.
+RUN mkdir -p /sito-config && chown 65532:65532 /sito-config && touch /sito-config/.keep
 
 # Runtime stage (tag kept for readability, digest pinned for supply-chain integrity)
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
@@ -20,6 +25,7 @@ COPY --from=builder /src/target/release/sito /usr/bin/sito
 # below. Bind-mounted host directories must be handed to uid/gid 65532 once:
 #   sudo chown -R 65532:65532 /path/on/host
 COPY --from=builder --chown=65532:65532 /sito-data/ /var/lib/sito/
+COPY --from=builder --chown=65532:65532 /sito-config/ /etc/sito/
 USER nonroot
 EXPOSE 53/udp 53/tcp 853/tcp 853/udp 443/tcp 443/udp 8080/tcp 8953/tcp
 VOLUME ["/var/lib/sito"]

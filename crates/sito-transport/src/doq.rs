@@ -22,6 +22,10 @@ use crate::tls::TlsAcceptorManager;
 /// length prefix; the DNS-over-TCP ceiling is 65535 bytes).
 const MAX_DOQ_MESSAGE_BYTES: usize = 65_535;
 
+/// Upper bound on handling a single QUIC stream: a client that opens a stream
+/// and never completes the length prefix/body must not pin a task forever.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Configuration options for the DoQ listener.
 #[derive(Clone)]
 pub struct DoqConfig {
@@ -157,12 +161,8 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                         let peer_addr = conn.remote_address();
                         let client_ip = peer_addr.ip();
 
-                        if !rate_limiter.check(client_ip) {
-                            debug!("DoQ rate limit exceeded for client {}", client_ip);
-                            conn.close(1u32.into(), b"Rate limit exceeded");
-                            return;
-                        }
-
+                        // Rate limiting is per query (stream) below; the
+                        // connection cap already bounds connection setup.
                         // Extract SNI from handshake data if present
                         let sni = conn.handshake_data().and_then(|any| {
                             any.downcast_ref::<quinn::crypto::rustls::HandshakeData>()
@@ -175,8 +175,12 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                             let handler = Arc::clone(&handler);
                             let sni = sni.clone();
+                            let stream_limiter = Arc::clone(&rate_limiter);
 
                             tokio::spawn(async move {
+                              let timed = tokio::time::timeout(
+                                STREAM_TIMEOUT,
+                                async move {
                                 // RFC 9250: Each stream carries a single query preceded by a 2-octet length prefix
                                 let mut len_buf = [0u8; 2];
                                 if let Err(e) = recv.read_exact(&mut len_buf).await {
@@ -193,6 +197,17 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                 let mut query_buf = vec![0u8; query_len];
                                 if let Err(e) = recv.read_exact(&mut query_buf).await {
                                     warn!("DoQ stream failed reading query body from {}: {}", peer_addr, e);
+                                    return;
+                                }
+
+                                // Per-query budget: the connection-time check
+                                // alone lets one QUIC connection issue
+                                // unlimited streams.
+                                if !stream_limiter.check(client_ip) {
+                                    debug!(
+                                        "DoQ per-query rate limit exceeded for client {}",
+                                        client_ip
+                                    );
                                     return;
                                 }
 
@@ -234,6 +249,12 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                         }
                                     }
                                 }
+                                },
+                              )
+                              .await;
+                              if timed.is_err() {
+                                  debug!("DoQ stream from {} timed out", peer_addr);
+                              }
                             });
                         }
                     });

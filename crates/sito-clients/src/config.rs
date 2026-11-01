@@ -37,6 +37,16 @@ pub struct ClientsConfig {
     pub trust_routeros_lease_names: bool,
 }
 
+/// Optional `[integrations]` section: RouterOS DHCP lease sync and curated
+/// runtime-updatable list categories.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IntegrationsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mikrotik: Option<crate::routeros::RouterOsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lists: Option<crate::runtime_lists::ListCategoriesConfig>,
+}
+
 fn default_group() -> String {
     "default".to_string()
 }
@@ -68,6 +78,9 @@ pub struct ClientEntryConfig {
 /// A policy group configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientGroupConfig {
+    /// Free-form operator note; informational only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(default = "default_true")]
     pub filtering: bool,
     #[serde(default)]
@@ -93,6 +106,7 @@ pub struct ClientGroupConfig {
 impl Default for ClientGroupConfig {
     fn default() -> Self {
         Self {
+            description: None,
             filtering: true,
             lists: Vec::new(),
             custom_rules: Vec::new(),

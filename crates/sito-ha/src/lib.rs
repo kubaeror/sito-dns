@@ -99,11 +99,14 @@ mod tests {
         )));
 
         let slave_metrics = sito_stats::MetricsRegistry::new("0.1.0", "slave");
+        let runtime = Arc::new(sito_runtime::RuntimeState::new(
+            config_arc.clone(),
+            clients_arc.clone(),
+            rewrites_arc.clone(),
+        ));
         let handles = SlaveAppHandles {
-            config: config_arc.clone(),
+            runtime,
             filter: filter_engine.clone(),
-            rewrites: rewrites_arc.clone(),
-            clients: clients_arc.clone(),
             metrics: slave_metrics.clone(),
             config_path: None,
         };
@@ -130,6 +133,7 @@ mod tests {
         };
         coordinator.update_bundle(bundle).unwrap();
 
+        let runtime_for_assert = handles.runtime.clone();
         let (_resync_tx, resync_rx) = tokio::sync::mpsc::channel(1);
         let _worker_handle = spawn_slave_worker(
             slave_ha_cfg,
@@ -151,6 +155,15 @@ mod tests {
 
         assert!(synced, "Slave should synchronize version 2 in < 3s");
         assert_eq!(coordinator.connected_slave_count(), 1);
+
+        // Regression: the pushed configuration must be visible through the
+        // RuntimeState snapshot the query pipeline reads, not only through the
+        // raw config handle.
+        let snapshot = runtime_for_assert.snapshot();
+        assert_eq!(
+            snapshot.config.server.role, "slave",
+            "HA push must publish config through RuntimeState::replace"
+        );
 
         let slaves = coordinator.list_slaves();
         assert_eq!(slaves.len(), 1);
@@ -272,11 +285,14 @@ mod tests {
             sito_clients::ClientRegistry::new(Default::default()),
         )));
 
+        let runtime = Arc::new(sito_runtime::RuntimeState::new(
+            config_arc,
+            clients_arc,
+            rewrites_arc,
+        ));
         let handles = SlaveAppHandles {
-            config: config_arc,
+            runtime,
             filter: filter_engine,
-            rewrites: rewrites_arc,
-            clients: clients_arc,
             metrics: metrics.clone(),
             config_path: None,
         };
@@ -326,11 +342,14 @@ mod tests {
         let clients_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(
             sito_clients::ClientRegistry::new(Default::default()),
         )));
+        let runtime = Arc::new(sito_runtime::RuntimeState::new(
+            config_arc,
+            clients_arc,
+            rewrites_arc,
+        ));
         SlaveAppHandles {
-            config: config_arc,
+            runtime,
             filter: filter_engine,
-            rewrites: rewrites_arc,
-            clients: clients_arc,
             metrics: sito_stats::MetricsRegistry::new("0.1.0", "slave"),
             config_path: None,
         }
@@ -685,5 +704,55 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_master_closes_stalled_slave_handshake() {
+        use tokio::io::AsyncReadExt;
+
+        let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        let port = reserve_port();
+        let coordinator = MasterCoordinator::new(
+            "master-stall".to_string(),
+            1,
+            signing_key,
+            sito_stats::MetricsRegistry::new("0.1.0", "test"),
+        )
+        .with_token(Some("tok".to_string()));
+
+        let master_cfg = HaConfig {
+            replication_port: port,
+            listen_addr: "127.0.0.1".to_string(),
+            allow_insecure_ws: true,
+            slave_token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let _server = spawn_master_server(master_cfg, coordinator, shutdown_rx);
+
+        // Wait for the listener, then connect and send nothing: the server must
+        // close the socket after the handshake timeout instead of pinning a
+        // task forever (slowloris).
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to master");
+        let mut buf = [0u8; 1];
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(20), stream.read(&mut buf)).await;
+        assert!(
+            matches!(res, Ok(Ok(0) | Err(_))),
+            "stalled handshake must be closed by the master: {res:?}"
+        );
+
+        let _ = shutdown_tx.send(true);
     }
 }

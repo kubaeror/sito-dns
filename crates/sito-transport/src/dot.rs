@@ -103,12 +103,8 @@ pub async fn start_dot_listener<H: QueryHandler>(
                         continue;
                     };
 
-                    let client_ip = peer_addr.ip();
-                    if !rate_limiter.check(client_ip) {
-                        debug!("DoT rate limit exceeded for client {}", client_ip);
-                        continue;
-                    }
-
+                    // Rate limiting is per query inside handle_dot_connection;
+                    // the connection cap above already bounds connection setup.
                     let acceptor = config.acceptor_mgr.acceptor();
                     let handler = Arc::clone(&handler);
                     let cfg = config.clone();
@@ -283,6 +279,18 @@ async fn handle_dot_connection<H: QueryHandler>(
         }
 
         query_count += 1;
+
+        // Per-query budget: the accept-time check alone lets one connection
+        // issue unlimited queries.
+        if let Some(ref limiter) = config.rate_limiter
+            && !limiter.check(peer_addr.ip())
+        {
+            debug!(
+                "DoT per-query rate limit exceeded for client {}; dropping query",
+                peer_addr.ip()
+            );
+            continue;
+        }
 
         let query = match decode_message(&msg_buf) {
             Ok(q) => q,

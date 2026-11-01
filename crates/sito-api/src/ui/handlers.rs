@@ -694,6 +694,8 @@ pub async fn filtering_toggle_handler(
             &format!("Failed to apply filter configuration: {e}"),
         );
     }
+    // Filter rules changed: drop cached answers that may now be blocked.
+    ctx.cache.flush();
     if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return error_response(
@@ -752,6 +754,8 @@ pub async fn filtering_add_handler(
             &format!("Failed to apply filter configuration: {e}"),
         );
     }
+    // Filter rules changed: drop cached answers that may now be blocked.
+    ctx.cache.flush();
     if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return error_response(
@@ -789,6 +793,8 @@ pub async fn filtering_delete_handler(
             &format!("Failed to apply filter configuration: {e}"),
         );
     }
+    // Filter rules changed: drop cached answers that may now be blocked.
+    ctx.cache.flush();
     if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return error_response(
@@ -834,6 +840,8 @@ pub async fn filtering_custom_rules_handler(
             &format!("Failed to apply filter configuration: {e}"),
         );
     }
+    // Filter rules changed: drop cached answers that may now be blocked.
+    ctx.cache.flush();
     if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
         tracing::error!("Failed to persist configuration to disk: {e:?}");
         return error_response(
@@ -880,6 +888,9 @@ pub async fn filtering_simulate_handler(
                     sito_core::verdict::BlockReason::Parental => "parental filter".to_string(),
                     sito_core::verdict::BlockReason::Service(s) => format!("blocked service: {s}"),
                     sito_core::verdict::BlockReason::AntiDohBypass => "Anti-DoH bypass".to_string(),
+                    sito_core::verdict::BlockReason::FilterUnavailable => {
+                        "filter rules unavailable (fail-closed)".to_string()
+                    }
                 };
                 axum::response::Html(format!(
                     "<div class='badge badge-danger' style='font-size:0.9rem; padding: 6px 12px;'>BLOCKED ({})</div>",
@@ -924,6 +935,7 @@ pub async fn filtering_update_all_handler(
             &format!("Failed to refresh filter lists: {e}"),
         );
     }
+    ctx.cache.flush();
     Redirect::to("/filtering").into_response()
 }
 
@@ -1162,7 +1174,10 @@ pub async fn clients_add_handler(
         );
     }
     ctx.set_config(new_cfg);
-    let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
+    let new_reg = sito_clients::ClientRegistry::with_routeros_leases(
+        clients_cfg,
+        ctx.clients.load().routeros_leases_store(),
+    );
     ctx.set_clients(new_reg);
     crate::publish_bundle(&ctx);
 
@@ -1212,7 +1227,10 @@ pub async fn clients_delete_handler(
         );
     }
     ctx.set_config(new_cfg);
-    let new_reg = sito_clients::ClientRegistry::new(clients_cfg);
+    let new_reg = sito_clients::ClientRegistry::with_routeros_leases(
+        clients_cfg,
+        ctx.clients.load().routeros_leases_store(),
+    );
     ctx.set_clients(new_reg);
     crate::publish_bundle(&ctx);
 
@@ -1514,6 +1532,7 @@ pub async fn system_reload_handler(
             &format!("Failed to apply filter configuration: {e}"),
         );
     }
+    ctx.cache.flush();
     let bootstrap = sito_upstream::BootstrapResolver::new(
         cfg.upstream.bootstrap.clone(),
         std::time::Duration::from_millis(cfg.upstream.timeout_ms),

@@ -211,8 +211,11 @@ pub async fn update_config(
 
     let unmasked_toml = unmask_sensitive_toml(&req.config_toml, &current_toml);
 
-    // Pre-commit parse and validation
+    // Pre-commit parse and deep validation: never persist a configuration the
+    // server cannot load (the watcher would reject it after we returned 200).
     let parsed: Config = Config::from_toml_str(&unmasked_toml)
+        .map_err(|e| ProblemDetails::bad_request(format!("Configuration error: {e}")))?;
+    crate::config_validation::validate_typed_sections(&parsed)
         .map_err(|e| ProblemDetails::bad_request(format!("Configuration error: {e}")))?;
 
     let restart_required = restart_required_fields(&ctx.config.load(), &parsed);
@@ -233,6 +236,52 @@ pub async fn update_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_restart_required_fields_marks_restart_only_sections() {
+        let old = Config::default();
+        let mut new = old.clone();
+
+        // [auth] is read once at startup and must be reported as restart-only.
+        let mut auth = toml::Table::new();
+        auth.insert("session_ttl_hours".to_string(), toml::Value::Integer(1));
+        new.auth = Some(toml::Value::Table(auth));
+        let fields = restart_required_fields(&old, &new);
+        assert!(fields.iter().any(|f| f == "auth"), "got {fields:?}");
+
+        // Listener ports are rebound in-process by the watcher, not restart-only.
+        new.dns.port = old.dns.port.saturating_add(1);
+        let fields = restart_required_fields(&old, &new);
+        assert!(
+            !fields.iter().any(|f| f.starts_with("dns.")),
+            "listener changes must not claim restart-required: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn test_restore_archive_rejects_decompression_bomb() {
+        let enc = GzEncoder::new(Vec::new(), Compression::default());
+        let mut tar = Builder::new(enc);
+        let bomb = vec![b'a'; (MAX_RESTORE_CONFIG_BYTES + 1) as usize];
+        let mut header = Header::new_gnu();
+        header.set_size(bomb.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "config.toml", &bomb[..])
+            .unwrap();
+        let bytes = tar.into_inner().unwrap().finish().unwrap();
+
+        let err = extract_backup_archive(&bytes).expect_err("bomb must be rejected");
+        assert!(err.to_string().contains("exceeds"), "got: {err}");
+    }
+
+    #[test]
+    fn test_restore_archive_rejects_typed_section_errors() {
+        let bad_config = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\nentries = \"not-an-array\"\n";
+        let archive = create_backup_archive(bad_config).expect("archive builds");
+        let err = extract_backup_archive(&archive).expect_err("must reject typed errors");
+        assert!(err.to_string().contains("[clients]"), "got: {err}");
+    }
 
     #[test]
     fn test_mask_sensitive_toml_covers_tokens_arrays_and_tables() {
@@ -299,36 +348,19 @@ fn restart_required_fields(old: &Config, new: &Config) -> Vec<String> {
         "server.log_format",
         &mut fields,
     );
-    mark(old.dns.bind != new.dns.bind, "dns.bind", &mut fields);
-    mark(old.dns.port != new.dns.port, "dns.port", &mut fields);
-    mark(
-        old.dns.dot_port != new.dns.dot_port,
-        "dns.dot_port",
-        &mut fields,
-    );
-    mark(
-        old.dns.doh_port != new.dns.doh_port,
-        "dns.doh_port",
-        &mut fields,
-    );
-    mark(
-        old.dns.doq_port != new.dns.doq_port,
-        "dns.doq_port",
-        &mut fields,
-    );
-    mark(
-        old.dns.doh3_port != new.dns.doh3_port,
-        "dns.doh3_port",
-        &mut fields,
-    );
+    // dns.bind/ports and dns.rate_limit_per_ip are rebound in-process by the
+    // config watcher, so they are not restart-only.
     mark(
         old.dns.doh_dedicated_hostname != new.dns.doh_dedicated_hostname,
         "dns.doh_dedicated_hostname",
         &mut fields,
     );
+    // [auth] sessions/token policy and [integrations] workers are read once at
+    // startup; changes need a restart.
+    mark(old.auth != new.auth, "auth", &mut fields);
     mark(
-        old.dns.rate_limit_per_ip != new.dns.rate_limit_per_ip,
-        "dns.rate_limit_per_ip",
+        old.integrations != new.integrations,
+        "integrations",
         &mut fields,
     );
     mark(old.web != new.web, "web", &mut fields);
@@ -360,18 +392,76 @@ pub async fn reload_config(
 
     let parsed = Config::from_toml_str(&raw)
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid configuration on disk: {e}")))?;
+    crate::config_validation::validate_typed_sections(&parsed)
+        .map_err(|e| ProblemDetails::bad_request(format!("Invalid configuration on disk: {e}")))?;
 
     let restart_required = restart_required_fields(&ctx.config.load(), &parsed);
 
     ctx.querylog_sender
         .set_anonymize(parsed.privacy.anonymize_querylog);
-    ctx.set_config(parsed);
+    apply_hot_config(&ctx, parsed).await?;
     crate::publish_bundle(&ctx);
 
     Ok(Json(ConfigUpdateResponse {
-        message: "Configuration reloaded successfully from disk".to_string(),
+        message: "Configuration reloaded from disk and applied".to_string(),
         restart_required,
     }))
+}
+
+/// Applies the hot-reloadable components of `cfg` to the live server.
+///
+/// Mirrors the config-watcher apply order: filter, upstreams, cache, then the
+/// coherent runtime snapshot (config/clients/rewrites). Fails on the first
+/// component error instead of reporting a successful reload that applied
+/// nothing.
+async fn apply_hot_config(ctx: &ServerContext, cfg: Config) -> Result<(), ProblemDetails> {
+    let filter_started = Instant::now();
+    ctx.filter
+        .reload_with_config(&cfg.filtering)
+        .await
+        .map_err(|e| {
+            ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
+        })?;
+    ctx.metrics.set_filter_rules(ctx.filter.rule_count());
+    ctx.metrics
+        .observe_filter_compile(filter_started.elapsed().as_secs_f64());
+    // Filter rules changed: drop cached answers that may now be blocked.
+    ctx.cache.flush();
+
+    let bootstrap = sito_upstream::BootstrapResolver::new(
+        cfg.upstream.bootstrap.clone(),
+        Duration::from_millis(cfg.upstream.timeout_ms),
+    );
+    ctx.upstream
+        .reload(&cfg.upstream, &bootstrap)
+        .await
+        .map_err(|e| {
+            ProblemDetails::internal_error(format!("Failed to apply upstream configuration: {e}"))
+        })?;
+
+    let clients: sito_clients::ClientsConfig = match cfg.clients.as_ref() {
+        Some(value) => value.clone().try_into().map_err(|e| {
+            ProblemDetails::bad_request(format!("invalid [clients] configuration: {e}"))
+        })?,
+        None => sito_clients::ClientsConfig::default(),
+    };
+    let rewrites: sito_rewrites::RewritesConfig = match cfg.rewrites.as_ref() {
+        Some(value) => value.clone().try_into().map_err(|e| {
+            ProblemDetails::bad_request(format!("invalid [rewrites] configuration: {e}"))
+        })?,
+        None => sito_rewrites::RewritesConfig::default(),
+    };
+
+    ctx.cache.update_config(cfg.dns.cache.clone()).await;
+    ctx.runtime.replace(sito_runtime::RuntimeSnapshot {
+        config: std::sync::Arc::new(cfg),
+        clients: std::sync::Arc::new(sito_clients::ClientRegistry::with_routeros_leases(
+            clients,
+            ctx.clients.load().routeros_leases_store(),
+        )),
+        rewrites: std::sync::Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
+    });
+    Ok(())
 }
 
 /// Download a complete configuration backup archive (.tar.gz).
@@ -416,6 +506,14 @@ pub fn create_backup_archive(config_toml: &str) -> anyhow::Result<Vec<u8>> {
     Ok(compressed)
 }
 
+/// Maximum decompressed size accepted for `config.toml` inside a restore archive.
+const MAX_RESTORE_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+/// Maximum decompressed size accepted for `metadata.json` inside a restore archive.
+const MAX_RESTORE_METADATA_BYTES: u64 = 64 * 1024;
+/// Maximum combined decompressed size accepted for a restore archive. Caps
+/// gzip bombs even when individual entries lie about their sizes.
+const MAX_RESTORE_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Extract and validate a compressed .tar.gz archive containing config.toml and metadata.json
 pub fn extract_backup_archive(archive_bytes: &[u8]) -> anyhow::Result<(String, BackupMetadata)> {
     if archive_bytes.is_empty() {
@@ -427,22 +525,43 @@ pub fn extract_backup_archive(archive_bytes: &[u8]) -> anyhow::Result<(String, B
 
     let mut restored_config_toml = None;
     let mut restored_metadata = None;
+    let mut total_read: u64 = 0;
 
     let entries = archive.entries()?;
     for entry_res in entries {
-        let mut entry = entry_res?;
+        let entry = entry_res?;
         let path = entry.path()?.to_string_lossy().to_string();
 
-        if path == "config.toml" || path.ends_with("/config.toml") {
-            let mut s = String::new();
-            entry.read_to_string(&mut s)?;
-            restored_config_toml = Some(s);
+        let cap = if path == "config.toml" || path.ends_with("/config.toml") {
+            MAX_RESTORE_CONFIG_BYTES
         } else if path == "metadata.json" || path.ends_with("/metadata.json") {
-            let mut s = String::new();
-            entry.read_to_string(&mut s)?;
-            if let Ok(meta) = serde_json::from_str::<BackupMetadata>(&s) {
-                restored_metadata = Some(meta);
-            }
+            MAX_RESTORE_METADATA_BYTES
+        } else {
+            continue;
+        };
+
+        // Read at most cap+1 bytes so an oversized (or lying) entry is
+        // rejected without buffering it in full.
+        let mut limited = entry.take(cap + 1);
+        let mut bytes = Vec::new();
+        limited.read_to_end(&mut bytes)?;
+        let read = bytes.len() as u64;
+        if read > cap {
+            anyhow::bail!("Restore archive entry '{path}' exceeds the {cap}-byte limit");
+        }
+        total_read = total_read.saturating_add(read);
+        if total_read > MAX_RESTORE_TOTAL_BYTES {
+            anyhow::bail!(
+                "Restore archive expands beyond the {MAX_RESTORE_TOTAL_BYTES}-byte limit"
+            );
+        }
+
+        let s = String::from_utf8(bytes)
+            .map_err(|e| anyhow::anyhow!("Restore archive entry '{path}' is not UTF-8: {e}"))?;
+        if path == "config.toml" || path.ends_with("/config.toml") {
+            restored_config_toml = Some(s);
+        } else if let Ok(meta) = serde_json::from_str::<BackupMetadata>(&s) {
+            restored_metadata = Some(meta);
         }
     }
 
@@ -451,8 +570,10 @@ pub fn extract_backup_archive(archive_bytes: &[u8]) -> anyhow::Result<(String, B
     let config_toml = restored_config_toml
         .ok_or_else(|| anyhow::anyhow!("Archive does not contain a valid config.toml"))?;
 
-    // Pre-validation of restored configuration
-    Config::from_toml_str(&config_toml)
+    // Pre-validation of restored configuration (including typed sections)
+    let restored = Config::from_toml_str(&config_toml)
+        .map_err(|e| anyhow::anyhow!("Restored configuration validation failed: {e}"))?;
+    crate::config_validation::validate_typed_sections(&restored)
         .map_err(|e| anyhow::anyhow!("Restored configuration validation failed: {e}"))?;
 
     Ok((config_toml, meta))
