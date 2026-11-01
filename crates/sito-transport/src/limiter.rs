@@ -2,7 +2,7 @@
 
 use dashmap::DashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 #[derive(Debug)]
@@ -31,6 +31,7 @@ pub struct RateLimiter {
     burst: AtomicU32,
     buckets: DashMap<IpAddr, Bucket>,
     max_buckets: usize,
+    pruner_started: AtomicBool,
 }
 
 impl RateLimiter {
@@ -47,6 +48,7 @@ impl RateLimiter {
             burst: AtomicU32::new(burst.max(1)),
             buckets: DashMap::new(),
             max_buckets: max_buckets.max(1),
+            pruner_started: AtomicBool::new(false),
         }
     }
 
@@ -128,10 +130,17 @@ impl RateLimiter {
     }
 
     /// Spawn a background task to periodically prune inactive rate limit buckets every 60 seconds until shutdown.
+    ///
+    /// If a pruner is already running for this `RateLimiter`, subsequent calls
+    /// return a no-op task so sharing one limiter across multiple listeners does
+    /// not spawn duplicate sweep tasks.
     pub fn spawn_pruner(
         self: &std::sync::Arc<Self>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
+        if self.pruner_started.swap(true, Ordering::AcqRel) {
+            return tokio::spawn(async {});
+        }
         let limiter = std::sync::Arc::clone(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -148,6 +157,7 @@ impl RateLimiter {
                     }
                 }
             }
+            limiter.pruner_started.store(false, Ordering::Release);
         })
     }
 }

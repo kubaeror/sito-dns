@@ -9,7 +9,6 @@ use sito_clients::{
     ClientRegistry, EffectivePolicy, ParentalRegistry, RuntimeLists, ServiceRegistry,
     match_safe_search,
 };
-use sito_core::FilterEngine;
 use sito_core::client::ClientContext;
 use sito_core::config::Config;
 use sito_core::verdict::{RewriteAction, Verdict};
@@ -41,10 +40,10 @@ impl Drop for InFlightGuard {
 struct QueryOutcome {
     response: Option<Message>,
     verdict: &'static str,
-    /// Matched rule/list identifiers are static labels; the query-log entry
-    /// materializes them only when logging is enabled.
-    rule: Option<&'static str>,
-    source: Option<&'static str>,
+    /// Matched rule/list identifiers: static labels use `Cow::Borrowed` and
+    /// matched filter rules carry their rule text and list name via `Cow::Owned`.
+    rule: Option<std::borrow::Cow<'static, str>>,
+    source: Option<std::borrow::Cow<'static, str>>,
     upstream: Option<String>,
     from_cache: bool,
     domain_str: String,
@@ -52,11 +51,38 @@ struct QueryOutcome {
     dnssec: Option<&'static str>,
 }
 
+fn block_reason_labels(
+    reason: &sito_core::verdict::BlockReason,
+) -> (
+    Option<std::borrow::Cow<'static, str>>,
+    Option<std::borrow::Cow<'static, str>>,
+) {
+    use std::borrow::Cow;
+    match reason {
+        sito_core::verdict::BlockReason::Rule(rule_ref) => (
+            Some(Cow::Owned(rule_ref.rule_text.clone())),
+            rule_ref.list_name.clone().map(Cow::Owned),
+        ),
+        sito_core::verdict::BlockReason::Parental => (Some(Cow::Borrowed("parental")), None),
+        sito_core::verdict::BlockReason::Service(svc) => (
+            Some(Cow::Borrowed("service")),
+            Some(Cow::Owned(svc.clone())),
+        ),
+        sito_core::verdict::BlockReason::AntiDohBypass => (
+            Some(Cow::Borrowed("anti_doh_bypass")),
+            Some(Cow::Borrowed("anti_doh_bypass")),
+        ),
+        sito_core::verdict::BlockReason::FilterUnavailable => {
+            (Some(Cow::Borrowed("filter_unavailable")), None)
+        }
+    }
+}
+
 impl QueryOutcome {
     fn blocked(
         response: Message,
-        rule: Option<&'static str>,
-        source: Option<&'static str>,
+        rule: Option<std::borrow::Cow<'static, str>>,
+        source: Option<std::borrow::Cow<'static, str>>,
         domain_str: String,
         qtype: RecordType,
     ) -> Self {
@@ -390,8 +416,8 @@ impl DnsPipeline {
         query_id: u16,
         domain_str: &str,
         qtype: RecordType,
-        rule: Option<&'static str>,
-        source: Option<&'static str>,
+        rule: Option<std::borrow::Cow<'static, str>>,
+        source: Option<std::borrow::Cow<'static, str>>,
     ) -> QueryOutcome {
         let resp = make_blocked_response(
             query,
@@ -427,8 +453,8 @@ impl DnsPipeline {
             query_id,
             domain_str,
             qtype,
-            Some("anti_doh_bypass"),
-            Some("anti_doh_bypass"),
+            Some(std::borrow::Cow::Borrowed("anti_doh_bypass")),
+            Some(std::borrow::Cow::Borrowed("anti_doh_bypass")),
         ))
     }
 
@@ -461,8 +487,8 @@ impl DnsPipeline {
             query_id,
             domain_str,
             qtype,
-            Some("anti_doh_bypass"),
-            Some("anti_doh_bypass"),
+            Some(std::borrow::Cow::Borrowed("anti_doh_bypass")),
+            Some(std::borrow::Cow::Borrowed("anti_doh_bypass")),
         ))
     }
 
@@ -505,23 +531,22 @@ impl DnsPipeline {
                 query_id,
                 domain_str,
                 qtype,
-                Some("parental"),
+                Some(std::borrow::Cow::Borrowed("parental")),
                 None,
             ));
         }
 
         let services = self.lists.services();
         if !policy.active_blocked_services.is_empty()
-            && services
-                .matches_any_service(
-                    policy.active_blocked_services.iter().map(String::as_str),
-                    domain_str,
-                )
-                .is_some()
+            && let Some(service_name) = services.matches_any_service(
+                policy.active_blocked_services.iter().map(String::as_str),
+                domain_str,
+            )
         {
             info!(
                 qname = %domain_str,
                 qtype = ?qtype,
+                service = %service_name,
                 "Query blocked by service blocking policy"
             );
             return Some(Self::blocked_outcome(
@@ -530,8 +555,8 @@ impl DnsPipeline {
                 query_id,
                 domain_str,
                 qtype,
-                Some("service"),
-                None,
+                Some(std::borrow::Cow::Borrowed("service")),
+                Some(std::borrow::Cow::Owned(service_name.to_string())),
             ));
         }
 
@@ -564,8 +589,9 @@ impl DnsPipeline {
                     verdict = ?verdict,
                     "Query blocked by standard filter"
                 );
+                let (rule, source) = block_reason_labels(&verdict);
                 Some(Self::blocked_outcome(
-                    query, config, query_id, domain_str, qtype, None, None,
+                    query, config, query_id, domain_str, qtype, rule, source,
                 ))
             }
             Verdict::Rewrite(action) => {
@@ -577,27 +603,147 @@ impl DnsPipeline {
         }
     }
 
-    /// Cache lookup honouring the DNSSEC-aware client guard.
-    ///
-    /// A DNSSEC-aware client must never be served an unvalidated entry while
-    /// validation is enabled: such a lookup is treated as a miss so the query
-    /// is re-resolved upstream.
     /// True when any CNAME target in `response` is blocked by the current
-    /// filter rules. Cached entries are re-checked because rules can change
-    /// after the response was stored (cache hits skip the upstream uncloaking
-    /// pass unless this is applied).
+    /// global/group filter rules, parental controls, or service blocking.
+    /// Cached and stale entries are re-checked because rules can change after
+    /// the response was stored.
     fn cname_target_blocked(
         &self,
         response: &Message,
         qtype: RecordType,
         client: &ClientContext,
+        policy: &EffectivePolicy,
     ) -> bool {
-        response.answers.iter().any(|record| match &record.data {
-            RData::CNAME(cname) => self.filter.evaluate(&cname.0, qtype, client).is_blocked(),
-            _ => false,
-        })
+        if !response
+            .answers
+            .iter()
+            .any(|record| matches!(record.data, RData::CNAME(_)))
+        {
+            return false;
+        }
+
+        let global_snapshot = self.filter.snapshot();
+        let group_snapshot = if !policy.lists.is_empty() || !policy.custom_rules.is_empty() {
+            self.filter.group_snapshot(&policy.group_name)
+        } else {
+            None
+        };
+
+        for record in &response.answers {
+            let RData::CNAME(cname) = &record.data else {
+                continue;
+            };
+            let cname_target = &cname.0;
+            let cname_domain_str = cname_target.to_ascii().to_lowercase();
+            let normalized = normalized_query_domain(cname_target);
+
+            let mut global_candidates = FilterCandidates::default();
+            global_snapshot.allowlist.collect_candidates(
+                &normalized,
+                &global_snapshot.interner,
+                &mut global_candidates.allow,
+            );
+            global_snapshot.blocklist.collect_candidates(
+                &normalized,
+                &global_snapshot.interner,
+                &mut global_candidates.block,
+            );
+
+            let group_candidates = group_snapshot.as_ref().map(|gs| {
+                let mut candidates = FilterCandidates::default();
+                gs.allowlist
+                    .collect_candidates(&normalized, &gs.interner, &mut candidates.allow);
+                gs.blocklist
+                    .collect_candidates(&normalized, &gs.interner, &mut candidates.block);
+                candidates
+            });
+
+            // 1. $important rules on the CNAME target
+            let mut imp = global_snapshot.evaluate_important_candidates(
+                &normalized,
+                qtype,
+                client,
+                &global_candidates.allow,
+                &global_candidates.block,
+            );
+            if imp.is_none()
+                && let (Some(gs), Some(gc)) = (group_snapshot.as_ref(), group_candidates.as_ref())
+            {
+                imp = gs.evaluate_important_candidates(
+                    &normalized,
+                    qtype,
+                    client,
+                    &gc.allow,
+                    &gc.block,
+                );
+            }
+            if let Some(verdict) = imp {
+                if verdict.is_blocked() {
+                    return true;
+                }
+                if verdict.is_allowed() {
+                    continue;
+                }
+            }
+
+            // 2. Parental control categories on the CNAME target
+            if policy.parental
+                && self.lists.parental().matches_any_category(
+                    policy.parental_categories.iter().map(String::as_str),
+                    &cname_domain_str,
+                )
+            {
+                return true;
+            }
+
+            // 3. Blocked services on the CNAME target
+            if !policy.active_blocked_services.is_empty()
+                && self
+                    .lists
+                    .services()
+                    .matches_any_service(
+                        policy.active_blocked_services.iter().map(String::as_str),
+                        &cname_domain_str,
+                    )
+                    .is_some()
+            {
+                return true;
+            }
+
+            // 4. Standard filter rules (global + per-group combined)
+            let group_std =
+                group_snapshot
+                    .as_ref()
+                    .zip(group_candidates.as_ref())
+                    .map(|(gs, gc)| {
+                        gs.evaluate_standard_candidates(
+                            &normalized,
+                            qtype,
+                            client,
+                            &gc.allow,
+                            &gc.block,
+                        )
+                    });
+            let global_std = global_snapshot.evaluate_standard_candidates(
+                &normalized,
+                qtype,
+                client,
+                &global_candidates.allow,
+                &global_candidates.block,
+            );
+            if combine_standard_verdicts(global_std, group_std).is_blocked() {
+                return true;
+            }
+        }
+
+        false
     }
 
+    /// Cache lookup honouring the DNSSEC-aware client guard.
+    ///
+    /// A DNSSEC-aware client must never be served an unvalidated entry while
+    /// validation is enabled: such a lookup is treated as a miss so the query
+    /// is re-resolved upstream.
     async fn cached_response(&self, query: &Message, client_wants_dnssec: bool) -> Option<Message> {
         let response = self.cache.get_for_query(query).await?;
         if client_wants_dnssec
@@ -645,16 +791,13 @@ impl DnsPipeline {
         {
             let bg_upstream = Arc::clone(effective_upstream);
             let bg_cache = Arc::clone(&self.cache);
-            let bg_query = query.clone();
-            // Refresh with the same DNSSEC shape as the primary resolution:
-            // when validation is enabled force DO so the refreshed entry
-            // carries RRSIGs even for DO=0 clients, and run the same
-            // validation as the primary path before inserting. Otherwise a
-            // malicious upstream could plant AD=1 bogus data in the cache.
+            let mut bg_query = query.clone();
+            // Never propagate a client's CD=1 flag into the background refresh:
+            // the shared cache must always be validated when DNSSEC is enabled
+            // so a CD=1 query cannot poison cached answers for CD=0 clients.
+            bg_query.metadata.checking_disabled = false;
             let dnssec_mode = self.dnssec.load().mode;
-            let bg_validator = if dnssec_mode == sito_dnssec::DnssecMode::Disabled
-                || bg_query.metadata.checking_disabled
-            {
+            let bg_validator = if dnssec_mode == sito_dnssec::DnssecMode::Disabled {
                 None
             } else {
                 Some(self.dnssec.load_full())
@@ -703,7 +846,7 @@ impl DnsPipeline {
         QueryOutcome {
             response: Some(cached_resp),
             verdict: "allowed",
-            rule: Some("cache"),
+            rule: Some(std::borrow::Cow::Borrowed("cache")),
             source: None,
             upstream: None,
             from_cache: true,
@@ -791,21 +934,22 @@ impl QueryHandler for DnsPipeline {
             // UTS46-decode `xn--` labels and never match an IDN rule.
             let domain_str = qname.to_ascii().to_lowercase();
 
+            // Both the global `filtering.enabled` switch and the client's
+            // effective group policy must be enabled for filtering to run.
+            let is_filtering_active = config.filtering.enabled && policy.is_filtering_enabled;
+
             // Collect filter candidates once for both the `$important`
             // (stage 1) and standard (stage 3) passes. The snapshot is loaded
             // once so both passes see the same compiled rule set, and the
             // candidate walk is not repeated. Clients with filtering disabled
             // skip the work entirely.
-            let (normalized_domain, filter_snapshot, filter_candidates) = if policy
-                .is_filtering_enabled
-            {
+            let (normalized_domain, filter_snapshot, filter_candidates) = if is_filtering_active {
                 let normalized = normalized_query_domain(qname);
                 let snapshot = self.filter.snapshot();
                 // Fail closed when filtering was never able to load its
                 // rules: an initial download failure must not silently
                 // turn into an allow-all resolver.
-                if config.filtering.enabled && config.filtering.fail_closed && snapshot.unavailable
-                {
+                if config.filtering.fail_closed && snapshot.unavailable {
                     // The engine logs/statuses the load failure once; keep this
                     // per-query path at debug level to avoid log flooding.
                     debug!(
@@ -833,7 +977,7 @@ impl QueryHandler for DnsPipeline {
             // Per-group extra rules (clients.groups.<name>.lists/custom_rules)
             // are compiled separately by the engine and applied only to clients
             // whose resolved policy selects the group.
-            let (group_snapshot, group_candidates) = if policy.is_filtering_enabled
+            let (group_snapshot, group_candidates) = if is_filtering_active
                 && (!policy.lists.is_empty() || !policy.custom_rules.is_empty())
             {
                 match self.filter.group_snapshot(&policy.group_name) {
@@ -859,11 +1003,12 @@ impl QueryHandler for DnsPipeline {
 
             trace!(qname = %qname, qtype = ?qtype, "Processing DNS query");
 
-            let bypass_check_needed = match config.filtering.anti_doh_bypass.as_str() {
-                "block_all" => true,
-                "block_except_trusted" => !policy.trusted,
-                _ => false,
-            };
+            let bypass_check_needed = config.filtering.enabled
+                && match config.filtering.anti_doh_bypass.as_str() {
+                    "block_all" => true,
+                    "block_except_trusted" => !policy.trusted,
+                    _ => false,
+                };
 
             // Anti-DoH bypass: check if domain matches known public resolver
             if bypass_check_needed
@@ -898,21 +1043,22 @@ impl QueryHandler for DnsPipeline {
             }
             if let Some(verdict) = important_verdict {
                 match verdict {
-                    Verdict::Block(_) => {
+                    Verdict::Block(reason) => {
                         info!(
                             qname = %qname,
                             qtype = ?qtype,
-                            verdict = ?verdict,
+                            reason = ?reason,
                             "Query blocked by $important filter rule"
                         );
+                        let (rule, source) = block_reason_labels(&reason);
                         return Self::blocked_outcome(
                             &query,
                             config,
                             query_id,
                             &domain_str,
                             qtype,
-                            None,
-                            None,
+                            rule,
+                            source,
                         );
                     }
                     Verdict::Rewrite(action) => {
@@ -962,6 +1108,7 @@ impl QueryHandler for DnsPipeline {
 
             // ADR-0007 Stage 4: Safe Search CNAME rewrites (Google, Bing, YouTube, DuckDuckGo)
             if !important_allowed
+                && is_filtering_active
                 && policy.safe_search
                 && let Some(target) = match_safe_search(&domain_str, policy.safe_search_youtube)
                 && let Ok(cname_target) =
@@ -977,16 +1124,17 @@ impl QueryHandler for DnsPipeline {
                 return QueryOutcome::rewritten(ss_resp, domain_str, qtype);
             }
 
+            let cname_uncloaking_active =
+                is_filtering_active && config.filtering.cname_cloaking && !important_allowed;
+
             // 5. Cache lookup
             // The single-flight guard (when acquired) is held until this async
             // block finishes, i.e. across the upstream resolution and the
             // cache insert below.
             let _cache_single_flight: Option<sito_cache::SingleFlightGuard> = if cache_enabled {
                 if let Some(cached_resp) = self.cached_response(&query, client_wants_dnssec).await {
-                    if config.filtering.enabled
-                        && config.filtering.cname_cloaking
-                        && policy.is_filtering_enabled
-                        && self.cname_target_blocked(&cached_resp, qtype, &client)
+                    if cname_uncloaking_active
+                        && self.cname_target_blocked(&cached_resp, qtype, &client, &policy)
                     {
                         info!(
                             qname = %qname,
@@ -998,7 +1146,7 @@ impl QueryHandler for DnsPipeline {
                             query_id,
                             &domain_str,
                             qtype,
-                            Some("cname_uncloaking"),
+                            Some(std::borrow::Cow::Borrowed("cname_uncloaking")),
                             None,
                         );
                     }
@@ -1026,10 +1174,8 @@ impl QueryHandler for DnsPipeline {
                 let flight = self.cache.single_flight_for_query(&query).await;
                 if let Some(cached_resp) = self.cached_response(&query, client_wants_dnssec).await {
                     // A concurrent query populated the entry while we waited.
-                    if config.filtering.enabled
-                        && config.filtering.cname_cloaking
-                        && policy.is_filtering_enabled
-                        && self.cname_target_blocked(&cached_resp, qtype, &client)
+                    if cname_uncloaking_active
+                        && self.cname_target_blocked(&cached_resp, qtype, &client, &policy)
                     {
                         info!(
                             qname = %qname,
@@ -1041,7 +1187,7 @@ impl QueryHandler for DnsPipeline {
                             query_id,
                             &domain_str,
                             qtype,
-                            Some("cname_uncloaking"),
+                            Some(std::borrow::Cow::Borrowed("cname_uncloaking")),
                             None,
                         );
                     }
@@ -1107,35 +1253,24 @@ impl QueryHandler for DnsPipeline {
                         return outcome;
                     }
 
-                    // 7. CNAME uncloaking: inspect any CNAME targets against FilterEngine
-                    if config.filtering.enabled
-                        && config.filtering.cname_cloaking
-                        && policy.is_filtering_enabled
+                    // 7. CNAME uncloaking: inspect any CNAME targets against active filter stages
+                    if cname_uncloaking_active
+                        && self.cname_target_blocked(&upstream_resp, qtype, &client, &policy)
                     {
-                        for record in &upstream_resp.answers {
-                            if let RData::CNAME(cname) = &record.data {
-                                let cname_target = &cname.0;
-                                let verdict = self.filter.evaluate(cname_target, qtype, &client);
-                                if verdict.is_blocked() {
-                                    info!(
-                                        qname = %qname,
-                                        cname_target = %cname_target,
-                                        verdict = ?verdict,
-                                        via_cname = true,
-                                        "Query blocked via CNAME uncloaking"
-                                    );
-                                    return Self::blocked_outcome(
-                                        &query,
-                                        config,
-                                        query_id,
-                                        &domain_str,
-                                        qtype,
-                                        Some("cname_uncloaking"),
-                                        None,
-                                    );
-                                }
-                            }
-                        }
+                        info!(
+                            qname = %qname,
+                            via_cname = true,
+                            "Query blocked via CNAME uncloaking"
+                        );
+                        return Self::blocked_outcome(
+                            &query,
+                            config,
+                            query_id,
+                            &domain_str,
+                            qtype,
+                            Some(std::borrow::Cow::Borrowed("cname_uncloaking")),
+                            None,
+                        );
                     }
 
                     // 8. DNSSEC validation
@@ -1218,6 +1353,36 @@ impl QueryHandler for DnsPipeline {
                         && config.dns.cache.serve_stale_hours > 0
                         && let Some(mut stale_resp) = self.cache.get_stale_for_query(&query).await
                     {
+                        if bypass_check_needed
+                            && let Some(outcome) = self.anti_doh_blocked_by_answers(
+                                &query,
+                                config,
+                                &stale_resp.answers,
+                                query_id,
+                                &domain_str,
+                                qtype,
+                                "stale_cache",
+                            )
+                        {
+                            return outcome;
+                        }
+                        if cname_uncloaking_active
+                            && self.cname_target_blocked(&stale_resp, qtype, &client, &policy)
+                        {
+                            info!(
+                                qname = %qname,
+                                "Stale cached response blocked via CNAME uncloaking"
+                            );
+                            return Self::blocked_outcome(
+                                &query,
+                                config,
+                                query_id,
+                                &domain_str,
+                                qtype,
+                                Some(std::borrow::Cow::Borrowed("cname_uncloaking")),
+                                None,
+                            );
+                        }
                         debug!(
                             qname = %qname,
                             "Upstream failed, serving stale cached response (RFC 8767)"
@@ -1229,7 +1394,7 @@ impl QueryHandler for DnsPipeline {
                         return QueryOutcome {
                             response: Some(stale_resp),
                             verdict: "allowed",
-                            rule: Some("stale_cache"),
+                            rule: Some(std::borrow::Cow::Borrowed("stale_cache")),
                             source: None,
                             upstream: None,
                             from_cache: true,
@@ -1284,8 +1449,8 @@ impl QueryHandler for DnsPipeline {
                 qtype: qtype_num,
                 rcode,
                 verdict: outcome.verdict.to_string(),
-                rule: outcome.rule.map(str::to_string),
-                list_source: outcome.source.map(str::to_string),
+                rule: outcome.rule.map(std::borrow::Cow::into_owned),
+                list_source: outcome.source.map(std::borrow::Cow::into_owned),
                 upstream: outcome.upstream,
                 elapsed_us: Some(elapsed_us),
                 dnssec: outcome.dnssec.map(str::to_string),
