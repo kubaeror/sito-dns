@@ -93,6 +93,27 @@ pub fn evaluate_nsec_denial(
         .filter(|record| signer_zone.zone_of(record.owner))
         .collect();
 
+    // Longest existing ancestor of `qname`: every ancestor of an existing NSEC
+    // owner inside `signer_zone` exists (at least as an empty non-terminal),
+    // save for a wildcard label itself (`*`) which only proves its base name.
+    let mut closest = signer_zone.clone();
+    for record in &relevant {
+        let mut cand = if record.owner.is_wildcard() {
+            record.owner.base_name()
+        } else {
+            record.owner.clone()
+        };
+        while !cand.is_root() {
+            if cand != *qname && cand.zone_of(qname) {
+                if cand.num_labels() > closest.num_labels() {
+                    closest = cand;
+                }
+                break;
+            }
+            cand = cand.base_name();
+        }
+    }
+
     if nxdomain {
         // The exact name must not exist and must be covered by an NSEC.
         if relevant.iter().any(|record| record.owner == qname) {
@@ -102,16 +123,7 @@ pub fn evaluate_nsec_denial(
             return NsecDenial::Incomplete;
         }
 
-        // Longest existing ancestor: an NSEC owner, else the zone apex.
-        let mut closest = signer_zone.clone();
-        for record in &relevant {
-            let owner = record.owner;
-            if owner != qname && owner.num_labels() > closest.num_labels() && owner.zone_of(qname) {
-                closest = owner.clone();
-            }
-        }
-
-        // No wildcard may have synthesized the name.
+        // No wildcard at the closest encloser may have synthesized the name.
         let Ok(wildcard) = Name::from_ascii(format!("*.{}", closest.to_ascii())) else {
             return NsecDenial::Incomplete;
         };
@@ -129,14 +141,14 @@ pub fn evaluate_nsec_denial(
         return NsecDenial::Secure;
     }
 
-    // Wildcard NODATA: the wildcard covering the name denies the type, and
-    // the exact name is proven absent by an NSEC covering it.
+    // Wildcard NODATA: the wildcard at the closest encloser denies the type,
+    // and the exact name is proven absent by an NSEC covering it.
     let exact_name_absent = relevant.iter().any(|record| covers(record, qname));
     if exact_name_absent
         && relevant.iter().any(|record| {
             record.owner.is_wildcard()
                 && denies_type(record, qtype)
-                && record.owner.base_name().zone_of(qname)
+                && record.owner.base_name() == closest
         })
     {
         return NsecDenial::Secure;
