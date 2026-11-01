@@ -7,6 +7,12 @@ docs/
 scripts/
 .opencode/
 docker-compose*.yml
+# HA deployment material (certificates, node configs, generated keys).
+ha/
+# Local environment and any PEM/key material must never enter the build context.
+.env
+*.pem
+*.key
 *.log
 __pycache__/
 *.pyc

@@ -58,7 +58,7 @@ When a client is resolved, its effective group policy is compiled lazily at quer
 
 ## 3. ADR-0007 Query Resolution Precedence
 
-The pipeline guarantees strict deterministic resolution order ratifying [ADR-0007](file:///home/ubuntu/sito-dns/docs/adr/0007-precedence-rewrites-vs-important.md):
+The pipeline guarantees strict deterministic resolution order ratifying [ADR-0007](adr/0007-precedence-rewrites-vs-important.md):
 
 ```
                         Incoming DNS Query

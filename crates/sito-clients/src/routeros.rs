@@ -11,7 +11,7 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::mac::normalize_mac;
 use crate::registry::{ClientRegistry, RouterOsLease};
@@ -63,6 +63,9 @@ impl Default for RouterOsConfig {
 /// instead of being buffered into memory.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// Request timeout applied to every RouterOS HTTP client.
+pub const ROUTEROS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Errors occurring during RouterOS lease synchronization.
 #[derive(Debug, Error)]
 pub enum RouterOsError {
@@ -77,6 +80,15 @@ pub enum RouterOsError {
 
     #[error("JSON deserialization error: {0}")]
     JsonError(#[from] serde_json::Error),
+
+    #[error("failed to build the RouterOS HTTP client: {0}")]
+    ClientBuild(String),
+
+    #[error(
+        "RouterOS password environment variable '{variable}' is not set or empty; \
+         refusing to authenticate with an empty password"
+    )]
+    MissingPasswordEnv { variable: String },
 }
 
 /// Raw lease schema from RouterOS REST API (`/rest/ip/dhcp-server/lease`).
@@ -107,6 +119,18 @@ impl RawRouterOsLease {
         if let Some(ref d) = self.disabled
             && (d.as_bool() == Some(true) || d.as_str() == Some("true"))
         {
+            return None;
+        }
+
+        // Only active (`bound`) leases may identify clients. Waiting/offered/
+        // expired/conflict leases still occupy an address (or none at all) and
+        // must never grant a client entry's group/trusted policy. A lease with
+        // no `status` field is rejected as unverifiable.
+        let bound = self
+            .status
+            .as_deref()
+            .is_some_and(|status| status.trim().eq_ignore_ascii_case("bound"));
+        if !bound {
             return None;
         }
 
@@ -154,10 +178,17 @@ pub async fn fetch_routeros_leases(
     }
 
     if !authenticated && let Some(ref username) = config.username {
-        let password = if let Some(ref pwd_env) = config.password_env {
-            std::env::var(pwd_env).unwrap_or_default()
-        } else {
-            config.password.clone().unwrap_or_default()
+        let password = match config.password_env.as_deref() {
+            // A configured env var that cannot be resolved is a configuration
+            // error: never silently send an empty password.
+            Some(variable) => std::env::var(variable)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.trim().to_string())
+                .ok_or_else(|| RouterOsError::MissingPasswordEnv {
+                    variable: variable.to_string(),
+                })?,
+            None => config.password.clone().unwrap_or_default(),
         };
         req = req.basic_auth(username, Some(&password));
     }
@@ -205,6 +236,60 @@ async fn read_capped_body(
     Ok(body)
 }
 
+/// Builds the RouterOS HTTP client with the configured TLS and timeout
+/// settings.
+///
+/// A build failure is returned to the caller: it must never be papered over
+/// with a default client that silently drops the 10-second timeout or the
+/// `allow_invalid_certs` setting.
+pub fn build_routeros_client(config: &RouterOsConfig) -> Result<reqwest::Client, RouterOsError> {
+    build_routeros_client_with_timeout(config, ROUTEROS_REQUEST_TIMEOUT)
+}
+
+fn build_routeros_client_with_timeout(
+    config: &RouterOsConfig,
+    timeout: Duration,
+) -> Result<reqwest::Client, RouterOsError> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .danger_accept_invalid_certs(config.allow_invalid_certs)
+        .build()
+        .map_err(|e| RouterOsError::ClientBuild(e.to_string()))
+}
+
+/// Test seam: forces [`init_sync_client`] down the build-failure path.
+#[cfg(test)]
+static FORCE_CLIENT_BUILD_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Builds the client used by the lease-sync task, or reports the failure and
+/// disables the task.
+///
+/// Unlike `reqwest::Client::new()`, this never panics and never drops the
+/// configured timeout/TLS settings.
+fn init_sync_client(config: &RouterOsConfig) -> Option<reqwest::Client> {
+    #[cfg(test)]
+    if FORCE_CLIENT_BUILD_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+        return report_client_build_failure(&RouterOsError::ClientBuild(
+            "forced test failure".to_string(),
+        ));
+    }
+
+    match build_routeros_client(config) {
+        Ok(client) => Some(client),
+        Err(err) => report_client_build_failure(&err),
+    }
+}
+
+fn report_client_build_failure(err: &RouterOsError) -> Option<reqwest::Client> {
+    error!(
+        error = %err,
+        "Failed to build the RouterOS HTTP client; DHCP lease sync is disabled"
+    );
+    None
+}
+
 /// Background task synchronizing RouterOS DHCP leases periodically.
 pub fn spawn_routeros_sync(
     config: RouterOsConfig,
@@ -216,11 +301,9 @@ pub fn spawn_routeros_sync(
             return;
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .danger_accept_invalid_certs(config.allow_invalid_certs)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let Some(client) = init_sync_client(&config) else {
+            return;
+        };
 
         let interval = Duration::from_secs(config.interval_s.max(5));
         let mut ticker = tokio::time::interval(interval);
@@ -350,7 +433,7 @@ mod tests {
 
         // Verify client identification by IP using RouterOS lease
         let mut ctx = ClientContext::new(IpAddr::from_str("192.168.1.150").unwrap());
-        let _policy = registry.resolve(&mut ctx, chrono::Utc::now());
+        let _policy = registry.resolve(&mut ctx, registry.now());
 
         // The MAC learned from the lease is populated, but the client-chosen
         // DHCP hostname is not trusted for identity by default.
@@ -370,7 +453,7 @@ mod tests {
 
         // Previous leases are retained in registry
         let mut ctx2 = ClientContext::new(IpAddr::from_str("192.168.1.151").unwrap());
-        let _policy2 = registry.resolve(&mut ctx2, chrono::Utc::now());
+        let _policy2 = registry.resolve(&mut ctx2, registry.now());
         assert_eq!(ctx2.mac.as_deref(), Some("aa:bb:cc:dd:ee:02"));
         assert_eq!(ctx2.client_name, None);
     }
@@ -381,6 +464,150 @@ mod tests {
         assert!(
             !config.allow_invalid_certs,
             "TLS verification must be enabled unless explicitly opted out"
+        );
+    }
+
+    #[test]
+    fn test_routeros_only_bound_leases_identify_clients() {
+        let raw = |status: Option<&str>| RawRouterOsLease {
+            address: Some("192.168.1.10".to_string()),
+            mac_address: Some("AA:BB:CC:DD:EE:0A".to_string()),
+            host_name: Some("some-host".to_string()),
+            comment: None,
+            status: status.map(str::to_string),
+            disabled: None,
+        };
+
+        assert!(
+            raw(Some("bound")).into_lease().is_some(),
+            "a bound lease must be usable"
+        );
+        assert!(
+            raw(Some("BOUND")).into_lease().is_some(),
+            "status comparison must be case-insensitive"
+        );
+
+        for status in [
+            Some("waiting"),
+            Some("offered"),
+            Some("expired"),
+            Some("busy"),
+            Some("conflict"),
+            None,
+        ] {
+            assert!(
+                raw(status).into_lease().is_none(),
+                "lease status {status:?} must not identify a client"
+            );
+        }
+    }
+
+    #[test]
+    fn test_routeros_client_build_failure_is_not_replaced_by_a_default_client() {
+        let config = RouterOsConfig {
+            enabled: true,
+            url: "http://127.0.0.1:1".to_string(),
+            token_env: None,
+            username: None,
+            password: None,
+            password_env: None,
+            interval_s: 300,
+            allow_invalid_certs: false,
+        };
+
+        // The happy path builds a client carrying the configured settings.
+        assert!(init_sync_client(&config).is_some());
+
+        // A build failure must abort the task instead of silently falling back
+        // to `reqwest::Client::new()` (which drops the timeout/TLS settings and
+        // can panic).
+        FORCE_CLIENT_BUILD_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let client = init_sync_client(&config);
+        FORCE_CLIENT_BUILD_FAILURE.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            client.is_none(),
+            "a failed client build must not be replaced by a default client"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_routeros_client_applies_configured_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                // Accept the request but never answer it.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let config = RouterOsConfig {
+            enabled: true,
+            url: format!("http://127.0.0.1:{port}"),
+            token_env: None,
+            username: None,
+            password: None,
+            password_env: None,
+            interval_s: 300,
+            allow_invalid_certs: false,
+        };
+
+        // The production client uses ROUTEROS_REQUEST_TIMEOUT; a shortened
+        // timeout proves the setting is applied to the client that fetches.
+        let client = build_routeros_client_with_timeout(&config, Duration::from_millis(100))
+            .expect("client must build");
+        let err = fetch_routeros_leases(&client, &config)
+            .await
+            .expect_err("a stalled response must hit the configured timeout");
+        assert!(
+            matches!(err, RouterOsError::RequestFailed(ref e) if e.is_timeout()),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(ROUTEROS_REQUEST_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn test_routeros_missing_password_env_errors_instead_of_empty_password() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let accepted_clone = Arc::clone(&accepted);
+
+        tokio::spawn(async move {
+            if listener.accept().await.is_ok() {
+                accepted_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let config = RouterOsConfig {
+            enabled: true,
+            url: format!("http://127.0.0.1:{port}"),
+            token_env: None,
+            username: Some("admin".to_string()),
+            password: Some("ignored-when-password-env-is-set".to_string()),
+            password_env: Some("SITO_TEST_ROUTEROS_UNSET_PASSWORD".to_string()),
+            interval_s: 300,
+            allow_invalid_certs: false,
+        };
+
+        let err = fetch_routeros_leases(&reqwest::Client::new(), &config)
+            .await
+            .expect_err("an unresolvable password_env must be a config error");
+        assert!(
+            matches!(err, RouterOsError::MissingPasswordEnv { ref variable }
+                if variable == "SITO_TEST_ROUTEROS_UNSET_PASSWORD"),
+            "unexpected error: {err:?}"
+        );
+
+        // Never send a request with an empty password.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !accepted.load(std::sync::atomic::Ordering::SeqCst),
+            "no request may be sent when password_env cannot be resolved"
         );
     }
 

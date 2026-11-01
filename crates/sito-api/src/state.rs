@@ -90,14 +90,16 @@ impl ServerContext {
 
     /// Publishes an updated HA configuration bundle to all connected replica slaves,
     /// incrementing the configuration version monotonic counter.
-    pub fn publish_bundle(&self) {
+    pub async fn publish_bundle(&self) {
         let Some(ref coordinator) = self.master_coordinator else {
             return;
         };
 
         let config = self.config.load();
-        let raw_toml = std::fs::read_to_string(&self.config_path)
-            .unwrap_or_else(|_| toml::to_string_pretty(&**config).unwrap_or_default());
+        let raw_toml = match tokio::fs::read_to_string(&self.config_path).await {
+            Ok(raw) => raw,
+            Err(_) => toml::to_string_pretty(&**config).unwrap_or_default(),
+        };
         let sanitized_toml = sito_ha::sanitize_config_for_bundle(&raw_toml).unwrap_or_default();
         let list_metadata = config
             .filtering
@@ -130,7 +132,7 @@ impl ServerContext {
             config_toml: sanitized_toml,
             custom_rules: config.filtering.custom_rules.clone(),
             rewrites: config.rewrites.clone(),
-            clients: config.clients.clone(),
+            clients: sanitize_clients_for_bundle(config.clients.as_ref()),
             lists: list_metadata,
         };
 
@@ -148,9 +150,19 @@ impl ServerContext {
     }
 }
 
+/// Strips `client_id_secrets` from the structured `[clients]` value before it
+/// is replicated. The raw `config_toml` is sanitized by the HA crate; the
+/// structured field must be sanitized here for the same reason.
+#[must_use]
+pub fn sanitize_clients_for_bundle(clients: Option<&toml::Value>) -> Option<toml::Value> {
+    let mut table = clients?.as_table()?.clone();
+    table.remove("client_id_secrets");
+    Some(toml::Value::Table(table))
+}
+
 /// Helper function to publish an updated configuration bundle to replica slaves.
-pub fn publish_bundle(ctx: &ServerContext) {
-    ctx.publish_bundle();
+pub async fn publish_bundle(ctx: &ServerContext) {
+    ctx.publish_bundle().await;
 }
 
 // Axum FromRef implementations for modular extractors
@@ -176,5 +188,37 @@ impl axum::extract::FromRef<ServerContext> for QueryLogSender {
 impl axum::extract::FromRef<ServerContext> for MetricsRegistry {
     fn from_ref(input: &ServerContext) -> Self {
         input.metrics.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_clients_for_bundle_strips_shared_secrets() {
+        let clients: toml::Value = toml::from_str(
+            r#"
+            [client_id_secrets]
+            "phone" = "super-secret"
+            [[entries]]
+            name = "phone"
+            ids = ["10.0.0.5"]
+            "#,
+        )
+        .unwrap();
+
+        let sanitized = sanitize_clients_for_bundle(Some(&clients)).expect("table");
+        assert!(
+            sanitized.get("client_id_secrets").is_none(),
+            "structured HA clients must not carry shared secrets: {sanitized}"
+        );
+        assert!(
+            sanitized.get("entries").is_some(),
+            "non-secret client fields must survive"
+        );
+        assert!(!sanitized.to_string().contains("super-secret"));
+
+        assert!(sanitize_clients_for_bundle(None).is_none());
     }
 }

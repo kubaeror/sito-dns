@@ -289,10 +289,15 @@ key = "/etc/sito/certs/master.key"
     // 2. ha section must be stripped
     assert!(!sanitized.contains("[ha]"));
     assert!(!sanitized.contains("replication_port"));
-    // 3. secrets must be replaced with ${SECRET:key}
-    assert!(sanitized.contains("admin_password_hash = \"${SECRET:admin_password_hash}\""));
-    assert!(sanitized.contains("tokens = \"${SECRET:auth_tokens}\""));
+    // 3. Legacy auth secret keys are stripped entirely: they are not part of
+    // AuthConfig (credentials live in the node-local users.toml/tokens.toml),
+    // and an unresolvable ${SECRET:...} placeholder would make every slave
+    // reject the pushed configuration.
+    assert!(!sanitized.contains("admin_password_hash"));
+    assert!(!sanitized.contains("${SECRET:admin_password_hash}"));
+    assert!(!sanitized.contains("${SECRET:auth_tokens}"));
     assert!(!sanitized.contains("secret_argon_hash"));
+    assert!(!sanitized.contains("secret_auth_token_xyz"));
 
     let clean_bundle = ConfigBundle {
         version: 1,

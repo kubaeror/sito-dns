@@ -166,7 +166,7 @@ impl QueryLogWriter {
             tx,
             dropped_total: Arc::clone(&dropped_total),
             live_tail_tx: live_tail_tx.clone(),
-            anonymize: Arc::clone(&anonymize_arc),
+            anonymize: anonymize_arc,
         };
 
         let join_handle = tokio::spawn(async move {
@@ -178,12 +178,7 @@ impl QueryLogWriter {
                 tokio::select! {
                     cmd = rx.recv() => {
                         match cmd {
-                            Some(WriterCommand::Entry(mut entry)) => {
-                                if anonymize_arc.load(Ordering::Relaxed)
-                                    && let Ok(ip) = entry.client_ip.parse::<IpAddr>()
-                                {
-                                    entry.client_ip = crate::anonymize_ip(ip);
-                                }
+                            Some(WriterCommand::Entry(entry)) => {
                                 batch.push(*entry);
                                 if batch.len() >= BATCH_SIZE_THRESHOLD {
                                     flush_batch(&db, &mut batch, &dropped_total, "size threshold").await;

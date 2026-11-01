@@ -236,12 +236,90 @@ async fn load_or_create_account(
     Ok(account)
 }
 
+/// Writes `contents` to `path` atomically: a temp file in the same directory
+/// is written, fsynced and renamed over the target, then the directory is
+/// fsynced. A crash can therefore never leave a half-written certificate or
+/// key file behind.
+fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+    }
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    std::fs::rename(&tmp, path)?;
+    if let Ok(dir_file) = std::fs::File::open(dir) {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
+}
+
+/// SHA-256 of a file's contents, hex encoded.
+fn file_sha256(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+    Some(
+        digest
+            .as_ref()
+            .iter()
+            .fold(String::with_capacity(64), |mut acc, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(acc, "{byte:02x}");
+                acc
+            }),
+    )
+}
+
+/// Path of the cert/key pair fingerprint marker written after every rotation.
+fn pair_metadata_path(storage_dir: &Path) -> std::path::PathBuf {
+    storage_dir.join("pair.sha256")
+}
+
+/// Whether the stored pair fingerprint matches the certificate and key files.
+///
+/// A missing marker is treated as unknown (older installs, manual certs) so
+/// existing deployments are not thrown into a renewal loop; a marker that does
+/// not match means a rotation only completed partially and the material must
+/// be re-obtained before the next handshake.
+fn pair_metadata_matches(cert_path: &Path, key_path: &Path, metadata_path: &Path) -> bool {
+    let Ok(stored) = std::fs::read_to_string(metadata_path) else {
+        return true;
+    };
+    let (Some(cert_hash), Some(key_hash)) = (file_sha256(cert_path), file_sha256(key_path)) else {
+        return false;
+    };
+    let mut parts = stored.split_whitespace();
+    parts.next() == Some(cert_hash.as_str()) && parts.next() == Some(key_hash.as_str())
+}
+
 /// Check whether the current certificate on disk needs to be acquired or renewed.
 pub fn certificate_needs_renewal(config: &AcmeServiceConfig) -> bool {
     let cert_path = config.storage_dir.join("cert.pem");
     let key_path = config.storage_dir.join("key.pem");
 
     if !cert_path.exists() || !key_path.exists() {
+        return true;
+    }
+
+    if !pair_metadata_matches(
+        &cert_path,
+        &key_path,
+        &pair_metadata_path(&config.storage_dir),
+    ) {
+        warn!(
+            "ACME certificate and key do not match the last completed rotation \
+             (partial write); renewal needed"
+        );
         return true;
     }
 
@@ -464,10 +542,41 @@ pub async fn obtain_or_renew_certificate(
     let cert_path = config.storage_dir.join("cert.pem");
     let key_path = config.storage_dir.join("key.pem");
 
-    std::fs::write(&cert_path, &cert_chain_pem)
-        .map_err(|e| format!("Failed to write cert.pem to {}: {e}", cert_path.display()))?;
-    write_secret_file(&key_path, private_key_pem.as_bytes())
-        .map_err(|e| format!("Failed to write key.pem to {}: {e}", key_path.display()))?;
+    // Write the key first, then the certificate, each atomically. On any
+    // failure remove the certificate so `certificate_needs_renewal` retries
+    // instead of serving a mismatched pair.
+    if let Err(e) = write_atomic(&key_path, private_key_pem.as_bytes(), 0o600) {
+        let _ = std::fs::remove_file(&cert_path);
+        return Err(format!(
+            "Failed to write key.pem to {}: {e}",
+            key_path.display()
+        ));
+    }
+    if let Err(e) = write_atomic(&cert_path, cert_chain_pem.as_bytes(), 0o644) {
+        let _ = std::fs::remove_file(&cert_path);
+        return Err(format!(
+            "Failed to write cert.pem to {}: {e}",
+            cert_path.display()
+        ));
+    }
+    // Record the completed pair so a partially finished rotation is detected
+    // even after a crash (rustls does not verify that cert and key match).
+    let pair_marker = if let (Some(cert_hash), Some(key_hash)) =
+        (file_sha256(&cert_path), file_sha256(&key_path))
+    {
+        format!("{cert_hash} {key_hash}\n")
+    } else {
+        let _ = std::fs::remove_file(&cert_path);
+        return Err("Failed to fingerprint the rotated certificate/key pair".to_string());
+    };
+    if let Err(e) = write_atomic(
+        &pair_metadata_path(&config.storage_dir),
+        pair_marker.as_bytes(),
+        0o644,
+    ) {
+        let _ = std::fs::remove_file(&cert_path);
+        return Err(format!("Failed to record the certificate/key pair: {e}"));
+    }
 
     info!(
         "ACME certificate and private key saved to {:?}",
@@ -550,8 +659,8 @@ pub fn start_acme_manager(
 
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
                         debug!("ACME manager shutting down");
                         break;
                     }
@@ -584,6 +693,7 @@ pub fn start_acme_manager(
 mod tests {
     use super::*;
     use crate::tls::generate_test_cert;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn test_days_until_expiration() {
@@ -620,5 +730,46 @@ mod tests {
         assert!(certificate_needs_renewal(&config));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_pair_metadata_detects_partial_rotation() {
+        let dir = std::env::temp_dir().join(format!("sito_acme_pair_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let meta = pair_metadata_path(&dir);
+
+        // Missing marker: unknown (older/manual installs) must not force a
+        // renewal loop.
+        std::fs::write(&cert, b"cert").expect("write cert");
+        std::fs::write(&key, b"key").expect("write key");
+        assert!(pair_metadata_matches(&cert, &key, &meta));
+
+        // A completed rotation records the pair and matches.
+        let cert_hash = file_sha256(&cert).expect("cert hash");
+        let key_hash = file_sha256(&key).expect("key hash");
+        std::fs::write(&meta, format!("{cert_hash} {key_hash}\n")).expect("write marker");
+        assert!(pair_metadata_matches(&cert, &key, &meta));
+
+        // A new certificate with the old key is a partial rotation.
+        std::fs::write(&cert, b"new-cert").expect("write new cert");
+        assert!(
+            !pair_metadata_matches(&cert, &key, &meta),
+            "a mismatched pair must force renewal"
+        );
+
+        // Atomic writes replace the file and apply the requested mode.
+        write_atomic(&cert, b"atomic", 0o600).expect("atomic write");
+        assert_eq!(std::fs::read(&cert).expect("read"), b"atomic");
+        let mode = std::fs::metadata(&cert)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -48,12 +48,21 @@ pub enum HaMessage {
         error: Option<String>,
     },
 
-    /// Periodic health and traffic statistics report from slave to master (every 30s).
+    /// Periodic health and traffic statistics report from slave to master
+    /// (every `stats_interval_secs`).
+    ///
+    /// Every value is scoped to the reporting window: `window_s` is the actual
+    /// length of that window and the counters are deltas since the previous
+    /// report, never lifetime totals.
     #[serde(rename = "stats_report")]
     StatsReport {
+        /// Actual length of the reporting window in seconds.
         window_s: u64,
+        /// Queries observed in the window.
         queries: u64,
+        /// Queries blocked in the window.
         blocked: u64,
+        /// Per-upstream measurements observed in the window.
         #[serde(default)]
         upstreams: HashMap<String, UpstreamReport>,
     },
@@ -82,6 +91,10 @@ impl HaMessage {
 }
 
 /// Upstream health metrics included in periodic stats reports.
+///
+/// Both values are scoped to the report window: `rtt_ms` is the mean RTT of
+/// the samples observed in the window (`0.0` when the window had none) and
+/// `errors` is the number of errors observed in the window.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UpstreamReport {
     pub rtt_ms: f64,

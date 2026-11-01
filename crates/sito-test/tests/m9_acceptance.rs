@@ -107,7 +107,7 @@ fn test_m9_security_redos_adversarial_patterns() {
     let mut interner = sito_filter::structures::LabelInterner::new();
     let compiled = builder.build(&mut interner);
     assert!(
-        compiled.regex.is_some(),
+        compiled.has_regex(),
         "Regex DFA must compile without backtracking errors"
     );
 

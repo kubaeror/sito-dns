@@ -1,8 +1,8 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v1.7.0**.
+This document is the exhaustive configuration reference for **sito v1.8.0**.
 
-`sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the local secret store, then `DNSD_SECRET_<NAME>`, then a bare `<NAME>` environment variable.
+`sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the `DNSD_SECRET_<name>` environment variable, then a bare `<name>` environment variable; there is no on-disk local secret store, and a placeholder that cannot be resolved rejects the whole pushed configuration.
 
 > [!NOTE]
 > The tables below are validated against the Rust config structs in CI (`scripts/check_config_reference.py`); adding a setting without documenting it fails the build.
@@ -71,7 +71,7 @@ allow_plaintext_doh = false
 | `doh_dedicated_hostname` | string | `""` | When set, DoH/DoH3 requests whose Host/authority does not match are rejected with `421 Misdirected Request`. Empty allows any hostname. |
 | `dot_padding` | boolean | `false` | RFC 7830/8467 padding on DoT responses to mitigate traffic analysis. |
 | `edns_udp_size` | integer | `1232` | Maximum EDNS0 UDP buffer size (1232 bytes prevents IPv6 fragmentation). |
-| `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual client IP. `0` disables rate limiting. |
+| `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual client IP (`0` disables rate limiting; maximum `1000000`). |
 | `max_tcp_connections` | integer | `256` | Maximum concurrent TCP, DoT, and DoH client connections. |
 | `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
@@ -113,7 +113,7 @@ ntp = ["local.internal"]
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `mode` | string | `"validate"` | Validation mode. Accepted: `"validate"`/`"strict"` (bogus = SERVFAIL), `"log_only"`/`"log-only"`/`"permissive"`/`"log_fail"` (log and clear AD), `"off"`/`"disabled"`. |
+| `mode` | string | `"validate"` | Validation mode. Accepted: `"validate"`/`"strict"` (bogus = SERVFAIL), `"log_only"`/`"log-only"`/`"permissive"` (log and clear AD), `"off"`/`"disabled"`. |
 | `validate` | boolean | `true` | Enable DNSSEC processing. Validation walks DS/DNSKEY links present in the response and, when the chain is incomplete, resolves the missing DNSKEY/DS records through the configured upstreams (bounded per-query fetch budget). NSEC/NSEC3 denial proofs are enumerated; opt-out NXDOMAIN answers are treated as insecure. |
 | `ntp` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). Alias retained for compatibility; `nta` is the preferred key. |
 | `nta` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). |
@@ -146,7 +146,7 @@ staging = false
 | `tls.key` | string | `None` | Path to PEM-encoded unencrypted PKCS#8 or RSA/EC private key. |
 | `tls.sni_certs` | array of tables | `[]` | Additional certificate/key pairs mapped to specific SNI hostnames. |
 | `acme.enabled` | boolean | `false` | Enables automated certificate issuance via Let's Encrypt / ACME. |
-| `acme.email` | string | `""` | Contact email address for ACME registration. |
+| `acme.email` | string | `None` | Contact email address for ACME registration. |
 | `acme.domains` | array of strings | `[]` | Domain names for ACME TLS-ALPN-01 / HTTP-01 certificates. |
 | `acme.staging` | boolean | `false` | When `true`, uses Let's Encrypt Staging API to avoid rate limits during testing. |
 | `acme.cache_dir` | string | `None` | Directory used to persist ACME account keys and certificates (defaults to `<data_dir>/acme`). |
@@ -177,11 +177,12 @@ servers = ["udp://192.168.1.1:53"]
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `servers` | array of strings | `["tls://..."]` | Upstream resolvers. Schemes: `udp://` or `host:port` (UDP with TCP fallback), `tls://` (DoT), `https://host[:port]/dns-query` (DoH, RFC 8484 with GET fallback), `quic://host[:port]` (DoQ, RFC 9250, default port 853). |
-| `bootstrap` | array of IPs | `["9.9.9.9"]` | Plain IP addresses used to bootstrap resolution of encrypted upstream domain names. |
+| `servers` | array of strings | `["1.1.1.1", "1.0.0.1"]` | Upstream resolvers. Schemes: `udp://` or `host:port` (UDP with TCP fallback), `tls://` (DoT), `https://host[:port]/dns-query` (DoH, RFC 8484 with GET fallback), `quic://host[:port]` (DoQ, RFC 9250, default port 853). |
+| `bootstrap` | array of IPs | `["9.9.9.9", "149.112.112.112"]` | Plain IP addresses used to bootstrap resolution of encrypted upstream domain names. |
 | `strategy` | string | `"failover"` | Forwarding strategy: `"parallel"` (fastest answer wins), `"failover"` (sequential fallback), or `"load_balance"`. |
-| `timeout_ms` | integer | `5000` | Request timeout per upstream query in milliseconds. |
+| `timeout_ms` | integer | `5000` | Overall per-query budget in milliseconds, shared across failover/load-balance retries (each sequential attempt gets an equal share of the remaining budget; parallel races use the full budget). |
 | `probe_domain` | string | `"example.com"` | Test domain used for periodic health-checking of upstreams. |
+| `ecs` | string | `"off"` | EDNS Client Subnet policy: `"off"` strips client ECS before forwarding and deduplicates cache keys; `"forward"` forwards ECS after clamping IPv4 to /24 and IPv6 to /56 (zero source prefixes dropped). Forwarding can improve CDN locality but discloses a coarse client-location hint and splits cache entries by subnet. |
 | `pool_size` | integer | `4` | Number of persistent TCP/TLS connections maintained per upstream endpoint. |
 | `per_domain` | array of tables | `[]` | Domain-specific upstream forwarder rules (e.g., routing LAN domains to internal router). |
 
@@ -218,6 +219,7 @@ enabled = true
 | `cname_cloaking` | boolean | `true` | Follow CNAME chains upstream and apply filter rules against intermediate canonical names. |
 | `fail_closed` | boolean | `true` | Answer SERVFAIL while filtering is enabled but no rule snapshot has ever loaded (e.g. every list failed at boot), instead of silently allowing traffic. |
 | `anti_doh_bypass` | string | `"off"` | Block known public DoH/DoT resolvers to enforce network-wide filtering: `"off"`, `"block_all"`, or `"block_except_trusted"`. |
+| `max_rules` | integer | `2000000` | Hard cap on the total parsed rules (all lists plus custom rules). A reload above the cap is rejected and the previous snapshot is retained (or the engine stays fail-closed when nothing loaded yet). |
 | `custom_rules` | array of strings | `[]` | In-line custom ABP / AdGuard filter rules. |
 | `lists` | array of tables | `[]` | Subscription lists to download and compile (`name`, `url`, `enabled`). Schemes: `http://`, `https://`, `file://`. Global `refresh_interval_hours` controls update frequency. |
 
@@ -261,6 +263,7 @@ schedule = "0 0 15-21 * * MON-FRI"
 | `groups` | table (map of name → group) | `{}` | Policy groups keyed by group name, e.g. `[clients.groups.kids]`, with optional `[[clients.groups.<name>.blocked_services]]` entries. Group fields: description (optional operator note), filtering, lists, custom_rules, safe_search, safe_search_youtube, parental, parental_categories, schedule_enabled, schedule, blocked_services. |
 | `client_id_secrets` | table (map of entry name → secret) | `{}` | Shared secrets accepted as the first DoT SNI label (`<secret>.dns.example.com`) or the DoH path segment (`/dns-query/<secret>`). Empty disables path/SNI identification. |
 | `trust_routeros_lease_names` | boolean | `false` | Trust RouterOS DHCP lease host names/comments for client identification. Off by default because lease data is client-controlled. |
+| `timezone` | string | `"local"` | Timezone used to evaluate client schedules and time-of-day rules. `"local"`/`"system"` uses the host zone (DST-aware); `"UTC"` and fixed offsets (`"+02:00"`, `"-05:30"`, `"+0530"`, `"UTC+2"`) are also accepted. IANA names are not supported (no tzdb dependency); schedules in UTC-only deployments should set this explicitly. |
 
 ---
 
@@ -268,7 +271,7 @@ schedule = "0 0 15-21 * * MON-FRI"
 
 ```toml
 [rewrites]
-auto_ptr = true
+auto_ptr = true   # opt-in; the section default is false (see note below)
 ttl = 60
 
 [[rewrites.entries]]
@@ -280,7 +283,7 @@ exception_clients = ["admin-laptop"]
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `auto_ptr` | boolean | `true` | Automatically synthesize reverse PTR records (`in-addr.arpa` / `ip6.arpa`) for local A/AAAA rewrites in RFC 1918 / ULA ranges. |
+| `auto_ptr` | boolean | `false` | Automatically synthesize reverse PTR records (`in-addr.arpa` / `ip6.arpa`) for local A/AAAA rewrites in RFC 1918 / ULA ranges. Opt-in. |
 | `ttl` | integer | `60` | TTL for synthesized rewrite records. |
 | `entries` | array of tables | `[]` | Local record rewrites (`domain`, `type` (`A`/`AAAA`/`CNAME`/`PTR`/`TXT`), `answer`, and optional `exception_clients`). |
 
@@ -306,14 +309,27 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `web.enabled` | boolean | `true` | Enable the web dashboard and REST API. |
-| `web.port` | integer | `8080` | Port for the Web Dashboard and REST API (`/api/v1/`). |
+| `web.port` | integer | `8080` | Port for the Web Dashboard and REST API (`/api/v1/`; must be ≥ 1). |
 | `web.bind` | string (IP address) | `"0.0.0.0"` | Bind address for the web server. |
 | `web.metrics_auth` | boolean | `true` | Require authentication (token or session) for `/metrics`. |
 | `web.trusted_proxies`| array of IP addresses | `[]` | Individual proxy IPs trusted to supply `X-Forwarded-For`/`X-Forwarded-Proto` (CIDR is **not** supported here). |
-| `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required. |
+| `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required (must be ≥ 1). |
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
 | `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL; corrupt stores are backed up and start empty. Use `sito reset-sessions` to invalidate everything. |
 | `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
+
+Two additional `[web]` keys are read from the raw table:
+
+* `web.public_url` (string, unset) — external URL of the admin UI. Its scheme
+  decides `Secure` cookies, HSTS and the expected CSRF origin. Set it when the
+  UI is reached through a reverse proxy; it is authoritative over request
+  headers and over the DNS `[tls]` certificate settings.
+* `web.tls_terminated_by_proxy` (boolean, `false`) — TLS is terminated by a
+  trusted reverse proxy in front of the server (the immediate peer must be in
+  `web.trusted_proxies` or `X-Forwarded-Proto` is ignored).
+
+The admin scheme is never derived from the DNS DoT/DoH certificate config.
+
 
 ---
 
@@ -330,7 +346,7 @@ anonymize_querylog = false
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `stats.retention_days` | integer | `90` | Days to keep detailed per-query records before automated pruning and hourly aggregation (alias: `query_log_retention_days`). |
+| `stats.retention_days` | integer | `90` | Days to keep detailed per-query records before automated pruning and hourly aggregation (must be ≥ 1; alias: `query_log_retention_days`). |
 | `privacy.anonymize_querylog` | boolean | `false` | Mask client IPs (/24 for IPv4, /56 for IPv6) before persisting to database and before live-tail broadcast. |
 
 > Query logging is always enabled when `[stats]` is present; Prometheus metrics are always exposed on `/metrics` and protected according to `web.metrics_auth`.
@@ -383,7 +399,7 @@ interval_s = 300
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Enable automated client discovery from RouterOS DHCP server. |
-| `url` | string | `""` | Base URL of RouterOS REST API (`https://router.lan`). |
+| `url` | string | `"https://192.168.1.1"` | Base URL of RouterOS REST API (`https://router.lan`). |
 | `token_env` | string | `"MIKROTIK_API_TOKEN"` | Environment variable containing the RouterOS API token. |
 | `username` | string | `None` | Username for HTTP basic authentication when no token is used. |
 | `password` | string | `None` | Password for HTTP basic authentication (prefer `password_env` to keep secrets out of the config). |
@@ -416,5 +432,62 @@ url = "https://lists.example.com/services.json"
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `refresh_hours` | integer | `24` | Default refresh interval in hours for categories without an override (must be greater than 0). |
+| `refresh_hours` | integer | `24` | Default refresh interval in hours for categories without an override (must be ≥ 1). |
 | `categories` | table (map of category → source) | `{}` | Sources keyed by category id (`adult`, `gambling`, `services`, or any custom parental category). Each entry has a required `url` (`https://`, `http://` or `file://`), an optional `refresh_hours` override and an optional `license` string for operator reference. Refreshed domain lists replace the bundled content of that category; `services` expects service JSON. |
+
+---
+
+## 16. Hot Reload Matrix
+
+The running server watches the file passed to `--config` (the CLI default is
+the relative `config.toml`; the systemd unit and container image pass
+`/etc/sito/config.toml`) and re-applies the settings below in-process. A
+configuration that cannot be parsed or validated is rejected as a whole: the
+previous settings stay active and the error is logged. The REST API reports
+restart-only changes in the `restart_required` field of `PUT /api/v1/config`
+and `POST /api/v1/config/reload`.
+
+### 16.1 Applied live (no restart)
+
+| Setting | How it is applied |
+|---|---|
+| `server.log_level` | Log-level filter reloaded. |
+| `server.update_require_signature` | Read when an update is started, not at boot. |
+| `web.metrics_auth`, `web.trusted_proxies`, `web.public_url`, `web.tls_terminated_by_proxy` | Read from the live configuration when a request is handled. |
+| `dns.bind`, `dns.port`, `dns.dot_port`, `dns.doh_port`, `dns.doq_port`, `dns.doh3_port`, `dns.doh_dedicated_hostname`, `dns.dot_padding`, `dns.edns_udp_size`, `dns.max_tcp_connections`, `dns.allow_plaintext_doh` | DNS listeners are stopped and rebound in-process when the listener plan changes; a failed rebind restores the previous bindings. TLS listeners need the acceptors created at startup. |
+| `dns.rate_limit_per_ip` | Live rate limiters updated. |
+| `dns.cache.enabled`, `dns.cache.size_mb`, `dns.cache.min_ttl`, `dns.cache.max_ttl`, `dns.cache.negative_ttl_max`, `dns.cache.prefetch`, `dns.cache.serve_stale_hours` | Cache configuration updated. |
+| `dns.dnssec.mode`, `dns.dnssec.validate`, `dns.dnssec.ntp`, `dns.dnssec.nta`, `dns.dnssec.trust_anchors` | DNSSEC validator swapped for the new configuration. |
+| `upstream.servers`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.ecs`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt. |
+| `filtering.enabled`, `filtering.refresh_interval_hours`, `filtering.blocking_mode`, `filtering.blocking_ttl`, `filtering.cname_cloaking`, `filtering.fail_closed`, `filtering.anti_doh_bypass`, `filtering.max_rules`, `filtering.lists`, `filtering.custom_rules` | Filter engine reloaded with the new lists/rules; cached answers are flushed. List downloads continue asynchronously after the reload. |
+| `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
+| `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |
+| `privacy.anonymize_querylog` | Query-log writer updated. |
+| `stats.retention_days` | Re-read on the next retention sweep (every 24 h). |
+
+### 16.2 Requires a restart
+
+| Setting | Why |
+|---|---|
+| `server.role`, `server.instance_name`, `server.data_dir`, `server.log_format` | Read once at process start. |
+| `upstream.bootstrap` | The file watcher reuses the bootstrap resolver created at startup; `POST /api/v1/config/reload` rebuilds it immediately, but a config-file edit alone needs a restart. |
+| `web.enabled`, `web.bind`, `web.port` | The admin HTTP listener is bound at startup. |
+| `auth.session_ttl_hours`, `auth.login_rate_limit`, `auth.session_persist`, `auth.token_default_ttl_days` | Auth manager is created at startup. |
+| `tls.cert`, `tls.key`, `tls.sni_certs`, `acme.*` | TLS/ACME setup is initialized at startup. (Certificate file *contents* are re-read by the certificate watcher; changing the configured paths needs a restart.) |
+| `ha.*` | HA replication tasks are created at startup. |
+| `integrations.mikrotik.*`, `integrations.lists.*` | Integration sync/refresh tasks are spawned at startup. |
+
+> [!NOTE]
+> `restart_required` is computed from the same change matrix as the table
+> above: `[server]` except `log_level`, `[auth]`, the web listener fields
+> (`enabled`/`bind`/`port`), `[tls]`, `[acme]`, `[ha]` and `[integrations]`.
+> Everything else applies live. Editing a config file also logs a warning for
+> restart-only changes (the watcher applies the rest).
+>
+> Same-transport port collisions are rejected at validation: `dns.dot_port`
+> with `dns.doh_port` (both TCP) and `dns.doq_port` with `dns.doh3_port` (both
+> UDP) must differ, as must any of them with `dns.port`. `dot_port` and
+> `doq_port` may share a number (different protocols).
+>
+> `config_version` is evaluated whenever the file is loaded; only version `1`
+> is accepted.

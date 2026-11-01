@@ -50,6 +50,34 @@ impl ConfigBundle {
         serde_json::from_str(s)
             .map_err(|e| HaError::Serialization(format!("Failed to parse bundle JSON: {e}")))
     }
+
+    /// Strips secret material from the structured fields in place.
+    ///
+    /// The `config_toml` string is sanitized by [`sanitize_config_for_bundle`],
+    /// but the structured `clients` value travels alongside it and must be
+    /// sanitized identically: per-client shared secrets (`client_id_secrets`)
+    /// are node-local (DoH path / DoT SNI credentials) and must never be
+    /// replicated.
+    pub fn strip_structured_secrets(&mut self) {
+        if let Some(ref mut clients) = self.clients {
+            strip_client_id_secrets(clients);
+        }
+    }
+
+    /// Returns a copy with all structured secret material stripped.
+    #[must_use]
+    pub fn sanitized(&self) -> Self {
+        let mut bundle = self.clone();
+        bundle.strip_structured_secrets();
+        bundle
+    }
+}
+
+/// Removes the `client_id_secrets` table from a structured `[clients]` value.
+fn strip_client_id_secrets(clients: &mut toml::Value) {
+    if let toml::Value::Table(table) = clients {
+        table.remove("client_id_secrets");
+    }
 }
 
 /// Builds a sanitized TOML string from a master configuration TOML string.
@@ -57,7 +85,9 @@ impl ConfigBundle {
 /// Strips out:
 /// - The entire `[ha]` section
 /// - `server.instance_name` (so slaves preserve their own local instance names)
-/// - Masks known secrets into `${SECRET:name}` placeholders
+/// - Secret material: legacy `[auth]` verifiers, RouterOS credentials and
+///   per-client shared secrets (path-valued fields such as `tls.key` are kept;
+///   they are node-local paths, not secret material)
 /// - Sets `server.role = "slave"` in the replicable configuration.
 pub fn sanitize_config_for_bundle(master_toml: &str) -> Result<String, HaError> {
     let mut table: toml::Table = toml::from_str(master_toml).map_err(|e| HaError::Validation {
@@ -74,49 +104,21 @@ pub fn sanitize_config_for_bundle(master_toml: &str) -> Result<String, HaError> 
         server_table.insert("role".to_string(), toml::Value::String("slave".to_string()));
     }
 
-    // 3. Mask TLS keys if present
-    if let Some(toml::Value::Table(tls_table)) = table.get_mut("tls")
-        && tls_table.contains_key("key")
-    {
-        tls_table.insert(
-            "key".to_string(),
-            toml::Value::String("${SECRET:tls_key}".to_string()),
-        );
-    }
-
-    // 4. Mask web secrets if present
-    if let Some(toml::Value::Table(web_table)) = table.get_mut("web") {
-        if web_table.contains_key("key") {
-            web_table.insert(
-                "key".to_string(),
-                toml::Value::String("${SECRET:web_key}".to_string()),
-            );
-        }
-        if web_table.contains_key("cert") {
-            web_table.insert(
-                "cert".to_string(),
-                toml::Value::String("${SECRET:web_cert}".to_string()),
-            );
-        }
-    }
-
-    // 5. Mask auth secrets if present
+    // 3. Mask genuine secret material only. Path-valued fields (`tls.key`,
+    // `web.key`, `web.cert`) are NOT masked: replacing a path with
+    // `${SECRET:...}` makes the slave fail substitution and permanently
+    // rejects every push (slaves keep their own node-local TLS files).
+    //
+    // `[auth]` in the current schema only carries session/token policy
+    // (optionally `users.toml`); legacy `admin_password_hash`/`tokens` values
+    // are secret material and are stripped outright rather than replaced by a
+    // placeholder the slave cannot resolve.
     if let Some(toml::Value::Table(auth_table)) = table.get_mut("auth") {
-        if auth_table.contains_key("admin_password_hash") {
-            auth_table.insert(
-                "admin_password_hash".to_string(),
-                toml::Value::String("${SECRET:admin_password_hash}".to_string()),
-            );
-        }
-        if auth_table.contains_key("tokens") {
-            auth_table.insert(
-                "tokens".to_string(),
-                toml::Value::String("${SECRET:auth_tokens}".to_string()),
-            );
-        }
+        auth_table.remove("admin_password_hash");
+        auth_table.remove("tokens");
     }
 
-    // 6. Strip integration secrets: these are provisioned per node (or
+    // 4. Strip integration secrets: these are provisioned per node (or
     // supplied via `${SECRET:...}` for the fields that support it) and must
     // never travel inside the replicated configuration.
     if let Some(toml::Value::Table(integrations_table)) = table.get_mut("integrations")
@@ -126,7 +128,7 @@ pub fn sanitize_config_for_bundle(master_toml: &str) -> Result<String, HaError> 
         mikrotik.remove("password");
     }
 
-    // 7. Strip per-client shared secrets (DoH path / DoT SNI identity). A
+    // 5. Strip per-client shared secrets (DoH path / DoT SNI identity). A
     // table cannot be replaced by a `${SECRET:...}` string placeholder without
     // breaking TOML, so slaves keep their local copy (see
     // `merge_local_replication_config`) and master-added secrets must be
@@ -227,10 +229,15 @@ pub fn substitute_secrets<S: ::std::hash::BuildHasher>(
 }
 
 /// Packages a `ConfigBundle` into a signed `HaMessage::ConfigPush`.
+///
+/// The bundle is sanitized before serialization (structured
+/// `clients.client_id_secrets` stripped) so secret material can never reach
+/// the wire, even when a caller built the bundle from a raw configuration.
 pub fn build_and_sign_push(
     bundle: &ConfigBundle,
     signing_key: &Ed25519SigningKey,
 ) -> Result<HaMessage, HaError> {
+    let bundle = bundle.sanitized();
     let bundle_json = bundle.to_json()?;
     let payload_bytes = bundle_json.as_bytes();
 
@@ -368,9 +375,13 @@ replication_port = 8953
 
 [tls]
 cert = "/etc/sito/cert.pem"
-key = "super_secret_private_key_content"
+key = "/etc/sito/tls.key"
+
+[web]
+bind = "0.0.0.0"
 
 [auth]
+session_ttl_hours = 12
 admin_password_hash = "$argon2id$v=19$m=65536,t=3,p=4$secret_hash"
 
 [clients]
@@ -387,17 +398,23 @@ password = "mikrotik_secret_password"
         assert!(!sanitized.contains("[ha]"));
         assert!(!sanitized.contains("master-prod"));
         assert!(sanitized.contains("role = \"slave\""));
+        assert!(sanitized.contains("session_ttl_hours = 12"));
 
-        // Check masking and stripping
+        // Check secret stripping
         assert!(!sanitized.contains("super_secret_private_key_content"));
         assert!(!sanitized.contains("secret_hash"));
+        assert!(!sanitized.contains("admin_password_hash"));
         assert!(!sanitized.contains("mikrotik_secret_token_12345"));
         assert!(!sanitized.contains("mikrotik_secret_password"));
         assert!(!sanitized.contains("client_shared_secret_9876"));
         assert!(!sanitized.contains("client_id_secrets"));
 
-        assert!(sanitized.contains("${SECRET:tls_key}"));
-        assert!(sanitized.contains("${SECRET:admin_password_hash}"));
+        // Path-valued fields must survive verbatim: they are node-local file
+        // paths, not secrets, and a `${SECRET:tls_key}` placeholder would make
+        // the slave reject every push.
+        assert!(sanitized.contains("key = \"/etc/sito/tls.key\""));
+        assert!(!sanitized.contains("${SECRET:tls_key}"));
+        assert!(!sanitized.contains("${SECRET:"));
 
         // Security scanner test
         let secrets = [
@@ -412,6 +429,56 @@ password = "mikrotik_secret_password"
         // Test scanner detects leaks
         let leaky = format!("{sanitized}\nleak = \"secret_hash\"");
         assert!(scan_for_secrets(&leaky, &secrets).is_err());
+    }
+
+    #[test]
+    fn test_serialized_bundle_strips_structured_client_secrets() {
+        let signing_key = Ed25519SigningKey::generate().unwrap();
+
+        let mut secrets = toml::Table::new();
+        secrets.insert(
+            "kids-tablet".to_string(),
+            toml::Value::String("client_shared_secret_9876".to_string()),
+        );
+        let mut clients = toml::Table::new();
+        clients.insert("client_id_secrets".to_string(), toml::Value::Table(secrets));
+        clients.insert(
+            "entries".to_string(),
+            toml::Value::Array(vec![toml::Value::String("kids-tablet".to_string())]),
+        );
+
+        let bundle = ConfigBundle {
+            version: 7,
+            timestamp: 123,
+            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+            custom_rules: vec![],
+            rewrites: None,
+            clients: Some(toml::Value::Table(clients)),
+            lists: vec![],
+        };
+
+        let push = build_and_sign_push(&bundle, &signing_key).unwrap();
+        let payload_b64 = match &push {
+            HaMessage::ConfigPush { payload_b64, .. } => payload_b64.clone(),
+            other => panic!("expected ConfigPush, got {other:?}"),
+        };
+        let payload = String::from_utf8(BASE64_STANDARD.decode(payload_b64).unwrap()).unwrap();
+        assert!(
+            !payload.contains("client_shared_secret_9876"),
+            "serialized push payload must not contain the client secret: {payload}"
+        );
+        assert!(!payload.contains("client_id_secrets"));
+        assert!(
+            payload.contains("kids-tablet"),
+            "non-secret client entries must be replicated"
+        );
+
+        // The unpacked bundle seen by the slave is sanitized as well.
+        let unpacked = verify_and_unpack_push(&push, 6, &signing_key.public_key()).unwrap();
+        let clients = unpacked
+            .clients
+            .expect("structured clients must be replicated");
+        assert!(clients.get("client_id_secrets").is_none());
     }
 
     #[test]
@@ -502,5 +569,32 @@ password = "mikrotik_secret_password"
         let template = "key = \"${SECRET:nested}\"";
         let res = substitute_secrets(template, &secrets, false).unwrap();
         assert_eq!(res, "key = \"val_${SECRET:nested}_safe\"");
+    }
+
+    #[test]
+    fn test_substitute_secrets_from_environment_and_missing_failure() {
+        // There is no on-disk local secret store: placeholders resolve from
+        // `DNSD_SECRET_<name>` (and then a bare `<name>`) environment
+        // variables. Use a unique name so parallel tests cannot observe it.
+        let suffix = format!("ha_test_{}", rand::random::<u64>());
+        let var = format!("DNSD_SECRET_{suffix}");
+        // SAFETY: the variable name is unique to this test; no other test or
+        // thread reads it.
+        unsafe { std::env::set_var(&var, "env-secret-value") };
+
+        let template = format!("token = \"${{SECRET:{suffix}}}\"");
+        let resolved = substitute_secrets(&template, &HashMap::new(), false).unwrap();
+        assert_eq!(resolved, "token = \"env-secret-value\"");
+        // SAFETY: see above.
+        unsafe { std::env::remove_var(&var) };
+
+        // A missing secret fails closed instead of silently substituting empty.
+        let err = substitute_secrets(
+            "token = \"${SECRET:definitely_missing_ha_secret}\"",
+            &HashMap::new(),
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, HaError::Validation { .. }));
     }
 }

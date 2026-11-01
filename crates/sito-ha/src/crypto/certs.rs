@@ -97,11 +97,6 @@ pub fn compute_blake3_fingerprint(cert_der: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(cert_der).to_hex())
 }
 
-/// Computes the raw hex BLAKE3 fingerprint of a DER-encoded certificate.
-pub fn compute_blake3_raw_hex(cert_der: &[u8]) -> String {
-    blake3::hash(cert_der).to_hex().to_string()
-}
-
 /// Appends user-provided SANs (IP addresses or DNS names) to certificate params.
 fn append_extra_sans(
     params: &mut CertificateParams,
@@ -320,13 +315,35 @@ pub fn generate_ha_certs_with_sans(
 }
 
 fn write_private_key_file(path: &Path, content: &str) -> Result<(), HaError> {
-    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // The mode is applied at creation time so the private key is never
+        // observable with wider permissions (no write-then-chmod window).
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content)?;
+    }
+
+    // Repair a pre-existing file created outside this code path.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
+        if perms.mode() & 0o777 != 0o600 {
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms)?;
+        }
     }
     Ok(())
 }
@@ -369,6 +386,19 @@ mod tests {
         let summary = certs.summary();
         assert!(summary.contains("sito HA mTLS Certificates"));
         assert!(summary.contains("master_fingerprint"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for key_path in [
+                certs.ca_key_path.as_path(),
+                certs.master_key_path.as_ref().unwrap().as_path(),
+                certs.slave_key_path.as_ref().unwrap().as_path(),
+            ] {
+                let mode = std::fs::metadata(key_path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{} must be 0600", key_path.display());
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

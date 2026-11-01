@@ -3,6 +3,7 @@
 use clap::{Parser, Subcommand};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
+use rand::RngExt;
 use sito_core::config::Config;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -417,6 +418,39 @@ async fn probe_dns(addr: SocketAddr, timeout_ms: u64) -> Result<(), anyhow::Erro
     Ok(())
 }
 
+/// Creates or replaces a file with owner-only (0600) permissions and fsyncs it.
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), anyhow::Error> {
+    use std::io::Write;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    // `mode` only applies on creation: repair the permissions of a
+    // pre-existing world-readable file we are overwriting.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(contents)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// fsyncs the parent directory so a rename is durable.
+fn fsync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+}
+
 /// Executes the `backup` subcommand.
 pub fn run_backup(config_path: &Path, output: Option<&Path>) -> Result<PathBuf, anyhow::Error> {
     let content = std::fs::read_to_string(config_path).map_err(|e| {
@@ -447,9 +481,13 @@ pub fn run_backup(config_path: &Path, output: Option<&Path>) -> Result<PathBuf, 
         ))
     };
 
-    std::fs::write(&out_path, archive_bytes)?;
+    // Backups contain configuration secrets (HA tokens, client secrets): the
+    // file must never be group/world readable.
+    write_private_file(&out_path, &archive_bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to write backup '{}': {e}", out_path.display()))?;
+    fsync_parent_dir(&out_path);
     println!(
-        "Backup successfully created at '{}' from '{}'",
+        "Backup successfully created at '{}' from '{}' (mode 0600)",
         out_path.display(),
         config_path.display()
     );
@@ -480,18 +518,123 @@ pub fn run_restore(
     let (config_toml, metadata) =
         sito_api::handlers::config::extract_backup_archive(&archive_bytes)?;
 
-    // Atomic write to destination
+    // Write a 0600 temporary sibling, fsync it, then atomically rename it into
+    // place and fsync the directory.
     let tmp_path = target_config_path.with_extension("tmp");
-    std::fs::write(&tmp_path, &config_toml)?;
+    write_private_file(&tmp_path, config_toml.as_bytes()).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to write temporary restore file '{}': {e}",
+            tmp_path.display()
+        )
+    })?;
     std::fs::rename(&tmp_path, target_config_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ =
+            std::fs::set_permissions(target_config_path, std::fs::Permissions::from_mode(0o600));
+    }
+    fsync_parent_dir(target_config_path);
 
     println!(
-        "Successfully restored configuration (sito version: {}, backup timestamp: {}) to '{}'",
+        "Successfully restored configuration (sito version: {}, backup timestamp: {}) to '{}' (mode 0600)",
         metadata.sito_version,
         metadata.timestamp,
         target_config_path.display()
     );
     Ok(())
+}
+
+/// Resolves the healthcheck DNS and web targets from a configuration.
+///
+/// A wildcard listener bind cannot be probed directly, so the target falls back
+/// to loopback: `127.0.0.1` is preferred because it is the first loopback
+/// address available on every dual-stack host, while `::1` is only used when
+/// the configuration binds IPv6 addresses exclusively.
+#[must_use]
+pub fn healthcheck_targets_from_config(config: &Config) -> (SocketAddr, SocketAddr) {
+    let bind_ip = config
+        .dns
+        .bind
+        .iter()
+        .find(|ip| !ip.is_unspecified())
+        .copied()
+        .unwrap_or_else(|| {
+            if config.dns.bind.iter().any(std::net::IpAddr::is_ipv4) {
+                "127.0.0.1".parse().expect("valid loopback")
+            } else {
+                "::1".parse().expect("valid ipv6 loopback")
+            }
+        });
+    let web_cfg = config.get_web_config();
+    let web_ip = if web_cfg.bind.is_unspecified() {
+        "127.0.0.1".parse().expect("valid loopback")
+    } else {
+        web_cfg.bind
+    };
+    (
+        SocketAddr::new(bind_ip, config.dns.port),
+        SocketAddr::new(web_ip, web_cfg.port),
+    )
+}
+
+/// Outcome of preparing the `--no-setup` first boot with no configuration file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoSetupBootstrap {
+    /// A configuration file exists; nothing to prepare.
+    NotNeeded,
+    /// A random admin password was generated and must be shown exactly once.
+    GeneratedPassword(String),
+    /// Node-local credentials already exist and were deliberately kept; the
+    /// admin UI is loopback-bound but no password was generated.
+    KeptExistingUsers,
+}
+
+/// Prepares the insecure `--no-setup` first boot with no configuration file.
+///
+/// Without a config the built-in defaults would bootstrap `admin/adminadmin`
+/// on `0.0.0.0`. Instead the admin UI is bound to loopback. When no users
+/// exist, a random admin password is generated and written to `users.toml`
+/// (0600) for the caller to print once. When `users.toml` already exists the
+/// stored credentials are kept untouched (use `sito reset-admin` to rotate
+/// them deliberately).
+pub fn prepare_no_setup_bootstrap(
+    config_path: &Path,
+    config: &mut Config,
+) -> Result<NoSetupBootstrap, anyhow::Error> {
+    if config_path.exists() {
+        return Ok(NoSetupBootstrap::NotNeeded);
+    }
+
+    // Bind the admin UI to loopback: the random password protects against
+    // credential guessing, loopback binding against network exposure.
+    let mut web = config.get_web_config();
+    if web.bind.is_unspecified() {
+        web.bind = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    }
+    config.set_web_config(web);
+
+    // Never silently rotate credentials that already exist on this node.
+    if config.server.data_dir.join("users.toml").exists() {
+        return Ok(NoSetupBootstrap::KeptExistingUsers);
+    }
+
+    let mut bytes = [0u8; 24];
+    rand::rng().fill(&mut bytes);
+    let mut password = String::with_capacity(48);
+    for byte in &bytes {
+        let _ = std::fmt::Write::write_fmt(&mut password, format_args!("{byte:02x}"));
+    }
+    sito_api::AuthManager::reset_admin_credentials(&config.server.data_dir, &password).map_err(
+        |e| {
+            anyhow::anyhow!(
+                "Refusing to start with built-in defaults: failed to write the random admin \
+                 credentials to '{}': {e}",
+                config.server.data_dir.display()
+            )
+        },
+    )?;
+    Ok(NoSetupBootstrap::GeneratedPassword(password))
 }
 
 /// Executes the `ha gen-certs` subcommand.
@@ -648,6 +791,12 @@ pub fn run_reset_sessions(config_path: &Path) -> Result<(), anyhow::Error> {
         }
     }
 
+    // Rotate the user-secret generation so a session/token copied out of the
+    // deleted store can never be replayed, even if the files are restored.
+    let generation = sito_api::auth::manager::rotate_auth_generation(data_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to rotate the auth generation: {e}"))?;
+    println!("Auth generation rotated to {generation}.");
+
     if removed == 0 {
         println!(
             "No persisted sessions or tokens found in '{}'.",
@@ -726,6 +875,101 @@ mod tests {
             Some(Commands::Healthcheck { setup_fallback, .. }) => assert!(setup_fallback),
             other => panic!("expected healthcheck command, got {other:?}"),
         }
+    }
+
+    /// Regression: the healthcheck used to prefer `::1` whenever any bind was
+    /// IPv6, which fails on hosts where the v6 loopback is disabled.
+    #[test]
+    fn test_healthcheck_targets_prefer_ipv4_loopback() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.dns.bind.len(),
+            2,
+            "default binds both wildcard families"
+        );
+        let (dns, web) = healthcheck_targets_from_config(&cfg);
+        assert_eq!(dns.ip().to_string(), "127.0.0.1");
+        assert_eq!(dns.port(), cfg.dns.port);
+        assert_eq!(web.ip().to_string(), "127.0.0.1");
+
+        // IPv6-only configuration still resolves to the v6 loopback.
+        let mut v6_only = Config::default();
+        v6_only.dns.bind = vec!["::".parse().unwrap()];
+        let (dns, _) = healthcheck_targets_from_config(&v6_only);
+        assert!(dns.ip().is_ipv6());
+
+        // A concrete non-wildcard bind is probed directly.
+        let mut concrete = Config::default();
+        concrete.dns.bind = vec!["10.0.0.5".parse().unwrap()];
+        let (dns, _) = healthcheck_targets_from_config(&concrete);
+        assert_eq!(dns.ip().to_string(), "10.0.0.5");
+    }
+
+    /// Regression for WP-4.5: `--no-setup` without a config used to start the
+    /// admin UI on 0.0.0.0 with `admin/adminadmin`.
+    #[tokio::test]
+    async fn test_no_setup_without_config_generates_random_password_on_loopback() {
+        let dir = std::env::temp_dir().join(format!("sito_no_setup_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let mut config = Config::default();
+        config.server.data_dir = dir.clone();
+
+        let password = match prepare_no_setup_bootstrap(&config_path, &mut config)
+            .expect("bootstrap preparation")
+        {
+            NoSetupBootstrap::GeneratedPassword(password) => password,
+            other => panic!("expected a generated password, got {other:?}"),
+        };
+        assert_eq!(password.len(), 48, "random password must be 192-bit hex");
+        assert!(
+            config.get_web_config().bind.is_loopback(),
+            "admin UI must bind loopback when no config exists"
+        );
+
+        let users_file = dir.join("users.toml");
+        assert!(users_file.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&users_file).unwrap().permissions();
+            assert_eq!(perms.mode() & 0o777, 0o600);
+        }
+
+        let mgr =
+            sito_api::AuthManager::with_storage_checked(&dir, 24, 5, false).expect("load users");
+        assert!(matches!(
+            mgr.login("admin", "adminadmin", "127.0.0.1").await,
+            sito_api::auth::LoginResult::InvalidCredentials { .. }
+        ));
+        assert!(matches!(
+            mgr.login("admin", &password, "127.0.0.1").await,
+            sito_api::auth::LoginResult::Success(_)
+        ));
+
+        // Existing config: the credential must not be rotated again.
+        std::fs::write(&config_path, "config_version = 1\n").unwrap();
+        assert_eq!(
+            prepare_no_setup_bootstrap(&config_path, &mut config).unwrap(),
+            NoSetupBootstrap::NotNeeded
+        );
+
+        // No config but existing users: keep them untouched.
+        std::fs::remove_file(&config_path).unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.clone();
+        assert_eq!(
+            prepare_no_setup_bootstrap(&config_path, &mut config).unwrap(),
+            NoSetupBootstrap::KeptExistingUsers
+        );
+        let mgr =
+            sito_api::AuthManager::with_storage_checked(&dir, 24, 5, false).expect("load users");
+        assert!(matches!(
+            mgr.login("admin", &password, "127.0.0.1").await,
+            sito_api::auth::LoginResult::Success(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Single-shot UDP responder that echoes a pre-built DNS message.
@@ -887,5 +1131,86 @@ mod tests {
             err.to_string().contains("timed out"),
             "unexpected error: {err}"
         );
+    }
+
+    /// WP-4.3: backups contain secrets (HA tokens, client secrets) and must be
+    /// created 0600; restore must also repair the permissions of the config.
+    #[test]
+    fn test_backup_and_restore_files_are_private() {
+        let dir = std::env::temp_dir().join(format!("sito_backup_perm_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+        )
+        .unwrap();
+
+        let archive = dir.join("backup.tar.gz");
+        run_backup(&config_path, Some(&archive)).expect("backup");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&archive).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "backup archive must be owner-only");
+        }
+
+        // Restore to a fresh path (and then over a world-readable file).
+        let restored = dir.join("restored.toml");
+        run_restore(&archive, &restored, false).expect("restore");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&restored).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "restored config must be owner-only");
+        }
+        let content = std::fs::read_to_string(&restored).unwrap();
+        assert!(content.contains("1.1.1.1"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&restored, std::fs::Permissions::from_mode(0o644)).unwrap();
+            run_restore(&archive, &restored, true).expect("forced restore");
+            let mode = std::fs::metadata(&restored).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "restore must repair loose permissions");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WP-4.4: `reset-sessions` rotates the auth generation so a copied
+    /// session/token cannot be replayed.
+    #[test]
+    fn test_reset_sessions_rotates_auth_generation() {
+        let dir =
+            std::env::temp_dir().join(format!("sito_reset_sessions_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "config_version = 1\n[server]\ndata_dir = \"{}\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+
+        // Seed a session and a token store plus a users file.
+        std::fs::write(dir.join("sessions.toml"), "sessions = []\n").unwrap();
+        std::fs::write(dir.join("tokens.toml"), "tokens = []\n").unwrap();
+
+        run_reset_sessions(&config_path).expect("reset sessions");
+        assert!(!dir.join("sessions.toml").exists());
+        assert!(!dir.join("tokens.toml").exists());
+        let generation = std::fs::read_to_string(dir.join("auth_generation")).unwrap();
+        assert_eq!(generation.trim(), "1");
+
+        // A second run bumps it again (monotonic).
+        run_reset_sessions(&config_path).expect("reset sessions twice");
+        let generation = std::fs::read_to_string(dir.join("auth_generation")).unwrap();
+        assert_eq!(generation.trim(), "2");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -6,9 +6,78 @@
     "license": {
       "name": "GPL-3.0-only"
     },
-    "version": "1.7.0"
+    "version": "1.8.0"
   },
   "paths": {
+    "/api/v1/auth/change-password": {
+      "post": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "Change a password. Self-service requires the current password; an Admin may\noverride another account (audited) with `username` set.",
+        "operationId": "change_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Password changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Password policy violation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/wrong current password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/auth/login": {
       "post": {
         "tags": [
@@ -90,13 +159,13 @@
         "operationId": "list_tokens",
         "responses": {
           "200": {
-            "description": "List of API tokens",
+            "description": "List of API tokens (hashes are never returned)",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/ApiTokenMeta"
+                    "$ref": "#/components/schemas/ApiTokenDto"
                   }
                 }
               }
@@ -497,6 +566,303 @@
         }
       }
     },
+    "/api/v1/auth/users": {
+      "get": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "List local user accounts.",
+        "operationId": "list_users",
+        "responses": {
+          "200": {
+            "description": "User accounts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UserDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "Create a local user account.",
+        "operationId": "create_user",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUserRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "User created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid username, password or role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Username already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/auth/users/{username}": {
+      "put": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "Update a user's role.",
+        "operationId": "update_user",
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "description": "Username",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateUserRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "User role updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid role or last-admin protection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "User not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "Delete a local user account.",
+        "operationId": "delete_user",
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "description": "Username",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "User deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Last-admin protection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "User not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/cache/flush": {
       "post": {
         "tags": [
@@ -885,11 +1251,23 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "reveal",
+            "in": "query",
+            "description": "`1`/`true` reveals the stored shared secret. Admin-only and audited.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Client details retrieved",
+            "description": "Client details retrieved (shared secret replaced by a marker unless ?reveal=1)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1405,7 +1783,7 @@
         "operationId": "get_filter_lists",
         "responses": {
           "200": {
-            "description": "Subscription lists retrieved",
+            "description": "Subscription lists retrieved with real rule counts",
             "content": {
               "application/json": {
                 "schema": {
@@ -1669,6 +2047,26 @@
           },
           "403": {
             "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "A resync is already queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "HA replication is not active or the resync could not be queued",
             "content": {
               "application/json": {
                 "schema": {
@@ -2620,13 +3018,12 @@
           }
         }
       },
-      "ApiTokenMeta": {
+      "ApiTokenDto": {
         "type": "object",
-        "description": "Stored metadata for an API token (the plaintext token is never stored).",
+        "description": "API token metadata safe for API/UI responses (never includes the hash).",
         "required": [
           "id",
           "name",
-          "hash",
           "scope",
           "created_at"
         ],
@@ -2640,11 +3037,7 @@
               "integer",
               "null"
             ],
-            "format": "int64",
-            "description": "Unix timestamp after which the token is rejected (`None` = no expiry)."
-          },
-          "hash": {
-            "type": "string"
+            "format": "int64"
           },
           "id": {
             "type": "string"
@@ -2660,7 +3053,7 @@
             "type": "string"
           },
           "scope": {
-            "$ref": "#/components/schemas/Role"
+            "type": "string"
           }
         }
       },
@@ -2714,6 +3107,30 @@
           }
         }
       },
+      "ChangePasswordRequest": {
+        "type": "object",
+        "description": "Request to change a password. The caller must either prove knowledge of the\ncurrent password (self-service) or be an Admin overriding another account\n(`username` set, audited).",
+        "required": [
+          "new_password"
+        ],
+        "properties": {
+          "current_password": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "new_password": {
+            "type": "string"
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "ClientDto": {
         "type": "object",
         "description": "Client configuration record.",
@@ -2725,7 +3142,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Shared DoH-path/DoT-SNI secret. On `GET` responses this is only ever\npopulated when the caller explicitly requested a reveal; otherwise it\nis `None` and `has_secret`/`secret_hint` describe the stored value."
           },
           "dot_sni": {
             "type": [
@@ -2735,6 +3153,10 @@
           },
           "group": {
             "type": "string"
+          },
+          "has_secret": {
+            "type": "boolean",
+            "description": "Response only: a shared secret is stored for this client."
           },
           "ignore_query_log": {
             "type": "boolean"
@@ -2756,6 +3178,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "secret_hint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Response only: masked hint (`last4`) for the stored shared secret."
           },
           "subnet": {
             "type": "array",
@@ -2894,7 +3323,7 @@
       },
       "CreateTokenRequest": {
         "type": "object",
-        "description": "Request to create an API token.",
+        "description": "Request to create or update an API token.",
         "required": [
           "name",
           "scope"
@@ -2930,6 +3359,26 @@
           "token": {
             "type": "string",
             "description": "The plaintext token. Only displayed once upon creation."
+          }
+        }
+      },
+      "CreateUserRequest": {
+        "type": "object",
+        "description": "Request to create a local user account.",
+        "required": [
+          "username",
+          "password",
+          "role"
+        ],
+        "properties": {
+          "password": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
           }
         }
       },
@@ -3168,8 +3617,23 @@
           "version"
         ],
         "properties": {
+          "active_bundle": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Master only: whether an active bundle exists to re-push. `false` means\nthe request was accepted but there is nothing to replicate yet."
+          },
           "role": {
             "type": "string"
+          },
+          "slaves_notified": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Master only: connected slaves for which a push was queued.",
+            "minimum": 0
           },
           "status": {
             "type": "string"
@@ -3227,6 +3691,10 @@
           "connected_at": {
             "type": "string"
           },
+          "diverged": {
+            "type": "boolean",
+            "description": "True when this slave reported a version above the master's current one.\n`lag` is pinned to 0 in that case and must not be read as \"in sync\"."
+          },
           "instance": {
             "type": "string"
           },
@@ -3277,6 +3745,17 @@
               "null"
             ]
           },
+          "diverged": {
+            "type": "boolean",
+            "description": "True when the master detected a version-continuity violation: a slave\nacknowledged a version above the master's current version, meaning\nevery push below the slave's version is silently ignored."
+          },
+          "diverged_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable reason for `diverged`, when set."
+          },
           "instance_name": {
             "type": "string"
           },
@@ -3285,6 +3764,13 @@
               "string",
               "null"
             ]
+          },
+          "master_pubkey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Master only: the Ed25519 public key (hex) that signs replicated\nbundles. Slaves must list it as `master_pubkey`."
           },
           "master_url": {
             "type": [
@@ -3339,7 +3825,7 @@
       },
       "LoginResponse": {
         "type": "object",
-        "description": "Login response.",
+        "description": "Login response.\n\nThe session itself is delivered as an HttpOnly `Set-Cookie` header; it is\ndeliberately never echoed in the JSON body. The TOTP `partial_token` is\nreturned only to clients that opt in with `X-Sito-Token-Delivery: body`\n(CLI/API consumers); browser clients receive it as an HttpOnly cookie.",
         "properties": {
           "partial_token": {
             "type": [
@@ -3348,12 +3834,6 @@
             ]
           },
           "role": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "session_id": {
             "type": [
               "string",
               "null"
@@ -4029,6 +4509,18 @@
           }
         }
       },
+      "UpdateUserRequest": {
+        "type": "object",
+        "description": "Request to change a user's role.",
+        "required": [
+          "role"
+        ],
+        "properties": {
+          "role": {
+            "type": "string"
+          }
+        }
+      },
       "UpstreamConfigDto": {
         "type": "object",
         "description": "Upstream DNS configuration.",
@@ -4159,6 +4651,26 @@
             "items": {
               "$ref": "#/components/schemas/UpstreamTestItem"
             }
+          }
+        }
+      },
+      "UserDto": {
+        "type": "object",
+        "description": "User account record (never includes password hashes or TOTP secrets).",
+        "required": [
+          "username",
+          "role",
+          "totp_enabled"
+        ],
+        "properties": {
+          "role": {
+            "type": "string"
+          },
+          "totp_enabled": {
+            "type": "boolean"
+          },
+          "username": {
+            "type": "string"
           }
         }
       }

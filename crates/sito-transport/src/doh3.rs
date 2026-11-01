@@ -25,6 +25,11 @@ const MAX_DOH3_BODY_BYTES: usize = 65_535;
 /// client that opens a stream and stalls must not pin a task forever.
 const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum accepted size of an HTTP/3 field section (request headers). The
+/// default in h3 0.0.8 is `VarInt::MAX`, which lets a peer force unbounded
+/// buffering before the limit is checked.
+const MAX_DOH3_FIELD_SECTION_BYTES: u64 = 16 * 1024;
+
 /// Configuration options for the DoH3 listener.
 #[derive(Clone)]
 pub struct Doh3Config {
@@ -91,6 +96,13 @@ pub fn build_quinn_h3_server_config(
     transport_cfg.max_idle_timeout(Some(timeout));
     transport_cfg.max_concurrent_bidi_streams(100u32.into());
     transport_cfg.max_concurrent_uni_streams(100u32.into());
+    // The h3 0.0.8 frame decoder buffers a complete HEADERS payload before the
+    // field-section limit applies, so the QUIC flow-control windows are the
+    // effective memory bound for a request. Keep them small: 128 KiB per
+    // stream and 2 MiB per connection (previously the connection window was
+    // effectively unbounded).
+    transport_cfg.stream_receive_window(quinn::VarInt::from_u32(128 * 1024));
+    transport_cfg.receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
 
     quinn_cfg.transport_config(Arc::new(transport_cfg));
 
@@ -102,6 +114,53 @@ fn decode_base64url(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s)
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
+}
+
+/// Decodes one form-urlencoded component (`+` is a space, `%XX` escapes are
+/// percent-decoded).
+fn form_url_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let high = (bytes[i + 1] as char).to_digit(16);
+                let low = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(high), Some(low)) = (high, low) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    out.push((high * 16 + low) as u8);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Extracts the `dns` query parameter with the same form-urlencoded semantics
+/// as the DoH (axum) path: percent-encoded values are decoded and the last
+/// occurrence wins when the parameter is repeated.
+fn decode_dns_query_param(query: &str) -> Option<String> {
+    let mut value = None;
+    for pair in query.split('&') {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        if form_url_decode(raw_key) == "dns" {
+            value = Some(form_url_decode(raw_value));
+        }
+    }
+    value
 }
 
 /// Start the DNS over HTTP/3 (DoH3) listener.
@@ -131,7 +190,7 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
     let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
         Arc::new(RateLimiter::new(
             config.rate_limit_per_ip,
-            config.rate_limit_per_ip * 2,
+            RateLimiter::burst_for_rate(config.rate_limit_per_ip),
         ))
     });
     rate_limiter.spawn_pruner(shutdown_rx.clone());
@@ -145,8 +204,8 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = accept_shutdown_rx.changed() => {
-                    if *accept_shutdown_rx.borrow() {
+                res = accept_shutdown_rx.changed() => {
+                    if res.is_err() || *accept_shutdown_rx.borrow() {
                         debug!("DoH3 listener stopping due to shutdown");
                         endpoint_accept.close(0u32.into(), b"Server shutdown");
                         break;
@@ -192,7 +251,9 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
 
                         trace!("DoH3 QUIC connection established from {}", peer_addr);
 
-                        let mut h3_conn = match h3::server::builder()
+                        let mut h3_server = h3::server::builder();
+                        h3_server.max_field_section_size(MAX_DOH3_FIELD_SECTION_BYTES);
+                        let mut h3_conn = match h3_server
                             .build(h3_quinn::Connection::new(conn))
                             .await
                         {
@@ -367,16 +428,7 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                     }
                                     http::Method::GET => {
                                         let query_str = req.uri().query().unwrap_or("");
-                                        let mut dns_param = None;
-                                        for pair in query_str.split('&') {
-                                            if let Some((k, v)) = pair.split_once('=')
-                                                && k == "dns" {
-                                                    dns_param = Some(v);
-                                                    break;
-                                                }
-                                        }
-
-                                        let Some(param) = dns_param else {
+                                        let Some(param) = decode_dns_query_param(query_str) else {
                                             let resp = http::Response::builder()
                                                 .status(http::StatusCode::BAD_REQUEST)
                                                 .body(())
@@ -386,7 +438,7 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                             return;
                                         };
 
-                                        match decode_base64url(param) {
+                                        match decode_base64url(&param) {
                                             Ok(b) if b.len() <= MAX_DOH3_BODY_BYTES => b,
                                             Ok(_) => {
                                                 let resp = http::Response::builder()
@@ -485,8 +537,8 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
             let mut last_config = mgr.current_config();
             loop {
                 tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
                             break;
                         }
                     }
@@ -657,10 +709,64 @@ mod tests {
         let get_dns_resp = decode_message(&get_body).unwrap();
         assert_eq!(get_dns_resp.metadata.id, 8001);
 
+        // 3. GET with percent-encoded base64 padding (`%3D`): the DoH (axum)
+        // path percent-decodes the query parameter, so DoH3 must too.
+        let padded = base64::engine::general_purpose::URL_SAFE.encode(&wire_query);
+        assert!(
+            padded.contains('='),
+            "test fixture must produce base64 padding to exercise %3D decoding"
+        );
+        let percent_encoded = padded.replace('=', "%3D");
+        let req_percent = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(format!("https://localhost/dns-query?dns={percent_encoded}"))
+            .header(http::header::ACCEPT, "application/dns-message")
+            .body(())
+            .unwrap();
+
+        let mut percent_stream = send_request.send_request(req_percent).await.unwrap();
+        percent_stream.finish().await.unwrap();
+
+        let percent_resp = percent_stream.recv_response().await.unwrap();
+        assert_eq!(percent_resp.status(), http::StatusCode::OK);
+
+        let mut percent_body = Vec::new();
+        while let Some(mut chunk) = percent_stream.recv_data().await.unwrap() {
+            percent_body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
+        }
+        let percent_dns_resp = decode_message(&percent_body).unwrap();
+        assert_eq!(percent_dns_resp.metadata.id, 8001);
+
         drop(send_request);
         driver_task.abort();
         let _ = shutdown_tx.send(true);
         let _ = listener_handle.await;
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Regression: the GET `dns` parameter used to be split on `&`/`=` without
+    /// percent-decoding, so a `%3D`-encoded (padded) base64 value was rejected
+    /// even though the DoH path accepts it.
+    #[test]
+    fn test_doh3_get_dns_param_decoding_matches_doh() {
+        assert_eq!(decode_dns_query_param("dns=abc"), Some("abc".to_string()));
+        // Percent-encoded '=' (base64 padding) must survive decoding.
+        assert_eq!(
+            decode_dns_query_param("dns=ab%3D%3D"),
+            Some("ab==".to_string())
+        );
+        // Percent-encoded key.
+        assert_eq!(decode_dns_query_param("%64ns=abc"), Some("abc".to_string()));
+        // `+` is a space in form-urlencoded data.
+        assert_eq!(decode_dns_query_param("dns=a+b"), Some("a b".to_string()));
+        // The last occurrence wins, matching the DoH HashMap extractor.
+        assert_eq!(
+            decode_dns_query_param("dns=first&dns=second"),
+            Some("second".to_string())
+        );
+        // A value containing '=' is not truncated.
+        assert_eq!(decode_dns_query_param("dns=a=b"), Some("a=b".to_string()));
+        assert_eq!(decode_dns_query_param("other=abc"), None);
+        assert_eq!(decode_dns_query_param(""), None);
     }
 }

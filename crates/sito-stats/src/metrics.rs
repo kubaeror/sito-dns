@@ -25,6 +25,7 @@ const LATENCY_BUCKETS: &[f64] = &[
 struct HistogramState {
     counts: Vec<u64>,
     sum: f64,
+    sum_ns: u128,
     count: u64,
 }
 
@@ -39,6 +40,7 @@ impl HistogramState {
         Self {
             counts: vec![0; LATENCY_BUCKETS.len()],
             sum: 0.0,
+            sum_ns: 0,
             count: 0,
         }
     }
@@ -46,6 +48,11 @@ impl HistogramState {
     fn observe(&mut self, val: f64) {
         self.count += 1;
         self.sum += val;
+        if val.is_finite() && val > 0.0 {
+            self.sum_ns = self
+                .sum_ns
+                .saturating_add((val * 1_000_000_000.0).round() as u128);
+        }
         for (i, &bucket) in LATENCY_BUCKETS.iter().enumerate() {
             if val <= bucket {
                 self.counts[i] += 1;
@@ -74,6 +81,108 @@ struct InternerState {
 const MAX_INTERNER_LABELS: usize = 4_096;
 /// Label value used once [`MAX_INTERNER_LABELS`] is reached.
 const INTERNER_OVERFLOW_LABEL: &str = "__other__";
+
+/// Query types that keep an exact numeric `qtype` label on
+/// `sito_queries_total`. The DNS wire type is a free 16-bit field, so exposing
+/// it verbatim would let any client create up to 65 536 permanent series per
+/// protocol and verdict. Everything outside this list is collapsed into
+/// [`QTYPE_OTHER_LABEL`], bounding the series count to
+/// `protocols × (KNOWN_QTYPES.len() + 1) × verdicts`.
+///
+/// The list covers the types a resolver sees in practice (IANA common and
+/// DNSSEC-enabled types).
+pub const KNOWN_QTYPES: &[u16] = &[
+    1,     // A
+    2,     // NS
+    5,     // CNAME
+    6,     // SOA
+    12,    // PTR
+    13,    // HINFO
+    15,    // MX
+    16,    // TXT
+    17,    // RP
+    24,    // SIG
+    25,    // KEY
+    28,    // AAAA
+    29,    // LOC
+    33,    // SRV
+    35,    // NAPTR
+    36,    // KX
+    37,    // CERT
+    39,    // DNAME
+    41,    // OPT
+    43,    // DS
+    44,    // SSHFP
+    45,    // IPSECKEY
+    46,    // RRSIG
+    47,    // NSEC
+    48,    // DNSKEY
+    49,    // DHCID
+    50,    // NSEC3
+    51,    // NSEC3PARAM
+    52,    // TLSA
+    53,    // SMIMEA
+    55,    // HIP
+    59,    // CDS
+    60,    // CDNSKEY
+    61,    // OPENPGPKEY
+    62,    // CSYNC
+    63,    // ZONEMD
+    64,    // SVCB
+    65,    // HTTPS
+    99,    // SPF
+    108,   // EUI48
+    109,   // EUI64
+    249,   // TKEY
+    250,   // TSIG
+    251,   // IXFR
+    252,   // AXFR
+    255,   // ANY
+    256,   // URI
+    257,   // CAA
+    259,   // DOA
+    260,   // AMTRELAY
+    32768, // TA
+    32769, // DLV
+];
+/// Label value used for query types outside [`KNOWN_QTYPES`].
+const QTYPE_OTHER_LABEL: &str = "__other__";
+/// Sentinel stored in the counter key for every [`QTYPE_OTHER_LABEL`] query
+/// type. Type 65535 is reserved (RFC 6895), so it never has to be preserved.
+const QTYPE_OTHER: u16 = u16::MAX;
+
+const QTYPE_BITMAP_WORDS: usize = 65_536 / 64;
+
+/// Builds a 65 536-bit membership bitmap from [`KNOWN_QTYPES`] at compile time.
+const fn qtype_bitmap() -> [u64; QTYPE_BITMAP_WORDS] {
+    let mut words = [0u64; QTYPE_BITMAP_WORDS];
+    let mut i = 0;
+    while i < KNOWN_QTYPES.len() {
+        let qtype = KNOWN_QTYPES[i] as usize;
+        words[qtype / 64] |= 1u64 << (qtype % 64);
+        i += 1;
+    }
+    words
+}
+
+static KNOWN_QTYPE_BITMAP: [u64; QTYPE_BITMAP_WORDS] = qtype_bitmap();
+
+/// Returns true when `qtype` has a dedicated `sito_queries_total` series.
+#[inline]
+fn is_known_qtype(qtype: u16) -> bool {
+    let qtype = qtype as usize;
+    KNOWN_QTYPE_BITMAP[qtype / 64] & (1u64 << (qtype % 64)) != 0
+}
+
+/// Maps a raw wire query type to the bounded label stored in the counter key.
+#[inline]
+fn bounded_qtype(qtype: u16) -> u16 {
+    if is_known_qtype(qtype) {
+        qtype
+    } else {
+        QTYPE_OTHER
+    }
+}
 
 /// Interns metric label values into dense integer ids.
 ///
@@ -242,7 +351,10 @@ impl MetricsRegistry {
     pub fn inc_queries(&self, proto: &str, qtype: u16, verdict: &str) {
         let proto_id = self.labels.intern(proto);
         let verdict_id = self.labels.intern(verdict);
-        increment_counter(&self.queries_total, (proto_id, qtype, verdict_id));
+        increment_counter(
+            &self.queries_total,
+            (proto_id, bounded_qtype(qtype), verdict_id),
+        );
         increment_counter(&self.transport_queries_total, proto_id);
     }
 
@@ -350,6 +462,12 @@ impl MetricsRegistry {
         self.querylog_dropped.store(dropped, Ordering::Relaxed);
     }
 
+    /// Increments the query-log drop counter by one.
+    ///
+    /// Production publishes the writer's cumulative drop count through
+    /// [`Self::set_querylog_dropped`] (the writer cannot depend on the metrics
+    /// registry directly); this per-event helper exists for tests and is kept
+    /// for the `sito-test` acceptance suite.
     pub fn inc_querylog_dropped(&self) {
         self.querylog_dropped.fetch_add(1, Ordering::Relaxed);
     }
@@ -388,6 +506,11 @@ impl MetricsRegistry {
     }
 
     /// Returns a map of upstream identifiers to (rtt_ms, total_errors).
+    ///
+    /// Both values are **lifetime** measurements: the mean of every RTT sample
+    /// observed since process start and the total error count. Callers that
+    /// need a window-scoped view (e.g. periodic reports) must take two
+    /// [`Self::snapshot`]s and use [`MetricsSnapshot::delta_since`].
     pub fn get_upstream_reports(&self) -> std::collections::HashMap<String, (f64, u64)> {
         let mut res = std::collections::HashMap::new();
         {
@@ -419,6 +542,70 @@ impl MetricsRegistry {
             }
         }
         res
+    }
+
+    /// Captures the lifetime counters and RTT accumulators that back periodic
+    /// window reports.
+    ///
+    /// Take a snapshot, then for each later report call
+    /// [`MetricsSnapshot::delta_since`] with the previous snapshot to obtain
+    /// the activity observed since then. Unlike [`Self::get_upstream_reports`],
+    /// RTT samples are carried as a sum and a sample count, so a window mean
+    /// never mixes in samples taken before the window.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        let mut queries_total = 0u64;
+        let mut blocked_total = 0u64;
+        {
+            let map = self
+                .queries_total
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (&(_proto, _qtype, verdict), count) in map.iter() {
+                let count = count.load(Ordering::Relaxed);
+                queries_total += count;
+                if self.labels.label(verdict).as_ref() == "blocked" {
+                    blocked_total += count;
+                }
+            }
+        }
+
+        let mut upstreams: HashMap<String, UpstreamSnapshot> = HashMap::new();
+        {
+            let map = self
+                .upstream_rtt
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (&upstream, hist) in map.iter() {
+                let hist = hist.lock().unwrap_or_else(PoisonError::into_inner);
+                upstreams.insert(
+                    self.labels.label(upstream).to_string(),
+                    UpstreamSnapshot {
+                        rtt_sum_secs: hist.sum,
+                        rtt_sum_ns: hist.sum_ns,
+                        rtt_count: hist.count,
+                        errors_total: 0,
+                    },
+                );
+            }
+        }
+        {
+            let map = self
+                .upstream_errors
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (&(upstream, _kind), count) in map.iter() {
+                upstreams
+                    .entry(self.labels.label(upstream).to_string())
+                    .or_default()
+                    .errors_total += count.load(Ordering::Relaxed);
+            }
+        }
+
+        MetricsSnapshot {
+            queries_total,
+            blocked_total,
+            upstreams,
+        }
     }
 
     /// Generates the Prometheus text exposition representation conforming to Table 14.2.
@@ -457,11 +644,16 @@ impl MetricsRegistry {
                         .then_with(|| a.2.as_ref().cmp(b.2.as_ref()))
                 });
                 for (proto, qtype, verdict, count) in entries {
+                    let qtype_label = if qtype == QTYPE_OTHER {
+                        QTYPE_OTHER_LABEL.to_string()
+                    } else {
+                        qtype.to_string()
+                    };
                     let _ = writeln!(
                         out,
                         "sito_queries_total{{proto=\"{}\",qtype=\"{}\",verdict=\"{}\"}} {count}",
                         escape_label_value(&proto),
-                        qtype,
+                        qtype_label,
                         escape_label_value(&verdict)
                     );
                 }
@@ -880,6 +1072,151 @@ impl MetricsRegistry {
     }
 }
 
+/// Point-in-time copy of the monotonic counters that back window reports.
+///
+/// Registry counters only ever grow while the process lives, so the difference
+/// between two snapshots is a window-scoped measurement; see
+/// [`MetricsSnapshot::delta_since`].
+#[derive(Debug, Clone, Default)]
+pub struct MetricsSnapshot {
+    queries_total: u64,
+    blocked_total: u64,
+    upstreams: HashMap<String, UpstreamSnapshot>,
+}
+
+impl MetricsSnapshot {
+    /// Lifetime query total at snapshot time.
+    pub fn queries_total(&self) -> u64 {
+        self.queries_total
+    }
+
+    /// Lifetime blocked-query total at snapshot time.
+    pub fn blocked_total(&self) -> u64 {
+        self.blocked_total
+    }
+
+    /// Per-upstream lifetime accumulators at snapshot time.
+    pub fn upstreams(&self) -> &HashMap<String, UpstreamSnapshot> {
+        &self.upstreams
+    }
+
+    /// Computes the window-scoped difference between `self` (newer) and
+    /// `previous` (older).
+    ///
+    /// A counter that went backwards is treated as reset (process restart or a
+    /// replaced registry), and the newer reading is then reported as the whole
+    /// window instead of saturating to zero. A reset loses the pre-reset part
+    /// of the window, which is the only honest choice without persistent
+    /// counters.
+    pub fn delta_since(&self, previous: &MetricsSnapshot) -> MetricsDelta {
+        let mut upstreams = HashMap::with_capacity(self.upstreams.len());
+        for (name, current) in &self.upstreams {
+            let prior = previous.upstreams.get(name);
+            let (rtt_sum_secs, rtt_count) = match prior {
+                Some(p)
+                    if current.rtt_count >= p.rtt_count && current.rtt_sum_ns >= p.rtt_sum_ns =>
+                {
+                    (
+                        (current.rtt_sum_ns - p.rtt_sum_ns) as f64 / 1_000_000_000.0,
+                        current.rtt_count - p.rtt_count,
+                    )
+                }
+                // Missing or reset accumulator: the current values belong to
+                // this window.
+                _ => (current.rtt_sum_secs, current.rtt_count),
+            };
+            let errors = match prior {
+                Some(p) => counter_delta(current.errors_total, p.errors_total),
+                None => current.errors_total,
+            };
+            upstreams.insert(
+                name.clone(),
+                UpstreamDelta {
+                    rtt_sum_secs,
+                    rtt_count,
+                    errors,
+                },
+            );
+        }
+
+        MetricsDelta {
+            queries: counter_delta(self.queries_total, previous.queries_total),
+            blocked: counter_delta(self.blocked_total, previous.blocked_total),
+            upstreams,
+        }
+    }
+}
+
+/// Per-upstream lifetime accumulators captured by [`MetricsRegistry::snapshot`].
+#[derive(Debug, Clone, Default)]
+pub struct UpstreamSnapshot {
+    rtt_sum_secs: f64,
+    rtt_sum_ns: u128,
+    rtt_count: u64,
+    errors_total: u64,
+}
+
+impl UpstreamSnapshot {
+    /// Sum of every RTT sample in seconds.
+    pub fn rtt_sum_secs(&self) -> f64 {
+        self.rtt_sum_secs
+    }
+
+    /// Number of RTT samples.
+    pub fn rtt_count(&self) -> u64 {
+        self.rtt_count
+    }
+
+    /// Lifetime error total.
+    pub fn errors_total(&self) -> u64 {
+        self.errors_total
+    }
+}
+
+/// Window-scoped difference between two [`MetricsSnapshot`]s.
+#[derive(Debug, Clone, Default)]
+pub struct MetricsDelta {
+    /// Queries observed in the window.
+    pub queries: u64,
+    /// Blocked queries observed in the window.
+    pub blocked: u64,
+    /// Per-upstream measurements observed in the window.
+    pub upstreams: HashMap<String, UpstreamDelta>,
+}
+
+/// Window-scoped per-upstream measurements.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UpstreamDelta {
+    /// Sum of RTT samples observed in the window, in seconds.
+    pub rtt_sum_secs: f64,
+    /// Number of RTT samples observed in the window.
+    pub rtt_count: u64,
+    /// Errors observed in the window.
+    pub errors: u64,
+}
+
+impl UpstreamDelta {
+    /// Mean RTT over the window in milliseconds (`0.0` when there is no
+    /// sample).
+    pub fn mean_rtt_ms(&self) -> f64 {
+        if self.rtt_count == 0 {
+            0.0
+        } else {
+            (self.rtt_sum_secs / self.rtt_count as f64) * 1000.0
+        }
+    }
+}
+
+/// Subtracts two monotonic counter readings, treating a decrease as a reset:
+/// the newer reading then belongs entirely to the current window.
+fn counter_delta(current: u64, previous: u64) -> u64 {
+    if current >= previous {
+        current - previous
+    } else {
+        current
+    }
+}
+
 /// Escapes a Prometheus label value per the exposition format spec.
 fn escape_label_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
@@ -1167,6 +1504,49 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         );
     }
 
+    /// WP-7.1 regression: the client-controlled 16-bit `qtype` must not create
+    /// an unbounded number of `sito_queries_total` series. Common types keep
+    /// exact labels; everything else collapses into `qtype="__other__"`.
+    #[test]
+    fn test_queries_total_qtype_cardinality_is_bounded() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        let flood: u32 = 50_000;
+        for qtype in 0..flood {
+            reg.inc_queries("udp", qtype as u16, "allowed");
+        }
+        // Common types still get their own exact series.
+        reg.inc_queries("udp", 1, "allowed");
+        reg.inc_queries("udp", 28, "allowed");
+
+        let series = reg
+            .queries_total
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        assert!(
+            series <= KNOWN_QTYPES.len() + 1,
+            "qtype flood must collapse into the known set plus __other__ (got {series})"
+        );
+
+        // No observation is lost: the bounded series still account for every
+        // increment.
+        let total: u64 = reg
+            .queries_total
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum();
+        assert_eq!(total, u64::from(flood) + 2);
+
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains(r#"qtype="__other__""#));
+        assert!(rendered.contains(r#"qtype="1""#));
+        assert!(rendered.contains(r#"qtype="28""#));
+        // Raw wire values outside the known set are never exposed.
+        assert!(!rendered.contains(r#"qtype="40000""#));
+    }
+
     #[test]
     fn test_filter_metrics_are_reported() {
         let reg = MetricsRegistry::new("1.0.0", "test");
@@ -1176,6 +1556,59 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         assert!(rendered.contains("sito_filter_rules{list=\"total\"} 42"));
         assert!(rendered.contains("sito_filter_compile_seconds_count 1"));
         assert!(rendered.contains("sito_filter_compile_seconds_sum 0.25"));
+    }
+
+    /// Regression for audit WP-7.3: [`MetricsSnapshot::delta_since`] must
+    /// return window-scoped differences from lifetime counters, including
+    /// upstream RTT (sum + samples) and error totals, and must treat a
+    /// counter going backwards as a reset instead of saturating to zero.
+    #[test]
+    fn test_snapshot_delta_is_window_scoped_and_reset_safe() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.inc_queries("udp", 1, "allowed");
+        reg.inc_queries("udp", 28, "blocked");
+        reg.observe_upstream_rtt("8.8.8.8:53", 0.020);
+        reg.observe_upstream_rtt("8.8.8.8:53", 0.030);
+        reg.inc_upstream_errors("8.8.8.8:53", "timeout");
+        let previous = reg.snapshot();
+        assert_eq!(previous.queries_total(), 2);
+        assert_eq!(previous.blocked_total(), 1);
+
+        // No new activity: the delta is zero even though lifetime totals are
+        // non-zero.
+        let delta = reg.snapshot().delta_since(&previous);
+        assert_eq!(delta.queries, 0);
+        assert_eq!(delta.blocked, 0);
+        let upstream = &delta.upstreams["8.8.8.8:53"];
+        assert_eq!(upstream.rtt_count, 0);
+        assert_eq!(upstream.errors, 0);
+        assert!(upstream.mean_rtt_ms().abs() < f64::EPSILON);
+
+        // New activity is measured from the previous snapshot only: the mean
+        // must exclude the two pre-window RTT samples.
+        reg.inc_queries("udp", 28, "allowed");
+        reg.observe_upstream_rtt("8.8.8.8:53", 0.040);
+        reg.inc_upstream_errors("8.8.8.8:53", "network");
+        let delta = reg.snapshot().delta_since(&previous);
+        assert_eq!(delta.queries, 1);
+        assert_eq!(delta.blocked, 0);
+        let upstream = &delta.upstreams["8.8.8.8:53"];
+        assert_eq!(upstream.rtt_count, 1);
+        assert!((upstream.mean_rtt_ms() - 40.0).abs() < 1e-6);
+        assert_eq!(upstream.errors, 1);
+
+        // A replaced registry (process restart / metrics swap) restarts the
+        // counters; the newer reading is the whole window, not zero.
+        let reset = MetricsRegistry::new("1.0.0", "test");
+        reset.inc_queries("udp", 1, "allowed");
+        reset.observe_upstream_rtt("8.8.8.8:53", 0.005);
+        let delta = reset.snapshot().delta_since(&previous);
+        assert_eq!(delta.queries, 1);
+        assert_eq!(delta.blocked, 0);
+        let upstream = &delta.upstreams["8.8.8.8:53"];
+        assert_eq!(upstream.rtt_count, 1);
+        assert_eq!(upstream.errors, 0);
+        assert!((upstream.mean_rtt_ms() - 5.0).abs() < 1e-6);
     }
 }
 

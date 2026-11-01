@@ -2,7 +2,7 @@
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use flate2::Compression;
@@ -15,13 +15,17 @@ use std::time::{Duration, Instant};
 use tar::{Archive, Builder, Header};
 
 use crate::auth::rbac::RequireAdmin;
-use crate::config_writer::save_config_atomic;
+use crate::config_apply::{ApplyHooks, FilterApply, apply_and_persist_config, apply_full_config};
 use crate::error::ProblemDetails;
 use crate::models::{
     BackupMetadata, ConfigResponse, ConfigUpdateResponse, GenericMessageResponse,
     RestoreConfirmRequest, RestorePreparedResponse, UpdateConfigRequest,
 };
 use crate::state::ServerContext;
+
+/// Placeholder written in place of a secret value. Masked output is valid TOML
+/// and round-trips through [`unmask_sensitive_toml`].
+pub const SECRET_PLACEHOLDER: &str = "***";
 
 /// Returns true when a TOML key holds a secret value.
 fn is_sensitive_key(key: &str) -> bool {
@@ -41,125 +45,133 @@ fn is_sensitive_key(key: &str) -> bool {
     ) || key.ends_with("_token")
         || key.ends_with("_password")
         || key.ends_with("_secret")
+        || key.ends_with("_secrets")
         || key.ends_with("_key")
 }
 
-/// Extracts the final key segment from a (possibly dotted/quoted) TOML key.
-fn sensitive_key_of(lhs: &str) -> &str {
-    let last = lhs.trim().rsplit('.').next().unwrap_or(lhs).trim();
-    last.trim_matches('"').trim_matches('\'')
+/// True when the whole table at this path holds secrets (per-client shared
+/// secrets are keyed by client name, so the key name alone is not sensitive).
+fn is_sensitive_table_path(path: &[String]) -> bool {
+    matches!(
+        path.join(".").as_str(),
+        "clients.client_id_secrets" | "clients.client_id_secrets.*"
+    )
 }
 
-/// Masks sensitive values inside a single-line inline table.
-fn mask_inline_table(value: &str) -> String {
-    let trimmed = value.trim();
-    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
-        return value.to_string();
-    }
-    let inner = &trimmed[1..trimmed.len() - 1];
-    let masked: Vec<String> = inner
-        .split(',')
-        .map(|pair| {
-            if let Some((key, _)) = pair.split_once('=')
-                && is_sensitive_key(sensitive_key_of(key))
-            {
-                return format!("{} = \"***\"", key.trim());
+/// Walks a parsed TOML tree and replaces every secret value with the
+/// placeholder. Secret detection is by key path, so nested tables, arrays of
+/// tables and inline tables are all covered.
+fn mask_value(value: &mut toml::Value, path: &mut Vec<String>) {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, child) in table.iter_mut() {
+                path.push(key.clone());
+                if is_sensitive_key(key) || is_sensitive_table_path(path) {
+                    *child = toml::Value::String(SECRET_PLACEHOLDER.to_string());
+                } else {
+                    mask_value(child, path);
+                }
+                path.pop();
             }
-            pair.to_string()
+        }
+        toml::Value::Array(items) => {
+            for item in items {
+                mask_value(item, path);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Line-based fallback used only when the input is not parseable TOML (the
+/// server's own configuration always is). Prefer [`mask_sensitive_toml`].
+fn mask_sensitive_toml_fallback(toml_str: &str) -> String {
+    toml_str
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            match trimmed.split_once('=') {
+                Some((lhs, _)) => {
+                    let key = lhs.trim().rsplit('.').next().unwrap_or(lhs).trim();
+                    let key = key.trim_matches('"').trim_matches('\'');
+                    if is_sensitive_key(key) {
+                        let (prefix, _) = line.split_at(line.find('=').map_or(0, |i| i + 1));
+                        format!("{prefix} \"{SECRET_PLACEHOLDER}\"")
+                    } else {
+                        line.to_string()
+                    }
+                }
+                None => line.to_string(),
+            }
         })
-        .collect();
-    format!("{{{}}}", masked.join(","))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn bracket_delta(line: &str) -> i64 {
-    let opens =
-        i64::try_from(line.chars().filter(|c| matches!(c, '[' | '{')).count()).unwrap_or(i64::MAX);
-    let closes =
-        i64::try_from(line.chars().filter(|c| matches!(c, ']' | '}')).count()).unwrap_or(i64::MAX);
-    opens - closes
-}
-
-/// Mask sensitive values (e.g. `key = "..."`, `slave_token = "..."`,
-/// `secret = ["a"]`, `[tls] key = ...` or multi-line arrays/inline tables)
-/// with `"***"`.
+/// Masks sensitive values with a TOML-value walk keyed by path
+/// (`clients.client_id_secrets.*`, `*.password`, `*.key`, `*.token`,
+/// `slave_token`, `secret_key`, ...) and serializes the masked tree. The
+/// output is always valid TOML, including for multi-line arrays/tables.
 pub fn mask_sensitive_toml(toml_str: &str) -> String {
-    let mut out = Vec::new();
-    let mut masking_multiline = false;
-    let mut depth = 0i64;
-
-    for line in toml_str.lines() {
-        if masking_multiline {
-            out.push("***".to_string());
-            depth += bracket_delta(line);
-            if depth <= 0 {
-                masking_multiline = false;
-            }
-            continue;
-        }
-
-        let trimmed = line.trim_start();
-        let Some((lhs, rhs)) = trimmed.split_once('=') else {
-            out.push(line.to_string());
-            continue;
-        };
-        if !is_sensitive_key(sensitive_key_of(lhs)) {
-            // Inline tables can contain nested secret keys (e.g. credentials).
-            if rhs.trim_start().starts_with('{') && rhs.contains('=') {
-                let (prefix, _) = match line.find('=') {
-                    Some(idx) => line.split_at(idx + 1),
-                    None => (line, ""),
-                };
-                out.push(format!("{prefix} {}", mask_inline_table(rhs)));
-            } else {
-                out.push(line.to_string());
-            }
-            continue;
-        }
-
-        let (prefix, _) = match line.find('=') {
-            Some(idx) => line.split_at(idx + 1),
-            None => (line, ""),
-        };
-        let value = rhs.trim();
-        let opens_collection = (value.starts_with('[') && !value.ends_with(']'))
-            || (value.starts_with('{') && !value.ends_with('}'));
-        if opens_collection {
-            masking_multiline = true;
-            depth = bracket_delta(value);
-        }
-        out.push(format!("{prefix} \"***\""));
-    }
-    out.join("\n")
+    let Ok(table) = toml::from_str::<toml::Table>(toml_str) else {
+        return mask_sensitive_toml_fallback(toml_str);
+    };
+    let mut root = toml::Value::Table(table);
+    mask_value(&mut root, &mut Vec::new());
+    let toml::Value::Table(masked) = root else {
+        return mask_sensitive_toml_fallback(toml_str);
+    };
+    toml::to_string_pretty(&masked).unwrap_or_else(|_| mask_sensitive_toml_fallback(toml_str))
 }
 
-/// Unmask sensitive values in new TOML if they are preserved as "***"
+/// Restores placeholder values in `new_toml` from `current_toml` by key path.
+///
+/// This replaces the old line-based matching, which restored the first line
+/// with the same key name anywhere in the file and could not handle
+/// multi-line values or nested tables.
 pub fn unmask_sensitive_toml(new_toml: &str, current_toml: &str) -> String {
-    let current_lines: Vec<&str> = current_toml.lines().collect();
-    let mut out = Vec::new();
+    let (Ok(mut new_table), Ok(current_table)) = (
+        toml::from_str::<toml::Table>(new_toml),
+        toml::from_str::<toml::Table>(current_toml),
+    ) else {
+        return new_toml.to_string();
+    };
 
-    for new_line in new_toml.lines() {
-        let trimmed = new_line.trim_start();
-        if trimmed.contains("\"***\"") {
-            let key_prefix = trimmed.split('=').next().unwrap_or("").trim();
-            // Find matching key in current_toml (exact key name match)
-            let mut matched = false;
-            for cur_line in &current_lines {
-                let cur_trimmed = cur_line.trim_start();
-                let cur_key = cur_trimmed.split('=').next().unwrap_or("").trim();
-                if cur_key == key_prefix && cur_trimmed.contains('=') {
-                    out.push((*cur_line).to_string());
-                    matched = true;
-                    break;
+    restore_placeholders(&mut new_table, &current_table);
+    toml::to_string_pretty(&new_table).unwrap_or_else(|_| new_toml.to_string())
+}
+
+fn restore_placeholders(new: &mut toml::Table, current: &toml::Table) {
+    for (key, value) in new.iter_mut() {
+        let current_child = current.get(key);
+        if value.as_str() == Some(SECRET_PLACEHOLDER) {
+            if let Some(current_child) = current_child {
+                *value = current_child.clone();
+            }
+            continue;
+        }
+        match value {
+            toml::Value::Table(table) => {
+                if let Some(current_table) = current_child.and_then(toml::Value::as_table) {
+                    restore_placeholders(table, current_table);
                 }
             }
-            if !matched {
-                out.push(new_line.to_string());
+            toml::Value::Array(items) => {
+                let Some(current_items) = current_child.and_then(toml::Value::as_array) else {
+                    continue;
+                };
+                for (index, item) in items.iter_mut().enumerate() {
+                    if let (toml::Value::Table(table), Some(current_table)) = (
+                        item,
+                        current_items.get(index).and_then(toml::Value::as_table),
+                    ) {
+                        restore_placeholders(table, current_table);
+                    }
+                }
             }
-        } else {
-            out.push(new_line.to_string());
+            _ => {}
         }
     }
-    out.join("\n")
 }
 
 /// Get current full configuration with secrets masked.
@@ -203,6 +215,7 @@ pub async fn get_config(
 pub async fn update_config(
     _admin: RequireAdmin,
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     Json(req): Json<UpdateConfigRequest>,
 ) -> Result<Json<ConfigUpdateResponse>, ProblemDetails> {
     let current_toml = tokio::fs::read_to_string(&ctx.config_path)
@@ -211,52 +224,22 @@ pub async fn update_config(
 
     let unmasked_toml = unmask_sensitive_toml(&req.config_toml, &current_toml);
 
-    // Pre-commit parse and deep validation: never persist a configuration the
-    // server cannot load (the watcher would reject it after we returned 200).
+    // Parse, deep-validate, apply and only then persist: a configuration the
+    // server cannot load must never reach the file.
     let parsed: Config = Config::from_toml_str(&unmasked_toml)
         .map_err(|e| ProblemDetails::bad_request(format!("Configuration error: {e}")))?;
-    crate::config_validation::validate_typed_sections(&parsed)
-        .map_err(|e| ProblemDetails::bad_request(format!("Configuration error: {e}")))?;
 
-    let restart_required = restart_required_fields(&ctx.config.load(), &parsed);
-
-    // Atomic write
-    save_config_atomic(&ctx.config_path, &parsed).await?;
-    ctx.querylog_sender
-        .set_anonymize(parsed.privacy.anonymize_querylog);
-    ctx.set_config(parsed);
-    crate::publish_bundle(&ctx);
+    let report = apply_and_persist_config(&ctx, &parsed, FilterApply::Sync, hooks.as_dyn()).await?;
 
     Ok(Json(ConfigUpdateResponse {
         message: "Configuration successfully updated".to_string(),
-        restart_required,
+        restart_required: report.restart_required,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_restart_required_fields_marks_restart_only_sections() {
-        let old = Config::default();
-        let mut new = old.clone();
-
-        // [auth] is read once at startup and must be reported as restart-only.
-        let mut auth = toml::Table::new();
-        auth.insert("session_ttl_hours".to_string(), toml::Value::Integer(1));
-        new.auth = Some(toml::Value::Table(auth));
-        let fields = restart_required_fields(&old, &new);
-        assert!(fields.iter().any(|f| f == "auth"), "got {fields:?}");
-
-        // Listener ports are rebound in-process by the watcher, not restart-only.
-        new.dns.port = old.dns.port.saturating_add(1);
-        let fields = restart_required_fields(&old, &new);
-        assert!(
-            !fields.iter().any(|f| f.starts_with("dns.")),
-            "listener changes must not claim restart-required: {fields:?}"
-        );
-    }
 
     #[test]
     fn test_restore_archive_rejects_decompression_bomb() {
@@ -298,15 +281,28 @@ api_key = ["first", "second"]
 
 [web]
 header = { api_token = "Bearer xyz", Accept = "text/html" }
+
+[clients.client_id_secrets]
+"phone" = "shared-secret-one"
+"laptop" = "shared-secret-two"
 "#;
         let masked = mask_sensitive_toml(toml_str);
         assert!(!masked.contains("super-secret-private-key"));
         assert!(!masked.contains("abc123"));
         assert!(!masked.contains("first"));
         assert!(!masked.contains("Bearer xyz"));
+        assert!(!masked.contains("shared-secret-one"));
+        assert!(!masked.contains("shared-secret-two"));
         assert!(masked.contains("cert = \"public-cert.pem\""));
         assert!(masked.contains("\"1.1.1.1\""));
-        assert!(masked.contains("\"***\""));
+        assert!(masked.contains(SECRET_PLACEHOLDER));
+
+        // The masked output must always be parseable TOML.
+        let parsed: toml::Table = toml::from_str(&masked).expect("masked TOML parses");
+        assert_eq!(
+            parsed["clients"]["client_id_secrets"].as_str(),
+            Some(SECRET_PLACEHOLDER)
+        );
     }
 
     #[test]
@@ -316,58 +312,198 @@ header = { api_token = "Bearer xyz", Accept = "text/html" }
         assert!(!masked.contains("secret1"));
         assert!(!masked.contains("secret2"));
         assert!(masked.contains("name = \"ok\""));
+        // Multi-line values are masked as a scalar placeholder, not a broken
+        // multi-line fragment: the result parses.
+        let parsed: toml::Table = toml::from_str(&masked).expect("masked TOML parses");
+        assert_eq!(
+            parsed["slave_token"].as_str(),
+            Some(SECRET_PLACEHOLDER),
+            "masked multi-line value must be valid TOML"
+        );
     }
-}
 
-/// Settings that are only read at process start; changing them needs a restart.
-fn restart_required_fields(old: &Config, new: &Config) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mark = |changed: bool, name: &str, fields: &mut Vec<String>| {
-        if changed {
-            fields.push(name.to_string());
-        }
-    };
+    #[test]
+    fn test_mask_round_trip_restores_multiline_and_client_secrets() {
+        let original = r#"[server]
+slave_token = [
+  "multi-line-secret-one",
+  "multi-line-secret-two",
+]
 
-    mark(
-        old.server.role != new.server.role,
-        "server.role",
-        &mut fields,
-    );
-    mark(
-        old.server.instance_name != new.server.instance_name,
-        "server.instance_name",
-        &mut fields,
-    );
-    mark(
-        old.server.data_dir != new.server.data_dir,
-        "server.data_dir",
-        &mut fields,
-    );
-    mark(
-        old.server.log_format != new.server.log_format,
-        "server.log_format",
-        &mut fields,
-    );
-    // dns.bind/ports and dns.rate_limit_per_ip are rebound in-process by the
-    // config watcher, so they are not restart-only.
-    mark(
-        old.dns.doh_dedicated_hostname != new.dns.doh_dedicated_hostname,
-        "dns.doh_dedicated_hostname",
-        &mut fields,
-    );
-    // [auth] sessions/token policy and [integrations] workers are read once at
-    // startup; changes need a restart.
-    mark(old.auth != new.auth, "auth", &mut fields);
-    mark(
-        old.integrations != new.integrations,
-        "integrations",
-        &mut fields,
-    );
-    mark(old.web != new.web, "web", &mut fields);
-    mark(old.tls != new.tls, "tls", &mut fields);
-    mark(old.acme != new.acme, "acme", &mut fields);
-    mark(old.ha != new.ha, "ha", &mut fields);
-    fields
+[clients.client_id_secrets]
+"phone" = "phone-secret"
+"laptop" = "laptop-secret"
+
+[upstream]
+servers = ["1.1.1.1"]
+api_key = "upstream-api-key"
+"#;
+        let masked = mask_sensitive_toml(original);
+        assert!(!masked.contains("multi-line-secret-one"));
+        assert!(!masked.contains("phone-secret"));
+        assert!(!masked.contains("upstream-api-key"));
+
+        // Round-trip: the masked document parses and unmasks back to the
+        // original values by key path.
+        let _: toml::Table = toml::from_str(&masked).expect("masked output parses");
+        let restored = unmask_sensitive_toml(&masked, original);
+        let restored: toml::Table = toml::from_str(&restored).expect("unmasked output parses");
+        assert_eq!(
+            restored["server"]["slave_token"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            restored["clients"]["client_id_secrets"]["phone"].as_str(),
+            Some("phone-secret")
+        );
+        assert_eq!(
+            restored["clients"]["client_id_secrets"]["laptop"].as_str(),
+            Some("laptop-secret")
+        );
+        assert_eq!(
+            restored["upstream"]["api_key"].as_str(),
+            Some("upstream-api-key")
+        );
+        // Non-secret values survive the round trip untouched.
+        assert_eq!(
+            restored["upstream"]["servers"].as_array().map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_unmask_is_path_aware_not_name_based() {
+        // Two different tables use the same key name; the line-based matcher
+        // used to restore the first occurrence in file order.
+        let original = r#"[web]
+token = "web-token"
+
+[ha]
+token = "ha-token"
+"#;
+        let masked = mask_sensitive_toml(original);
+        let restored = unmask_sensitive_toml(&masked, original);
+        let restored: toml::Table = toml::from_str(&restored).unwrap();
+        assert_eq!(restored["web"]["token"].as_str(), Some("web-token"));
+        assert_eq!(restored["ha"]["token"].as_str(), Some("ha-token"));
+    }
+
+    fn admin() -> RequireAdmin {
+        RequireAdmin(crate::auth::AuthUser {
+            username: "admin".to_string(),
+            role: crate::auth::token::Role::Admin,
+            token_id: None,
+        })
+    }
+
+    /// WP-4.2: `PUT /config` with an unparseable/typo upstream must be rejected
+    /// with 400 and the file must stay untouched.
+    #[tokio::test]
+    async fn test_update_config_rejects_invalid_upstream_and_keeps_file() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_put");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let original = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+        tokio::fs::write(&ctx.config_path, original).await.unwrap();
+        ctx.set_config(Config::from_toml_str(original).unwrap());
+
+        let err = update_config(
+            admin(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(UpdateConfigRequest {
+                config_toml: "config_version = 1\n[upstream]\nservers = [\"oops-typo\"]\n"
+                    .to_string(),
+            }),
+        )
+        .await
+        .expect_err("invalid upstream must be rejected");
+        assert_eq!(err.status, 400);
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            original,
+            "the rejected configuration must not be persisted"
+        );
+        assert_eq!(ctx.config.load().upstream.servers, vec!["1.1.1.1"]);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-4.2: reloading a file with an invalid `[clients]` section must return
+    /// 400 and must not wipe the live clients/runtime snapshot.
+    #[tokio::test]
+    async fn test_reload_rejects_invalid_clients_without_wiping() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_reload");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let seed = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\n[[clients.entries]]\nname = \"phone\"\nids = [\"10.0.0.5\"]\n";
+        let seed_cfg = Config::from_toml_str(seed).unwrap();
+        ctx.set_config(seed_cfg.clone());
+        let clients_cfg: sito_clients::ClientsConfig =
+            seed_cfg.clients.clone().unwrap().try_into().unwrap();
+        ctx.set_clients(sito_clients::ClientRegistry::new(clients_cfg));
+
+        tokio::fs::write(
+            &ctx.config_path,
+            "config_version = 1\n[clients]\nentries = \"not-an-array\"\n",
+        )
+        .await
+        .unwrap();
+
+        let err = reload_config(
+            admin(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+        )
+        .await
+        .expect_err("invalid clients section must be rejected");
+        assert_eq!(err.status, 400);
+
+        let live = ctx.config.load();
+        let clients = live
+            .clients
+            .as_ref()
+            .and_then(|v| v.get("entries"))
+            .and_then(|v| v.as_array())
+            .expect("live clients section must survive the rejected reload");
+        assert_eq!(clients.len(), 1);
+        assert_eq!(
+            ctx.runtime.snapshot().config.upstream.servers,
+            vec!["1.1.1.1"],
+            "runtime snapshot must be untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-4.2: a persist failure rolls the in-memory apply back.
+    #[tokio::test]
+    async fn test_persist_failure_rolls_back_in_memory_config() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_rollback");
+        let mut ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.config_path = std::path::PathBuf::from("/proc/forbidden_cfg_test/config.toml");
+
+        let original_ttl = ctx.config.load().dns.cache.min_ttl;
+        let mut candidate = (**ctx.config.load()).clone();
+        candidate.dns.cache.min_ttl = original_ttl.saturating_add(42);
+
+        let err = crate::config_apply::apply_and_persist_config(
+            &ctx,
+            &candidate,
+            FilterApply::Sync,
+            None,
+        )
+        .await
+        .expect_err("persist must fail");
+        assert_eq!(err.status, 500);
+        assert_eq!(
+            ctx.config.load().dns.cache.min_ttl,
+            original_ttl,
+            "in-memory apply must be rolled back when the persist fails"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
 
 /// Reload configuration from disk without server restart.
@@ -385,6 +521,7 @@ fn restart_required_fields(old: &Config, new: &Config) -> Vec<String> {
 pub async fn reload_config(
     _admin: RequireAdmin,
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
 ) -> Result<Json<ConfigUpdateResponse>, ProblemDetails> {
     let raw = tokio::fs::read_to_string(&ctx.config_path)
         .await
@@ -392,76 +529,15 @@ pub async fn reload_config(
 
     let parsed = Config::from_toml_str(&raw)
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid configuration on disk: {e}")))?;
-    crate::config_validation::validate_typed_sections(&parsed)
-        .map_err(|e| ProblemDetails::bad_request(format!("Invalid configuration on disk: {e}")))?;
 
-    let restart_required = restart_required_fields(&ctx.config.load(), &parsed);
-
-    ctx.querylog_sender
-        .set_anonymize(parsed.privacy.anonymize_querylog);
-    apply_hot_config(&ctx, parsed).await?;
-    crate::publish_bundle(&ctx);
+    // Same deep validation and apply routine as every other write path.
+    let report = apply_full_config(&ctx, &parsed, FilterApply::Sync, hooks.as_dyn()).await?;
+    ctx.publish_bundle().await;
 
     Ok(Json(ConfigUpdateResponse {
         message: "Configuration reloaded from disk and applied".to_string(),
-        restart_required,
+        restart_required: report.restart_required,
     }))
-}
-
-/// Applies the hot-reloadable components of `cfg` to the live server.
-///
-/// Mirrors the config-watcher apply order: filter, upstreams, cache, then the
-/// coherent runtime snapshot (config/clients/rewrites). Fails on the first
-/// component error instead of reporting a successful reload that applied
-/// nothing.
-async fn apply_hot_config(ctx: &ServerContext, cfg: Config) -> Result<(), ProblemDetails> {
-    let filter_started = Instant::now();
-    ctx.filter
-        .reload_with_config(&cfg.filtering)
-        .await
-        .map_err(|e| {
-            ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
-        })?;
-    ctx.metrics.set_filter_rules(ctx.filter.rule_count());
-    ctx.metrics
-        .observe_filter_compile(filter_started.elapsed().as_secs_f64());
-    // Filter rules changed: drop cached answers that may now be blocked.
-    ctx.cache.flush();
-
-    let bootstrap = sito_upstream::BootstrapResolver::new(
-        cfg.upstream.bootstrap.clone(),
-        Duration::from_millis(cfg.upstream.timeout_ms),
-    );
-    ctx.upstream
-        .reload(&cfg.upstream, &bootstrap)
-        .await
-        .map_err(|e| {
-            ProblemDetails::internal_error(format!("Failed to apply upstream configuration: {e}"))
-        })?;
-
-    let clients: sito_clients::ClientsConfig = match cfg.clients.as_ref() {
-        Some(value) => value.clone().try_into().map_err(|e| {
-            ProblemDetails::bad_request(format!("invalid [clients] configuration: {e}"))
-        })?,
-        None => sito_clients::ClientsConfig::default(),
-    };
-    let rewrites: sito_rewrites::RewritesConfig = match cfg.rewrites.as_ref() {
-        Some(value) => value.clone().try_into().map_err(|e| {
-            ProblemDetails::bad_request(format!("invalid [rewrites] configuration: {e}"))
-        })?,
-        None => sito_rewrites::RewritesConfig::default(),
-    };
-
-    ctx.cache.update_config(cfg.dns.cache.clone()).await;
-    ctx.runtime.replace(sito_runtime::RuntimeSnapshot {
-        config: std::sync::Arc::new(cfg),
-        clients: std::sync::Arc::new(sito_clients::ClientRegistry::with_routeros_leases(
-            clients,
-            ctx.clients.load().routeros_leases_store(),
-        )),
-        rewrites: std::sync::Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
-    });
-    Ok(())
 }
 
 /// Download a complete configuration backup archive (.tar.gz).
@@ -570,10 +646,11 @@ pub fn extract_backup_archive(archive_bytes: &[u8]) -> anyhow::Result<(String, B
     let config_toml = restored_config_toml
         .ok_or_else(|| anyhow::anyhow!("Archive does not contain a valid config.toml"))?;
 
-    // Pre-validation of restored configuration (including typed sections)
+    // Pre-validation of restored configuration (including typed sections and
+    // every upstream target, so a typo in `servers` cannot be restored).
     let restored = Config::from_toml_str(&config_toml)
         .map_err(|e| anyhow::anyhow!("Restored configuration validation failed: {e}"))?;
-    crate::config_validation::validate_typed_sections(&restored)
+    crate::config_apply::validate_full_config_sync(&restored)
         .map_err(|e| anyhow::anyhow!("Restored configuration validation failed: {e}"))?;
 
     Ok((config_toml, meta))
@@ -691,6 +768,7 @@ pub async fn prepare_restore(
 pub async fn confirm_restore(
     _admin: RequireAdmin,
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     Json(req): Json<RestoreConfirmRequest>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
     let pending = {
@@ -714,11 +792,9 @@ pub async fn confirm_restore(
     let parsed = Config::from_toml_str(&config_toml)
         .map_err(|e| ProblemDetails::bad_request(format!("Configuration error: {e}")))?;
 
-    save_config_atomic(&ctx.config_path, &parsed).await?;
-    ctx.querylog_sender
-        .set_anonymize(parsed.privacy.anonymize_querylog);
-    ctx.set_config(parsed);
-    crate::publish_bundle(&ctx);
+    // Apply first, persist second: a restored config that cannot be applied is
+    // rejected without touching the current file.
+    apply_and_persist_config(&ctx, &parsed, FilterApply::Sync, hooks.as_dyn()).await?;
 
     Ok(Json(GenericMessageResponse {
         message: "Configuration successfully restored from backup".to_string(),

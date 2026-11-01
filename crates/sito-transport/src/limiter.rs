@@ -2,7 +2,7 @@
 
 use dashmap::DashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 #[derive(Debug)]
@@ -31,6 +31,7 @@ pub struct RateLimiter {
     burst: AtomicU32,
     buckets: DashMap<IpAddr, Bucket>,
     max_buckets: usize,
+    pruner_started: AtomicBool,
 }
 
 impl RateLimiter {
@@ -47,14 +48,22 @@ impl RateLimiter {
             burst: AtomicU32::new(burst.max(1)),
             buckets: DashMap::new(),
             max_buckets: max_buckets.max(1),
+            pruner_started: AtomicBool::new(false),
         }
+    }
+
+    /// Burst allowance derived from a configured per-IP rate (twice the rate),
+    /// saturating instead of overflowing for extreme configuration values.
+    #[must_use]
+    pub const fn burst_for_rate(rate_per_sec: u32) -> u32 {
+        rate_per_sec.saturating_mul(2)
     }
 
     /// Applies a new rate limit. `rate_per_sec = 0` disables limiting.
     pub fn set_rate(&self, rate_per_sec: u32) {
         self.rate_per_sec.store(rate_per_sec, Ordering::Relaxed);
         self.burst
-            .store(rate_per_sec.saturating_mul(2).max(1), Ordering::Relaxed);
+            .store(Self::burst_for_rate(rate_per_sec).max(1), Ordering::Relaxed);
     }
 
     /// Check if a request from the given IP is allowed.
@@ -121,18 +130,25 @@ impl RateLimiter {
     }
 
     /// Spawn a background task to periodically prune inactive rate limit buckets every 60 seconds until shutdown.
+    ///
+    /// If a pruner is already running for this `RateLimiter`, subsequent calls
+    /// return a no-op task so sharing one limiter across multiple listeners does
+    /// not spawn duplicate sweep tasks.
     pub fn spawn_pruner(
         self: &std::sync::Arc<Self>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
+        if self.pruner_started.swap(true, Ordering::AcqRel) {
+            return tokio::spawn(async {});
+        }
         let limiter = std::sync::Arc::clone(self);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             interval.tick().await;
             loop {
                 tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
                             break;
                         }
                     }
@@ -141,6 +157,7 @@ impl RateLimiter {
                     }
                 }
             }
+            limiter.pruner_started.store(false, Ordering::Release);
         })
     }
 }
@@ -193,6 +210,16 @@ mod tests {
         for _ in 0..100 {
             assert!(limiter.check(ip));
         }
+    }
+
+    /// Regression: the derived burst must saturate for extreme configured
+    /// rates instead of overflowing (which panicked in debug builds).
+    #[test]
+    fn test_rate_limiter_burst_for_rate_saturates() {
+        assert_eq!(RateLimiter::burst_for_rate(0), 0);
+        assert_eq!(RateLimiter::burst_for_rate(20), 40);
+        assert_eq!(RateLimiter::burst_for_rate(u32::MAX / 2), u32::MAX - 1);
+        assert_eq!(RateLimiter::burst_for_rate(u32::MAX), u32::MAX);
     }
 
     #[test]

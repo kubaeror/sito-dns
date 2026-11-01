@@ -4,13 +4,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
 
 use sito_core::client::ClientContext;
-use sito_proto::{decode_message, encode_message};
+use sito_proto::{decode_message, encode_message, truncate_for_framing};
 
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
@@ -59,7 +59,7 @@ pub async fn start_tcp_listener<H: QueryHandler>(
     handler: Arc<H>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
-    let listener = TcpListener::bind(config.bind_addr).await?;
+    let listener = crate::net::bind_tcp_listener(config.bind_addr)?;
     let local_addr = listener.local_addr()?;
     info!("TCP listener started on {}", local_addr);
 
@@ -67,7 +67,7 @@ pub async fn start_tcp_listener<H: QueryHandler>(
     let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
         Arc::new(RateLimiter::new(
             config.rate_limit_per_ip,
-            config.rate_limit_per_ip * 2,
+            RateLimiter::burst_for_rate(config.rate_limit_per_ip),
         ))
     });
     rate_limiter.spawn_pruner(shutdown_rx.clone());
@@ -75,8 +75,8 @@ pub async fn start_tcp_listener<H: QueryHandler>(
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
                         debug!("TCP listener stopping due to shutdown");
                         break;
                     }
@@ -144,11 +144,21 @@ async fn handle_tcp_connection<H: QueryHandler>(
     // cannot be framed and is dropped instead of being wrapped around.
     let write_task = tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
-            let Some(len) = frame_prefix(bytes.len()) else {
+            let bytes = if frame_prefix(bytes.len()).is_none() {
+                // RFC 7766 §8: fall back to a TC=1 response instead of
+                // leaving the client waiting for a frame that never comes.
                 warn!(
-                    "TCP response of {} bytes exceeds the 65535-byte DNS-over-TCP limit; dropping",
+                    "TCP response of {} bytes exceeds the 65535-byte DNS-over-TCP limit; sending TC=1",
                     bytes.len()
                 );
+                let Some(truncated) = truncate_for_framing(&bytes) else {
+                    continue;
+                };
+                truncated
+            } else {
+                bytes
+            };
+            let Some(len) = frame_prefix(bytes.len()) else {
                 continue;
             };
             let write_res = timeout(WRITE_TIMEOUT, async {

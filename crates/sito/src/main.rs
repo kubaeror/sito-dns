@@ -4,7 +4,6 @@ use clap::Parser;
 use sito::cli::{Cli, Commands, run_backup, run_check_config, run_healthcheck_or_web, run_restore};
 use sito::server::run_server_full;
 use sito_core::config::Config;
-use std::net::SocketAddr;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -36,29 +35,8 @@ async fn main() -> anyhow::Result<()> {
                     (Some(addr), "127.0.0.1:8080".parse().unwrap())
                 } else if let Ok(content) = std::fs::read_to_string(&cli.config) {
                     if let Ok(cfg) = Config::from_toml_str(&content) {
-                        let bind_ip = cfg
-                            .dns
-                            .bind
-                            .iter()
-                            .find(|ip| !ip.is_unspecified())
-                            .copied()
-                            .unwrap_or_else(|| {
-                                if cfg.dns.bind.iter().any(std::net::IpAddr::is_ipv6) {
-                                    "::1".parse().unwrap()
-                                } else {
-                                    "127.0.0.1".parse().unwrap()
-                                }
-                            });
-                        let web_cfg = cfg.get_web_config();
-                        let web_ip = if web_cfg.bind.is_unspecified() {
-                            "127.0.0.1".parse().unwrap()
-                        } else {
-                            web_cfg.bind
-                        };
-                        (
-                            Some(SocketAddr::new(bind_ip, cfg.dns.port)),
-                            SocketAddr::new(web_ip, web_cfg.port),
-                        )
+                        let (dns, web) = sito::cli::healthcheck_targets_from_config(&cfg);
+                        (Some(dns), web)
                     } else {
                         (
                             Some("127.0.0.1:53".parse().unwrap()),
@@ -161,7 +139,34 @@ async fn main() -> anyhow::Result<()> {
         })?;
         (config, false)
     } else if cli.no_setup {
-        (Config::default(), false)
+        // No config file: the built-in defaults would bootstrap
+        // `admin/adminadmin` on 0.0.0.0. Generate a random admin password and
+        // bind the admin UI to loopback instead, printing the password once.
+        let mut config = Config::default();
+        match sito::cli::prepare_no_setup_bootstrap(&config_path, &mut config) {
+            Ok(sito::cli::NoSetupBootstrap::GeneratedPassword(password)) => {
+                eprintln!("\n==================================================================");
+                eprintln!(" --no-setup without a configuration file detected.");
+                eprintln!(" Admin UI bound to 127.0.0.1 with a randomly generated password.");
+                eprintln!(" Username: admin");
+                eprintln!(" Password: {password}");
+                eprintln!(" Store this password now; it is never shown again.");
+                eprintln!("==================================================================\n");
+            }
+            Ok(sito::cli::NoSetupBootstrap::KeptExistingUsers) => {
+                eprintln!("\n==================================================================");
+                eprintln!(" --no-setup without a configuration file detected.");
+                eprintln!(" Existing credentials were found and kept; the admin UI is bound");
+                eprintln!(" to 127.0.0.1. Use `sito reset-admin` to deliberately rotate them.");
+                eprintln!("==================================================================\n");
+            }
+            Ok(sito::cli::NoSetupBootstrap::NotNeeded) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        (config, false)
     } else {
         (Config::default(), true)
     };
@@ -204,6 +209,14 @@ async fn main() -> anyhow::Result<()> {
             " First run detected: open http://{}:{} to complete setup",
             host_display, web_cfg.port
         );
+        if config.server.data_dir.join("users.toml").exists() {
+            eprintln!(
+                " Note: '{}' already exists, so the wizard requires an admin login",
+                config.server.data_dir.join("users.toml").display()
+            );
+            eprintln!(" instead of the first-boot setup token. Log in, then complete the wizard");
+            eprintln!(" to restore the missing configuration.");
+        }
         eprintln!("==================================================================\n");
         tracing::info!(
             "First run detected: open http://{}:{} to complete setup",

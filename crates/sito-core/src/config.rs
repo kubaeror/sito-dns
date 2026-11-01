@@ -105,19 +105,22 @@ impl Config {
         // errors (e.g. `[web] bind = ["0.0.0.0"]`) fail fast instead of being
         // silently replaced by defaults at runtime.
         if let Some(ref val) = self.web {
-            let _: WebConfig = val.clone().try_into().map_err(|e| {
+            let web: WebConfig = val.clone().try_into().map_err(|e| {
                 ConfigError::validation("web", format!("invalid [web] section: {e}"))
             })?;
+            web.validate()?;
         }
         if let Some(ref val) = self.auth {
-            let _: AuthConfig = val.clone().try_into().map_err(|e| {
+            let auth: AuthConfig = val.clone().try_into().map_err(|e| {
                 ConfigError::validation("auth", format!("invalid [auth] section: {e}"))
             })?;
+            auth.validate()?;
         }
         if let Some(ref val) = self.stats {
-            let _: StatsConfig = val.clone().try_into().map_err(|e| {
+            let stats: StatsConfig = val.clone().try_into().map_err(|e| {
                 ConfigError::validation("stats", format!("invalid [stats] section: {e}"))
             })?;
+            stats.validate()?;
         }
         for (name, section) in [
             ("ha", &self.ha),
@@ -257,6 +260,9 @@ pub struct WebConfig {
     pub enabled: bool,
     #[serde(default = "default_web_bind")]
     pub bind: IpAddr,
+    /// Admin API / dashboard TCP port. Must be greater than 0; port 0 would
+    /// ask the OS for an ephemeral port that operators and clients cannot
+    /// discover.
     #[serde(default = "default_web_port")]
     pub port: u16,
     #[serde(default)]
@@ -293,9 +299,25 @@ impl Default for WebConfig {
     }
 }
 
+impl WebConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.port == 0 {
+            return Err(ConfigError::validation(
+                "web.port",
+                "port must be greater than 0 (0 would request an ephemeral port that clients cannot discover)",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Query statistics and retention parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatsConfig {
+    /// Days to keep detailed per-query records before pruning/rollup.
+    ///
+    /// Must be at least 1: `0` would delete every query-log row on the next
+    /// retention sweep while still advertising query logging as enabled.
     #[serde(default = "default_retention_days", alias = "query_log_retention_days")]
     pub retention_days: u32,
 }
@@ -312,11 +334,27 @@ impl Default for StatsConfig {
     }
 }
 
+impl StatsConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.retention_days == 0 {
+            return Err(ConfigError::validation(
+                "stats.retention_days",
+                "retention_days must be greater than 0",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Administrative authentication and session parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthConfig {
+    /// Web session lifetime in hours. Must be greater than 0: a session
+    /// created with a zero TTL is already expired and can never be used.
     #[serde(default = "default_session_ttl_hours")]
     pub session_ttl_hours: u64,
+    /// Maximum failed login attempts per minute per IP before lockout.
+    /// `0` disables the per-IP login rate limit.
     #[serde(default = "default_login_rate_limit")]
     pub login_rate_limit: usize,
     /// Persist web sessions and API tokens across restarts (`sessions.toml`/`tokens.toml`).
@@ -352,6 +390,18 @@ impl Default for AuthConfig {
             session_persist: default_session_persist(),
             token_default_ttl_days: default_token_ttl_days(),
         }
+    }
+}
+
+impl AuthConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.session_ttl_hours == 0 {
+            return Err(ConfigError::validation(
+                "auth.session_ttl_hours",
+                "session_ttl_hours must be greater than 0 (sessions would expire immediately)",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -446,16 +496,22 @@ impl ServerConfig {
 /// DNS server listening and protocol parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsConfig {
+    /// Addresses every listener binds (UDP/TCP DNS, DoT, DoH, DoQ, DoH3).
     #[serde(default = "default_dns_bind")]
     pub bind: Vec<IpAddr>,
+    /// Plain UDP/TCP DNS port; must be greater than 0.
     #[serde(default = "default_dns_port")]
     pub port: u16,
+    /// DNS-over-TLS (TCP) port; `0` disables the DoT listener.
     #[serde(default = "default_dns_dot_port")]
     pub dot_port: u16,
+    /// DNS-over-HTTPS (TCP) port; `0` disables the DoH listener.
     #[serde(default = "default_dns_doh_port")]
     pub doh_port: u16,
+    /// DNS-over-QUIC (UDP) port; `0` disables the DoQ listener (the default).
     #[serde(default = "default_dns_doq_port")]
     pub doq_port: u16,
+    /// DNS-over-HTTP/3 (UDP) port; `0` disables the DoH3 listener.
     #[serde(default = "default_dns_doh3_port")]
     pub doh3_port: u16,
     #[serde(default)]
@@ -470,6 +526,10 @@ pub struct DnsConfig {
     pub tls: Option<TlsConfig>,
     #[serde(default = "default_dns_edns_udp_size")]
     pub edns_udp_size: u16,
+    /// Per-source-IP query rate limit (queries/second); `0` disables limiting.
+    ///
+    /// Accepted range is `0` through [`MAX_RATE_LIMIT_PER_IP`]; see that
+    /// constant for why the upper bound exists.
     #[serde(default = "default_dns_rate_limit_per_ip")]
     pub rate_limit_per_ip: u32,
     #[serde(default = "default_dns_max_tcp_connections")]
@@ -479,6 +539,16 @@ pub struct DnsConfig {
     #[serde(default)]
     pub dnssec: DnssecConfig,
 }
+
+/// Upper bound accepted for [`DnsConfig::rate_limit_per_ip`].
+///
+/// The transport layer sizes each client's token bucket as
+/// `rate_limit_per_ip * 2` (burst), so values above `u32::MAX / 2` would
+/// overflow that multiplication. This bound is deliberately far below the
+/// arithmetic limit: a single source IP asking for more than one million
+/// queries per second is not a real deployment, and operators who want no
+/// limit can set `0` (disabled).
+pub const MAX_RATE_LIMIT_PER_IP: u32 = 1_000_000;
 
 fn default_dns_bind() -> Vec<IpAddr> {
     vec![
@@ -533,12 +603,44 @@ impl Default for DnsConfig {
     }
 }
 
+/// Rejects two listeners that would contend for the same `addr:port` on the
+/// same transport.
+///
+/// Every listener binds the shared `dns.bind` address list, so equal nonzero
+/// ports always collide. Cross-transport pairs (e.g. DoT/TCP and DoQ/UDP) are
+/// intentionally accepted.
+fn reject_port_conflict(
+    first: (&str, u16),
+    second: (&str, u16),
+    transport: &str,
+) -> Result<(), ConfigError> {
+    if first.1 > 0 && first.1 == second.1 {
+        return Err(ConfigError::validation(
+            second.0,
+            format!(
+                "{} and {} both use {transport} on the same dns.bind addresses; use distinct ports",
+                second.0, first.0
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl DnsConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.port == 0 {
             return Err(ConfigError::validation(
                 "dns.port",
                 "port must be greater than 0",
+            ));
+        }
+        if self.rate_limit_per_ip > MAX_RATE_LIMIT_PER_IP {
+            return Err(ConfigError::validation(
+                "dns.rate_limit_per_ip",
+                format!(
+                    "rate_limit_per_ip must be 0 (disabled) or between 1 and {MAX_RATE_LIMIT_PER_IP} (got {})",
+                    self.rate_limit_per_ip
+                ),
             ));
         }
         if self.bind.is_empty() {
@@ -562,6 +664,38 @@ impl DnsConfig {
                 "max_tcp_connections must be greater than 0",
             ));
         }
+        // TCP listeners: plain DNS, DoT and DoH. UDP listeners: plain DNS, DoQ
+        // and DoH3. Within one transport, equal nonzero ports cannot bind.
+        reject_port_conflict(
+            ("dns.dot_port", self.dot_port),
+            ("dns.doh_port", self.doh_port),
+            "TCP",
+        )?;
+        reject_port_conflict(
+            ("dns.doq_port", self.doq_port),
+            ("dns.doh3_port", self.doh3_port),
+            "UDP",
+        )?;
+        reject_port_conflict(
+            ("dns.port", self.port),
+            ("dns.dot_port", self.dot_port),
+            "TCP",
+        )?;
+        reject_port_conflict(
+            ("dns.port", self.port),
+            ("dns.doh_port", self.doh_port),
+            "TCP",
+        )?;
+        reject_port_conflict(
+            ("dns.port", self.port),
+            ("dns.doq_port", self.doq_port),
+            "UDP",
+        )?;
+        reject_port_conflict(
+            ("dns.port", self.port),
+            ("dns.doh3_port", self.doh3_port),
+            "UDP",
+        )?;
         if let Some(ref tls) = self.tls {
             tls.validate()?;
         }
@@ -653,6 +787,69 @@ impl CacheConfig {
     }
 }
 
+/// Validates one `zone:algorithm:base64` trust-anchor entry. An operator typo
+/// must fail configuration loading instead of silently producing a different
+/// anchor set (the validator used to default the algorithm to ECDSA P-256).
+fn validate_trust_anchor(anchor: &str) -> Result<(), ConfigError> {
+    use base64::Engine as _;
+
+    let parts: Vec<&str> = anchor.split(':').collect();
+    let (domain, algorithm, encoded) = match parts.as_slice() {
+        [domain, algorithm, encoded] => (domain.trim(), algorithm.trim(), encoded.trim()),
+        [domain, encoded] => (domain.trim(), "13", encoded.trim()),
+        _ => {
+            return Err(ConfigError::validation(
+                "dns.dnssec.trust_anchors",
+                format!("'{anchor}' must be 'zone:algorithm:base64' or 'zone:base64'"),
+            ));
+        }
+    };
+    if domain.is_empty() {
+        return Err(ConfigError::validation(
+            "dns.dnssec.trust_anchors",
+            format!("'{anchor}' has an empty zone name"),
+        ));
+    }
+    let algorithm: u8 = algorithm.parse().map_err(|_| {
+        ConfigError::validation(
+            "dns.dnssec.trust_anchors",
+            format!("'{anchor}' has an unparsable algorithm number '{algorithm}'"),
+        )
+    })?;
+    if !matches!(algorithm, 8 | 10 | 13 | 14 | 15) {
+        return Err(ConfigError::validation(
+            "dns.dnssec.trust_anchors",
+            format!("'{anchor}' uses unsupported DNSSEC algorithm {algorithm}"),
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| {
+            ConfigError::validation(
+                "dns.dnssec.trust_anchors",
+                format!("'{anchor}' has invalid base64 key material: {e}"),
+            )
+        })?;
+    if bytes.is_empty() {
+        return Err(ConfigError::validation(
+            "dns.dnssec.trust_anchors",
+            format!("'{anchor}' has empty key material"),
+        ));
+    }
+    let name = if domain.ends_with('.') {
+        domain.to_string()
+    } else {
+        format!("{domain}.")
+    };
+    hickory_proto::rr::Name::from_str(&name).map_err(|e| {
+        ConfigError::validation(
+            "dns.dnssec.trust_anchors",
+            format!("'{anchor}' has an invalid zone name: {e}"),
+        )
+    })?;
+    Ok(())
+}
+
 fn default_dnssec_mode() -> String {
     "validate".to_string()
 }
@@ -694,7 +891,11 @@ impl DnssecConfig {
                 "dns.dnssec.mode",
                 format!("unrecognized DNSSEC mode: '{}'", self.mode),
             )),
+        }?;
+        for anchor in &self.trust_anchors {
+            validate_trust_anchor(anchor)?;
         }
+        Ok(())
     }
 
     /// Check if a domain matches any configured Negative Trust Anchor (NTA/NTP).
@@ -803,6 +1004,21 @@ pub enum UpstreamStrategy {
     LoadBalance,
 }
 
+/// Policy for forwarding the RFC 7871 EDNS Client Subnet option upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamEcs {
+    /// Strip client ECS options before forwarding. Upstreams only see this
+    /// resolver's address, and all clients share one cache entry per question.
+    #[default]
+    Off,
+    /// Forward client ECS options after validation and prefix clamping
+    /// (IPv4 /24, IPv6 /56, source prefix 0 is dropped). This improves CDN
+    /// accuracy for the client's network but discloses a coarse location
+    /// hint to the upstream resolver and splits cache entries per subnet.
+    Forward,
+}
+
 /// Per-domain upstream forwarder routing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerDomainUpstream {
@@ -821,10 +1037,25 @@ pub struct UpstreamConfig {
     pub strategy: UpstreamStrategy,
     #[serde(default = "default_upstream_timeout_ms")]
     pub timeout_ms: u64,
+    /// Domain queried by upstream health probes; must be a non-empty valid DNS
+    /// name.
     #[serde(default = "default_upstream_probe_domain")]
     pub probe_domain: String,
     #[serde(default = "default_upstream_pool_size")]
     pub pool_size: usize,
+    /// EDNS Client Subnet (ECS) forwarding policy.
+    ///
+    /// `"off"` (default) strips client ECS options, so upstream resolvers only
+    /// see this resolver's address and all clients share the same cache
+    /// entries. `"forward"` forwards client ECS after clamping prefix lengths
+    /// (IPv4 /24, IPv6 /56) and dropping a zero source prefix; this improves
+    /// CDN locality but discloses a coarse client-location hint to the
+    /// upstream and splits the cache by subnet.
+    #[serde(default)]
+    pub ecs: UpstreamEcs,
+    /// Per-domain routing rules. Each rule must list at least one non-empty
+    /// domain (otherwise it can never match) and one non-empty server
+    /// (otherwise matching queries would fail closed with SERVFAIL).
     #[serde(default)]
     pub per_domain: Vec<PerDomainUpstream>,
 }
@@ -857,6 +1088,7 @@ impl Default for UpstreamConfig {
             timeout_ms: default_upstream_timeout_ms(),
             probe_domain: default_upstream_probe_domain(),
             pool_size: default_upstream_pool_size(),
+            ecs: UpstreamEcs::default(),
             per_domain: Vec::new(),
         }
     }
@@ -881,6 +1113,39 @@ impl UpstreamConfig {
                 "upstream.pool_size",
                 "pool_size must be greater than 0",
             ));
+        }
+        let probe_domain = self.probe_domain.trim();
+        if probe_domain.is_empty() {
+            return Err(ConfigError::validation(
+                "upstream.probe_domain",
+                "probe_domain cannot be empty",
+            ));
+        }
+        let probe_name = if probe_domain.ends_with('.') {
+            probe_domain.to_string()
+        } else {
+            format!("{probe_domain}.")
+        };
+        hickory_proto::rr::Name::from_str(&probe_name).map_err(|e| {
+            ConfigError::validation(
+                "upstream.probe_domain",
+                format!("probe_domain '{probe_domain}' is not a valid DNS name: {e}"),
+            )
+        })?;
+
+        for (i, rule) in self.per_domain.iter().enumerate() {
+            if rule.domains.iter().all(|d| d.trim().is_empty()) {
+                return Err(ConfigError::validation(
+                    format!("upstream.per_domain[{i}].domains"),
+                    "per-domain rule must list at least one non-empty domain",
+                ));
+            }
+            if rule.servers.iter().all(|s| s.trim().is_empty()) {
+                return Err(ConfigError::validation(
+                    format!("upstream.per_domain[{i}].servers"),
+                    "per-domain rule must list at least one non-empty upstream server",
+                ));
+            }
         }
         Ok(())
     }
@@ -991,7 +1256,8 @@ pub struct FilterListConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Per-list refresh interval in hours. When unset, the global
-    /// `FilteringConfig.refresh_interval_hours` is used.
+    /// `FilteringConfig.refresh_interval_hours` is used. Must be greater than
+    /// 0 when set; the scheduler would otherwise silently clamp it to 1 hour.
     #[serde(default)]
     pub refresh_hours: Option<u64>,
 }
@@ -1017,6 +1283,11 @@ pub struct FilteringConfig {
     pub fail_closed: bool,
     #[serde(default = "default_filtering_anti_doh_bypass")]
     pub anti_doh_bypass: String,
+    /// Hard cap on the total number of parsed rules (all lists plus custom
+    /// rules). A reload that would exceed the cap is rejected instead of
+    /// materialising an unbounded rule set.
+    #[serde(default = "default_filtering_max_rules")]
+    pub max_rules: usize,
     #[serde(default)]
     pub lists: Vec<FilterListConfig>,
     #[serde(default)]
@@ -1032,6 +1303,9 @@ fn default_filtering_blocking_ttl() -> u32 {
 fn default_filtering_anti_doh_bypass() -> String {
     "off".to_string()
 }
+fn default_filtering_max_rules() -> usize {
+    2_000_000
+}
 
 impl Default for FilteringConfig {
     fn default() -> Self {
@@ -1043,6 +1317,7 @@ impl Default for FilteringConfig {
             cname_cloaking: true,
             fail_closed: true,
             anti_doh_bypass: default_filtering_anti_doh_bypass(),
+            max_rules: default_filtering_max_rules(),
             lists: Vec::new(),
             custom_rules: Vec::new(),
         }
@@ -1057,11 +1332,27 @@ impl FilteringConfig {
                 "refresh_interval_hours must be greater than 0",
             ));
         }
+        if self.max_rules == 0 {
+            return Err(ConfigError::validation(
+                "filtering.max_rules",
+                "max_rules must be greater than 0",
+            ));
+        }
+        let mut seen_names = std::collections::HashSet::new();
         for (i, list) in self.lists.iter().enumerate() {
             if list.name.trim().is_empty() {
                 return Err(ConfigError::validation(
                     format!("filtering.lists[{i}].name"),
                     "filter list name cannot be empty",
+                ));
+            }
+            // List names are the engine's identity (status, per-list refresh,
+            // group references, cache keys); duplicates silently overwrite one
+            // another and must be rejected at config time.
+            if !seen_names.insert(list.name.as_str()) {
+                return Err(ConfigError::validation(
+                    format!("filtering.lists[{i}].name"),
+                    format!("duplicate filter list name '{}'", list.name),
                 ));
             }
             if list.url.trim().is_empty() {
@@ -1078,6 +1369,12 @@ impl FilteringConfig {
                 return Err(ConfigError::validation(
                     format!("filtering.lists[{i}].url"),
                     "filter list URL must use http://, https://, or file:// scheme",
+                ));
+            }
+            if list.refresh_hours == Some(0) {
+                return Err(ConfigError::validation(
+                    format!("filtering.lists[{i}].refresh_hours"),
+                    "refresh_hours must be greater than 0 when set (omit it to use filtering.refresh_interval_hours)",
                 ));
             }
         }
@@ -1279,6 +1576,58 @@ enabled = false
     }
 
     #[test]
+    fn test_upstream_ecs_policy_defaults_off_and_parses_forward() {
+        let base = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+        let default = Config::from_toml_str(base).expect("default config");
+        assert_eq!(default.upstream.ecs, UpstreamEcs::Off);
+
+        let forward =
+            Config::from_toml_str(&format!("{base}ecs = \"forward\"\n")).expect("forward config");
+        assert_eq!(forward.upstream.ecs, UpstreamEcs::Forward);
+
+        let invalid = Config::from_toml_str(&format!("{base}ecs = \"sometimes\"\n"));
+        assert!(invalid.is_err(), "unknown ECS policy must be rejected");
+    }
+
+    /// Regression (audit 6, WP-3.9): two lists with the same `name` silently
+    /// overwrote each other in the engine; the config must reject them.
+    #[test]
+    fn test_filtering_rejects_duplicate_list_names() {
+        let toml_str = r#"
+config_version = 1
+[upstream]
+servers = ["1.1.1.1"]
+
+[filtering]
+lists = [
+    { name = "ads", url = "https://example.com/a.txt" },
+    { name = "ads", url = "https://example.com/b.txt" },
+]
+"#;
+        let err = Config::from_toml_str(toml_str).unwrap_err();
+        match err {
+            ConfigError::Validation { field, .. } => {
+                assert_eq!(field, "filtering.lists[1].name");
+            }
+            other => panic!("expected validation error on filtering.lists[1].name, got: {other:?}"),
+        }
+
+        // Distinct names in the same positions stay accepted.
+        let ok = r#"
+config_version = 1
+[upstream]
+servers = ["1.1.1.1"]
+
+[filtering]
+lists = [
+    { name = "ads", url = "https://example.com/a.txt" },
+    { name = "trackers", url = "https://example.com/b.txt" },
+]
+"#;
+        Config::from_toml_str(ok).expect("distinct list names must parse");
+    }
+
+    #[test]
     fn test_blocking_mode_deserialization() {
         let toml_null = "config_version = 1\n[filtering]\nblocking_mode = \"null_rdata\"\n[upstream]\nservers = [\"1.1.1.1\"]";
         let cfg = Config::from_toml_str(toml_null).unwrap();
@@ -1385,5 +1734,197 @@ key = "/path/to/key.pem"
         );
         assert_ne!(cfg.dns.dot_port, cfg.dns.doq_port);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_trust_anchor_validation_rejects_malformed_entries() {
+        let base = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+
+        for (anchor, needle) in [
+            ("", "must be 'zone:algorithm:base64'"),
+            ("com:not-a-number:AQID", "unparsable algorithm"),
+            ("com:99:AQID", "unsupported DNSSEC algorithm 99"),
+            ("com:13:!!!not-base64!!!", "invalid base64"),
+            ("com:13:", "empty key material"),
+            ("bad..name:13:AQID", "invalid zone name"),
+        ] {
+            let toml = format!("{base}[dns.dnssec]\ntrust_anchors = [\"{anchor}\"]\n");
+            // `from_toml_str` validates eagerly, so accept the error from
+            // either stage.
+            let message = match Config::from_toml_str(&toml) {
+                Ok(config) => config
+                    .validate()
+                    .expect_err(&format!("'{anchor}' must be rejected"))
+                    .to_string(),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                message.contains(needle),
+                "unexpected error for '{anchor}': {message}"
+            );
+        }
+
+        // A well-formed anchor is accepted.
+        let toml = format!("{base}[dns.dnssec]\ntrust_anchors = [\"com:13:AQIDBA==\"]\n");
+        let config = Config::from_toml_str(&toml).expect("parses");
+        config.validate().expect("valid anchor");
+    }
+
+    /// Base TOML with the required upstream section.
+    const TEST_BASE: &str = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+
+    fn expect_validation_field(toml: &str, expected: &str) {
+        let err = Config::from_toml_str(toml)
+            .expect_err(&format!("config must be rejected (expected {expected})"));
+        match err {
+            ConfigError::Validation { field, .. } => assert_eq!(field, expected),
+            other => panic!("expected validation error on {expected}, got {other:?}"),
+        }
+    }
+
+    /// Audit 6 / WP-6.5: the transports size the token-bucket burst as
+    /// `rate_limit_per_ip * 2`, so the value must be bounded.
+    #[test]
+    fn test_rate_limit_per_ip_upper_bound() {
+        let over = format!(
+            "{TEST_BASE}[dns]\nrate_limit_per_ip = {}\n",
+            MAX_RATE_LIMIT_PER_IP + 1
+        );
+        expect_validation_field(&over, "dns.rate_limit_per_ip");
+
+        let at_bound = format!("{TEST_BASE}[dns]\nrate_limit_per_ip = {MAX_RATE_LIMIT_PER_IP}\n");
+        Config::from_toml_str(&at_bound).expect("the documented bound must be accepted");
+
+        let disabled = format!("{TEST_BASE}[dns]\nrate_limit_per_ip = 0\n");
+        Config::from_toml_str(&disabled).expect("0 disables rate limiting");
+    }
+
+    /// Audit 6 / WP-6.5: `retention_days = 0` deleted every query-log row on
+    /// the next sweep instead of being rejected.
+    #[test]
+    fn test_stats_retention_days_zero_rejected() {
+        expect_validation_field(
+            &format!("{TEST_BASE}[stats]\nretention_days = 0\n"),
+            "stats.retention_days",
+        );
+        // The legacy alias is validated through the same path.
+        expect_validation_field(
+            &format!("{TEST_BASE}[stats]\nquery_log_retention_days = 0\n"),
+            "stats.retention_days",
+        );
+        Config::from_toml_str(&format!("{TEST_BASE}[stats]\nretention_days = 1\n"))
+            .expect("retention_days = 1 must be accepted");
+    }
+
+    /// Audit 6 / WP-6.5: `web.port = 0` requested an ephemeral port that
+    /// clients cannot discover; it must be rejected.
+    #[test]
+    fn test_web_port_zero_rejected() {
+        expect_validation_field(&format!("{TEST_BASE}[web]\nport = 0\n"), "web.port");
+        Config::from_toml_str(&format!("{TEST_BASE}[web]\nport = 8080\n"))
+            .expect("a non-zero web port must be accepted");
+    }
+
+    /// Audit 6 / WP-6.5: two TCP listeners on one port cannot both bind.
+    #[test]
+    fn test_dns_rejects_tcp_port_collisions() {
+        for (ports, field) in [
+            ("dot_port = 9443\ndoh_port = 9443", "dns.doh_port"),
+            ("port = 8853\ndot_port = 8853", "dns.dot_port"),
+            ("port = 8443\ndoh_port = 8443", "dns.doh_port"),
+        ] {
+            expect_validation_field(&format!("{TEST_BASE}[dns]\n{ports}\n"), field);
+        }
+    }
+
+    /// Audit 6 / WP-6.5: two UDP listeners on one port cannot both bind.
+    #[test]
+    fn test_dns_rejects_udp_port_collisions() {
+        for (ports, field) in [
+            ("doq_port = 8853\ndoh3_port = 8853", "dns.doh3_port"),
+            ("port = 8853\ndoq_port = 8853", "dns.doq_port"),
+            ("port = 8443\ndoh3_port = 8443", "dns.doh3_port"),
+        ] {
+            expect_validation_field(&format!("{TEST_BASE}[dns]\n{ports}\n"), field);
+        }
+    }
+
+    /// Different transports may share a port number (TCP vs UDP).
+    #[test]
+    fn test_dns_allows_cross_transport_port_sharing() {
+        let toml = format!(
+            "{TEST_BASE}[dns]\ndot_port = 853\ndoq_port = 853\ndoh_port = 443\ndoh3_port = 443\n"
+        );
+        Config::from_toml_str(&toml)
+            .expect("DoT/DoQ and DoH/DoH3 may share a port number across transports");
+    }
+
+    /// Audit 6 / WP-6.5: a zero session TTL creates sessions that are already
+    /// expired.
+    #[test]
+    fn test_auth_session_ttl_zero_rejected() {
+        expect_validation_field(
+            &format!("{TEST_BASE}[auth]\nsession_ttl_hours = 0\n"),
+            "auth.session_ttl_hours",
+        );
+        Config::from_toml_str(&format!("{TEST_BASE}[auth]\nsession_ttl_hours = 1\n"))
+            .expect("a one-hour session TTL must be accepted");
+    }
+
+    /// Audit 6 / WP-6.5: a per-list `refresh_hours = 0` was silently clamped
+    /// to one hour by the scheduler.
+    #[test]
+    fn test_filtering_list_refresh_hours_zero_rejected() {
+        let zero = format!(
+            "{TEST_BASE}[filtering]\nlists = [{{ name = \"ads\", url = \"https://example.com/a.txt\", refresh_hours = 0 }}]\n"
+        );
+        expect_validation_field(&zero, "filtering.lists[0].refresh_hours");
+
+        let omitted = format!(
+            "{TEST_BASE}[filtering]\nlists = [{{ name = \"ads\", url = \"https://example.com/a.txt\" }}]\n"
+        );
+        Config::from_toml_str(&omitted)
+            .expect("omitting refresh_hours must use the global interval");
+
+        let positive = format!(
+            "{TEST_BASE}[filtering]\nlists = [{{ name = \"ads\", url = \"https://example.com/a.txt\", refresh_hours = 24 }}]\n"
+        );
+        Config::from_toml_str(&positive).expect("a positive refresh_hours must be accepted");
+    }
+
+    /// Audit 6 / WP-6.5: an empty or malformed probe domain made every
+    /// upstream health probe fail at runtime.
+    #[test]
+    fn test_upstream_probe_domain_validated() {
+        expect_validation_field(
+            "config_version = 1\n[upstream]\nprobe_domain = \"\"\n",
+            "upstream.probe_domain",
+        );
+        expect_validation_field(
+            "config_version = 1\n[upstream]\nprobe_domain = \"bad..name\"\n",
+            "upstream.probe_domain",
+        );
+        Config::from_toml_str("config_version = 1\n[upstream]\nprobe_domain = \"example.com\"\n")
+            .expect("a valid probe domain must be accepted");
+    }
+
+    /// Audit 6 / WP-6.5: per-domain rules without domains can never match and
+    /// rules without servers fail closed with SERVFAIL.
+    #[test]
+    fn test_upstream_per_domain_requires_domains_and_servers() {
+        expect_validation_field(
+            &format!(
+                "{TEST_BASE}[[upstream.per_domain]]\ndomains = []\nservers = [\"192.168.1.1\"]\n"
+            ),
+            "upstream.per_domain[0].domains",
+        );
+        expect_validation_field(
+            &format!("{TEST_BASE}[[upstream.per_domain]]\ndomains = [\"lan\"]\nservers = []\n"),
+            "upstream.per_domain[0].servers",
+        );
+        Config::from_toml_str(&format!(
+            "{TEST_BASE}[[upstream.per_domain]]\ndomains = [\"lan\"]\nservers = [\"192.168.1.1\"]\n"
+        ))
+        .expect("a complete per-domain rule must be accepted");
     }
 }

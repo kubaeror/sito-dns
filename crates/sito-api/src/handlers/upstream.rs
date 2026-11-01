@@ -100,6 +100,7 @@ pub async fn update_upstream_config(
         timeout_ms: dto.timeout_ms,
         probe_domain: dto.probe_domain.clone(),
         pool_size: dto.pool_size,
+        ecs: new_config.upstream.ecs,
         per_domain: new_config.upstream.per_domain,
     };
 
@@ -133,7 +134,7 @@ pub async fn update_upstream_config(
         return Err(e);
     }
     ctx.set_config(new_config);
-    crate::publish_bundle(&ctx);
+    crate::publish_bundle(&ctx).await;
 
     Ok(Json(dto))
 }

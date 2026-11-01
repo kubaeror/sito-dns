@@ -6,11 +6,38 @@
 use hickory_proto::rr::RecordType;
 use sito_core::client::ClientContext;
 use sito_core::verdict::{BlockReason, RewriteAction, Verdict};
+use sito_filter::DnsRewriteRule;
 use sito_filter::engine::FilterSnapshot;
-use sito_filter::parser::parse_rules;
+use sito_filter::parser::{parse_line, parse_rules};
 
 fn default_client() -> ClientContext {
     ClientContext::new("192.168.1.100".parse().unwrap())
+}
+
+/// Collects the effective rewrite list for `domain` exactly like the DNS
+/// pipeline does: all matching rewrites, with exception cancellations applied.
+fn effective_rewrites(
+    snapshot: &FilterSnapshot,
+    domain: &str,
+    rtype: RecordType,
+    client: &ClientContext,
+) -> Vec<DnsRewriteRule> {
+    let mut allow = Vec::new();
+    let mut block = Vec::new();
+    snapshot
+        .allowlist
+        .collect_candidates(domain, &snapshot.interner, &mut allow);
+    snapshot
+        .blocklist
+        .collect_candidates(domain, &snapshot.interner, &mut block);
+    let mut rules = snapshot.collect_rewrite_rules(domain, rtype, client, &block, false);
+    let mut cancellations =
+        snapshot.collect_rewrite_cancellations(domain, rtype, client, &allow, false);
+    // `$important` exceptions outrank standard rewrites.
+    cancellations
+        .extend(snapshot.collect_rewrite_cancellations(domain, rtype, client, &allow, true));
+    sito_filter::apply_rewrite_cancellations(&mut rules, &cancellations);
+    rules
 }
 
 #[test]
@@ -703,4 +730,339 @@ fn test_conformance_corpus_200_rules() {
             );
         }
     }
+}
+
+// --- AdGuard semantics regressions (audit 6, WP-3.5) ---
+
+#[test]
+fn test_conformance_bare_domain_blocks_exact_host_only() {
+    // AdGuard: `example.org` blocks example.org but not its subdomains.
+    let snapshot = FilterSnapshot::compile(parse_rules("example.org\n", "conformance").0);
+    let client = default_client();
+    assert!(matches!(
+        snapshot.evaluate("example.org", RecordType::A, &client),
+        Verdict::Block(_)
+    ));
+    assert!(matches!(
+        snapshot.evaluate("www.example.org", RecordType::A, &client),
+        Verdict::Allow(None)
+    ));
+}
+
+#[test]
+fn test_conformance_path_rule_is_inert_at_dns_level() {
+    // `||example.com/path` cannot match a DNS query and must not be widened
+    // into a domain block.
+    let snapshot = FilterSnapshot::compile(parse_rules("||path-rule.example/\n", "conformance").0);
+    let client = default_client();
+    assert!(matches!(
+        snapshot.evaluate("path-rule.example", RecordType::A, &client),
+        Verdict::Allow(None)
+    ));
+    assert!(matches!(
+        snapshot.evaluate("sub.path-rule.example", RecordType::A, &client),
+        Verdict::Allow(None)
+    ));
+}
+
+#[test]
+fn test_conformance_denyallow_on_exception_rule() {
+    // `@@*$denyallow=blocked.example` allows everything except
+    // blocked.example; the denyallow domain must stay blocked.
+    let rules = "
+@@*$denyallow=blocked.example
+||blocked.example^
+";
+    let snapshot = FilterSnapshot::compile(parse_rules(rules, "conformance").0);
+    let client = default_client();
+    assert!(
+        matches!(
+            snapshot.evaluate("blocked.example", RecordType::A, &client),
+            Verdict::Block(_)
+        ),
+        "denyallow domains must not be allowed by the exception"
+    );
+    assert!(matches!(
+        snapshot.evaluate("other.example", RecordType::A, &client),
+        Verdict::Allow(_)
+    ));
+    assert!(matches!(
+        snapshot.evaluate("sub.blocked.example", RecordType::A, &client),
+        Verdict::Block(_)
+    ));
+}
+
+#[test]
+fn test_conformance_dnsrewrite_ptr_and_txt() {
+    // PTR and TXT rewrites must both parse and produce a rewrite verdict; the
+    // DNS pipeline synthesizes the corresponding records.
+    let rules = "
+||4.3.2.1.in-addr.arpa^$dnsrewrite=NOERROR;PTR;printer.lan.
+||txt-rewrite.example^$dnsrewrite=NOERROR;TXT;hello;world
+";
+    let snapshot = FilterSnapshot::compile(parse_rules(rules, "conformance").0);
+    let client = default_client();
+
+    match snapshot.evaluate("4.3.2.1.in-addr.arpa", RecordType::PTR, &client) {
+        Verdict::Rewrite(RewriteAction::DnsRewrite {
+            rcode,
+            rtype,
+            value,
+        }) => {
+            assert_eq!(rcode, "NOERROR");
+            assert_eq!(rtype.as_deref(), Some("PTR"));
+            assert_eq!(value.as_deref(), Some("printer.lan."));
+        }
+        other => panic!("expected PTR rewrite, got {other:?}"),
+    }
+
+    match snapshot.evaluate("txt-rewrite.example", RecordType::TXT, &client) {
+        Verdict::Rewrite(RewriteAction::DnsRewrite {
+            rcode,
+            rtype,
+            value,
+        }) => {
+            assert_eq!(rcode, "NOERROR");
+            assert_eq!(rtype.as_deref(), Some("TXT"));
+            // Remaining semicolons belong to the TXT data (they are not a
+            // second record separator).
+            assert_eq!(value.as_deref(), Some("hello;world"));
+        }
+        other => panic!("expected TXT rewrite, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_conformance_dnsrewrite_unsupported_types_rejected() {
+    // Types the pipeline cannot synthesize are rejected at parse time instead
+    // of being accepted and silently answered as NODATA.
+    assert!(
+        parse_line(
+            "||ns-rewrite.example^$dnsrewrite=NOERROR;NS;ns.example.net",
+            "conformance",
+            1
+        )
+        .is_none()
+    );
+    assert!(
+        parse_line(
+            "||mx-rewrite.example^$dnsrewrite=NOERROR;MX;mail.example.net",
+            "conformance",
+            2
+        )
+        .is_none()
+    );
+    // The supported set still parses.
+    assert!(
+        parse_line(
+            "||ptr-rewrite.example^$dnsrewrite=NOERROR;PTR;host.example.net",
+            "conformance",
+            3
+        )
+        .is_some()
+    );
+    assert!(
+        parse_line(
+            "||txt-rewrite.example^$dnsrewrite=NOERROR;TXT;data",
+            "conformance",
+            4
+        )
+        .is_some()
+    );
+}
+
+#[test]
+fn test_conformance_dnsrewrite_aggregates_all_matching_values() {
+    // AdGuard returns every A/AAAA value contributed by matching rewrite
+    // rules, not just the first one.
+    let rules = "
+||multi-rewrite.example^$dnsrewrite=1.2.3.4
+||multi-rewrite.example^$dnsrewrite=5.6.7.8
+||multi-rewrite.example^$dnsrewrite=NOERROR;AAAA;2001:db8::1
+";
+    let snapshot = FilterSnapshot::compile(parse_rules(rules, "conformance").0);
+    let client = default_client();
+
+    assert!(matches!(
+        snapshot.evaluate("multi-rewrite.example", RecordType::A, &client),
+        Verdict::Rewrite(_)
+    ));
+
+    let rewrites = effective_rewrites(&snapshot, "multi-rewrite.example", RecordType::A, &client);
+    let values: Vec<&str> = rewrites
+        .iter()
+        .filter_map(|rule| rule.value.as_deref())
+        .collect();
+    assert_eq!(rewrites.len(), 3, "all matching rewrites must be kept");
+    assert!(values.contains(&"1.2.3.4"));
+    assert!(values.contains(&"5.6.7.8"));
+    assert!(values.contains(&"2001:db8::1"));
+}
+
+#[test]
+fn test_conformance_dnsrewrite_bare_exception_cancels_all() {
+    // `@@||x^$dnsrewrite` cancels every matching rewrite instead of acting as
+    // an allow verdict.
+    let rules = "
+||cancel-all.example^$dnsrewrite=1.2.3.4
+@@||cancel-all.example^$dnsrewrite
+";
+    let snapshot = FilterSnapshot::compile(parse_rules(rules, "conformance").0);
+    let client = default_client();
+
+    // The exception is not an allow verdict: the rewrite rule still matches.
+    assert!(matches!(
+        snapshot.evaluate("cancel-all.example", RecordType::A, &client),
+        Verdict::Rewrite(_)
+    ));
+    assert!(
+        effective_rewrites(&snapshot, "cancel-all.example", RecordType::A, &client).is_empty(),
+        "bare exception must cancel every rewrite"
+    );
+
+    // A cancellation-only exception must not unblock a plain blocking rule.
+    let plain = "
+||plain-block.example^
+@@||plain-block.example^$dnsrewrite
+";
+    let snapshot = FilterSnapshot::compile(parse_rules(plain, "conformance").0);
+    assert!(matches!(
+        snapshot.evaluate("plain-block.example", RecordType::A, &client),
+        Verdict::Block(_)
+    ));
+}
+
+#[test]
+fn test_conformance_dnsrewrite_exception_cancels_specific_value() {
+    // `@@||x^$dnsrewrite=value` cancels only the identical rewrite.
+    let rules = "
+||cancel-one.example^$dnsrewrite=1.2.3.4
+||cancel-one.example^$dnsrewrite=5.6.7.8
+@@||cancel-one.example^$dnsrewrite=1.2.3.4
+";
+    let snapshot = FilterSnapshot::compile(parse_rules(rules, "conformance").0);
+    let client = default_client();
+
+    let rewrites = effective_rewrites(&snapshot, "cancel-one.example", RecordType::A, &client);
+    assert_eq!(rewrites.len(), 1, "only the named rewrite is cancelled");
+    assert_eq!(rewrites[0].rtype.as_deref(), Some("A"));
+    assert_eq!(rewrites[0].value.as_deref(), Some("5.6.7.8"));
+
+    // The explicit rcode;rtype;value form is equivalent.
+    let explicit = "
+||cancel-explicit.example^$dnsrewrite=NOERROR;A;1.2.3.4
+||cancel-explicit.example^$dnsrewrite=5.6.7.8
+@@||cancel-explicit.example^$dnsrewrite=NOERROR;A;1.2.3.4
+";
+    let snapshot = FilterSnapshot::compile(parse_rules(explicit, "conformance").0);
+    let rewrites = effective_rewrites(&snapshot, "cancel-explicit.example", RecordType::A, &client);
+    assert_eq!(rewrites.len(), 1);
+    assert_eq!(rewrites[0].value.as_deref(), Some("5.6.7.8"));
+}
+
+#[test]
+fn test_conformance_client_quoted_names_and_escapes() {
+    // AdGuard allows single/double quotes and `\` escapes for client names
+    // containing spaces, commas, pipes and quotes. `~` stays outside quotes.
+    let rules = r#"
+||quoted-space.example^$client='Frank\'s laptop'
+||quoted-comma.example^$client="Mary's, John's, and Boris's laptops"
+||quoted-pipe.example^$client='Device|With|Pipes'
+||quoted-negated.example^$client=~'Mary\'s\, John\'s\, and Boris\'s laptops'
+"#;
+    let (parsed, skipped) = parse_rules(rules, "conformance");
+    assert_eq!(skipped, 0, "quoted client rules must not be dropped");
+    let snapshot = FilterSnapshot::compile(parsed);
+
+    let frank =
+        ClientContext::new("192.168.1.10".parse().unwrap()).with_client_name("Frank's laptop");
+    let mary = ClientContext::new("192.168.1.11".parse().unwrap())
+        .with_client_name("Mary's, John's, and Boris's laptops");
+    let pipes =
+        ClientContext::new("192.168.1.12".parse().unwrap()).with_client_name("Device|With|Pipes");
+    let other = ClientContext::new("192.168.1.13".parse().unwrap()).with_client_name("other");
+
+    assert!(matches!(
+        snapshot.evaluate("quoted-space.example", RecordType::A, &frank),
+        Verdict::Block(_)
+    ));
+    assert!(matches!(
+        snapshot.evaluate("quoted-space.example", RecordType::A, &other),
+        Verdict::Allow(None)
+    ));
+
+    assert!(matches!(
+        snapshot.evaluate("quoted-comma.example", RecordType::A, &mary),
+        Verdict::Block(_)
+    ));
+    assert!(matches!(
+        snapshot.evaluate("quoted-comma.example", RecordType::A, &other),
+        Verdict::Allow(None)
+    ));
+
+    assert!(matches!(
+        snapshot.evaluate("quoted-pipe.example", RecordType::A, &pipes),
+        Verdict::Block(_)
+    ));
+    assert!(matches!(
+        snapshot.evaluate("quoted-pipe.example", RecordType::A, &other),
+        Verdict::Allow(None)
+    ));
+
+    // Inverted quoted name: excluded for Mary, applies to everyone else.
+    assert!(matches!(
+        snapshot.evaluate("quoted-negated.example", RecordType::A, &mary),
+        Verdict::Allow(None)
+    ));
+    assert!(matches!(
+        snapshot.evaluate("quoted-negated.example", RecordType::A, &other),
+        Verdict::Block(_)
+    ));
+
+    // Quoting must not break CIDR/IP/negation parsing.
+    let basic = "||cidr-quoted.example^$client=10.0.0.0/8|~10.1.2.99\n";
+    let snapshot = FilterSnapshot::compile(parse_rules(basic, "conformance").0);
+    let cidr = ClientContext::new("10.1.2.3".parse().unwrap());
+    let negated = ClientContext::new("10.1.2.99".parse().unwrap());
+    let outside = ClientContext::new("172.16.0.1".parse().unwrap());
+    assert!(matches!(
+        snapshot.evaluate("cidr-quoted.example", RecordType::A, &cidr),
+        Verdict::Block(_)
+    ));
+    assert!(matches!(
+        snapshot.evaluate("cidr-quoted.example", RecordType::A, &negated),
+        Verdict::Allow(None)
+    ));
+    assert!(matches!(
+        snapshot.evaluate("cidr-quoted.example", RecordType::A, &outside),
+        Verdict::Allow(None)
+    ));
+}
+
+#[test]
+fn test_conformance_dnsrewrite_important_exception_cancels_standard_rewrite() {
+    // An `$important` cancellation-only exception outranks a standard rewrite.
+    let rules = "
+||important-cancel.example^$dnsrewrite=1.2.3.4
+@@||important-cancel.example^$dnsrewrite,important
+";
+    let (parsed, skipped) = parse_rules(rules, "conformance");
+    assert_eq!(skipped, 0);
+    let snapshot = FilterSnapshot::compile(parsed);
+    let client = default_client();
+
+    assert!(matches!(
+        snapshot.evaluate("important-cancel.example", RecordType::A, &client),
+        Verdict::Rewrite(_)
+    ));
+    assert!(
+        effective_rewrites(
+            &snapshot,
+            "important-cancel.example",
+            RecordType::A,
+            &client
+        )
+        .is_empty(),
+        "an important exception must cancel a standard rewrite"
+    );
 }

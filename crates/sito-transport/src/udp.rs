@@ -73,13 +73,19 @@ pub fn create_reuseport_udp_socket(addr: &SocketAddr) -> std::io::Result<std::ne
     #[cfg(unix)]
     unsafe {
         let opt: libc::c_int = 1;
-        libc::setsockopt(
+        let rc = libc::setsockopt(
             socket.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_REUSEPORT,
             (&raw const opt).cast::<libc::c_void>(),
             std::mem::size_of_val(&opt) as libc::socklen_t,
         );
+        if rc != 0 {
+            // Without SO_REUSEPORT the multi-worker fan-out cannot bind the
+            // same address repeatedly; surface the real cause instead of a
+            // confusing EADDRINUSE on worker 2.
+            return Err(std::io::Error::last_os_error());
+        }
     }
 
     if addr.is_ipv6() {
@@ -103,7 +109,7 @@ pub fn start_udp_listener<H: QueryHandler>(
     let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
         Arc::new(RateLimiter::new(
             config.rate_limit_per_ip,
-            config.rate_limit_per_ip * 2,
+            RateLimiter::burst_for_rate(config.rate_limit_per_ip),
         ))
     });
     let mut tasks = Vec::new();
@@ -112,7 +118,11 @@ pub fn start_udp_listener<H: QueryHandler>(
     for worker_id in 0..config.worker_count {
         let std_socket = create_reuseport_udp_socket(&config.bind_addr)?;
         let local_addr = std_socket.local_addr()?;
-        let async_fd = Arc::new(AsyncFd::new(std_socket)?);
+        // SAFETY: `std_socket` is moved into the `AsyncFd` and is never
+        // closed, replaced or duplicated through another handle while it is
+        // owned; `register` is the I/O-safety-preserving constructor
+        // (`AsyncFd::new` is deprecated as unsound).
+        let async_fd = Arc::new(unsafe { AsyncFd::register(std_socket) }?);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(1024));
 
         let handler = Arc::clone(handler);
@@ -131,8 +141,8 @@ pub fn start_udp_listener<H: QueryHandler>(
 
             loop {
                 tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
                             debug!("UDP worker #{} stopping due to cancellation", worker_id);
                             break;
                         }

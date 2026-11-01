@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, trace, warn};
 
 use sito_core::client::ClientContext;
-use sito_proto::{decode_message, encode_message};
+use sito_proto::{decode_message, encode_message, truncate_for_framing};
 
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
@@ -20,7 +20,10 @@ use crate::tls::TlsAcceptorManager;
 
 /// Maximum DNS message size accepted over a DoQ stream (RFC 9250, 2-octet
 /// length prefix; the DNS-over-TCP ceiling is 65535 bytes).
-const MAX_DOQ_MESSAGE_BYTES: usize = 65_535;
+/// RFC 9250 §4.3 DoQ stream error codes used when abandoning a stream.
+const DOQ_INTERNAL_ERROR: u32 = 1;
+const DOQ_PROTOCOL_ERROR: u32 = 2;
+const DOQ_EXCESSIVE_LOAD: u32 = 4;
 
 /// Upper bound on handling a single QUIC stream: a client that opens a stream
 /// and never completes the length prefix/body must not pin a task forever.
@@ -115,7 +118,7 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
     let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
         Arc::new(RateLimiter::new(
             config.rate_limit_per_ip,
-            config.rate_limit_per_ip * 2,
+            RateLimiter::burst_for_rate(config.rate_limit_per_ip),
         ))
     });
     rate_limiter.spawn_pruner(shutdown_rx.clone());
@@ -128,8 +131,8 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = accept_shutdown_rx.changed() => {
-                    if *accept_shutdown_rx.borrow() {
+                res = accept_shutdown_rx.changed() => {
+                    if res.is_err() || *accept_shutdown_rx.borrow() {
                         debug!("DoQ listener stopping due to shutdown");
                         endpoint_accept.close(0u32.into(), b"Server shutdown");
                         break;
@@ -172,31 +175,38 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                         trace!("DoQ QUIC connection established from {}", peer_addr);
 
                         // Process incoming bidirectional streams (RFC 9250 section 4.2)
-                        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        while let Ok((send, recv)) = conn.accept_bi().await {
                             let handler = Arc::clone(&handler);
                             let sni = sni.clone();
                             let stream_limiter = Arc::clone(&rate_limiter);
 
                             tokio::spawn(async move {
+                              let mut send = send;
+                              let mut recv = recv;
                               let timed = tokio::time::timeout(
                                 STREAM_TIMEOUT,
-                                async move {
+                                async {
                                 // RFC 9250: Each stream carries a single query preceded by a 2-octet length prefix
                                 let mut len_buf = [0u8; 2];
                                 if let Err(e) = recv.read_exact(&mut len_buf).await {
                                     trace!("DoQ stream failed reading length prefix from {}: {}", peer_addr, e);
+                                    // RFC 9250 §4.3: abandon the stream explicitly
+                                    // instead of leaving the client waiting.
+                                    let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
                                     return;
                                 }
 
                                 let query_len = u16::from_be_bytes(len_buf) as usize;
-                                if query_len == 0 || query_len > MAX_DOQ_MESSAGE_BYTES {
-                                    warn!("DoQ invalid query length {} from {}", query_len, peer_addr);
+                                if query_len == 0 {
+                                    warn!("DoQ zero-length query from {}", peer_addr);
+                                    let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
                                     return;
                                 }
 
                                 let mut query_buf = vec![0u8; query_len];
                                 if let Err(e) = recv.read_exact(&mut query_buf).await {
                                     warn!("DoQ stream failed reading query body from {}: {}", peer_addr, e);
+                                    let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
                                     return;
                                 }
 
@@ -208,13 +218,29 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                         "DoQ per-query rate limit exceeded for client {}",
                                         client_ip
                                     );
+                                    let _ = send.reset(DOQ_EXCESSIVE_LOAD.into());
                                     return;
                                 }
 
                                 let query = match decode_message(&query_buf) {
-                                    Ok(q) => q,
+                                    Ok(mut q) => {
+                                        // RFC 9250 §4.2.1: the DNS Message ID on
+                                        // the wire MUST be 0; a non-zero ID is a
+                                        // protocol error (§4.3.3).
+                                        if q.metadata.id != 0 {
+                                            warn!(
+                                                "DoQ query with non-zero message ID {} from {}",
+                                                q.metadata.id, peer_addr
+                                            );
+                                            let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
+                                            return;
+                                        }
+                                        q.metadata.id = 0;
+                                        q
+                                    }
                                     Err(e) => {
                                         warn!("DoQ failed decoding DNS query from {}: {}", peer_addr, e);
+                                        let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
                                         return;
                                     }
                                 };
@@ -224,16 +250,37 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                     None => ClientContext::new(client_ip).with_proto("doq"),
                                 };
 
-                                if let Some(response) = handler.handle(query, client_ctx).await {
+                                if let Some(mut response) = handler.handle(query, client_ctx).await {
+                                    // RFC 9250 §4.2.1: responses always carry ID 0.
+                                    response.metadata.id = 0;
                                     match encode_message(&response) {
                                         Ok(encoded) => {
+                                            let encoded =
+                                                if frame_prefix(encoded.len()).is_none() {
+                                                    warn!(
+                                                        "DoQ response of {} bytes exceeds the 65535-byte limit; sending TC=1",
+                                                        encoded.len()
+                                                    );
+                                                    let Some(truncated) =
+                                                        truncate_for_framing(&encoded)
+                                                    else {
+                                                        warn!(
+                                                            "DoQ response from {} could not be truncated to fit the 65535-byte limit",
+                                                            peer_addr
+                                                        );
+                                                        let _ = send.reset(DOQ_INTERNAL_ERROR.into());
+                                                        return;
+                                                    };
+                                                    truncated
+                                                } else {
+                                                    encoded
+                                                };
                                             let Some(resp_len) = frame_prefix(encoded.len()) else {
-                                                warn!(
-                                                    "DoQ response of {} bytes exceeds the 65535-byte DNS message limit; dropping",
-                                                    encoded.len()
-                                                );
+                                                let _ = send.reset(DOQ_INTERNAL_ERROR.into());
                                                 return;
                                             };
+                                            // A write error means the peer already
+                                            // abandoned the stream; no reset needed.
                                             if let Err(e) = send.write_all(&resp_len).await {
                                                 trace!("DoQ write length error to {}: {}", peer_addr, e);
                                                 return;
@@ -246,6 +293,7 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                         }
                                         Err(e) => {
                                             warn!("DoQ failed to encode response to {}: {}", peer_addr, e);
+                                            let _ = send.reset(DOQ_INTERNAL_ERROR.into());
                                         }
                                     }
                                 }
@@ -254,6 +302,10 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                               .await;
                               if timed.is_err() {
                                   debug!("DoQ stream from {} timed out", peer_addr);
+                                  // A client that never completes the length
+                                  // prefix/body gets an explicit protocol error
+                                  // instead of a silently finished stream.
+                                  let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
                               }
                             });
                         }
@@ -271,8 +323,8 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
             let mut last_config = mgr.current_config();
             loop {
                 tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
                             break;
                         }
                     }
@@ -311,7 +363,8 @@ mod tests {
     async fn test_doq_query_and_response() {
         let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
 
-        let temp_dir = std::env::temp_dir().join(format!("sito_doq_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_doq_test_qr_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
         let cert_file = temp_dir.join("cert.pem");
         let key_file = temp_dir.join("key.pem");
@@ -378,7 +431,8 @@ mod tests {
 
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
 
-        let mut query = Message::new(9901, MessageType::Query, OpCode::Query);
+        // RFC 9250 §4.2.1: the on-the-wire message ID must be 0.
+        let mut query = Message::new(0, MessageType::Query, OpCode::Query);
         query.queries.push(Query::query(
             Name::from_str("doq-test.example.com.").unwrap(),
             RecordType::A,
@@ -398,12 +452,217 @@ mod tests {
         recv.read_exact(&mut resp_buf).await.unwrap();
 
         let dns_resp = decode_message(&resp_buf).unwrap();
-        assert_eq!(dns_resp.metadata.id, 9901);
+        assert_eq!(dns_resp.metadata.id, 0);
         assert_eq!(dns_resp.answers.len(), 1);
         assert_eq!(
             dns_resp.answers[0].data,
             RData::A(A(std::net::Ipv4Addr::new(9, 9, 9, 9)))
         );
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_doq_rejects_non_zero_message_id() {
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_doq_test_badid_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        std::fs::write(&cert_file, &cert_pem).unwrap();
+        std::fs::write(&key_file, &key_pem).unwrap();
+
+        let server_config =
+            crate::tls::load_server_config(&cert_file, &key_file, &[], vec![b"doq".to_vec()])
+                .unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = udp_socket.local_addr().unwrap().port();
+        drop(udp_socket);
+
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
+
+        let handler = Arc::new(|query: Message, client: ClientContext| async move {
+            assert_eq!(client.proto, "doq");
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::NoError;
+            let qname = query.queries[0].name().clone();
+            resp.answers.push(Record::from_rdata(
+                qname,
+                300,
+                RData::A(A(std::net::Ipv4Addr::new(9, 9, 9, 9))),
+            ));
+            Some(resp)
+        });
+
+        let _handle = start_doq_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Build Quinn client
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
+        root_store.add(cert_der).unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"doq".to_vec()];
+
+        let quic_client_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls)).unwrap();
+        let client_cfg = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
+
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_cfg);
+
+        let conn = client_endpoint
+            .connect(actual_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+
+        // RFC 9250 §4.3.3: a non-zero message ID is a fatal protocol error.
+        let mut query = Message::new(1234, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("doq-test.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let wire = encode_message(&query).unwrap();
+
+        let len_prefix = (wire.len() as u16).to_be_bytes();
+        send.write_all(&len_prefix).await.unwrap();
+        send.write_all(&wire).await.unwrap();
+        send.finish().unwrap();
+
+        // The server must abandon the stream with DOQ_PROTOCOL_ERROR (2).
+        let mut resp_len_buf = [0u8; 2];
+        let err = recv
+            .read_exact(&mut resp_len_buf)
+            .await
+            .expect_err("a non-zero message ID must be rejected");
+        match err {
+            quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)) => {
+                assert_eq!(code.into_inner(), u64::from(DOQ_PROTOCOL_ERROR));
+            }
+            other => panic!("expected a DOQ_PROTOCOL_ERROR reset, got {other:?}"),
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Regression: a stream whose length prefix or body is truncated used to
+    /// be abandoned silently (the send side was merely finished), so the
+    /// client saw a clean, empty stream instead of an RFC 9250 protocol error.
+    #[tokio::test]
+    async fn test_doq_truncated_stream_is_reset_with_protocol_error() {
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_doq_test_trunc_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        std::fs::write(&cert_file, &cert_pem).unwrap();
+        std::fs::write(&key_file, &key_pem).unwrap();
+
+        let server_config =
+            crate::tls::load_server_config(&cert_file, &key_file, &[], vec![b"doq".to_vec()])
+                .unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = udp_socket.local_addr().unwrap().port();
+        drop(udp_socket);
+
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let _handle = start_doq_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
+        root_store.add(cert_der).unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"doq".to_vec()];
+
+        let quic_client_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls)).unwrap();
+        let client_cfg = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
+
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_cfg);
+
+        let conn = client_endpoint
+            .connect(actual_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+
+        // 1. Truncated length prefix: only one of the two prefix octets.
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[0x00]).await.unwrap();
+        send.finish().unwrap();
+
+        let mut resp_len_buf = [0u8; 2];
+        let err = recv
+            .read_exact(&mut resp_len_buf)
+            .await
+            .expect_err("a truncated length prefix must be rejected");
+        match err {
+            quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)) => {
+                assert_eq!(code.into_inner(), u64::from(DOQ_PROTOCOL_ERROR));
+            }
+            other => panic!("expected a DOQ_PROTOCOL_ERROR reset, got {other:?}"),
+        }
+
+        // 2. Truncated body: the length prefix promises more bytes than sent.
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[0x00, 0x40]).await.unwrap();
+        send.write_all(&[0u8; 3]).await.unwrap();
+        send.finish().unwrap();
+
+        let mut resp_len_buf = [0u8; 2];
+        let err = recv
+            .read_exact(&mut resp_len_buf)
+            .await
+            .expect_err("a truncated query body must be rejected");
+        match err {
+            quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)) => {
+                assert_eq!(code.into_inner(), u64::from(DOQ_PROTOCOL_ERROR));
+            }
+            other => panic!("expected a DOQ_PROTOCOL_ERROR reset, got {other:?}"),
+        }
 
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -474,7 +733,7 @@ mod tests {
 
         // RFC 9250 permits DNS messages up to 65535 bytes; build a query well
         // above the previous 4096-byte server cap.
-        let mut query = Message::new(4242, MessageType::Query, OpCode::Query);
+        let mut query = Message::new(0, MessageType::Query, OpCode::Query);
         for i in 0..300 {
             query.queries.push(Query::query(
                 Name::from_str(&format!("q{i}.example.com.")).unwrap(),

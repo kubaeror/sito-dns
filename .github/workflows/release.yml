@@ -4,12 +4,13 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
-    inputs:
-      tag_name:
-        description: 'Release Tag Name (e.g. v1.0.0)'
-        required: true
-        default: 'v1.0.0'
+
+# Releases are published from tag pushes only. workflow_dispatch is
+# deliberately not supported: GitHub mints the OIDC identity from the ref that
+# triggered the run, so a dispatch run on a branch would sign with
+# `...release.yml@refs/heads/<branch>` which neither contrib/install.sh nor
+# crates/sito-api/src/updater.rs accepts (both pin `@refs/tags/.*`). Tag pushes
+# sign with `...release.yml@refs/tags/<tag>` and verify end-to-end.
 
 # Least privilege by default; jobs grant the narrow permissions they need.
 permissions:
@@ -33,10 +34,10 @@ jobs:
             features: "embed-ui,mimalloc"
           - target: aarch64-unknown-linux-gnu
             use_cross: true
-            features: "embed-ui"
+            features: "embed-ui,mimalloc"
           - target: armv7-unknown-linux-gnueabihf
             use_cross: true
-            features: "embed-ui"
+            features: "embed-ui,mimalloc"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -67,9 +68,9 @@ jobs:
 
       - name: Package release archive
         env:
-          # workflow_dispatch input is passed via env, never interpolated
-          # directly into the shell.
-          RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
+          # The tag that triggered the run; the ref_name fallback was removed
+          # together with workflow_dispatch publishing.
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           VERSION="${RELEASE_TAG}"
           ARCHIVE_DIR="sito-${VERSION}-${{ matrix.target }}"
@@ -121,9 +122,7 @@ jobs:
 
       - name: Verify release tag matches the workspace version
         env:
-          # workflow_dispatch input is passed via env, never interpolated
-          # directly into the shell.
-          RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           if [ "${RELEASE_TAG}" != "v${VERSION}" ]; then
@@ -134,10 +133,13 @@ jobs:
       - name: Install cargo-sbom
         uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
-          tool: cargo-sbom
+          tool: cargo-sbom@0.10.0
 
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          # Pinned to a v2 release: the v3 CLI changed its flag surface.
+          cosign-release: 'v2.6.5'
 
       - name: Generate SPDX SBOM
         run: |
@@ -145,6 +147,9 @@ jobs:
           sha256sum release-assets/sito.spdx.json >> release-assets/SHA256SUMS
 
       - name: Sign release archives (cosign keyless)
+        # Runs on tag pushes only (see the `on:` block): the signing identity
+        # must stay `release.yml@refs/tags/*` so install.sh and the updater
+        # can verify it.
         run: |
           cd release-assets
           for archive in *.tar.gz; do
@@ -158,9 +163,8 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          # Required on workflow_dispatch: without an explicit tag the action
-          # throws "GitHub Releases requires a tag".
-          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
+          # Tag pushes only; ref_name is the tag that triggered the run.
+          tag_name: ${{ github.ref_name }}
           files: |
             release-assets/*
           generate_release_notes: true
@@ -177,9 +181,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-
+      # No docker/setup-qemu-action: the Dockerfile builds on
+      # --platform=$BUILDPLATFORM and cross-compiles, so no target-architecture
+      # binaries are executed during the build.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -199,7 +203,6 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
-            type=raw,value=${{ github.event.inputs.tag_name }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push multi-arch Docker image
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
@@ -207,7 +210,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64,linux/arm64,linux/arm/v7
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Supply-chain attestations: BuildKit provenance and an SPDX SBOM

@@ -8,14 +8,14 @@
 //! allowed roots, never from `/proc`, `/sys`, `/dev` or non-regular files.
 
 use crate::downloader::{
-    DEFAULT_DOWNLOAD_TIMEOUT, DEFAULT_MAX_LIST_BYTES, cache_key_for_list, cache_path_for_list,
-    read_from_cache_capped, save_to_cache,
+    DEFAULT_DOWNLOAD_TIMEOUT, DEFAULT_MAX_LIST_BYTES, MAX_METADATA_BYTES, cache_key_for_list,
+    cache_path_for_list, read_cache_verified, save_to_cache, write_atomic,
 };
 use crate::error::FilterError;
 use reqwest::StatusCode;
 use reqwest::header::{IF_MODIFIED_SINCE, IF_NONE_MATCH};
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
@@ -27,6 +27,15 @@ pub struct ListMetadata {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub updated_at_secs: u64,
+    /// Byte length of the cached list content this metadata describes.
+    ///
+    /// `None` for metadata written by older versions; such entries carry no
+    /// integrity signal and the cache reader refuses them.
+    #[serde(default)]
+    pub content_len: Option<u64>,
+    /// Line count of the cached list content (second integrity signal).
+    #[serde(default)]
+    pub line_count: Option<usize>,
 }
 
 /// Generates the file path for storing subscription metadata.
@@ -36,84 +45,42 @@ pub fn meta_path_for_list(data_dir: &Path, list_name: &str) -> PathBuf {
         .join(format!("{}.meta.json", cache_key_for_list(list_name)))
 }
 
-/// Reads list metadata from disk cache.
+/// Reads list metadata from disk cache, rejecting files larger than
+/// [`MAX_METADATA_BYTES`] before parsing them.
 pub async fn read_metadata(path: &Path) -> Option<ListMetadata> {
-    let content = tokio::fs::read_to_string(path).await.ok()?;
+    read_metadata_capped(path, MAX_METADATA_BYTES).await
+}
+
+/// Reads list metadata from disk cache, rejecting files larger than
+/// `max_bytes` before reading them into memory.
+pub async fn read_metadata_capped(path: &Path, max_bytes: usize) -> Option<ListMetadata> {
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut content = String::new();
+    let mut limited = file.take(max_bytes as u64 + 1);
+    limited.read_to_string(&mut content).await.ok()?;
+    if content.len() > max_bytes {
+        warn!(
+            path = %path.display(),
+            limit = max_bytes,
+            "Ignoring oversized blocklist metadata file"
+        );
+        return None;
+    }
     serde_json::from_str(&content).ok()
 }
 
-/// Saves list metadata to disk cache.
+/// Saves list metadata to disk cache (atomic temp file + rename).
 pub async fn save_metadata(path: &Path, meta: &ListMetadata) -> Result<(), FilterError> {
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
     let content = serde_json::to_string(meta).unwrap_or_default();
-    tokio::fs::write(path, content)
-        .await
-        .map_err(|e| FilterError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })
+    write_atomic(path, content.as_bytes()).await
 }
 
-/// Returns true for IPs that must never be fetched as blocklist sources:
-/// loopback, private, link-local (including cloud metadata), CGNAT,
-/// unspecified, multicast, reserved and documentation ranges.
+/// Returns true for IPs that must never be fetched as blocklist sources.
+///
+/// Delegates to the shared guard in [`sito_core::ssrf`] so subscriptions, the
+/// upstream probe and any future outbound integration agree on the denylist.
 pub(crate) fn is_denied_target_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || o[0] == 0
-                || o[0] >= 240
-                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 (CGNAT)
-                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
-                || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15
-        }
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_denied_target_ip(IpAddr::V4(v4));
-            }
-            // Translation/encapsulation prefixes that embed an IPv4 address:
-            // without unwrapping these, a NAT64/6to4/Teredo literal could
-            // reach a private v4 target through a v6-only denylist.
-            let o = v6.octets();
-            let embedded = if o[0] == 0x00
-                && o[1] == 0x64
-                && o[2] == 0xff
-                && o[3] == 0x9b
-                && o[4..12].iter().all(|b| *b == 0)
-            {
-                // NAT64 64:ff9b::/96
-                Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]))
-            } else if o[0] == 0x20 && o[1] == 0x02 {
-                // 6to4 2002::/16
-                Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]))
-            } else if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0 && o[3] == 0 {
-                // Teredo 2001:0000::/32: client IPv4 is bitwise-inverted.
-                Some(Ipv4Addr::new(!o[12], !o[13], !o[14], !o[15]))
-            } else {
-                None
-            };
-            if let Some(v4) = embedded {
-                return is_denied_target_ip(IpAddr::V4(v4));
-            }
-            let seg = v6.segments();
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
-                || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link local
-                || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 documentation
-                || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0) // 100::/64 discard
-        }
-    }
+    sito_core::is_denied_target_ip(ip)
 }
 
 /// Returns true when `path` (canonical) is inside `root`.
@@ -150,14 +117,16 @@ fn build_client(
     })
 }
 
-/// Reads a blocklist from disk cache, returning `error` when unavailable.
+/// Reads a verified blocklist from disk cache, returning `error` when
+/// unavailable or when the cache fails its integrity check.
 async fn load_cache_or(
     cache_path: &Path,
+    meta_path: &Path,
     list_name: &str,
     max_bytes: usize,
     error: FilterError,
 ) -> Result<String, FilterError> {
-    match read_from_cache_capped(cache_path, max_bytes).await {
+    match read_cache_verified(cache_path, meta_path, list_name, max_bytes).await {
         Ok(cached) => {
             info!(
                 list = %list_name,
@@ -448,7 +417,7 @@ impl SubscriptionFetcher {
                         error = %e,
                         "Refusing local blocklist; attempting disk cache fallback"
                     );
-                    load_cache_or(&cache_path, list_name, self.max_bytes, e).await
+                    load_cache_or(&cache_path, &meta_path, list_name, self.max_bytes, e).await
                 }
             };
         }
@@ -474,7 +443,7 @@ impl SubscriptionFetcher {
                     error = %e,
                     "Refusing blocklist URL target; attempting disk cache fallback"
                 );
-                return load_cache_or(&cache_path, list_name, self.max_bytes, e).await;
+                return load_cache_or(&cache_path, &meta_path, list_name, self.max_bytes, e).await;
             }
         };
         let client = match pinned.as_ref() {
@@ -511,7 +480,14 @@ impl SubscriptionFetcher {
                     let status = resp.status();
                     if status == StatusCode::NOT_MODIFIED {
                         info!(list = %list_name, "Blocklist unchanged (HTTP 304 Not Modified), serving disk cache");
-                        match read_from_cache_capped(&cache_path, self.max_bytes).await {
+                        match read_cache_verified(
+                            &cache_path,
+                            &meta_path,
+                            list_name,
+                            self.max_bytes,
+                        )
+                        .await
+                        {
                             Ok(content) => return Ok(content),
                             Err(e) => {
                                 // The server claims "not modified" but we have
@@ -618,21 +594,34 @@ impl SubscriptionFetcher {
                         });
                     };
 
-                    // Save to disk cache
-                    if let Err(e) = save_to_cache(&cache_path, &content).await {
-                        warn!(list = %list_name, error = %e, "Failed to save blocklist to disk cache");
-                    }
-
-                    // Save metadata
-                    let updated_secs = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs());
-                    let meta = ListMetadata {
-                        etag: new_etag,
-                        last_modified: new_last_modified,
-                        updated_at_secs: updated_secs,
+                    // Save to disk cache. Metadata is only refreshed when the
+                    // cache write succeeded: pairing a new ETag/size with an
+                    // old cache file would let a later 304 serve stale rules.
+                    let cache_saved = match save_to_cache(&cache_path, &content).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            warn!(list = %list_name, error = %e, "Failed to save blocklist to disk cache");
+                            false
+                        }
                     };
-                    let _ = save_metadata(&meta_path, &meta).await;
+
+                    // Save metadata, including the integrity signals the
+                    // cache reader validates before trusting the file.
+                    if cache_saved {
+                        let updated_secs = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs());
+                        let meta = ListMetadata {
+                            etag: new_etag,
+                            last_modified: new_last_modified,
+                            updated_at_secs: updated_secs,
+                            content_len: Some(content.len() as u64),
+                            line_count: Some(content.lines().count()),
+                        };
+                        if let Err(e) = save_metadata(&meta_path, &meta).await {
+                            warn!(list = %list_name, error = %e, "Failed to save blocklist metadata");
+                        }
+                    }
 
                     info!(list = %list_name, bytes = content.len(), "Successfully fetched blocklist");
                     return Ok(content);
@@ -661,7 +650,14 @@ impl SubscriptionFetcher {
             url: url.to_string(),
             reason: "blocklist download failed".to_string(),
         });
-        load_cache_or(&cache_path, list_name, self.max_bytes, fallback_error).await
+        load_cache_or(
+            &cache_path,
+            &meta_path,
+            list_name,
+            self.max_bytes,
+            fallback_error,
+        )
+        .await
     }
 }
 
@@ -727,11 +723,55 @@ mod tests {
             etag: Some("\"abc123etag\"".to_string()),
             last_modified: Some("Fri, 05 Sep 2026 00:00:00 GMT".to_string()),
             updated_at_secs: 123_456_789,
+            content_len: Some(42),
+            line_count: Some(3),
         };
 
         save_metadata(&meta_file, &meta).await.unwrap();
         let loaded = read_metadata(&meta_file).await.unwrap();
         assert_eq!(meta, loaded);
+
+        // Oversized metadata files are refused instead of being parsed whole
+        // (the payload is valid JSON, so only the size cap can reject it).
+        let oversized = format!(
+            "{{\"etag\":\"{}\",\"updated_at_secs\":0}}",
+            "x".repeat(MAX_METADATA_BYTES)
+        );
+        assert!(
+            serde_json::from_str::<ListMetadata>(&oversized).is_ok(),
+            "test precondition: the oversized metadata must be valid JSON"
+        );
+        tokio::fs::write(&meta_file, oversized).await.unwrap();
+        assert!(read_metadata(&meta_file).await.is_none());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Regression (audit 6, WP-3.9): metadata from older versions carries no
+    /// integrity fields, so a cache file it describes must not be trusted.
+    #[tokio::test]
+    async fn test_legacy_metadata_without_integrity_fields_is_rejected() {
+        let temp_dir = temp_dir("sito_legacy_meta_test");
+        let meta_file = meta_path_for_list(&temp_dir, "legacy");
+        let cache_file = cache_path_for_list(&temp_dir, "legacy");
+        let content = "0.0.0.0 legacy.example\n";
+        save_to_cache(&cache_file, content).await.unwrap();
+        save_metadata(
+            &meta_file,
+            &ListMetadata {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+                updated_at_secs: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = read_cache_verified(&cache_file, &meta_file, "legacy", DEFAULT_MAX_LIST_BYTES)
+            .await
+            .expect_err("a cache without integrity fields must not be trusted");
+        assert!(matches!(err, FilterError::CacheCorrupted { .. }));
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
@@ -909,6 +949,64 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 
+    /// A successful fetch must write cache metadata that the reader accepts,
+    /// so a later `304 Not Modified` can serve the cached content (and not
+    /// re-download because the integrity signals were recorded incorrectly).
+    #[tokio::test]
+    async fn test_304_serves_verified_cache() {
+        let data_dir = temp_dir("sito_304_ok_test");
+        let responses = vec![
+            "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: 16\r\nConnection: close\r\n\r\n||fresh.example^".to_string(),
+            "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        ];
+        let (addr, captured, server) = spawn_http_server(responses).await;
+
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            0,
+            Duration::from_millis(10),
+        );
+        fetcher.allow_private_targets = true;
+        let url = format!("http://{addr}/list.txt");
+
+        let first = fetcher
+            .fetch_or_cached("etag-list", &url, &data_dir)
+            .await
+            .unwrap();
+        assert_eq!(first, "||fresh.example^");
+
+        // The metadata written by the fetch must satisfy the integrity check.
+        let cache_path = cache_path_for_list(&data_dir, "etag-list");
+        let meta_path = meta_path_for_list(&data_dir, "etag-list");
+        let verified = read_cache_verified(&cache_path, &meta_path, "etag-list", 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(verified, first);
+
+        // The conditional request is answered from the verified cache.
+        let second = fetcher
+            .fetch_or_cached("etag-list", &url, &data_dir)
+            .await
+            .unwrap();
+        assert_eq!(second, first);
+
+        server.await.unwrap();
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected exactly one conditional request"
+        );
+        assert!(
+            requests[1].to_ascii_lowercase().contains("if-none-match"),
+            "second request should be conditional: {}",
+            requests[1]
+        );
+
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
     #[tokio::test]
     async fn test_304_with_missing_cache_retries_unconditionally() {
         let data_dir = temp_dir("sito_304_test");
@@ -921,6 +1019,7 @@ mod tests {
                 etag: Some("\"v1\"".to_string()),
                 last_modified: None,
                 updated_at_secs: 1,
+                ..Default::default()
             },
         )
         .await

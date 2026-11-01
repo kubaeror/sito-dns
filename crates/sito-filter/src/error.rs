@@ -31,9 +31,15 @@ pub enum FilterError {
     #[error("Invalid URL '{url}': {reason}")]
     InvalidUrl { url: String, reason: String },
 
+    #[error("Cached blocklist '{path}' failed its integrity check: {reason}")]
+    CacheCorrupted { path: PathBuf, reason: String },
+
     #[error("Rule compilation task failed: {0}")]
     CompileTaskFailed(String),
 
     #[error("No filter list sources could be loaded ({failed} failed): {details}")]
     NoSourcesLoaded { failed: usize, details: String },
+
+    #[error("Filter rule set exceeds the configured limit of {limit} rules (parsed: {count})")]
+    TooManyRules { count: usize, limit: usize },
 }

@@ -16,8 +16,8 @@ pub mod writer;
 
 pub use anonymize::anonymize_ip;
 pub use db::{
-    ClientStats, GlobalStats, HourlyActivity, QueryLogFilter, QueryLogPage, RetentionReport,
-    StatsDb, UpstreamStats,
+    ClientStats, GlobalStats, HourlyActivity, MAX_AGGREGATE_ROWS, QueryLogFilter, QueryLogPage,
+    RetentionReport, StatsDb, UpstreamStats,
 };
 pub use entry::QueryLogEntry;
 pub use error::StatsError;
@@ -492,10 +492,16 @@ mod tests {
         assert_eq!(rep1.aggregated_hours, 1);
         assert_eq!(rep1.deleted_records, 2);
 
-        let watermark = db.get_watermark("hourly_aggregation").await.unwrap();
+        let watermark = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT last_id, last_ts FROM stats_watermark WHERE key = 'hourly_aggregation'",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
         assert!(watermark.is_some());
-        let (wm_id, _) = watermark.unwrap();
+        let (wm_id, wm_ts) = watermark.unwrap();
         assert!(wm_id >= 2);
+        assert!(wm_ts > 0);
 
         // Verify stats_hourly has exactly 2 queries
         let (queries, blocked): (i64, i64) = sqlx::query_as(
@@ -855,6 +861,444 @@ mod tests {
         assert_eq!(
             stats.top_clients.first(),
             Some(&("192.168.1.10".to_string(), 3))
+        );
+    }
+
+    /// WP-7.2: retention populates the hourly top lists and long windows are
+    /// answered from the rollups instead of silently under-reporting.
+    #[tokio::test]
+    async fn test_retention_populates_rollups_and_long_window_merges_them() {
+        let db = StatsDb::in_memory().await.unwrap();
+        // Older than the 90-day retention period, but inside the 365-day
+        // statistics window used below.
+        let old_ts = chrono::Utc::now().timestamp_millis() - 100 * 86_400_000;
+        let mut entries = Vec::new();
+        for i in 0..5 {
+            let mut entry =
+                retention_entry(old_ts + i * 60_000, "archived.example", "allowed", None);
+            entry.client_ip = "10.9.9.9".into();
+            entry.client_name = Some("archived-host".into());
+            entry.upstream = Some("tls://9.9.9.9".into());
+            entry.elapsed_us = Some(1_000);
+            entries.push(entry);
+        }
+        for i in 0..3 {
+            let mut entry =
+                retention_entry(old_ts + i * 60_000, "blocked.example", "blocked", None);
+            entry.client_ip = "10.8.8.8".into();
+            entry.upstream = Some("tls://8.8.8.8".into());
+            entry.elapsed_us = Some(2_000);
+            entries.push(entry);
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let report = db.cleanup_retention(90).await.unwrap();
+        assert_eq!(report.deleted_records, 8);
+
+        // The hourly rollup carries bounded top lists (previously always '[]').
+        let (top_domains, top_clients, top_upstreams): (String, String, String) = sqlx::query_as(
+            "SELECT top_domains, top_clients, top_upstreams FROM stats_hourly LIMIT 1",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_ne!(top_domains, "[]");
+        assert_ne!(top_clients, "[]");
+        assert_ne!(top_upstreams, "[]");
+
+        // A 365-day window must include the pruned rows via the rollups.
+        let stats = db.get_global_stats(365 * 86_400_000).await.unwrap();
+        assert_eq!(stats.total_queries, 8);
+        assert_eq!(stats.blocked_queries, 3);
+        assert_eq!(
+            stats.top_domains.first(),
+            Some(&("archived.example".to_string(), 5))
+        );
+        assert_eq!(
+            stats.top_blocked_domains.first(),
+            Some(&("blocked.example".to_string(), 3))
+        );
+        assert_eq!(
+            stats.top_clients.first(),
+            Some(&("archived-host".to_string(), 5))
+        );
+
+        let clients = db.get_client_stats(365 * 86_400_000).await.unwrap();
+        let archived = clients
+            .iter()
+            .find(|c| c.client_ip == "10.9.9.9")
+            .expect("archived client must be merged into a long window");
+        assert_eq!(archived.client_name.as_deref(), Some("archived-host"));
+        assert_eq!(archived.total_queries, 5);
+
+        let upstreams = db.get_upstream_stats(365 * 86_400_000).await.unwrap();
+        let tls = upstreams
+            .iter()
+            .find(|u| u.upstream == "tls://9.9.9.9")
+            .expect("archived upstream must be merged into a long window");
+        assert_eq!(tls.total_queries, 5);
+        assert_eq!(tls.avg_elapsed_us, 1_000);
+    }
+
+    /// WP-7.2: re-rolling a partially pruned hour merges (not replaces) the
+    /// stored top lists.
+    #[tokio::test]
+    async fn test_rollup_tops_merge_across_repeated_sweeps() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let hour_ts = 1_000_000_000_000i64;
+        db.insert_batch(&[retention_entry(hour_ts, "first.test", "allowed", None)])
+            .await
+            .unwrap();
+        let rep1 = db.cleanup_retention(90).await.unwrap();
+        assert_eq!(rep1.aggregated_hours, 1);
+
+        db.insert_batch(&[retention_entry(
+            hour_ts + 10,
+            "second.test",
+            "allowed",
+            None,
+        )])
+        .await
+        .unwrap();
+        let rep2 = db.cleanup_retention(90).await.unwrap();
+        assert_eq!(rep2.aggregated_hours, 1);
+
+        let (top_domains,): (String,) = sqlx::query_as(
+            "SELECT top_domains FROM stats_hourly WHERE hour = (1000000000000 / 3600000) * 3600000",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let tops: Vec<(String, i64, i64)> = serde_json::from_str(&top_domains).unwrap();
+        let names: Vec<&str> = tops.iter().map(|(qname, _, _)| qname.as_str()).collect();
+        assert!(
+            names.contains(&"first.test"),
+            "first sweep top must survive"
+        );
+        assert!(
+            names.contains(&"second.test"),
+            "second sweep top must be merged in"
+        );
+    }
+
+    /// WP-7.2: clearing the query log folds rows into `stats_hourly` so totals
+    /// survive the clear.
+    #[tokio::test]
+    async fn test_delete_query_logs_folds_rows_into_hourly_rollups() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        db.insert_batch(&[
+            retention_entry(now - 1_000, "keep-total.example", "allowed", None),
+            retention_entry(now - 900, "keep-total.example", "blocked", None),
+        ])
+        .await
+        .unwrap();
+
+        let deleted = db.delete_query_logs().await.unwrap();
+        assert_eq!(deleted, 2);
+        assert!(
+            db.query_logs(&QueryLogFilter::default())
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+
+        let stats = db.get_global_stats(86_400_000).await.unwrap();
+        assert_eq!(
+            stats.total_queries, 2,
+            "clearing the log must not reset aggregate totals"
+        );
+        assert_eq!(stats.blocked_queries, 1);
+        assert_eq!(
+            stats.top_domains.first(),
+            Some(&("keep-total.example".to_string(), 2))
+        );
+    }
+
+    /// WP-7.2: `cleanup_retention` vacuums after a large sweep so pages freed
+    /// by the delete are returned to the filesystem.
+    #[tokio::test]
+    async fn test_retention_vacuum_shrinks_database_after_large_delete() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito-vacuum-db-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db_path = temp_dir.join("stats.db");
+        let db = StatsDb::open(&db_path).await.unwrap();
+
+        let old_ts = 1_000_000_000_000i64;
+        let padding = "x".repeat(200);
+        let mut entries = Vec::new();
+        for i in 0..3_000i64 {
+            let mut entry = retention_entry(old_ts + i, "vacuum.test", "allowed", None);
+            entry.client_ip = format!("10.{}.{}.{}", i / 65_536, (i / 256) % 256, i % 256);
+            entry.rule = Some(format!("{padding}-{i}"));
+            entries.push(entry);
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let before = db.db_size_bytes().await.unwrap();
+        let report = db.cleanup_retention(90).await.unwrap();
+        assert_eq!(report.deleted_records, 3_000);
+        let after = db.db_size_bytes().await.unwrap();
+        assert!(
+            after < before,
+            "vacuum must shrink the database after a large retention delete \
+             (before={before}, after={after})"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// WP-7.2: pagination exposes the number of rows matching the filters.
+    #[tokio::test]
+    async fn test_query_logs_total_count_matches_filters() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut entries = Vec::new();
+        for i in 0..50 {
+            let verdict = if i % 2 == 0 { "allowed" } else { "blocked" };
+            entries.push(retention_entry(now + i, "count.test", verdict, None));
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let page = db
+            .query_logs(&QueryLogFilter {
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 10);
+        assert_eq!(page.total_count, Some(50));
+
+        let blocked = db
+            .query_logs(&QueryLogFilter {
+                status: Some("blocked".into()),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(blocked.total_count, Some(25));
+
+        // The cursor must not change the total.
+        let cursor = page.next_cursor.unwrap().parse::<i64>().unwrap();
+        let page2 = db
+            .query_logs(&QueryLogFilter {
+                cursor: Some(cursor),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page2.total_count, Some(50));
+    }
+
+    /// WP-7.3: the per-client aggregate is bounded, deterministically ordered
+    /// and reports the total number of distinct clients.
+    #[tokio::test]
+    async fn test_client_stats_are_bounded_and_deterministic() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let clients = 3_000i64;
+        let mut entries = Vec::new();
+        for i in 0..clients {
+            for r in 0..=(i % 3) {
+                let mut entry = retention_entry(now + i + r, "client.test", "allowed", None);
+                entry.client_ip = format!("10.{}.{}.{}", i / 65_536, (i / 256) % 256, i % 256);
+                entry.client_name = Some(format!("host-{}", i % 10));
+                entries.push(entry);
+            }
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let stats = db.get_client_stats(86_400_000).await.unwrap();
+        assert_eq!(
+            stats.len(),
+            MAX_AGGREGATE_ROWS,
+            "result set must be bounded"
+        );
+        assert_eq!(
+            db.count_client_stats(86_400_000).await.unwrap(),
+            clients,
+            "distinct client total must be reported"
+        );
+        assert!(stats.windows(2).all(|w| {
+            w[0].total_queries > w[1].total_queries
+                || (w[0].total_queries == w[1].total_queries && w[0].client_ip < w[1].client_ip)
+        }));
+
+        // One address seen under several names keeps MAX(client_name).
+        let db2 = StatsDb::in_memory().await.unwrap();
+        let mut first = retention_entry(now, "name.test", "allowed", None);
+        first.client_ip = "10.1.1.1".into();
+        first.client_name = Some("zulu".into());
+        let mut second = retention_entry(now + 1, "name.test", "allowed", None);
+        second.client_ip = "10.1.1.1".into();
+        second.client_name = Some("alpha".into());
+        db2.insert_batch(&[first, second]).await.unwrap();
+        let stats = db2.get_client_stats(86_400_000).await.unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].client_name.as_deref(), Some("zulu"));
+    }
+
+    /// WP-7.3: the per-upstream aggregate is bounded, deterministically ordered
+    /// and reports the total number of distinct upstreams.
+    #[tokio::test]
+    async fn test_upstream_stats_are_bounded_and_deterministic() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let upstreams = 3_000i64;
+        let mut entries = Vec::new();
+        for i in 0..upstreams {
+            for r in 0..=(i % 3) {
+                let mut entry = retention_entry(now + i + r, "upstream.test", "allowed", None);
+                entry.upstream = Some(format!(
+                    "tls://10.{}.{}.{}",
+                    i / 65_536,
+                    (i / 256) % 256,
+                    i % 256
+                ));
+                entry.elapsed_us = Some(100);
+                entries.push(entry);
+            }
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let stats = db.get_upstream_stats(86_400_000).await.unwrap();
+        assert_eq!(
+            stats.len(),
+            MAX_AGGREGATE_ROWS,
+            "result set must be bounded"
+        );
+        assert_eq!(
+            db.count_upstream_stats(86_400_000).await.unwrap(),
+            upstreams,
+            "distinct upstream total must be reported"
+        );
+        assert!(stats.windows(2).all(|w| {
+            w[0].total_queries > w[1].total_queries
+                || (w[0].total_queries == w[1].total_queries && w[0].upstream < w[1].upstream)
+        }));
+    }
+
+    /// WP-7.2/7.3: blocked domains are ranked independently of the total-query
+    /// ranking, so a heavily blocked domain outside the total top-N is still
+    /// reported.
+    #[tokio::test]
+    async fn test_top_blocked_domains_ranked_independently() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut entries = Vec::new();
+        // 120 noise domains with three queries each: enough to push the
+        // blocked-heavy domain out of the top-100 by total.
+        for i in 0..120 {
+            for k in 0..3 {
+                let mut entry = retention_entry(
+                    now + i * 3 + k,
+                    &format!("noise-{i}.example"),
+                    "allowed",
+                    None,
+                );
+                entry.client_ip = "10.0.0.1".into();
+                entries.push(entry);
+            }
+        }
+        // The blocked-heavy domain: two queries, both blocked.
+        for k in 0..2 {
+            let mut entry =
+                retention_entry(now + 100_000 + k, "blocked-heavy.example", "blocked", None);
+            entry.client_ip = "10.0.0.2".into();
+            entries.push(entry);
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let stats = db.get_global_stats(86_400_000).await.unwrap();
+        assert_eq!(
+            stats.top_blocked_domains.first(),
+            Some(&("blocked-heavy.example".to_string(), 2)),
+            "blocked ranking must not depend on the total-query ranking"
+        );
+    }
+
+    /// WP-7.2/7.3: a blocked-heavy domain that is outside the top-N by total
+    /// must survive the hourly rollup and still be reported for a long window.
+    #[tokio::test]
+    async fn test_rollup_keeps_blocked_heavy_domain_outside_total_top_n() {
+        let db = StatsDb::in_memory().await.unwrap();
+        // Older than retention, inside the 365-day window used below.
+        let old_ts = chrono::Utc::now().timestamp_millis() - 100 * 86_400_000;
+        let mut entries = Vec::new();
+        for i in 0..120 {
+            for k in 0..3 {
+                let mut entry = retention_entry(
+                    old_ts + i * 3 + k,
+                    &format!("noise-{i}.example"),
+                    "allowed",
+                    None,
+                );
+                entry.client_ip = "10.0.0.1".into();
+                entries.push(entry);
+            }
+        }
+        for k in 0..2 {
+            let mut entry = retention_entry(
+                old_ts + 100_000 + k,
+                "blocked-heavy.example",
+                "blocked",
+                None,
+            );
+            entry.client_ip = "10.0.0.2".into();
+            entries.push(entry);
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let report = db.cleanup_retention(90).await.unwrap();
+        assert_eq!(report.deleted_records, 120 * 3 + 2);
+
+        let stats = db.get_global_stats(365 * 86_400_000).await.unwrap();
+        assert_eq!(
+            stats.top_blocked_domains.first(),
+            Some(&("blocked-heavy.example".to_string(), 2)),
+            "rollup must keep the top-blocked union, not only the top-total list"
+        );
+    }
+
+    /// WP-7.2: rows arriving after a clear are added to the folded totals
+    /// without double counting the cleared rows.
+    #[tokio::test]
+    async fn test_delete_query_logs_then_new_rows_do_not_double_count() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        db.insert_batch(&[retention_entry(
+            now - 1_000,
+            "same-hour.example",
+            "allowed",
+            None,
+        )])
+        .await
+        .unwrap();
+        db.delete_query_logs().await.unwrap();
+        db.insert_batch(&[retention_entry(
+            now - 500,
+            "same-hour.example",
+            "blocked",
+            None,
+        )])
+        .await
+        .unwrap();
+
+        let stats = db.get_global_stats(86_400_000).await.unwrap();
+        assert_eq!(stats.total_queries, 2);
+        assert_eq!(stats.blocked_queries, 1);
+        assert_eq!(
+            stats.top_domains.first(),
+            Some(&("same-hour.example".to_string(), 2))
         );
     }
 

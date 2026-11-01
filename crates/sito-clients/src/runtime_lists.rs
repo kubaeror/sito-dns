@@ -260,15 +260,10 @@ impl RuntimeLists {
             let entries = registry.service_count() as u64;
             (entries, None, Some(Arc::new(registry)))
         } else {
-            let entries = content
-                .lines()
-                .filter(|line| {
-                    let trimmed = line.trim();
-                    !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with('!')
-                })
-                .count() as u64;
             let mut parental = (*self.parental.load_full()).clone();
-            parental.set_category_list(category, content);
+            // Count parsed entries, not raw lines: malformed/comment lines must
+            // not inflate the reported entry count or the truncation guard.
+            let entries = parental.set_category_list(category, content);
             (entries, Some(Arc::new(parental)), None)
         };
 
@@ -479,6 +474,35 @@ mod tests {
             .apply_content_forced("adult", "only.example\n")
             .unwrap();
         assert!(store.parental().matches_category("adult", "only.example"));
+        assert!(!store.parental().matches_category("adult", "a.example"));
+    }
+
+    #[test]
+    fn test_drop_guard_counts_parsed_entries_not_raw_lines() {
+        let store = store();
+
+        // A first refresh dominated by malformed lines must report the number
+        // of parsed domains (1), not the raw line count (1001).
+        let mut content = String::new();
+        for _ in 0..1_000 {
+            content.push_str("not a domain line\n");
+        }
+        content.push_str("a.example\n");
+        let entries = store.apply_content("adult", &content).unwrap();
+        assert_eq!(entries, 1, "only the parsed domain may be counted");
+
+        let status = store
+            .statuses()
+            .into_iter()
+            .find(|s| s.category == "adult")
+            .unwrap();
+        assert_eq!(status.entries, 1);
+
+        // A legitimate later update of the same size must not be rejected as a
+        // >50% shrink (which would happen if the malformed lines had inflated
+        // the previous count).
+        store.apply_content("adult", "b.example\n").unwrap();
+        assert!(store.parental().matches_category("adult", "b.example"));
         assert!(!store.parental().matches_category("adult", "a.example"));
     }
 

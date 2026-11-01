@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use sito_core::error::UpstreamError;
-use sito_proto::{Message, MessageType};
+use sito_proto::{Message, MessageType, ResponseCode};
 
 /// Trait implemented by DNS upstream resolvers.
 #[async_trait]
@@ -58,6 +58,21 @@ pub fn validate_response(query: &Message, response: &Message) -> Result<(), Upst
     Ok(())
 }
 
+/// Whether a structurally valid reply carries a response code that should be
+/// retried against another candidate instead of being returned to the client.
+///
+/// `SERVFAIL` (RFC 1035 §4.1.1) means the server failed to process the query,
+/// `REFUSED` means a policy/ACL rejection and `NOTIMP` means the server does
+/// not implement the requested operation. In all three cases the upstream
+/// answered but is not usable for this query, while `NOERROR`/`NXDOMAIN` (and
+/// DNSSEC-delegation codes such as `NOTAUTH`) are real answers.
+pub fn is_retryable_response(response: &Message) -> bool {
+    matches!(
+        response.metadata.response_code,
+        ResponseCode::ServFail | ResponseCode::Refused | ResponseCode::NotImp
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +116,27 @@ mod tests {
 
         let missing_question = Message::response(0x1234, OpCode::Query);
         assert!(validate_response(&query, &missing_question).is_err());
+    }
+
+    #[test]
+    fn test_retryable_response_codes() {
+        let query = make_query();
+        for (code, retryable) in [
+            (ResponseCode::ServFail, true),
+            (ResponseCode::Refused, true),
+            (ResponseCode::NotImp, true),
+            (ResponseCode::NoError, false),
+            (ResponseCode::NXDomain, false),
+            (ResponseCode::FormErr, false),
+        ] {
+            let mut response = Message::response(0x1234, OpCode::Query);
+            response.queries = query.queries.clone();
+            response.metadata.response_code = code;
+            assert_eq!(
+                is_retryable_response(&response),
+                retryable,
+                "unexpected retryability for {code}"
+            );
+        }
     }
 }

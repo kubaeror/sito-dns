@@ -14,6 +14,7 @@ pub mod doq;
 pub mod dot;
 pub mod handler;
 pub mod limiter;
+pub mod net;
 pub mod pktinfo;
 pub mod tcp;
 pub mod tls;
@@ -30,6 +31,7 @@ pub use doq::{DoqConfig, build_quinn_server_config, start_doq_listener};
 pub use dot::{DotConfig, start_dot_listener};
 pub use handler::QueryHandler;
 pub use limiter::RateLimiter;
+pub use net::bind_tcp_listener;
 pub use tcp::{TcpConfig, start_tcp_listener};
 pub use tls::{
     CertWatcher, DynamicCertResolver, TlsAcceptorManager, TlsError, build_server_config,
@@ -44,7 +46,7 @@ mod tests {
     use sito_core::client::ClientContext;
     use sito_proto::rdata::A;
     use sito_proto::{
-        Message, MessageType, Name, OpCode, Query, RData, Record, RecordType, ResponseCode,
+        Edns, Message, MessageType, Name, OpCode, Query, RData, Record, RecordType, ResponseCode,
         decode_message, encode_message,
     };
     use std::net::SocketAddr;
@@ -593,9 +595,10 @@ mod tests {
         }
         stream.flush().await.unwrap();
 
-        // Both queries must be answered with valid, length-prefixed frames:
-        // a >64 KB attempt must never wrap its 2-octet length prefix and
-        // desynchronize the stream (the encoder truncates to the u16 ceiling).
+        // Both queries must be answered with valid, length-prefixed frames.
+        // The >64 KB response must come back as TC=1 with the question
+        // preserved (RFC 7766 §8) instead of being dropped, and neither frame
+        // may wrap its 2-octet length prefix.
         let mut received = Vec::new();
         for _ in 0..2 {
             let mut len_buf = [0u8; 2];
@@ -604,10 +607,23 @@ mod tests {
             let mut resp_buf = vec![0u8; resp_len];
             stream.read_exact(&mut resp_buf).await.unwrap();
             let resp = decode_message(&resp_buf).unwrap();
-            received.push(resp.metadata.id);
+            received.push(resp);
         }
-        assert!(received.contains(&8101), "got ids: {received:?}");
-        assert!(received.contains(&8102), "got ids: {received:?}");
+        let huge = received
+            .iter()
+            .find(|resp| resp.metadata.id == 8101)
+            .expect("huge response");
+        let small = received
+            .iter()
+            .find(|resp| resp.metadata.id == 8102)
+            .expect("small response");
+        assert!(
+            huge.metadata.truncation,
+            "an unframable response must be truncated with TC=1"
+        );
+        assert_eq!(huge.queries.len(), 1, "the question must be preserved");
+        assert!(!small.metadata.truncation);
+        assert_eq!(small.answers.len(), 1);
 
         let _ = shutdown_tx.send(true);
     }
@@ -685,12 +701,13 @@ mod tests {
         let server_name = ServerName::try_from("dot.example.com").unwrap().to_owned();
         let mut tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
 
-        // Send a query
+        // Send an EDNS query: RFC 8467 padding applies to EDNS clients.
         let mut query = Message::new(4001, MessageType::Query, OpCode::Query);
         query.queries.push(Query::query(
             Name::from_str("dot.example.com.").unwrap(),
             RecordType::A,
         ));
+        query.set_edns(Edns::new());
         let encoded = encode_message(&query).unwrap();
         let len = encoded.len() as u16;
         tls_stream.write_all(&len.to_be_bytes()).await.unwrap();
@@ -712,6 +729,29 @@ mod tests {
             resp_len % sito_proto::DOT_PADDING_BLOCK_SIZE,
             0,
             "Response must be padded to block size 468"
+        );
+
+        // A non-EDNS query must not receive an OPT record (RFC 6891 §6.1.1).
+        let mut plain = Message::new(4002, MessageType::Query, OpCode::Query);
+        plain.queries.push(Query::query(
+            Name::from_str("dot.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let encoded = encode_message(&plain).unwrap();
+        let len = encoded.len() as u16;
+        tls_stream.write_all(&len.to_be_bytes()).await.unwrap();
+        tls_stream.write_all(&encoded).await.unwrap();
+        tls_stream.flush().await.unwrap();
+
+        tls_stream.read_exact(&mut len_buf).await.unwrap();
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        tls_stream.read_exact(&mut resp_buf).await.unwrap();
+        let resp = decode_message(&resp_buf).unwrap();
+        assert_eq!(resp.metadata.id, 4002);
+        assert!(
+            resp.edns.is_none(),
+            "non-EDNS clients must not receive an OPT record"
         );
 
         let _ = shutdown_tx.send(true);
@@ -1196,6 +1236,191 @@ mod tests {
         assert_eq!(dns_resp.metadata.id, 7001);
 
         let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Regression: a dropped shutdown sender (partial startup failure, failed
+    /// rebind) must stop listener tasks instead of leaving `changed()`
+    /// returning `Err` in a busy loop forever.
+    #[tokio::test]
+    async fn test_listeners_exit_when_shutdown_sender_is_dropped() {
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        // TCP
+        let (tcp_tx, tcp_rx) = watch::channel(false);
+        let tcp_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp_probe.local_addr().unwrap().port();
+        drop(tcp_probe);
+        let tcp_handle = start_tcp_listener(
+            TcpConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], tcp_port)),
+                ..TcpConfig::default()
+            },
+            handler.clone(),
+            tcp_rx,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(tcp_tx);
+        tokio::time::timeout(Duration::from_secs(2), tcp_handle)
+            .await
+            .expect("TCP listener must exit when the shutdown sender is dropped")
+            .expect("TCP listener task panicked");
+
+        // UDP (one worker)
+        let (udp_tx, udp_rx) = watch::channel(false);
+        let udp_probe = create_reuseport_udp_socket(&"127.0.0.1:0".parse().unwrap()).unwrap();
+        let udp_port = udp_probe.local_addr().unwrap().port();
+        drop(udp_probe);
+        let udp_handles = start_udp_listener(
+            &UdpConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], udp_port)),
+                worker_count: 1,
+                edns_udp_size: 1232,
+                rate_limit_per_ip: 100,
+                rate_limiter: None,
+            },
+            &handler,
+            &udp_rx,
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(udp_tx);
+        for handle in udp_handles {
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("UDP worker must exit when the shutdown sender is dropped")
+                .expect("UDP worker task panicked");
+        }
+    }
+
+    /// Regression: every listener derives its rate-limiter burst from
+    /// `rate_limit_per_ip`. The previous `rate_limit_per_ip * 2` overflowed
+    /// (panicking in debug builds) for extreme configured rates; starting a
+    /// listener with `u32::MAX` must be safe.
+    #[tokio::test]
+    async fn test_extreme_rate_limit_does_not_overflow_any_listener() {
+        use crate::tls::generate_test_cert;
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_rate_limit_overflow_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+        let server_config =
+            load_server_config(&cert_file, &key_file, &[], vec![b"dot".to_vec()]).unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // UDP
+        let udp_probe = create_reuseport_udp_socket(&"127.0.0.1:0".parse().unwrap()).unwrap();
+        let udp_port = udp_probe.local_addr().unwrap().port();
+        drop(udp_probe);
+        let udp_handles = start_udp_listener(
+            &UdpConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], udp_port)),
+                worker_count: 1,
+                edns_udp_size: 1232,
+                rate_limit_per_ip: u32::MAX,
+                rate_limiter: None,
+            },
+            &handler,
+            &shutdown_rx,
+        )
+        .unwrap();
+
+        // TCP
+        let tcp_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp_probe.local_addr().unwrap().port();
+        drop(tcp_probe);
+        let tcp_handle = start_tcp_listener(
+            TcpConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], tcp_port)),
+                rate_limit_per_ip: u32::MAX,
+                rate_limiter: None,
+                ..TcpConfig::default()
+            },
+            handler.clone(),
+            shutdown_rx.clone(),
+        )
+        .await
+        .unwrap();
+
+        // DoT
+        let dot_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dot_port = dot_probe.local_addr().unwrap().port();
+        drop(dot_probe);
+        let mut dot_config = DotConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], dot_port)),
+            acceptor_mgr.clone(),
+        );
+        dot_config.rate_limit_per_ip = u32::MAX;
+        dot_config.rate_limiter = None;
+        let dot_handle = start_dot_listener(dot_config, handler.clone(), shutdown_rx.clone())
+            .await
+            .unwrap();
+
+        // DoH (plaintext: no TLS acceptor needed)
+        let doh_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let doh_port = doh_probe.local_addr().unwrap().port();
+        drop(doh_probe);
+        let mut doh_config = DohConfig::new(SocketAddr::from(([127, 0, 0, 1], doh_port)), None);
+        doh_config.rate_limit_per_ip = u32::MAX;
+        doh_config.rate_limiter = None;
+        let doh_handle = start_doh_listener(doh_config, handler.clone(), shutdown_rx.clone())
+            .await
+            .unwrap();
+
+        // DoQ
+        let doq_probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let doq_port = doq_probe.local_addr().unwrap().port();
+        drop(doq_probe);
+        let mut doq_config = DoqConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], doq_port)),
+            Some(acceptor_mgr.clone()),
+        );
+        doq_config.rate_limit_per_ip = u32::MAX;
+        doq_config.rate_limiter = None;
+        let doq_handle = start_doq_listener(doq_config, handler.clone(), shutdown_rx.clone())
+            .await
+            .unwrap();
+
+        // DoH3
+        let doh3_probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let doh3_port = doh3_probe.local_addr().unwrap().port();
+        drop(doh3_probe);
+        let mut doh3_config = Doh3Config::new(
+            SocketAddr::from(([127, 0, 0, 1], doh3_port)),
+            Some(acceptor_mgr),
+        );
+        doh3_config.rate_limit_per_ip = u32::MAX;
+        doh3_config.rate_limiter = None;
+        let doh3_handle = start_doh3_listener(doh3_config, handler, shutdown_rx)
+            .await
+            .unwrap();
+
+        let _ = shutdown_tx.send(true);
+        for handle in [tcp_handle, dot_handle, doh_handle, doq_handle, doh3_handle] {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        }
+        for handle in udp_handles {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        }
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

@@ -1,33 +1,47 @@
 //! TOTP implementation conforming to RFC 6238 and section 12.2.
 //!
 //! 30s window, ±1 step tolerance, replay protection for accepted time steps,
-//! and 10 one-time backup codes with 128 bits of entropy stored as Argon2id
-//! hashes (never as unsalted fast hashes).
+//! and 10 one-time backup codes with 128 bits of entropy stored as keyed
+//! BLAKE3 digests.
+//!
+//! Dynamic codes are verified with HMAC (RFC 6238) and backup codes with a
+//! fast constant-time digest comparison: an attacker cannot turn a failed
+//! verification into ten Argon2id computations. Argon2 (memory-hard) remains
+//! reserved for low-entropy user passwords.
 
-use argon2::password_hash::phc::PasswordHash;
-use argon2::password_hash::{PasswordHasher, PasswordVerifier};
-use argon2::{Algorithm, Argon2, Params, Version};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use totp_rs::{Builder, Secret};
 
-/// Backup-code Argon2 memory cost in KiB (16 MiB; codes are already high-entropy).
-const BACKUP_ARGON2_M_COST: u32 = 16_384;
-const BACKUP_ARGON2_T_COST: u32 = 2;
-const BACKUP_ARGON2_P_COST: u32 = 2;
+/// Prefix used for BLAKE3 backup-code digests. Hashes without it are legacy
+/// Argon2id digests from older releases and are refused (never verified) so a
+/// failed attempt cannot trigger memory-hard work.
+pub const BACKUP_HASH_PREFIX: &str = "b3:";
 
 /// TOTP configuration and state for a user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TotpConfig {
     pub enabled: bool,
     pub secret: String,
-    /// Argon2id hashes of remaining one-time backup codes.
+    /// BLAKE3 digests (`b3:<hex>`) of remaining one-time backup codes.
     pub backup_code_hashes: Vec<String>,
     /// Highest accepted TOTP time-step, used to reject replays within the
     /// ±1 window. `None` until the first successful dynamic-code login.
     #[serde(default)]
     pub last_used_step: Option<u64>,
+}
+
+impl TotpConfig {
+    /// True when any stored backup-code digest is a legacy Argon2id hash that
+    /// this version refuses to verify.
+    #[must_use]
+    pub fn has_legacy_backup_hashes(&self) -> bool {
+        self.backup_code_hashes
+            .iter()
+            .any(|h| !h.starts_with(BACKUP_HASH_PREFIX))
+    }
 }
 
 /// Returned during TOTP setup.
@@ -116,8 +130,8 @@ impl TotpConfig {
             }
         }
 
-        // 2. Try one-time backup codes. Evaluate every hash (no early exit) so
-        //    the position of the match is not observable from timing.
+        // 2. Try one-time backup codes. Evaluate every digest (no early exit)
+        //    so the position of the match is not observable from timing.
         let mut matched_idx = None;
         for (idx, h) in self.backup_code_hashes.iter().enumerate() {
             if verify_backup_code(&clean_code, h) {
@@ -134,31 +148,31 @@ impl TotpConfig {
     }
 }
 
-fn backup_argon2() -> Argon2<'static> {
-    let params = Params::new(
-        BACKUP_ARGON2_M_COST,
-        BACKUP_ARGON2_T_COST,
-        BACKUP_ARGON2_P_COST,
-        None,
+fn backup_digest(code: &str) -> String {
+    format!(
+        "{BACKUP_HASH_PREFIX}{}",
+        blake3::hash(code.as_bytes()).to_hex()
     )
-    .expect("valid backup-code Argon2 parameters");
-    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
 fn hash_backup_code(code: &str) -> String {
-    backup_argon2()
-        .hash_password(code.as_bytes())
-        .map(|hash| hash.to_string())
-        .expect("backup-code hashing cannot fail")
+    backup_digest(code)
 }
 
-fn verify_backup_code(code: &str, hash_str: &str) -> bool {
-    let Ok(parsed_hash) = PasswordHash::new(hash_str) else {
+/// Constant-time verification of a backup code against a stored digest.
+///
+/// Legacy Argon2id digests (written by releases before 1.8) are refused
+/// outright: verifying them would reintroduce the ten-Argon2 hashes per failed
+/// TOTP attempt that this module exists to prevent. Affected users can still
+/// log in with their authenticator app and re-enroll 2FA to get fresh codes.
+fn verify_backup_code(code: &str, stored: &str) -> bool {
+    let Some(expected) = stored.strip_prefix(BACKUP_HASH_PREFIX) else {
         return false;
     };
-    backup_argon2()
-        .verify_password(code.as_bytes(), &parsed_hash)
-        .is_ok()
+    let actual = blake3::hash(code.as_bytes()).to_hex();
+    let expected = expected.as_bytes();
+    let actual = actual.as_bytes();
+    expected.len() == actual.len() && bool::from(expected.ct_eq(actual))
 }
 
 #[cfg(test)]
@@ -192,9 +206,19 @@ mod tests {
         assert!(!setup.qr_code.is_empty());
         assert!(setup.otpauth_url.contains("sito"));
 
-        // Plaintext codes are never stored; hashes are Argon2id.
-        assert!(config.backup_code_hashes[0].starts_with("$argon2id$"));
+        // Plaintext codes are never stored; digests are fast BLAKE3 (no Argon2:
+        // a failed TOTP attempt must not cost ten memory-hard hashes).
+        assert!(config.backup_code_hashes[0].starts_with(BACKUP_HASH_PREFIX));
         assert_ne!(config.backup_code_hashes[0], setup.backup_codes[0]);
+        assert!(
+            config
+                .backup_code_hashes
+                .iter()
+                .all(|h| !h.contains("$argon2")),
+            "backup codes must never be Argon2-hashed: {:#?}",
+            config.backup_code_hashes
+        );
+        assert!(!config.has_legacy_backup_hashes());
 
         let valid_code = dynamic_code(&config);
         assert!(config.verify(&valid_code, "admin", "sito"));
@@ -222,6 +246,38 @@ mod tests {
         assert!(
             !config.verify(&code, "admin", "sito"),
             "replayed code must be rejected"
+        );
+    }
+
+    /// Regression for WP-4.4: one failed verification used to run up to ten
+    /// Argon2id hashes (~16 MiB / 2 iterations each). 50 failed attempts must
+    /// now complete in well under a second; the old implementation needed
+    /// several seconds at minimum.
+    #[test]
+    fn test_failed_totp_verification_is_bounded() {
+        let (mut config, _setup) = TotpConfig::generate("sito", "admin");
+        let attempts = 50;
+        let start = std::time::Instant::now();
+        for _ in 0..attempts {
+            assert!(!config.verify("000000", "admin", "sito"));
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "{attempts} failed TOTP verifications took {elapsed:?}; Argon2 backup-code hashing must not be on this path"
+        );
+    }
+
+    /// Legacy Argon2 backup hashes are refused without running Argon2.
+    #[test]
+    fn test_legacy_argon2_backup_hashes_are_refused() {
+        let (mut config, setup) = TotpConfig::generate("sito", "admin");
+        let argon2_hash = "$argon2id$v=19$m=16384,t=2,p=2$c29tZXNhbHQ$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        config.backup_code_hashes = vec![argon2_hash.to_string()];
+        assert!(config.has_legacy_backup_hashes());
+        assert!(
+            !config.verify(&setup.backup_codes[0], "admin", "sito"),
+            "legacy Argon2 backup hashes must be refused, never verified"
         );
     }
 }

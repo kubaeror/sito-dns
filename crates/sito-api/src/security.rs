@@ -3,15 +3,17 @@
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, HOST, ORIGIN, REFERER, SET_COOKIE};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_TYPE, COOKIE, HOST, ORIGIN, REFERER, SET_COOKIE, VARY,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::net::{IpAddr, SocketAddr};
 use subtle::ConstantTimeEq;
 
-use crate::auth::client_ip::is_https_request;
-use crate::auth::session::extract_session_cookie;
+use crate::auth::client_ip::{AdminSchemeConfig, admin_scheme_config, is_https_request};
+use crate::auth::session::{extract_csrf_cookie, extract_session_cookie};
 use crate::error::ProblemDetails;
 use crate::state::ServerContext;
 
@@ -29,16 +31,30 @@ fn peer_addr(request: &Request) -> Option<SocketAddr> {
 }
 
 /// Returns true for responses that must never be cached (auth/config/session
-/// state and anything that sets a cookie).
+/// state, authenticated API surfaces and any response that sets a cookie).
 fn is_sensitive_path(path: &str) -> bool {
     path.starts_with("/api/v1/auth")
         || path.starts_with("/api/v1/config")
         || path.starts_with("/api/v1/system")
-        || path.starts_with("/ui/login")
-        || path.starts_with("/ui/logout")
-        || path.starts_with("/ui/wizard")
-        || path == "/login"
-        || path == "/wizard"
+        || path.starts_with("/api/v1/clients")
+        || path.starts_with("/api/v1/querylog")
+        || path.starts_with("/api/v1/stats")
+        || path.starts_with("/api/v1/ha")
+        || path.starts_with("/ui/")
+        || matches!(
+            path,
+            "/" | "/login"
+                | "/logout"
+                | "/wizard"
+                | "/dashboard"
+                | "/querylog"
+                | "/filtering"
+                | "/clients"
+                | "/rewrites"
+                | "/upstreams"
+                | "/settings"
+                | "/system"
+        )
 }
 
 /// Adds baseline security headers to every response.
@@ -49,9 +65,9 @@ pub async fn security_headers_middleware(
 ) -> Response {
     let config = ctx.config.load();
     let trusted_proxies = config.get_web_config().trusted_proxies.clone();
-    let tls_enabled = config.get_tls_config().is_some();
+    let scheme = admin_scheme_config(config.web.as_ref());
     let peer = peer_addr(&request);
-    let is_https = is_https_request(peer, request.headers(), &trusted_proxies, tls_enabled);
+    let is_https = is_https_request(peer, request.headers(), &trusted_proxies, &scheme);
     let path = request.uri().path().to_string();
 
     let mut response = next.run(request).await;
@@ -108,6 +124,9 @@ pub async fn security_headers_middleware(
     }
     if is_sensitive_path(&path) || headers.contains_key(SET_COOKIE) {
         headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        // Responses depend on the caller's cookies: caches must not serve one
+        // user's data to another.
+        headers.insert(VARY, HeaderValue::from_static("Cookie"));
     }
 
     response
@@ -182,23 +201,23 @@ fn same_origin(
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
     trusted_proxies: &[IpAddr],
-    tls_enabled: bool,
+    scheme: &AdminSchemeConfig,
 ) -> bool {
-    let Some((scheme, authority)) = split_origin(value) else {
+    let Some((scheme_url, authority)) = split_origin(value) else {
         return false;
     };
-    let expected_scheme = if is_https_request(peer, headers, trusted_proxies, tls_enabled) {
+    let expected_scheme = if is_https_request(peer, headers, trusted_proxies, scheme) {
         "https"
     } else {
         "http"
     };
-    if !scheme.eq_ignore_ascii_case(expected_scheme) {
+    if !scheme_url.eq_ignore_ascii_case(expected_scheme) {
         return false;
     }
     let Some(expected) = expected_authority(headers, peer, trusted_proxies) else {
         return false;
     };
-    normalize_authority(authority, scheme) == normalize_authority(&expected, expected_scheme)
+    normalize_authority(authority, scheme_url) == normalize_authority(&expected, expected_scheme)
 }
 
 /// Decodes a `application/x-www-form-urlencoded` field (percent-decoding and
@@ -251,6 +270,24 @@ fn hex_val(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+/// Constant-time comparison of a supplied CSRF value with the session token.
+fn csrf_value_matches(expected: &str, supplied: Option<&str>) -> bool {
+    let expected = expected.as_bytes();
+    let supplied = supplied.unwrap_or("").as_bytes();
+    !expected.is_empty() && expected.len() == supplied.len() && bool::from(expected.ct_eq(supplied))
+}
+
+/// Double-submit check: the non-HttpOnly `sito_csrf` cookie must carry the same
+/// token as the session. A request authenticated by the session cookie without
+/// a matching CSRF cookie is rejected, so the cookie is not dead machinery.
+fn csrf_cookie_matches(expected: &str, headers: &HeaderMap) -> bool {
+    let supplied = headers
+        .get(COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_csrf_cookie);
+    csrf_value_matches(expected, supplied.as_deref())
 }
 
 /// Extracts the CSRF token from the `X-CSRF-Token` header or (for
@@ -322,7 +359,7 @@ pub async fn csrf_protection_middleware(
 
     let config = ctx.config.load();
     let trusted_proxies = config.get_web_config().trusted_proxies.clone();
-    let tls_enabled = config.get_tls_config().is_some();
+    let scheme = admin_scheme_config(config.web.as_ref());
     let peer = peer_addr(&request);
 
     let session = request
@@ -347,13 +384,7 @@ pub async fn csrf_protection_middleware(
         if origin.eq_ignore_ascii_case("null") {
             return reject("Cross-origin request rejected (Origin: null)");
         }
-        if !same_origin(
-            origin,
-            request.headers(),
-            peer,
-            &trusted_proxies,
-            tls_enabled,
-        ) {
+        if !same_origin(origin, request.headers(), peer, &trusted_proxies, &scheme) {
             return reject("Cross-origin request rejected (CSRF protection)");
         }
     } else if session.is_some() {
@@ -362,42 +393,29 @@ pub async fn csrf_protection_middleware(
         // (CLI/API) are not browser-ambient and may omit both.
         match referer {
             Some(referer)
-                if same_origin(
-                    referer,
-                    request.headers(),
-                    peer,
-                    &trusted_proxies,
-                    tls_enabled,
-                ) => {}
+                if same_origin(referer, request.headers(), peer, &trusted_proxies, &scheme) => {}
             _ => {
                 return reject("Missing Origin/Referer on mutating request (CSRF protection)");
             }
         }
     } else if let Some(referer) = referer
-        && !same_origin(
-            referer,
-            request.headers(),
-            peer,
-            &trusted_proxies,
-            tls_enabled,
-        )
+        && !same_origin(referer, request.headers(), peer, &trusted_proxies, &scheme)
     {
         return reject("Cross-origin request rejected (CSRF protection)");
     }
     drop(config);
 
-    // Session-bound double-submit token.
+    // Session-bound double-submit token: both the `sito_csrf` cookie and the
+    // header/form value must match the session's token.
     if let Some(session) = session {
+        if !csrf_cookie_matches(&session.csrf_token, request.headers()) {
+            return reject("CSRF cookie missing or invalid");
+        }
         let (request, token) = match extract_csrf_token(request).await {
             Ok(result) => result,
             Err(response) => return *response,
         };
-        let expected = session.csrf_token.as_bytes();
-        let supplied = token.as_deref().unwrap_or("").as_bytes();
-        if expected.is_empty()
-            || expected.len() != supplied.len()
-            || !bool::from(expected.ct_eq(supplied))
-        {
+        if !csrf_value_matches(&session.csrf_token, token.as_deref()) {
             return reject("CSRF token missing or invalid");
         }
         return next.run(request).await;
@@ -434,35 +452,36 @@ mod tests {
 
     #[test]
     fn test_same_origin_matching() {
+        let plain = AdminSchemeConfig::default();
         let headers = headers_with_host("example.com:8080");
         assert!(same_origin(
             "http://example.com:8080/dashboard",
             &headers,
             None,
             &[],
-            false
+            &plain
         ));
         assert!(!same_origin(
             "http://evil.example.com:8080/",
             &headers,
             None,
             &[],
-            false
+            &plain
         ));
         assert!(!same_origin(
             "https://example.com:8080/",
             &headers,
             None,
             &[],
-            false
+            &plain
         ));
-        assert!(!same_origin("null", &headers, None, &[], false));
+        assert!(!same_origin("null", &headers, None, &[], &plain));
         assert!(!same_origin(
             "http://example.com/",
             &headers,
             None,
             &[],
-            false
+            &plain
         ));
 
         // Default ports are normalized.
@@ -472,15 +491,19 @@ mod tests {
             &headers,
             None,
             &[],
-            false
+            &plain
         ));
         let headers = headers_with_host("example.com:443");
+        let https_scheme = AdminSchemeConfig {
+            public_url_scheme: Some("https".to_string()),
+            tls_terminated_by_proxy: false,
+        };
         assert!(same_origin(
             "https://example.com/",
             &headers,
             None,
             &[],
-            true
+            &https_scheme
         ));
     }
 
@@ -496,13 +519,14 @@ mod tests {
         let proxy_ip: IpAddr = "10.0.0.1".parse().unwrap();
         let trusted = vec![proxy_ip];
         let peer = SocketAddr::from_str("10.0.0.1:5555").unwrap();
+        let plain = AdminSchemeConfig::default();
 
         assert!(same_origin(
             "https://dns.example.com/",
             &headers,
             Some(peer),
             &trusted,
-            false
+            &plain
         ));
         // Untrusted peer cannot use forwarded headers.
         assert!(!same_origin(
@@ -510,8 +534,23 @@ mod tests {
             &headers,
             Some(SocketAddr::from_str("198.51.100.1:5555").unwrap()),
             &trusted,
-            false
+            &plain
         ));
+    }
+
+    /// Regression for WP-4.1: with a DNS `[tls]` certificate configured the
+    /// plain-HTTP origin check used to expect `https` and reject every browser
+    /// mutation. The admin scheme must come only from `[web]`/trusted proxy.
+    #[test]
+    fn test_origin_check_ignores_dns_tls_config() {
+        let mut config = sito_core::config::Config::default();
+        config.tls = Some(sito_core::config::TlsConfig {
+            cert: Some(std::path::PathBuf::from("/etc/sito/dot-cert.pem")),
+            key: Some(std::path::PathBuf::from("/etc/sito/dot-key.pem")),
+            sni_certs: Vec::new(),
+        });
+        let scheme = admin_scheme_config(config.web.as_ref());
+        assert!(!is_https_request(None, &HeaderMap::new(), &[], &scheme));
     }
 
     #[test]
@@ -557,9 +596,41 @@ mod tests {
     fn test_sensitive_paths() {
         assert!(is_sensitive_path("/api/v1/auth/login"));
         assert!(is_sensitive_path("/api/v1/config"));
+        assert!(is_sensitive_path("/api/v1/clients"));
+        assert!(is_sensitive_path("/api/v1/querylog"));
+        assert!(is_sensitive_path("/api/v1/stats"));
         assert!(is_sensitive_path("/ui/login"));
         assert!(is_sensitive_path("/wizard"));
-        assert!(!is_sensitive_path("/dashboard"));
+        assert!(is_sensitive_path("/dashboard"));
+        assert!(is_sensitive_path("/querylog"));
         assert!(!is_sensitive_path("/static/app.js"));
+        assert!(!is_sensitive_path("/assets/app.js"));
+        assert!(!is_sensitive_path("/health"));
+    }
+
+    #[test]
+    fn test_csrf_double_submit_cookie_is_enforced() {
+        let token = "a".repeat(64);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("sito_session=abc; sito_csrf={token}")).unwrap(),
+        );
+        assert!(csrf_cookie_matches(&token, &headers));
+
+        // Session cookie without the CSRF cookie: rejected.
+        let mut session_only = HeaderMap::new();
+        session_only.insert(COOKIE, HeaderValue::from_static("sito_session=abc"));
+        assert!(!csrf_cookie_matches(&token, &session_only));
+
+        // Mismatched or empty values are rejected.
+        let mut wrong = HeaderMap::new();
+        wrong.insert(COOKIE, HeaderValue::from_static("sito_csrf=deadbeef"));
+        assert!(!csrf_cookie_matches(&token, &wrong));
+        assert!(!csrf_cookie_matches(&token, &HeaderMap::new()));
+        assert!(!csrf_cookie_matches("", &headers));
+        assert!(!csrf_value_matches(&token, None));
+        assert!(!csrf_value_matches(&token, Some("short")));
+        assert!(csrf_value_matches(&token, Some(&token)));
     }
 }

@@ -42,7 +42,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Run clippy
-        run: cargo clippy --workspace --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: test
@@ -53,11 +53,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Run tests
-        run: cargo test --workspace --all-features
+        env:
+          # The OpenAPI export test writes docs/openapi.json only when this is
+          # set; the diff below then verifies the committed spec is current.
+          SITO_UPDATE_OPENAPI: "1"
+        run: cargo test --workspace --all-features --locked
       - name: Verify docs/openapi.json is up to date
         run: git diff --exit-code docs/openapi.json
       - name: Verify configuration reference matches the config structs
         run: python3 scripts/check_config_reference.py --github
+
+  fuzz:
+    name: fuzz build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # fuzz/ is a standalone workspace with its own lockfile/target dir.
+          workspaces: |
+            fuzz -> target
+      # `--locked` fails when fuzz/Cargo.lock is stale (for example after a
+      # workspace version bump), so this both compiles every fuzz target on
+      # stable and guards lock freshness without needing cargo-fuzz/nightly.
+      - name: Check fuzz targets compile
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked
 
   deny:
     name: deny
@@ -79,6 +101,10 @@ jobs:
         run: command -v shellcheck >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y shellcheck)
       - name: Run shellcheck
         run: shellcheck -S warning contrib/install.sh
+      - name: Test AdGuard converter against the fixture
+        run: |
+          python3 -c "import yaml" >/dev/null 2>&1 || python3 -m pip install --quiet --break-system-packages pyyaml
+          python3 contrib/tests/test_adguard_to_sito.py
 
   build:
     name: build (${{ matrix.target }})
@@ -108,9 +134,9 @@ jobs:
       - name: Build binary for ${{ matrix.target }}
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --workspace --features embed-ui --target ${{ matrix.target }}
+            cross build --workspace --features embed-ui --locked --target ${{ matrix.target }}
           else
-            cargo build --workspace --all-features --target ${{ matrix.target }}
+            cargo build --workspace --all-features --locked --target ${{ matrix.target }}
           fi
       - name: Verify binary output
         if: matrix.target == 'x86_64-unknown-linux-gnu'

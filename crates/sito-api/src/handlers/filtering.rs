@@ -33,11 +33,44 @@ fn resolve_filter_list_index(cfg: &sito_core::config::Config, id: &str) -> Optio
         .filter(|idx| *idx < cfg.filtering.lists.len())
 }
 
+/// Real per-list statistics from the live filter snapshot and the on-disk list
+/// metadata (the previous implementation always returned `0`/`None`).
+async fn filter_list_stats(ctx: &ServerContext, list_name: &str) -> (usize, Option<i64>) {
+    let rule_count = {
+        let snapshot = ctx.filter.snapshot();
+        snapshot
+            .rules
+            .iter()
+            .filter(|rule| rule.source == list_name)
+            .count()
+    };
+    let data_dir = ctx.config.load().server.data_dir.clone();
+    let meta_path = sito_filter::subscription::meta_path_for_list(&data_dir, list_name);
+    let last_updated = sito_filter::subscription::read_metadata(&meta_path)
+        .await
+        .and_then(|meta| i64::try_from(meta.updated_at_secs).ok());
+    (rule_count, last_updated)
+}
+
+/// Builds a list DTO with real statistics.
+async fn filter_list_dto(ctx: &ServerContext, list: &FilterListConfig) -> FilterListDto {
+    let (rule_count, last_updated) = filter_list_stats(ctx, &list.name).await;
+    FilterListDto {
+        id: list.name.clone(),
+        name: list.name.clone(),
+        url: list.url.clone(),
+        enabled: list.enabled,
+        refresh_hours: list.refresh_hours.unwrap_or(24) as u32,
+        rule_count,
+        last_updated,
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/filtering/lists",
     responses(
-        (status = 200, description = "Subscription lists retrieved", body = Vec<FilterListDto>),
+        (status = 200, description = "Subscription lists retrieved with real rule counts", body = Vec<FilterListDto>),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
@@ -47,21 +80,11 @@ pub async fn get_filter_lists(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
 ) -> Json<Vec<FilterListDto>> {
-    let cfg = ctx.config.load();
-    let dtos = cfg
-        .filtering
-        .lists
-        .iter()
-        .map(|list| FilterListDto {
-            id: list.name.clone(),
-            name: list.name.clone(),
-            url: list.url.clone(),
-            enabled: list.enabled,
-            refresh_hours: list.refresh_hours.unwrap_or(24) as u32,
-            rule_count: 0,
-            last_updated: None,
-        })
-        .collect();
+    let lists = ctx.config.load().filtering.lists.clone();
+    let mut dtos = Vec::with_capacity(lists.len());
+    for list in &lists {
+        dtos.push(filter_list_dto(&ctx, list).await);
+    }
     Json(dtos)
 }
 
@@ -114,17 +137,11 @@ pub async fn add_filter_list(
     ctx.cache.flush();
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
     ctx.set_config(new_cfg);
-    crate::publish_bundle(&ctx);
+    crate::publish_bundle(&ctx).await;
 
-    Ok(Json(FilterListDto {
-        id: name,
-        name: new_list.name,
-        url: new_list.url,
-        enabled: new_list.enabled,
-        refresh_hours: new_list.refresh_hours.unwrap_or(24) as u32,
-        rule_count: 0,
-        last_updated: None,
-    }))
+    let mut dto = filter_list_dto(&ctx, &new_list).await;
+    dto.id = name;
+    Ok(Json(dto))
 }
 
 #[utoipa::path(
@@ -183,16 +200,6 @@ pub async fn update_filter_list(
         list.refresh_hours = Some(u64::from(rh));
     }
 
-    let updated_dto = FilterListDto {
-        id: list.name.clone(),
-        name: list.name.clone(),
-        url: list.url.clone(),
-        enabled: list.enabled,
-        refresh_hours: list.refresh_hours.unwrap_or(24) as u32,
-        rule_count: 0,
-        last_updated: None,
-    };
-
     ctx.filter
         .reload_with_config(&new_cfg.filtering)
         .await
@@ -201,10 +208,11 @@ pub async fn update_filter_list(
         })?;
     ctx.cache.flush();
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
+    let updated = new_cfg.filtering.lists[idx].clone();
     ctx.set_config(new_cfg);
-    crate::publish_bundle(&ctx);
+    crate::publish_bundle(&ctx).await;
 
-    Ok(Json(updated_dto))
+    Ok(Json(filter_list_dto(&ctx, &updated).await))
 }
 
 #[utoipa::path(
@@ -238,7 +246,7 @@ pub async fn delete_filter_list(
     ctx.cache.flush();
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
     ctx.set_config(new_cfg);
-    crate::publish_bundle(&ctx);
+    crate::publish_bundle(&ctx).await;
 
     Ok(Json(GenericMessageResponse {
         message: format!("Filter list '{}' deleted successfully", removed.name),
@@ -319,7 +327,7 @@ pub async fn set_filtering_rules(
     ctx.cache.flush();
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
     ctx.set_config(new_cfg);
-    crate::publish_bundle(&ctx);
+    crate::publish_bundle(&ctx).await;
 
     Ok(Json(CustomRulesDto {
         rules: payload.rules,
@@ -410,4 +418,75 @@ pub async fn check_filtering(
         list_source: source,
         category: cat,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::rbac::AuthUser;
+    use crate::auth::token::Role;
+
+    fn operator() -> RequireOperator {
+        RequireOperator(AuthUser {
+            username: "operator".to_string(),
+            role: Role::Operator,
+            token_id: None,
+        })
+    }
+
+    /// WP-4.5: `GET /filtering/lists` must report the real compiled rule count
+    /// (the placeholder `0` made a loaded list indistinguishable from a dead
+    /// one).
+    #[tokio::test]
+    async fn test_filter_lists_expose_real_rule_counts() {
+        let temp_dir = crate::test_support::temp_dir("sito_filter_counts");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let list_path = temp_dir.join("local-list.txt");
+        std::fs::write(
+            &list_path,
+            "||ads.example^\n||tracker.example^\n0.0.0.0 banner.example\n",
+        )
+        .unwrap();
+
+        let mut config = (**ctx.config.load()).clone();
+        config.filtering.lists = vec![FilterListConfig {
+            name: "Local".to_string(),
+            url: format!("file://{}", list_path.display()),
+            enabled: true,
+            refresh_hours: None,
+        }];
+        ctx.filter
+            .reload_with_config(&config.filtering)
+            .await
+            .expect("local list loads");
+        ctx.set_config(config);
+
+        let Json(dtos) = get_filter_lists(operator(), State(ctx.clone())).await;
+        assert_eq!(dtos.len(), 1);
+        assert_eq!(
+            dtos[0].rule_count, 3,
+            "rule_count must reflect the compiled rules for the list"
+        );
+
+        // A list whose source does not exist reports zero rules while the
+        // healthy list keeps its real count.
+        let mut config = (**ctx.config.load()).clone();
+        config.filtering.lists.push(FilterListConfig {
+            name: "Missing".to_string(),
+            url: format!("file://{}", temp_dir.join("missing.txt").display()),
+            enabled: true,
+            refresh_hours: None,
+        });
+        let _ = ctx.filter.reload_with_config(&config.filtering).await;
+        ctx.set_config(config);
+        let Json(dtos) = get_filter_lists(operator(), State(ctx.clone())).await;
+        assert_eq!(dtos.len(), 2);
+        let local = dtos.iter().find(|d| d.name == "Local").unwrap();
+        let missing = dtos.iter().find(|d| d.name == "Missing").unwrap();
+        assert_eq!(local.rule_count, 3);
+        assert_eq!(missing.rule_count, 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

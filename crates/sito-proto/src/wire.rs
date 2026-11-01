@@ -45,6 +45,18 @@ pub fn set_edns_payload_size(msg: &mut Message, max_payload: u16) {
 /// Default block size for RFC 8467 DNS-over-TLS response padding.
 pub const DOT_PADDING_BLOCK_SIZE: usize = 468;
 
+/// Builds a TC=1 response that fits the 65535-byte DNS-over-TCP framing limit
+/// (RFC 7766 §8): the question is preserved and the answer sections dropped.
+///
+/// Returns `None` when the message cannot be decoded or the truncated form
+/// still cannot be framed.
+pub fn truncate_for_framing(encoded: &[u8]) -> Option<Vec<u8>> {
+    let message = decode_message(encoded).ok()?;
+    let truncated = message.truncate();
+    let bytes = encode_message(&truncated).ok()?;
+    (bytes.len() <= 0xFFFF).then_some(bytes)
+}
+
 /// Apply RFC 8467 block-length padding to a DNS message using EDNS(0) option 12.
 pub fn apply_dot_padding(msg: &mut Message, block_size: usize) -> Result<(), ProtoError> {
     use hickory_proto::rr::rdata::opt::EdnsOption;
@@ -88,12 +100,17 @@ pub fn synthesize_blocked_response(
     let mut response = Message::response(query.metadata.id, query.metadata.op_code);
     response.metadata.recursion_desired = query.metadata.recursion_desired;
     response.metadata.recursion_available = true;
+    // RFC 4035 §3.2.2: the CD bit is copied from the query into the
+    // response, including synthesized answers.
+    response.metadata.checking_disabled = query.metadata.checking_disabled;
     response.queries.clone_from(&query.queries);
 
-    // Echo back EDNS if client had it
+    // Echo back EDNS if client had it, including DO so a DNSSEC-aware client
+    // can tell the answer was produced by a DNSSEC-aware resolver.
     if let Some(client_edns) = &query.edns {
         let mut resp_edns = Edns::new();
         resp_edns.set_max_payload(client_edns.max_payload());
+        resp_edns.set_dnssec_ok(client_edns.flags().dnssec_ok);
         response.set_edns(resp_edns);
     }
 
@@ -163,11 +180,13 @@ pub fn synthesize_cname_response(query: &Message, cname_target: &Name, ttl: u32)
     response.metadata.recursion_desired = query.metadata.recursion_desired;
     response.metadata.recursion_available = true;
     response.metadata.response_code = ResponseCode::NoError;
+    response.metadata.checking_disabled = query.metadata.checking_disabled;
     response.queries.clone_from(&query.queries);
 
     if let Some(client_edns) = &query.edns {
         let mut resp_edns = Edns::new();
         resp_edns.set_max_payload(client_edns.max_payload());
+        resp_edns.set_dnssec_ok(client_edns.flags().dnssec_ok);
         response.set_edns(resp_edns);
     }
 
@@ -189,11 +208,13 @@ pub fn synthesize_records_response(query: &Message, answers: Vec<Record>) -> Mes
     response.metadata.recursion_desired = query.metadata.recursion_desired;
     response.metadata.recursion_available = true;
     response.metadata.response_code = ResponseCode::NoError;
+    response.metadata.checking_disabled = query.metadata.checking_disabled;
     response.queries.clone_from(&query.queries);
 
     if let Some(client_edns) = &query.edns {
         let mut resp_edns = Edns::new();
         resp_edns.set_max_payload(client_edns.max_payload());
+        resp_edns.set_dnssec_ok(client_edns.flags().dnssec_ok);
         response.set_edns(resp_edns);
     }
 
@@ -303,6 +324,42 @@ mod tests {
         let resp = synthesize_blocked_response(&query, &BlockingMode::NullRdata, 60);
         assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
         assert!(resp.answers.is_empty());
+    }
+
+    #[test]
+    fn test_synthesized_responses_copy_cd_and_do() {
+        let mut query = Message::new(77, MessageType::Query, OpCode::Query);
+        query.metadata.checking_disabled = true;
+        let qname = Name::from_str("ads.example.com.").unwrap();
+        query
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        query.set_edns(edns);
+
+        let blocked = synthesize_blocked_response(&query, &BlockingMode::ZeroIp, 60);
+        assert!(blocked.metadata.checking_disabled, "CD must be copied");
+        assert!(
+            blocked.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok),
+            "DO must be echoed"
+        );
+
+        let cname =
+            synthesize_cname_response(&query, &Name::from_str("safe.example.com.").unwrap(), 60);
+        assert!(cname.metadata.checking_disabled);
+        assert!(cname.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok));
+
+        let records = synthesize_records_response(
+            &query,
+            vec![Record::from_rdata(
+                qname,
+                60,
+                RData::A(A(Ipv4Addr::new(192, 0, 2, 77))),
+            )],
+        );
+        assert!(records.metadata.checking_disabled);
+        assert!(records.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok));
     }
 
     #[test]

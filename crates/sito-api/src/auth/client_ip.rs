@@ -64,20 +64,85 @@ pub fn resolve_client_ip(
     "127.0.0.1".to_string()
 }
 
-/// Determines if the request arrived over HTTPS, either directly (if server is configured with TLS)
-/// or via a trusted reverse proxy with `X-Forwarded-Proto: https`.
+/// Explicit admin-transport scheme settings read from the raw `[web]` table.
 ///
-/// `X-Forwarded-Proto` is only trusted when the direct peer is a configured
-/// trusted proxy; without peer information the header is ignored so clients
-/// cannot spoof a secure connection.
+/// The admin UI is served over plain HTTP by axum; TLS is terminated either by
+/// an explicit `web.public_url` declaration or by a reverse proxy in front of
+/// it. The DNS TLS material (`[tls]`/`[dns.tls]`) only secures DoT/DoH and must
+/// never be used to decide the admin scheme: doing so marks plain-HTTP browser
+/// sessions as secure, which makes `Secure` cookies invisible and rejects every
+/// mutating Origin check.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdminSchemeConfig {
+    /// Scheme of the configured external admin URL (`web.public_url`), lowercased.
+    /// When set it is authoritative and the request-derived scheme is ignored,
+    /// because the operator has declared how the UI is reached.
+    pub public_url_scheme: Option<String>,
+    /// `web.tls_terminated_by_proxy = true`: TLS is terminated by a trusted
+    /// reverse proxy in front of this server.
+    pub tls_terminated_by_proxy: bool,
+}
+
+impl AdminSchemeConfig {
+    /// True when requests are considered to arrive over HTTPS regardless of
+    /// per-request headers (explicit operator declaration only).
+    #[must_use]
+    pub fn is_always_https(&self) -> bool {
+        match &self.public_url_scheme {
+            Some(scheme) => scheme.eq_ignore_ascii_case("https"),
+            None => self.tls_terminated_by_proxy,
+        }
+    }
+}
+
+/// Builds [`AdminSchemeConfig`] from the raw `[web]` TOML table. Unknown or
+/// wrongly-typed keys fall back to the secure-by-default `false`.
+#[must_use]
+pub fn admin_scheme_config(web: Option<&toml::Value>) -> AdminSchemeConfig {
+    let Some(web) = web else {
+        return AdminSchemeConfig::default();
+    };
+    let Ok(table) = web.clone().try_into::<toml::Table>() else {
+        return AdminSchemeConfig::default();
+    };
+
+    let public_url_scheme = table
+        .get("public_url")
+        .and_then(toml::Value::as_str)
+        .and_then(|url| url.split_once("://").map(|(scheme, _)| scheme))
+        .map(str::trim)
+        .filter(|scheme| !scheme.is_empty())
+        .map(str::to_ascii_lowercase);
+
+    let tls_terminated_by_proxy = table
+        .get("tls_terminated_by_proxy")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+
+    AdminSchemeConfig {
+        public_url_scheme,
+        tls_terminated_by_proxy,
+    }
+}
+
+/// Determines if the request arrived over HTTPS.
+///
+/// The scheme is derived only from the explicit admin-transport setting
+/// (`web.public_url` / `web.tls_terminated_by_proxy`) or from
+/// `X-Forwarded-Proto: https` sent by a configured trusted proxy. The DNS TLS
+/// configuration is deliberately not an input: a DoT/DoH certificate does not
+/// secure the admin UI.
+///
+/// An untrusted peer cannot influence the scheme: its `X-Forwarded-Proto`
+/// value is ignored entirely.
 pub fn is_https_request(
     peer_addr: Option<SocketAddr>,
     headers: &HeaderMap,
     trusted_proxies: &[IpAddr],
-    tls_enabled: bool,
+    scheme: &AdminSchemeConfig,
 ) -> bool {
-    if tls_enabled {
-        return true;
+    if let Some(expected) = &scheme.public_url_scheme {
+        return expected.eq_ignore_ascii_case("https");
     }
 
     if let Some(peer) = peer_addr
@@ -88,7 +153,7 @@ pub fn is_https_request(
         return val.eq_ignore_ascii_case("https");
     }
 
-    false
+    scheme.tls_terminated_by_proxy
 }
 
 #[cfg(test)]
@@ -181,24 +246,116 @@ mod tests {
     #[test]
     fn test_is_https_request() {
         let empty_headers = HeaderMap::new();
-        assert!(!is_https_request(None, &empty_headers, &[], false));
-        assert!(is_https_request(None, &empty_headers, &[], true));
+        let plain = AdminSchemeConfig::default();
+        assert!(!is_https_request(None, &empty_headers, &[], &plain));
 
         let mut https_headers = HeaderMap::new();
         https_headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
         // Without peer information the header must not be trusted.
-        assert!(!is_https_request(None, &https_headers, &[], false));
+        assert!(!is_https_request(None, &https_headers, &[], &plain));
 
         let proxy_ip: IpAddr = "10.0.0.1".parse().unwrap();
         let peer = SocketAddr::new(proxy_ip, 12345);
         // Untrusted proxy
-        assert!(!is_https_request(Some(peer), &https_headers, &[], false));
+        assert!(!is_https_request(Some(peer), &https_headers, &[], &plain));
         // Trusted proxy
         assert!(is_https_request(
             Some(peer),
             &https_headers,
             &[proxy_ip],
-            false
+            &plain
+        ));
+    }
+
+    #[test]
+    fn test_admin_scheme_never_derives_from_dns_tls() {
+        // Regression: the DNS DoT/DoH certificate (`[tls]`) used to be passed
+        // as `tls_enabled`, which made a plain-HTTP admin UI believe it was
+        // serving HTTPS (Secure cookies ignored, HSTS over HTTP, every CSRF
+        // Origin check rejected).
+        let headers = HeaderMap::new();
+        let scheme = admin_scheme_config(None);
+        assert!(!is_https_request(None, &headers, &[], &scheme));
+        assert!(!scheme.is_always_https());
+    }
+
+    #[test]
+    fn test_admin_scheme_from_web_table() {
+        let https_public = toml::from_str::<toml::Value>(
+            r#"
+            public_url = "https://dns.example.com"
+            tls_terminated_by_proxy = false
+            "#,
+        )
+        .unwrap();
+        let scheme = admin_scheme_config(Some(&https_public));
+        assert_eq!(scheme.public_url_scheme.as_deref(), Some("https"));
+        assert!(is_https_request(None, &HeaderMap::new(), &[], &scheme));
+
+        let http_public =
+            toml::from_str::<toml::Value>(r#"public_url = "http://dns.example.com:8080""#).unwrap();
+        let scheme = admin_scheme_config(Some(&http_public));
+        assert_eq!(scheme.public_url_scheme.as_deref(), Some("http"));
+        // Explicit http declaration wins over a spoofed forwarded header.
+        let mut forwarded = HeaderMap::new();
+        forwarded.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        let proxy_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let peer = SocketAddr::new(proxy_ip, 12345);
+        assert!(!is_https_request(
+            Some(peer),
+            &forwarded,
+            &[proxy_ip],
+            &scheme
+        ));
+
+        let proxy_terminated =
+            toml::from_str::<toml::Value>(r"tls_terminated_by_proxy = true").unwrap();
+        let scheme = admin_scheme_config(Some(&proxy_terminated));
+        assert!(scheme.tls_terminated_by_proxy);
+        assert!(scheme.is_always_https());
+
+        // Invalid public_url fails closed to plain HTTP.
+        let garbage = toml::from_str::<toml::Value>(r#"public_url = "not a url""#).unwrap();
+        let scheme = admin_scheme_config(Some(&garbage));
+        assert_eq!(scheme.public_url_scheme, None);
+        assert!(!scheme.is_always_https());
+    }
+
+    #[test]
+    fn test_admin_scheme_untrusted_forwarded_proto_ignored() {
+        let proxy_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let attacker: IpAddr = "198.51.100.7".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+
+        let scheme = AdminSchemeConfig {
+            public_url_scheme: None,
+            tls_terminated_by_proxy: false,
+        };
+        assert!(!is_https_request(
+            Some(SocketAddr::new(attacker, 5555)),
+            &headers,
+            &[proxy_ip],
+            &scheme
+        ));
+        assert!(is_https_request(
+            Some(SocketAddr::new(proxy_ip, 5555)),
+            &headers,
+            &[proxy_ip],
+            &scheme
+        ));
+
+        // `web.tls_terminated_by_proxy = true` is an operator declaration and
+        // does not depend on the peer, but never on request headers.
+        let declared = AdminSchemeConfig {
+            public_url_scheme: None,
+            tls_terminated_by_proxy: true,
+        };
+        assert!(is_https_request(
+            Some(SocketAddr::new(attacker, 5555)),
+            &headers,
+            &[],
+            &declared
         ));
     }
 }

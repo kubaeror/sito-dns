@@ -1,7 +1,7 @@
 //! Cache lookup key definition.
 
 use sito_proto::rdata::opt::ClientSubnet;
-use sito_proto::{DNSClass, Edns, Message, Name, RecordType, normalize_domain};
+use sito_proto::{DNSClass, Edns, Message, Name, OpCode, RecordType, normalize_domain};
 
 /// Key identifying a unique DNS query for caching.
 ///
@@ -17,11 +17,16 @@ use sito_proto::{DNSClass, Edns, Message, Name, RecordType, normalize_domain};
 /// * `ecs` mirrors the RFC 7871 Client Subnet option that this pipeline
 ///   forwards upstream, so subnet-specific answers are only served to the
 ///   same client subnet.
+/// * `opcode` separates questions with the same name/type/class but a
+///   different operation (for example `QUERY` vs `NOTIFY`/`UPDATE`), which
+///   may carry completely different semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub qname: String,
     pub qtype: u16,
     pub qclass: u16,
+    /// DNS opcode of the query (RFC 1035 §4.1.1).
+    pub opcode: u16,
     /// DNSSEC OK (DO) bit of the client query (RFC 3225).
     pub dnssec_ok: bool,
     /// Checking Disabled (CD) bit of the client query (RFC 4035).
@@ -40,6 +45,7 @@ impl CacheKey {
             qname: normalize_name(name),
             qtype: u16::from(qtype),
             qclass: u16::from(qclass),
+            opcode: u16::from(u8::from(OpCode::Query)),
             dnssec_ok: false,
             checking_disabled: false,
             ecs: None,
@@ -55,6 +61,7 @@ impl CacheKey {
             qname: normalize_name(first_query.name()),
             qtype: u16::from(first_query.query_type()),
             qclass: u16::from(first_query.query_class()),
+            opcode: u16::from(u8::from(query.metadata.op_code)),
             dnssec_ok: query
                 .edns
                 .as_ref()
@@ -85,6 +92,12 @@ fn normalize_name(name: &Name) -> String {
     // labels, which would key IDN queries under a Unicode variant that
     // `invalidate_domain` (punycode-normalized) can never evict.
     let ascii = name.to_ascii();
+    if ascii.is_empty() || ascii == "." {
+        // `normalize_domain` rejects the root (empty label); keep a canonical
+        // "." so root queries are cacheable and `invalidate_domain(".")` can
+        // address them.
+        return ".".to_string();
+    }
     normalize_domain(&ascii).unwrap_or_else(|_| ascii.trim_end_matches('.').to_ascii_lowercase())
 }
 
@@ -163,5 +176,35 @@ mod tests {
     fn test_key_from_query_without_question_is_none() {
         let query = Message::new(1, MessageType::Query, OpCode::Query);
         assert!(CacheKey::from_query(&query).is_none());
+    }
+
+    #[test]
+    fn test_opcode_is_part_of_the_key() {
+        let name = Name::from_str("example.com.").unwrap();
+        let mut query = Message::new(1, MessageType::Query, OpCode::Query);
+        query
+            .queries
+            .push(Query::query(name.clone(), RecordType::A));
+        let query_key = CacheKey::from_query(&query).unwrap();
+
+        query.metadata.op_code = OpCode::Notify;
+        let notify_key = CacheKey::from_query(&query).unwrap();
+
+        assert_ne!(
+            query_key, notify_key,
+            "different opcodes must not share a cache entry"
+        );
+    }
+
+    #[test]
+    fn test_root_name_key_is_dot() {
+        let key = CacheKey::new(&Name::root(), RecordType::NS, DNSClass::IN);
+        assert_eq!(key.qname, ".");
+
+        let mut query = Message::new(1, MessageType::Query, OpCode::Query);
+        query
+            .queries
+            .push(Query::query(Name::root(), RecordType::NS));
+        assert_eq!(CacheKey::from_query(&query).unwrap().qname, ".");
     }
 }

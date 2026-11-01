@@ -14,7 +14,7 @@ use sito_proto::{
     DNSClass, Message, MessageType, Name, RData, RecordType, ResponseCode, encode_message,
 };
 
-use crate::entry::CacheEntry;
+use crate::entry::{CacheEntry, ValidationStatus};
 use crate::key::CacheKey;
 
 /// TTL (seconds) clamped onto records served from stale cache per RFC 8767 §5.
@@ -159,15 +159,35 @@ impl DnsCache {
 
     /// Retrieve a response for the given query from cache, adjusting TTLs according to elapsed time.
     pub async fn get(&self, name: &Name, qtype: RecordType, qclass: DNSClass) -> Option<Message> {
-        self.get_by_key(&CacheKey::new(name, qtype, qclass)).await
+        self.get_by_key(&CacheKey::new(name, qtype, qclass))
+            .await
+            .map(|(message, _)| message)
     }
 
     /// Retrieve a response for `query`, honouring its DO/CD/ECS cache key.
     pub async fn get_for_query(&self, query: &Message) -> Option<Message> {
-        self.get_by_key(&CacheKey::from_query(query)?).await
+        self.get_for_query_with_status(query)
+            .await
+            .map(|(message, _)| message)
     }
 
-    async fn get_by_key(&self, key: &CacheKey) -> Option<Message> {
+    /// Retrieve a response and its recorded DNSSEC validation status.
+    ///
+    /// The pipeline uses the status to decide whether the entry may be served
+    /// when validation is active (see [`ValidationStatus`]).
+    pub async fn get_for_query_with_status(
+        &self,
+        query: &Message,
+    ) -> Option<(Message, ValidationStatus)> {
+        self.get_by_key_with_status(&CacheKey::from_query(query)?)
+            .await
+    }
+
+    async fn get_by_key(&self, key: &CacheKey) -> Option<(Message, ValidationStatus)> {
+        self.get_by_key_with_status(key).await
+    }
+
+    async fn get_by_key_with_status(&self, key: &CacheKey) -> Option<(Message, ValidationStatus)> {
         let config = self.config.load();
         if !config.enabled {
             return None;
@@ -227,7 +247,7 @@ impl DnsCache {
             key.qname,
             entry.max_lifespan_secs.saturating_sub(elapsed_secs)
         );
-        Some(response)
+        Some((response, entry.validation_status))
     }
 
     /// Retrieve a stale cached response according to RFC 8767 when upstreams fail.
@@ -337,6 +357,26 @@ impl DnsCache {
     ///   NODATA and require an SOA in the authority section (RFC 2308);
     ///   negative answers without an SOA are not cached.
     pub async fn insert(&self, query: &Message, response: &Message) {
+        let validation_status = if response.metadata.authentic_data {
+            ValidationStatus::Secure
+        } else {
+            ValidationStatus::Unchecked
+        };
+        self.insert_with_status(query, response, validation_status)
+            .await;
+    }
+
+    /// Insert a response together with its DNSSEC validation status.
+    ///
+    /// The extra parameter lets the pipeline distinguish a validated insecure
+    /// answer from one that was never validated, which the plain [`insert`]
+    /// convenience method cannot express.
+    pub async fn insert_with_status(
+        &self,
+        query: &Message,
+        response: &Message,
+        validation_status: ValidationStatus,
+    ) {
         let Some(key) = CacheKey::from_query(query) else {
             return;
         };
@@ -420,21 +460,35 @@ impl DnsCache {
         let mut additional_ttls = Vec::new();
 
         let max_lifespan_secs = if is_negative {
-            // RFC 2308 requires a SOA record to derive the negative TTL.
-            // Without one the answer is not cacheable.
-            let Some(soa_ttl) = negative_ttl_from_soa(&response.authorities) else {
+            // RFC 2308 requires a SOA record owned by an ancestor of the query
+            // name (or of a CNAME target on the chain) to derive the negative
+            // TTL. A SOA for an unrelated zone is out of bailiwick and must not
+            // be trusted for this name.
+            let (chain_names, cname_chain_ttl) = cname_chain(first_query.name(), response);
+            let Some(soa_ttl) = negative_ttl_from_soa(&response.authorities, &chain_names) else {
                 trace!(
-                    "Not caching negative response for {} without a SOA record",
+                    "Not caching negative response for {} without a bailiwick SOA record",
                     key.qname
                 );
                 return;
             };
             let clamped_ttl =
                 soa_ttl.clamp(config.min_ttl, config.negative_ttl_max.max(config.min_ttl));
-            for auth in &response.authorities {
-                authority_ttls.push(auth.ttl.min(clamped_ttl));
+            // RFC 2308: the negative answer must never outlive the CNAME chain
+            // that led to it. Otherwise the cached NODATA/NXDOMAIN would keep
+            // being served after the alias TTL expired.
+            let max_lifespan = clamped_ttl.min(cname_chain_ttl.unwrap_or(u32::MAX));
+
+            for answer in &response.answers {
+                answer_ttls.push(answer.ttl.min(max_lifespan));
             }
-            clamped_ttl
+            for auth in &response.authorities {
+                authority_ttls.push(auth.ttl.min(max_lifespan));
+            }
+            for additional in &response.additionals {
+                additional_ttls.push(additional.ttl.min(max_lifespan));
+            }
+            max_lifespan
         } else {
             let mut min_record_ttl = u32::MAX;
             let effective_max_ttl = config.max_ttl.max(config.min_ttl);
@@ -474,6 +528,7 @@ impl DnsCache {
             answer_ttls,
             authority_ttls,
             additional_ttls,
+            validation_status,
             hits: Arc::new(AtomicU32::new(0)),
             estimated_bytes,
         };
@@ -500,8 +555,16 @@ impl DnsCache {
     /// index; the suffix string is precomputed so the scan performs no
     /// per-entry formatting.
     pub fn invalidate_domain(&self, domain: &str) {
-        let normalized =
-            sito_proto::normalize_domain(domain).unwrap_or_else(|_| domain.to_ascii_lowercase());
+        let trimmed = domain.trim();
+        // The root name is an ancestor of every cached name, so invalidating
+        // it is equivalent to flushing the cache. `normalize_domain(".")`
+        // rejects the root, which used to leave root entries unaffected.
+        if trimmed.is_empty() || trimmed.trim_end_matches('.').is_empty() {
+            self.flush();
+            return;
+        }
+        let normalized = sito_proto::normalize_domain(trimmed)
+            .unwrap_or_else(|_| trimmed.trim_end_matches('.').to_ascii_lowercase());
         let subdomain_suffix = format!(".{normalized}");
         let cache = self.cache.load();
         let _ = cache.invalidate_entries_if(move |k, _v| {
@@ -560,13 +623,53 @@ fn answer_owners_are_relevant(qname: &Name, response: &Message) -> bool {
         .all(|record| relevant.contains(&record.name))
 }
 
-/// Derives the RFC 2308 negative TTL from the SOA record in `authorities`
-/// (`min(SOA TTL, SOA MINIMUM)`), or `None` when no SOA is present.
-fn negative_ttl_from_soa(authorities: &[sito_proto::Record]) -> Option<u32> {
+/// Derives the RFC 2308 negative TTL from the first SOA record in
+/// `authorities` (`min(SOA TTL, SOA MINIMUM)`) whose owner is one of
+/// `chain_names` or an ancestor of one. A SOA for an unrelated zone is out of
+/// bailiwick and is ignored.
+fn negative_ttl_from_soa(authorities: &[sito_proto::Record], chain_names: &[Name]) -> Option<u32> {
     for auth in authorities {
-        if let RData::SOA(SOA { minimum, .. }) = &auth.data {
+        if let RData::SOA(SOA { minimum, .. }) = &auth.data
+            && chain_names.iter().any(|name| auth.name.zone_of(name))
+        {
             return Some(auth.ttl.min(*minimum));
         }
     }
     None
+}
+
+/// Names on the CNAME chain starting at `qname` (including `qname` itself) and
+/// the minimum TTL among the aliases on that chain.
+///
+/// A negative answer reached through aliases must expire with the shortest
+/// alias on the path; otherwise the cached negative would outlive its chain.
+/// The names are also the only in-bailiwick owners a negative SOA may cover.
+fn cname_chain(qname: &Name, response: &Message) -> (Vec<Name>, Option<u32>) {
+    let mut names: Vec<Name> = Vec::new();
+    let mut min_ttl: Option<u32> = None;
+    let mut current = qname.clone();
+    for _ in 0..16 {
+        if names.contains(&current) {
+            break;
+        }
+        names.push(current.clone());
+        let next = response.answers.iter().find_map(|record| {
+            if record.record_type() == RecordType::CNAME && record.name == current {
+                match &record.data {
+                    RData::CNAME(cname) => {
+                        min_ttl = Some(min_ttl.map_or(record.ttl, |ttl| ttl.min(record.ttl)));
+                        Some(cname.0.clone())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        });
+        match next {
+            Some(target) => current = target,
+            None => break,
+        }
+    }
+    (names, min_ttl)
 }

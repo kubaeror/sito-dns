@@ -21,18 +21,18 @@ pub use bundle::{
 };
 pub use config::HaConfig;
 pub use crypto::{
-    Ed25519SigningKey, GeneratedCerts, compute_blake3_fingerprint, compute_blake3_raw_hex,
-    generate_ha_certs, generate_ha_certs_with_sans, parse_public_key, verify_ed25519_signature,
+    Ed25519SigningKey, GeneratedCerts, compute_blake3_fingerprint, generate_ha_certs,
+    generate_ha_certs_with_sans, parse_public_key, verify_ed25519_signature,
 };
 pub use error::HaError;
-pub use master::{MasterCoordinator, SlaveSummary, spawn_master_server};
+pub use master::{MasterCoordinator, ResyncOutcome, SlaveSummary, spawn_master_server};
 pub use protocol::{HaMessage, PROTOCOL_VERSION, UpstreamReport};
 pub use slave::{
     SlaveAppHandles, SlaveState, SlaveStatusTracker, apply_config_push, spawn_slave_worker,
 };
 pub use transport::{
-    ExponentialBackoff, PinnedClientCertVerifier, PinnedServerCertVerifier,
-    build_client_tls_config, build_server_tls_config,
+    ExponentialBackoff, MAX_WS_MESSAGE_SIZE, PinnedClientCertVerifier, PinnedServerCertVerifier,
+    build_client_tls_config, build_server_tls_config, ws_config,
 };
 
 #[cfg(test)]

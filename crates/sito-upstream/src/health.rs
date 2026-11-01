@@ -78,12 +78,12 @@ impl UpstreamHealth {
     }
 
     /// Record a query failure.
-    pub fn record_error(&mut self, err: &UpstreamError) {
-        // SERVFAIL and DnssecBogus do not lower health per plan section 6.3
-        if matches!(err, UpstreamError::DnssecBogus) {
-            return;
-        }
-
+    ///
+    /// Every error kind counts: a `SERVFAIL`/`REFUSED`/`NOTIMP` reply is a real
+    /// upstream failure (the manager retries those against other candidates)
+    /// and transport/validation failures are equally a failure of that server.
+    /// There is no exempt kind.
+    pub fn record_error(&mut self, _error: &UpstreamError) {
         self.consecutive_errors += 1;
         self.probe_successes = 0;
 
@@ -138,11 +138,13 @@ mod tests {
     }
 
     #[test]
-    fn test_dnssec_bogus_does_not_lower_health() {
+    fn test_all_error_kinds_lower_health() {
+        // Every error kind counts uniformly (previously one kind was exempt).
         let mut health = UpstreamHealth::new();
-        for _ in 0..10 {
-            health.record_error(&UpstreamError::DnssecBogus);
+        for _ in 0..6 {
+            health.record_error(&UpstreamError::Timeout);
         }
-        assert_eq!(health.status(), HealthStatus::Healthy);
+        assert_eq!(health.status(), HealthStatus::Down);
+        assert!(!health.is_available());
     }
 }

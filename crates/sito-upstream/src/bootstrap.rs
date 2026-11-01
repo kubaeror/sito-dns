@@ -149,6 +149,13 @@ impl BootstrapResolver {
                 match res {
                     Ok(resp) => {
                         for ans in &resp.answers {
+                            // Only accept addresses the bootstrap server is
+                            // authoritative for: a response may otherwise point
+                            // the resolver at an unrelated (attacker-chosen)
+                            // address for a different owner name.
+                            if ans.name != qname {
+                                continue;
+                            }
                             match &ans.data {
                                 RData::A(A(v4)) => {
                                     resolved_ips.push(IpAddr::V4(*v4));

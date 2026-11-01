@@ -8,7 +8,7 @@ pub mod entry;
 pub mod key;
 
 pub use cache::{DnsCache, SingleFlightGuard};
-pub use entry::CacheEntry;
+pub use entry::{CacheEntry, ValidationStatus};
 pub use key::CacheKey;
 
 #[cfg(test)]
@@ -173,6 +173,240 @@ mod tests {
             .await
             .expect("negative response should be cached");
         assert_eq!(cached.metadata.response_code, ResponseCode::NXDomain);
+    }
+
+    #[tokio::test]
+    async fn test_negative_ttl_clamped_by_soa_minimum_and_cname_chain() {
+        let config = make_test_config(10, 3600, 1800);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("alias.example.").unwrap();
+        let target = Name::from_str("target.example.").unwrap();
+        let query = query_for(70, &qname);
+        let mut response = Message::response(70, OpCode::Query);
+        response.queries = query.queries.clone();
+        // NODATA reached through a CNAME whose TTL (30 s) is shorter than the
+        // SOA-derived negative TTL (120 s).
+        response.answers.push(Record::from_rdata(
+            qname.clone(),
+            30,
+            RData::CNAME(sito_proto::rdata::CNAME(target)),
+        ));
+        response.authorities.push(Record::from_rdata(
+            Name::from_str("example.").unwrap(),
+            300,
+            RData::SOA(SOA::new(
+                Name::from_str("ns1.example.").unwrap(),
+                Name::from_str("hostmaster.example.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                120,
+            )),
+        ));
+        cache.insert(&query, &response).await;
+
+        let cached = cache
+            .get(&qname, RecordType::A, DNSClass::IN)
+            .await
+            .expect("negative response must be cached");
+        assert_eq!(
+            cached.answers[0].ttl, 30,
+            "negative TTL must be capped by the CNAME chain TTL"
+        );
+        assert_eq!(
+            cached.authorities[0].ttl, 30,
+            "the SOA TTL must not outlive the negative lifespan"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let later = cache
+            .get(&qname, RecordType::A, DNSClass::IN)
+            .await
+            .expect("still within lifespan");
+        assert!(
+            later.answers[0].ttl < 30,
+            "negative answer TTLs must decrement on serve (got {})",
+            later.answers[0].ttl
+        );
+    }
+
+    #[tokio::test]
+    async fn test_negative_ttl_uses_soa_minimum() {
+        let config = make_test_config(10, 3600, 1800);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("nodata.example.").unwrap();
+        let query = query_for(71, &qname);
+        let mut response = Message::response(71, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.authorities.push(Record::from_rdata(
+            Name::from_str("example.").unwrap(),
+            300,
+            RData::SOA(SOA::new(
+                Name::from_str("ns1.example.").unwrap(),
+                Name::from_str("hostmaster.example.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                60, // SOA MINIMUM is shorter than the SOA record TTL
+            )),
+        ));
+        cache.insert(&query, &response).await;
+
+        let cached = cache
+            .get(&qname, RecordType::A, DNSClass::IN)
+            .await
+            .expect("negative response must be cached");
+        assert_eq!(
+            cached.authorities[0].ttl, 60,
+            "negative TTL must use min(SOA TTL, SOA MINIMUM)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_negative_soa_must_be_in_bailiwick() {
+        let config = make_test_config(10, 3600, 1800);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("nx.example.").unwrap();
+        let query = query_for(72, &qname);
+        let mut response = Message::response(72, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.metadata.response_code = ResponseCode::NXDomain;
+        // A SOA for an unrelated zone must not authorize a negative entry.
+        response.authorities.push(Record::from_rdata(
+            Name::from_str("unrelated.").unwrap(),
+            300,
+            RData::SOA(SOA::new(
+                Name::from_str("ns1.unrelated.").unwrap(),
+                Name::from_str("hostmaster.unrelated.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                120,
+            )),
+        ));
+        cache.insert(&query, &response).await;
+        assert!(
+            cache
+                .get(&qname, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "out-of-bailiwick SOA must not authorize negative caching"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_negative_soa_for_cname_target_zone_is_in_bailiwick() {
+        let config = make_test_config(10, 3600, 1800);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("alias.example.").unwrap();
+        let target = Name::from_str("target.other.").unwrap();
+        let query = query_for(78, &qname);
+        let mut response = Message::response(78, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.metadata.response_code = ResponseCode::NXDomain;
+        response.answers.push(Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::CNAME(sito_proto::rdata::CNAME(target)),
+        ));
+        // A cross-zone alias legitimately ends in the target's zone.
+        response.authorities.push(Record::from_rdata(
+            Name::from_str("other.").unwrap(),
+            300,
+            RData::SOA(SOA::new(
+                Name::from_str("ns1.other.").unwrap(),
+                Name::from_str("hostmaster.other.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                120,
+            )),
+        ));
+        cache.insert(&query, &response).await;
+        assert!(
+            cache
+                .get(&qname, RecordType::A, DNSClass::IN)
+                .await
+                .is_some(),
+            "a SOA for the CNAME target's zone is in bailiwick"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_root_name_is_cacheable_and_invalidation_flushes() {
+        let config = make_test_config(10, 3600, 1800);
+        let cache = DnsCache::new(config);
+
+        let root = Name::root();
+        let query = query_for(73, &root);
+        let response = answer_response(73, &root, [192, 0, 2, 73]);
+        cache.insert(&query, &response).await;
+        insert_answer(&cache, 74, "example.com.").await;
+
+        assert!(
+            cache
+                .get(&root, RecordType::A, DNSClass::IN)
+                .await
+                .is_some(),
+            "root queries must be cacheable"
+        );
+        cache.invalidate_domain(".");
+        assert!(
+            cache
+                .get(&root, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "root invalidation must evict the root entry"
+        );
+        assert!(
+            cache
+                .get(
+                    &Name::from_str("example.com.").unwrap(),
+                    RecordType::A,
+                    DNSClass::IN
+                )
+                .await
+                .is_none(),
+            "root invalidation covers every descendant"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validation_status_round_trips_through_cache() {
+        let config = make_test_config(10, 3600, 1800);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("status.example.").unwrap();
+        let query = query_for(75, &qname);
+        let response = answer_response(75, &qname, [192, 0, 2, 75]);
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Insecure)
+            .await;
+
+        let (_, status) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("cache hit");
+        assert_eq!(status, ValidationStatus::Insecure);
+
+        // The convenience insert derives Secure from the AD bit.
+        let mut secure = answer_response(76, &qname, [192, 0, 2, 76]);
+        secure.metadata.authentic_data = true;
+        let secure_query = query_for(76, &qname);
+        cache.insert(&secure_query, &secure).await;
+        let (_, status) = cache
+            .get_for_query_with_status(&secure_query)
+            .await
+            .expect("cache hit");
+        assert_eq!(status, ValidationStatus::Secure);
     }
 
     #[tokio::test]

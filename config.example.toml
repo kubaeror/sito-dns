@@ -79,8 +79,9 @@ session_ttl_hours = 24
 login_rate_limit = 5
 # Persist sessions/tokens (0600 files in data_dir) across restarts.
 session_persist = true
-# Default API-token lifetime in days; 0 = no expiry.
-token_default_ttl_days = 0
+# Default API-token lifetime in days; 0 = no expiry. 90 keeps credentials from
+# living forever by omission.
+token_default_ttl_days = 90
 
 [stats]
 retention_days = 90
@@ -150,3 +151,12 @@ metrics_auth = true
 # When binding non-loopback over plain HTTP the admin interface is reachable
 # without transport encryption; use a TLS reverse proxy or [tls] in production.
 trusted_proxies = []
+# The admin UI is served over plain HTTP by axum; TLS is terminated either by
+# an explicit public URL or by a reverse proxy. The DNS [tls] certificate only
+# secures DoT/DoH and never the admin scheme.
+#
+# Explicit external URL of the admin UI (scheme decides Secure cookies/HSTS):
+# public_url = "https://dns.example.com"
+#
+# Set when a trusted reverse proxy terminates TLS in front of this server:
+# tls_terminated_by_proxy = false

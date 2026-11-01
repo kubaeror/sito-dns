@@ -14,6 +14,12 @@ pub const SESSION_COOKIE_NAME: &str = "sito_session";
 pub const SESSION_COOKIE_NAME_SECURE: &str = "__Host-sito_session";
 /// Double-submit/browser CSRF cookie name. Not HttpOnly so the UI can read it.
 pub const CSRF_COOKIE_NAME: &str = "sito_csrf";
+/// Short-lived cookie carrying the TOTP partial-login token for browser
+/// clients (the JSON API only returns it to clients that explicitly ask via
+/// `X-Sito-Token-Delivery: body`).
+pub const PARTIAL_COOKIE_NAME: &str = "sito_partial";
+/// Partial-login token lifetime, mirroring `PartialAuth::expires_at`.
+pub const PARTIAL_COOKIE_MAX_AGE_SECS: i64 = 300;
 pub const DEFAULT_SESSION_TTL_SECS: i64 = 86400; // 24 hours
 
 /// Active user session.
@@ -28,6 +34,11 @@ pub struct Session {
     /// token was introduced; such sessions receive a fresh token on load.
     #[serde(default)]
     pub csrf_token: String,
+    /// User-secret generation the session was issued under. A global
+    /// `reset-admin`/`reset-sessions` rotates the generation and invalidates
+    /// every persisted session even if its file survives.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 fn random_token_hex() -> String {
@@ -48,7 +59,15 @@ impl Session {
             created_at: now,
             expires_at: now + ttl_secs,
             csrf_token: random_token_hex(),
+            generation: 0,
         }
+    }
+
+    /// Stamps the session with the current user-secret generation.
+    #[must_use]
+    pub fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
     }
 
     pub fn is_expired(&self) -> bool {
@@ -105,6 +124,36 @@ pub fn build_csrf_cookie(token: &str, max_age_secs: i64, secure: bool) -> String
 pub fn build_clear_csrf_cookie(secure: bool) -> String {
     let secure_attr = if secure { "; Secure" } else { "" };
     format!("{CSRF_COOKIE_NAME}=; Path=/{secure_attr}; SameSite=Strict; Max-Age=0")
+}
+
+/// Generates the HttpOnly cookie that carries the TOTP partial-login token for
+/// browser clients. It is never readable from JavaScript and expires with the
+/// in-memory partial token (5 minutes).
+pub fn build_partial_cookie(token: &str, max_age_secs: i64, secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!(
+        "{PARTIAL_COOKIE_NAME}={token}; Path=/; HttpOnly{secure_attr}; SameSite=Strict; Max-Age={max_age_secs}"
+    )
+}
+
+/// Generates a `Set-Cookie` header value clearing the partial-login cookie.
+pub fn build_clear_partial_cookie(secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!("{PARTIAL_COOKIE_NAME}=; Path=/; HttpOnly{secure_attr}; SameSite=Strict; Max-Age=0")
+}
+
+/// Extracts the TOTP partial-login token from a Cookie header string.
+pub fn extract_partial_cookie(cookie_header: &str) -> Option<String> {
+    for piece in cookie_header.split(';') {
+        let trimmed = piece.trim();
+        if let Some(val) = trimmed.strip_prefix("sito_partial=") {
+            let token = val.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn session_cookie_name(secure: bool) -> &'static str {
@@ -203,6 +252,26 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_token_cookie_is_httponly_and_readable() {
+        let cookie = build_partial_cookie("deadbeef", PARTIAL_COOKIE_MAX_AGE_SECS, true);
+        assert!(cookie.starts_with("sito_partial=deadbeef"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("Secure"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Max-Age=300"));
+        assert_eq!(
+            extract_partial_cookie(&format!("theme=dark; {cookie}")),
+            Some("deadbeef".to_string())
+        );
+
+        let clear = build_clear_partial_cookie(false);
+        assert!(clear.starts_with("sito_partial=;"));
+        assert!(clear.contains("Max-Age=0"));
+        assert!(!clear.contains("Secure"));
+        assert_eq!(extract_partial_cookie(&clear), None);
+    }
+
+    #[test]
     fn test_legacy_session_without_csrf_token_gets_one() {
         let mut session = Session {
             id: "abc".to_string(),
@@ -211,6 +280,7 @@ mod tests {
             created_at: 0,
             expires_at: i64::MAX,
             csrf_token: String::new(),
+            generation: 0,
         };
         session.ensure_csrf_token();
         assert_eq!(session.csrf_token.len(), 64);

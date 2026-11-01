@@ -5,7 +5,7 @@
 //! documentation, multicast, ...) and pin the resolved address so a hostile
 //! DNS server cannot rebind the connection to an internal host.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr as _;
 use std::time::Duration;
 
@@ -18,46 +18,11 @@ pub const MAX_PROBE_SERVERS: usize = 16;
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Returns true when an IP must never be used as an outbound probe target.
+///
+/// Delegates to the shared guard in [`sito_core::ssrf`]; probe-specific policy
+/// (the resolver allowlist) lives in the callers.
 pub fn is_forbidden_probe_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_forbidden_probe_ipv4(*v4),
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_forbidden_probe_ipv4(v4);
-            }
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-                // Documentation 2001:db8::/32
-                || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8)
-                // Deprecated site-local fec0::/10
-                || (v6.segments()[0] & 0xffc0) == 0xfec0
-        }
-    }
-}
-
-fn is_forbidden_probe_ipv4(ip: Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || ip.is_documentation()
-        // Carrier-grade NAT 100.64.0.0/10
-        || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
-        // Benchmarking 198.18.0.0/15
-        || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
-        // Reserved 240.0.0.0/4
-        || octets[0] >= 240
-        // 192.0.0.0/24 IETF protocol assignments
-        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-        // 198.51.100.0/24 and 203.0.113.0/24 are covered by is_documentation
-        // 192.88.99.0/24 (6to4 relay anycast)
-        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+    sito_core::is_denied_target_ip(*ip)
 }
 
 /// Resolves `host:port` once, rejects any non-global address and returns the

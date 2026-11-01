@@ -50,10 +50,16 @@ pub fn covers(record: &NsecRecord<'_>, qname: &Name) -> bool {
 ///
 /// An NSEC at a delegation point from the parent zone (NS without SOA) denies
 /// the type only for the parent, not for the child zone that owns the name.
+/// The exception is DS: RFC 6840 §4.1/§4.4 accepts a parent-side delegation
+/// NSEC (NS set, SOA clear, DS clear) as proof that no DS exists at the
+/// delegation, which is what makes an unsigned delegation provable.
 fn denies_type(record: &NsecRecord<'_>, qtype: RecordType) -> bool {
     let types = record.rdata.type_set();
     if types.contains(qtype) || types.contains(RecordType::CNAME) {
         return false;
+    }
+    if qtype == RecordType::DS {
+        return true;
     }
     !types.contains(RecordType::NS) || types.contains(RecordType::SOA)
 }
@@ -87,6 +93,27 @@ pub fn evaluate_nsec_denial(
         .filter(|record| signer_zone.zone_of(record.owner))
         .collect();
 
+    // Longest existing ancestor of `qname`: every ancestor of an existing NSEC
+    // owner inside `signer_zone` exists (at least as an empty non-terminal),
+    // save for a wildcard label itself (`*`) which only proves its base name.
+    let mut closest = signer_zone.clone();
+    for record in &relevant {
+        let mut cand = if record.owner.is_wildcard() {
+            record.owner.base_name()
+        } else {
+            record.owner.clone()
+        };
+        while !cand.is_root() {
+            if cand != *qname && cand.zone_of(qname) {
+                if cand.num_labels() > closest.num_labels() {
+                    closest = cand;
+                }
+                break;
+            }
+            cand = cand.base_name();
+        }
+    }
+
     if nxdomain {
         // The exact name must not exist and must be covered by an NSEC.
         if relevant.iter().any(|record| record.owner == qname) {
@@ -96,16 +123,7 @@ pub fn evaluate_nsec_denial(
             return NsecDenial::Incomplete;
         }
 
-        // Longest existing ancestor: an NSEC owner, else the zone apex.
-        let mut closest = signer_zone.clone();
-        for record in &relevant {
-            let owner = record.owner;
-            if owner != qname && owner.num_labels() > closest.num_labels() && owner.zone_of(qname) {
-                closest = owner.clone();
-            }
-        }
-
-        // No wildcard may have synthesized the name.
+        // No wildcard at the closest encloser may have synthesized the name.
         let Ok(wildcard) = Name::from_ascii(format!("*.{}", closest.to_ascii())) else {
             return NsecDenial::Incomplete;
         };
@@ -123,14 +141,14 @@ pub fn evaluate_nsec_denial(
         return NsecDenial::Secure;
     }
 
-    // Wildcard NODATA: the wildcard covering the name denies the type, and
-    // the exact name is proven absent by an NSEC covering it.
+    // Wildcard NODATA: the wildcard at the closest encloser denies the type,
+    // and the exact name is proven absent by an NSEC covering it.
     let exact_name_absent = relevant.iter().any(|record| covers(record, qname));
     if exact_name_absent
         && relevant.iter().any(|record| {
             record.owner.is_wildcard()
                 && denies_type(record, qtype)
-                && record.owner.base_name().zone_of(qname)
+                && record.owner.base_name() == closest
         })
     {
         return NsecDenial::Secure;
@@ -460,6 +478,53 @@ mod tests {
         }];
         assert_eq!(
             evaluate_nsec_denial(&records, &qname, RecordType::A, false, &zone),
+            NsecDenial::Incomplete
+        );
+    }
+
+    #[test]
+    fn test_ds_nodata_at_delegation_is_secure() {
+        // RFC 6840 4.1/4.4: a parent-side delegation NSEC (NS set, SOA clear,
+        // DS clear) proves that no DS exists at the delegation, while it must
+        // not deny other types for the child zone.
+        let zone = Name::from_str("example.").unwrap();
+        let qname = Name::from_str("child.example.").unwrap();
+        let (owner, delegation) = nsec(
+            "child.example.",
+            "z.example.",
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+        );
+        let records = [NsecRecord {
+            owner: &owner,
+            rdata: &delegation,
+        }];
+        assert_eq!(
+            evaluate_nsec_denial(&records, &qname, RecordType::DS, false, &zone),
+            NsecDenial::Secure
+        );
+        assert_eq!(
+            evaluate_nsec_denial(&records, &qname, RecordType::A, false, &zone),
+            NsecDenial::Incomplete,
+            "the parent NSEC must not deny child-zone types"
+        );
+
+        // A DS bit in the bitmap means there is a DS, so no denial.
+        let (_, with_ds) = nsec(
+            "child.example.",
+            "z.example.",
+            &[
+                RecordType::NS,
+                RecordType::DS,
+                RecordType::NSEC,
+                RecordType::RRSIG,
+            ],
+        );
+        let records = [NsecRecord {
+            owner: &owner,
+            rdata: &with_ds,
+        }];
+        assert_eq!(
+            evaluate_nsec_denial(&records, &qname, RecordType::DS, false, &zone),
             NsecDenial::Incomplete
         );
     }

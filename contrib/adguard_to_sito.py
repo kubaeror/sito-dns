@@ -10,8 +10,9 @@ Usage:
 import sys
 import argparse
 import ipaddress
+import math
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 try:
     import yaml
@@ -33,27 +34,91 @@ def parse_yaml_fallback(text: str) -> Dict[str, Any]:
     return data
 
 
-def normalize_upstream(value: str) -> str:
-    """Maps AdGuard upstream URLs to the schemes supported by sito.
+def as_int(value: Any, default: int) -> int:
+    """Best-effort integer conversion that never raises."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
-    sito supports `tls://` (DoT) and plain host/IP (`udp://` optional).
-    DoH (`https://host/dns-query`) and DoQ (`quic://host`) are mapped to
-    `tls://host`, which provides equivalent transport encryption.
+
+def parse_interval_days(value: Any, default: int = 90) -> int:
+    """Maps AdGuard's `statistics.interval` to sito's `stats.retention_days`.
+
+    AdGuard stores whole days in current releases; duration strings ("24h",
+    "168h0m0s", "7d") are accepted too for configs written by other tools.
+    Unparseable values fall back to `default` with a warning.
     """
-    value = str(value).strip()
-    lower = value.lower()
-    if lower.startswith("https://") or lower.startswith("http://"):
-        host = value.split("://", 1)[1].split("/", 1)[0]
-        return f"tls://{host}"
-    if lower.startswith("quic://") or lower.startswith("h3://"):
-        host = value.split("://", 1)[1].split("/", 1)[0]
-        return f"tls://{host}"
-    return value
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return max(1, int(value))
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if re.fullmatch(r"(?:\d+(?:\.\d+)?[smhdw])+", text):
+        seconds = 0.0
+        for amount, unit in re.findall(r"(\d+(?:\.\d+)?)([smhdw])", text):
+            seconds += float(amount) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
+        return max(1, math.ceil(seconds / 86400))
+    try:
+        return max(1, int(text))
+    except ValueError:
+        print(
+            f"Warning: unrecognized statistics.interval value {value!r}; using {default} days",
+            file=sys.stderr,
+        )
+        return default
 
 
-def normalize_bootstrap(value: str) -> str:
-    """Extracts a plain IP address from a bootstrap value (supports IPv6)."""
+def normalize_upstream(value: str) -> Optional[str]:
+    """Maps an AdGuard upstream URL to a sito-supported upstream.
+
+    DoH (`https://`) and DoQ (`quic://`) are preserved exactly - converting
+    them to `tls://` would change the transport. Returns None when the scheme
+    has no sito equivalent, so the caller can skip the entry with a warning.
+    """
     v = str(value).strip()
+    lower = v.lower()
+    if not v:
+        return None
+    if lower.startswith("https://"):
+        return v
+    if lower.startswith("http://"):
+        print(f"Warning: upstream {v!r} uses plaintext http://; converting to https://", file=sys.stderr)
+        return f"https://{v.split('://', 1)[1]}"
+    if lower.startswith("h3://"):
+        # sito has no HTTP/3-only upstream transport; https:// keeps DoH.
+        return f"https://{v.split('://', 1)[1]}"
+    if lower.startswith(("quic://", "tls://", "udp://")):
+        return v
+    if lower.startswith("tcp://"):
+        # sito's plain upstream speaks UDP with TCP fallback.
+        print(
+            f"Notice: upstream {v!r} uses tcp://; treating it as a plain upstream",
+            file=sys.stderr,
+        )
+        return v.split("://", 1)[1]
+    if "://" in v:
+        scheme = v.split("://", 1)[0]
+        print(f"Warning: unsupported upstream scheme '{scheme}://' in {v!r}; skipping", file=sys.stderr)
+        return None
+    return v
+
+
+def parse_bootstrap_ip(value: Any) -> Optional[str]:
+    """Extracts an IP literal from an AdGuard bootstrap entry.
+
+    Accepts `9.9.9.9`, `9.9.9.9:53`, `[2606:4700::1111]:53`,
+    `https://1.1.1.1/dns-query` and bare IPv6 literals. Returns None for
+    hostnames or anything else that is not an IP address: sito's
+    `upstream.bootstrap` only accepts IPs.
+    """
+    v = str(value).strip()
+    if not v:
+        return None
     if "://" in v:
         v = v.split("://", 1)[1]
     v = v.split("/", 1)[0]
@@ -61,15 +126,19 @@ def normalize_bootstrap(value: str) -> str:
         return str(ipaddress.ip_address(v))
     except ValueError:
         pass
-    if v.startswith("[") and "]" in v:
-        return v[1:v.index("]")]
-    host, _, port = v.rpartition(":")
-    if host and port.isdigit():
-        try:
-            return str(ipaddress.ip_address(host))
-        except ValueError:
-            return host
-    return v
+    if v.startswith("["):
+        end = v.find("]")
+        if end == -1:
+            return None
+        host = v[1:end]
+    else:
+        host, sep, port = v.rpartition(":")
+        if not sep or not port.isdigit():
+            return None
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return None
 
 
 def toml_quote(value: Any) -> str:
@@ -118,8 +187,8 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
     tls = agh_cfg.get("tls", {})
     filtering = agh_cfg.get("filtering", {})
     clients = agh_cfg.get("clients", {})
-    querylog = agh_cfg.get("querylog", {})
-    stats = agh_cfg.get("stats", {})
+    # AdGuard stores retention under `statistics.interval` (int days).
+    stats = agh_cfg.get("statistics") or agh_cfg.get("stats") or {}
 
     lines: List[str] = [
         "# Generated automatically from AdGuardHome.yaml by adguard_to_sito.py",
@@ -141,11 +210,12 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
     lines.append(f"bind = [{bind_quoted}]")
     lines.append(f"port = {dns.get('port', 53)}")
 
-    # Encrypted transport ports
+    # Encrypted transport ports. AdGuard's key is `port_https`; the newer
+    # `port_dns_over_https` spelling is accepted as a fallback.
     if tls.get("enabled", False):
-        lines.append(f"dot_port = {tls.get('port_dns_over_tls', 853)}")
-        lines.append(f"doh_port = {tls.get('port_dns_over_https', 443)}")
-        lines.append(f"doq_port = {tls.get('port_dns_over_quic', 853)}")
+        lines.append(f"dot_port = {as_int(tls.get('port_dns_over_tls'), 853)}")
+        lines.append(f"doh_port = {as_int(tls.get('port_https', tls.get('port_dns_over_https')), 443)}")
+        lines.append(f"doq_port = {as_int(tls.get('port_dns_over_quic'), 853)}")
     else:
         lines.append("dot_port = 0")
         lines.append("doh_port = 0")
@@ -168,21 +238,49 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
         "",
     ])
 
-    # Upstreams
+    # Upstreams. Only sito-supported schemes are emitted; unsupported entries
+    # (for example sdns:// DNSCrypt stamps) are skipped with a warning.
     upstreams = dns.get("upstream_dns", [])
-    if not upstreams:
+    if not isinstance(upstreams, list) or not upstreams:
         upstreams = ["tls://dns.quad9.net", "1.1.1.1:53"]
-    bootstrap = dns.get("bootstrap_dns", ["9.9.9.9", "1.1.1.1"])
+    converted_upstreams: List[str] = []
+    for u in upstreams:
+        converted = normalize_upstream(u)
+        if converted is not None and converted not in converted_upstreams:
+            converted_upstreams.append(converted)
+    if not converted_upstreams:
+        print("Warning: no supported upstreams found; using sito defaults", file=sys.stderr)
+        converted_upstreams = ["tls://dns.quad9.net", "1.1.1.1:53"]
+
+    # Bootstrap hosts must be IP literals; anything else is skipped because
+    # sito would reject the whole config.
+    bootstrap_entries = dns.get("bootstrap_dns") or ["9.9.9.9", "1.1.1.1"]
+    if not isinstance(bootstrap_entries, list):
+        bootstrap_entries = [bootstrap_entries]
+    bootstrap_ips: List[str] = []
+    for entry in bootstrap_entries:
+        ip = parse_bootstrap_ip(entry)
+        if ip is None:
+            print(
+                f"Warning: bootstrap entry {entry!r} is not an IP address; skipping it",
+                file=sys.stderr,
+            )
+        elif ip not in bootstrap_ips:
+            bootstrap_ips.append(ip)
 
     lines.append("[upstream]")
     lines.append("servers = [")
-    for u in upstreams:
-        lines.append(f"    {toml_quote(normalize_upstream(u))},")
+    for u in converted_upstreams:
+        lines.append(f"    {toml_quote(u)},")
     lines.append("]")
-    lines.append("bootstrap = [")
-    for b in bootstrap:
-        lines.append(f"    {toml_quote(normalize_bootstrap(b))},")
-    lines.append("]")
+    if bootstrap_ips:
+        lines.append("bootstrap = [")
+        for b in bootstrap_ips:
+            lines.append(f"    {toml_quote(b)},")
+        lines.append("]")
+    else:
+        lines.append("# No valid bootstrap IPs were found in the AdGuard config; leaving")
+        lines.append("# bootstrap unset so sito uses its built-in defaults.")
     lines.append('strategy = "parallel"')
     lines.append("timeout_ms = 5000")
     lines.append("")
@@ -192,7 +290,8 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
         "[filtering]",
         f"enabled = {str(filtering.get('enabled', True)).lower()}",
         f"blocking_mode = {toml_quote(convert_blocking_mode(dns))}",
-        f"blocking_ttl = {dns.get('blocking_ipv4_ttl', 10)}",
+        # AdGuard stores the blocked-response TTL under filtering.
+        f"blocking_ttl = {as_int(filtering.get('blocked_response_ttl'), 10)}",
         "cname_cloaking = true",
     ])
 
@@ -274,9 +373,14 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
                 f"group = {toml_quote(group)}",
             ])
             client_upstreams = c.get("upstreams") or []
-            if client_upstreams:
+            converted_client_upstreams = []
+            for u in client_upstreams:
+                converted = normalize_upstream(u)
+                if converted is not None and converted not in converted_client_upstreams:
+                    converted_client_upstreams.append(converted)
+            if converted_client_upstreams:
                 upstreams_str = ", ".join(
-                    toml_quote(normalize_upstream(u)) for u in client_upstreams
+                    toml_quote(u) for u in converted_client_upstreams
                 )
                 lines.append(f"upstreams = [{upstreams_str}]")
                 lines.append("use_global_upstreams = false")
@@ -316,11 +420,13 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
     # separately from AdGuard)
     lines.extend([
         "[stats]",
-        # AdGuard stores its retention interval under `stats.interval`.
-        f"retention_days = {max(7, int(stats.get('interval', 90)))}",
+        # AdGuard stores its retention interval (days) under
+        # `statistics.interval`; duration strings are accepted as well.
+        f"retention_days = {parse_interval_days(stats.get('interval'), 90)}",
         "",
         "[privacy]",
-        f"anonymize_querylog = {str(querylog.get('anonymize_client_ip', False)).lower()}",
+        # AdGuard keeps client-IP anonymization in the dns section.
+        f"anonymize_querylog = {str(dns.get('anonymize_client_ip', False)).lower()}",
         "",
     ])
 

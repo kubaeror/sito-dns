@@ -5,6 +5,313 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.8.0] - 2026-11-01
+
+Independent audit 6 remediation. This release fixes every P0 and P1 finding
+from the v1.7.0 audit: DNSSEC validation bypass/SERVFAIL regressions, the
+default dual-stack startup failure, TLS advisories, transport hardening,
+per-group filtering, the config apply/validation pipeline, API/UI secret and
+session handling, HA replication state/version continuity, cache/DNSSEC
+response correctness, stats cardinality and retention, CI/ops and docs truth.
+
+Migration notes:
+- Filter list caches written by <= 1.7.0 lack integrity metadata and are
+  re-downloaded once; with `fail_closed = true` and no network the first boot
+  answers SERVFAIL until a fetch succeeds.
+- `upstream.timeout_ms` is now the overall per-query retry budget (shared by
+  failover/load-balance attempts), not a per-attempt timeout.
+- Behavior changes: DNSSEC Insecure/Bogus policy, HA persist-before-ACK,
+  per-group rules now active, `clients.timezone` (default `local`),
+  `upstream.ecs` (default `off`), `rewrites.auto_ptr` (default `false`),
+  `$dnsrewrite` PTR/TXT/aggregation/cancellation.
+
+### Critical (P0)
+- **DNSSEC validation bypass via key-tag collision**: trust was keyed on the
+  16-bit key tag, so an anchored key paired with a same-tag forgery could
+  authenticate forged answers (AD=1) and poison the validated-key cache. Trust
+  is now bound to the full DNSKEY public-key bytes, validated cache entries are
+  never overwritten by a same-tag key, and every candidate key for an RRSIG is
+  tried instead of the first tag match.
+- **DNSSEC global SERVFAIL after the first chain fetch**: linking the fetched
+  root DNSKEY to the trust anchor marked the root as a "signed zone", turning
+  every later unsigned response into a stripped-signature Bogus/SERVFAIL in the
+  default `validate` mode. Only signatures that validated over response data
+  now record zone evidence.
+- **Default `dns.bind = ["0.0.0.0", "::"]` failed to start**: the TCP `::`
+  socket was dual-stack, so binding it after `0.0.0.0` returned EADDRINUSE and
+  aborted startup. TCP/DoT/DoH listeners now set `IPV6_V6ONLY` and
+  `SO_REUSEADDR` explicitly.
+- **RUSTSEC-2026-0285**: `rustls` 0.23.43 accepted TLS 1.3 handshake messages
+  across encryption level boundaries; upgraded to 0.23.45 (CI `cargo deny`
+  now passes).
+
+### High (P1)
+- **Listener tasks busy-spun at 100% CPU** after a partial startup or failed
+  listener rebind because a closed shutdown channel was treated as "no change"
+  in every listener/pruner/watcher loop; a dropped sender now stops the task.
+
+### DNSSEC correctness (Phase 1)
+- **Chain-fetch budget**: a flat budget of 6 fetches could not reach the root
+  from signers with three or more labels; the budget now scales with the label
+  count (`2*labels+1`).
+- **Stripped signature vs unsigned delegation**: a response without RRSIGs
+  under a previously validated zone was always a downgrade. The validator now
+  probes the DS records of the candidate delegation cuts with the zone's
+  validated key; an authenticated DS denial (NSEC/NSEC3 including opt-out)
+  proves an unsigned delegation and resolves as Insecure, while an
+  authenticated DS, an in-zone DS NODATA or an unprovable delegation stays
+  fail-closed Bogus.
+- **NSEC DS NODATA at a delegation** is accepted (RFC 6840 §4.1/§4.4).
+- **NSEC3 NODATA** requires the CNAME bit to be clear (RFC 6840 §4.3) and the
+  wildcard NODATA proof now covers the next closer name (RFC 5155 §8.7).
+- **Authenticated TTLs**: validated RRsets and RRSIGs are capped by the
+  signature validity (RFC 4035 §5.3.3), so cache entries cannot outlive their
+  signatures.
+- **AD semantics**: AD is only set when every Answer/Authority RRset is
+  authentic (RFC 4035 §3.2.3); unsupported DS digests/algorithms treat the
+  delegation as unsigned (RFC 6840 §5.2) instead of SERVFAIL.
+- **Trust anchors**: malformed `dns.dnssec.trust_anchors` entries now fail
+  configuration validation instead of silently defaulting algorithms.
+
+### Transport (Phase 2)
+- **DoH**: dedicated-hostname matching uses the URI authority (HTTP/2/3
+  `:authority`) and normalizes ports, IPv6 literals and FQDNs; connections get
+  a header-read timeout and a 30 s read-idle timeout.
+- **DoH3**: field-section limit (16 KiB) and bounded QUIC receive windows
+  (128 KiB/stream, 2 MiB/connection) stop whole-HEADERS buffering from being
+  used for memory exhaustion.
+- **DoQ**: RFC 9250 wire Message ID 0 is enforced (and responses use ID 0);
+  oversized responses fall back to TC=1.
+- **Framing**: TCP/DoT/DoQ responses above 65535 bytes are answered with TC=1
+  (question preserved) instead of being dropped; DoT padding only applies to
+  EDNS clients and never exceeds the framing limit; a default `DotConfig`
+  enforces its per-query rate limit.
+- **ACME**: rotation writes key and cert atomically and records a cert/key
+  fingerprint so a partially completed rotation forces renewal instead of
+  serving a mismatched pair.
+- **Upstream**: plain UDP/TCP randomize the on-the-wire Message ID (RFC 5452)
+  and restore the caller's ID; the bootstrap resolver only accepts answers for
+  the queried owner.
+- **Listeners**: SO_REUSEPORT failures surface as the real error, the sendmsg
+  source-address fallback is logged, DoT without TLS and DoQ/DoH3 bind failures
+  log at error level, and Alt-Svc advertises h3 only when a DoH3 listener is
+  possible.
+
+### Filtering (Phase 3, partial)
+- A failed reload with zero loadable sources now keeps the engine explicitly
+  unavailable, so `fail_closed` answers SERVFAIL after a disabled → enabled
+  transition instead of silently allowing traffic.
+
+### Filtering (Phase 3)
+- **Per-group `lists`/`custom_rules` are implemented**: the engine compiles one
+  extra snapshot per group from the referenced loaded lists plus the group's
+  custom rules; the pipeline evaluates group `$important` after global ones and
+  combines standard verdicts so a group allow can unblock and a group block
+  applies to members.
+- **Bounded regex compilation**: patterns compile in 128-pattern batches with
+  bisection on failure and a hard batch budget, so one pathological subset can
+  no longer stall compilation or silently disable the regex/wildcard class;
+  dropped patterns are counted and logged.
+- **`filtering.max_rules`** (default 2,000,000) caps the parsed rule set; an
+  over-limit reload retains the previous snapshot or stays fail-closed.
+- A failed reload with zero loadable sources keeps the engine unavailable, so
+  `fail_closed` survives a disabled → enabled transition.
+- **AdGuard semantics**: bare domains block the exact host only, URL/path rules
+  are inert at DNS level, and `$denyallow` is honoured on exception rules.
+- **Rewrites**: IDN config entries and lookups are normalized to ASCII/
+  punycode, so punycode entries (the form the wire and lists use) match.
+
+### HA (Phase 5)
+- **Bundle secrets**: the structured `clients` value is sanitized like
+  `config_toml`, so master client shared secrets are no longer replicated;
+  legacy `[auth]` secret keys are stripped instead of becoming unresolvable
+  `${SECRET:...}` placeholders.
+- **`[tls] key` is no longer masked** (it is a path, not secret material) —
+  this previously made every slave reject pushes for standard TLS configs. The
+  placeholder secret store is documented as environment-only.
+- **Version continuity**: a promoted slave or a lost `ha_state.toml` seeds the
+  master sequence from the highest slave-reported version before publishing;
+  a slave-ahead ACK is logged at error level and surfaced as
+  `diverged`/`diverged_reason` in `/ha/status` (with `master_pubkey` exposed
+  for slave configuration).
+- **Slave state machine**: an already-current reconnect marks `Synced` without
+  clearing `Degraded`; a failed persist is an apply failure (no
+  `applied:true` ACK); TLS/WS handshakes are bounded by a 10 s timeout;
+  WebSocket messages are capped at 1 MiB on both ends; absent `clients`/
+  `rewrites` mean authoritative removal in runtime, snapshot and disk; the
+  bundle list metadata is consumed by the slave.
+- **Hygiene**: signing/cert keys are created 0600 and an existing 0644 file is
+  repaired; `/ha/resync` reports an honest 503/429 instead of always
+  `resync_triggered`; the runbook documents the real status JSON, promotion
+  steps and `ha_state.toml`.
+
+### Upstream (Phase 6.1)
+- **Failover retries on SERVFAIL/REFUSED/NOTIMP** (previously a well-formed
+  SERVFAIL was treated as success, so the default failover strategy gave up
+  while healthy upstreams remained).
+- Retries share one overall `timeout_ms` budget (each sequential attempt gets
+  an equal share of the remainder); failures are attributed to the failing
+  server via `UpstreamQueryError`, health is recorded for every failed
+  candidate, and the active health probe uses a separate (≥5 s) timeout so a
+  slow-but-healthy handshake is not marked down.
+
+### Stats (Phase 7)
+- **qtype metric cardinality is bounded** (known types + `__other__`) instead
+  of up to 65 536 permanent series per protocol/verdict.
+- Retention rollups now populate `top_domains`/`top_clients`/`top_upstreams`
+  and are merged into global/client/upstream stats, so windows longer than the
+  detailed retention no longer silently under-report; `VACUUM` runs after
+  large retention sweeps; "clear query log" folds rows into the rollups first;
+  pagination exposes a real total count.
+- Per-client/per-upstream queries are `LIMIT`-bounded with deterministic
+  labels and expose `X-Total-Count`.
+
+### Filtering robustness (Phase 3, continued)
+- **List cache integrity**: cache writes are atomic (temp + fsync + rename),
+  metadata records content length and line count, and a truncated/mismatched
+  or metadata-less cache is re-fetched instead of trusted. *Migration note:* a
+  cache written by ≤ 1.7.0 lacks the new integrity fields and will be
+  re-downloaded once; with `fail_closed = true` and no network, that first boot
+  answers SERVFAIL until a fetch succeeds.
+- Duplicate filter-list names are rejected by config validation.
+- `reload_with_config` is transactional: a rejected configuration is no longer
+  retained for later scheduled refreshes.
+- Prefix rules are indexed in a trie (no linear scan) and the regex matcher
+  reuses a scratch `PatternSet`.
+- Removed dead `FilterSnapshot.exact`/`legacy_exact` and `parse_hosts`.
+
+### CI / ops / docs (Phases 8 and 10)
+- CI: `clippy --all-targets --all-features`, pre-merge fuzz compilation with a
+  refreshed `fuzz/Cargo.lock`, corpus caching, pinned tool versions, `--locked`
+  cross builds; releases publish on tag pushes only (so cosign identity
+  `refs/tags/*` is verifiable by the installer/updater).
+- Docker: builder cross-compiles from `$BUILDPLATFORM` (no QEMU on fat-LTO),
+  `mimalloc` on every arch, `ha/`/key material excluded from the build context,
+  compose hardening (`no-new-privileges`, read-only rootfs, tmpfs,
+  `start_period`).
+- Installer: the web health probe respects `web.enabled`/`web.bind` (no more
+  rollback of a working upgrade), capabilities are re-applied after a
+  rollback, and uninstall cleans up the user/group.
+- AdGuard converter: correct AdGuard keys (`statistics.interval` as duration,
+  `tls.port_https`, `filtering.blocked_response_ttl`,
+  `dns.anonymize_client_ip`), IP-only bootstrap with warnings, DoH/DoQ schemes
+  preserved, plus a fixture self-test wired into CI.
+- Docs truth pass: config-reference modes/defaults corrected and a hot-reload
+  matrix added, compatibility matrix re-verified against the engine, SECURITY
+  versions, install/migration samples, README wizard claims.
+
+### Clients (Phase 3.7)
+- Schedules evaluate in a configurable timezone (`clients.timezone`, default
+  `"local"`; `"UTC"` and fixed offsets accepted) instead of always UTC.
+- MAC resolution no longer reads `/proc/net/arp` on the query hot path
+  (background snapshot + bounded positive/negative caches; ARP is skipped
+  entirely when no client uses MAC identity).
+- RouterOS only trusts `status = "bound"` leases; a failed client build no
+  longer downgrades settings or panics; a missing `password_env` errors
+  instead of sending an empty password.
+- `unidentified_clients` is bounded (1024 entries, 24 h retention);
+  runtime-list drop guards count parsed entries instead of raw lines.
+
+### API / UI / auth (Phase 4)
+- The admin scheme is no longer derived from the DNS TLS certificate config:
+  `web.public_url`/`web.tls_terminated_by_proxy` or a trusted proxy's
+  `X-Forwarded-Proto` decide `Secure` cookies, HSTS and CSRF origins.
+- Secret handling: path-aware TOML masking (valid round-trip, includes
+  `client_id_secrets`), client secrets returned as markers with an Admin-only
+  audited reveal, no token hashes or session ids in API bodies, UI client
+  deletion removes the shared secret, backup/restore files are 0600.
+- `reset-admin`/`reset-sessions` rotate the auth generation and delete
+  persisted sessions/tokens; user management and change-password endpoints;
+  the missing-config/existing-users deadlock is resolved; CSRF double-submit
+  enforcement; TOTP backup codes use fast digests; the UI probe requires
+  Operator.
+- One apply/validate pipeline is shared by the watcher, API, UI and wizard
+  (deep upstream validation, persist-after-apply with rollback, truthful
+  `restart_required`); the wizard fetches blocklists asynchronously.
+- `--no-setup` without a config generates a random admin password and binds
+  the UI to loopback (existing `users.toml` credentials are kept untouched).
+
+### Configuration (Phase 6.5)
+- `rewrites.auto_ptr` now has a single default (`false`) for both serde and
+  `Default`.
+- Stricter validation: `rate_limit_per_ip` upper bound, `retention_days >= 1`,
+  `web.port >= 1`, `session_ttl_hours >= 1`, `refresh_hours >= 1`, valid
+  `probe_domain`, non-empty per-domain rules, and same-transport DNS port
+  collisions are rejected.
+
+### Transport (Phase 2 tail)
+- ACME HTTP-01 binds both wildcard families; the certificate watcher watches
+  the configured files (not the whole directory), survives atomic renames and
+  logs watch errors; DoH3 GET matches DoH decoding; DoQ resets timed-out and
+  truncated streams with RFC 9250 error codes; rate-limiter bursts saturate.
+
+### Follow-up hardening (wave 4)
+- **DNSSEC**: DS/DNSKEY trust-link signatures outside their validity window are
+  Bogus with the correct EDE; a validated CNAME chain crossing into an unsigned
+  zone is Insecure (not SERVFAIL); NSEC closest-encloser and NSEC3 DS-NODATA /
+  wildcard / opt-out / next-closer proofs were corrected; bogus-reason metric
+  cardinality is bounded.
+- **Filtering/rewrites**: `||wildcard` patterns anchor at domain/subdomain
+  boundaries, `|exact^` is exact, path rules are inert, and rewrite CNAMEs are
+  synthesized for every query type.
+- **Pipeline**: CNAME uncloaking now re-checks `$important`, parental, service
+  and combined global+group rules on the target; filtering requires both the
+  global switch and the client policy; prefetch no longer propagates CD=1 into
+  the shared cache; block metrics carry rule/list labels.
+- **HA statistics**: slaves report real window deltas (queries, blocked,
+  upstream RTT/errors) instead of lifetime totals labelled as a 30 s window;
+  query-log anonymization is applied once at ingest.
+- **Cleanup**: removed the write-only `EffectivePolicy.ids`; startup uses the
+  fallible bundled-list loaders (no panic on corrupt embedded data); the
+  OpenAPI export writes only with `SITO_UPDATE_OPENAPI=1` and otherwise
+  verifies the committed spec; RouterOS disables redirects; schedule window
+  parsing handles wildcard minutes.
+
+### Cache and response shaping (Phase 6.2–6.4)
+- Negative cache TTLs are clamped by the SOA MINIMUM and the remaining CNAME
+  chain TTLs, decremented on serve, and the SOA owner is bailiwick-checked.
+- Cache entries carry a validation status (`Secure`/`Insecure`/`Indeterminate`/
+  `Unchecked`); unsigned answers are now served from cache to DNSSEC-aware
+  clients with AD=0 instead of being bypassed (which amplified upstream traffic
+  and key fetches), while `Unchecked` entries are never served when validation
+  is enabled.
+- The cache key includes the opcode and handles the root name; `invalidate "."`
+  flushes everything.
+- Non-Query opcodes answer NOTIMP and EDNS versions above 0 answer BADVERS.
+- RRSIG/NSEC/NSEC3/DNSKEY and DO-dependent EDNS options are stripped for
+  clients that did not set DO; DO=1 responses are cached only under the DO=1
+  key.
+- New `upstream.ecs = "off" | "forward"` policy (default `off`): strip client
+  ECS or forward it clamped to /24 (IPv4) and /56 (IPv6); cache keys follow the
+  same policy.
+- Synthesized block/rewrite/error responses preserve the client's CD and DO
+  bits, and prefetch never caches AD=1 without local validation.
+
+### Filtering semantics completion (WP-3.5)
+- `$dnsrewrite` now synthesizes PTR and TXT (with 255-byte TXT chunking) in
+  addition to A/AAAA/CNAME, aggregates every matching rewrite for an owner,
+  and honours AdGuard cancellation: `@@...$dnsrewrite` cancels all matching
+  rewrites and `@@...$dnsrewrite=value` cancels only that value (an
+  `$important` cancellation also cancels standard rewrites). Unsupported
+  record types are rejected at parse time with a warning instead of silently
+  answering NODATA.
+- `$client` supports quoted names and `\,`/`\|` escapes (spaces, commas,
+  pipes), while negation and CIDR matching are unchanged.
+
+### Dependencies
+- Security updates: `rustls` 0.23.46, `ctutils` 0.4.7, `rustls-webpki`
+  0.103.16, `webpki-roots` 1.0.11, `tokio` 1.54.1 (RUSTSEC-2026-0285/0346/0347/
+  0348/0349/0381/0382/0385/0386).
+- Patch updates: `hickory-proto` 0.26.3, `clap` 4.6.7, `reqwest` 0.13.5,
+  `quinn` 0.11.12, `quinn-proto` 0.11.19, `rand` 0.10.3, `toml` 1.1.8.
+- Accepted, documented in `deny.toml`: `zip` 3.x is a build dependency of
+  `utoipa-swagger-ui` 9 used only to unpack the crate's bundled Swagger UI
+  assets (never user archives at runtime). The fixes require `zip` 9 via
+  `utoipa-swagger-ui` 10 / `utoipa` 6, a breaking major upgrade scheduled
+  separately (RUSTSEC-2026-0367/0368/0369).
+
+---
+
 ## [1.7.0] - 2026-09-13
 
 ### Audit 5 remediation (independent full audit)

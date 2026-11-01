@@ -168,7 +168,7 @@ impl RewriteTable {
             return None;
         }
 
-        let qname_str = normalize_domain_key(&qname.to_string());
+        let qname_str = normalize_domain_key(&qname.to_ascii());
         if visited.iter().any(|seen| seen == &qname_str) {
             // CNAME loop detected; stop resolving to avoid unbounded recursion.
             return None;
@@ -188,8 +188,8 @@ impl RewriteTable {
             }
         }
 
-        // 2. Check exact CNAME if requested qtype is A or AAAA
-        if (qtype == RecordType::A || qtype == RecordType::AAAA)
+        // 2. Check exact CNAME (when qtype == CNAME, step 1 already returned it)
+        if qtype != RecordType::CNAME
             && let Some(rules) = self.exact.get(&(qname_str.clone(), RecordType::CNAME))
         {
             for rule in rules {
@@ -404,8 +404,21 @@ fn ip_in_cidr(network: IpAddr, prefix: u8, target: IpAddr) -> bool {
     }
 }
 
+/// Normalizes a rewrite domain to the same ASCII/punycode form the filter
+/// engine and cache use.
+///
+/// Queries are matched through `Name::to_ascii()`, so a config entry written
+/// as Unicode must become punycode and a config entry written as punycode must
+/// stay as-is; previously Unicode config matched only by accident (via the
+/// UTS46-decoded `Name::to_string()`) and punycode entries never matched.
 fn normalize_domain_key(domain: &str) -> String {
-    domain.trim_end_matches('.').to_ascii_lowercase()
+    let trimmed = domain.trim().trim_end_matches('.');
+    if let Some(rest) = trimmed.strip_prefix("*.") {
+        let ascii = sito_proto::normalize_domain_or_idna(rest)
+            .unwrap_or_else(|_| rest.to_ascii_lowercase());
+        return format!("*.{ascii}");
+    }
+    sito_proto::normalize_domain_or_idna(trimmed).unwrap_or_else(|_| trimmed.to_ascii_lowercase())
 }
 
 fn matches_wildcard(candidate: &str, suffix: &str) -> bool {
@@ -812,11 +825,17 @@ entries = [
         assert_eq!(answers[1].record_type(), RecordType::A);
         assert_eq!(answers[1].data, RData::A(A(Ipv4Addr::new(192, 168, 1, 1))));
 
-        // External CNAME returns only CNAME
+        // External CNAME returns only CNAME (including for non-A/AAAA types like HTTPS/TXT)
         let qname_ext = Name::from_str("external.lan.").unwrap();
         let answers_ext = table.lookup(&qname_ext, RecordType::A, &client).unwrap();
         assert_eq!(answers_ext.len(), 1);
         assert_eq!(answers_ext[0].record_type(), RecordType::CNAME);
+
+        let answers_https = table
+            .lookup(&qname_ext, RecordType::HTTPS, &client)
+            .unwrap();
+        assert_eq!(answers_https.len(), 1);
+        assert_eq!(answers_https[0].record_type(), RecordType::CNAME);
     }
 
     #[test]
@@ -884,5 +903,52 @@ entries = [
                 .lookup(&qname_nas, RecordType::A, &other_client)
                 .is_some()
         );
+    }
+
+    /// Regression (audit 6, WP-3.6): punycode config entries must match, and
+    /// Unicode config entries must be normalized to punycode.
+    #[test]
+    fn test_idn_rewrite_entries_match_punycode_queries() {
+        let config: RewritesConfig = toml::from_str(
+            r#"
+            [[entries]]
+            domain = "xn--mnchen-3ya.de"
+            type = "A"
+            answer = "192.0.2.10"
+
+            [[entries]]
+            domain = "bücher.example"
+            type = "A"
+            answer = "192.0.2.11"
+
+            [[entries]]
+            domain = "*.xn--mnchen-3ya.de"
+            type = "A"
+            answer = "192.0.2.12"
+        "#,
+        )
+        .expect("parse rewrites config");
+        let table = RewriteTable::new(config);
+        let client = ClientContext::new("192.168.1.50".parse().unwrap());
+
+        let puny_apex = Name::from_ascii("xn--mnchen-3ya.de.").unwrap();
+        let records = table
+            .lookup(&puny_apex, RecordType::A, &client)
+            .expect("punycode entry must match a punycode query");
+        assert_eq!(records[0].data, RData::A(A(Ipv4Addr::new(192, 0, 2, 10))));
+
+        // The Unicode config entry is normalized to punycode too.
+        let unicode_entry = Name::from_ascii("xn--bcher-kva.example.").unwrap();
+        let records = table
+            .lookup(&unicode_entry, RecordType::A, &client)
+            .expect("uninitialized Unicode entry must be normalized");
+        assert_eq!(records[0].data, RData::A(A(Ipv4Addr::new(192, 0, 2, 11))));
+
+        // Wildcards with IDN suffixes resolve as well.
+        let wildcard = Name::from_ascii("shop.xn--mnchen-3ya.de.").unwrap();
+        let records = table
+            .lookup(&wildcard, RecordType::A, &client)
+            .expect("IDN wildcard must match");
+        assert_eq!(records[0].data, RData::A(A(Ipv4Addr::new(192, 0, 2, 12))));
     }
 }

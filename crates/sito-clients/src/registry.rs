@@ -11,7 +11,7 @@
 //! operator has explicitly enabled them: display `name`s, DoH path segments
 //! and DHCP hostnames are not credentials.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, TimeDelta, Utc};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
@@ -22,6 +22,13 @@ use crate::config::{ClientEntryConfig, ClientsConfig};
 use crate::mac::{MacResolver, normalize_mac_id};
 use crate::policy::EffectivePolicy;
 use crate::safe_search::YouTubeSafeSearchMode;
+use crate::timezone::ClientTimeZone;
+
+/// Upper bound on the discovered-but-unconfigured client list.
+const MAX_UNIDENTIFIED_CLIENTS: usize = 1024;
+
+/// Discovered clients older than this are dropped on the next insert.
+const UNIDENTIFIED_CLIENT_TTL: TimeDelta = TimeDelta::hours(24);
 
 /// Information on a discovered client not explicitly configured in `clients.entries`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +37,8 @@ pub struct UnidentifiedClient {
     pub mac: Option<String>,
     pub hostname: Option<String>,
     pub comment: Option<String>,
+    /// Instant the client was last seen (UTC).
+    pub last_seen: DateTime<Utc>,
 }
 
 /// RouterOS DHCP lease entry for matching.
@@ -63,6 +72,7 @@ pub struct ClientRegistry {
     config: ClientsConfig,
     index: Arc<ClientIndex>,
     mac_resolver: MacResolver,
+    timezone: ClientTimeZone,
     routeros_leases: Arc<RwLock<Vec<RouterOsLease>>>,
     unidentified_clients: Arc<RwLock<HashMap<IpAddr, UnidentifiedClient>>>,
 }
@@ -83,10 +93,18 @@ impl ClientRegistry {
         routeros_leases: Arc<RwLock<Vec<RouterOsLease>>>,
     ) -> Self {
         let index = Arc::new(build_client_index(&config));
+        let mac_resolver = MacResolver::new();
+        // ARP resolution is only needed when an entry declares a MAC identity;
+        // when it is not, the query path must not touch the ARP snapshot at all.
+        if !index.macs.is_empty() {
+            mac_resolver.start_background_refresh();
+        }
+        let timezone = config.timezone;
         Self {
             config,
             index,
-            mac_resolver: MacResolver::new(),
+            mac_resolver,
+            timezone,
             routeros_leases,
             unidentified_clients: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -106,20 +124,61 @@ impl ClientRegistry {
         &self.mac_resolver
     }
 
+    /// The timezone schedules are evaluated in (`clients.timezone`).
+    #[must_use]
+    pub fn timezone(&self) -> ClientTimeZone {
+        self.timezone
+    }
+
+    /// The current instant in the configured `clients.timezone`.
+    ///
+    /// Pass the result to [`ClientRegistry::resolve`] so cron schedules are
+    /// matched against the operator's wall clock, not UTC.
+    #[must_use]
+    pub fn now(&self) -> DateTime<FixedOffset> {
+        self.timezone.now()
+    }
+
     /// Update the RouterOS lease table.
     pub fn update_routeros_leases(&self, leases: Vec<RouterOsLease>) {
         *self.routeros_leases.write().unwrap() = leases;
     }
 
+    /// Snapshot of discovered-but-unconfigured clients, newest first.
+    ///
+    /// The list is bounded (oldest entries beyond
+    /// [`MAX_UNIDENTIFIED_CLIENTS`] and entries older than
+    /// [`UNIDENTIFIED_CLIENT_TTL`] are dropped), and is intended for
+    /// administrative discovery (e.g. an API/UI "create client" flow).
+    #[must_use]
+    pub fn unidentified_clients(&self) -> Vec<UnidentifiedClient> {
+        let mut clients: Vec<UnidentifiedClient> = self
+            .unidentified_clients
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        clients.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then_with(|| a.ip.cmp(&b.ip)));
+        clients
+    }
+
     /// Resolves an incoming query's ClientContext to an EffectivePolicy,
     /// and populates any missing fields (client_name, group, mac) in `ctx`.
-    pub fn resolve(&self, ctx: &mut ClientContext, now: DateTime<Utc>) -> EffectivePolicy {
+    ///
+    /// `now` is the current instant in the configured `clients.timezone`
+    /// (see [`ClientRegistry::now`]); cron schedules are matched against that
+    /// wall clock.
+    pub fn resolve(&self, ctx: &mut ClientContext, now: DateTime<FixedOffset>) -> EffectivePolicy {
         // 1. Identify client entry
-        if let Some(entry) = self.identify(ctx) {
+        if let Some(entry) = self.identify(ctx, now) {
             ctx.client_name = Some(entry.name.clone());
             ctx.group = Some(entry.group.clone());
             if ctx.id.is_none() {
                 ctx.id = Some(ClientId::new(&entry.name));
+            }
+            if ctx.mac.is_none() {
+                ctx.mac = self.resolve_known_mac(ctx.ip, entry);
             }
 
             return self.build_effective_policy(Some(entry), now);
@@ -129,7 +188,25 @@ impl ClientRegistry {
         self.build_effective_policy(None, now)
     }
 
-    fn identify(&self, ctx: &mut ClientContext) -> Option<&ClientEntryConfig> {
+    fn resolve_known_mac(&self, ip: IpAddr, entry: &ClientEntryConfig) -> Option<String> {
+        if !self.index.macs.is_empty()
+            && let Some(mac) = self.mac_resolver.resolve_mac(ip)
+        {
+            return Some(mac);
+        }
+        if let Ok(leases) = self.routeros_leases.read()
+            && let Some(lease) = leases.iter().find(|l| l.ip == Some(ip))
+        {
+            return Some(lease.mac.clone());
+        }
+        entry.ids.iter().find_map(|id| normalize_mac_id(id))
+    }
+
+    fn identify(
+        &self,
+        ctx: &mut ClientContext,
+        now: DateTime<FixedOffset>,
+    ) -> Option<&ClientEntryConfig> {
         // 1. Shared-secret ClientID from DoH path or DoT/DoQ SNI subdomain.
         //    Only secrets configured in `clients.client_id_secrets` count;
         //    display names and arbitrary SNI labels never identify a client.
@@ -142,8 +219,12 @@ impl ClientRegistry {
             return Some(matched);
         }
 
-        // 3. Local MAC matching
-        if let Some(mac) = self.mac_resolver.resolve_mac(ctx.ip) {
+        // 3. Local MAC matching. Skipped entirely when no entry declares a MAC
+        //    identity: the ARP snapshot is then never consulted on the query
+        //    path (the background refresher is not even started).
+        if !self.index.macs.is_empty()
+            && let Some(mac) = self.mac_resolver.resolve_mac(ctx.ip)
+        {
             ctx.mac = Some(mac.clone());
             if let Some(matched) = self.match_by_mac(&mac) {
                 return Some(matched);
@@ -151,18 +232,24 @@ impl ClientRegistry {
         }
 
         // 4. RouterOS lease table match
-        if let Some(matched) = self.match_by_routeros(ctx) {
+        if let Some(matched) = self.match_by_routeros(ctx, now) {
             return Some(matched);
         }
 
         None
     }
 
-    fn entry_for_secret(&self, secret: &str) -> Option<&ClientEntryConfig> {
-        self.index
-            .secrets
-            .get(secret)
-            .and_then(|&idx| self.config.entries.get(idx))
+    fn entry_for_secret(&self, candidate: &str) -> Option<&ClientEntryConfig> {
+        let mut matched_idx: Option<usize> = None;
+        for (secret, &idx) in &self.index.secrets {
+            if constant_time_eq(secret.as_bytes(), candidate.as_bytes()) {
+                match matched_idx {
+                    Some(prev) if prev <= idx => {}
+                    _ => matched_idx = Some(idx),
+                }
+            }
+        }
+        matched_idx.and_then(|idx| self.config.entries.get(idx))
     }
 
     fn match_by_client_id_or_sni(&self, ctx: &ClientContext) -> Option<&ClientEntryConfig> {
@@ -221,7 +308,11 @@ impl ClientRegistry {
             .and_then(|&idx| self.config.entries.get(idx))
     }
 
-    fn match_by_routeros(&self, ctx: &mut ClientContext) -> Option<&ClientEntryConfig> {
+    fn match_by_routeros(
+        &self,
+        ctx: &mut ClientContext,
+        now: DateTime<FixedOffset>,
+    ) -> Option<&ClientEntryConfig> {
         // DHCP hostnames/comments are client-controlled. They only participate
         // in identification when the operator explicitly opts in; MAC/IP lease
         // matching stays active either way.
@@ -270,16 +361,7 @@ impl ClientRegistry {
                 }
 
                 // Detected but undefined client
-                let mut unidentified = self.unidentified_clients.write().unwrap();
-                unidentified.insert(
-                    ctx.ip,
-                    UnidentifiedClient {
-                        ip: ctx.ip,
-                        mac: Some(lease.mac.clone()),
-                        hostname: lease.hostname.clone(),
-                        comment: lease.comment.clone(),
-                    },
-                );
+                self.record_unidentified(ctx.ip, lease, now);
 
                 if trust_names && ctx.client_name.is_none() {
                     ctx.client_name.clone_from(&lease.hostname);
@@ -290,10 +372,44 @@ impl ClientRegistry {
         None
     }
 
+    /// Records a discovered client, bounding the map by age and size.
+    fn record_unidentified(&self, ip: IpAddr, lease: &RouterOsLease, now: DateTime<FixedOffset>) {
+        let now_utc = now.with_timezone(&Utc);
+        let mut unidentified = self.unidentified_clients.write().unwrap();
+
+        // Drop stale entries first; a long-idle client must not pin memory.
+        unidentified.retain(|_, client| now_utc - client.last_seen < UNIDENTIFIED_CLIENT_TTL);
+
+        unidentified.insert(
+            ip,
+            UnidentifiedClient {
+                ip,
+                mac: Some(lease.mac.clone()),
+                hostname: lease.hostname.clone(),
+                comment: lease.comment.clone(),
+                last_seen: now_utc,
+            },
+        );
+
+        if unidentified.len() > MAX_UNIDENTIFIED_CLIENTS {
+            // Evict the oldest entries; the newest MAX_UNIDENTIFIED_CLIENTS
+            // are kept regardless of insertion order.
+            let mut by_age: Vec<(IpAddr, DateTime<Utc>)> = unidentified
+                .iter()
+                .map(|(ip, client)| (*ip, client.last_seen))
+                .collect();
+            by_age.sort_by_key(|(_, last_seen)| *last_seen);
+            let excess = unidentified.len() - MAX_UNIDENTIFIED_CLIENTS;
+            for (ip, _) in by_age.into_iter().take(excess) {
+                unidentified.remove(&ip);
+            }
+        }
+    }
+
     fn build_effective_policy(
         &self,
         entry: Option<&ClientEntryConfig>,
-        now: DateTime<Utc>,
+        now: DateTime<FixedOffset>,
     ) -> EffectivePolicy {
         let group_name = entry.map_or("default", |e| e.group.as_str());
         let group = self.config.groups.get(group_name);
@@ -305,7 +421,6 @@ impl ClientRegistry {
 
         if let Some(e) = entry {
             policy.client_name = Some(e.name.clone());
-            policy.ids.clone_from(&e.ids);
             policy.ignore_query_log = e.ignore_query_log;
             policy.ignore_stats = e.ignore_stats;
             policy.use_global_upstreams = e.use_global_upstreams;
@@ -357,16 +472,25 @@ impl ClientRegistry {
     }
 }
 
-/// Extract {id} from {id}.dns.domain.
+/// Extract `{id}` from `{id}.dns.domain` or `{id}.domain.tld` (at least 3 labels).
 pub fn extract_id_from_sni(sni: &str) -> Option<&str> {
-    let parts: Vec<&str> = sni.split('.').collect();
-    if parts.len() >= 3 && parts[1] == "dns" {
-        return Some(parts[0]);
-    }
-    if parts.len() >= 2 {
+    let trimmed = sni.trim_end_matches('.');
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.len() >= 3 && !parts[0].is_empty() {
         return Some(parts[0]);
     }
     None
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Extract and sanitize ClientID from URL path (e.g. `/dns-query/{client_id}`).
@@ -480,6 +604,7 @@ fn ip_in_subnet(network: IpAddr, prefix: u8, target_ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use std::str::FromStr;
 
     fn sample_config() -> ClientsConfig {
@@ -524,7 +649,7 @@ lists = ["GlobalList"]
         let ip = IpAddr::from_str("172.16.0.5").unwrap();
         let mut ctx = ClientContext::with_id(ip, "jane-secret-a1");
 
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
         assert_eq!(policy.group_name, "kids");
         assert!(policy.ignore_query_log);
@@ -540,7 +665,7 @@ lists = ["GlobalList"]
         let ip = IpAddr::from_str("172.16.0.6").unwrap();
         let mut ctx = ClientContext::with_sni(ip, "jane-secret-a1.dns.home.arpa");
 
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
         assert_eq!(policy.group_name, "kids");
     }
@@ -552,19 +677,19 @@ lists = ["GlobalList"]
 
         // The entry's display name must never authenticate the client.
         let mut ctx = ClientContext::with_id(ip, "Admin Laptop");
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.group_name, "default");
         assert!(!policy.trusted);
 
         // Neither may a guessable value from `ids` (hostname, IP or MAC).
         let mut ctx = ClientContext::with_id(ip, "admin-laptop");
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.group_name, "default");
         assert!(!policy.trusted);
 
         // A configured shared secret does authenticate.
         let mut ctx = ClientContext::with_id(ip, "admin-secret-b2");
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.client_name.as_deref(), Some("Admin Laptop"));
         assert_eq!(policy.group_name, "admin");
         assert!(policy.trusted);
@@ -576,7 +701,7 @@ lists = ["GlobalList"]
         let ip = IpAddr::from_str("8.8.8.8").unwrap();
         let mut ctx = ClientContext::with_sni(ip, "admin.dns.home.arpa");
 
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.group_name, "default");
         assert!(!policy.trusted);
     }
@@ -587,7 +712,7 @@ lists = ["GlobalList"]
         let ip = IpAddr::from_str("192.168.1.20").unwrap();
         let mut ctx = ClientContext::new(ip);
 
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
         assert_eq!(policy.group_name, "kids");
     }
@@ -598,7 +723,7 @@ lists = ["GlobalList"]
         let ip = IpAddr::from_str("10.0.0.55").unwrap();
         let mut ctx = ClientContext::new(ip);
 
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.client_name.as_deref(), Some("Office Subnet"));
         assert_eq!(policy.group_name, "office");
     }
@@ -625,14 +750,14 @@ group = "narrow"
         // Both subnets match; the /24 must win over the /8 regardless of
         // configuration order.
         let mut ctx = ClientContext::new(IpAddr::from_str("10.1.2.3").unwrap());
-        assert_eq!(reg.resolve(&mut ctx, Utc::now()).group_name, "narrow");
+        assert_eq!(reg.resolve(&mut ctx, reg.now()).group_name, "narrow");
 
         let mut ctx = ClientContext::new(IpAddr::from_str("10.9.9.9").unwrap());
-        assert_eq!(reg.resolve(&mut ctx, Utc::now()).group_name, "wide");
+        assert_eq!(reg.resolve(&mut ctx, reg.now()).group_name, "wide");
 
         // An exact host address beats every CIDR block.
         let mut ctx = ClientContext::new(IpAddr::from_str("10.1.2.3").unwrap());
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.group_name, "narrow");
     }
 
@@ -645,7 +770,7 @@ group = "narrow"
         reg.mac_resolver().set_mock_arp(arp);
 
         let mut ctx = ClientContext::new(ip);
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
         assert_eq!(policy.group_name, "kids");
         assert_eq!(ctx.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
@@ -669,12 +794,16 @@ group = "hex"
         reg.mac_resolver().set_mock_arp(arp);
 
         let mut ctx = ClientContext::new(ip);
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(
             policy.group_name, "default",
             "a 12-hex-char id is a name, not a MAC address"
         );
         assert_eq!(policy.client_name, None);
+        assert_eq!(
+            ctx.mac, None,
+            "ARP resolution must be skipped entirely when no entry uses MAC identity"
+        );
 
         // The explicit form is still accepted.
         let mut mac_cfg: ClientsConfig = toml::from_str(
@@ -694,7 +823,7 @@ group = "hex"
         arp.insert(ip, "de:ad:be:ef:ca:fe".to_string());
         reg.mac_resolver().set_mock_arp(arp);
         let mut ctx = ClientContext::new(ip);
-        assert_eq!(reg.resolve(&mut ctx, Utc::now()).group_name, "hex");
+        assert_eq!(reg.resolve(&mut ctx, reg.now()).group_name, "hex");
     }
 
     #[test]
@@ -713,7 +842,7 @@ group = "hex"
         // A client-controlled DHCP hostname must not grant the entry's
         // group/trusted policy unless explicitly enabled.
         let mut ctx = ClientContext::new(ip);
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.group_name, "default");
         assert!(!policy.trusted);
         assert_eq!(policy.client_name, None);
@@ -737,7 +866,7 @@ group = "hex"
         reg.update_routeros_leases(vec![lease]);
 
         let mut ctx = ClientContext::new(ip);
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.client_name.as_deref(), Some("Admin Laptop"));
         assert_eq!(policy.group_name, "admin");
         assert!(policy.trusted);
@@ -765,7 +894,7 @@ group = "known"
         }]);
 
         let mut ctx = ClientContext::new(ip);
-        assert_eq!(reg.resolve(&mut ctx, Utc::now()).group_name, "known");
+        assert_eq!(reg.resolve(&mut ctx, reg.now()).group_name, "known");
     }
 
     #[test]
@@ -775,7 +904,7 @@ group = "known"
         let ip = IpAddr::from_str("192.168.1.20").unwrap();
         let mut ctx = ClientContext::with_id(ip, "admin-secret-b2");
 
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.client_name.as_deref(), Some("Admin Laptop"));
         assert_eq!(policy.group_name, "admin");
         assert!(policy.trusted);
@@ -791,7 +920,7 @@ group = "known"
         let mut ctx = ClientContext::with_id(ip, "orphan-secret");
 
         // The orphan secret is not attached to any entry.
-        assert_eq!(reg.resolve(&mut ctx, Utc::now()).group_name, "default");
+        assert_eq!(reg.resolve(&mut ctx, reg.now()).group_name, "default");
     }
 
     #[test]
@@ -821,9 +950,132 @@ group = "known"
         let ip = IpAddr::from_str("8.8.8.8").unwrap();
         let mut ctx = ClientContext::new(ip);
 
-        let policy = reg.resolve(&mut ctx, Utc::now());
+        let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.client_name, None);
         assert_eq!(policy.group_name, "default");
         assert_eq!(policy.lists, vec!["GlobalList"]);
+    }
+
+    #[test]
+    fn test_schedule_uses_configured_timezone() {
+        let toml_str = r#"
+timezone = "+05:00"
+
+[[entries]]
+name = "Kid"
+ids = ["192.168.1.30"]
+group = "kids"
+
+[groups.kids]
+schedule_enabled = true
+schedule = "0 0 15-21 * * MON-FRI"
+"#;
+        let cfg: ClientsConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.timezone.to_string(), "+05:00");
+        let reg = ClientRegistry::new(cfg);
+
+        // Monday 2026-09-07: 10:00 UTC is 15:00 at UTC+05:00.
+        let at_15_local = Utc.with_ymd_and_hms(2026, 9, 7, 10, 0, 0).unwrap();
+        let mut ctx = ClientContext::new(IpAddr::from_str("192.168.1.30").unwrap());
+        let policy = reg.resolve(&mut ctx, reg.timezone().at_utc(at_15_local));
+        assert!(
+            policy.is_filtering_enabled,
+            "the 15:00-21:00 local window must be active at 10:00 UTC"
+        );
+
+        // 09:59:59 UTC is 14:59:59 local: outside the window.
+        let before_window = Utc.with_ymd_and_hms(2026, 9, 7, 9, 59, 59).unwrap();
+        let mut ctx = ClientContext::new(IpAddr::from_str("192.168.1.30").unwrap());
+        let policy = reg.resolve(&mut ctx, reg.timezone().at_utc(before_window));
+        assert!(
+            !policy.is_filtering_enabled,
+            "14:59:59 local must be outside the window"
+        );
+    }
+
+    #[test]
+    fn test_schedule_timezone_default_is_local() {
+        let cfg: ClientsConfig = toml::from_str("").unwrap();
+        assert!(cfg.timezone.is_local());
+        let reg = ClientRegistry::new(cfg);
+        assert!(reg.timezone().is_local());
+    }
+
+    fn routeros_lease(ip: IpAddr, hostname: Option<&str>) -> RouterOsLease {
+        RouterOsLease {
+            mac: "11:22:33:44:55:66".to_string(),
+            ip: Some(ip),
+            hostname: hostname.map(str::to_string),
+            comment: None,
+        }
+    }
+
+    #[test]
+    fn test_unidentified_clients_are_bounded() {
+        let reg = ClientRegistry::new(ClientsConfig::default());
+        let base = Utc.with_ymd_and_hms(2026, 9, 7, 12, 0, 0).unwrap();
+
+        for i in 0..(MAX_UNIDENTIFIED_CLIENTS + 8) {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i as u32));
+            reg.update_routeros_leases(vec![routeros_lease(ip, None)]);
+            let mut ctx = ClientContext::new(ip);
+            let now = base + TimeDelta::seconds(i64::try_from(i).expect("small loop index"));
+            let _ = reg.resolve(&mut ctx, reg.timezone().at_utc(now));
+        }
+
+        let list = reg.unidentified_clients();
+        assert_eq!(list.len(), MAX_UNIDENTIFIED_CLIENTS);
+        // The oldest entries are evicted; the newest survive.
+        let oldest = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000));
+        assert!(!list.iter().any(|client| client.ip == oldest));
+        let newest = IpAddr::V4(std::net::Ipv4Addr::from(
+            0x0a00_0000 + (MAX_UNIDENTIFIED_CLIENTS + 7) as u32,
+        ));
+        assert!(list.iter().any(|client| client.ip == newest));
+        // Newest-first ordering.
+        assert_eq!(list[0].ip, newest);
+    }
+
+    #[test]
+    fn test_unidentified_clients_expire_by_age() {
+        let reg = ClientRegistry::new(ClientsConfig::default());
+        let base = Utc.with_ymd_and_hms(2026, 9, 7, 12, 0, 0).unwrap();
+
+        let old_ip = IpAddr::from_str("10.10.10.10").unwrap();
+        reg.update_routeros_leases(vec![routeros_lease(old_ip, None)]);
+        let mut ctx = ClientContext::new(old_ip);
+        let _ = reg.resolve(&mut ctx, reg.timezone().at_utc(base));
+        assert_eq!(reg.unidentified_clients().len(), 1);
+
+        // 25 h later a different client is seen: the stale entry is dropped.
+        let new_ip = IpAddr::from_str("10.10.10.11").unwrap();
+        reg.update_routeros_leases(vec![routeros_lease(new_ip, None)]);
+        let mut ctx = ClientContext::new(new_ip);
+        let _ = reg.resolve(&mut ctx, reg.timezone().at_utc(base + TimeDelta::hours(25)));
+
+        let list = reg.unidentified_clients();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].ip, new_ip);
+        assert_eq!(list[0].last_seen, base + TimeDelta::hours(25));
+    }
+
+    #[test]
+    fn test_mac_populated_on_ip_and_secret_matches() {
+        let reg = ClientRegistry::new(sample_config());
+        let ip = IpAddr::from_str("192.168.1.20").unwrap();
+        let mut ctx = ClientContext::new(ip);
+        let policy = reg.resolve(&mut ctx, reg.now());
+        assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
+        assert_eq!(ctx.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+    }
+
+    #[test]
+    fn test_two_label_sni_does_not_extract_client_id() {
+        assert_eq!(extract_id_from_sni("dns.google"), None);
+        assert_eq!(extract_id_from_sni("example.com."), None);
+        assert_eq!(
+            extract_id_from_sni("client1.dns.example.com"),
+            Some("client1")
+        );
     }
 }

@@ -2,6 +2,7 @@
 
 use axum::Json;
 use axum::extract::{Query, State};
+use std::str::FromStr;
 
 use crate::auth::rbac::RequireOperator;
 use crate::error::ProblemDetails;
@@ -47,15 +48,69 @@ pub async fn invalidate_cache(
     State(ctx): State<ServerContext>,
     Query(query): Query<InvalidateCacheQuery>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
-    if query.domain.trim().is_empty() {
+    let domain = query.domain.trim();
+    if domain.is_empty() {
         return Err(ProblemDetails::bad_request(
             "domain parameter must not be empty",
         ));
     }
 
-    ctx.cache.invalidate_domain(&query.domain);
+    // Reject unparseable domains instead of reporting a successful
+    // invalidation for a string the cache can never match.
+    let name = sito_proto::Name::from_str(domain)
+        .map_err(|e| ProblemDetails::bad_request(format!("Invalid domain name '{domain}': {e}")))?;
+
+    ctx.cache.invalidate_domain(&name.to_string());
 
     Ok(Json(GenericMessageResponse {
         message: format!("Invalidated cache entries matching '{}'", query.domain),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::rbac::{AuthUser, RequireOperator};
+    use crate::auth::token::Role;
+
+    fn operator() -> RequireOperator {
+        RequireOperator(AuthUser {
+            username: "operator".to_string(),
+            role: Role::Operator,
+            token_id: None,
+        })
+    }
+
+    /// WP-4.5: an unparseable domain must be a 400, not a fake success.
+    #[tokio::test]
+    async fn test_invalidate_cache_rejects_unparseable_domains() {
+        let temp_dir = crate::test_support::temp_dir("sito_cache_invalidate");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        for domain in ["not a domain!!", "exa mple.com", "..", "a..b"] {
+            let err = invalidate_cache(
+                operator(),
+                State(ctx.clone()),
+                Query(InvalidateCacheQuery {
+                    domain: domain.to_string(),
+                }),
+            )
+            .await
+            .expect_err("unparseable domain must be rejected");
+            assert_eq!(err.status, 400, "domain '{domain}' must yield 400");
+        }
+
+        let ok = invalidate_cache(
+            operator(),
+            State(ctx.clone()),
+            Query(InvalidateCacheQuery {
+                domain: "example.com".to_string(),
+            }),
+        )
+        .await
+        .expect("valid domain accepted");
+        assert!(ok.0.message.contains("example.com"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

@@ -13,8 +13,16 @@
 //! Expressions containing ranges/lists/steps in the hour or minute fields are
 //! widened to the matching window (e.g. `0 0 15-21 * * MON-FRI` is active all
 //! through 15:00-21:59). Use `0 0 9-17 * * *`-style ranges for time windows.
+//!
+//! # Timezone
+//!
+//! [`Schedule::is_active`] evaluates against the wall clock of the timestamp
+//! it is given; the timestamp's timezone is honored (its `DateTime<Tz>` local
+//! fields are matched). Callers convert the configured `clients.timezone`
+//! first — see [`crate::timezone::ClientTimeZone`] and
+//! [`crate::registry::ClientRegistry::resolve`].
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone};
 use croner::Cron;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -111,11 +119,18 @@ impl Schedule {
 
     /// Check if the schedule is active at the specified timestamp.
     ///
+    /// The timestamp's timezone determines the wall clock the cron fields are
+    /// matched against: pass the instant converted to the configured
+    /// `clients.timezone` (see [`crate::timezone::ClientTimeZone`]).
+    ///
     /// Evaluation fails closed: if `croner` cannot evaluate the expression at
     /// this instant (e.g. due to a clock/date edge case), the schedule is
     /// treated as active so filtering/safe-search policy remains enforced and
     /// a warning is logged. This never silently disables a policy.
-    pub fn is_active(&self, timestamp: &DateTime<Utc>) -> bool {
+    pub fn is_active<Tz: TimeZone>(&self, timestamp: &DateTime<Tz>) -> bool
+    where
+        Tz::Offset: fmt::Display,
+    {
         if let Some(ref window) = self.window_cron
             && let Ok(matching) = window.is_time_matching(timestamp)
             && matching
@@ -394,15 +409,15 @@ fn build_window_cron(expr: &str) -> Option<Cron> {
     if parts.len() == 6 {
         // [sec, min, hour, dom, mon, dow]
         let (sec, min, hour) = (parts[0], parts[1], parts[2]);
-        if sec == "0" && min == "0" && is_range(hour) {
+        if sec == "0" && (min == "0" || min == "*") && is_range(hour) {
             // e.g. `0 0 15-21 * * MON-FRI` -> active for all of hours 15-21.
             let mut window_parts = parts.clone();
             window_parts[0] = "*";
             window_parts[1] = "*";
             return Cron::from_str(&window_parts.join(" ")).ok();
         }
-        if sec == "0" && is_range(min) {
-            // e.g. `0 15-30 10 * * *` -> active for all of minutes 15-30 in hour 10.
+        if sec == "0" && (min == "*" || is_range(min)) {
+            // e.g. `0 15-30 10 * * *` or `0 * 10 * * *` -> active across all seconds of matching minutes.
             let mut window_parts = parts.clone();
             window_parts[0] = "*";
             return Cron::from_str(&window_parts.join(" ")).ok();
@@ -414,10 +429,14 @@ fn build_window_cron(expr: &str) -> Option<Cron> {
         // [min, hour, dom, mon, dow]
         let (min, hour) = (parts[0], parts[1]);
 
-        // `* * * * *` means "every minute": for a schedule check at arbitrary
-        // seconds this must be treated as always active.
-        if min == "*" && hour == "*" {
-            return Cron::from_str("* * * * * *").ok();
+        // Any 5-field schedule with `*` in the minute field (e.g. `* * * * *`,
+        // `* 15-21 * * MON-FRI`, `* 9 * * *`, `* * * * MON-FRI`) means every
+        // minute of the matching hours/days and must be active across all 60
+        // seconds of each matching minute.
+        if min == "*" {
+            let mut window_parts = vec!["*"];
+            window_parts.extend_from_slice(&parts);
+            return Cron::from_str(&window_parts.join(" ")).ok();
         }
 
         // Only widen to an hour window when the hour is an explicit range/list,
@@ -442,7 +461,7 @@ fn build_window_cron(expr: &str) -> Option<Cron> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn test_valid_6_field_cron() {
@@ -559,6 +578,35 @@ mod tests {
     }
 
     #[test]
+    fn test_is_active_honors_timestamp_timezone() {
+        use chrono::{FixedOffset, Timelike};
+
+        // 15:00-21:59 local, Monday-Friday.
+        let schedule = Schedule::parse("0 0 15-21 * * MON-FRI").unwrap();
+
+        // Same instant: 10:00 UTC is 15:00 at UTC+05:00.
+        let at_10_utc = Utc.with_ymd_and_hms(2026, 9, 7, 10, 0, 0).unwrap();
+        assert!(
+            !schedule.is_active(&at_10_utc),
+            "10:00 UTC must not match a 15:00 local window"
+        );
+
+        let plus_five = FixedOffset::east_opt(5 * 3600).unwrap();
+        let at_15_plus_five = at_10_utc.with_timezone(&plus_five);
+        assert_eq!(at_15_plus_five.hour(), 15);
+        assert!(
+            schedule.is_active(&at_15_plus_five),
+            "15:00 at UTC+05:00 must match the configured window"
+        );
+
+        // The same wall-clock fields in a Western zone are outside the window.
+        let minus_five = FixedOffset::west_opt(5 * 3600).unwrap();
+        let at_05_minus_five = at_10_utc.with_timezone(&minus_five);
+        assert_eq!(at_05_minus_five.hour(), 5);
+        assert!(!schedule.is_active(&at_05_minus_five));
+    }
+
+    #[test]
     fn test_minute_level_boundary_toggle() {
         // Active between 10:15 and 10:30 (inclusive) every day
         let schedule = Schedule::parse("0 15-30 10 * * *").unwrap();
@@ -664,5 +712,17 @@ mod tests {
         assert!(fail_closed_on_error(CronError::InvalidPattern(
             "unreachable".to_string()
         )));
+    }
+
+    #[test]
+    fn test_five_field_wildcard_minute_window_is_active_across_all_seconds() {
+        let schedule = Schedule::parse("* 15-21 * * MON-FRI").unwrap();
+        let mid_second = Utc.with_ymd_and_hms(2026, 9, 7, 16, 20, 37).unwrap();
+        assert!(
+            schedule.is_active(&mid_second),
+            "5-field `* 15-21 * * MON-FRI` must match non-zero seconds within the window"
+        );
+        let outside = Utc.with_ymd_and_hms(2026, 9, 7, 22, 0, 15).unwrap();
+        assert!(!schedule.is_active(&outside));
     }
 }

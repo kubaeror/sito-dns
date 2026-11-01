@@ -8,7 +8,6 @@ use std::collections::HashSet;
 pub struct EffectivePolicy {
     pub client_name: Option<String>,
     pub group_name: String,
-    pub ids: Vec<String>,
     pub ignore_query_log: bool,
     pub ignore_stats: bool,
     pub use_global_upstreams: bool,
@@ -29,7 +28,6 @@ impl Default for EffectivePolicy {
         Self {
             client_name: None,
             group_name: "default".to_string(),
-            ids: Vec::new(),
             ignore_query_log: false,
             ignore_stats: false,
             use_global_upstreams: true,

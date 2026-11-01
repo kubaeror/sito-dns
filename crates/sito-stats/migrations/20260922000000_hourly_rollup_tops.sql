@@ -1,0 +1,12 @@
+-- Migration: hourly rollup top-N payloads for retention-aware stats windows.
+--
+-- `stats_hourly.top_domains`/`top_clients` were always written as '[]' and
+-- never read. Retention now stores bounded top-N lists per hour so long
+-- statistics windows (older than the detailed query-log retention) can be
+-- answered from the rollups:
+--   top_domains  : [[qname, total, blocked], ...]
+--   top_clients  : [[client_ip, client_name|null, total, blocked, last_seen], ...]
+--   top_upstreams: [[upstream, total, errors, elapsed_us_sum], ...]
+-- Each list holds at most ROLLUP_TOP_N (100) entries per hour. Per-upstream
+-- data had no column at all before, so add it.
+ALTER TABLE stats_hourly ADD COLUMN top_upstreams TEXT NOT NULL DEFAULT '[]';
