@@ -21,6 +21,12 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # `basic-toml` is a build-time-only dependency of askama_macros (parsing
+    # template configuration during compilation); it is not linked into the
+    # runtime binary. The crate is unmaintained (RUSTSEC-2026-0374) and
+    # askama 0.16.1 (the latest release) still requires it; track an askama
+    # update that drops the dependency.
+    "RUSTSEC-2026-0374",
 ]
 
 [licenses]
