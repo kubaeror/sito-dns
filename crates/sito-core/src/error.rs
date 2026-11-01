@@ -20,9 +20,6 @@ pub enum UpstreamError {
     #[error("Upstream does not support the requested operation")]
     Unsupported,
 
-    #[error("DNSSEC validation failure (bogus response)")]
-    DnssecBogus,
-
     #[error("All configured upstream servers are unavailable")]
     AllDown,
 
@@ -43,7 +40,6 @@ impl UpstreamError {
             Self::Tls(_) => "tls",
             Self::BadResponse(_) => "bad_response",
             Self::Unsupported => "unsupported",
-            Self::DnssecBogus => "dnssec_bogus",
             Self::AllDown => "all_down",
             Self::Io(_) => "io",
         }
@@ -62,14 +58,13 @@ mod tests {
             UpstreamError::Tls("x".repeat(1000)),
             UpstreamError::BadResponse("y".repeat(1000)),
             UpstreamError::Unsupported,
-            UpstreamError::DnssecBogus,
             UpstreamError::AllDown,
             UpstreamError::Io("z".repeat(1000)),
         ]
         .iter()
         .map(UpstreamError::kind)
         .collect();
-        assert_eq!(kinds.len(), 8);
+        assert_eq!(kinds.len(), 7);
         for kind in kinds {
             assert!(kind.len() < 32, "kind labels must stay short: {kind}");
         }
