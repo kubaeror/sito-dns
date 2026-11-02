@@ -1,5 +1,7 @@
 # Phase M0 — Foundation (1 week)
 
+> **Historical phase plan.** This document records the original M0 plan and exit criteria; it is not a description of current behavior. Current behavior is documented in the [configuration reference](../configuration-reference.md), HA operations in the [HA runbook](../runbook-ha.md), and user-visible changes in the [1.9.0 release notes](../release-notes-1.9.0.md).
+
 Goal: a repository ready for agent work — before a single line of DNS logic exists. Everything "boring" whose absence hurts painfully in M9.
 
 ## Scope
@@ -14,7 +16,7 @@ Goal: a repository ready for agent work — before a single line of DNS logic ex
 - `git init`, protected `main` branch, mandatory conventional commits
 - Cargo workspace with the 13 crates from plan section 3.3: empty `lib.rs` + `//!` doc-comment with the crate's responsibility
 - `[workspace.lints]`: clippy `pedantic` (with an allowlist of exceptions in the file, not inline), rustfmt `edition 2024`
-- `rust-toolchain.toml`: `channel = "stable"`, components `clippy`, `rustfmt`; MSRV noted in README
+- `rust-toolchain.toml`: a pinned toolchain channel (a fixed version, not `"stable"`), components `clippy`, `rustfmt`; MSRV noted in README
 - `.gitignore` (target/, node_modules/, .env), `.editorconfig`
 
 ### 2. CI (GitHub Actions)
@@ -124,7 +126,7 @@ DoD: documents render correctly; relative links work.
   12. `sito-stats`: Query logging, persistent SQLite storage with WAL, and Prometheus metrics.
   13. `sito-ha`: Master/slave push replication, mTLS WebSockets, and signed config bundles.
   Each crate contains `src/lib.rs` with `//!` module documentation describing its responsibility.
-- **Toolchain & Standards:** `rust-toolchain.toml` pinned to stable with `rustfmt` and `clippy`; `rustfmt.toml` set to `edition = "2024"`; `.editorconfig` configured; `.gitignore` covering build artifacts, node_modules, and secrets.
+- **Toolchain & Standards:** `rust-toolchain.toml` pinned to a fixed toolchain version with `rustfmt` and `clippy`; `rustfmt.toml` set to `edition = "2024"`; `.editorconfig` configured; `.gitignore` covering build artifacts, node_modules, and secrets.
 
 #### Prompt M0.2 — CI and Quality
 - **GitHub Actions Workflow (`.github/workflows/ci.yml`):**

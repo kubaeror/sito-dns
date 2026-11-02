@@ -7,6 +7,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+See the [1.9.0 release notes](docs/release-notes-1.9.0.md) for the user-visible
+summary and migration checklist. This changelog remains the exhaustive record.
+
 ### Added
 - **Configurable filter-list size cap**: `filtering.max_list_bytes` (default
   `67108864`, 64 MiB) bounds each downloaded subscription list and its

@@ -23,7 +23,7 @@
 | **Memory @ 1M Rules** | **~ 285 MB RSS** (Trie + Interning) | 400 – 800 MB RSS | ~ 350 MB RSS |
 | **Encrypted Transports** | **DoT, DoH (H2), DoQ, DoH3** | DoT, DoH, DoQ | Plain only (requires proxy) |
 | **High Availability (HA)** | **Native mTLS WebSocket Push (<2s)** | External tool (adguardhome-sync) | External tool (gravity-sync) |
-| **Filter Rule Engine** | **ABP/AdGuard syntax (see [compatibility matrix](docs/compatibility.md); `$dnsrewrite` partial)** | Full ABP + modifiers | Domain regex & wildcards |
+| **Filter Rule Engine** | **ABP/AdGuard syntax (see [compatibility matrix](docs/compatibility.md); qtype-aware `$dnsrewrite`)** | Full ABP + modifiers | Domain regex & wildcards |
 | **ReDoS Defense** | **Pure Dense DFA (no backtracking)** | RE2 linear time | POSIX regex (risk of backtrack) |
 | **ACME Certificates** | **Native TLS-ALPN-01 & HTTP-01** | Built-in ACME | External (Certbot) |
 | **RouterOS Integration** | **Native DHCP Lease Sync** | None | None |
@@ -163,6 +163,7 @@ Swagger UI / OpenAPI documentation is available at `http://localhost:8080/api/do
 * **[User Management & Authentication](docs/user-management.md):** Accounts, roles/RBAC, password changes, API tokens, TOTP 2FA, last-admin protection, and recovery (management is API-only).
 * **[Migrating from AdGuard Home](docs/migration-adguard.md):** Migration instructions and automated converter script (`contrib/adguard_to_sito.py`).
 * **[High-Availability Runbook](docs/runbook-ha.md):** Deployment architectures, mTLS certificates, failover, and slave promotion.
+* **[1.9.0 Release Notes](docs/release-notes-1.9.0.md):** User-visible behavior changes, migration checklist, and dependency notes for 1.9.0.
 * **[Changelog](CHANGELOG.md):** Release notes for v1.8.0 and complete history of phases M0 through M9.
 
 ---

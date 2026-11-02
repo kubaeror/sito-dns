@@ -1,5 +1,7 @@
 # Phase M7 — DoQ, DoH3, Anti-Bypass and ACME (3 weeks)
 
+> **Historical phase plan.** This document records the original M7 plan and exit criteria; it is not a description of current behavior. Current behavior is documented in the [configuration reference](../configuration-reference.md), HA operations in the [HA runbook](../runbook-ha.md), and user-visible changes in the [1.9.0 release notes](../release-notes-1.9.0.md).
+
 Goal: close out every transport from the survey (item 5: "everything native like AdGuard") plus automatic certificates. References: plan sections 5.5, 5.6, 9.6.
 
 ## Scope

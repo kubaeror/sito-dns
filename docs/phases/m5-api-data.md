@@ -1,5 +1,7 @@
 # Phase M5 — REST API, Auth and Data Layer (3 weeks)
 
+> **Historical phase plan.** This document records the original M5 plan and exit criteria; it is not a description of current behavior. Current behavior is documented in the [configuration reference](../configuration-reference.md), HA operations in the [HA runbook](../runbook-ha.md), and user-visible changes in the [1.9.0 release notes](../release-notes-1.9.0.md).
+
 Goal: full management via API, persistent query log, Prometheus metrics, backup and hot-reload. From this phase on, TOML becomes optional. References: plan sections 12, 14, 15.
 
 ## Scope

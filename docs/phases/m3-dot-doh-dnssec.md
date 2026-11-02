@@ -1,5 +1,7 @@
 # Phase M3 — DoT, DoH and DNSSEC Validation (3 weeks)
 
+> **Historical phase plan.** This document records the original M3 plan and exit criteria; it is not a description of current behavior. Current behavior is documented in the [configuration reference](../configuration-reference.md), HA operations in the [HA runbook](../runbook-ha.md), and user-visible changes in the [1.9.0 release notes](../release-notes-1.9.0.md).
+
 Goal: encrypted inbound transports and local DNSSEC validation. References: plan sections 5.3, 5.4, 8.
 
 ## Scope
