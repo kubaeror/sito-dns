@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+
+{% block title %}Account - sito DNS{% endblock %}
+{% block page_title %}My Account &amp; Credentials{% endblock %}
+
+{% block content %}
+{% if !error_message.is_empty() %}
+<div style="background-color: rgba(239, 68, 68, 0.15); border: 1px solid var(--accent-danger); color: var(--accent-danger); padding: 10px 14px; border-radius: var(--radius-md); font-size: 0.85rem; margin-bottom: 18px;">
+  {{ error_message }}
+</div>
+{% endif %}
+
+{% if !notice_message.is_empty() %}
+<div style="background-color: rgba(34, 197, 94, 0.12); border: 1px solid var(--success); color: var(--success); padding: 10px 14px; border-radius: var(--radius-md); font-size: 0.85rem; margin-bottom: 18px;">
+  {{ notice_message }}
+</div>
+{% endif %}
+
+{% if let Some(token) = new_token %}
+<div style="background-color: rgba(56, 189, 248, 0.1); border: 1px solid var(--accent); border-radius: var(--radius-md); padding: 14px 16px; margin-bottom: 18px;">
+  <div style="font-weight: 600; margin-bottom: 6px;">New API token “{{ new_token_name }}” ({{ new_token_scope }})</div>
+  <div class="form-help" style="margin-bottom: 8px;">Copy it now — this is the only time it will be shown.</div>
+  <code style="display: block; word-break: break-all; padding: 8px 10px; background: var(--bg-base); border-radius: 4px;">{{ token }}</code>
+</div>
+{% endif %}
+
+<div class="grid-2">
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">Profile</div>
+    </div>
+    <div class="form-group">
+      <div class="form-label">Username</div>
+      <div class="mono td-strong">{{ username }}</div>
+    </div>
+    <div class="form-group">
+      <div class="form-label">Role</div>
+      <div><span class="badge badge-info">{{ user_role }}</span></div>
+    </div>
+    <div class="form-group">
+      <div class="form-label">TOTP 2FA</div>
+      {% if totp_enabled %}
+      <span class="badge badge-success">Enabled</span>
+      {% else %}
+      <span class="badge badge-neutral">Disabled</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">Change Password</div>
+    </div>
+    <form action="/ui/account/password" method="POST">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="form-group">
+        <label class="form-label" for="current-password">Current Password</label>
+        <input type="password" id="current-password" name="current_password" class="form-input" required autocomplete="current-password">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="new-password">New Password</label>
+        <input type="password" id="new-password" name="new_password" class="form-input" required autocomplete="new-password">
+        <div class="form-help">At least 8 characters, no whitespace.</div>
+      </div>
+      <div style="display: flex; justify-content: flex-end;">
+        <button type="submit" class="btn btn-primary">Change Password</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="card" style="margin-top: 20px;">
+  <div class="card-header">
+    <div class="card-title">API Tokens</div>
+  </div>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Scope</th>
+          <th>Created</th>
+          <th>Last Used</th>
+          <th>Expires</th>
+          <th style="text-align: center;">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for t in tokens %}
+        <tr>
+          <td class="td-strong">{{ t.name }}</td>
+          <td><span class="badge badge-info">{{ t.scope }}</span></td>
+          <td class="mono" style="color: var(--text-secondary);">{{ t.created_at }}</td>
+          <td class="mono" style="color: var(--text-secondary);">{{ t.last_used }}</td>
+          <td class="mono" style="color: var(--text-secondary);">{{ t.expires_at }}</td>
+          <td style="text-align: center;">
+            <form action="/ui/account/tokens/{{ t.id }}/delete" method="POST" style="display:inline;"
+                  data-confirm="Revoke token {{ t.name }}?"
+                  @submit="if (!confirm($el.dataset.confirm)) { $event.preventDefault(); }">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="btn-icon" style="color: var(--accent-danger);" title="Revoke token">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+              </button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 24px;">No API tokens yet</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <form action="/ui/account/tokens" method="POST" style="margin-top: 16px;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label" for="token-name">Token Name</label>
+        <input type="text" id="token-name" name="name" class="form-input" required maxlength="128" placeholder="ci-deploy">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="token-scope">Scope</label>
+        <select id="token-scope" name="scope" class="form-input">
+          <option value="viewer">Viewer</option>
+          {% if can_create_operator_token %}<option value="operator">Operator</option>{% endif %}
+          {% if can_create_admin_token %}<option value="admin">Admin</option>{% endif %}
+        </select>
+      </div>
+    </div>
+    <div style="display: flex; justify-content: flex-end;">
+      <button type="submit" class="btn btn-primary">Create Token</button>
+    </div>
+  </form>
+</div>
+
+{% if totp_enabled %}
+<div class="card" style="margin-top: 20px; max-width: 720px;">
+  <div class="card-header">
+    <div class="card-title">Disable TOTP 2FA</div>
+  </div>
+  <form action="/ui/account/totp/disable" method="POST">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="form-help" style="margin-bottom: 12px;">Re-authenticate to turn off two-factor authentication. Disabling 2FA signs you out of every session.</div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label" for="totp-password">Current Password</label>
+        <input type="password" id="totp-password" name="password" class="form-input" required autocomplete="current-password">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="totp-code">TOTP or Backup Code</label>
+        <input type="text" id="totp-code" name="code" class="form-input" required autocomplete="one-time-code">
+      </div>
+    </div>
+    <div style="display: flex; justify-content: flex-end;">
+      <button type="submit" class="btn btn-danger">Disable TOTP</button>
+    </div>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

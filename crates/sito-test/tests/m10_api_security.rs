@@ -464,3 +464,123 @@ headers = { api_token = "inline-secret-token", accept = "text/html" }
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
+
+/// D-17b: the user-management UI must keep the same CSRF and RBAC guarantees
+/// as the REST API: session cookies need the double-submit token, and Viewers
+/// cannot invoke Admin-only mutations.
+#[cfg(feature = "embed-ui")]
+#[tokio::test]
+async fn test_acceptance_m10_ui_users_csrf_and_rbac() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_m10_ui_users_{}", rand::random::<u64>()));
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    let ctx = create_test_context(&temp_dir, false).await;
+    let app = sito_api::create_router(ctx.clone());
+
+    let login = |user: &'static str, pass: &'static str| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"user": user, "pass": pass}).to_string(),
+                ))
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            (
+                cookie_from_response(&res, "sito_session").expect("session cookie"),
+                cookie_from_response(&res, "sito_csrf").expect("csrf cookie"),
+            )
+        }
+    };
+
+    let (admin_session, admin_csrf) = login("admin", "adminadmin").await;
+    let admin_cookies = format!("sito_session={admin_session}; sito_csrf={admin_csrf}");
+
+    // 1. Missing CSRF token -> 403.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ui/users/create")
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://localhost")
+        .header(header::COOKIE, &admin_cookies)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(
+            "username=csrfmissing&password=Password123&role=viewer",
+        ))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(!ctx.auth_mgr.has_user("csrfmissing"));
+
+    // 2. Wrong CSRF token -> 403.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ui/users/create")
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://localhost")
+        .header(header::COOKIE, &admin_cookies)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(
+            "csrf_token=deadbeef&username=csrfwrong&password=Password123&role=viewer",
+        ))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(!ctx.auth_mgr.has_user("csrfwrong"));
+
+    // 3. A Viewer with a valid CSRF token still gets 403 from the handler.
+    ctx.auth_mgr
+        .create_user("view_user", "ViewerPassword1", Role::Viewer)
+        .await;
+    let (viewer_session, viewer_csrf) = login("view_user", "ViewerPassword1").await;
+    let viewer_cookies = format!("sito_session={viewer_session}; sito_csrf={viewer_csrf}");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ui/users/create")
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://localhost")
+        .header(header::COOKIE, &viewer_cookies)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!(
+            "csrf_token={viewer_csrf}&username=viewer-made&password=Password123&role=viewer"
+        )))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(!ctx.auth_mgr.has_user("viewer-made"));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ui/users/admin/delete")
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://localhost")
+        .header(header::COOKIE, &viewer_cookies)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!("csrf_token={viewer_csrf}")))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(ctx.auth_mgr.has_user("admin"));
+
+    // 4. Same-origin + matching CSRF token lets the Admin create a user.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ui/users/create")
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://localhost")
+        .header(header::COOKIE, &admin_cookies)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!(
+            "csrf_token={admin_csrf}&username=alice&password=AlicePassword1&role=operator"
+        )))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    assert!(ctx.auth_mgr.has_user("alice"));
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}

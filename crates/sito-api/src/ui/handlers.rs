@@ -18,14 +18,20 @@ use crate::auth::session::{
 use crate::auth::token::Role;
 use crate::config_apply::{ApplyHooks, FilterApply, apply_and_persist_config, apply_full_config};
 use crate::config_writer::save_config_atomic;
+use crate::error::ProblemDetails;
+use crate::handlers::auth_handlers::{
+    ensure_role_change_allowed, ensure_user_deletion_allowed, validate_password_policy,
+    validate_username,
+};
 use crate::models::{FilterListDto, StatusResponse};
 use crate::probe::probe_upstream_target;
 use crate::state::ServerContext;
 use crate::ui::templates::{
-    ClientViewItem, ClientsTemplate, DashboardStatsPartialTemplate, DashboardTemplate,
-    FilteringTemplate, HtmlTemplate, LoginTemplate, QueryLogRowItem, QueryLogRowsPartialTemplate,
-    QueryLogTemplate, RewriteViewItem, RewritesTemplate, SettingsTemplate, SystemTemplate,
-    UpstreamViewItem, UpstreamsTemplate, WizardTemplate,
+    AccountTemplate, ClientViewItem, ClientsTemplate, DashboardStatsPartialTemplate,
+    DashboardTemplate, FilteringTemplate, HtmlTemplate, LoginTemplate, QueryLogRowItem,
+    QueryLogRowsPartialTemplate, QueryLogTemplate, RewriteViewItem, RewritesTemplate,
+    SettingsTemplate, SystemTemplate, TokenViewItem, UpstreamViewItem, UpstreamsTemplate,
+    UserViewItem, UsersTemplate, WizardTemplate,
 };
 use sito_core::FilterEngine;
 use sito_core::config::{BlockingMode, Config, FilterListConfig, UpstreamStrategy};
@@ -2322,6 +2328,553 @@ pub async fn wizard_complete_handler(
     Redirect::to("/login").into_response()
 }
 
+// ---------------------------------------------------------------------------
+// User Management & Account (D-17b)
+// ---------------------------------------------------------------------------
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+fn format_token_timestamp(ts: Option<i64>) -> String {
+    ts.and_then(chrono::DateTime::from_timestamp_millis)
+        .map_or_else(
+            || "—".to_string(),
+            |dt| dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+        )
+}
+
+fn user_view_items(ctx: &ServerContext, current_username: &str) -> Vec<UserViewItem> {
+    ctx.auth_mgr
+        .list_users()
+        .into_iter()
+        .map(|user| {
+            let encoded = percent_encode_path_segment(&user.username);
+            UserViewItem {
+                is_current: user.username == current_username,
+                username: user.username,
+                role: user.role,
+                totp_enabled: user.totp_enabled,
+                role_action: format!("/ui/users/{encoded}/role"),
+                delete_action: format!("/ui/users/{encoded}/delete"),
+            }
+        })
+        .collect()
+}
+
+fn token_view_items(ctx: &ServerContext, max_scope: Role) -> Vec<TokenViewItem> {
+    ctx.auth_mgr
+        .list_tokens()
+        .iter()
+        .filter(|token| token.scope <= max_scope)
+        .map(|token| TokenViewItem {
+            id: token.id.clone(),
+            name: token.name.clone(),
+            scope: token.scope.to_string(),
+            created_at: format_token_timestamp(Some(token.created_at)),
+            last_used: format_token_timestamp(token.last_used),
+            expires_at: format_token_timestamp(token.expires_at),
+        })
+        .collect()
+}
+
+fn render_users_page(
+    ctx: &ServerContext,
+    user: &AuthUser,
+    csrf: &str,
+    error_message: &str,
+    status: StatusCode,
+) -> Response {
+    let users = user_view_items(ctx, &user.username);
+    let mut response = HtmlTemplate(UsersTemplate {
+        csrf_token: csrf,
+        is_authenticated: true,
+        username: &user.username,
+        user_role: user.role.as_str(),
+        active_tab: "users",
+        version: env!("CARGO_PKG_VERSION"),
+        users,
+        error_message,
+    })
+    .into_response();
+    *response.status_mut() = status;
+    response
+}
+
+fn render_account_page(
+    ctx: &ServerContext,
+    user: &AuthUser,
+    csrf: &str,
+    error_message: &str,
+    notice_message: &str,
+    new_token: Option<&crate::auth::token::CreateTokenResponse>,
+    status: StatusCode,
+) -> Response {
+    let tokens = token_view_items(ctx, user.role);
+    let totp_enabled = ctx.auth_mgr.totp_enabled(&user.username);
+    let (token_value, token_name, token_scope) = match new_token {
+        Some(token) => (
+            Some(token.token.as_str()),
+            token.name.as_str(),
+            token.scope.to_string(),
+        ),
+        None => (None, "", String::new()),
+    };
+    let mut response = HtmlTemplate(AccountTemplate {
+        csrf_token: csrf,
+        is_authenticated: true,
+        username: &user.username,
+        user_role: user.role.as_str(),
+        active_tab: "account",
+        version: env!("CARGO_PKG_VERSION"),
+        tokens,
+        totp_enabled,
+        can_create_operator_token: user.role >= Role::Operator,
+        can_create_admin_token: user.role >= Role::Admin,
+        error_message,
+        notice_message,
+        new_token: token_value,
+        new_token_name: token_name,
+        new_token_scope: &token_scope,
+    })
+    .into_response();
+    *response.status_mut() = status;
+    response
+}
+
+fn session_or_redirect(
+    ctx: &ServerContext,
+    headers: &HeaderMap,
+) -> Result<(AuthUser, String), Box<Response>> {
+    match get_session_user(ctx, headers) {
+        Some(user) => Ok((user, get_csrf_token(ctx, headers))),
+        None => Err(Box::new(Redirect::to("/login").into_response())),
+    }
+}
+
+fn admin_or_forbidden(
+    ctx: &ServerContext,
+    headers: &HeaderMap,
+) -> Result<(AuthUser, String), Box<Response>> {
+    let (user, csrf) = session_or_redirect(ctx, headers)?;
+    if user.role < Role::Admin {
+        return Err(Box::new(StatusCode::FORBIDDEN.into_response()));
+    }
+    Ok((user, csrf))
+}
+
+fn users_problem_page(
+    ctx: &ServerContext,
+    user: &AuthUser,
+    csrf: &str,
+    problem: ProblemDetails,
+) -> Response {
+    let status = StatusCode::from_u16(problem.status).unwrap_or(StatusCode::BAD_REQUEST);
+    let detail = problem.detail;
+    render_users_page(ctx, user, csrf, &detail, status)
+}
+
+fn account_problem_page(
+    ctx: &ServerContext,
+    user: &AuthUser,
+    csrf: &str,
+    problem: ProblemDetails,
+) -> Response {
+    let status = StatusCode::from_u16(problem.status).unwrap_or(StatusCode::BAD_REQUEST);
+    let detail = problem.detail;
+    render_account_page(ctx, user, csrf, &detail, "", None, status)
+}
+
+pub async fn users_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
+    let (user, csrf) = match admin_or_forbidden(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    render_users_page(&ctx, &user, &csrf, "", StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+pub struct CreateUserForm {
+    pub username: String,
+    pub password: String,
+    pub role: String,
+}
+
+pub async fn users_create_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Form(form): Form<CreateUserForm>,
+) -> Response {
+    let (user, csrf) = match admin_or_forbidden(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    let username = form.username.trim();
+    let role = match validate_username(username)
+        .and_then(|()| validate_password_policy(&form.password))
+        .and_then(|()| {
+            Role::from_str(form.role.trim())
+                .map_err(|e| ProblemDetails::bad_request(format!("Invalid role: {e}")))
+        }) {
+        Ok(role) => role,
+        Err(problem) => return users_problem_page(&ctx, &user, &csrf, problem),
+    };
+
+    if ctx.auth_mgr.has_user(username) {
+        return users_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::conflict(format!("User '{username}' already exists")),
+        );
+    }
+
+    ctx.auth_mgr
+        .create_user(username, &form.password, role)
+        .await;
+    tracing::info!(
+        actor = %user.username,
+        target = %username,
+        role = %role,
+        "Administrator created a user account"
+    );
+    Redirect::to("/users").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct UpdateUserRoleForm {
+    pub role: String,
+}
+
+pub async fn users_role_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+    Form(form): Form<UpdateUserRoleForm>,
+) -> Response {
+    let (user, csrf) = match admin_or_forbidden(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    let role = match Role::from_str(form.role.trim()) {
+        Ok(role) => role,
+        Err(e) => {
+            return users_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request(format!("Invalid role: {e}")),
+            );
+        }
+    };
+    if let Err(problem) = ensure_role_change_allowed(&ctx, &username, role) {
+        return users_problem_page(&ctx, &user, &csrf, problem);
+    }
+
+    if !ctx.auth_mgr.set_user_role(&username, role).await {
+        return users_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::not_found(format!("User '{username}' not found")),
+        );
+    }
+    tracing::info!(
+        actor = %user.username,
+        target = %username,
+        role = %role,
+        "Administrator changed a user role"
+    );
+    Redirect::to("/users").into_response()
+}
+
+pub async fn users_delete_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+) -> Response {
+    let (user, csrf) = match admin_or_forbidden(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    if let Err(problem) = ensure_user_deletion_allowed(&ctx, &username) {
+        return users_problem_page(&ctx, &user, &csrf, problem);
+    }
+    if !ctx.auth_mgr.delete_user(&username).await {
+        return users_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::not_found(format!("User '{username}' not found")),
+        );
+    }
+    tracing::info!(
+        actor = %user.username,
+        target = %username,
+        "Administrator deleted a user account"
+    );
+    Redirect::to("/users").into_response()
+}
+
+pub async fn account_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
+    let (user, csrf) = match session_or_redirect(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    render_account_page(&ctx, &user, &csrf, "", "", None, StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+pub struct AccountPasswordForm {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+pub async fn account_password_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Form(form): Form<AccountPasswordForm>,
+) -> Response {
+    let (user, csrf) = match session_or_redirect(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    if let Err(problem) = validate_password_policy(&form.new_password) {
+        return account_problem_page(&ctx, &user, &csrf, problem);
+    }
+    if form.current_password.is_empty() {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::bad_request("Current password is required"),
+        );
+    }
+    if !ctx
+        .auth_mgr
+        .verify_user_password(&user.username, &form.current_password)
+        .await
+    {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::bad_request("Current password is incorrect"),
+        );
+    }
+    if !ctx
+        .auth_mgr
+        .update_user_password(&user.username, &form.new_password)
+        .await
+    {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::not_found("User account not found"),
+        );
+    }
+    tracing::info!(user = %user.username, "User changed their password from the web UI");
+    // Password changes revoke every session for the account, including this
+    // one, so send the browser back to the login page.
+    Redirect::to("/login").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CreateAccountTokenForm {
+    pub name: String,
+    pub scope: String,
+}
+
+pub async fn account_token_create_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Form(form): Form<CreateAccountTokenForm>,
+) -> Response {
+    let (user, csrf) = match session_or_redirect(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    let name = form.name.trim();
+    if name.is_empty() {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::bad_request("Token name is required"),
+        );
+    }
+    if name.len() > 128 {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::bad_request("Token name must be at most 128 characters"),
+        );
+    }
+    let scope = match Role::from_str(form.scope.trim()) {
+        Ok(scope) => scope,
+        Err(e) => {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request(format!("Invalid token scope: {e}")),
+            );
+        }
+    };
+    // API tokens are global in the current auth model, so never let a lower
+    // role mint a token that outranks it.
+    if scope > user.role {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::forbidden("A token scope may not exceed your own role"),
+        );
+    }
+
+    let (_meta, token) = ctx.auth_mgr.create_token(name, scope).await;
+    tracing::info!(user = %user.username, token = %token.id, "User created an API token from the web UI");
+    // The plaintext token is shown only in this response and is never stored
+    // or logged; reloading the page lists metadata only.
+    render_account_page(&ctx, &user, &csrf, "", "", Some(&token), StatusCode::OK)
+}
+
+pub async fn account_token_delete_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let (user, csrf) = match session_or_redirect(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    let Some(token) = ctx
+        .auth_mgr
+        .list_tokens()
+        .into_iter()
+        .find(|token| token.id == id)
+    else {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::not_found(format!("Token '{id}' not found")),
+        );
+    };
+    // Tokens are global; prevent a lower role from revoking a higher one.
+    if token.scope > user.role {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::forbidden("A token scope may not exceed your own role"),
+        );
+    }
+
+    if !ctx.auth_mgr.delete_token(&id).await {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::not_found(format!("Token '{id}' not found")),
+        );
+    }
+    tracing::info!(user = %user.username, token = %id, "User revoked an API token from the web UI");
+    Redirect::to("/account").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct DisableAccountTotpForm {
+    pub password: String,
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+pub async fn account_totp_disable_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Form(form): Form<DisableAccountTotpForm>,
+) -> Response {
+    let (user, csrf) = match session_or_redirect(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    // Mirror the REST disable handler: the current password is always
+    // required, and when TOTP is enabled a valid TOTP or backup code must
+    // accompany it.
+    if !ctx
+        .auth_mgr
+        .verify_user_password(&user.username, &form.password)
+        .await
+    {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::bad_request("Re-authentication failed: invalid password"),
+        );
+    }
+    if ctx.auth_mgr.totp_enabled(&user.username) {
+        let Some(code) = form
+            .code
+            .as_deref()
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+        else {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request("A TOTP or backup code is required to disable 2FA"),
+            );
+        };
+        if !ctx
+            .auth_mgr
+            .verify_second_factor(&user.username, code)
+            .await
+        {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request(
+                    "Re-authentication failed: invalid TOTP or backup code",
+                ),
+            );
+        }
+    }
+
+    if !ctx.auth_mgr.disable_totp(&user.username).await {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::not_found("User account not found"),
+        );
+    }
+    tracing::info!(user = %user.username, "User disabled TOTP 2FA from the web UI");
+    // Disabling 2FA revokes every session for the account by design.
+    Redirect::to("/login").into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3156,6 +3709,456 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn session_headers(session: &crate::auth::session::Session) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, session.to_cookie_header().parse().unwrap());
+        headers
+    }
+
+    async fn response_body(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn test_users_page_requires_admin() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_users_rbac_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        // Anonymous visitors are sent to the login page.
+        let resp = users_page(State(ctx.clone()), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/login")
+        );
+
+        ctx.auth_mgr
+            .create_user("view_user", "ViewerPass1", Role::Viewer)
+            .await;
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+
+        let LoginResult::Success(view_session) = ctx
+            .auth_mgr
+            .login("view_user", "ViewerPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("viewer login failed");
+        };
+        let view_headers = session_headers(&view_session);
+
+        let resp = users_page(State(ctx.clone()), view_headers.clone()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a Viewer must not list user accounts"
+        );
+
+        let LoginResult::Success(oper_session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+        let resp = users_page(State(ctx.clone()), session_headers(&oper_session)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "an Operator must not list user accounts"
+        );
+
+        // /account is available to every authenticated role.
+        let resp = account_page(State(ctx.clone()), view_headers).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let LoginResult::Success(admin_session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let resp = users_page(State(ctx.clone()), session_headers(&admin_session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_users_create_role_delete_flow() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_users_flow_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let LoginResult::Success(session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let headers = session_headers(&session);
+
+        // Weak passwords and invalid roles are rejected by the shared policy.
+        let resp = users_create_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(CreateUserForm {
+                username: "bob".to_string(),
+                password: "short".to_string(),
+                role: "viewer".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(!ctx.auth_mgr.has_user("bob"));
+
+        let resp = users_create_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(CreateUserForm {
+                username: "alice".to_string(),
+                password: "AlicePassword1".to_string(),
+                role: "operator".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/users")
+        );
+        assert!(ctx.auth_mgr.has_user("alice"));
+        assert_eq!(ctx.auth_mgr.role_of("alice"), Some(Role::Operator));
+
+        // Duplicate creation is a conflict and does not overwrite the account.
+        let resp = users_create_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(CreateUserForm {
+                username: "alice".to_string(),
+                password: "OtherPassword1".to_string(),
+                role: "viewer".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(ctx.auth_mgr.role_of("alice"), Some(Role::Operator));
+
+        let resp = users_role_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Path("alice".to_string()),
+            Form(UpdateUserRoleForm {
+                role: "viewer".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(ctx.auth_mgr.role_of("alice"), Some(Role::Viewer));
+
+        let resp = users_delete_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Path("alice".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(!ctx.auth_mgr.has_user("alice"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_users_last_admin_protected() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_users_last_admin_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let LoginResult::Success(session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let headers = session_headers(&session);
+
+        let resp = users_role_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Path("admin".to_string()),
+            Form(UpdateUserRoleForm {
+                role: "viewer".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_body(resp).await;
+        assert!(
+            body.contains("last remaining admin"),
+            "visible error missing: {body}"
+        );
+        assert_eq!(ctx.auth_mgr.role_of("admin"), Some(Role::Admin));
+
+        let resp =
+            users_delete_handler(State(ctx.clone()), headers, Path("admin".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_body(resp).await;
+        assert!(
+            body.contains("last remaining admin"),
+            "visible error missing: {body}"
+        );
+        assert!(ctx.auth_mgr.has_user("admin"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_account_password_change() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_account_pw_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let LoginResult::Success(session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let headers = session_headers(&session);
+
+        let resp = account_password_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(AccountPasswordForm {
+                current_password: "wrong-password".to_string(),
+                new_password: "NewAdminPassword1".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_body(resp).await;
+        assert!(body.contains("Current password is incorrect"), "{body}");
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("admin", "adminadmin")
+                .await,
+            "wrong current password must not change the password"
+        );
+
+        let resp = account_password_handler(
+            State(ctx.clone()),
+            headers,
+            Form(AccountPasswordForm {
+                current_password: "adminadmin".to_string(),
+                new_password: "NewAdminPassword1".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(matches!(
+            ctx.auth_mgr
+                .login("admin", "NewAdminPassword1", "127.0.0.1")
+                .await,
+            LoginResult::Success(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_account_tokens_create_and_revoke() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_account_tokens_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let LoginResult::Success(session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let headers = session_headers(&session);
+
+        let resp = account_token_create_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(CreateAccountTokenForm {
+                name: "ci-deploy".to_string(),
+                scope: "viewer".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+        let plaintext = body
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .find(|part| part.starts_with("sito_") && part.len() == 69)
+            .expect("plaintext token must be rendered")
+            .to_string();
+        assert!(body.contains("ci-deploy"));
+        assert!(
+            body.contains("only time"),
+            "one-time warning missing: {body}"
+        );
+
+        let tokens = ctx.auth_mgr.list_tokens();
+        assert_eq!(tokens.len(), 1);
+        let token_id = tokens[0].id.clone();
+        assert!(
+            !body.contains(&tokens[0].hash),
+            "the stored token hash must never be rendered"
+        );
+
+        // Reloading the account page lists metadata only, not the plaintext.
+        let resp = account_page(State(ctx.clone()), headers.clone()).await;
+        let reloaded = response_body(resp).await;
+        assert!(
+            !reloaded.contains(&plaintext),
+            "plaintext token must not survive the one-time response: {reloaded}"
+        );
+        assert!(reloaded.contains("ci-deploy"));
+
+        let resp = account_token_delete_handler(State(ctx.clone()), headers, Path(token_id)).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(ctx.auth_mgr.list_tokens().is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_account_token_scope_capped_at_user_role() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_token_scope_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("view_user", "ViewerPass1", Role::Viewer)
+            .await;
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("view_user", "ViewerPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("viewer login failed");
+        };
+        let headers = session_headers(&session);
+
+        let resp = account_token_create_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(CreateAccountTokenForm {
+                name: "escalation".to_string(),
+                scope: "admin".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            ctx.auth_mgr.list_tokens().is_empty(),
+            "a Viewer must not mint an Admin token"
+        );
+
+        let resp = account_token_create_handler(
+            State(ctx.clone()),
+            headers,
+            Form(CreateAccountTokenForm {
+                name: "read-only".to_string(),
+                scope: "viewer".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(ctx.auth_mgr.list_tokens().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_account_totp_disable() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_account_totp_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let setup = ctx.auth_mgr.init_totp_setup("admin").await.expect("setup");
+        assert!(
+            ctx.auth_mgr
+                .confirm_totp_setup("admin", &setup.backup_codes[0])
+                .await
+        );
+        assert!(ctx.auth_mgr.totp_enabled("admin"));
+
+        // Enabling TOTP revokes the old session, and logging in now needs a
+        // second factor. Use a backup code to obtain a real session.
+        let LoginResult::TotpRequired { partial_token } =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("TOTP login should require a second factor");
+        };
+        let crate::auth::manager::TotpVerifyResult::Success(session) = ctx
+            .auth_mgr
+            .verify_totp(&partial_token, &setup.backup_codes[1], "127.0.0.1")
+            .await
+        else {
+            panic!("TOTP verification failed");
+        };
+        let headers = session_headers(&session);
+
+        let resp = account_totp_disable_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(DisableAccountTotpForm {
+                password: "wrong-password".to_string(),
+                code: Some(setup.backup_codes[2].clone()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(ctx.auth_mgr.totp_enabled("admin"));
+
+        let resp = account_totp_disable_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(DisableAccountTotpForm {
+                password: "adminadmin".to_string(),
+                code: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_body(resp).await;
+        assert!(body.contains("A TOTP or backup code is required"), "{body}");
+        assert!(ctx.auth_mgr.totp_enabled("admin"));
+
+        let resp = account_totp_disable_handler(
+            State(ctx.clone()),
+            headers,
+            Form(DisableAccountTotpForm {
+                password: "adminadmin".to_string(),
+                code: Some(setup.backup_codes[2].clone()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(
+            !ctx.auth_mgr.totp_enabled("admin"),
+            "TOTP status must flip to disabled"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

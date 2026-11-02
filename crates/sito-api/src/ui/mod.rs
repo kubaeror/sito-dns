@@ -21,11 +21,35 @@ pub fn ui_router() -> Router<ServerContext> {
         .route("/settings", get(handlers::settings_page))
         .route("/system", get(handlers::system_page))
         .route("/wizard", get(handlers::wizard_page))
+        .route("/users", get(handlers::users_page))
+        .route("/account", get(handlers::account_page))
         // Static assets
         .route("/static/{*path}", get(static_files::static_handler))
         // UI Actions & Partials
         .route("/ui/login", post(handlers::login_submit))
         .route("/ui/logout", post(handlers::logout_handler))
+        .route("/ui/users/create", post(handlers::users_create_handler))
+        .route("/ui/users/{username}/role", post(handlers::users_role_handler))
+        .route(
+            "/ui/users/{username}/delete",
+            post(handlers::users_delete_handler),
+        )
+        .route(
+            "/ui/account/password",
+            post(handlers::account_password_handler),
+        )
+        .route(
+            "/ui/account/tokens",
+            post(handlers::account_token_create_handler),
+        )
+        .route(
+            "/ui/account/tokens/{id}/delete",
+            post(handlers::account_token_delete_handler),
+        )
+        .route(
+            "/ui/account/totp/disable",
+            post(handlers::account_totp_disable_handler),
+        )
         .route("/ui/partials/dashboard-stats", get(handlers::dashboard_stats_partial))
         .route("/ui/partials/querylog-rows", get(handlers::querylog_rows_partial))
         .route("/ui/filtering/toggle/{id}", post(handlers::filtering_toggle_handler))
@@ -54,10 +78,11 @@ mod tests {
     use crate::models::StatusResponse;
     use crate::ui::static_files::StaticAssets;
     use crate::ui::templates::{
-        ClientViewItem, ClientsTemplate, DashboardStatsPartialTemplate, DashboardTemplate,
-        FilteringTemplate, LoginTemplate, QueryLogRowItem, QueryLogRowsPartialTemplate,
-        QueryLogTemplate, RewriteViewItem, RewritesTemplate, SettingsTemplate, SystemTemplate,
-        UpstreamViewItem, UpstreamsTemplate, WizardTemplate,
+        AccountTemplate, ClientViewItem, ClientsTemplate, DashboardStatsPartialTemplate,
+        DashboardTemplate, FilteringTemplate, LoginTemplate, QueryLogRowItem,
+        QueryLogRowsPartialTemplate, QueryLogTemplate, RewriteViewItem, RewritesTemplate,
+        SettingsTemplate, SystemTemplate, TokenViewItem, UpstreamViewItem, UpstreamsTemplate,
+        UserViewItem, UsersTemplate, WizardTemplate,
     };
     use sito_stats::GlobalStats;
 
@@ -304,5 +329,89 @@ mod tests {
             setup_token: "test-token",
         };
         assert!(wiz_tmpl.render().unwrap().contains("Welcome to sito DNS"));
+    }
+
+    #[test]
+    fn test_render_users_and_account_templates() {
+        let users_tmpl = UsersTemplate {
+            csrf_token: "csrf-token",
+            is_authenticated: true,
+            username: "admin",
+            user_role: "admin",
+            active_tab: "users",
+            version: "1.2.1",
+            users: vec![
+                UserViewItem {
+                    username: "admin".to_string(),
+                    role: "admin".to_string(),
+                    totp_enabled: false,
+                    role_action: "/ui/users/admin/role".to_string(),
+                    delete_action: "/ui/users/admin/delete".to_string(),
+                    is_current: true,
+                },
+                UserViewItem {
+                    username: "alice".to_string(),
+                    role: "operator".to_string(),
+                    totp_enabled: true,
+                    role_action: "/ui/users/alice/role".to_string(),
+                    delete_action: "/ui/users/alice/delete".to_string(),
+                    is_current: false,
+                },
+            ],
+            error_message: "Duplicate user",
+        };
+        let html = users_tmpl.render().expect("render users template");
+        assert!(html.contains("alice"));
+        assert!(html.contains("/ui/users/alice/role"));
+        assert!(html.contains("Duplicate user"));
+        assert!(html.contains("href=\"/users\""), "admin nav link missing");
+
+        // The Users nav link is admin-only.
+        let viewer_tmpl = UsersTemplate {
+            csrf_token: "csrf-token",
+            is_authenticated: true,
+            username: "alice",
+            user_role: "viewer",
+            active_tab: "users",
+            version: "1.2.1",
+            users: Vec::new(),
+            error_message: "",
+        };
+        let viewer_html = viewer_tmpl.render().expect("render viewer users template");
+        assert!(
+            !viewer_html.contains("href=\"/users\""),
+            "Viewers must not see the Users nav link"
+        );
+        assert!(viewer_html.contains("href=\"/account\""));
+
+        let account_tmpl = AccountTemplate {
+            csrf_token: "csrf-token",
+            is_authenticated: true,
+            username: "alice",
+            user_role: "viewer",
+            active_tab: "account",
+            version: "1.2.1",
+            tokens: vec![TokenViewItem {
+                id: "tok_abc".to_string(),
+                name: "ci-deploy".to_string(),
+                scope: "viewer".to_string(),
+                created_at: "2026-01-01 00:00 UTC".to_string(),
+                last_used: "—".to_string(),
+                expires_at: "—".to_string(),
+            }],
+            totp_enabled: true,
+            can_create_operator_token: false,
+            can_create_admin_token: false,
+            error_message: "",
+            notice_message: "",
+            new_token: Some("sito_plaintext_once"),
+            new_token_name: "ci-deploy",
+            new_token_scope: "viewer",
+        };
+        let account_html = account_tmpl.render().expect("render account template");
+        assert!(account_html.contains("sito_plaintext_once"));
+        assert!(account_html.contains("ci-deploy"));
+        assert!(account_html.contains("Disable TOTP"));
+        assert!(account_html.contains("/ui/account/tokens/tok_abc/delete"));
     }
 }

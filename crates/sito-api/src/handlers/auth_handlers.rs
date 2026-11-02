@@ -448,7 +448,7 @@ pub async fn delete_token(
 // ---------------------------------------------------------------------------
 
 /// Rejects usernames that would be ambiguous in logs/config or empty.
-fn validate_username(username: &str) -> Result<(), ProblemDetails> {
+pub(crate) fn validate_username(username: &str) -> Result<(), ProblemDetails> {
     let trimmed = username.trim();
     if trimmed.is_empty() {
         return Err(ProblemDetails::bad_request("Username must not be empty"));
@@ -487,6 +487,48 @@ pub fn validate_password_policy(password: &str) -> Result<(), ProblemDetails> {
     if password.eq_ignore_ascii_case("adminadmin") {
         return Err(ProblemDetails::bad_request(
             "The default password is not allowed",
+        ));
+    }
+    Ok(())
+}
+
+/// Shared last-admin guard for role changes: an existing Admin may only be
+/// demoted while another Admin remains. Also rejects unknown accounts.
+pub(crate) fn ensure_role_change_allowed(
+    ctx: &ServerContext,
+    username: &str,
+    role: Role,
+) -> Result<(), ProblemDetails> {
+    if !ctx.auth_mgr.has_user(username) {
+        return Err(ProblemDetails::not_found(format!(
+            "User '{username}' not found"
+        )));
+    }
+    if role != Role::Admin
+        && ctx.auth_mgr.role_of(username) == Some(Role::Admin)
+        && ctx.auth_mgr.admin_count() <= 1
+    {
+        return Err(ProblemDetails::bad_request(
+            "Cannot demote the last remaining admin account",
+        ));
+    }
+    Ok(())
+}
+
+/// Shared last-admin guard for deletions: an Admin may only be deleted while
+/// another Admin remains. Also rejects unknown accounts.
+pub(crate) fn ensure_user_deletion_allowed(
+    ctx: &ServerContext,
+    username: &str,
+) -> Result<(), ProblemDetails> {
+    if !ctx.auth_mgr.has_user(username) {
+        return Err(ProblemDetails::not_found(format!(
+            "User '{username}' not found"
+        )));
+    }
+    if ctx.auth_mgr.role_of(username) == Some(Role::Admin) && ctx.auth_mgr.admin_count() <= 1 {
+        return Err(ProblemDetails::bad_request(
+            "Cannot delete the last remaining admin account",
         ));
     }
     Ok(())
@@ -573,19 +615,7 @@ pub async fn update_user(
 ) -> Result<Json<UserDto>, ProblemDetails> {
     let role = Role::from_str(req.role.trim())
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid role: {e}")))?;
-    if !ctx.auth_mgr.has_user(&username) {
-        return Err(ProblemDetails::not_found(format!(
-            "User '{username}' not found"
-        )));
-    }
-    if role != Role::Admin
-        && ctx.auth_mgr.role_of(&username) == Some(Role::Admin)
-        && ctx.auth_mgr.admin_count() <= 1
-    {
-        return Err(ProblemDetails::bad_request(
-            "Cannot demote the last remaining admin account",
-        ));
-    }
+    ensure_role_change_allowed(&ctx, &username, role)?;
 
     if !ctx.auth_mgr.set_user_role(&username, role).await {
         return Err(ProblemDetails::not_found(format!(
@@ -624,16 +654,7 @@ pub async fn delete_user(
     State(ctx): State<ServerContext>,
     Path(username): Path<String>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
-    if !ctx.auth_mgr.has_user(&username) {
-        return Err(ProblemDetails::not_found(format!(
-            "User '{username}' not found"
-        )));
-    }
-    if ctx.auth_mgr.role_of(&username) == Some(Role::Admin) && ctx.auth_mgr.admin_count() <= 1 {
-        return Err(ProblemDetails::bad_request(
-            "Cannot delete the last remaining admin account",
-        ));
-    }
+    ensure_user_deletion_allowed(&ctx, &username)?;
     if !ctx.auth_mgr.delete_user(&username).await {
         return Err(ProblemDetails::not_found(format!(
             "User '{username}' not found"
