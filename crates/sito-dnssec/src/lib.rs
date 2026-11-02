@@ -526,6 +526,25 @@ fn negative_answer_name(response: &Message, qname: &Name) -> Name {
     current
 }
 
+/// Every name in the CNAME chain starting at `qname` (the query name plus each
+/// target), bounded to 16 hops. Used to check signature coverage across a
+/// stripped chain, not only at the original qname.
+fn cname_chain_names(response: &Message, qname: &Name) -> Vec<Name> {
+    let mut names = vec![qname.clone()];
+    let mut current = qname.clone();
+    for _ in 0..16 {
+        let Some(next) = cname_target(response, &current) else {
+            break;
+        };
+        if next == current {
+            break;
+        }
+        names.push(next.clone());
+        current = next;
+    }
+    names
+}
+
 /// Whether a response is negative (NXDOMAIN, or a NODATA answer for the
 /// queried name after following any CNAME chain).
 fn is_negative_response(response: &Message, qname: &Name, qtype: RecordType) -> bool {
@@ -1032,6 +1051,40 @@ fn ds_response_status(
         return DsStatus::InZone;
     }
 
+    // NXDOMAIN / wildcard denial at the cut: an authenticated NSEC whose range
+    // covers the cut proves the name does not exist in the parent zone, so it
+    // is not a delegation cut. This is what makes a stripped NXDOMAIN (or a
+    // wildcard-synthesized answer) directly in the anchor zone fail closed.
+    for record in response.answers.iter().chain(response.authorities.iter()) {
+        if !parent_zone.zone_of(&LowerName::from(&record.name)) {
+            continue;
+        }
+        let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = &record.data else {
+            continue;
+        };
+        // A parent-side delegation NSEC does not prove absence below the cut.
+        let types = nsec.type_set();
+        if types.contains(RecordType::NS) && !types.contains(RecordType::SOA) {
+            continue;
+        }
+        let nsec_record = NsecRecord {
+            owner: &record.name,
+            rdata: nsec,
+        };
+        if nsec::covers(&nsec_record, cut)
+            && has_valid_rrsig_for(
+                response,
+                &record.name,
+                RecordType::NSEC,
+                parent_zone,
+                parent_keys,
+                now,
+            )
+        {
+            return DsStatus::InZone;
+        }
+    }
+
     // NSEC3 denial at the cut.
     let nsec3_records: Vec<&Record> = response
         .answers
@@ -1115,6 +1168,39 @@ fn ds_response_status(
                 }
             }
         }
+
+        // NXDOMAIN / wildcard denial at the cut (RFC 5155 §8.4/§8.7). A
+        // complete non-opt-out proof means the cut is inside the parent zone.
+        // An opt-out span may hide an unsigned delegation, so it stays
+        // Insecure rather than being declared signed.
+        match nsec3::evaluate_nsec3_denial(&records, cut, RecordType::DS, true) {
+            Nsec3Denial::Secure => return DsStatus::InZone,
+            Nsec3Denial::OptOut => {
+                for record in &nsec3_records {
+                    if let RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) = &record.data
+                        && nsec3::covers(
+                            &nsec3::Nsec3Record {
+                                owner: &record.name,
+                                rdata: nsec3,
+                            },
+                            cut,
+                        )
+                        && nsec3.opt_out()
+                        && has_valid_rrsig_for(
+                            response,
+                            &record.name,
+                            RecordType::NSEC3,
+                            parent_zone,
+                            parent_keys,
+                            now,
+                        )
+                    {
+                        return DsStatus::Unsigned(record.ttl.max(1));
+                    }
+                }
+            }
+            Nsec3Denial::Incomplete => {}
+        }
         return DsStatus::Unknown;
     }
 
@@ -1133,14 +1219,16 @@ enum DelegationProof {
 }
 
 /// Candidate delegation cuts between `zone` (exclusive) and `name` (inclusive),
-/// shallowest first.
-fn delegation_cuts(name: &LowerName, zone: &LowerName) -> Vec<LowerName> {
+/// shallowest first. Returns `truncated = true` when the path is deeper than
+/// [`MAX_CHAIN_CUTS`]; callers must fail closed in that case instead of using
+/// the anchor keys against a cut they never reached.
+fn delegation_cuts(name: &LowerName, zone: &LowerName) -> (Vec<LowerName>, bool) {
     if zone == name || !zone.zone_of(name) {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     let mut cuts = Vec::new();
     let mut current = name.clone();
-    while current != *zone && cuts.len() < MAX_CHAIN_CUTS {
+    while current != *zone {
         cuts.push(current.clone());
         let base = current.base_name();
         if base == current {
@@ -1149,7 +1237,9 @@ fn delegation_cuts(name: &LowerName, zone: &LowerName) -> Vec<LowerName> {
         current = base;
     }
     cuts.reverse();
-    cuts
+    let truncated = cuts.len() > MAX_CHAIN_CUTS;
+    cuts.truncate(MAX_CHAIN_CUTS);
+    (cuts, truncated)
 }
 
 /// Result of the DS/DNSKEY trust-extension walk.
@@ -1385,6 +1475,17 @@ impl DnssecValidator {
             .any(|entry| *entry.value() >= now && entry.key().zone_of(name))
     }
 
+    /// Whether any name in the response's CNAME chain (starting at `qname`) is
+    /// covered by a zone proven signed and is not under an authenticated
+    /// unsigned delegation. A stripped chain must fail closed even when only
+    /// the target (not the original qname) belongs to the signed zone.
+    fn signed_chain_contains(&self, response: &Message, qname: &Name, now: u32) -> bool {
+        cname_chain_names(response, qname).iter().any(|name| {
+            let lower = LowerName::from(name);
+            self.signed_zone_contains(&lower, now) && !self.insecure_zone_covers(&lower, now)
+        })
+    }
+
     /// Records that `zone` was proven unsigned by an authenticated DS denial,
     /// valid until `expiry`.
     fn mark_insecure_zone(&self, zone: &LowerName, expiry: u32, now: u32) {
@@ -1481,7 +1582,7 @@ impl DnssecValidator {
             }
         };
 
-        let cuts = delegation_cuts(name, &zone);
+        let (cuts, truncated) = delegation_cuts(name, &zone);
         if cuts.is_empty() {
             // `name` is the signed start/anchor zone itself.
             self.mark_signed_zone(name, now.saturating_add(CHAIN_STATUS_TTL_MAX), now);
@@ -1567,6 +1668,15 @@ impl DnssecValidator {
                     };
                 }
             }
+        }
+
+        // The delegation path was deeper than the probe budget. Every walk
+        // step was authenticated, but the remaining labels were not, so fail
+        // closed for this query without persisting an unauthenticated status.
+        if truncated {
+            self.signed_zones
+                .insert(name.clone(), now.saturating_add(CHAIN_STATUS_TTL_MAX));
+            return DelegationProof::ShouldBeSigned;
         }
 
         // Every cut was authenticated as signed or inside the signed parent,
@@ -1714,7 +1824,12 @@ impl DnssecValidator {
             return Some((zone, keys));
         }
 
-        for cut in delegation_cuts(target, &zone) {
+        let (cuts, truncated) = delegation_cuts(target, &zone);
+        if truncated {
+            // Do not return keys for a zone we never reached.
+            return None;
+        }
+        for cut in cuts {
             let cut_name = Name::from(cut.clone());
             let Ok(ds_response) = fetcher.query(&cut_name, RecordType::DS).await else {
                 return None;
@@ -1931,31 +2046,31 @@ impl DnssecValidator {
         if self.mode != DnssecMode::Disabled
             && let Some(query) = response.queries.first()
         {
-            let qname = LowerName::from(query.name());
             has_rrsigs = response_has_rrsigs(response);
             query_is_nta = self.is_nta(query.name());
             if !has_rrsigs && !query_is_nta {
-                probe_failed |= self.prepare_unsigned_response(&qname, fetcher, now).await;
-                let final_target = LowerName::from(&negative_answer_name(response, query.name()));
-                if final_target != qname {
-                    probe_failed |= self
-                        .prepare_unsigned_response(&final_target, fetcher, now)
-                        .await;
+                // Probe every name in the CNAME chain, not only the final
+                // target: an attacker can strip signatures from a chain whose
+                // original name is unsigned while a later hop is signed.
+                for name in cname_chain_names(response, query.name()) {
+                    let lower = LowerName::from(&name);
+                    probe_failed |= self.prepare_unsigned_response(&lower, fetcher, now).await;
                 }
             }
         }
 
         // A never-proven zone with no signatures and no authenticated
         // delegation status is `Indeterminate` (AD=0), never a persistent
-        // Insecure/Bogus decision: the probe may simply be offline.
+        // Insecure/Bogus decision: the probe may simply be offline. Signed
+        // evidence anywhere in the CNAME chain must still fail closed.
         if probe_failed && !has_rrsigs && !query_is_nta {
-            let qname = LowerName::from(
-                response
-                    .queries
-                    .first()
-                    .map_or_else(Name::root, |q| q.name().clone()),
-            );
-            if !self.signed_zone_contains(&qname, now) && !self.insecure_zone_covers(&qname, now) {
+            let qname = response
+                .queries
+                .first()
+                .map_or_else(Name::root, |q| q.name().clone());
+            if !self.signed_chain_contains(response, &qname, now)
+                && !self.insecure_zone_covers(&LowerName::from(&qname), now)
+            {
                 response.metadata.authentic_data = false;
                 let outcome = ValidationOutcome::Indeterminate;
                 self.metrics.record_validation(&outcome);
@@ -2332,12 +2447,12 @@ impl DnssecValidator {
         }
 
         // A response without RRSIGs under a zone already proven signed is a
-        // signature-stripping downgrade, not an unsigned zone.
+        // signature-stripping downgrade, not an unsigned zone. Check every
+        // name in the CNAME chain: the original name may be unsigned while the
+        // target is signed.
         if rrsigs.is_empty() {
             response.metadata.authentic_data = false;
-            if self.signed_zone_contains(&qname_lower, now)
-                && !self.insecure_zone_covers(&qname_lower, now)
-            {
+            if self.signed_chain_contains(response, &qname, now) {
                 return self.handle_bogus(
                     response,
                     upstream,
@@ -5199,6 +5314,285 @@ mod tests {
             RData::A(A(Ipv4Addr::new(192, 0, 2, 44))),
         ));
         response
+    }
+
+    /// A DS response proving (via a covering NSEC) that `cut` does not exist
+    /// in `parent`, signed by the parent zone key.
+    fn covering_nsec_ds_message(
+        parent: &Name,
+        owner: &Name,
+        next: &Name,
+        cut: &Name,
+        key: &DNSKEY,
+        signer: &hickory_proto::dnssec::DnssecSigner,
+    ) -> Message {
+        signed_nsec_response_records(
+            parent,
+            &[(
+                owner.clone(),
+                next.clone(),
+                vec![RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+            )],
+            cut,
+            key,
+            signer,
+            ResponseCode::NXDomain,
+        )
+    }
+
+    /// A stripped CNAME chain: `qname` points at `target`, and both the CNAME
+    /// and target A records carry no RRSIGs.
+    fn stripped_cname_response(qname: &Name, target: &Name) -> Message {
+        use hickory_proto::rr::rdata::CNAME;
+        let mut response = Message::new(8, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+        response.answers.push(Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::CNAME(CNAME(target.clone())),
+        ));
+        response.answers.push(Record::from_rdata(
+            target.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 45))),
+        ));
+        response
+    }
+
+    /// Critical regression: a stripped CNAME chain whose *target* is in a
+    /// signed zone must be Bogus even when the original qname is an
+    /// authenticated unsigned delegation.
+    #[tokio::test]
+    async fn test_stripped_cname_target_in_signed_zone_is_bogus() {
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let unsigned_cut = Name::from_str("unsigned.signed.example.").expect("cut");
+        let qname = Name::from_str("www.unsigned.signed.example.").expect("qname");
+        let target = Name::from_str("www.signed.example.").expect("target");
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+
+        let unsigned_denial = signed_nsec_response(
+            &parent_origin,
+            &unsigned_cut,
+            &Name::from_str("z.signed.example.").expect("next"),
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+            &unsigned_cut,
+            &parent_key,
+            &parent_signer,
+            ResponseCode::NoError,
+        );
+        // The target exists inside the signed zone and is not a delegation.
+        let target_in_zone = signed_nsec_response(
+            &parent_origin,
+            &target,
+            &Name::from_str("z.signed.example.").expect("next"),
+            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+            &target,
+            &parent_key,
+            &parent_signer,
+            ResponseCode::NoError,
+        );
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(&unsigned_cut, RecordType::DS, unsigned_denial)
+            .with(&target, RecordType::DS, target_in_zone);
+
+        let mut response = stripped_cname_response(&qname, &target);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a stripped CNAME target in a signed zone must be Bogus: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+        assert!(
+            response.answers.is_empty(),
+            "bogus response must not carry the target answer: {:?}",
+            response.answers
+        );
+    }
+
+    /// Important regression: a stripped NXDOMAIN for a name directly in the
+    /// anchor zone is proven by a *covering* NSEC (owned by another name).
+    #[tokio::test]
+    async fn test_stripped_nxdomain_in_anchor_zone_is_bogus() {
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let qname = Name::from_str("missing.signed.example.").expect("qname");
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+
+        let ds_denial = covering_nsec_ds_message(
+            &parent_origin,
+            &Name::from_str("a.signed.example.").expect("owner"),
+            &Name::from_str("z.signed.example.").expect("next"),
+            &qname,
+            &parent_key,
+            &parent_signer,
+        );
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(&qname, RecordType::DS, ds_denial);
+
+        let mut response = Message::new(11, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+        response.metadata.response_code = ResponseCode::NXDomain;
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a stripped NXDOMAIN in the anchor zone must be Bogus: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+    }
+
+    /// Important regression: a stripped wildcard-synthesized answer directly
+    /// in the anchor zone is proven signed by the same covering-NSEC DS denial.
+    #[tokio::test]
+    async fn test_stripped_wildcard_answer_in_anchor_zone_is_bogus() {
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let qname = Name::from_str("wildcard.signed.example.").expect("qname");
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+
+        let ds_denial = covering_nsec_ds_message(
+            &parent_origin,
+            &Name::from_str("a.signed.example.").expect("owner"),
+            &Name::from_str("z.signed.example.").expect("next"),
+            &qname,
+            &parent_key,
+            &parent_signer,
+        );
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(&qname, RecordType::DS, ds_denial);
+
+        // The wildcard at *.signed.example. synthesized this A answer; the
+        // response carries no RRSIGs.
+        let mut response = stripped_response(&qname);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a stripped wildcard answer in the anchor zone must be Bogus: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+    }
+
+    /// Important regression: the probe must walk the *shallowest* cuts. A deep
+    /// name beyond the per-query budget fails closed (Bogus), never AD=0.
+    #[tokio::test]
+    async fn test_deep_name_beyond_probe_budget_fails_closed() {
+        let (root_origin, root_key, root_signer) = create_test_signer(".");
+        let qname = Name::from_str("a.b.c.d.e.f.g.h.i.example.").expect("qname");
+        let zone = LowerName::from(&root_origin);
+
+        // The eight shallowest cuts must be the ones walked. Hard-code them so
+        // the fixture cannot silently adapt to a deepest-first regression.
+        let shallow = [
+            "example.",
+            "i.example.",
+            "h.i.example.",
+            "g.h.i.example.",
+            "f.g.h.i.example.",
+            "e.f.g.h.i.example.",
+            "d.e.f.g.h.i.example.",
+            "c.d.e.f.g.h.i.example.",
+        ];
+        let mut fetcher = StaticFetcher::new().with(
+            &root_origin,
+            RecordType::DNSKEY,
+            anchored_dnskey_message(&root_origin, &root_key, &root_signer),
+        );
+        for cut in shallow {
+            let cut_name = Name::from_str(cut).expect("cut");
+            let next = Name::from_str(&format!("zzz.{cut}")).expect("next");
+            let ds_nodata = signed_nsec_response(
+                &root_origin,
+                &cut_name,
+                &next,
+                &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+                &cut_name,
+                &root_key,
+                &root_signer,
+                ResponseCode::NoError,
+            );
+            fetcher = fetcher.with(&cut_name, RecordType::DS, ds_nodata);
+        }
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&root_key, zone);
+        let mut response = stripped_response(&qname);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a deep name beyond the probe budget must fail closed: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+        assert!(
+            fetcher.calls() > MAX_CHAIN_CUTS,
+            "the shallow budget must actually be walked"
+        );
+    }
+
+    /// `delegation_cuts` keeps the shallowest cuts and reports truncation.
+    #[test]
+    fn test_delegation_cuts_keep_shallowest_budget() {
+        let zone = LowerName::from(&Name::from_str(".").expect("root"));
+        let name = LowerName::from(&Name::from_str("a.b.c.d.e.f.g.h.i.example.").expect("name"));
+        let (cuts, truncated) = delegation_cuts(&name, &zone);
+        assert!(truncated, "the test name must exceed the probe budget");
+        assert_eq!(cuts.len(), MAX_CHAIN_CUTS);
+        assert_eq!(
+            cuts.first(),
+            Some(&LowerName::from(
+                &Name::from_str("example.").expect("shallowest cut")
+            )),
+            "the budget must keep the shallowest cuts"
+        );
+        assert_eq!(
+            cuts.last(),
+            Some(&LowerName::from(
+                &Name::from_str("c.d.e.f.g.h.i.example.").expect("eighth cut")
+            )),
+            "the eighth shallowest cut is the deepest one kept"
+        );
     }
 
     /// Cold start, no prior signed data: an authenticated DS for the cut must
