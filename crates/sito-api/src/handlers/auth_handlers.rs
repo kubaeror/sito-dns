@@ -229,7 +229,7 @@ pub async fn logout(
         && let Ok(cookie_str) = cookie_header.to_str()
         && let Some(session_id) = crate::auth::session::extract_session_cookie(cookie_str)
     {
-        ctx.auth_mgr.logout(&session_id);
+        ctx.auth_mgr.logout(&session_id).await;
     }
 
     let config = ctx.config.load();
@@ -350,7 +350,7 @@ pub async fn disable_totp(
         }
     }
 
-    if !ctx.auth_mgr.disable_totp(&username) {
+    if !ctx.auth_mgr.disable_totp(&username).await {
         return Err(ProblemDetails::not_found("User account not found"));
     }
     Ok(Json(GenericMessageResponse {
@@ -413,7 +413,7 @@ pub async fn create_token(
     let scope = Role::from_str(&req.scope)
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid token scope: {e}")))?;
 
-    let (_meta, resp) = ctx.auth_mgr.create_token(&req.name, scope);
+    let (_meta, resp) = ctx.auth_mgr.create_token(&req.name, scope).await;
     Ok(Json(resp))
 }
 
@@ -434,7 +434,7 @@ pub async fn delete_token(
     State(ctx): State<ServerContext>,
     Path(id): Path<String>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
-    if ctx.auth_mgr.delete_token(&id) {
+    if ctx.auth_mgr.delete_token(&id).await {
         Ok(Json(GenericMessageResponse {
             message: format!("Token {id} successfully revoked"),
         }))
@@ -587,7 +587,7 @@ pub async fn update_user(
         ));
     }
 
-    if !ctx.auth_mgr.set_user_role(&username, role) {
+    if !ctx.auth_mgr.set_user_role(&username, role).await {
         return Err(ProblemDetails::not_found(format!(
             "User '{username}' not found"
         )));
@@ -634,7 +634,7 @@ pub async fn delete_user(
             "Cannot delete the last remaining admin account",
         ));
     }
-    if !ctx.auth_mgr.delete_user(&username) {
+    if !ctx.auth_mgr.delete_user(&username).await {
         return Err(ProblemDetails::not_found(format!(
             "User '{username}' not found"
         )));
@@ -915,7 +915,7 @@ mod tests {
     async fn test_token_api_never_returns_hashes() {
         let temp_dir = crate::test_support::temp_dir("sito_auth_tokens");
         let ctx = crate::test_support::mock_context(&temp_dir).await;
-        let (meta, _resp) = ctx.auth_mgr.create_token("grafana", Role::Viewer);
+        let (meta, _resp) = ctx.auth_mgr.create_token("grafana", Role::Viewer).await;
 
         let Json(dtos) = list_tokens(admin(), State(ctx.clone())).await;
         assert_eq!(dtos.len(), 1);

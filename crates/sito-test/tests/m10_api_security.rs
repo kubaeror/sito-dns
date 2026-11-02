@@ -198,7 +198,12 @@ async fn test_acceptance_m10_csrf_and_origin_enforcement() {
     assert_eq!(res.status(), StatusCode::OK);
 
     // 5. Bearer-token mutation is exempt from the double submit.
-    let admin_tok = ctx.auth_mgr.create_token("csrf-test", Role::Admin).1.token;
+    let admin_tok = ctx
+        .auth_mgr
+        .create_token("csrf-test", Role::Admin)
+        .await
+        .1
+        .token;
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/cache/flush")
@@ -379,7 +384,12 @@ async fn test_acceptance_m10_metrics_token_auth() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
     // Query token is not accepted outside WebSocket upgrades.
-    let tok = ctx.auth_mgr.create_token("metrics", Role::Viewer).1.token;
+    let tok = ctx
+        .auth_mgr
+        .create_token("metrics", Role::Viewer)
+        .await
+        .1
+        .token;
     let req = Request::builder()
         .uri(format!("/metrics?token={tok}"))
         .body(Body::empty())
@@ -406,7 +416,7 @@ async fn test_acceptance_m10_restore_preview_is_masked() {
     tokio::fs::create_dir_all(&temp_dir).await.unwrap();
     let ctx = create_test_context(&temp_dir, false).await;
     let app = sito_api::create_router(ctx.clone());
-    let admin_tok = ctx.auth_mgr.create_token("mask", Role::Admin).1.token;
+    let admin_tok = ctx.auth_mgr.create_token("mask", Role::Admin).await.1.token;
 
     let secret_toml = r#"
 [server]

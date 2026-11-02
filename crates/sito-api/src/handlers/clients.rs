@@ -953,7 +953,7 @@ mod tests {
             std::env::temp_dir().join(format!("sito_clients_rbac_{}", rand::random::<u64>()));
         let _ = std::fs::create_dir_all(&temp_dir);
         let ctx = mock_context(&temp_dir).await;
-        let (_, token) = ctx.auth_mgr.create_token("viewer", Role::Viewer);
+        let (_, token) = ctx.auth_mgr.create_token("viewer", Role::Viewer).await;
 
         let request = axum::http::Request::builder()
             .uri("/api/v1/clients/unidentified")
@@ -972,7 +972,7 @@ mod tests {
         assert_eq!(err.status, 403);
 
         // Operators pass the same extractor.
-        let (_, token) = ctx.auth_mgr.create_token("operator", Role::Operator);
+        let (_, token) = ctx.auth_mgr.create_token("operator", Role::Operator).await;
         let request = axum::http::Request::builder()
             .uri("/api/v1/clients/unidentified")
             .header(

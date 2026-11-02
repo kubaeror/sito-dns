@@ -283,7 +283,7 @@ pub async fn logout_handler(
         && let Ok(s) = cookie_hdr.to_str()
         && let Some(session_id) = extract_session_cookie(s)
     {
-        ctx.auth_mgr.logout(&session_id);
+        ctx.auth_mgr.logout(&session_id).await;
     }
     let is_secure = {
         let config = ctx.config.load();
@@ -2278,7 +2278,7 @@ pub async fn wizard_complete_handler(
                 .await;
             // If custom admin username chosen, remove default 'admin' account if still on bootstrap password
             if admin_user != "admin" && ctx.auth_mgr.is_default_admin_active() {
-                ctx.auth_mgr.delete_user("admin");
+                ctx.auth_mgr.delete_user("admin").await;
             }
         }
         ctx.auth_mgr.mark_setup_complete();

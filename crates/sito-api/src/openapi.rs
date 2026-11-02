@@ -142,7 +142,7 @@ use utoipa::OpenApi;
     info(
         title = "sito DNS Administrative API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Administrative REST API and OpenAPI 3.0 specification for the sito DNS server",
+        description = "Administrative REST API and OpenAPI 3.0 specification for the sito DNS server. Account, role, API-token and TOTP management is API-only; see docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
         license(name = "GPL-3.0-only")
     )
 )]

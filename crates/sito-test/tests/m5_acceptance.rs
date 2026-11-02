@@ -182,13 +182,24 @@ async fn test_acceptance_m5_rbac_matrix() {
     let (ctx, _cfg_path, _writer) = create_test_context(&temp_dir).await;
 
     // Create tokens for all 3 roles
-    let admin_tok = ctx.auth_mgr.create_token("adm-test", Role::Admin).1.token;
+    let admin_tok = ctx
+        .auth_mgr
+        .create_token("adm-test", Role::Admin)
+        .await
+        .1
+        .token;
     let oper_tok = ctx
         .auth_mgr
         .create_token("opr-test", Role::Operator)
+        .await
         .1
         .token;
-    let view_tok = ctx.auth_mgr.create_token("viw-test", Role::Viewer).1.token;
+    let view_tok = ctx
+        .auth_mgr
+        .create_token("viw-test", Role::Viewer)
+        .await
+        .1
+        .token;
 
     let app = sito_api::create_router(ctx);
 
@@ -352,7 +363,12 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
     tokio::fs::create_dir_all(&temp_dir).await.unwrap();
 
     let (ctx, _cfg_path, _writer) = create_test_context(&temp_dir).await;
-    let admin_tok = ctx.auth_mgr.create_token("adm-ql", Role::Admin).1.token;
+    let admin_tok = ctx
+        .auth_mgr
+        .create_token("adm-ql", Role::Admin)
+        .await
+        .1
+        .token;
 
     // Seed test query logs into SQLite
     let now = chrono::Utc::now().timestamp_millis();
@@ -484,7 +500,12 @@ async fn test_acceptance_m5_websocket_livetail() {
     tokio::fs::create_dir_all(&temp_dir).await.unwrap();
 
     let (ctx, _cfg_path, _writer) = create_test_context(&temp_dir).await;
-    let view_tok = ctx.auth_mgr.create_token("ws-viewer", Role::Viewer).1.token;
+    let view_tok = ctx
+        .auth_mgr
+        .create_token("ws-viewer", Role::Viewer)
+        .await
+        .1
+        .token;
     let sender = ctx.querylog_sender.clone();
     let app = sito_api::create_router(ctx);
 
@@ -563,7 +584,7 @@ async fn test_acceptance_m5_prometheus_table_14_2() {
     ctx.metrics.set_ha_slaves_connected(2);
     ctx.metrics.set_querylog_dropped(1);
 
-    let (_meta, token_resp) = ctx.auth_mgr.create_token("viewer", Role::Viewer);
+    let (_meta, token_resp) = ctx.auth_mgr.create_token("viewer", Role::Viewer).await;
     let app = sito_api::create_router(ctx);
 
     let req = Request::builder()
@@ -690,7 +711,12 @@ async fn test_acceptance_m5_api_backup_and_token_restore() {
     tokio::fs::create_dir_all(&temp_dir).await.unwrap();
 
     let (ctx, _config_path, _writer) = create_test_context(&temp_dir).await;
-    let admin_tok = ctx.auth_mgr.create_token("adm-bck", Role::Admin).1.token;
+    let admin_tok = ctx
+        .auth_mgr
+        .create_token("adm-bck", Role::Admin)
+        .await
+        .1
+        .token;
     let app = sito_api::create_router(ctx.clone());
 
     // GET /api/v1/config/backup -> download tar.gz
@@ -778,7 +804,12 @@ async fn test_acceptance_m5_metrics_auth() {
     let (ctx, _cfg_path, _writer) = create_test_context(&temp_dir).await;
 
     // Create viewer account
-    let view_tok = ctx.auth_mgr.create_token("viewer", Role::Viewer).1.token;
+    let view_tok = ctx
+        .auth_mgr
+        .create_token("viewer", Role::Viewer)
+        .await
+        .1
+        .token;
 
     let app = sito_api::create_router(ctx.clone());
 
