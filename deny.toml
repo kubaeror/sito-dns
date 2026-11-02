@@ -71,6 +71,10 @@ skip = [
     { name = "sha1" },              # legacy transitive use
     { name = "sha2" },              # 0.10 vs 0.11
     { name = "syn" },               # proc-macro ecosystem (1.x vs 2.x)
+    # zerofrom-derive 0.1.8 (pulled in by the icu 2.4 update) uses synstructure
+    # 0.14, while asn1-rs-derive 0.6 (x509-parser) is still on 0.13. Both are
+    # proc-macro-only; wait for asn1-rs-derive to move to synstructure 0.14.
+    { name = "synstructure" },
     { name = "tokio-tungstenite" }, # axum 0.8 (0.29) vs sito-ha/sito-test (0.30)
     { name = "tungstenite" },       # axum 0.8 (0.29) vs sito-ha/sito-test (0.30)
 ]
