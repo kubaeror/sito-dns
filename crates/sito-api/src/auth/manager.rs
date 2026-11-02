@@ -257,6 +257,12 @@ pub(crate) static SECRET_WRITE_DELAYS: Mutex<Vec<(PathBuf, std::time::Duration)>
 fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
     #[cfg(test)]
     {
+        // Record the write before any test-only delay so tests can observe that
+        // the blocking write has started.
+        SECRET_WRITE_THREADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path.to_path_buf(), std::thread::current().id()));
         let delay = {
             let mut delays = SECRET_WRITE_DELAYS
                 .lock()
@@ -269,10 +275,6 @@ fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
         if let Some(delay) = delay {
             std::thread::sleep(delay);
         }
-        SECRET_WRITE_THREADS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((path.to_path_buf(), std::thread::current().id()));
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -931,9 +933,13 @@ impl AuthManager {
     ///
     /// The snapshot is taken while holding `persist_lock` and the lock is held
     /// until the write finishes, so a stale snapshot cannot land after a newer
-    /// one.
+    /// one. The guard is owned by the blocking task, so cancelling the caller
+    /// cannot release it before the write completes.
     async fn save_users_async(&self) {
-        let _persist = self.persist_lock.lock().await;
+        // Use an owned guard moved into the blocking closure: if the caller is
+        // cancelled mid-write, the closure keeps the lock until the write
+        // finishes so a newer save cannot complete (and be overwritten) first.
+        let persist = self.persist_lock.clone().lock_owned().await;
         let (path, toml_str) = match self.users_toml() {
             Ok(Some(entry)) => entry,
             Ok(None) => return,
@@ -942,7 +948,12 @@ impl AuthManager {
                 return;
             }
         };
-        match tokio::task::spawn_blocking(move || write_secret_file(&path, &toml_str)).await {
+        match tokio::task::spawn_blocking(move || {
+            let _persist = persist;
+            write_secret_file(&path, &toml_str)
+        })
+        .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::error!("Failed to persist users file: {e}"),
             Err(e) => tracing::error!("Users persistence task failed: {e}"),
@@ -979,7 +990,7 @@ impl AuthManager {
     /// Persists sessions on the blocking pool so async handlers never perform
     /// blocking file IO on the runtime worker.
     async fn save_sessions_async(&self) {
-        let _persist = self.persist_lock.lock().await;
+        let persist = self.persist_lock.clone().lock_owned().await;
         let Some((path, toml_str)) = self.sessions_toml() else {
             self.sessions_dirty.store(false, Ordering::SeqCst);
             return;
@@ -987,7 +998,12 @@ impl AuthManager {
         // Mark dirty before writing so a failed write is retried by the pruner
         // instead of being lost until the next explicit session mutation.
         self.sessions_dirty.store(true, Ordering::SeqCst);
-        match tokio::task::spawn_blocking(move || write_secret_file(&path, &toml_str)).await {
+        match tokio::task::spawn_blocking(move || {
+            let _persist = persist;
+            write_secret_file(&path, &toml_str)
+        })
+        .await
+        {
             Ok(Ok(())) => self.sessions_dirty.store(false, Ordering::SeqCst),
             Ok(Err(e)) => tracing::error!("Failed to persist sessions file: {e}"),
             Err(e) => tracing::error!("Sessions persistence task failed: {e}"),
@@ -998,13 +1014,18 @@ impl AuthManager {
     /// the write and cleared only after success, so a failed write is retried
     /// by the pruner.
     async fn save_tokens_async(&self) {
-        let _persist = self.persist_lock.lock().await;
+        let persist = self.persist_lock.clone().lock_owned().await;
         let Some((path, toml_str)) = self.tokens_toml() else {
             self.tokens_dirty.store(false, Ordering::SeqCst);
             return;
         };
         self.tokens_dirty.store(true, Ordering::SeqCst);
-        match tokio::task::spawn_blocking(move || write_secret_file(&path, &toml_str)).await {
+        match tokio::task::spawn_blocking(move || {
+            let _persist = persist;
+            write_secret_file(&path, &toml_str)
+        })
+        .await
+        {
             Ok(Ok(())) => self.tokens_dirty.store(false, Ordering::SeqCst),
             Ok(Err(e)) => tracing::error!("Failed to persist API tokens file: {e}"),
             Err(e) => tracing::error!("API tokens persistence task failed: {e}"),
@@ -3778,6 +3799,82 @@ mod tests {
         assert_eq!(
             after_reload, expected,
             "a reload must reproduce the final in-memory token state"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cancelling the future that awaits a persistence write must not release
+    /// the persist lock early: the detached blocking write owns the lock until
+    /// it finishes, so a newer save cannot be overwritten by the orphan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_token_save_keeps_lock_until_write_finishes() {
+        let dir = auth_temp_dir("cancelled_token_save");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        let (meta, _resp) = mgr
+            .create_token("doomed", Role::Viewer, None)
+            .await
+            .expect("token");
+        let tokens_path = dir.join("tokens.toml");
+
+        let writes_before = SECRET_WRITE_THREADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(path, _)| path == &tokens_path)
+            .count();
+        SECRET_WRITE_DELAYS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((tokens_path.clone(), Duration::from_millis(500)));
+
+        let save_mgr = mgr.clone();
+        let save = tokio::spawn(async move {
+            save_mgr.save_tokens_async().await;
+        });
+
+        // Wait until the blocking write has started and is sleeping.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let writes = SECRET_WRITE_THREADS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|(path, _)| path == &tokens_path)
+                .count();
+            if writes > writes_before {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the delayed write to start"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Cancel the caller while the orphaned blocking write is still running.
+        save.abort();
+        let _ = save.await;
+
+        // The newer revocation must persist after (not before) the orphan write.
+        assert!(mgr.delete_token(&meta.id).await);
+        // Give a broken implementation time to let the orphan land afterwards.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let raw = std::fs::read_to_string(&tokens_path).unwrap();
+        let persisted: TokensFile = toml::from_str(&raw).unwrap();
+        assert!(
+            !persisted.tokens.iter().any(|token| token.id == meta.id),
+            "a cancelled stale write must not resurrect a deleted token: {raw}"
+        );
+
+        drop(mgr);
+        let reloaded = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            !reloaded
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == meta.id),
+            "a reload must not resurrect a deleted token"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
