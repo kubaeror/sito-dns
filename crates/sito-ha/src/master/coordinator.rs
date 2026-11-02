@@ -42,7 +42,6 @@ pub struct ResyncOutcome {
 /// A version-continuity violation observed on a slave acknowledgement.
 #[derive(Debug, Clone)]
 struct Divergence {
-    instance: String,
     acked_version: u64,
     reason: String,
 }
@@ -74,9 +73,10 @@ pub struct MasterCoordinator {
     persist_lock: Arc<tokio::sync::Mutex<()>>,
     /// Monotonic id assigned to each accepted slave connection.
     next_connection_id: Arc<AtomicU64>,
-    /// Most severe version-continuity violation observed (slave ahead of the
-    /// master); cleared when a push above the divergent version is applied.
-    diverged: Arc<Mutex<Option<Divergence>>>,
+    /// Version-continuity violations per currently connected slave; an entry is
+    /// removed when a push above its version is applied or the slave
+    /// disconnects, so the metric series cannot outlive the record.
+    diverged: Arc<Mutex<HashMap<String, Divergence>>>,
 }
 
 impl MasterCoordinator {
@@ -110,7 +110,7 @@ impl MasterCoordinator {
             publish_lock: Arc::new(Mutex::new(())),
             persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             next_connection_id: Arc::new(AtomicU64::new(1)),
-            diverged: Arc::new(Mutex::new(None)),
+            diverged: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -274,53 +274,56 @@ impl MasterCoordinator {
     /// Returns true when a version-continuity violation (a slave acknowledging
     /// a version above the master's) is currently recorded.
     pub fn is_diverged(&self) -> bool {
-        self.diverged.lock().unwrap().is_some()
+        !self.diverged.lock().unwrap().is_empty()
     }
 
-    /// Returns the recorded divergence reason, if any.
+    /// Returns the most severe recorded divergence reason, if any.
     pub fn diverged_reason(&self) -> Option<String> {
         self.diverged
             .lock()
             .unwrap()
-            .as_ref()
+            .values()
+            .max_by_key(|d| d.acked_version)
             .map(|d| d.reason.clone())
     }
 
-    /// Records a version-continuity violation, keeping the most severe one.
+    /// Records a version-continuity violation for one instance, keeping the
+    /// most severe version that instance reported.
     fn mark_diverged(&self, instance: &str, acked_version: u64, reason: String) {
         let mut diverged = self.diverged.lock().unwrap();
         if diverged
-            .as_ref()
+            .get(instance)
             .is_none_or(|d| acked_version >= d.acked_version)
         {
-            let previous_instance = diverged.as_ref().map(|d| d.instance.clone());
-            if let Some(previous) = previous_instance
-                && previous != instance
-            {
-                self.metrics.set_ha_diverged(&previous, false);
-            }
-            *diverged = Some(Divergence {
-                instance: instance.to_string(),
-                acked_version,
-                reason,
-            });
+            diverged.insert(
+                instance.to_string(),
+                Divergence {
+                    acked_version,
+                    reason,
+                },
+            );
             self.metrics.set_ha_diverged(instance, true);
         }
     }
 
-    /// Clears the divergence record once a version above the divergent one was
+    /// Clears each divergence record once a version above its divergent one was
     /// successfully applied by the master's slaves (or the operator published
     /// past it).
+    ///
+    /// The slaves lock is held across the connectivity check and gauge update
+    /// so a concurrent disconnect cannot remove the record/metric and have this
+    /// path recreate a stale `0` series.
     fn clear_divergence_above(&self, version: u64) {
+        let slaves = self.slaves.lock().unwrap();
         let mut diverged = self.diverged.lock().unwrap();
-        let cleared_instance = diverged
-            .as_ref()
-            .filter(|d| version > d.acked_version)
-            .map(|d| d.instance.clone());
-        if let Some(instance) = cleared_instance {
-            *diverged = None;
-            // Do not recreate a series removed when that slave disconnected.
-            if self.slaves.lock().unwrap().contains_key(&instance) {
+        let cleared: Vec<String> = diverged
+            .iter()
+            .filter(|(_, d)| version > d.acked_version)
+            .map(|(instance, _)| instance.clone())
+            .collect();
+        for instance in cleared {
+            diverged.remove(&instance);
+            if slaves.contains_key(&instance) {
                 self.metrics.set_ha_diverged(&instance, false);
             }
         }
@@ -892,9 +895,11 @@ impl MasterCoordinator {
             .is_some_and(|s| s.connection_id == connection_id);
         if owned {
             slaves.remove(instance);
-            // Drop the per-slave catch-up bookkeeping with the session so the
-            // map cannot grow across reconnects.
+            // Drop the per-slave catch-up and divergence bookkeeping with the
+            // session so neither map nor its metric label can grow across
+            // reconnects.
             self.stale_repushes.lock().unwrap().remove(instance);
+            self.diverged.lock().unwrap().remove(instance);
             self.metrics.remove_ha_diverged(instance);
         }
         #[allow(clippy::cast_possible_wrap)]
@@ -1854,7 +1859,6 @@ mod tests {
     #[test]
     fn test_unregister_removes_divergence_metric_series() {
         let coordinator = test_coordinator();
-        coordinator.metrics.set_ha_diverged("slave-1", true);
         let (tx, _rx) = mpsc::channel::<HaMessage>(1);
         coordinator.slaves.lock().unwrap().insert(
             "slave-1".to_string(),
@@ -1870,6 +1874,14 @@ mod tests {
                 connection_id: 1,
             },
         );
+        coordinator.mark_diverged("slave-1", 50, "continuity broken".to_string());
+        assert!(
+            coordinator
+                .metrics
+                .render_prometheus()
+                .contains(r#"sito_ha_diverged{instance="slave-1"} 1"#),
+            "the mark path must raise the gauge before disconnect"
+        );
 
         assert!(coordinator.unregister_session("slave-1", 1));
         let rendered = coordinator.metrics.render_prometheus();
@@ -1877,6 +1889,63 @@ mod tests {
             !rendered.contains(r#"sito_ha_diverged{instance="slave-1"}"#),
             "the divergence series must be removed on disconnect: {rendered}"
         );
+        assert!(
+            !coordinator.is_diverged(),
+            "the divergence record must be dropped with the session"
+        );
+    }
+
+    /// A disconnected instance's divergence record and series are both removed,
+    /// so a later divergence on another instance must not recreate it.
+    #[test]
+    fn test_disconnected_divergence_is_never_recreated() {
+        let coordinator = test_coordinator();
+        let (tx, _rx) = mpsc::channel::<HaMessage>(1);
+        coordinator.slaves.lock().unwrap().insert(
+            "slave-a".to_string(),
+            ActiveSlave {
+                instance: "slave-a".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 1,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+        coordinator.mark_diverged("slave-a", 50, "a is ahead".to_string());
+        assert!(coordinator.unregister_session("slave-a", 1));
+
+        // A more severe divergence on a different, connected instance.
+        let (tx, _rx) = mpsc::channel::<HaMessage>(1);
+        coordinator.slaves.lock().unwrap().insert(
+            "slave-b".to_string(),
+            ActiveSlave {
+                instance: "slave-b".to_string(),
+                remote_addr: "127.0.0.1:1001".parse().unwrap(),
+                synced_version: 1,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 2,
+            },
+        );
+        coordinator.mark_diverged("slave-b", 60, "b is ahead".to_string());
+
+        let rendered = coordinator.metrics.render_prometheus();
+        assert!(
+            rendered.contains(r#"sito_ha_diverged{instance="slave-b"} 1"#),
+            "the live divergence must be exposed: {rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"sito_ha_diverged{instance="slave-a"}"#),
+            "a disconnected instance must not get a recreated series: {rendered}"
+        );
+        assert_eq!(coordinator.diverged_reason().as_deref(), Some("b is ahead"));
     }
 
     #[test]
