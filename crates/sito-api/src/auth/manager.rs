@@ -253,16 +253,30 @@ pub(crate) static SECRET_WRITE_THREADS: Mutex<Vec<(PathBuf, std::thread::ThreadI
 pub(crate) static SECRET_WRITE_DELAYS: Mutex<Vec<(PathBuf, std::time::Duration)>> =
     Mutex::new(Vec::new());
 
+/// Test-only one-shot signals sent when a write for a matching path has
+/// started. Kept separate from [`SECRET_WRITE_THREADS`] so a test never depends
+/// on globally cleared state.
+#[cfg(test)]
+pub(crate) static SECRET_WRITE_START_SIGNALS: Mutex<
+    Vec<(PathBuf, tokio::sync::oneshot::Sender<()>)>,
+> = Mutex::new(Vec::new());
+
 /// Atomically writes a secret file with owner-only permissions.
 fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
     #[cfg(test)]
     {
-        // Record the write before any test-only delay so tests can observe that
-        // the blocking write has started.
-        SECRET_WRITE_THREADS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((path.to_path_buf(), std::thread::current().id()));
+        let signal = {
+            let mut signals = SECRET_WRITE_START_SIGNALS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            signals
+                .iter()
+                .position(|(signal_path, _)| signal_path == path)
+                .map(|index| signals.remove(index).1)
+        };
+        if let Some(sender) = signal {
+            let _ = sender.send(());
+        }
         let delay = {
             let mut delays = SECRET_WRITE_DELAYS
                 .lock()
@@ -275,6 +289,10 @@ fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
         if let Some(delay) = delay {
             std::thread::sleep(delay);
         }
+        SECRET_WRITE_THREADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path.to_path_buf(), std::thread::current().id()));
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -998,13 +1016,21 @@ impl AuthManager {
         // Mark dirty before writing so a failed write is retried by the pruner
         // instead of being lost until the next explicit session mutation.
         self.sessions_dirty.store(true, Ordering::SeqCst);
+        let sessions_dirty = self.sessions_dirty.clone();
         match tokio::task::spawn_blocking(move || {
             let _persist = persist;
-            write_secret_file(&path, &toml_str)
+            let result = write_secret_file(&path, &toml_str);
+            if result.is_ok() {
+                // Clear while the persist guard is still held: a newer save
+                // woken by its release must not be able to set the flag again
+                // and then have this older caller clear it after a failure.
+                sessions_dirty.store(false, Ordering::SeqCst);
+            }
+            result
         })
         .await
         {
-            Ok(Ok(())) => self.sessions_dirty.store(false, Ordering::SeqCst),
+            Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::error!("Failed to persist sessions file: {e}"),
             Err(e) => tracing::error!("Sessions persistence task failed: {e}"),
         }
@@ -1020,13 +1046,21 @@ impl AuthManager {
             return;
         };
         self.tokens_dirty.store(true, Ordering::SeqCst);
+        let tokens_dirty = self.tokens_dirty.clone();
         match tokio::task::spawn_blocking(move || {
             let _persist = persist;
-            write_secret_file(&path, &toml_str)
+            let result = write_secret_file(&path, &toml_str);
+            if result.is_ok() {
+                // Clear while the persist guard is still held: a newer save
+                // woken by its release must not be able to set the flag again
+                // and then have this older caller clear it after a failure.
+                tokens_dirty.store(false, Ordering::SeqCst);
+            }
+            result
         })
         .await
         {
-            Ok(Ok(())) => self.tokens_dirty.store(false, Ordering::SeqCst),
+            Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::error!("Failed to persist API tokens file: {e}"),
             Err(e) => tracing::error!("API tokens persistence task failed: {e}"),
         }
@@ -3816,12 +3850,11 @@ mod tests {
             .expect("token");
         let tokens_path = dir.join("tokens.toml");
 
-        let writes_before = SECRET_WRITE_THREADS
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        SECRET_WRITE_START_SIGNALS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter(|(path, _)| path == &tokens_path)
-            .count();
+            .push((tokens_path.clone(), started_tx));
         SECRET_WRITE_DELAYS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -3832,24 +3865,12 @@ mod tests {
             save_mgr.save_tokens_async().await;
         });
 
-        // Wait until the blocking write has started and is sleeping.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let writes = SECRET_WRITE_THREADS
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .filter(|(path, _)| path == &tokens_path)
-                .count();
-            if writes > writes_before {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for the delayed write to start"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        // Wait until the blocking write has started and is sleeping. The signal
+        // is path-scoped and one-shot, so parallel tests cannot consume it.
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("timed out waiting for the delayed write to start")
+            .expect("write-start signal was dropped");
 
         // Cancel the caller while the orphaned blocking write is still running.
         save.abort();
