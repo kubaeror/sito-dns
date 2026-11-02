@@ -11,9 +11,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Configurable filter-list size cap**: `filtering.max_list_bytes` (default
   `67108864`, 64 MiB) bounds each downloaded subscription list and its
   disk-cache read, enforced before the body is buffered. The value must be
-  greater than 0. Lowering the cap invalidates larger cached lists; with
-  `fail_closed = true` and no network, queries answer SERVFAIL until a fetch
-  under the new cap succeeds.
+  greater than 0. Lowering the cap invalidates larger cached lists. After a
+  restart (or when no previous snapshot exists), an invalidated larger cache
+  with `fail_closed = true` and no network answers SERVFAIL until a fetch under
+  the new cap succeeds; a live reload keeps the previous snapshot and records
+  the list in `failed_lists`.
 
 ### Security
 - **DNSSEC cold-start signature stripping**: a response without RRSIGs is now

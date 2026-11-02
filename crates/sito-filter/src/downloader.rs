@@ -426,6 +426,18 @@ mod tests {
             "unexpected error: {err}"
         );
 
+        // A cap of usize::MAX must not overflow the internal take() bound.
+        let huge = ListDownloader::new(DEFAULT_DOWNLOAD_TIMEOUT, usize::MAX);
+        let content = huge
+            .fetch_or_cached(
+                "huge-cap",
+                &format!("file://{}", file_path.display()),
+                &temp_dir,
+            )
+            .await
+            .expect("usize::MAX must not overflow the read cap");
+        assert_eq!(content, "0123456789");
+
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 

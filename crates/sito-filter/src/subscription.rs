@@ -371,7 +371,7 @@ impl SubscriptionFetcher {
             });
         }
 
-        let mut limited = file.take(self.max_bytes as u64 + 1);
+        let mut limited = file.take((self.max_bytes as u64).saturating_add(1));
         let mut bytes = Vec::new();
         limited
             .read_to_end(&mut bytes)
