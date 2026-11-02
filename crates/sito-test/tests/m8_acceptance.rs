@@ -950,6 +950,8 @@ async fn test_m8_push_applies_upstream_and_dnssec_without_watcher() {
         ctx.clone(),
         hooks.clone(),
     ));
+    // Listener generation and rate limiters are live in this scenario.
+    applier.mark_listeners_ready();
     let self_write = applier.self_write_tracker();
 
     let tracker = SlaveStatusTracker::new("slave-apply".to_string(), 0, None);
@@ -1056,8 +1058,9 @@ nta = ["pushed.internal"]
         "a push must not trigger a second filter download/compile through the watcher"
     );
 
-    // Even without the exact self-write record (for example after a restart),
-    // an identical document is a no-op.
+    // Non-HA watcher behavior is unchanged: once the self-write record is
+    // consumed, an equal external document (touch / no-op save) still goes
+    // through the normal apply path.
     match apply_config_document_event(
         &ctx,
         &persisted,
@@ -1067,10 +1070,121 @@ nta = ["pushed.internal"]
     )
     .await
     {
-        ConfigFileApplyOutcome::Unchanged => {}
-        other => panic!("an identical document must be a no-op, got {other:?}"),
+        ConfigFileApplyOutcome::Applied(_) => {}
+        other => panic!("an equal non-HA document must still be applied, got {other:?}"),
     }
-    assert_eq!(filter_compile_count(&ctx.metrics), filter_compiles_before);
+    assert_eq!(
+        filter_compile_count(&ctx.metrics),
+        filter_compiles_before + 1,
+        "a non-HA equal document retains the old watcher apply behavior"
+    );
+
+    // A changed watcher document is applied normally.
+    let mut changed = (**ctx.config.load()).clone();
+    changed.upstream.servers = vec!["8.8.8.8".to_string()];
+    let changed_document = toml::to_string_pretty(&changed).unwrap();
+    match apply_config_document_event(
+        &ctx,
+        &changed_document,
+        FilterApply::Sync,
+        Some(&*hooks),
+        &self_write,
+    )
+    .await
+    {
+        ConfigFileApplyOutcome::Applied(_) => {}
+        other => panic!("a changed watcher document must be applied, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.runtime.snapshot().config.upstream.servers,
+        vec!["8.8.8.8".to_string()]
+    );
+    assert_eq!(
+        filter_compile_count(&ctx.metrics),
+        filter_compiles_before + 2
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// D-01 startup-order regression: a push that arrives before the DNS listener
+/// generation and rate limiters exist is refused (so the worker ACKs
+/// `applied:false` and retries) instead of being applied and persisted with
+/// listener/rate-limit components silently skipped.
+#[tokio::test]
+async fn test_m8_push_before_listeners_fails_and_retries_after_ready() {
+    let signing_key = Ed25519SigningKey::generate().unwrap();
+    let (ctx, _token, temp_dir) = create_test_context("slave", None, None, None).await;
+
+    let hooks = Arc::new(RecordingDnssecHooks {
+        validator: Arc::new(ArcSwap::from_pointee(
+            sito_dnssec::DnssecValidator::from_config(&Config::default().dns.dnssec),
+        )),
+        observed_nta: Arc::new(Mutex::new(Vec::new())),
+    });
+    let applier = Arc::new(sito::server::HaConfigApplier::new(
+        ctx.clone(),
+        hooks.clone(),
+    ));
+    let tracker = SlaveStatusTracker::new("slave-startup".to_string(), 0, None);
+    let handles = SlaveAppHandles {
+        runtime: ctx.runtime.clone(),
+        filter: ctx.filter.clone(),
+        metrics: ctx.metrics.clone(),
+        config_path: Some(ctx.config_path.clone()),
+        applier: applier.clone(),
+    };
+
+    let push = build_and_sign_push(
+        &ConfigBundle {
+            version: 2,
+            timestamp: 1,
+            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n\n[upstream]\nservers = [\"9.9.9.9\"]\n".to_string(),
+            custom_rules: vec![],
+            rewrites: None,
+            clients: None,
+            lists: vec![],
+        },
+        &signing_key,
+    )
+    .unwrap();
+
+    let err =
+        sito_ha::apply_config_push(&push, &tracker, &handles, signing_key.public_key().as_ref())
+            .await
+            .expect_err("a push before listeners exist must not be acknowledged");
+    assert!(
+        err.to_string().contains("not initialized yet"),
+        "the failure must identify the uninitialized listener components: {err}"
+    );
+    assert_eq!(tracker.get_state(), SlaveState::Degraded);
+    assert_eq!(
+        tracker.get_version(),
+        0,
+        "the watermark must not advance before listeners are available"
+    );
+    assert_eq!(
+        ctx.runtime.snapshot().config.upstream.servers,
+        Config::default().upstream.servers,
+        "the live configuration must be untouched"
+    );
+
+    // Once the listener generation and rate limiters are live, the same push
+    // applies and the watermark advances.
+    applier.mark_listeners_ready();
+    let applied =
+        sito_ha::apply_config_push(&push, &tracker, &handles, signing_key.public_key().as_ref())
+            .await
+            .expect("the retry after listener startup must apply");
+    assert_eq!(applied, 2);
+    assert_eq!(tracker.get_state(), SlaveState::Synced);
+    assert_eq!(tracker.get_version(), 2);
+    assert_eq!(
+        ctx.runtime.snapshot().config.upstream.servers,
+        vec!["9.9.9.9".to_string()]
+    );
+    let persisted = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
+    assert!(persisted.contains("9.9.9.9"));
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

@@ -541,6 +541,11 @@ pub struct HaConfigApplier {
     ctx: sito_api::ServerContext,
     hooks: Arc<dyn sito_api::config_apply::ConfigApplyHooks>,
     self_write: Arc<sito_api::config_apply::AppliedDocumentTracker>,
+    /// Set only after `init_tls_and_acme` and `DnsListenerManager::start` have
+    /// produced the listener generation and shared rate limiters. Before that,
+    /// a push must not be acknowledged: applying it would silently skip the
+    /// listener/rate-limit components.
+    listeners_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HaConfigApplier {
@@ -549,11 +554,34 @@ impl HaConfigApplier {
         ctx: sito_api::ServerContext,
         hooks: Arc<dyn sito_api::config_apply::ConfigApplyHooks>,
     ) -> Self {
+        Self::with_self_write(
+            ctx,
+            hooks,
+            Arc::new(sito_api::config_apply::AppliedDocumentTracker::new()),
+        )
+    }
+
+    /// Creates an applier sharing the watcher's self-write tracker. The
+    /// listener readiness gate is still closed until
+    /// [`Self::mark_listeners_ready`] is called.
+    #[must_use]
+    pub fn with_self_write(
+        ctx: sito_api::ServerContext,
+        hooks: Arc<dyn sito_api::config_apply::ConfigApplyHooks>,
+        self_write: Arc<sito_api::config_apply::AppliedDocumentTracker>,
+    ) -> Self {
         Self {
             ctx,
             hooks,
-            self_write: Arc::new(sito_api::config_apply::AppliedDocumentTracker::new()),
+            self_write,
+            listeners_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Opens the readiness gate after the DNS listeners and rate limiters exist.
+    pub fn mark_listeners_ready(&self) {
+        self.listeners_ready
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Tracks the documents written by this applier so the file watcher can
@@ -570,6 +598,18 @@ impl sito_ha::SlaveConfigApplier for HaConfigApplier {
         cfg: &'a Config,
         document: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        // Never acknowledge a push before the listener generation and shared
+        // rate limiters exist: otherwise a listener/rate-limit change would be
+        // silently skipped while the rest is applied and persisted.
+        if !self
+            .listeners_ready
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Box::pin(async {
+                Err("DNS listeners and rate limiters are not initialized yet".to_string())
+            });
+        }
+
         // Record before the write so a watcher event racing the rename is
         // recognised as this applier's own output.
         self.self_write.record(document);
@@ -591,6 +631,57 @@ impl sito_ha::SlaveConfigApplier for HaConfigApplier {
             }
         })
     }
+}
+
+/// Spawns the pending slave worker once the listener generation and shared
+/// rate limiters exist.
+///
+/// The applier's readiness gate is opened here, immediately before spawning, so
+/// a push can never be acknowledged while listener/rate-limit components are
+/// still uninitialized. Master roles have no pending receiver and are a no-op.
+#[allow(clippy::too_many_arguments)]
+fn spawn_slave_worker_after_listeners(
+    ha_runtime: &mut HaRuntime,
+    server_ctx: &sito_api::ServerContext,
+    hooks: &Arc<ServerApplyHooks>,
+    runtime: &Arc<sito_runtime::RuntimeState>,
+    filter_engine: &Arc<HostsFilterEngine>,
+    metrics: &sito_stats::MetricsRegistry,
+    config_path: &Path,
+    self_write: &Arc<sito_api::config_apply::AppliedDocumentTracker>,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    let (Some(tracker), Some(resync_rx)) = (
+        ha_runtime.tracker.clone(),
+        ha_runtime.resync_receiver.take(),
+    ) else {
+        return;
+    };
+    if ha_runtime.config.master_url.is_none() {
+        warn!("Slave role configured without master_url; replication worker idle");
+        return;
+    }
+
+    let applier = Arc::new(HaConfigApplier::with_self_write(
+        server_ctx.clone(),
+        hooks.clone(),
+        self_write.clone(),
+    ));
+    applier.mark_listeners_ready();
+    let slave_handles = sito_ha::SlaveAppHandles {
+        runtime: runtime.clone(),
+        filter: filter_engine.clone(),
+        metrics: metrics.clone(),
+        config_path: Some(config_path.to_path_buf()),
+        applier,
+    };
+    let _slave_worker_handle = sito_ha::spawn_slave_worker(
+        ha_runtime.config.clone(),
+        tracker,
+        slave_handles,
+        resync_rx,
+        shutdown_rx.clone(),
+    );
 }
 
 /// Watches the configuration file and applies hot reloads in-process. Returns
@@ -657,8 +748,8 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
                     Ok(content) => {
                         use sito_api::config_apply::ConfigFileApplyOutcome;
                         // Same apply/validate pipeline as every API write path;
-                        // the HA applier's own write and no-op documents are
-                        // skipped instead of reloading every component again.
+                        // only the HA applier's exact self-write is skipped so
+                        // a push is not applied twice.
                         match sito_api::config_apply::apply_config_document_event(
                             &ctx,
                             &content,
@@ -671,11 +762,6 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
                             ConfigFileApplyOutcome::SelfWriteIgnored => {
                                 info!(
                                     "Ignoring file-watcher event for the configuration written by the HA push"
-                                );
-                            }
-                            ConfigFileApplyOutcome::Unchanged => {
-                                info!(
-                                    "Configuration file matches the running configuration; skipping reload"
                                 );
                             }
                             ConfigFileApplyOutcome::Applied(report) => {
@@ -933,41 +1019,11 @@ pub async fn run_server_full(
         dns_starter,
     };
 
-    // Spawn the slave replication worker now that the context and apply hooks
-    // exist. A push is applied through `HaConfigApplier`, which owns the single
-    // apply/persist path used before the worker ACKs `applied: true`.
-    let self_write = if let (Some(tracker), Some(resync_rx)) = (
-        ha_runtime.tracker.clone(),
-        ha_runtime.resync_receiver.take(),
-    ) {
-        if ha_runtime.config.master_url.is_some() {
-            let applier = Arc::new(HaConfigApplier::new(
-                server_ctx.clone(),
-                apply_hooks.clone(),
-            ));
-            let self_write = applier.self_write_tracker();
-            let slave_handles = sito_ha::SlaveAppHandles {
-                runtime: runtime.clone(),
-                filter: filter_engine.clone(),
-                metrics: metrics.clone(),
-                config_path: Some(config_path_buf.clone()),
-                applier,
-            };
-            let _slave_worker_handle = sito_ha::spawn_slave_worker(
-                ha_runtime.config.clone(),
-                tracker,
-                slave_handles,
-                resync_rx,
-                shutdown_rx.clone(),
-            );
-            self_write
-        } else {
-            warn!("Slave role configured without master_url; replication worker idle");
-            Arc::new(sito_api::config_apply::AppliedDocumentTracker::new())
-        }
-    } else {
-        Arc::new(sito_api::config_apply::AppliedDocumentTracker::new())
-    };
+    // The watcher needs the applier's self-write tracker before the slave
+    // worker exists; the worker itself is spawned only after the listener
+    // generation and rate limiters are live (see
+    // `spawn_slave_worker_after_listeners`).
+    let self_write = Arc::new(sito_api::config_apply::AppliedDocumentTracker::new());
 
     let api_router = sito_api::create_router_with_hooks(
         server_ctx.clone(),
@@ -1031,9 +1087,9 @@ pub async fn run_server_full(
     // Spawn config file watcher for hot-reload. It shares the same
     // apply/validate pipeline and hook components as the API/UI write paths.
     tokio::spawn(run_config_watcher(ConfigWatcher {
-        ctx: server_ctx,
-        hooks: apply_hooks,
-        self_write,
+        ctx: server_ctx.clone(),
+        hooks: apply_hooks.clone(),
+        self_write: self_write.clone(),
         shutdown_rx: shutdown_rx.clone(),
     }));
 
@@ -1079,6 +1135,17 @@ pub async fn run_server_full(
                 )
                 .await?;
                 *listener_manager.lock().await = Some(manager);
+                spawn_slave_worker_after_listeners(
+                    &mut ha_runtime,
+                    &server_ctx,
+                    &apply_hooks,
+                    &runtime,
+                    &filter_engine,
+                    &metrics,
+                    &config_path_buf,
+                    &self_write,
+                    &shutdown_rx,
+                );
 
                 info!(
                     port = current_cfg.dns.port,
@@ -1100,14 +1167,32 @@ pub async fn run_server_full(
                 doq: None,
                 doh3: None,
             });
-        let manager =
-            DnsListenerManager::start(&config, pipeline.clone(), acceptors, rate_limiters.clone())
-                .await?;
+        // Start from the current configuration (the watcher may already have
+        // applied a file change during startup), not the stale startup copy.
+        let listener_config = config_arc.load();
+        let manager = DnsListenerManager::start(
+            &listener_config,
+            pipeline.clone(),
+            acceptors,
+            rate_limiters.clone(),
+        )
+        .await?;
         *listener_manager.lock().await = Some(manager);
+        spawn_slave_worker_after_listeners(
+            &mut ha_runtime,
+            &server_ctx,
+            &apply_hooks,
+            &runtime,
+            &filter_engine,
+            &metrics,
+            &config_path_buf,
+            &self_write,
+            &shutdown_rx,
+        );
 
         info!(
-            port = config.dns.port,
-            bind = ?config.dns.bind,
+            port = listener_config.dns.port,
+            bind = ?listener_config.dns.bind,
             "sito DNS server successfully initialized and listening"
         );
 

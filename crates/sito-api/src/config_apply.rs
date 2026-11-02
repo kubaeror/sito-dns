@@ -340,8 +340,6 @@ impl AppliedDocumentTracker {
 pub enum ConfigFileApplyOutcome {
     /// The change was the HA applier's own write; nothing was re-applied.
     SelfWriteIgnored,
-    /// The file already matches the running configuration; nothing was applied.
-    Unchanged,
     /// The new configuration was applied and published to slaves.
     Applied(AppliedReport),
     /// The document was rejected; the running configuration is untouched.
@@ -350,9 +348,10 @@ pub enum ConfigFileApplyOutcome {
 
 /// Applies a configuration document read from disk (file-watcher path).
 ///
-/// This is idempotent with respect to the HA slave applier: an exact self-write
-/// is suppressed, and a document that is semantically identical to the running
-/// configuration is skipped instead of reloading every component again.
+/// Only the HA slave applier's exact self-write is suppressed; every other
+/// file event (including a semantically identical rewrite or `touch`) goes
+/// through the normal apply pipeline, preserving the watcher's historical
+/// behavior.
 pub async fn apply_config_document_event(
     ctx: &ServerContext,
     document: &str,
@@ -372,10 +371,6 @@ pub async fn apply_config_document_event(
             )));
         }
     };
-
-    if new_cfg == **ctx.config.load() {
-        return ConfigFileApplyOutcome::Unchanged;
-    }
 
     match apply_full_config(ctx, &new_cfg, filter_apply, hooks).await {
         Ok(report) => {
@@ -613,6 +608,60 @@ mod tests {
         tracker.record("config_version = 1\n");
         tracker.clear();
         assert!(!tracker.take_if_matches("config_version = 1\n"));
+    }
+
+    /// D-01 review: only the HA applier's exact self-write is suppressed.
+    /// Equal external writes keep the watcher's historical re-apply behavior,
+    /// and changed documents are applied normally.
+    #[tokio::test]
+    async fn test_config_document_event_only_suppresses_ha_self_write() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_watcher");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let tracker = AppliedDocumentTracker::new();
+
+        let equal_document = toml::to_string_pretty(&**ctx.config.load()).unwrap();
+        match apply_config_document_event(&ctx, &equal_document, FilterApply::Sync, None, &tracker)
+            .await
+        {
+            ConfigFileApplyOutcome::Applied(_) => {}
+            other => panic!("an equal external write must still be applied, got {other:?}"),
+        }
+
+        let mut changed = (**ctx.config.load()).clone();
+        changed.upstream.servers = vec!["9.9.9.9".to_string()];
+        let changed_document = toml::to_string_pretty(&changed).unwrap();
+        match apply_config_document_event(
+            &ctx,
+            &changed_document,
+            FilterApply::Sync,
+            None,
+            &tracker,
+        )
+        .await
+        {
+            ConfigFileApplyOutcome::Applied(_) => {}
+            other => panic!("a changed document must be applied, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.runtime.snapshot().config.upstream.servers,
+            vec!["9.9.9.9".to_string()]
+        );
+
+        tracker.record(&changed_document);
+        match apply_config_document_event(
+            &ctx,
+            &changed_document,
+            FilterApply::Sync,
+            None,
+            &tracker,
+        )
+        .await
+        {
+            ConfigFileApplyOutcome::SelfWriteIgnored => {}
+            other => panic!("the HA self-write must be suppressed, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// D-01: the HA path persists the exact document it built (preserving
