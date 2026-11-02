@@ -50,6 +50,16 @@ pub struct ClientViewItem {
     pub group: String,
 }
 
+/// One discovered-but-unconfigured client row.
+#[derive(Debug, Clone)]
+pub struct ClientDiscoveryViewItem {
+    pub ip: String,
+    pub mac: Option<String>,
+    pub hostname: Option<String>,
+    /// Pre-formatted UTC timestamp for display.
+    pub last_seen: String,
+}
+
 /// One row on the user-management page.
 #[derive(Debug, Clone)]
 pub struct UserViewItem {
@@ -199,6 +209,14 @@ pub struct ClientsTemplate<'a> {
     pub active_tab: &'a str,
     pub version: &'a str,
     pub clients: Vec<ClientViewItem>,
+    /// Newest-first discovered clients; empty for roles below Operator.
+    pub discovered: Vec<ClientDiscoveryViewItem>,
+    /// True when the signed-in role may see discovered-client PII.
+    pub can_view_discovered: bool,
+    /// Maximum number of entries the registry retains.
+    pub max_entries: usize,
+    /// Age after which discovered entries are pruned.
+    pub retention_hours: u64,
 }
 
 #[derive(Template)]

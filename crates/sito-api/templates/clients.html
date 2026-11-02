@@ -91,4 +91,54 @@
     </div>
   </div>
 </div>
+
+{% if can_view_discovered %}
+<div class="card" style="margin-top: 20px;">
+  <div class="card-header">
+    <div class="card-title">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+      Discovered but unidentified
+    </div>
+  </div>
+
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>IP Address</th>
+          <th>MAC / Hostname</th>
+          <th>Last Seen</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in discovered %}
+        <tr>
+          <td class="td-strong mono">{{ c.ip }}</td>
+          <td class="mono" style="color: var(--text-secondary);">
+            {% if let Some(mac) = c.mac %}
+            <div>{{ mac }}</div>
+            {% endif %}
+            {% if let Some(hostname) = c.hostname %}
+            <div>{{ hostname }}</div>
+            {% endif %}
+            {% if c.mac.is_none() && c.hostname.is_none() %}
+            <div>-</div>
+            {% endif %}
+          </td>
+          <td>{{ c.last_seen }}</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="3" style="text-align: center; color: var(--text-muted); padding: 24px;">No unidentified clients discovered yet.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div style="padding: 12px 18px; color: var(--text-muted); font-size: 0.8rem; border-top: 1px solid var(--border-color);">
+    Read-only view of recent devices that are not explicitly configured. Newest first, capped at {{ max_entries }} entries and pruned after {{ retention_hours }} hours.
+  </div>
+</div>
+{% endif %}
 {% endblock %}

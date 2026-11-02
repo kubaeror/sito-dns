@@ -27,11 +27,11 @@ use crate::models::{FilterListDto, StatusResponse};
 use crate::probe::probe_upstream_target;
 use crate::state::ServerContext;
 use crate::ui::templates::{
-    AccountTemplate, ClientViewItem, ClientsTemplate, DashboardStatsPartialTemplate,
-    DashboardTemplate, FilteringTemplate, HtmlTemplate, LoginTemplate, QueryLogRowItem,
-    QueryLogRowsPartialTemplate, QueryLogTemplate, RewriteViewItem, RewritesTemplate,
-    SettingsTemplate, SystemTemplate, TokenViewItem, UpstreamViewItem, UpstreamsTemplate,
-    UserViewItem, UsersTemplate, WizardTemplate,
+    AccountTemplate, ClientDiscoveryViewItem, ClientViewItem, ClientsTemplate,
+    DashboardStatsPartialTemplate, DashboardTemplate, FilteringTemplate, HtmlTemplate,
+    LoginTemplate, QueryLogRowItem, QueryLogRowsPartialTemplate, QueryLogTemplate, RewriteViewItem,
+    RewritesTemplate, SettingsTemplate, SystemTemplate, TokenViewItem, UpstreamViewItem,
+    UpstreamsTemplate, UserViewItem, UsersTemplate, WizardTemplate,
 };
 use sito_core::FilterEngine;
 use sito_core::config::{BlockingMode, Config, FilterListConfig, UpstreamStrategy};
@@ -1126,6 +1126,25 @@ pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
         })
         .collect();
 
+    // Discovered-client rows carry DHCP PII (IP/MAC/hostname), so they are
+    // loaded and rendered for Operators and above only.
+    let can_view_discovered = user.role >= Role::Operator;
+    let discovered: Vec<ClientDiscoveryViewItem> = if can_view_discovered {
+        ctx.clients
+            .load()
+            .unidentified_clients()
+            .into_iter()
+            .map(|client| ClientDiscoveryViewItem {
+                ip: client.ip.to_string(),
+                mac: client.mac,
+                hostname: client.hostname,
+                last_seen: client.last_seen.format("%Y-%m-%d %H:%M UTC").to_string(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     HtmlTemplate(ClientsTemplate {
         csrf_token: &csrf,
         is_authenticated: true,
@@ -1134,6 +1153,10 @@ pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
         active_tab: "clients",
         version: env!("CARGO_PKG_VERSION"),
         clients,
+        discovered,
+        can_view_discovered,
+        max_entries: sito_clients::MAX_UNIDENTIFIED_CLIENTS,
+        retention_hours: sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS,
     })
     .into_response()
 }
@@ -3759,6 +3782,215 @@ mod tests {
             .await
             .unwrap();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Records discovered clients through the same resolve path the DNS
+    /// listener uses, so the UI sees production-shaped registry entries.
+    fn seed_discovered(
+        ctx: &ServerContext,
+        entries: &[(
+            std::net::IpAddr,
+            &str,
+            Option<&str>,
+            chrono::DateTime<chrono::Utc>,
+        )],
+    ) {
+        let registry = ctx.clients.load();
+        for (ip, mac, hostname, last_seen) in entries {
+            registry.update_routeros_leases(vec![sito_clients::RouterOsLease {
+                mac: (*mac).to_string(),
+                ip: Some(*ip),
+                hostname: hostname.map(str::to_string),
+                comment: None,
+            }]);
+            let mut client = sito_core::client::ClientContext::new(*ip);
+            let _ = registry.resolve(&mut client, registry.timezone().at_utc(*last_seen));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clients_page_shows_unidentified_for_operator() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_operator_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+
+        let now = chrono::Utc::now();
+        let older: std::net::IpAddr = "10.42.0.10".parse().unwrap();
+        let newer: std::net::IpAddr = "10.42.0.11".parse().unwrap();
+        seed_discovered(
+            &ctx,
+            &[
+                (
+                    older,
+                    "aa:bb:cc:dd:ee:01",
+                    Some("older-host"),
+                    now - chrono::TimeDelta::minutes(5),
+                ),
+                (
+                    newer,
+                    "aa:bb:cc:dd:ee:02",
+                    Some("newer-host"),
+                    now - chrono::TimeDelta::minutes(1),
+                ),
+            ],
+        );
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+
+        assert!(
+            body.contains("Discovered but unidentified"),
+            "operators must see the discovered card: {body}"
+        );
+        assert!(body.contains("10.42.0.10"), "{body}");
+        assert!(body.contains("10.42.0.11"), "{body}");
+        assert!(body.contains("aa:bb:cc:dd:ee:01"), "{body}");
+        assert!(body.contains("aa:bb:cc:dd:ee:02"), "{body}");
+        assert!(body.contains("older-host"), "{body}");
+        assert!(body.contains("newer-host"), "{body}");
+        assert!(body.contains("Last Seen"), "{body}");
+        assert!(
+            body.contains(&now.format("%Y-%m-%d").to_string()),
+            "last-seen timestamps must render: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "capped at {} entries",
+                sito_clients::MAX_UNIDENTIFIED_CLIENTS
+            )),
+            "the entry bound must be visible: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "pruned after {} hours",
+                sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS
+            )),
+            "the retention window must be visible: {body}"
+        );
+
+        let newer_pos = body.find("10.42.0.11").expect("newer row");
+        let older_pos = body.find("10.42.0.10").expect("older row");
+        assert!(
+            newer_pos < older_pos,
+            "discovered rows must be newest first"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_clients_page_hides_unidentified_for_viewer() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_viewer_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("view_user", "ViewerPass1", Role::Viewer)
+            .await;
+
+        let ip: std::net::IpAddr = "10.43.0.20".parse().unwrap();
+        seed_discovered(
+            &ctx,
+            &[(
+                ip,
+                "aa:bb:cc:dd:ee:03",
+                Some("secret-host"),
+                chrono::Utc::now(),
+            )],
+        );
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("view_user", "ViewerPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("viewer login failed");
+        };
+        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+
+        assert!(
+            body.contains("Identified Clients & Device Policies"),
+            "viewers still see configured clients: {body}"
+        );
+        assert!(
+            !body.contains("Discovered but unidentified"),
+            "the discovered section must be operator-only: {body}"
+        );
+        assert!(
+            !body.contains("No unidentified clients discovered yet"),
+            "the empty state must not leak the section: {body}"
+        );
+        assert!(!body.contains("10.43.0.20"), "discovered IP leaked: {body}");
+        assert!(
+            !body.contains("aa:bb:cc:dd:ee:03"),
+            "discovered MAC leaked: {body}"
+        );
+        assert!(
+            !body.contains("secret-host"),
+            "discovered hostname leaked: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_clients_page_empty_unidentified_state() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_empty_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+
+        assert!(body.contains("Discovered but unidentified"), "{body}");
+        assert!(
+            body.contains("No unidentified clients discovered yet."),
+            "the empty state must render for operators: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "capped at {} entries",
+                sito_clients::MAX_UNIDENTIFIED_CLIENTS
+            )),
+            "the bound must stay visible when the list is empty: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]

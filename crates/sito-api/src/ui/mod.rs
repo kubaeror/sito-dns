@@ -78,11 +78,11 @@ mod tests {
     use crate::models::StatusResponse;
     use crate::ui::static_files::StaticAssets;
     use crate::ui::templates::{
-        AccountTemplate, ClientViewItem, ClientsTemplate, DashboardStatsPartialTemplate,
-        DashboardTemplate, FilteringTemplate, LoginTemplate, QueryLogRowItem,
-        QueryLogRowsPartialTemplate, QueryLogTemplate, RewriteViewItem, RewritesTemplate,
-        SettingsTemplate, SystemTemplate, TokenViewItem, UpstreamViewItem, UpstreamsTemplate,
-        UserViewItem, UsersTemplate, WizardTemplate,
+        AccountTemplate, ClientDiscoveryViewItem, ClientViewItem, ClientsTemplate,
+        DashboardStatsPartialTemplate, DashboardTemplate, FilteringTemplate, LoginTemplate,
+        QueryLogRowItem, QueryLogRowsPartialTemplate, QueryLogTemplate, RewriteViewItem,
+        RewritesTemplate, SettingsTemplate, SystemTemplate, TokenViewItem, UpstreamViewItem,
+        UpstreamsTemplate, UserViewItem, UsersTemplate, WizardTemplate,
     };
     use sito_stats::GlobalStats;
 
@@ -267,8 +267,29 @@ mod tests {
                 ids: vec!["192.168.1.100".to_string()],
                 group: "default".to_string(),
             }],
+            discovered: vec![ClientDiscoveryViewItem {
+                ip: "192.168.1.101".to_string(),
+                mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+                hostname: Some("laptop <b>&".to_string()),
+                last_seen: "2026-01-02 03:04 UTC".to_string(),
+            }],
+            can_view_discovered: true,
+            max_entries: sito_clients::MAX_UNIDENTIFIED_CLIENTS,
+            retention_hours: sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS,
         };
-        assert!(clients_tmpl.render().unwrap().contains("Work PC"));
+        let clients_html = clients_tmpl.render().unwrap();
+        assert!(clients_html.contains("Work PC"));
+        assert!(clients_html.contains("Discovered but unidentified"));
+        assert!(clients_html.contains("192.168.1.101"));
+        assert!(clients_html.contains("2026-01-02 03:04 UTC"));
+        assert!(
+            clients_html.contains("laptop &#60;b&#62;&#38;"),
+            "discovered hostnames must stay HTML-escaped: {clients_html}"
+        );
+        assert!(
+            !clients_html.contains("laptop <b>"),
+            "raw markup from a discovered hostname must never render"
+        );
 
         let upstreams_tmpl = UpstreamsTemplate {
             csrf_token: "",
