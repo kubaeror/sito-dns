@@ -42,6 +42,7 @@ pub struct ResyncOutcome {
 /// A version-continuity violation observed on a slave acknowledgement.
 #[derive(Debug, Clone)]
 struct Divergence {
+    instance: String,
     acked_version: u64,
     reason: String,
 }
@@ -68,6 +69,9 @@ pub struct MasterCoordinator {
     /// Serializes bundle publication so the version check and store cannot
     /// interleave and regress the active version.
     publish_lock: Arc<Mutex<()>>,
+    /// Serializes asynchronous publication (including the state write) so two
+    /// concurrent async publishers cannot complete their writes out of order.
+    persist_lock: Arc<tokio::sync::Mutex<()>>,
     /// Monotonic id assigned to each accepted slave connection.
     next_connection_id: Arc<AtomicU64>,
     /// Most severe version-continuity violation observed (slave ahead of the
@@ -104,6 +108,7 @@ impl MasterCoordinator {
             pending_fallbacks: Arc::new(Mutex::new(HashSet::new())),
             stale_repushes: Arc::new(Mutex::new(HashMap::new())),
             publish_lock: Arc::new(Mutex::new(())),
+            persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             next_connection_id: Arc::new(AtomicU64::new(1)),
             diverged: Arc::new(Mutex::new(None)),
         }
@@ -116,55 +121,75 @@ impl MasterCoordinator {
         self
     }
 
-    /// Persists the active bundle and version so a restart continues the
-    /// monotonic sequence instead of resetting to 1 (which slaves reject).
-    fn persist_state(&self) {
-        let path = self.state_path.lock().unwrap().clone();
-        let Some(path) = path else {
-            return;
-        };
-        let Some(bundle) = self.active_bundle.lock().unwrap().clone() else {
-            return;
-        };
-        let payload = match serde_json::to_vec_pretty(&bundle) {
-            Ok(payload) => payload,
-            Err(e) => {
-                error!(error = %e, "Failed to serialize HA master state");
-                return;
-            }
-        };
-        if let Some(parent) = path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            error!(error = %e, path = %parent.display(), "Failed to create HA state directory");
-            return;
+    /// Writes `payload` to `path` atomically (0600 temp file, fsync, rename).
+    fn write_state_file(path: &std::path::Path, payload: &[u8]) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
         let tmp = path.with_extension("tmp");
-        let write_result = {
-            #[cfg(unix)]
-            {
-                use std::io::Write as _;
-                use std::os::unix::fs::OpenOptionsExt as _;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&tmp)
-                    .and_then(|mut file| file.write_all(&payload))
-            }
-            #[cfg(not(unix))]
-            {
-                std::fs::write(&tmp, &payload)
-            }
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(payload)?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            file.write_all(payload)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Serializes the active bundle on the caller thread, if a state path and
+    /// an active bundle exist.
+    fn serialized_state(&self) -> std::io::Result<Option<(PathBuf, Vec<u8>)>> {
+        let path = self.state_path.lock().unwrap().clone();
+        let Some(path) = path else {
+            return Ok(None);
         };
-        if let Err(e) = write_result {
-            error!(error = %e, path = %tmp.display(), "Failed to persist HA master state");
-            return;
+        let Some(bundle) = self.active_bundle.lock().unwrap().clone() else {
+            return Ok(None);
+        };
+        let payload = serde_json::to_vec_pretty(&bundle).map_err(|e| {
+            std::io::Error::other(format!("failed to serialize HA master state: {e}"))
+        })?;
+        Ok(Some((path, payload)))
+    }
+
+    /// Persists the active bundle and version synchronously.
+    fn persist_state(&self) -> std::io::Result<()> {
+        if let Some((path, payload)) = self.serialized_state()? {
+            Self::write_state_file(&path, &payload)?;
         }
-        if let Err(e) = std::fs::rename(&tmp, &path) {
-            error!(error = %e, path = %path.display(), "Failed to atomically commit HA master state");
-        }
+        Ok(())
+    }
+
+    /// Persists the active bundle and version on the blocking pool.
+    ///
+    /// The caller thread only clones the path/payload; all filesystem work
+    /// (directory creation, 0600 write, `sync_all`, rename) runs in
+    /// `spawn_blocking` so a slow disk cannot stall a tokio worker.
+    async fn persist_state_async(&self) -> std::io::Result<()> {
+        let Some((path, payload)) = self.serialized_state()? else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || Self::write_state_file(&path, &payload))
+            .await
+            .map_err(|e| std::io::Error::other(format!("HA state writer task failed: {e}")))?
     }
 
     /// Restores the persisted version/bundle, if any.
@@ -262,16 +287,24 @@ impl MasterCoordinator {
     }
 
     /// Records a version-continuity violation, keeping the most severe one.
-    fn mark_diverged(&self, acked_version: u64, reason: String) {
+    fn mark_diverged(&self, instance: &str, acked_version: u64, reason: String) {
         let mut diverged = self.diverged.lock().unwrap();
         if diverged
             .as_ref()
             .is_none_or(|d| acked_version >= d.acked_version)
         {
+            let previous_instance = diverged.as_ref().map(|d| d.instance.clone());
+            if let Some(previous) = previous_instance
+                && previous != instance
+            {
+                self.metrics.set_ha_diverged(&previous, false);
+            }
             *diverged = Some(Divergence {
+                instance: instance.to_string(),
                 acked_version,
                 reason,
             });
+            self.metrics.set_ha_diverged(instance, true);
         }
     }
 
@@ -280,8 +313,16 @@ impl MasterCoordinator {
     /// past it).
     fn clear_divergence_above(&self, version: u64) {
         let mut diverged = self.diverged.lock().unwrap();
-        if diverged.as_ref().is_some_and(|d| version > d.acked_version) {
+        let cleared_instance = diverged
+            .as_ref()
+            .filter(|d| version > d.acked_version)
+            .map(|d| d.instance.clone());
+        if let Some(instance) = cleared_instance {
             *diverged = None;
+            // Do not recreate a series removed when that slave disconnected.
+            if self.slaves.lock().unwrap().contains_key(&instance) {
+                self.metrics.set_ha_diverged(&instance, false);
+            }
         }
     }
 
@@ -329,16 +370,9 @@ impl MasterCoordinator {
         true
     }
 
-    /// Sets and signs a new configuration bundle, immediately broadcasting it to all connected slaves.
-    pub fn update_bundle(&self, bundle: ConfigBundle) -> Result<u64, HaError> {
-        // Serialize the check-then-store: two concurrent publishers could
-        // otherwise both pass the monotonicity check and store out of order,
-        // regressing the active version and broadcasting a stale bundle.
-        let _publish_guard = self
-            .publish_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
+    /// Validates monotonicity, sanitizes and signs `bundle`, then stores it as
+    /// the active bundle/push. The caller must hold [`Self::publish_lock`].
+    fn store_bundle(&self, bundle: ConfigBundle) -> Result<(u64, HaMessage), HaError> {
         // Secret material must never be stored, persisted or signed: the
         // structured `clients` value is sanitized exactly like `config_toml`.
         let mut bundle = bundle;
@@ -360,14 +394,68 @@ impl MasterCoordinator {
 
         *self.active_bundle.lock().unwrap() = Some(bundle);
         *self.active_push.lock().unwrap() = Some(push_msg.clone());
-        self.persist_state();
+        Ok((version, push_msg))
+    }
 
+    /// Publishes the active configuration version to the HA metrics.
+    fn record_published_version(&self, version: u64) {
         #[allow(clippy::cast_precision_loss)]
         {
             self.metrics.set_ha_config_version("local", version as f64);
             self.metrics
                 .set_ha_config_version(&self.instance_name, version as f64);
         }
+    }
+
+    /// Sets and signs a new configuration bundle, immediately broadcasting it to all connected slaves.
+    pub fn update_bundle(&self, bundle: ConfigBundle) -> Result<u64, HaError> {
+        // Serialize the check-then-store: two concurrent publishers could
+        // otherwise both pass the monotonicity check and store out of order,
+        // regressing the active version and broadcasting a stale bundle.
+        let _publish_guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let (version, push_msg) = self.store_bundle(bundle)?;
+        self.persist_state()?;
+        self.record_published_version(version);
+
+        // Broadcast to all active slaves
+        self.broadcast(&push_msg);
+
+        info!(
+            version,
+            "Master updated configuration bundle and broadcasted push to connected slaves"
+        );
+
+        Ok(version)
+    }
+
+    /// Async variant of [`Self::update_bundle`] that persists state on the
+    /// blocking pool.
+    ///
+    /// `persist_lock` serializes the whole publish-and-write sequence so two
+    /// concurrent async publishers cannot complete their state writes out of
+    /// order. The standard `publish_lock` is only held for the in-memory
+    /// check/store/sign step and is dropped before awaiting the disk write.
+    pub async fn update_bundle_async(&self, bundle: ConfigBundle) -> Result<u64, HaError> {
+        let _persist_guard = self.persist_lock.lock().await;
+
+        let (version, push_msg) = {
+            let _publish_guard = self
+                .publish_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.store_bundle(bundle)?
+        };
+
+        if let Err(e) = self.persist_state_async().await {
+            error!(error = %e, "Failed to persist HA master state");
+            return Err(HaError::Io(e));
+        }
+
+        self.record_published_version(version);
 
         // Broadcast to all active slaves
         self.broadcast(&push_msg);
@@ -636,7 +724,7 @@ impl MasterCoordinator {
             let next_version = self.get_current_version().saturating_add(1);
             let mut rebased = bundle;
             rebased.version = next_version;
-            if let Err(e) = self.update_bundle(rebased) {
+            if let Err(e) = self.update_bundle_async(rebased).await {
                 warn!(
                     instance = %slave_instance,
                     version = next_version,
@@ -746,13 +834,13 @@ impl MasterCoordinator {
                 msg_opt = ws_stream.next() => {
                     match msg_opt {
                         Some(Ok(WsMessage::Text(txt))) => {
-                            if !self.process_slave_msg(&slave_instance, connection_id, &txt) {
+                            if !self.process_slave_msg(&slave_instance, connection_id, &txt).await {
                                 break;
                             }
                         }
                         Some(Ok(WsMessage::Binary(bin))) => {
                             if let Ok(txt) = std::str::from_utf8(&bin)
-                                && !self.process_slave_msg(&slave_instance, connection_id, txt) {
+                                && !self.process_slave_msg(&slave_instance, connection_id, txt).await {
                                     break;
                                 }
                         }
@@ -807,13 +895,19 @@ impl MasterCoordinator {
             // Drop the per-slave catch-up bookkeeping with the session so the
             // map cannot grow across reconnects.
             self.stale_repushes.lock().unwrap().remove(instance);
+            self.metrics.remove_ha_diverged(instance);
         }
         #[allow(clippy::cast_possible_wrap)]
         self.metrics.set_ha_slaves_connected(slaves.len() as i64);
         owned
     }
 
-    fn process_slave_msg(&self, slave_instance: &str, connection_id: u64, text: &str) -> bool {
+    async fn process_slave_msg(
+        &self,
+        slave_instance: &str,
+        connection_id: u64,
+        text: &str,
+    ) -> bool {
         let msg = match HaMessage::from_json(text) {
             Ok(m) => m,
             Err(e) => {
@@ -888,7 +982,7 @@ impl MasterCoordinator {
                         current,
                         "{reason}"
                     );
-                    self.mark_diverged(version, reason);
+                    self.mark_diverged(slave_instance, version, reason);
                     let active_bundle = self.active_bundle.lock().unwrap().clone();
                     if let Some(bundle) = active_bundle
                         && bundle.version <= version
@@ -901,7 +995,7 @@ impl MasterCoordinator {
                             version = next_version,
                             "Republishing the active bundle above the divergent version"
                         );
-                        if let Err(e) = self.update_bundle(rebased) {
+                        if let Err(e) = self.update_bundle_async(rebased).await {
                             error!(
                                 instance = %slave_instance,
                                 version = next_version,
@@ -992,6 +1086,9 @@ pub fn spawn_master_server(
     coordinator = coordinator.with_ping_interval_secs(ha_config.ping_interval_secs);
     tokio::spawn(async move {
         if ha_config.replication_port == 0 {
+            coordinator
+                .metrics
+                .inc_ha_startup_noop("master", "replication_disabled");
             info!("Master HA replication is disabled (replication_port is 0)");
             return;
         }
@@ -1008,6 +1105,9 @@ pub fn spawn_master_server(
             ) {
                 Ok(cfg) => Some(TlsAcceptor::from(cfg)),
                 Err(e) => {
+                    coordinator
+                        .metrics
+                        .inc_ha_startup_noop("master", "tls_init_failed");
                     error!("Failed to initialize mTLS for master HA replication server: {e}");
                     return;
                 }
@@ -1026,6 +1126,9 @@ pub fn spawn_master_server(
         let listener = match TcpListener::bind(&listen_addr).await {
             Ok(l) => l,
             Err(e) => {
+                coordinator
+                    .metrics
+                    .inc_ha_startup_noop("master", "bind_failed");
                 error!("Failed to bind master HA replication listener on '{listen_addr}': {e}");
                 return;
             }
@@ -1202,6 +1305,12 @@ mod tests {
         assert_eq!(first.restore_state().unwrap(), None);
         assert_eq!(first.update_bundle(test_bundle(1)).unwrap(), 1);
         assert_eq!(first.update_bundle(test_bundle(2)).unwrap(), 2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&state_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "persisted HA state must remain owner-only");
+        }
 
         // Simulate a restart: the same signing key and state path must resume
         // at v2 instead of resetting to v1 (which slaves reject as a rollback).
@@ -1227,9 +1336,206 @@ mod tests {
         )
         .with_state_path(state_path.clone());
         assert_eq!(third.restore_state().unwrap(), None);
+        let corrupt_backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("ha_state.corrupt.")
+            })
+            .collect();
+        assert_eq!(
+            corrupt_backups.len(),
+            1,
+            "corrupt state must be moved aside instead of deleted"
+        );
         assert_eq!(third.update_bundle(test_bundle(1)).unwrap(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_async_persist_roundtrip_and_permissions() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_async_state_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("ha_state.toml");
+        let coordinator = test_coordinator().with_state_path(state_path.clone());
+
+        assert_eq!(
+            coordinator
+                .update_bundle_async(test_bundle(4))
+                .await
+                .unwrap(),
+            4
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&state_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "async state writes must stay owner-only");
+        }
+        assert!(
+            !state_path.with_extension("tmp").exists(),
+            "the temporary file must be renamed away"
+        );
+
+        let restored = test_coordinator().with_state_path(state_path);
+        assert_eq!(restored.restore_state().unwrap(), Some(4));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a current-thread runtime a synchronous state write would starve the
+    /// ticker; `spawn_blocking` keeps the runtime responsive.
+    #[tokio::test]
+    async fn test_state_write_does_not_block_runtime() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_nonblocking_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let coordinator = test_coordinator().with_state_path(dir.join("ha_state.toml"));
+
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticker_ticks = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                ticker_ticks.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        // Let the ticker start before measuring.
+        tokio::task::yield_now().await;
+        let before = ticks.load(Ordering::Relaxed);
+
+        // A large payload makes the blocking write long enough to observe.
+        let mut big_bundle = test_bundle(2);
+        big_bundle.config_toml = "x".repeat(16 * 1024 * 1024);
+        coordinator.update_bundle_async(big_bundle).await.unwrap();
+        let after = ticks.load(Ordering::Relaxed);
+
+        ticker.abort();
+        assert!(
+            after > before,
+            "the tokio runtime must keep ticking while HA state is written (before={before}, after={after})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_persist_failure_propagates() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_persist_fail_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A regular file where the state directory should be makes every
+        // create_dir_all/write attempt fail deterministically.
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"blocked").unwrap();
+        let coordinator = test_coordinator().with_state_path(blocker.join("ha_state.toml"));
+
+        let err = coordinator
+            .update_bundle_async(test_bundle(2))
+            .await
+            .expect_err("a failed state write must not be reported as success");
+        assert!(
+            matches!(err, HaError::Io(_)),
+            "expected an I/O error, got {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_master_replication_disabled_records_startup_noop() {
+        let coordinator = test_coordinator();
+        let metrics = coordinator.metrics.clone();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_master_server(
+            HaConfig {
+                replication_port: 0,
+                ..Default::default()
+            },
+            coordinator,
+            shutdown_rx,
+        );
+        handle.await.unwrap();
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(
+                r#"sito_ha_startup_noop_total{role="master",reason="replication_disabled"} 1"#
+            ),
+            "the disabled listener must be observable: {rendered}"
+        );
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn test_master_bind_failure_records_startup_noop() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        let coordinator = test_coordinator();
+        let metrics = coordinator.metrics.clone();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_master_server(
+            HaConfig {
+                replication_port: port,
+                listen_addr: "127.0.0.1".to_string(),
+                allow_insecure_ws: true,
+                slave_token: Some("tok".to_string()),
+                ..Default::default()
+            },
+            coordinator,
+            shutdown_rx,
+        );
+        handle.await.unwrap();
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered
+                .contains(r#"sito_ha_startup_noop_total{role="master",reason="bind_failed"} 1"#),
+            "a listener bind failure must be observable: {rendered}"
+        );
+        drop(probe);
+    }
+
+    #[tokio::test]
+    async fn test_master_tls_init_failure_records_startup_noop() {
+        let coordinator = test_coordinator();
+        let metrics = coordinator.metrics.clone();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_master_server(
+            HaConfig {
+                replication_port: 1,
+                listen_addr: "127.0.0.1".to_string(),
+                cert: Some(PathBuf::from("/nonexistent/sito-master.crt")),
+                key: Some(PathBuf::from("/nonexistent/sito-master.key")),
+                pinned_slave_fingerprints: vec!["blake3:deadbeef".to_string()],
+                ..Default::default()
+            },
+            coordinator,
+            shutdown_rx,
+        );
+        handle.await.unwrap();
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(
+                r#"sito_ha_startup_noop_total{role="master",reason="tls_init_failed"} 1"#
+            ),
+            "a TLS init failure must be observable: {rendered}"
+        );
     }
 
     #[tokio::test]
@@ -1313,8 +1619,8 @@ mod tests {
         assert!(!coordinator.slaves.lock().unwrap().contains_key("slave-1"));
     }
 
-    #[test]
-    fn test_stale_repushes_are_cleaned_up_on_disconnect() {
+    #[tokio::test]
+    async fn test_stale_repushes_are_cleaned_up_on_disconnect() {
         let coordinator = test_coordinator();
         coordinator.update_bundle(test_bundle(2)).unwrap();
 
@@ -1342,7 +1648,7 @@ mod tests {
         }
         .to_json()
         .unwrap();
-        assert!(coordinator.process_slave_msg("slave-1", 7, &ack));
+        assert!(coordinator.process_slave_msg("slave-1", 7, &ack).await);
         assert_eq!(
             coordinator.stale_repushes.lock().unwrap().get("slave-1"),
             Some(&1),
@@ -1479,8 +1785,8 @@ mod tests {
         session.abort();
     }
 
-    #[test]
-    fn test_slave_ahead_ack_marks_diverged_and_republishes() {
+    #[tokio::test]
+    async fn test_slave_ahead_ack_marks_diverged_and_republishes() {
         let coordinator = test_coordinator();
         coordinator.update_bundle(test_bundle(2)).unwrap();
 
@@ -1509,8 +1815,13 @@ mod tests {
         }
         .to_json()
         .unwrap();
-        assert!(coordinator.process_slave_msg("slave-1", 1, &ack));
+        assert!(coordinator.process_slave_msg("slave-1", 1, &ack).await);
         assert!(coordinator.is_diverged(), "divergence must be surfaced");
+        let rendered = coordinator.metrics.render_prometheus();
+        assert!(
+            rendered.contains(r#"sito_ha_diverged{instance="slave-1"} 1"#),
+            "the per-slave divergence gauge must be raised: {rendered}"
+        );
         let reason = coordinator.diverged_reason().unwrap();
         assert!(reason.contains("continuity"), "reason: {reason}");
         let remediated = coordinator.get_current_version();
@@ -1531,8 +1842,41 @@ mod tests {
         }
         .to_json()
         .unwrap();
-        assert!(coordinator.process_slave_msg("slave-1", 1, &ack));
+        assert!(coordinator.process_slave_msg("slave-1", 1, &ack).await);
         assert!(!coordinator.is_diverged());
+        let rendered = coordinator.metrics.render_prometheus();
+        assert!(
+            rendered.contains(r#"sito_ha_diverged{instance="slave-1"} 0"#),
+            "recovering continuity must zero the gauge: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_unregister_removes_divergence_metric_series() {
+        let coordinator = test_coordinator();
+        coordinator.metrics.set_ha_diverged("slave-1", true);
+        let (tx, _rx) = mpsc::channel::<HaMessage>(1);
+        coordinator.slaves.lock().unwrap().insert(
+            "slave-1".to_string(),
+            ActiveSlave {
+                instance: "slave-1".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 1,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+
+        assert!(coordinator.unregister_session("slave-1", 1));
+        let rendered = coordinator.metrics.render_prometheus();
+        assert!(
+            !rendered.contains(r#"sito_ha_diverged{instance="slave-1"}"#),
+            "the divergence series must be removed on disconnect: {rendered}"
+        );
     }
 
     #[test]

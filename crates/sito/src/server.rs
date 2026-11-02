@@ -676,6 +676,7 @@ fn spawn_slave_worker_after_listeners(
         return;
     };
     if ha_runtime.config.master_url.is_none() {
+        metrics.inc_ha_startup_noop("slave", "missing_master_url");
         warn!("Slave role configured without master_url; replication worker idle");
         return;
     }

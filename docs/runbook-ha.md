@@ -366,6 +366,14 @@ When a slave node fails or must be reprovisioned from bare metal:
       node (the master plus each replica's last acknowledged version). Lag is the
       difference between the master's version and a slave's reported version; it
       is not exported as a separate per-slave metric.
+    - `sito_ha_diverged{instance="..."}`: `1` while a slave acknowledged a version
+      above the master's (version continuity is broken); it returns to `0` after
+      a higher version is applied and the series disappears when the slave
+      disconnects.
+    - `sito_ha_startup_noop_total{role,reason}`: Counts HA startup paths that left
+      replication inactive (`replication_disabled`, `missing_master_url`,
+      `tls_init_failed`, `bind_failed`). A non-zero value on a node expected to
+      replicate means replication is not running.
 
 ---
 

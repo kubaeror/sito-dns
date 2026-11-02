@@ -487,6 +487,9 @@ pub fn spawn_slave_worker(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let Some(master_url) = ha_config.master_url.clone() else {
+            handles
+                .metrics
+                .inc_ha_startup_noop("slave", "missing_master_url");
             warn!("Slave role configured without master_url; replication worker idle");
             return;
         };
@@ -966,6 +969,36 @@ where
 mod tests {
     use super::*;
     use crate::bundle::build_and_sign_push;
+
+    #[tokio::test]
+    async fn test_slave_missing_master_url_records_startup_noop() {
+        let handles = test_handles(None).await;
+        let metrics = handles.metrics.clone();
+        let tracker = SlaveStatusTracker::new("slave-idle".to_string(), 0, None);
+        let (_resync_tx, resync_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let worker = spawn_slave_worker(
+            HaConfig {
+                master_url: None,
+                ..Default::default()
+            },
+            tracker,
+            handles,
+            resync_rx,
+            shutdown_rx,
+        );
+        worker.await.unwrap();
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(
+                r#"sito_ha_startup_noop_total{role="slave",reason="missing_master_url"} 1"#
+            ),
+            "an idle slave worker must be observable: {rendered}"
+        );
+        let _ = shutdown_tx.send(true);
+    }
 
     async fn test_handles(config_path: Option<PathBuf>) -> SlaveAppHandles {
         let base_config = Config::default();

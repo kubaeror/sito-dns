@@ -136,7 +136,7 @@ impl ServerContext {
             lists: list_metadata,
         };
 
-        if let Err(e) = coordinator.update_bundle(bundle) {
+        if let Err(e) = coordinator.update_bundle_async(bundle).await {
             tracing::error!(
                 version = new_version,
                 "Failed to update HA bundle and broadcast to slaves: {e}"

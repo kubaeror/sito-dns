@@ -14,7 +14,7 @@ Each phase has its own file with: scope (in/out), tasks, coding-agent prompts, t
 | M5 | `m5-api-data.md` | REST API, auth, SQLite, Prometheus | 3 wk | M4 |
 | M6 | `m6-ui.md` | React panel + wizard | 5 wk | M5 (API); may start parallel to M2 |
 | M7 | `m7-doq-doh3-extras.md` | DoQ, DoH3, anti-bypass, ACME | 3 wk | M3, M4 |
-| M8 | `m8-ha.md` | Master/slave replication | 3 wk | M5 |
+| M8 | `m8-ha.md` | Master/slave replication (historical; see `docs/runbook-ha.md`) | 3 wk | M5 |
 | M9 | `m9-hardening-1-0.md` | Fuzzing, perf, 1.0 release | 4 wk | all |
 
 ## Dependency graph

@@ -1,5 +1,7 @@
 # Phase M8 — HA Master/Slave (3 weeks)
 
+> **Historical phase document.** It records what M8 set out to build and how it was verified at the time; `docs/runbook-ha.md` is authoritative for current HA behavior and operations.
+
 Goal: one master, config changes flowing automatically to slaves — including two instances on one machine. References: plan section 11 (protocol, security, topologies).
 
 ## Scope
@@ -19,7 +21,7 @@ Goal: one master, config changes flowing automatically to slaves — including t
 
 - Messages from section 11.1 (serde, `tag = "type"`); protocol versioning (`"v": 1`)
 - Bundle build: config.toml without `[ha]`/`server.instance_name` + custom rules + rewrites + clients/groups + list metadata (URLs, not content — section 11.2)
-- Secrets: `${SECRET:name}` placeholders; the slave substitutes from local env/files; a missing local secret → instance starts, but the feature is marked Degraded + alert
+- Secrets: `${SECRET:name}` placeholders; the slave substitutes from the process environment only (`DNSD_SECRET_<NAME>`, then `<NAME>`), because there is no file-backed secret store. A push referencing a missing secret is rejected and the slave enters Degraded rather than silently substituting an empty credential.
 - Signature: ed25519 over `blake3(payload)`; verify signature and version monotonicity before apply
 
 ### 3. Apply on the slave
@@ -30,7 +32,7 @@ Goal: one master, config changes flowing automatically to slaves — including t
 
 ### 4. Stats and read-only
 
-- `stats_report` every 30 s; master merges under the `instance` label (metrics 14.2 + `sito_ha_*`)
+- `stats_report` every 30 s; the master stores the latest report per slave (`last_stats`) and exposes it through `GET /api/v1/ha/slaves`. Replica counters are not merged into the master's Prometheus registry; scrape each replica's `/metrics` separately.
 - Middleware on the slave: mutating methods beyond `/status`, `/metrics`, `/auth` → `409` + `X-Dnsd-Master` header; UI shows the read-only badge (hook from M6.1)
 - Endpoints `/ha/status`, `/ha/slaves` (versions, lag, last ack), `/ha/resync`
 
@@ -90,7 +92,7 @@ Phase M8 — High Availability (HA) Master/Slave has been fully implemented, int
   - Config bundle sanitization with secret redaction (`${SECRET:name}` placeholders), automated security scanning against plaintext secret leaks, and substitution on slave.
   - Resilient mTLS WebSocket transport with rustls 0.23 custom pinned verifiers and exponential backoff (1s -> 60s with ±20% jitter).
   - Robust slave state machine (`Connecting` -> `HelloSent` -> `Synced` <-> `Applying` -> `Synced`/`Degraded`) with staging and rollback safety preserving uninterrupted DNS resolution.
-  - `MasterCoordinator` for push broadcast, slave tracking, and Prometheus metrics tracking (`sito_ha_slaves_connected`, `sito_ha_config_version`, `sito_ha_replication_lag_seconds`).
+  - `MasterCoordinator` for push broadcast, slave tracking, and Prometheus metrics tracking (`sito_ha_slaves_connected`, `sito_ha_config_version`, `sito_ha_diverged`, `sito_ha_startup_noop_total`).
 - **`sito-api` Integration**:
   - Live REST API handlers for `GET /api/v1/ha/status`, `GET /api/v1/ha/slaves`, and `POST /api/v1/ha/resync`.
   - `slave_read_only_middleware`: intercepting mutating methods on slave nodes outside `/api/v1/auth/*` and `/api/v1/ha/resync`, returning HTTP `409 Conflict` with `X-Dnsd-Master: <master_url>` header and RFC 7807 problem details.
@@ -103,15 +105,18 @@ Phase M8 — High Availability (HA) Master/Slave has been fully implemented, int
 ### 2. Quality Verification
 - `cargo fmt --check`: PASSED.
 - `cargo clippy --workspace --all-features -- -D warnings`: PASSED with 0 warnings across all 14 crates.
-- `cargo test --test m8_acceptance`: 10/10 acceptance tests passing cleanly:
-  1. `test_m8_gen_certs_cli_and_pinning`: OK
-  2. `test_m8_mtls_handshake_rejects_foreign_cert`: OK
-  3. `test_m8_secret_redaction_security_scanner`: OK
-  4. `test_m8_monotonicity_guard_rejects_replay`: OK
-  5. `test_m8_slave_rollback_on_invalid_bundle`: OK
-  6. `test_m8_slave_read_only_enforcement`: OK
-  7. `test_m8_ha_rest_api_endpoints`: OK
-  8. `test_m8_list_change_applied_to_two_slaves_fast`: OK (<2s synchronization)
-  9. `test_m8_chaos_master_mid_push_kill`: OK
-  10. `test_m8_slave_to_master_promotion_procedure`: OK
+- `cargo test -p sito-test --test m8_acceptance`: the full acceptance suite passes; current cases include:
+  1. `test_m8_gen_certs_cli_and_pinning`
+  2. `test_m8_mtls_handshake_rejects_foreign_cert`
+  3. `test_m8_secret_redaction_security_scanner`
+  4. `test_m8_monotonicity_guard_rejects_replay`
+  5. `test_m8_slave_rollback_on_invalid_bundle`
+  6. `test_m8_slave_read_only_enforcement`
+  7. `test_m8_ha_rest_api_endpoints`
+  8. `test_m8_list_change_applied_to_two_slaves_fast` (<2 s synchronization)
+  9. `test_m8_push_applies_upstream_and_dnssec_without_watcher`
+  10. `test_m8_push_before_listeners_fails_and_retries_after_ready`
+  11. `test_m8_chaos_master_mid_push_kill`
+  12. `test_m8_slave_to_master_promotion_procedure`
+  13. `test_m8_master_api_mutation_publishes_bundle`
 - `cargo deny check`: PASSED (advisories ok, bans ok, licenses ok, sources ok).
