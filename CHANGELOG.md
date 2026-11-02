@@ -49,8 +49,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   restoring both is equivalent to the old plaintext file, while restoring only
   one is a lockout. A missing or wrong key, or a failed decryption, refuses
   startup instead of silently disabling 2FA. An HA slave keeps its own
-  `totp.key`; `users.toml` is never replicated. `TotpConfig` and the one-time
-  setup response now redact secrets in `Debug` output.
+  `totp.key`; `users.toml` is never replicated. Recovery copies
+  (`users.toml.reset.*.bak`) are sanitized before being retained, and an
+  unparseable `users.toml` is no longer copied raw. `TotpConfig` and the
+  one-time setup response now redact secrets in `Debug` output.
 - **DNSSEC cold-start signature stripping**: a response without RRSIGs is now
   probed from the configured trust anchor even when the zone was never seen
   signed in this process. An authenticated DS turns the response into

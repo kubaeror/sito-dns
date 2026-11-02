@@ -111,11 +111,10 @@ struct FailureWindow {
 #[derive(Debug, thiserror::Error)]
 pub enum AuthStorageError {
     #[error(
-        "Corrupt users file '{path}': {source}. Corrupt file backed up to '{backup_path}'. Refusing to start to prevent unauthorized bootstrap; use `sito reset-admin` to recover."
+        "Corrupt users file '{path}': {source}. The corrupt file was not retained because it may contain plaintext TOTP secrets. Refusing to start to prevent unauthorized bootstrap; use `sito reset-admin` to recover."
     )]
     CorruptUsersFile {
         path: PathBuf,
-        backup_path: PathBuf,
         #[source]
         source: Box<toml::de::Error>,
     },
@@ -258,6 +257,65 @@ fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
 /// Atomically writes a secret file with owner-only permissions, logging errors.
 fn atomic_write_secret(path: &Path, content: &str) {
     let _ = write_secret_file(path, content);
+}
+
+/// Writes a sanitized copy of `users.toml` to `backup_path`.
+///
+/// Recovery copies must not reintroduce the plaintext-at-rest problem the
+/// encrypted store fixes: legacy plaintext TOTP secrets are sealed before the
+/// backup is written. An unparseable source is never copied raw; the function
+/// logs a value-free warning and removes any pre-existing copy at
+/// `backup_path`.
+///
+/// Returns `Ok(true)` when a sanitized backup was written, `Ok(false)` when the
+/// source was unparseable and no backup was retained.
+fn write_sanitized_users_backup(
+    source: &Path,
+    backup_path: &Path,
+    store: &TotpSecretStore,
+) -> Result<bool, AuthStorageError> {
+    let content = std::fs::read_to_string(source).map_err(|e| AuthStorageError::Io {
+        path: source.to_path_buf(),
+        source: e,
+    })?;
+
+    let mut file: UsersFile = if let Ok(file) = toml::from_str(&content) {
+        file
+    } else {
+        tracing::warn!(
+            source = %source.display(),
+            "Users file is unparseable; not retaining a backup because it may contain plaintext TOTP secrets"
+        );
+        // Never leave a raw copy from an earlier attempt behind.
+        let _ = std::fs::remove_file(backup_path);
+        return Ok(false);
+    };
+
+    for user in &mut file.users {
+        let username = user.username.clone();
+        let Some(totp) = user.totp.as_mut() else {
+            continue;
+        };
+        if TotpSecretStore::is_encrypted(&totp.secret) {
+            continue;
+        }
+        totp.secret = store.seal(&username, &totp.secret).map_err(|e| {
+            AuthStorageError::TotpSecretEncrypt {
+                username,
+                reason: e.to_string(),
+            }
+        })?;
+    }
+
+    let toml_str = toml::to_string_pretty(&file).map_err(|e| AuthStorageError::Serialize {
+        path: backup_path.to_path_buf(),
+        source: Box::new(e),
+    })?;
+    write_secret_file(backup_path, &toml_str).map_err(|e| AuthStorageError::Io {
+        path: backup_path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(true)
 }
 
 /// Path of the file holding the global user-secret generation counter.
@@ -503,38 +561,20 @@ impl AuthManager {
                 let file: UsersFile = match toml::from_str(&content) {
                     Ok(f) => f,
                     Err(e) => {
-                        let timestamp = chrono::Utc::now().timestamp();
-                        let backup_name = format!(
-                            "{}.corrupt.{}.bak",
-                            path.file_name().unwrap_or_default().to_string_lossy(),
-                            timestamp
+                        // Do not retain a raw copy: an unparseable file may still
+                        // contain legacy plaintext TOTP secrets.
+                        tracing::warn!(
+                            path = %path.display(),
+                            "Corrupt users file detected; not retaining a backup because it may contain plaintext TOTP secrets"
                         );
-                        let backup_path = path.with_file_name(backup_name);
-                        if let Err(copy_err) = std::fs::copy(path, &backup_path) {
-                            tracing::error!(
-                                source = %path.display(),
-                                dest = %backup_path.display(),
-                                error = %copy_err,
-                                "Failed to back up corrupt users file"
-                            );
-                        } else {
-                            tracing::warn!(
-                                source = %path.display(),
-                                backup = %backup_path.display(),
-                                "Backed up corrupt users file"
-                            );
-                        }
-
                         tracing::error!(
                             path = %path.display(),
-                            backup = %backup_path.display(),
                             error = %e,
                             "Corrupt users file detected; refusing to start"
                         );
 
                         return Err(AuthStorageError::CorruptUsersFile {
                             path: path.clone(),
-                            backup_path,
                             source: Box::new(e),
                         });
                     }
@@ -683,6 +723,9 @@ impl AuthManager {
         new_password: &str,
     ) -> std::io::Result<PathBuf> {
         let path = data_dir.as_ref().join("users.toml");
+        // Resolve the key before copying anything: a recovery backup must never
+        // retain legacy plaintext TOTP secrets.
+        let secret_store = TotpSecretStore::load_or_create(totp_key_path(&path))?;
         if path.exists() {
             let timestamp = chrono::Utc::now().timestamp();
             let backup_name = format!(
@@ -691,7 +734,19 @@ impl AuthManager {
                 timestamp
             );
             let backup_path = path.with_file_name(backup_name);
-            let _ = std::fs::copy(&path, &backup_path);
+            match write_sanitized_users_backup(&path, &backup_path, &secret_store) {
+                Ok(true) => tracing::warn!(
+                    source = %path.display(),
+                    backup = %backup_path.display(),
+                    "Backed up users file with TOTP secrets sealed"
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::error!(
+                    source = %path.display(),
+                    error = %e,
+                    "Failed to write sanitized users backup; no backup retained"
+                ),
+            }
         }
         // Rotate the user-secret generation *before* installing the new
         // credentials so every live session and API token is rejected as soon
@@ -729,7 +784,7 @@ impl AuthManager {
             // A reset replaces the account store; reuse an existing key so
             // backups of the previous users file stay decryptable, or create
             // one when the key was lost (the reset is the documented recovery).
-            secret_store: Some(TotpSecretStore::load_or_create(totp_key_path(&path))?),
+            secret_store: Some(secret_store),
         };
         mgr.create_user_internal("admin", new_password, Role::Admin);
         mgr.save_users();
@@ -2208,31 +2263,159 @@ mod tests {
     }
 
     #[test]
-    fn test_corrupt_users_file_creates_backup_and_refuses_to_start() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("sito_auth_corrupt_test_{}", rand::random::<u64>()));
-        let _ = std::fs::create_dir_all(&temp_dir);
+    fn test_corrupt_users_file_is_not_backed_up_and_refuses_to_start() {
+        let temp_dir = auth_temp_dir("corrupt");
         let users_file = temp_dir.join("users.toml");
-        let corrupt_content = "[[users]]\nusername = 'admin'\npassword_hash = invalid_syntax\n";
-        std::fs::write(&users_file, corrupt_content).unwrap();
+        let plaintext = "JBSWY3DPEHPK3PXP";
+        let corrupt_content = format!(
+            "[[users]]\nusername = 'admin'\npassword_hash = invalid_syntax\n\
+             [users.totp]\nenabled = true\nsecret = '{plaintext}'\n\
+             backup_code_hashes = []\nbroken = [\n"
+        );
+        std::fs::write(&users_file, &corrupt_content).unwrap();
 
-        let res = AuthManager::with_storage(&temp_dir, 24, 5);
-        match res {
-            Err(AuthStorageError::CorruptUsersFile {
-                path,
-                backup_path,
-                source: _,
-            }) => {
+        match AuthManager::with_storage(&temp_dir, 24, 5) {
+            Err(AuthStorageError::CorruptUsersFile { path, source: _ }) => {
                 assert_eq!(path, users_file);
-                assert!(backup_path.exists());
-                let backup_content = std::fs::read_to_string(&backup_path).unwrap();
-                assert_eq!(backup_content, corrupt_content);
             }
             Ok(_) => panic!("Expected Err(CorruptUsersFile), got Ok"),
             Err(other) => panic!("Expected CorruptUsersFile, got {other:?}"),
         }
 
+        // A corrupt file may still contain legacy plaintext TOTP secrets, so
+        // it must never be retained as a raw backup.
+        let backups: Vec<_> = std::fs::read_dir(&temp_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt."))
+            .collect();
+        assert!(
+            backups.is_empty(),
+            "corrupt users files must not be backed up raw"
+        );
+        for entry in std::fs::read_dir(&temp_dir).unwrap().filter_map(Result::ok) {
+            if entry.path() == users_file {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                assert!(
+                    !text.contains(plaintext),
+                    "recovery file {} leaked the legacy TOTP secret",
+                    entry.path().display()
+                );
+            }
+        }
+
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_reset_admin_backup_seals_legacy_plaintext() {
+        let dir = auth_temp_dir("reset_backup_plaintext");
+        let plaintext;
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            enable_totp(&mgr, "admin").await;
+            plaintext = in_memory_totp_secret(&mgr, "admin");
+        }
+
+        // Restore a pre-1.9 plaintext secret without starting the manager, so
+        // the reset itself is the first code path to see this file.
+        let users_file = dir.join("users.toml");
+        let raw = std::fs::read_to_string(&users_file).unwrap();
+        let parsed: UsersFile = toml::from_str(&raw).unwrap();
+        let sealed = parsed
+            .users
+            .iter()
+            .find(|u| u.username == "admin")
+            .and_then(|u| u.totp.as_ref())
+            .expect("stored TOTP config")
+            .secret
+            .clone();
+        let legacy = raw.replace(&sealed, &plaintext);
+        assert!(legacy.contains(&plaintext));
+        std::fs::write(&users_file, &legacy).unwrap();
+
+        AuthManager::reset_admin_credentials(&dir, "resetpassword1").unwrap();
+
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                let name = p.file_name().unwrap_or_default().to_string_lossy();
+                name.starts_with("users.toml.reset.") && name.ends_with(".bak")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "reset must retain one sanitized backup");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "recovery backup must be owner-only");
+        }
+        let backup_raw = std::fs::read_to_string(&backups[0]).unwrap();
+        assert!(
+            !backup_raw.contains(&plaintext),
+            "reset backup leaked the legacy plaintext TOTP secret"
+        );
+        let backup: UsersFile = toml::from_str(&backup_raw).unwrap();
+        let backup_secret = backup
+            .users
+            .iter()
+            .find(|u| u.username == "admin")
+            .and_then(|u| u.totp.as_ref())
+            .expect("backup keeps the TOTP config")
+            .secret
+            .clone();
+        assert!(backup_secret.starts_with("enc:v1:"));
+
+        // The live store is the freshly reset account and contains no TOTP.
+        let current = std::fs::read_to_string(&users_file).unwrap();
+        assert!(!current.contains(&plaintext));
+        assert!(!current.contains("enc:v1:"));
+
+        // No temporary files left by either atomic write.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("users.tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left behind");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reset_admin_skips_backup_for_unparseable_users_file() {
+        let dir = auth_temp_dir("reset_backup_corrupt");
+        let plaintext = "JBSWY3DPEHPK3PXP";
+        let corrupt_content = format!(
+            "[[users]]\nusername = 'admin'\npassword_hash = invalid_syntax\n\
+             [users.totp]\nenabled = true\nsecret = '{plaintext}'\n\
+             backup_code_hashes = []\nbroken = [\n"
+        );
+        std::fs::write(dir.join("users.toml"), corrupt_content).unwrap();
+
+        AuthManager::reset_admin_credentials(&dir, "resetpassword1").unwrap();
+
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                let name = p.file_name().unwrap_or_default().to_string_lossy();
+                name.starts_with("users.toml.reset.") && name.ends_with(".bak")
+            })
+            .collect();
+        assert!(
+            backups.is_empty(),
+            "unparseable users file must not be retained as a backup"
+        );
+        let current = std::fs::read_to_string(dir.join("users.toml")).unwrap();
+        assert!(!current.contains(plaintext));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2608,11 +2791,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("users.toml.tmp")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with("users.tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temporary files left behind");
 
@@ -2659,6 +2838,17 @@ mod tests {
         assert!(
             !migrated.contains(&plaintext),
             "migration must not leave the plaintext secret behind"
+        );
+
+        // The migration's atomic rewrite must not leave a temp file behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("users.tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "migration left temporary files behind"
         );
 
         // The account still logs in with its remaining backup code.
