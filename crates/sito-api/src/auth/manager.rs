@@ -246,13 +246,34 @@ async fn verify_password_blocking(password: String, hash: String) -> bool {
 pub(crate) static SECRET_WRITE_THREADS: Mutex<Vec<(PathBuf, std::thread::ThreadId)>> =
     Mutex::new(Vec::new());
 
+/// Test-only one-shot delays for the next write of a matching path. Tests use
+/// this to widen a real persistence interleaving (a slow filesystem) without
+/// changing production behavior.
+#[cfg(test)]
+pub(crate) static SECRET_WRITE_DELAYS: Mutex<Vec<(PathBuf, std::time::Duration)>> =
+    Mutex::new(Vec::new());
+
 /// Atomically writes a secret file with owner-only permissions.
 fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
     #[cfg(test)]
-    SECRET_WRITE_THREADS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .push((path.to_path_buf(), std::thread::current().id()));
+    {
+        let delay = {
+            let mut delays = SECRET_WRITE_DELAYS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            delays
+                .iter()
+                .position(|(delayed_path, _)| delayed_path == path)
+                .map(|index| delays.remove(index).1)
+        };
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
+        SECRET_WRITE_THREADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path.to_path_buf(), std::thread::current().id()));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -430,6 +451,11 @@ pub struct AuthManager {
     /// Serializes second-factor verification so a backup code cannot be
     /// consumed by two concurrent requests.
     totp_verification_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes snapshot + persist of the auth state files so a stale
+    /// snapshot can never overwrite a newer revocation/creation on disk.
+    /// Held only across the snapshot and its `spawn_blocking` write; callers
+    /// must not nest `save_*_async` calls while it is held.
+    persist_lock: Arc<tokio::sync::Mutex<()>>,
     users_path: Option<PathBuf>,
     sessions_path: Option<PathBuf>,
     tokens_path: Option<PathBuf>,
@@ -572,6 +598,7 @@ impl AuthManager {
             setup_token_failures: Arc::new(Mutex::new(HashMap::new())),
             setup_pending_warned: Arc::new(AtomicBool::new(false)),
             totp_verification_lock: Arc::new(tokio::sync::Mutex::new(())),
+            persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             users_path,
             sessions_path,
             tokens_path,
@@ -832,6 +859,7 @@ impl AuthManager {
             setup_token_failures: Arc::new(Mutex::new(HashMap::new())),
             setup_pending_warned: Arc::new(AtomicBool::new(false)),
             totp_verification_lock: Arc::new(tokio::sync::Mutex::new(())),
+            persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             users_path: Some(path.clone()),
             sessions_path: None,
             tokens_path: None,
@@ -900,7 +928,12 @@ impl AuthManager {
 
     /// Persists users on the blocking pool so async handlers never perform
     /// blocking file IO on the runtime worker.
+    ///
+    /// The snapshot is taken while holding `persist_lock` and the lock is held
+    /// until the write finishes, so a stale snapshot cannot land after a newer
+    /// one.
     async fn save_users_async(&self) {
+        let _persist = self.persist_lock.lock().await;
         let (path, toml_str) = match self.users_toml() {
             Ok(Some(entry)) => entry,
             Ok(None) => return,
@@ -946,6 +979,7 @@ impl AuthManager {
     /// Persists sessions on the blocking pool so async handlers never perform
     /// blocking file IO on the runtime worker.
     async fn save_sessions_async(&self) {
+        let _persist = self.persist_lock.lock().await;
         let Some((path, toml_str)) = self.sessions_toml() else {
             self.sessions_dirty.store(false, Ordering::SeqCst);
             return;
@@ -964,6 +998,7 @@ impl AuthManager {
     /// the write and cleared only after success, so a failed write is retried
     /// by the pruner.
     async fn save_tokens_async(&self) {
+        let _persist = self.persist_lock.lock().await;
         let Some((path, toml_str)) = self.tokens_toml() else {
             self.tokens_dirty.store(false, Ordering::SeqCst);
             return;
@@ -1359,19 +1394,34 @@ impl AuthManager {
             tracing::error!(user = username, "Failed to hash password for new user");
             return;
         };
-        if username == "admin" {
-            self.default_admin_active
-                .store(is_default, Ordering::SeqCst);
-        }
         let user = UserAccount {
             username: username.to_string(),
             password_hash: hash,
             role,
             totp: None,
         };
-        let existed = lock(&self.users)
-            .insert(username.to_string(), user)
-            .is_some();
+        let existed = {
+            let mut users = lock(&self.users);
+            if let Some(existing) = users.get(username)
+                && existing.role == Role::Admin
+                && role != Role::Admin
+                && users.values().filter(|u| u.role == Role::Admin).count() <= 1
+            {
+                // The internal create path can overwrite an existing
+                // account. Never let that remove the sole remaining Admin,
+                // even though request handlers already reject duplicates.
+                tracing::error!(
+                    user = %username,
+                    "Refusing to overwrite the last remaining Admin with a non-Admin role"
+                );
+                return;
+            }
+            users.insert(username.to_string(), user).is_some()
+        };
+        if username == "admin" {
+            self.default_admin_active
+                .store(is_default, Ordering::SeqCst);
+        }
         if existed {
             // Overwriting an account (new password/role) revokes its sessions
             // and credentials so the previous identity cannot keep access.
@@ -3602,6 +3652,134 @@ mod tests {
             1,
             "concurrent demote/delete must leave at least one Admin"
         );
+    }
+
+    /// Overwriting an existing account must not be able to remove the sole
+    /// remaining Admin, even through the internal (non-handler) path.
+    #[tokio::test]
+    async fn test_create_user_cannot_overwrite_sole_admin_with_non_admin_role() {
+        for role in [Role::Viewer, Role::Operator] {
+            let mgr = AuthManager::new();
+            assert_eq!(mgr.admin_count(), 1);
+            assert!(mgr.is_default_admin_active());
+
+            mgr.create_user("admin", "ReplacementPass1", role).await;
+
+            assert_eq!(
+                mgr.role_of("admin"),
+                Some(Role::Admin),
+                "a blocked overwrite must leave the Admin role unchanged ({role:?})"
+            );
+            assert_eq!(
+                mgr.admin_count(),
+                1,
+                "a blocked overwrite must leave exactly one Admin ({role:?})"
+            );
+            assert!(
+                mgr.is_default_admin_active(),
+                "a blocked overwrite must not change the default-admin flag ({role:?})"
+            );
+            assert!(
+                matches!(
+                    mgr.login("admin", "adminadmin", "127.0.0.1").await,
+                    LoginResult::Success(_)
+                ),
+                "a blocked overwrite must not change the password ({role:?})"
+            );
+        }
+    }
+
+    /// Concurrent create/delete writes must not let an older snapshot land
+    /// after a newer one: the persisted file must match the final in-memory
+    /// state (no resurrected deletions, no lost creations).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_token_mutations_persist_final_state() {
+        const MUTATIONS: usize = 30;
+        let dir = auth_temp_dir("concurrent_token_persist");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+
+        let mut seeded = Vec::with_capacity(MUTATIONS);
+        for i in 0..MUTATIONS {
+            let (meta, _resp) = mgr
+                .create_token(&format!("seed-{i}"), Role::Viewer, None)
+                .await
+                .expect("seed token");
+            seeded.push(meta.id);
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(MUTATIONS * 2));
+        // Model a slow disk for the first concurrent write so an older
+        // snapshot can complete after newer ones if writes are not serialized.
+        SECRET_WRITE_DELAYS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((dir.join("tokens.toml"), Duration::from_millis(300)));
+        let mut tasks = Vec::with_capacity(MUTATIONS * 2);
+        for id in seeded {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                assert!(mgr.delete_token(&id).await, "seeded token must be deleted");
+            }));
+        }
+        for i in 0..MUTATIONS {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                mgr.create_token(&format!("new-{i}"), Role::Viewer, None)
+                    .await
+                    .expect("new token");
+            }));
+        }
+        for task in tasks {
+            task.await.expect("token mutation task");
+        }
+
+        let mut expected: Vec<(String, String)> = mgr
+            .list_tokens()
+            .into_iter()
+            .map(|token| (token.id, token.name))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            expected.len(),
+            MUTATIONS,
+            "only the newly created tokens should remain"
+        );
+        assert!(
+            expected.iter().all(|(_, name)| name.starts_with("new-")),
+            "no deleted seed token may remain in memory: {expected:?}"
+        );
+
+        // Read the file directly instead of relying on a reload's filtering.
+        let raw = std::fs::read_to_string(dir.join("tokens.toml")).unwrap();
+        let persisted_file: TokensFile = toml::from_str(&raw).unwrap();
+        let mut persisted: Vec<(String, String)> = persisted_file
+            .tokens
+            .into_iter()
+            .map(|token| (token.id, token.name))
+            .collect();
+        persisted.sort();
+        assert_eq!(
+            persisted, expected,
+            "tokens.toml must reflect the final in-memory state after concurrent mutations"
+        );
+
+        drop(mgr);
+        let reloaded = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        let mut after_reload: Vec<(String, String)> = reloaded
+            .list_tokens()
+            .into_iter()
+            .map(|token| (token.id, token.name))
+            .collect();
+        after_reload.sort();
+        assert_eq!(
+            after_reload, expected,
+            "a reload must reproduce the final in-memory token state"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
