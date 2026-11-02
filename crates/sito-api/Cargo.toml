@@ -12,6 +12,7 @@ argon2 = "0.6"
 arc-swap.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+base64.workspace = true
 blake3.workspace = true
 chrono.workspace = true
 flate2.workspace = true

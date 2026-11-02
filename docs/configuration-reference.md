@@ -35,7 +35,7 @@ update_require_signature = true        # require cosign-verified release signatu
 |---|---|---|---|
 | `role` | string | `"master"` | HA cluster role: `"master"` (reads/writes, replicates state) or `"slave"` (read-only replica). |
 | `instance_name` | string | `"sito-main"` | Name of this server instance, reported in metrics and logs. |
-| `data_dir` | string | `"/var/lib/sito"` | Directory where the persistent SQLite DB (`stats.db`), list caches, TLS state, and the DNSSEC chain cache (`dnssec-chain-cache.toml`, 0600) are stored. |
+| `data_dir` | string | `"/var/lib/sito"` | Directory where the persistent SQLite DB (`stats.db`), list caches, TLS state, user credentials (`users.toml`, 0600), the TOTP encryption key (`totp.key`, 0600), and the DNSSEC chain cache (`dnssec-chain-cache.toml`, 0600) are stored. |
 | `log_level` | string | `"info"` | Logging verbosity: `"trace"`, `"debug"`, `"info"`, `"warn"`, or `"error"`. |
 | `log_format` | string | `"json"` | Formatting for stdout logs: `"pretty"` (human readable with colors) or `"json"` (structured). |
 | `update_require_signature` | boolean | `true` | When `true`, in-app updates and `sito update` require a valid cosign signature (`.sig`/`.pem` assets). A signature that is present is always verified even when this is `false`; when `true`, a missing signature or missing `cosign` binary aborts the update. Set to `false` only if you intentionally accept same-origin SHA-256-only integrity. |
@@ -318,6 +318,15 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
 | `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL; corrupt stores are backed up and start empty. Use `sito reset-sessions` to invalidate everything. |
 | `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
+
+Accounts are stored in `<data_dir>/users.toml` (0600). TOTP secrets are
+encrypted at rest with AES-256-GCM using `<data_dir>/totp.key` (0600, created
+automatically). Treat `totp.key` as a credential: **back it up together with
+`users.toml`**. Restoring both is equivalent to the previous plaintext user
+store; restoring only one is a lockout. If the key is missing or does not match
+the stored secrets, the server refuses to start rather than silently disabling
+2FA (`sito reset-admin` is the recovery path). An HA slave keeps its own
+`totp.key`; `users.toml` is never replicated or included in HA bundles.
 
 Two additional `[web]` keys are read from the raw table:
 

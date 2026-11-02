@@ -3043,6 +3043,7 @@ dependencies = [
  "askama",
  "async-trait",
  "axum",
+ "base64 0.23.1",
  "blake3",
  "chrono",
  "flate2",

@@ -2,6 +2,7 @@
 
 use crate::auth::lockout::LockoutTracker;
 use crate::auth::password::{hash_password, verify_password};
+use crate::auth::secret_store::TotpSecretStore;
 use crate::auth::session::{DEFAULT_SESSION_TTL_SECS, Session};
 use crate::auth::token::{ApiTokenMeta, CreateTokenResponse, Role, generate_token, hash_token};
 use crate::auth::totp::{TotpConfig, TotpSetupResponse};
@@ -132,6 +133,38 @@ pub enum AuthStorageError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "TOTP key file '{key_path}' is missing but '{users_path}' contains encrypted TOTP secrets. Restore '{key_path}' from the same backup as 'users.toml'; restoring only one is a lockout. Refusing to start to avoid silently disabling 2FA."
+    )]
+    MissingTotpKey {
+        key_path: PathBuf,
+        users_path: PathBuf,
+    },
+    #[error(
+        "TOTP key file '{key_path}' is invalid: {reason}. Refusing to start to avoid silently disabling 2FA."
+    )]
+    InvalidTotpKey { key_path: PathBuf, reason: String },
+    #[error(
+        "Failed to decrypt the TOTP secret for user '{username}' in '{users_path}' with key '{key_path}': {reason}. Refusing to start to avoid silently disabling 2FA; restore the matching 'totp.key' or use `sito reset-admin`."
+    )]
+    TotpSecretDecrypt {
+        username: String,
+        users_path: PathBuf,
+        key_path: PathBuf,
+        reason: String,
+    },
+    #[error("Failed to encrypt the TOTP secret for user '{username}': {reason}")]
+    TotpSecretEncrypt { username: String, reason: String },
+    #[error(
+        "TOTP encryption key is unavailable while persisting '{path}'; refusing to write plaintext secrets"
+    )]
+    MissingSecretStore { path: PathBuf },
+    #[error("Failed to serialize users file '{path}': {source}")]
+    Serialize {
+        path: PathBuf,
+        #[source]
+        source: Box<toml::ser::Error>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -232,6 +265,14 @@ fn auth_generation_path(data_dir: &Path) -> PathBuf {
     data_dir.join("auth_generation")
 }
 
+/// Path of the AES-256-GCM key that protects TOTP secrets in `users.toml`.
+fn totp_key_path(users_path: &Path) -> PathBuf {
+    users_path.parent().map_or_else(
+        || users_path.with_file_name("totp.key"),
+        |dir| dir.join("totp.key"),
+    )
+}
+
 /// Reads the persisted user-secret generation (`0` when no file exists).
 fn read_auth_generation(data_dir: &Path) -> u64 {
     std::fs::read_to_string(auth_generation_path(data_dir))
@@ -303,6 +344,9 @@ pub struct AuthManager {
     token_default_ttl_days: u64,
     /// Global user-secret generation; sessions/tokens must match it to be valid.
     generation: u64,
+    /// AES-256-GCM key for TOTP secrets (`<data_dir>/totp.key`); `None` for
+    /// memory-only managers.
+    secret_store: Option<TotpSecretStore>,
 }
 
 impl Default for AuthManager {
@@ -419,7 +463,7 @@ impl AuthManager {
         };
 
         let generation = data_dir.map_or(0, read_auth_generation);
-        let mgr = Self {
+        let mut mgr = Self {
             users: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             tokens: Arc::new(Mutex::new(HashMap::new())),
@@ -440,6 +484,7 @@ impl AuthManager {
             tokens_dirty: Arc::new(AtomicBool::new(false)),
             token_default_ttl_days,
             generation,
+            secret_store: None,
         };
 
         if let Some(ref path) = mgr.users_path {
@@ -503,9 +548,67 @@ impl AuthManager {
                     return Err(AuthStorageError::EmptyUsersFile { path: path.clone() });
                 }
 
+                // Resolve the TOTP encryption key before touching the users so
+                // encrypted values can never be mistaken for plaintext.
+                let key_path = totp_key_path(path);
+                let has_encrypted_totp = file.users.iter().any(|u| {
+                    u.totp
+                        .as_ref()
+                        .is_some_and(|totp| TotpSecretStore::is_encrypted(&totp.secret))
+                });
+                let store = if has_encrypted_totp {
+                    // Encrypted secrets are useless without their key: never
+                    // generate a replacement that would silently disable 2FA.
+                    TotpSecretStore::load_existing(&key_path).map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            AuthStorageError::MissingTotpKey {
+                                key_path: key_path.clone(),
+                                users_path: path.clone(),
+                            }
+                        } else {
+                            AuthStorageError::InvalidTotpKey {
+                                key_path: key_path.clone(),
+                                reason: e.to_string(),
+                            }
+                        }
+                    })?
+                } else {
+                    TotpSecretStore::load_or_create(&key_path).map_err(|e| {
+                        AuthStorageError::Io {
+                            path: key_path.clone(),
+                            source: e,
+                        }
+                    })?
+                };
+                mgr.secret_store = Some(store);
+
+                let mut migrated_plaintext = Vec::new();
+                let mut users = file.users;
+                for user in &mut users {
+                    let Some(totp) = user.totp.as_mut() else {
+                        continue;
+                    };
+                    if TotpSecretStore::is_encrypted(&totp.secret) {
+                        let store = mgr
+                            .secret_store
+                            .as_ref()
+                            .expect("key resolved for encrypted secrets");
+                        totp.secret = store.open(&user.username, &totp.secret).map_err(|e| {
+                            AuthStorageError::TotpSecretDecrypt {
+                                username: user.username.clone(),
+                                users_path: path.clone(),
+                                key_path: store.key_path().to_path_buf(),
+                                reason: e.to_string(),
+                            }
+                        })?;
+                    } else {
+                        migrated_plaintext.push(user.username.clone());
+                    }
+                }
+
                 let (has_admin, admin_default_active) = {
                     let mut map = lock(&mgr.users);
-                    for u in file.users {
+                    for u in users {
                         map.insert(u.username.clone(), u);
                     }
                     if let Some(admin) = map.get("admin") {
@@ -514,6 +617,26 @@ impl AuthManager {
                         (false, false)
                     }
                 };
+
+                // Legacy plaintext secrets are encrypted on this startup with
+                // exactly one atomic rewrite. Warnings name the account only.
+                if !migrated_plaintext.is_empty() {
+                    let (save_path, toml_str) =
+                        mgr.users_toml()?
+                            .ok_or_else(|| AuthStorageError::MissingSecretStore {
+                                path: path.clone(),
+                            })?;
+                    write_secret_file(&save_path, &toml_str).map_err(|e| AuthStorageError::Io {
+                        path: save_path,
+                        source: e,
+                    })?;
+                    for username in &migrated_plaintext {
+                        tracing::warn!(
+                            user = %username,
+                            "migrated legacy plaintext TOTP secret"
+                        );
+                    }
+                }
                 mgr.default_admin_active
                     .store(admin_default_active, Ordering::SeqCst);
                 mgr.setup_complete
@@ -533,6 +656,13 @@ impl AuthManager {
                 );
                 return Err(AuthStorageError::MissingUsersFile { path: path.clone() });
             }
+            let key_path = totp_key_path(path);
+            mgr.secret_store = Some(TotpSecretStore::load_or_create(&key_path).map_err(|e| {
+                AuthStorageError::Io {
+                    path: key_path,
+                    source: e,
+                }
+            })?);
             mgr.create_user_internal("admin", "adminadmin", Role::Admin);
             mgr.save_users();
         } else {
@@ -596,6 +726,10 @@ impl AuthManager {
             tokens_dirty: Arc::new(AtomicBool::new(false)),
             token_default_ttl_days: 0,
             generation,
+            // A reset replaces the account store; reuse an existing key so
+            // backups of the previous users file stay decryptable, or create
+            // one when the key was lost (the reset is the documented recovery).
+            secret_store: Some(TotpSecretStore::load_or_create(totp_key_path(&path))?),
         };
         mgr.create_user_internal("admin", new_password, Role::Admin);
         mgr.save_users();
@@ -603,28 +737,64 @@ impl AuthManager {
     }
 
     /// Serializes the current user accounts to TOML, returning the target path.
-    fn users_toml(&self) -> Option<(PathBuf, String)> {
-        let path = self.users_path.clone()?;
-        let users_list: Vec<UserAccount> = {
+    ///
+    /// TOTP secrets are sealed on cloned accounts, so the in-memory plaintext
+    /// (needed to verify codes) never reaches the file. An encryption failure
+    /// is returned instead of falling back to plaintext.
+    fn users_toml(&self) -> Result<Option<(PathBuf, String)>, AuthStorageError> {
+        let Some(path) = self.users_path.clone() else {
+            return Ok(None);
+        };
+        let mut users_list: Vec<UserAccount> = {
             let users = lock(&self.users);
             users.values().cloned().collect()
         };
+        for user in &mut users_list {
+            let username = user.username.clone();
+            let Some(totp) = user.totp.as_mut() else {
+                continue;
+            };
+            if TotpSecretStore::is_encrypted(&totp.secret) {
+                continue;
+            }
+            let store = self
+                .secret_store
+                .as_ref()
+                .ok_or_else(|| AuthStorageError::MissingSecretStore { path: path.clone() })?;
+            totp.secret = store.seal(&username, &totp.secret).map_err(|e| {
+                AuthStorageError::TotpSecretEncrypt {
+                    username: username.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+        }
         let file_content = UsersFile { users: users_list };
-        let toml_str = toml::to_string_pretty(&file_content).ok()?;
-        Some((path, toml_str))
+        let toml_str =
+            toml::to_string_pretty(&file_content).map_err(|e| AuthStorageError::Serialize {
+                path: path.clone(),
+                source: Box::new(e),
+            })?;
+        Ok(Some((path, toml_str)))
     }
 
     fn save_users(&self) {
-        if let Some((path, toml_str)) = self.users_toml() {
-            atomic_write_secret(&path, &toml_str);
+        match self.users_toml() {
+            Ok(Some((path, toml_str))) => atomic_write_secret(&path, &toml_str),
+            Ok(None) => {}
+            Err(e) => tracing::error!(error = %e, "Refusing to persist users file"),
         }
     }
 
     /// Persists users on the blocking pool so async handlers never perform
     /// blocking file IO on the runtime worker.
     async fn save_users_async(&self) {
-        let Some((path, toml_str)) = self.users_toml() else {
-            return;
+        let (path, toml_str) = match self.users_toml() {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!(error = %e, "Refusing to persist users file");
+                return;
+            }
         };
         match tokio::task::spawn_blocking(move || write_secret_file(&path, &toml_str)).await {
             Ok(Ok(())) => {}
@@ -1694,6 +1864,30 @@ impl AuthManager {
 mod tests {
     use super::*;
 
+    fn auth_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sito_auth_{label}_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn in_memory_totp_secret(mgr: &AuthManager, username: &str) -> String {
+        lock(&mgr.users)
+            .get(username)
+            .and_then(|u| u.totp.as_ref())
+            .map(|t| t.secret.clone())
+            .expect("user has TOTP configured")
+    }
+
+    async fn enable_totp(mgr: &AuthManager, username: &str) -> TotpSetupResponse {
+        let setup = mgr.init_totp_setup(username).await.expect("totp setup");
+        assert!(
+            mgr.confirm_totp_setup(username, &setup.backup_codes[0])
+                .await,
+            "TOTP setup must be confirmed"
+        );
+        setup
+    }
+
     #[tokio::test]
     async fn test_auth_manager_login_and_session() {
         let mgr = AuthManager::new();
@@ -2376,6 +2570,240 @@ mod tests {
         // Unknown user.
         assert!(!mgr.set_user_role("ghost", Role::Admin));
         assert_eq!(mgr.list_users().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_users_file_encrypts_totp_secret() {
+        let dir = auth_temp_dir("totp_encrypt");
+        let plaintext;
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            let _setup = enable_totp(&mgr, "admin").await;
+            plaintext = in_memory_totp_secret(&mgr, "admin");
+            assert_ne!(plaintext, "");
+        }
+
+        let users_file = dir.join("users.toml");
+        let raw = std::fs::read_to_string(&users_file).unwrap();
+        assert!(
+            raw.contains("enc:v1:"),
+            "TOTP secret must be sealed in users.toml: {raw}"
+        );
+        assert!(
+            !raw.contains(&plaintext),
+            "users.toml must not contain the recoverable TOTP secret: {raw}"
+        );
+
+        let parsed: UsersFile = toml::from_str(&raw).unwrap();
+        let stored = parsed
+            .users
+            .iter()
+            .find(|u| u.username == "admin")
+            .and_then(|u| u.totp.as_ref())
+            .expect("stored TOTP config");
+        assert!(stored.secret.starts_with("enc:v1:"));
+        assert_ne!(stored.secret, plaintext);
+
+        // The atomic rewrite must not leave temporary files behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("users.toml.tmp")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left behind");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_plaintext_totp_secret_migrates_on_load() {
+        let dir = auth_temp_dir("totp_migrate");
+        let plaintext;
+        let backup_code;
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            let setup = enable_totp(&mgr, "admin").await;
+            plaintext = in_memory_totp_secret(&mgr, "admin");
+            backup_code = setup.backup_codes[1].clone();
+        }
+
+        // Rewrite the file as a pre-1.9 plaintext store.
+        let users_file = dir.join("users.toml");
+        let raw = std::fs::read_to_string(&users_file).unwrap();
+        let parsed: UsersFile = toml::from_str(&raw).unwrap();
+        let sealed = parsed
+            .users
+            .iter()
+            .find(|u| u.username == "admin")
+            .and_then(|u| u.totp.as_ref())
+            .expect("stored TOTP config")
+            .secret
+            .clone();
+        assert!(sealed.starts_with("enc:v1:"));
+        let legacy = raw.replace(&sealed, &plaintext);
+        assert_ne!(legacy, raw);
+        assert!(legacy.contains(&plaintext));
+        std::fs::write(&users_file, &legacy).unwrap();
+
+        // Startup migrates the legacy value and rewrites the file once.
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        let migrated = std::fs::read_to_string(&users_file).unwrap();
+        assert!(
+            migrated.contains("enc:v1:"),
+            "migration must seal the plaintext secret"
+        );
+        assert!(
+            !migrated.contains(&plaintext),
+            "migration must not leave the plaintext secret behind"
+        );
+
+        // The account still logs in with its remaining backup code.
+        let LoginResult::TotpRequired { partial_token } =
+            mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("expected TOTP required after migration");
+        };
+        match mgr
+            .verify_totp(&partial_token, &backup_code, "127.0.0.1")
+            .await
+        {
+            TotpVerifyResult::Success(session) => assert_eq!(session.username, "admin"),
+            other => panic!("expected successful login after migration, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_totp_login_survives_restart() {
+        let dir = auth_temp_dir("totp_restart");
+        let backup_code;
+        let plaintext;
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            let setup = enable_totp(&mgr, "admin").await;
+            backup_code = setup.backup_codes[1].clone();
+            plaintext = in_memory_totp_secret(&mgr, "admin");
+        }
+
+        let raw = std::fs::read_to_string(dir.join("users.toml")).unwrap();
+        assert!(raw.contains("enc:v1:"));
+        assert!(!raw.contains(&plaintext));
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        let LoginResult::TotpRequired { partial_token } =
+            mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("expected TOTP required after restart");
+        };
+        match mgr
+            .verify_totp(&partial_token, &backup_code, "127.0.0.1")
+            .await
+        {
+            TotpVerifyResult::Success(session) => assert_eq!(session.username, "admin"),
+            other => panic!("expected successful login after restart, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_missing_totp_key_refuses_start() {
+        let dir = auth_temp_dir("totp_missing_key");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            enable_totp(&mgr, "admin").await;
+        }
+
+        let key_path = dir.join("totp.key");
+        let users_path = dir.join("users.toml");
+        std::fs::remove_file(&key_path).unwrap();
+
+        match AuthManager::with_storage(&dir, 24, 5) {
+            Err(AuthStorageError::MissingTotpKey {
+                key_path: actual_key,
+                users_path: actual_users,
+            }) => {
+                assert_eq!(actual_key, key_path);
+                assert_eq!(actual_users, users_path);
+            }
+            Ok(_) => panic!("startup must fail closed when the TOTP key is missing"),
+            Err(other) => panic!("expected MissingTotpKey, got {other:?}"),
+        }
+        assert!(users_path.exists(), "the users file must not be rewritten");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_wrong_totp_key_refuses_start() {
+        let dir = auth_temp_dir("totp_wrong_key");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            enable_totp(&mgr, "admin").await;
+        }
+
+        std::fs::write(dir.join("totp.key"), [0x5au8; 32]).unwrap();
+
+        match AuthManager::with_storage(&dir, 24, 5) {
+            Err(AuthStorageError::TotpSecretDecrypt { username, .. }) => {
+                assert_eq!(username, "admin");
+            }
+            Ok(_) => panic!("startup must fail closed with the wrong TOTP key"),
+            Err(other) => panic!("expected TotpSecretDecrypt, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_totp_key_file_is_0600() {
+        let dir = auth_temp_dir("totp_key_0600");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        enable_totp(&mgr, "admin").await;
+        drop(mgr);
+
+        let key_path = dir.join("totp.key");
+        assert!(key_path.exists());
+        assert_eq!(std::fs::metadata(&key_path).unwrap().len(), 32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_totp_secret_not_in_list_users_or_debug() {
+        let mgr = AuthManager::new();
+        enable_totp(&mgr, "admin").await;
+        let secret = in_memory_totp_secret(&mgr, "admin");
+        assert_ne!(secret, "");
+
+        let json = serde_json::to_string(&mgr.list_users()).unwrap();
+        assert!(!json.contains(&secret), "list_users leaked the TOTP secret");
+        assert!(!json.contains("secret"));
+
+        let user_debug = {
+            let users = lock(&mgr.users);
+            format!("{:?}", users.get("admin").unwrap())
+        };
+        assert!(!user_debug.contains(&secret));
+        assert!(user_debug.contains("<redacted>"));
+
+        let totp_debug = {
+            let users = lock(&mgr.users);
+            format!("{:?}", users.get("admin").unwrap().totp.as_ref().unwrap())
+        };
+        assert!(!totp_debug.contains(&secret));
+        assert!(totp_debug.contains("<redacted>"));
     }
 }
 
