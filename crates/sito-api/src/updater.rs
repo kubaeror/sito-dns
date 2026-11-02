@@ -4,11 +4,13 @@
 //! archive downloading with SHA256 checksum verification, and atomic self-replacement.
 
 use flate2::read::GzDecoder;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, info};
 
 pub const DEFAULT_GITHUB_REPO: &str = "kubaeror/sito-dns";
@@ -268,25 +270,71 @@ pub fn parse_checksum_from_sums(sums_content: &str, archive_name: &str) -> Optio
     None
 }
 
+/// Returns the expected checksum for `archive_name` from the sums manifest.
+fn expected_checksum_from_sums(
+    sums_content: Option<&str>,
+    archive_name: &str,
+) -> Result<String, UpdateError> {
+    let sums = sums_content.ok_or(UpdateError::ChecksumNotFound)?;
+    parse_checksum_from_sums(sums, archive_name).ok_or(UpdateError::ChecksumNotFound)
+}
+
+fn compare_checksum(computed_hash: &str, expected_hash: &str) -> Result<(), UpdateError> {
+    if !computed_hash.eq_ignore_ascii_case(expected_hash) {
+        return Err(UpdateError::ChecksumMismatch {
+            expected: expected_hash.to_string(),
+            actual: computed_hash.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Hashes a reader with SHA-256 in fixed-size chunks so the input is never
+/// buffered in memory as a whole.
+fn hash_reader_sha256<R: Read>(reader: &mut R) -> std::io::Result<String> {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        context.update(&buffer[..read]);
+    }
+    Ok(hex::encode(context.finish().as_ref()))
+}
+
 /// Verifies that archive checksum matches expected hash from sums manifest.
+///
+/// This retains the in-memory API for callers that already hold the bytes;
+/// [`verify_archive_checksum_file`] is the streaming variant used by the
+/// updater.
 pub fn verify_archive_checksum(
     archive_bytes: &[u8],
     archive_name: &str,
     sums_content: Option<&str>,
 ) -> Result<(), UpdateError> {
-    let sums = sums_content.ok_or(UpdateError::ChecksumNotFound)?;
-    let computed_hash =
-        hex::encode(ring::digest::digest(&ring::digest::SHA256, archive_bytes).as_ref());
-    let expected_hash =
-        parse_checksum_from_sums(sums, archive_name).ok_or(UpdateError::ChecksumNotFound)?;
+    let expected_hash = expected_checksum_from_sums(sums_content, archive_name)?;
+    let mut cursor = std::io::Cursor::new(archive_bytes);
+    let computed_hash = hash_reader_sha256(&mut cursor)?;
+    compare_checksum(&computed_hash, &expected_hash)
+}
 
-    if !computed_hash.eq_ignore_ascii_case(&expected_hash) {
-        return Err(UpdateError::ChecksumMismatch {
-            expected: expected_hash,
-            actual: computed_hash,
-        });
-    }
-    Ok(())
+/// Verifies an archive on disk without reading it into memory.
+pub async fn verify_archive_checksum_file(
+    archive_path: &Path,
+    archive_name: &str,
+    sums_content: Option<&str>,
+) -> Result<(), UpdateError> {
+    let expected_hash = expected_checksum_from_sums(sums_content, archive_name)?;
+    let path = archive_path.to_path_buf();
+    let computed_hash = tokio::task::spawn_blocking(move || -> Result<String, UpdateError> {
+        let mut file = std::fs::File::open(&path)?;
+        Ok(hash_reader_sha256(&mut file)?)
+    })
+    .await
+    .map_err(|e| UpdateError::Other(format!("Checksum verification task failed: {e}")))??;
+    compare_checksum(&computed_hash, &expected_hash)
 }
 
 /// Maximum accepted release archive size (defense against oversized downloads).
@@ -457,14 +505,88 @@ fn is_allowed_download_host(url: &str) -> bool {
         || host.ends_with(".githubusercontent.com")
 }
 
+/// Removes a temporary file or directory when it goes out of scope, so every
+/// error path cleans up after itself without explicit `remove_*` calls.
+struct TempFileGuard {
+    path: PathBuf,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.path.is_dir() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        } else {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Streams a download into `dest`, aborting as soon as the response exceeds
+/// `cap` bytes. A declared `Content-Length` above the cap is rejected before
+/// the file is created; chunked responses are covered by the running total.
+async fn download_capped(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    cap: u64,
+) -> Result<(), UpdateError> {
+    let response = client.get(url).send().await?;
+
+    if let Some(declared) = response.content_length()
+        && declared > cap
+    {
+        return Err(UpdateError::Other(format!(
+            "Download from '{url}' declares {declared} bytes, exceeding the {cap}-byte limit"
+        )));
+    }
+
+    let result = write_capped_stream(response, dest, cap).await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(dest).await;
+    }
+    result
+}
+
+async fn write_capped_stream(
+    response: reqwest::Response,
+    dest: &Path,
+    cap: u64,
+) -> Result<(), UpdateError> {
+    let mut file = tokio::fs::File::create(dest).await?;
+    let mut stream = response.bytes_stream();
+    let mut total: u64 = 0;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        total = total.saturating_add(chunk.len() as u64);
+        if total > cap {
+            drop(file);
+            return Err(UpdateError::Other(format!(
+                "Download exceeded the {cap}-byte limit; aborting"
+            )));
+        }
+        file.write_all(&chunk).await?;
+    }
+
+    file.flush().await?;
+    file.sync_all().await?;
+    Ok(())
+}
+
 /// Downloads release signature assets (when present) and applies the configured
-/// signature policy to the archive bytes.
+/// signature policy to the archive on disk.
 #[allow(clippy::too_many_arguments)]
 async fn apply_signature_policy(
     client: &reqwest::Client,
     repo_name: &str,
     archive: &ReleaseAsset,
-    archive_bytes: &[u8],
+    archive_path: &Path,
     sig_asset: Option<&ReleaseAsset>,
     cert_asset: Option<&ReleaseAsset>,
     required: bool,
@@ -472,8 +594,7 @@ async fn apply_signature_policy(
     let verifier = CosignVerifier::new(repo_name);
 
     let (Some(sig), Some(cert)) = (sig_asset, cert_asset) else {
-        return verify_release_signature(Path::new(&archive.name), None, None, required, &verifier)
-            .await;
+        return verify_release_signature(archive_path, None, None, required, &verifier).await;
     };
 
     for asset in [sig, cert] {
@@ -491,57 +612,46 @@ async fn apply_signature_policy(
         }
     }
 
-    debug!(asset = %sig.name, "Downloading release signature");
-    let sig_bytes = client
-        .get(&sig.browser_download_url)
-        .send()
-        .await?
-        .bytes()
-        .await?;
-    let cert_bytes = client
-        .get(&cert.browser_download_url)
-        .send()
-        .await?
-        .bytes()
-        .await?;
-    if sig_bytes.len() as u64 > MAX_SIGNATURE_ASSET_BYTES
-        || cert_bytes.len() as u64 > MAX_SIGNATURE_ASSET_BYTES
-    {
-        return Err(UpdateError::Other(
-            "Signature/certificate asset exceeded the maximum size".to_string(),
-        ));
-    }
-
     // cosign needs real files; use a unique temporary directory and always clean up.
     let temp_dir =
         std::env::temp_dir().join(format!("sito-update-verify-{}", rand::random::<u64>()));
+    let _temp_guard = TempFileGuard::new(temp_dir.clone());
     tokio::fs::create_dir_all(&temp_dir).await?;
-    let artifact_path = temp_dir.join(&archive.name);
     let sig_path = temp_dir.join(format!("{}.sig", archive.name));
     let cert_path = temp_dir.join(format!("{}.pem", archive.name));
 
-    tokio::fs::write(&artifact_path, archive_bytes).await?;
-    tokio::fs::write(&sig_path, &sig_bytes).await?;
-    tokio::fs::write(&cert_path, &cert_bytes).await?;
+    debug!(asset = %sig.name, "Downloading release signature");
+    download_capped(
+        client,
+        &sig.browser_download_url,
+        &sig_path,
+        MAX_SIGNATURE_ASSET_BYTES,
+    )
+    .await?;
+    download_capped(
+        client,
+        &cert.browser_download_url,
+        &cert_path,
+        MAX_SIGNATURE_ASSET_BYTES,
+    )
+    .await?;
 
-    let result = verify_release_signature(
-        &artifact_path,
+    verify_release_signature(
+        archive_path,
         Some(&sig_path),
         Some(&cert_path),
         required,
         &verifier,
     )
-    .await;
-
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-    result
+    .await
 }
 
-/// Extracts the `sito` executable from a gzipped release tarball, enforcing a
-/// per-entry decompression cap so a tar bomb cannot exhaust memory even when
-/// the compressed archive passed the download-size check.
-pub fn extract_binary_from_archive(archive_bytes: &[u8]) -> Result<Vec<u8>, UpdateError> {
-    let gz = GzDecoder::new(archive_bytes);
+/// Extracts the `sito` executable from a gzipped release tarball read from
+/// `reader`, enforcing a per-entry decompression cap so a tar bomb cannot
+/// exhaust memory even when the compressed archive passed the download-size
+/// check.
+pub fn extract_binary_from_reader<R: Read>(reader: R) -> Result<Vec<u8>, UpdateError> {
+    let gz = GzDecoder::new(reader);
     let mut tar = tar::Archive::new(gz);
     let mut binary_content = Vec::new();
     let mut found = false;
@@ -585,6 +695,48 @@ pub fn extract_binary_from_archive(archive_bytes: &[u8]) -> Result<Vec<u8>, Upda
         ));
     }
     Ok(binary_content)
+}
+
+/// In-memory compatibility wrapper around [`extract_binary_from_reader`].
+pub fn extract_binary_from_archive(archive_bytes: &[u8]) -> Result<Vec<u8>, UpdateError> {
+    extract_binary_from_reader(archive_bytes)
+}
+
+/// Extracts the binary from an archive on disk without buffering the archive.
+pub async fn extract_binary_from_file(archive_path: &Path) -> Result<Vec<u8>, UpdateError> {
+    let path = archive_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path)?;
+        extract_binary_from_reader(file)
+    })
+    .await
+    .map_err(|e| UpdateError::Other(format!("Archive extraction task failed: {e}")))?
+}
+
+/// Writes the extracted binary next to the running executable and renames it
+/// into place, removing the temporary file on any failure.
+async fn install_binary_atomically(
+    binary_content: &[u8],
+    current_exe: &Path,
+) -> Result<(), UpdateError> {
+    let parent_dir = current_exe.parent().ok_or_else(|| {
+        UpdateError::Other("Could not resolve parent directory of executable".to_string())
+    })?;
+
+    let temp_exe = parent_dir.join(format!(".sito_update_{}", rand::random::<u32>()));
+    let _temp_guard = TempFileGuard::new(temp_exe.clone());
+
+    tokio::fs::write(&temp_exe, binary_content).await?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        tokio::fs::set_permissions(&temp_exe, perms).await?;
+    }
+
+    tokio::fs::rename(&temp_exe, current_exe).await?;
+    Ok(())
 }
 
 /// Downloads the latest release archive, verifies the release signature (when
@@ -680,18 +832,16 @@ pub async fn apply_update(
     }
 
     info!(asset = %archive.name, url = %archive.browser_download_url, "Downloading release archive");
-    let archive_bytes = client
-        .get(&archive.browser_download_url)
-        .send()
-        .await?
-        .bytes()
-        .await?;
-
-    if archive_bytes.len() as u64 > MAX_UPDATE_ARCHIVE_BYTES {
-        return Err(UpdateError::Other(
-            "Release archive exceeded the maximum download size".to_string(),
-        ));
-    }
+    let archive_path =
+        std::env::temp_dir().join(format!("sito-update-archive-{}", rand::random::<u64>()));
+    let _archive_guard = TempFileGuard::new(archive_path.clone());
+    download_capped(
+        &client,
+        &archive.browser_download_url,
+        &archive_path,
+        MAX_UPDATE_ARCHIVE_BYTES,
+    )
+    .await?;
 
     // 2. Release signature policy (present signatures must always verify)
     let (sig_asset, cert_asset) = find_signature_assets(&assets, &archive.name);
@@ -699,7 +849,7 @@ pub async fn apply_update(
         &client,
         repo_name,
         &archive,
-        archive_bytes.as_ref(),
+        &archive_path,
         sig_asset.as_ref(),
         cert_asset.as_ref(),
         require_signature,
@@ -715,30 +865,15 @@ pub async fn apply_update(
         .text()
         .await?;
 
-    verify_archive_checksum(&archive_bytes, &archive.name, Some(&sums_content))?;
+    verify_archive_checksum_file(&archive_path, &archive.name, Some(&sums_content)).await?;
     info!(asset = %archive.name, "SHA256 checksum verified successfully");
 
     // 4. Extract 'sito' executable from tarball
-    let binary_content = extract_binary_from_archive(archive_bytes.as_ref())?;
+    let binary_content = extract_binary_from_file(&archive_path).await?;
 
     // 5. Replace current executable atomically
     let current_exe = std::env::current_exe()?;
-    let parent_dir = current_exe.parent().ok_or_else(|| {
-        UpdateError::Other("Could not resolve parent directory of executable".to_string())
-    })?;
-
-    let temp_exe = parent_dir.join(format!(".sito_update_{}", rand::random::<u32>()));
-
-    tokio::fs::write(&temp_exe, &binary_content).await?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        tokio::fs::set_permissions(&temp_exe, perms).await?;
-    }
-
-    tokio::fs::rename(&temp_exe, &current_exe).await?;
+    install_binary_atomically(&binary_content, &current_exe).await?;
 
     info!(
         version = %update_info.latest_version,
@@ -1040,5 +1175,169 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
         .await
         .unwrap_err();
         assert!(matches!(err, UpdateError::SignatureVerifierUnavailable(_)));
+    }
+
+    fn test_scratch_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sito-update-test-{label}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Serves exactly one HTTP/1.1 response on a loopback listener.
+    async fn serve_http_once(response: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            let _ = socket.read(&mut request).await;
+            let _ = socket.write_all(&response).await;
+            let _ = socket.shutdown().await;
+        });
+        (format!("http://{addr}/asset"), handle)
+    }
+
+    fn http_response_with_content_length(body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn http_chunked_response(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        for chunk in chunks {
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(chunk);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        response
+    }
+
+    #[tokio::test]
+    async fn test_stream_download_aborts_over_cap_without_residue() {
+        // Use a small cap so the test does not need to move 256 MiB.
+        let cap = 64 * 1024;
+        let payload = vec![0x5a_u8; cap as usize + 1];
+        let split = payload.len() / 2;
+        let response = http_chunked_response(&[&payload[..split], &payload[split..]]);
+        let (url, server) = serve_http_once(response).await;
+
+        let dir = test_scratch_dir("cap");
+        let dest = dir.join("archive.tar.gz");
+        let client = reqwest::Client::new();
+
+        let err = download_capped(&client, &url, &dest, cap)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(err, UpdateError::Other(_)), "got {err:?}");
+        assert!(!dest.exists(), "partial destination must be removed");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "no temp residue after an over-cap download"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_stream_download_content_length_over_cap_rejected_early() {
+        let cap = 1024;
+        // Declare more than the cap without sending a body: the reject must
+        // happen from the Content-Length header alone.
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            cap + 1
+        )
+        .into_bytes();
+        let (url, server) = serve_http_once(response).await;
+
+        let dir = test_scratch_dir("content-length");
+        let dest = dir.join("archive.tar.gz");
+        let client = reqwest::Client::new();
+
+        let err = download_capped(&client, &url, &dest, cap)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(err, UpdateError::Other(_)), "got {err:?}");
+        assert!(!dest.exists(), "rejected download must not create dest");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_stream_download_then_checksum_and_extract() {
+        let archive = build_tar_gz(&[("README.md", b"docs"), ("sito", b"streamed-binary-bytes")]);
+        let response = http_response_with_content_length(&archive);
+        let (url, server) = serve_http_once(response).await;
+
+        let dir = test_scratch_dir("checksum-extract");
+        let dest = dir.join("sito-v1.9.0-x86_64-unknown-linux-gnu.tar.gz");
+        let client = reqwest::Client::new();
+
+        download_capped(&client, &url, &dest, MAX_UPDATE_ARCHIVE_BYTES)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), archive);
+
+        let archive_name = "sito-v1.9.0-x86_64-unknown-linux-gnu.tar.gz";
+        let valid_hash =
+            hex::encode(ring::digest::digest(&ring::digest::SHA256, &archive).as_ref());
+        let sums_valid = format!("{valid_hash}  {archive_name}\n");
+        verify_archive_checksum_file(&dest, archive_name, Some(&sums_valid))
+            .await
+            .unwrap();
+
+        let sums_mismatch = format!("{}  {archive_name}\n", "0".repeat(64));
+        let err = verify_archive_checksum_file(&dest, archive_name, Some(&sums_mismatch))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UpdateError::ChecksumMismatch { .. }));
+
+        let extracted = extract_binary_from_file(&dest).await.unwrap();
+        assert_eq!(extracted, b"streamed-binary-bytes");
+        assert_eq!(extract_binary_from_archive(&archive).unwrap(), extracted);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_temp_exe_removed_when_rename_fails() {
+        let dir = test_scratch_dir("rename");
+        // Renaming a file over an existing directory fails, exercising the
+        // cleanup path after the temp executable was already written.
+        let target = dir.join("sito");
+        std::fs::create_dir(&target).unwrap();
+
+        let err = install_binary_atomically(b"new-binary", &target)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UpdateError::Io(_)), "got {err:?}");
+
+        let leaked: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".sito_update_"))
+            .collect();
+        assert!(leaked.is_empty(), "temp executable leaked: {leaked:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
