@@ -451,8 +451,8 @@ impl FilterSnapshot {
 
     /// Collects the `@@...$dnsrewrite` exception rules that cancel rewrites.
     ///
-    /// A value-less exception cancels every rewrite for the owner; one with a
-    /// value cancels only the identical rewrite (AdGuard semantics).
+    /// A bare exception cancels every rewrite for the owner; one with a value
+    /// cancels only the identical rewrite (AdGuard semantics).
     pub fn collect_rewrite_cancellations(
         &self,
         domain: &str,
@@ -503,10 +503,11 @@ fn modifier_scope_matches(
 }
 
 /// Whether a cancellation rule cancels every rewrite for the owner.
+///
+/// Only the bare `@@...$dnsrewrite` form cancels everything. An explicit
+/// `$dnsrewrite=NOERROR` is a NODATA rewrite and cancels only an identical one.
 fn cancels_all(rule: &DnsRewriteRule) -> bool {
-    rule.rtype.is_none()
-        && rule.value.is_none()
-        && (rule.rcode.is_empty() || rule.rcode.eq_ignore_ascii_case("NOERROR"))
+    rule.bare
 }
 
 /// Compares two rewrite rules for cancellation purposes.
@@ -514,6 +515,9 @@ fn cancels_all(rule: &DnsRewriteRule) -> bool {
 /// `A`/`AAAA` values compare as parsed addresses, domain-valued types compare
 /// after normalization, and TXT data compares byte-for-byte.
 fn same_rewrite(a: &DnsRewriteRule, b: &DnsRewriteRule) -> bool {
+    if a.bare != b.bare {
+        return false;
+    }
     let rcode_eq = |x: &str, y: &str| {
         let x = if x.is_empty() { "NOERROR" } else { x };
         let y = if y.is_empty() { "NOERROR" } else { y };
@@ -551,10 +555,10 @@ fn same_rewrite(a: &DnsRewriteRule, b: &DnsRewriteRule) -> bool {
 
 /// Removes cancelled and duplicate entries from an aggregated rewrite list.
 ///
-/// Cancellations are applied in rule order; a later value-less cancellation
-/// clears everything collected so far, matching AdGuard's "unblock all DNS
-/// rewrite rules" exception. Identical values contributed by several lists are
-/// emitted once.
+/// Cancellations are applied in rule order; a later bare cancellation clears
+/// everything collected so far, matching AdGuard's "unblock all DNS rewrite
+/// rules" exception. Identical values contributed by several lists are emitted
+/// once.
 pub fn apply_rewrite_cancellations(
     rules: &mut Vec<DnsRewriteRule>,
     cancellations: &[DnsRewriteRule],

@@ -349,11 +349,32 @@ fn txt_chunks(value: &str) -> Vec<String> {
     chunks
 }
 
+/// Whether a `$dnsrewrite` record type can answer the given question type.
+///
+/// DNS applies exact record-type matching, except that a CNAME answers any
+/// query type. Unsupported types are rejected by the parser; they fall through
+/// so the synthesis path can still warn about programmatically built rules.
+fn rewrite_applies_to_qtype(rtype: &str, qtype: RecordType) -> bool {
+    if rtype == "CNAME" {
+        return true;
+    }
+    match rtype {
+        "A" => qtype == RecordType::A,
+        "AAAA" => qtype == RecordType::AAAA,
+        "PTR" => qtype == RecordType::PTR,
+        "TXT" => qtype == RecordType::TXT,
+        _ => true,
+    }
+}
+
 /// Builds a synthesized response for all matching ABP `$dnsrewrite` rules.
 ///
 /// AdGuard aggregates every matching rewrite for an owner: two `A` rewrites
-/// produce two answer records. A non-`NOERROR` rcode is exclusive and wins over
-/// any record synthesis.
+/// produce two answer records. Records are filtered by the question type
+/// (`A`/`AAAA`/`PTR`/`TXT` exact match, `CNAME` answers any type); when no
+/// matching value applies the result is NOERROR/NODATA, never an upstream
+/// fallback. A non-`NOERROR` rcode is exclusive and wins over any record
+/// synthesis.
 fn make_rewrite_response(query: &Message, rules: &[DnsRewriteRule], query_id: u16) -> Message {
     let mut resp = Message::new(query_id, MessageType::Response, query.metadata.op_code);
     copy_query_response_flags(&mut resp, query);
@@ -379,6 +400,9 @@ fn make_rewrite_response(query: &Message, rules: &[DnsRewriteRule], query_id: u1
                 continue;
             };
             let rtype = rtype.to_ascii_uppercase();
+            if !rewrite_applies_to_qtype(&rtype, question.query_type()) {
+                continue;
+            }
             let rdata = match rtype.as_str() {
                 "A" => value
                     .parse::<std::net::Ipv4Addr>()
@@ -1803,6 +1827,7 @@ mod tests {
             rcode: rcode.to_string(),
             rtype: rtype.map(str::to_string),
             value: value.map(str::to_string),
+            bare: false,
         }
     }
 
@@ -1817,7 +1842,6 @@ mod tests {
 
     #[test]
     fn test_make_rewrite_response_synthesizes_ptr_txt_and_aggregates() {
-        let query = rewrite_query("4.3.2.1.in-addr.arpa.", RecordType::PTR);
         let long_txt = "x".repeat(300);
         let rules = vec![
             rewrite_rule("NOERROR", Some("A"), Some("10.0.0.1")),
@@ -1827,15 +1851,16 @@ mod tests {
             rewrite_rule("NOERROR", Some("TXT"), Some(&long_txt)),
         ];
 
+        // A questions aggregate every A value and ignore PTR/TXT rewrites.
+        let query = rewrite_query("rewrite.example.", RecordType::A);
         let resp = make_rewrite_response(&query, &rules, 7);
         assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
         assert_eq!(resp.metadata.id, 7);
         assert_eq!(
             resp.answers.len(),
-            5,
-            "all matching rewrites are synthesized"
+            2,
+            "only the two A rewrites are synthesized for an A question"
         );
-
         let a_values: Vec<_> = resp
             .answers
             .iter()
@@ -1852,14 +1877,21 @@ mod tests {
             ]
         );
 
+        // PTR questions only receive the PTR rewrite.
+        let query = rewrite_query("4.3.2.1.in-addr.arpa.", RecordType::PTR);
+        let resp = make_rewrite_response(&query, &rules, 8);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1, "only the PTR rewrite applies");
         assert!(
-            resp.answers.iter().any(|record| {
-                matches!(&record.data, RData::PTR(ptr) if ptr.0.to_ascii().trim_end_matches('.') == "printer.lan")
-            }),
+            matches!(&resp.answers[0].data, RData::PTR(ptr) if ptr.0.to_ascii().trim_end_matches('.') == "printer.lan"),
             "missing PTR record: {:?}",
             resp.answers
         );
 
+        // TXT questions receive the TXT rewrites with 255-byte chunking.
+        let query = rewrite_query("txt.example.", RecordType::TXT);
+        let resp = make_rewrite_response(&query, &rules, 9);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
         let txt_chunk_counts: Vec<usize> = resp
             .answers
             .iter()
@@ -1876,6 +1908,90 @@ mod tests {
     }
 
     #[test]
+    fn test_make_rewrite_response_matches_query_type() {
+        let rules = vec![rewrite_rule("NOERROR", Some("A"), Some("10.0.0.1"))];
+
+        let query = rewrite_query("host.example.", RecordType::A);
+        let resp = make_rewrite_response(&query, &rules, 1);
+        assert_eq!(resp.answers.len(), 1, "an A rule answers an A question");
+
+        for qtype in [RecordType::AAAA, RecordType::TXT, RecordType::PTR] {
+            let query = rewrite_query("host.example.", qtype);
+            let resp = make_rewrite_response(&query, &rules, 2);
+            assert_eq!(
+                resp.metadata.response_code,
+                ResponseCode::NoError,
+                "{qtype:?} must be NODATA, not an error"
+            );
+            assert!(
+                resp.answers.is_empty(),
+                "{qtype:?} must be NODATA for an A-only rewrite: {:?}",
+                resp.answers
+            );
+        }
+    }
+
+    #[test]
+    fn test_make_rewrite_response_aggregates_same_type_only() {
+        let rules = vec![
+            rewrite_rule("NOERROR", Some("A"), Some("10.0.0.1")),
+            rewrite_rule("NOERROR", Some("A"), Some("10.0.0.2")),
+            rewrite_rule("NOERROR", Some("AAAA"), Some("2001:db8::1")),
+            rewrite_rule("NOERROR", Some("TXT"), Some("ignored")),
+        ];
+
+        let query = rewrite_query("multi.example.", RecordType::A);
+        let resp = make_rewrite_response(&query, &rules, 3);
+        assert_eq!(resp.answers.len(), 2, "only the two A rules aggregate");
+        assert!(
+            resp.answers
+                .iter()
+                .all(|record| matches!(record.data, RData::A(_))),
+            "an A question must not receive AAAA/TXT records: {:?}",
+            resp.answers
+        );
+
+        let query = rewrite_query("multi.example.", RecordType::AAAA);
+        let resp = make_rewrite_response(&query, &rules, 4);
+        assert_eq!(resp.answers.len(), 1);
+        assert!(matches!(resp.answers[0].data, RData::AAAA(_)));
+    }
+
+    #[test]
+    fn test_make_rewrite_response_cname_answers_any_type() {
+        let rules = vec![rewrite_rule(
+            "NOERROR",
+            Some("CNAME"),
+            Some("target.example.net."),
+        )];
+
+        for qtype in [
+            RecordType::A,
+            RecordType::AAAA,
+            RecordType::TXT,
+            RecordType::PTR,
+        ] {
+            let query = rewrite_query("alias.example.", qtype);
+            let resp = make_rewrite_response(&query, &rules, 5);
+            assert_eq!(
+                resp.metadata.response_code,
+                ResponseCode::NoError,
+                "{qtype:?}"
+            );
+            assert_eq!(
+                resp.answers.len(),
+                1,
+                "a CNAME rewrite answers any question type ({qtype:?})"
+            );
+            assert!(
+                matches!(&resp.answers[0].data, RData::CNAME(cname) if cname.0.to_ascii().trim_end_matches('.') == "target.example.net"),
+                "expected CNAME answer for {qtype:?}: {:?}",
+                resp.answers
+            );
+        }
+    }
+
+    #[test]
     fn test_make_rewrite_response_rcode_wins_over_records() {
         let query = rewrite_query("rewrite.example.", RecordType::A);
         let rules = vec![
@@ -1889,6 +2005,12 @@ mod tests {
             "NXDOMAIN rewrite must not carry answers: {:?}",
             resp.answers
         );
+
+        // A non-NOERROR rcode wins even when no record matches the qtype.
+        let query = rewrite_query("rewrite.example.", RecordType::AAAA);
+        let resp = make_rewrite_response(&query, &rules, 10);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(resp.answers.len(), 0);
     }
 
     #[tokio::test]
@@ -1969,6 +2091,77 @@ mod tests {
             matches!(resp.answers[0].data, RData::A(A(ip)) if ip == std::net::Ipv4Addr::new(203, 0, 113, 9))
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_rewrite_matches_query_type_without_upstream() {
+        use std::sync::atomic::Ordering;
+
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        config.filtering.custom_rules = vec![
+            "||rewrite-type-pipeline.example^$dnsrewrite=1.2.3.4".to_string(),
+            "||rewrite-cname-pipeline.example^$dnsrewrite=cname.example.net".to_string(),
+        ];
+        let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+        // The rewrite answers an A question and never queries upstream.
+        let resp = pipeline
+            .handle(
+                rewrite_query("rewrite-type-pipeline.example.", RecordType::A),
+                client.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.answers.len(), 1);
+        assert!(
+            matches!(resp.answers[0].data, RData::A(A(ip)) if ip == std::net::Ipv4Addr::new(1, 2, 3, 4))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Other qtypes match the rule set but have no applicable value: the
+        // answer is NOERROR/NODATA, not an upstream fallback.
+        for qtype in [RecordType::AAAA, RecordType::TXT] {
+            let resp = pipeline
+                .handle(
+                    rewrite_query("rewrite-type-pipeline.example.", qtype),
+                    client.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.metadata.response_code,
+                ResponseCode::NoError,
+                "{qtype:?}"
+            );
+            assert!(
+                resp.answers.is_empty(),
+                "{qtype:?} must be NODATA instead of querying upstream: {:?}",
+                resp.answers
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{qtype:?} must not query upstream"
+            );
+        }
+
+        // A CNAME rewrite answers any question type.
+        let resp = pipeline
+            .handle(
+                rewrite_query("rewrite-cname-pipeline.example.", RecordType::TXT),
+                client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.answers.len(), 1);
+        assert!(
+            matches!(&resp.answers[0].data, RData::CNAME(cname) if cname.0.to_ascii().trim_end_matches('.') == "cname.example.net")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

@@ -961,6 +961,70 @@ fn test_conformance_dnsrewrite_exception_cancels_specific_value() {
 }
 
 #[test]
+fn test_rewrite_cancellation_bare_vs_explicit_noerror() {
+    // The bare form cancels every rewrite for the owner.
+    let bare = "
+||bare-cancel.example^$dnsrewrite=1.2.3.4
+||bare-cancel.example^$dnsrewrite=5.6.7.8
+@@||bare-cancel.example^$dnsrewrite
+";
+    let snapshot = FilterSnapshot::compile(parse_rules(bare, "conformance").0);
+    let client = default_client();
+    assert!(
+        effective_rewrites(&snapshot, "bare-cancel.example", RecordType::A, &client).is_empty(),
+        "a bare exception must cancel every rewrite"
+    );
+
+    // An explicit `=NOERROR` only cancels an identical NODATA rewrite, so
+    // valued rewrites survive it.
+    let explicit = "
+||explicit-noerror.example^$dnsrewrite=1.2.3.4
+@@||explicit-noerror.example^$dnsrewrite=NOERROR
+";
+    let snapshot = FilterSnapshot::compile(parse_rules(explicit, "conformance").0);
+    let rewrites = effective_rewrites(
+        &snapshot,
+        "explicit-noerror.example",
+        RecordType::A,
+        &client,
+    );
+    assert_eq!(
+        rewrites.len(),
+        1,
+        "an explicit NOERROR must not cancel a valued rewrite"
+    );
+    assert_eq!(rewrites[0].value.as_deref(), Some("1.2.3.4"));
+
+    // It does cancel the identical NODATA rewrite.
+    let nodata = "
+||explicit-nodata.example^$dnsrewrite=NOERROR
+@@||explicit-nodata.example^$dnsrewrite=NOERROR
+";
+    let snapshot = FilterSnapshot::compile(parse_rules(nodata, "conformance").0);
+    assert!(
+        effective_rewrites(&snapshot, "explicit-nodata.example", RecordType::A, &client).is_empty(),
+        "an explicit NOERROR must cancel an identical NODATA rewrite"
+    );
+}
+
+#[test]
+fn test_rewrite_cancellation_value_scoped() {
+    // A valued exception cancels only the identical rewrite and leaves the
+    // other values for the same owner intact.
+    let rules = "
+||value-scoped.example^$dnsrewrite=1.2.3.4
+||value-scoped.example^$dnsrewrite=5.6.7.8
+@@||value-scoped.example^$dnsrewrite=1.2.3.4
+";
+    let snapshot = FilterSnapshot::compile(parse_rules(rules, "conformance").0);
+    let client = default_client();
+
+    let rewrites = effective_rewrites(&snapshot, "value-scoped.example", RecordType::A, &client);
+    assert_eq!(rewrites.len(), 1);
+    assert_eq!(rewrites[0].value.as_deref(), Some("5.6.7.8"));
+}
+
+#[test]
 fn test_conformance_client_quoted_names_and_escapes() {
     // AdGuard allows single/double quotes and `\` escapes for client names
     // containing spaces, commas, pipes and quotes. `~` stays outside quotes.

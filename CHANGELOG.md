@@ -17,6 +17,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the new cap succeeds; a live reload keeps the previous snapshot and records
   the list in `failed_lists`.
 
+### Changed
+- **`$dnsrewrite` record-type matching**: rewrite records are now filtered by
+  the query type. `A`, `AAAA`, `PTR` and `TXT` rules answer only a question of
+  the same type, while `CNAME` answers any type. When matching rules contribute
+  no value for the question type, the answer is `NOERROR` with zero records
+  (NODATA) instead of falling back to an upstream lookup. Non-`NOERROR` rcodes
+  still take precedence over record synthesis.
+- **Bare `$dnsrewrite` vs explicit `$dnsrewrite=NOERROR`**: only the bare
+  `@@...$dnsrewrite` exception cancels every rewrite for the owner. An explicit
+  `@@...$dnsrewrite=NOERROR` now cancels only an identical NODATA rewrite, so
+  valued rewrites survive it. Canonical strings for bare rules changed from
+  `$dnsrewrite=NOERROR;;` to `$dnsrewrite`; existing `$badfilter` entries that
+  targeted a bare rewrite must be reviewed.
+
 ### Security
 - **DNSSEC cold-start signature stripping**: a response without RRSIGs is now
   probed from the configured trust anchor even when the zone was never seen
