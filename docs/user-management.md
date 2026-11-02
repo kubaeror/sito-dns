@@ -127,7 +127,12 @@ Deleting an account revokes that account's sessions **and every API token it
 owns**. Tokens created before ownership tracking (ownerless/legacy tokens) are
 not linked to an account, so they survive account deletion and remain
 Admin-managed; revoke them explicitly if they were issued to the deleted user.
-Password changes and TOTP changes revoke sessions but do not revoke API tokens.
+
+Password changes, TOTP disable, role changes, and overwriting/recreating an
+account also revoke **all API tokens owned by that account**: a credential must
+not outlive the password, second factor, or privileges it was issued under.
+Legacy ownerless tokens are never matched by these revocations and remain
+Admin-managed until explicitly revoked.
 
 ## 4. Change a Role
 
@@ -138,14 +143,16 @@ curl -sS -X PUT "$SITO/api/v1/auth/users/alice" \
   -d '{"role":"viewer"}'
 ```
 
-A role change revokes all sessions belonging to the target account so the new
-role is enforced on the next request. Demoting the last admin is rejected with
+A role change revokes all sessions belonging to the target account **and all
+API tokens it owns**, so the new role (and the loss of old privileges) is
+enforced on the next request. Demoting the last admin is rejected with
 `400 Bad Request`.
 
-Role demotion does **not** rewrite the scope of API tokens the account already
-created. A token keeps its original scope until it is revoked or reissued.
-After demoting an account, review and revoke/reissue its tokens if the old
-scope is no longer appropriate.
+Because promotion and demotion both revoke owned tokens, the account must
+create fresh tokens after a role change. This prevents an old Admin-scoped
+token from surviving a demotion. The last-admin check and the role update are
+atomic, so two concurrent demotions cannot both succeed and leave the
+deployment without an Admin.
 
 ## 5. Change a Password
 
@@ -172,8 +179,9 @@ curl -sS -X POST "$SITO/api/v1/auth/change-password" \
 ```
 
 The same password policy as account creation applies. A successful change
-revokes all sessions of the target account, including the caller's own session
-when changing your own password.
+revokes all sessions **and all owned API tokens** of the target account,
+including the caller's own session when changing your own password. Legacy
+ownerless tokens are unaffected.
 
 ## 6. API Tokens
 
@@ -212,15 +220,26 @@ account. Tokens created with a bearer credential inherit the owner of the
 authenticating token. Tokens written by older releases have no owner; they are
 legacy/ownerless and remain Admin-managed.
 
-When the global token cap (`MAX_API_TOKENS`, currently 256) is reached, creating
-another token evicts only the oldest token owned by the same account. If that
-account has no token to evict, creation fails with `400 Bad Request` instead of
-deleting another account's credential. A role demotion does not change the
-scope of existing tokens; revoke or reissue them when the old scope is no longer
-appropriate.
+A single account may hold at most **16 tokens**
+(`MAX_API_TOKENS_PER_OWNER`). Creating a 17th token evicts that account's oldest
+token; another account's tokens are never touched. Independently, the global
+store is capped at **256 tokens** (`MAX_API_TOKENS`). When the global cap is
+reached, creating another token evicts only the oldest token owned by the same
+account. If that account has no token to evict, creation fails with
+`400 Bad Request` instead of deleting another account's credential. Legacy
+ownerless tokens are not an owner: they rely on the global cap and remain
+Admin-managed.
 
-Deleting the owning account revokes its tokens immediately. Legacy ownerless
-tokens survive account deletion and must be revoked explicitly by an Admin.
+API tokens are revoked automatically by:
+
+* an account password change (self-service or Admin override);
+* disabling TOTP for the account;
+* any role change (promotion or demotion);
+* deleting the account.
+
+The revocation is immediate in memory and persisted to `tokens.toml`; the
+account must create a new token afterwards. Because a role change revokes its
+tokens, an old token can never retain privileges the account no longer has.
 
 Use a token as a Bearer credential:
 
@@ -291,7 +310,9 @@ an API workflow (Admin session required by the current API guards); the
      -d '{"password":"NewCorrectHorse2","code":"123456"}'
    ```
 
-Enabling or disabling TOTP revokes all sessions of the account.
+Enabling or disabling TOTP revokes all sessions of the account. Disabling TOTP
+also revokes every API token owned by the account, because removing the second
+factor is a credential change.
 
 TOTP secrets are encrypted at rest with AES-256-GCM using
 `<data_dir>/totp.key`. Back up `users.toml` and `totp.key` together: restoring

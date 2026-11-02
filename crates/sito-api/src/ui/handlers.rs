@@ -20,8 +20,7 @@ use crate::config_apply::{ApplyHooks, FilterApply, apply_and_persist_config, app
 use crate::config_writer::save_config_atomic;
 use crate::error::ProblemDetails;
 use crate::handlers::auth_handlers::{
-    ensure_role_change_allowed, ensure_user_deletion_allowed, validate_password_policy,
-    validate_username,
+    user_mutation_problem, validate_password_policy, validate_username,
 };
 use crate::models::{FilterListDto, StatusResponse};
 use crate::probe::probe_upstream_target;
@@ -2619,17 +2618,9 @@ pub async fn users_role_handler(
             );
         }
     };
-    if let Err(problem) = ensure_role_change_allowed(&ctx, &username, role) {
+    if let Err(err) = ctx.auth_mgr.set_user_role_checked(&username, role).await {
+        let problem = user_mutation_problem(&username, "demote", err);
         return users_problem_page(&ctx, &user, &csrf, problem);
-    }
-
-    if !ctx.auth_mgr.set_user_role(&username, role).await {
-        return users_problem_page(
-            &ctx,
-            &user,
-            &csrf,
-            ProblemDetails::not_found(format!("User '{username}' not found")),
-        );
     }
     tracing::info!(
         actor = %user.username,
@@ -2650,16 +2641,9 @@ pub async fn users_delete_handler(
         Err(response) => return *response,
     };
 
-    if let Err(problem) = ensure_user_deletion_allowed(&ctx, &username) {
+    if let Err(err) = ctx.auth_mgr.delete_user_checked(&username).await {
+        let problem = user_mutation_problem(&username, "delete", err);
         return users_problem_page(&ctx, &user, &csrf, problem);
-    }
-    if !ctx.auth_mgr.delete_user(&username).await {
-        return users_problem_page(
-            &ctx,
-            &user,
-            &csrf,
-            ProblemDetails::not_found(format!("User '{username}' not found")),
-        );
     }
     tracing::info!(
         actor = %user.username,

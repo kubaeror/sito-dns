@@ -6,7 +6,7 @@ use axum::http::header::{HeaderMap, SET_COOKIE};
 use axum::response::{IntoResponse, Response};
 use std::str::FromStr;
 
-use crate::auth::manager::{LoginResult, TotpVerifyResult};
+use crate::auth::manager::{LoginResult, TotpVerifyResult, UserMutationError};
 use crate::auth::rbac::RequireAdmin;
 use crate::auth::session::{
     Session, build_clear_csrf_cookie, build_clear_partial_cookie, build_clear_session_cookie,
@@ -523,46 +523,21 @@ pub fn validate_password_policy(password: &str) -> Result<(), ProblemDetails> {
     Ok(())
 }
 
-/// Shared last-admin guard for role changes: an existing Admin may only be
-/// demoted while another Admin remains. Also rejects unknown accounts.
-pub(crate) fn ensure_role_change_allowed(
-    ctx: &ServerContext,
+/// Maps an atomic user-mutation failure onto the REST error contract:
+/// `404` for unknown accounts and `400` for the last-admin guard.
+pub(crate) fn user_mutation_problem(
     username: &str,
-    role: Role,
-) -> Result<(), ProblemDetails> {
-    if !ctx.auth_mgr.has_user(username) {
-        return Err(ProblemDetails::not_found(format!(
-            "User '{username}' not found"
-        )));
+    action: &str,
+    err: UserMutationError,
+) -> ProblemDetails {
+    match err {
+        UserMutationError::NotFound => {
+            ProblemDetails::not_found(format!("User '{username}' not found"))
+        }
+        UserMutationError::LastAdmin => {
+            ProblemDetails::bad_request(format!("Cannot {action} the last remaining admin account"))
+        }
     }
-    if role != Role::Admin
-        && ctx.auth_mgr.role_of(username) == Some(Role::Admin)
-        && ctx.auth_mgr.admin_count() <= 1
-    {
-        return Err(ProblemDetails::bad_request(
-            "Cannot demote the last remaining admin account",
-        ));
-    }
-    Ok(())
-}
-
-/// Shared last-admin guard for deletions: an Admin may only be deleted while
-/// another Admin remains. Also rejects unknown accounts.
-pub(crate) fn ensure_user_deletion_allowed(
-    ctx: &ServerContext,
-    username: &str,
-) -> Result<(), ProblemDetails> {
-    if !ctx.auth_mgr.has_user(username) {
-        return Err(ProblemDetails::not_found(format!(
-            "User '{username}' not found"
-        )));
-    }
-    if ctx.auth_mgr.role_of(username) == Some(Role::Admin) && ctx.auth_mgr.admin_count() <= 1 {
-        return Err(ProblemDetails::bad_request(
-            "Cannot delete the last remaining admin account",
-        ));
-    }
-    Ok(())
 }
 
 /// List local user accounts.
@@ -648,13 +623,13 @@ pub async fn update_user(
 ) -> Result<Json<UserDto>, ProblemDetails> {
     let role = Role::from_str(req.role.trim())
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid role: {e}")))?;
-    ensure_role_change_allowed(&ctx, &username, role)?;
 
-    if !ctx.auth_mgr.set_user_role(&username, role).await {
-        return Err(ProblemDetails::not_found(format!(
-            "User '{username}' not found"
-        )));
-    }
+    // Check and mutate atomically so concurrent demotions cannot race past the
+    // last-admin guard.
+    ctx.auth_mgr
+        .set_user_role_checked(&username, role)
+        .await
+        .map_err(|err| user_mutation_problem(&username, "demote", err))?;
     tracing::info!(
         actor = %admin.username,
         target = %username,
@@ -687,12 +662,12 @@ pub async fn delete_user(
     State(ctx): State<ServerContext>,
     Path(username): Path<String>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
-    ensure_user_deletion_allowed(&ctx, &username)?;
-    if !ctx.auth_mgr.delete_user(&username).await {
-        return Err(ProblemDetails::not_found(format!(
-            "User '{username}' not found"
-        )));
-    }
+    // Check and delete atomically so concurrent deletions/demotions cannot
+    // race past the last-admin guard.
+    ctx.auth_mgr
+        .delete_user_checked(&username)
+        .await
+        .map_err(|err| user_mutation_problem(&username, "delete", err))?;
     tracing::info!(
         actor = %admin.username,
         target = %username,
@@ -1054,6 +1029,24 @@ mod tests {
             .await
             .expect_err("last admin cannot be deleted");
         assert_eq!(delete.status, 400);
+
+        // Unknown accounts stay 404 on both mutations.
+        let unknown_role = update_user(
+            admin(),
+            State(ctx.clone()),
+            AxumPath("ghost".to_string()),
+            Json(UpdateUserRequest {
+                role: "admin".to_string(),
+            }),
+        )
+        .await
+        .expect_err("unknown user rejected");
+        assert_eq!(unknown_role.status, 404);
+        let unknown_delete =
+            delete_user(admin(), State(ctx.clone()), AxumPath("ghost".to_string()))
+                .await
+                .expect_err("unknown user rejected");
+        assert_eq!(unknown_delete.status, 404);
 
         // Self-service password change requires the current password.
         let wrong = change_password(

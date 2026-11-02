@@ -44,11 +44,23 @@ exhaustive record.
   once), and TOTP disable after re-authentication. Forms are CSRF- and
   RBAC-protected; unauthorized pages return `403` and anonymous requests
   redirect to `/login`.
-- **API-token ownership**: tokens record their creating account. `/account`
-  lists only the caller's tokens (Admins also see legacy ownerless tokens and
-  an Owner column); deleting an account revokes its owned tokens; at the global
-  cap only the same owner's oldest token is evicted, otherwise creation returns
-  `400`. Role demotion does not rewrite an existing token's scope.
+- **API-token ownership and lifecycle**: tokens record their creating account.
+  `/account` lists only the caller's tokens (Admins also see legacy ownerless
+  tokens and an Owner column). Deleting an account, changing its password,
+  disabling its TOTP, changing its role (promotion or demotion), or
+  overwriting/recreating it revokes every token it owns; the revocation is
+  persisted to `tokens.toml`. Legacy ownerless tokens are never matched and
+  remain Admin-managed.
+- **Per-owner API-token quota**: a single owner may hold at most 16 tokens
+  (`MAX_API_TOKENS_PER_OWNER`); creating a 17th evicts that owner's oldest token
+  and never another owner's. The separate global cap remains 256
+  (`MAX_API_TOKENS`); when it is reached and the requesting owner has no token
+  to evict, creation returns `400`.
+- **Atomic last-admin protection**: last-admin checks for role changes and
+  account deletion now run under the same users lock as the mutation. Two
+  concurrent demotions/deletions cannot both pass and leave the deployment
+  without an Admin; the loser receives `400` and unknown accounts still receive
+  `404` on both the REST API and web UI.
 - **New HA metrics**: `sito_ha_diverged{instance}` (1 while a connected slave
   acknowledged a version above the master's; returns to 0 after recovery and
   the series is removed on disconnect) and

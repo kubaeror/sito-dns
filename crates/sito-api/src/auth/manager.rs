@@ -80,6 +80,10 @@ pub const MAX_PENDING_TOTP: usize = 10_000;
 pub const MAX_PARTIAL_TOKENS: usize = 10_000;
 /// Maximum number of API tokens kept in memory/on disk.
 pub const MAX_API_TOKENS: usize = 256;
+/// Maximum number of API tokens a single owner may hold. When the limit is
+/// reached, creating another token evicts that owner's oldest token; other
+/// owners' tokens are never touched.
+pub const MAX_API_TOKENS_PER_OWNER: usize = 16;
 pub const PENDING_TOTP_TTL: Duration = Duration::from_secs(600); // 10 minutes
 /// Maximum wrong TOTP codes per partial token before it is invalidated.
 pub const MAX_TOTP_ATTEMPTS: u32 = 5;
@@ -98,6 +102,16 @@ pub enum CreateTokenError {
         "API token capacity reached and this account has no revocable tokens; revoke a token and try again"
     )]
     CapacityReached,
+}
+
+/// Failure to apply a user mutation that must never leave the deployment
+/// without an Admin account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum UserMutationError {
+    #[error("user not found")]
+    NotFound,
+    #[error("operation would remove the last remaining admin account")]
+    LastAdmin,
 }
 
 #[derive(Debug, Clone)]
@@ -1222,54 +1236,111 @@ impl AuthManager {
             .count()
     }
 
-    /// Updates a user's role, revoking their sessions (a role change must take
-    /// effect immediately). Returns false when the user does not exist.
+    /// Updates a user's role, revoking their sessions and owned API tokens (a
+    /// role change must take effect immediately). Returns false when the user
+    /// does not exist.
+    ///
+    /// This variant does not check the last-admin invariant; request handlers
+    /// must use [`Self::set_user_role_checked`].
     pub async fn set_user_role(&self, username: &str, role: Role) -> bool {
-        let (exists, changed) = {
+        self.set_user_role_inner(username, role, false)
+            .await
+            .is_ok()
+    }
+
+    /// Atomically updates a user's role while protecting the last remaining
+    /// Admin account.
+    ///
+    /// The last-admin check and the mutation happen under the same users lock,
+    /// so two concurrent demotions cannot both pass. Returns whether the role
+    /// actually changed, or a distinct [`UserMutationError`].
+    pub async fn set_user_role_checked(
+        &self,
+        username: &str,
+        role: Role,
+    ) -> Result<bool, UserMutationError> {
+        self.set_user_role_inner(username, role, true).await
+    }
+
+    async fn set_user_role_inner(
+        &self,
+        username: &str,
+        role: Role,
+        protect_last_admin: bool,
+    ) -> Result<bool, UserMutationError> {
+        let changed = {
             let mut users = lock(&self.users);
-            match users.get_mut(username) {
-                Some(user) => {
-                    let changed = user.role != role;
-                    user.role = role;
-                    (true, changed)
-                }
-                None => (false, false),
+            let admin_count = users.values().filter(|u| u.role == Role::Admin).count();
+            let Some(user) = users.get_mut(username) else {
+                return Err(UserMutationError::NotFound);
+            };
+            if protect_last_admin
+                && user.role == Role::Admin
+                && role != Role::Admin
+                && admin_count <= 1
+            {
+                return Err(UserMutationError::LastAdmin);
             }
+            let changed = user.role != role;
+            user.role = role;
+            changed
         };
-        if !exists {
-            return false;
-        }
         if changed {
             self.purge_user_sessions(username).await;
+            // An Admin-scoped token must not survive a demotion, and a
+            // promotion changes the account's effective privileges too.
+            self.revoke_tokens_for_owner(username).await;
             self.save_users_async().await;
         }
-        true
+        Ok(changed)
     }
 
     /// Deletes a user account by username. Returns true if the user existed and was removed.
+    ///
+    /// This variant does not check the last-admin invariant; request handlers
+    /// must use [`Self::delete_user_checked`].
     pub async fn delete_user(&self, username: &str) -> bool {
-        let removed = lock(&self.users).remove(username).is_some();
-        if removed {
-            if username == "admin" {
-                self.default_admin_active.store(false, Ordering::SeqCst);
-            }
-            // A deleted account must lose access immediately: sessions are
-            // not re-validated against the user table on every request.
-            self.purge_user_sessions(username).await;
-            // API tokens are credentials for the account too: never leave
-            // them usable after the account is gone.
-            let removed_tokens = {
-                let mut tokens = lock(&self.tokens);
-                let before = tokens.len();
-                tokens.retain(|_, token| token.owner.as_deref() != Some(username));
-                tokens.len() != before
+        self.delete_user_inner(username, false).await.is_ok()
+    }
+
+    /// Atomically deletes a user account while protecting the last remaining
+    /// Admin account.
+    ///
+    /// The last-admin check and the removal happen under the same users lock,
+    /// so concurrent deletions/demotions cannot both pass.
+    pub async fn delete_user_checked(&self, username: &str) -> Result<(), UserMutationError> {
+        self.delete_user_inner(username, true).await
+    }
+
+    async fn delete_user_inner(
+        &self,
+        username: &str,
+        protect_last_admin: bool,
+    ) -> Result<(), UserMutationError> {
+        {
+            let mut users = lock(&self.users);
+            let Some(role) = users.get(username).map(|user| user.role) else {
+                return Err(UserMutationError::NotFound);
             };
-            if removed_tokens {
-                self.save_tokens_async().await;
+            if protect_last_admin
+                && role == Role::Admin
+                && users.values().filter(|u| u.role == Role::Admin).count() <= 1
+            {
+                return Err(UserMutationError::LastAdmin);
             }
-            self.save_users_async().await;
+            users.remove(username);
         }
-        removed
+        if username == "admin" {
+            self.default_admin_active.store(false, Ordering::SeqCst);
+        }
+        // A deleted account must lose access immediately: sessions are
+        // not re-validated against the user table on every request.
+        self.purge_user_sessions(username).await;
+        // API tokens are credentials for the account too: never leave
+        // them usable after the account is gone.
+        self.revoke_tokens_for_owner(username).await;
+        self.save_users_async().await;
+        Ok(())
     }
 
     /// Returns true if the default bootstrapped admin user is still active with default password.
@@ -1302,8 +1373,10 @@ impl AuthManager {
             .insert(username.to_string(), user)
             .is_some();
         if existed {
-            // Overwriting an account (new password/role) revokes its sessions.
+            // Overwriting an account (new password/role) revokes its sessions
+            // and credentials so the previous identity cannot keep access.
             self.purge_user_sessions(username).await;
+            self.revoke_tokens_for_owner(username).await;
         }
         self.save_users_async().await;
     }
@@ -1333,6 +1406,9 @@ impl AuthManager {
         }
         self.save_users_async().await;
         self.purge_user_sessions(username).await;
+        // A password change invalidates every credential derived from the old
+        // password, including owned API tokens.
+        self.revoke_tokens_for_owner(username).await;
         true
     }
 
@@ -1753,6 +1829,9 @@ impl AuthManager {
             return false;
         }
         self.purge_user_sessions(username).await;
+        // Disabling a second factor is a credential change: owned API tokens
+        // must not outlive it.
+        self.revoke_tokens_for_owner(username).await;
         self.save_users_async().await;
         true
     }
@@ -1784,11 +1863,32 @@ impl AuthManager {
         }
     }
 
+    /// Revokes every API token owned by `username` and persists the change.
+    ///
+    /// Legacy ownerless tokens are intentionally not matched: they are not
+    /// tied to an account and remain Admin-managed.
+    pub async fn revoke_tokens_for_owner(&self, username: &str) {
+        if self.revoke_tokens_for_owner_in_memory(username) {
+            self.save_tokens_async().await;
+        }
+    }
+
+    /// In-memory half of [`revoke_tokens_for_owner`]; returns whether anything
+    /// was removed so callers can skip an unnecessary persistence write.
+    fn revoke_tokens_for_owner_in_memory(&self, username: &str) -> bool {
+        let mut tokens = lock(&self.tokens);
+        let before = tokens.len();
+        tokens.retain(|_, token| token.owner.as_deref() != Some(username));
+        tokens.len() != before
+    }
+
     /// Creates a new API token owned by `owner`.
     ///
-    /// At the global capacity limit only a token owned by the same account is
-    /// evicted (oldest first). If the owner has no token to evict, the create
-    /// fails instead of silently deleting another account's credential.
+    /// A single owner may hold at most [`MAX_API_TOKENS_PER_OWNER`] tokens;
+    /// creating one more evicts that owner's oldest token. At the global
+    /// capacity limit only a token owned by the same account is evicted
+    /// (oldest first). If the owner has no token to evict, the create fails
+    /// instead of silently deleting another account's credential.
     pub async fn create_token(
         &self,
         name: &str,
@@ -1808,6 +1908,31 @@ impl AuthManager {
             let mut tokens = lock(&self.tokens);
             let now = chrono::Utc::now().timestamp();
             tokens.retain(|_, t| t.expires_at.is_none_or(|exp| now < exp));
+
+            // Per-owner quota. Legacy ownerless tokens are not an owner and
+            // keep relying on the global cap below. The loop also trims state
+            // persisted before the per-owner quota existed.
+            if let Some(owner_name) = owner {
+                loop {
+                    let owner_count = tokens
+                        .values()
+                        .filter(|token| token.owner.as_deref() == Some(owner_name))
+                        .count();
+                    if owner_count < MAX_API_TOKENS_PER_OWNER {
+                        break;
+                    }
+                    let oldest_key = tokens
+                        .iter()
+                        .filter(|(_, token)| token.owner.as_deref() == Some(owner_name))
+                        .min_by_key(|(_, token)| (token.created_at, token.id.clone()))
+                        .map(|(key, _)| key.clone());
+                    let Some(key) = oldest_key else {
+                        break;
+                    };
+                    tokens.remove(&key);
+                }
+            }
+
             if tokens.len() >= MAX_API_TOKENS {
                 let oldest_same_owner = tokens
                     .iter()
@@ -2257,10 +2382,16 @@ mod tests {
     #[tokio::test]
     async fn test_api_token_capacity_never_evicts_another_owners_token() {
         let mgr = AuthManager::new();
-        for i in 0..MAX_API_TOKENS {
-            mgr.create_token(&format!("admin-{i}"), Role::Admin, Some("admin"))
-                .await
-                .expect("admin token");
+        // Fill the global store to MAX_API_TOKENS with owned tokens only:
+        // 15 owners at the per-owner quota plus a 16th owner.
+        for owner in 0..(MAX_API_TOKENS / MAX_API_TOKENS_PER_OWNER - 1) {
+            let owner = format!("owner-{owner}");
+            for i in 0..MAX_API_TOKENS_PER_OWNER {
+                create_owned_token(&mgr, &owner, &format!("{owner}-{i}")).await;
+            }
+        }
+        for i in 0..MAX_API_TOKENS_PER_OWNER {
+            create_owned_token(&mgr, "admin", &format!("admin-{i}")).await;
         }
         assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
 
@@ -2271,12 +2402,11 @@ mod tests {
         assert_eq!(err, CreateTokenError::CapacityReached);
         assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
         assert!(
-            mgr.list_tokens()
-                .iter()
-                .all(|token| token.owner.as_deref() == Some("admin"))
+            mgr.list_tokens().iter().all(|token| token.owner.is_some()),
+            "the failed create must not have evicted another owner's token"
         );
 
-        // The same owner can still rotate its oldest token.
+        // The same owner can still rotate its oldest token at the global cap.
         mgr.create_token("admin-new", Role::Admin, Some("admin"))
             .await
             .expect("same-owner rotation");
@@ -2285,6 +2415,14 @@ mod tests {
             mgr.list_tokens()
                 .iter()
                 .any(|token| token.name == "admin-new")
+        );
+        assert_eq!(
+            mgr.list_tokens()
+                .iter()
+                .filter(|token| token.owner.as_deref() == Some("owner-0"))
+                .count(),
+            MAX_API_TOKENS_PER_OWNER,
+            "another owner's tokens must be untouched"
         );
     }
 
@@ -2368,6 +2506,220 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn owned_token_names(mgr: &AuthManager, owner: &str) -> Vec<String> {
+        let mut names: Vec<String> = mgr
+            .list_tokens()
+            .into_iter()
+            .filter(|token| token.owner.as_deref() == Some(owner))
+            .map(|token| token.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    async fn create_owned_token(mgr: &AuthManager, owner: &str, name: &str) {
+        mgr.create_token(name, Role::Viewer, Some(owner))
+            .await
+            .expect("owned token");
+    }
+
+    #[tokio::test]
+    async fn test_password_change_revokes_owned_tokens() {
+        let dir = auth_temp_dir("pw_revokes_tokens");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            mgr.create_user("alice", "AlicePassword1", Role::Operator)
+                .await;
+            create_owned_token(&mgr, "alice", "alice-token").await;
+            create_owned_token(&mgr, "admin", "admin-token").await;
+            mgr.create_token("legacy", Role::Viewer, None)
+                .await
+                .expect("legacy token");
+
+            assert!(mgr.update_user_password("alice", "AlicePassword2").await);
+            assert!(
+                owned_token_names(&mgr, "alice").is_empty(),
+                "a password change must revoke the account's API tokens"
+            );
+            assert_eq!(
+                owned_token_names(&mgr, "admin"),
+                vec!["admin-token".to_string()]
+            );
+            assert!(
+                mgr.list_tokens().iter().any(|token| token.name == "legacy"),
+                "legacy ownerless tokens stay Admin-managed"
+            );
+        }
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            owned_token_names(&mgr, "alice").is_empty(),
+            "password-change token revocation must survive a reload"
+        );
+        assert!(
+            mgr.list_tokens()
+                .iter()
+                .any(|token| token.name == "admin-token")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_disable_totp_revokes_owned_tokens() {
+        let dir = auth_temp_dir("totp_revokes_tokens");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            mgr.create_user("alice", "AlicePassword1", Role::Operator)
+                .await;
+            enable_totp(&mgr, "alice").await;
+            create_owned_token(&mgr, "alice", "alice-token").await;
+            create_owned_token(&mgr, "admin", "admin-token").await;
+
+            assert!(mgr.disable_totp("alice").await);
+            assert!(
+                owned_token_names(&mgr, "alice").is_empty(),
+                "disabling TOTP must revoke the account's API tokens"
+            );
+            assert_eq!(
+                owned_token_names(&mgr, "admin"),
+                vec!["admin-token".to_string()]
+            );
+        }
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            owned_token_names(&mgr, "alice").is_empty(),
+            "TOTP-disable token revocation must survive a reload"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_role_change_revokes_owned_tokens() {
+        let mgr = AuthManager::new();
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        create_owned_token(&mgr, "alice", "before-demotion").await;
+        create_owned_token(&mgr, "admin", "admin-token").await;
+
+        assert!(mgr.set_user_role("alice", Role::Viewer).await);
+        assert!(
+            owned_token_names(&mgr, "alice").is_empty(),
+            "demotion must revoke existing tokens so the old scope cannot survive"
+        );
+        assert_eq!(
+            owned_token_names(&mgr, "admin"),
+            vec!["admin-token".to_string()]
+        );
+
+        create_owned_token(&mgr, "alice", "before-promotion").await;
+        assert!(mgr.set_user_role("alice", Role::Admin).await);
+        assert!(
+            owned_token_names(&mgr, "alice").is_empty(),
+            "promotion also revokes existing tokens"
+        );
+        assert_eq!(
+            owned_token_names(&mgr, "admin"),
+            vec!["admin-token".to_string()]
+        );
+
+        // A no-op role update must not revoke anything.
+        create_owned_token(&mgr, "alice", "unchanged-role").await;
+        assert!(mgr.set_user_role("alice", Role::Admin).await);
+        assert!(
+            mgr.list_tokens()
+                .iter()
+                .any(|token| token.name == "unchanged-role"),
+            "setting the same role must not revoke tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_overwriting_user_revokes_owned_tokens() {
+        let mgr = AuthManager::new();
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        create_owned_token(&mgr, "alice", "alice-old").await;
+        create_owned_token(&mgr, "admin", "admin-token").await;
+
+        mgr.create_user("alice", "AlicePassword2", Role::Viewer)
+            .await;
+        assert!(
+            owned_token_names(&mgr, "alice").is_empty(),
+            "overwriting a user account must revoke its API tokens"
+        );
+        assert_eq!(
+            owned_token_names(&mgr, "admin"),
+            vec!["admin-token".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_per_owner_token_quota_evicts_only_that_owner() {
+        let mgr = AuthManager::new();
+        let (bob_token, _) = mgr
+            .create_token("bob-keep", Role::Viewer, Some("bob"))
+            .await
+            .expect("bob token");
+
+        for i in 0..MAX_API_TOKENS_PER_OWNER {
+            create_owned_token(&mgr, "alice", &format!("alice-{i}")).await;
+            // Keep created_at strictly increasing so "oldest" is unambiguous.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let alice_before = owned_token_names(&mgr, "alice");
+        assert_eq!(alice_before.len(), MAX_API_TOKENS_PER_OWNER);
+
+        create_owned_token(&mgr, "alice", "alice-new").await;
+
+        let alice_after = owned_token_names(&mgr, "alice");
+        assert_eq!(
+            alice_after.len(),
+            MAX_API_TOKENS_PER_OWNER,
+            "one owner must never exceed the per-owner quota"
+        );
+        assert!(
+            !alice_after.iter().any(|name| name == "alice-0"),
+            "the owner's oldest token must be evicted: {alice_after:?}"
+        );
+        assert!(alice_after.iter().any(|name| name == "alice-new"));
+        assert!(
+            mgr.list_tokens()
+                .iter()
+                .any(|token| token.id == bob_token.id),
+            "another owner's token must never be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_per_owner_token_quota_trims_persisted_overflow() {
+        let mgr = AuthManager::new();
+        // Simulate a tokens.toml written before the per-owner quota existed.
+        {
+            let mut tokens = lock(&mgr.tokens);
+            for i in 0..20 {
+                let (mut meta, _) = generate_token(&format!("legacy-{i}"), Role::Viewer);
+                meta.owner = Some("alice".to_string());
+                meta.created_at = i;
+                tokens.insert(meta.hash.clone(), meta);
+            }
+        }
+
+        create_owned_token(&mgr, "alice", "new").await;
+
+        let names = owned_token_names(&mgr, "alice");
+        assert_eq!(
+            names.len(),
+            MAX_API_TOKENS_PER_OWNER,
+            "legacy overflow must be trimmed to the per-owner quota"
+        );
+        assert!(names.iter().any(|name| name == "new"));
+        assert!(
+            !names.iter().any(|name| name == "legacy-0"),
+            "the oldest overflow token must be trimmed first"
+        );
     }
 
     #[test]
@@ -3049,7 +3401,99 @@ mod tests {
 
         // Unknown user.
         assert!(!mgr.set_user_role("ghost", Role::Admin).await);
+        assert_eq!(
+            mgr.set_user_role_checked("ghost", Role::Admin).await,
+            Err(UserMutationError::NotFound)
+        );
+        assert_eq!(
+            mgr.delete_user_checked("ghost").await,
+            Err(UserMutationError::NotFound)
+        );
         assert_eq!(mgr.list_users().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_demotions_keep_at_least_one_admin() {
+        let mgr = AuthManager::new();
+        mgr.create_user("admin2", "Admin2Password1", Role::Admin)
+            .await;
+        assert_eq!(mgr.admin_count(), 2);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let demote = |username: &'static str| {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                mgr.set_user_role_checked(username, Role::Viewer).await
+            })
+        };
+        let (first, second) = tokio::join!(demote("admin"), demote("admin2"));
+        let first = first.expect("demotion task");
+        let second = second.expect("demotion task");
+
+        let successes = [&first, &second]
+            .iter()
+            .filter(|result| matches!(result, Ok(true)))
+            .count();
+        let blocked = [&first, &second]
+            .iter()
+            .filter(|result| matches!(result, Err(UserMutationError::LastAdmin)))
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one concurrent demotion may succeed: {first:?} / {second:?}"
+        );
+        assert_eq!(
+            blocked, 1,
+            "the losing demotion must return LastAdmin: {first:?} / {second:?}"
+        );
+        assert_eq!(
+            mgr.admin_count(),
+            1,
+            "concurrent demotions must leave at least one Admin"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_demote_and_delete_keep_at_least_one_admin() {
+        let mgr = AuthManager::new();
+        mgr.create_user("admin2", "Admin2Password1", Role::Admin)
+            .await;
+        assert_eq!(mgr.admin_count(), 2);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let demote = {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                mgr.set_user_role_checked("admin", Role::Viewer).await
+            })
+        };
+        let delete = {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                mgr.delete_user_checked("admin2").await
+            })
+        };
+        let (demote, delete) = tokio::join!(demote, delete);
+        let demote = demote.expect("demotion task");
+        let delete = delete.expect("deletion task");
+
+        match (&demote, &delete) {
+            (Ok(true), Ok(())) => panic!("both operations removed an Admin"),
+            (Ok(true), Err(UserMutationError::LastAdmin))
+            | (Err(UserMutationError::LastAdmin), Ok(())) => {}
+            other => panic!("unexpected concurrent results: {other:?}"),
+        }
+        assert_eq!(
+            mgr.admin_count(),
+            1,
+            "concurrent demote/delete must leave at least one Admin"
+        );
     }
 
     #[tokio::test]

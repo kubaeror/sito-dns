@@ -160,6 +160,21 @@ restarting production nodes.
   async without holding a mutex guard across an await. Token revocation is
   immediate in memory and on all request paths; the on-disk token snapshot may
   lag by up to 60 s until the pruner persists it.
+- **Credential and privilege changes invalidate owned API tokens.** Changing an
+  account's password (self-service or Admin override), disabling its TOTP,
+  changing its role (promotion or demotion), or overwriting/recreating the
+  account revokes every API token it owns and persists `tokens.toml`. Deleting
+  an account already revoked its tokens. Legacy ownerless tokens are not tied
+  to an account and remain Admin-managed.
+- **Last-admin protection is atomic.** The “last remaining admin” check for
+  role changes and account deletion now runs under the same users lock as the
+  mutation. Concurrent demotions or deletions cannot both succeed and leave the
+  deployment without an Admin; the losing request returns `400` and unknown
+  accounts remain `404`.
+- **Per-owner API-token quota.** One account may hold at most 16 tokens. A 17th
+  creation evicts that account's oldest token and never another account's. The
+  separate global cap remains 256; when it is reached and the requesting
+  account has no token to evict, creation returns `400`.
 
 ### Web UI
 
@@ -173,11 +188,13 @@ restarting production nodes.
   plaintext is displayed exactly once. Admins additionally see legacy ownerless
   tokens and an Owner column.
 - **API-token ownership and lifecycle.** Tokens now record their creating
-  account. Deleting that account revokes its owned tokens; legacy ownerless
-  tokens remain Admin-managed. At the global cap, only the oldest token owned by
-  the same account is evicted; otherwise creation returns `400` rather than
-  evicting another account's token. Role demotion does not change an existing
-  token's scope, so revoke/reissue tokens after demotion when needed.
+  account. Deleting that account, changing its password, disabling its TOTP,
+  changing its role (promotion or demotion), or overwriting/recreating it
+  revokes its owned tokens; legacy ownerless tokens remain Admin-managed. Each
+  account may hold at most 16 tokens; a 17th evicts only that account's oldest
+  token. At the separate global cap of 256, only the oldest token owned by the
+  same account is evicted; otherwise creation returns `400` rather than evicting
+  another account's token.
 - **Operator unidentified-clients table.** The **Clients** page now includes the
   read-only discovery table described under “Statistics and API”.
 
