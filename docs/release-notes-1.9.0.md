@@ -67,8 +67,8 @@ restarting production nodes.
   that targeted the old shared form.
 - **Corrupt embedded rule data no longer panics.** Parental, service, and
   anti-bypass manifests that fail to load now refuse startup with a clear error
-  instead of aborting the process; the server does not run with a partially
-  loaded registry.
+  instead of panicking; the server does not run with a partially loaded
+  registry.
 
 ### Filtering configuration
 

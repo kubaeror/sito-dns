@@ -474,19 +474,19 @@ impl MasterCoordinator {
         }
 
         {
-            let publish_guard = self
+            let _publish_guard = self
                 .publish_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // A synchronous publisher may have advanced the sequence while the
             // write was in flight. Publishing our older prepared version would
             // regress the cluster, so restore the now-active state file and
-            // report the conflict instead.
+            // report the conflict instead. Keep `publish_guard` for the restore
+            // write so no newer publisher can interleave and be overwritten.
             if self.current_version.load(Ordering::SeqCst) != previous_version {
-                drop(publish_guard);
                 let active = self.active_bundle.lock().unwrap().clone();
                 if let Some(active) = active
-                    && let Err(e) = self.persist_bundle_async(&active).await
+                    && let Err(e) = self.persist_bundle(&active)
                 {
                     error!(error = %e, "Failed to restore HA master state after a concurrent publish");
                 }

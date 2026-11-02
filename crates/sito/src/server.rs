@@ -464,9 +464,6 @@ struct ConfigWatcher {
     ctx: sito_api::ServerContext,
     /// Hook-owned components shared with the REST/UI config write paths.
     hooks: Arc<ServerApplyHooks>,
-    /// Exact document written by the HA slave applier; consumed by the watcher
-    /// so a push is not applied a second time.
-    self_write: Arc<sito_api::config_apply::AppliedDocumentTracker>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -573,7 +570,6 @@ impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
 pub struct HaConfigApplier {
     ctx: sito_api::ServerContext,
     hooks: Arc<dyn sito_api::config_apply::ConfigApplyHooks>,
-    self_write: Arc<sito_api::config_apply::AppliedDocumentTracker>,
     /// Set only after `init_tls_and_acme` and `DnsListenerManager::start` have
     /// produced the listener generation and shared rate limiters. Before that,
     /// a push must not be acknowledged: applying it would silently skip the
@@ -587,26 +583,9 @@ impl HaConfigApplier {
         ctx: sito_api::ServerContext,
         hooks: Arc<dyn sito_api::config_apply::ConfigApplyHooks>,
     ) -> Self {
-        Self::with_self_write(
-            ctx,
-            hooks,
-            Arc::new(sito_api::config_apply::AppliedDocumentTracker::new()),
-        )
-    }
-
-    /// Creates an applier sharing the watcher's self-write tracker. The
-    /// listener readiness gate is still closed until
-    /// [`Self::mark_listeners_ready`] is called.
-    #[must_use]
-    pub fn with_self_write(
-        ctx: sito_api::ServerContext,
-        hooks: Arc<dyn sito_api::config_apply::ConfigApplyHooks>,
-        self_write: Arc<sito_api::config_apply::AppliedDocumentTracker>,
-    ) -> Self {
         Self {
             ctx,
             hooks,
-            self_write,
             listeners_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -615,13 +594,6 @@ impl HaConfigApplier {
     pub fn mark_listeners_ready(&self) {
         self.listeners_ready
             .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Tracks the documents written by this applier so the file watcher can
-    /// ignore its own write.
-    #[must_use]
-    pub fn self_write_tracker(&self) -> Arc<sito_api::config_apply::AppliedDocumentTracker> {
-        self.self_write.clone()
     }
 }
 
@@ -643,9 +615,6 @@ impl sito_ha::SlaveConfigApplier for HaConfigApplier {
             });
         }
 
-        // Record before the write so a watcher event racing the rename is
-        // recognised as this applier's own output.
-        self.self_write.record(document);
         Box::pin(async move {
             match sito_api::config_apply::apply_and_persist_document(
                 &self.ctx,
@@ -669,10 +638,7 @@ impl sito_ha::SlaveConfigApplier for HaConfigApplier {
                     }
                     Ok(())
                 }
-                Err(e) => {
-                    self.self_write.clear();
-                    Err(e.detail)
-                }
+                Err(e) => Err(e.detail),
             }
         })
     }
@@ -693,7 +659,6 @@ fn spawn_slave_worker_after_listeners(
     filter_engine: &Arc<HostsFilterEngine>,
     metrics: &sito_stats::MetricsRegistry,
     config_path: &Path,
-    self_write: &Arc<sito_api::config_apply::AppliedDocumentTracker>,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
     let (Some(tracker), Some(resync_rx)) = (
@@ -708,11 +673,7 @@ fn spawn_slave_worker_after_listeners(
         return;
     }
 
-    let applier = Arc::new(HaConfigApplier::with_self_write(
-        server_ctx.clone(),
-        hooks.clone(),
-        self_write.clone(),
-    ));
+    let applier = Arc::new(HaConfigApplier::new(server_ctx.clone(), hooks.clone()));
     applier.mark_listeners_ready();
     let slave_handles = sito_ha::SlaveAppHandles {
         runtime: runtime.clone(),
@@ -737,7 +698,6 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
     let ConfigWatcher {
         ctx,
         hooks,
-        self_write,
         shutdown_rx: mut watcher_shutdown_rx,
     } = watcher;
     let watcher_config_path = ctx.config_path.clone();
@@ -793,15 +753,14 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
                 match tokio::fs::read_to_string(&watcher_config_path).await {
                     Ok(content) => {
                         use sito_api::config_apply::ConfigFileApplyOutcome;
-                        // Same apply/validate pipeline as every API write path;
-                        // only the HA applier's exact self-write is skipped so
-                        // a push is not applied twice.
+                        // Same apply/validate pipeline as every API write path.
+                        // A document that already matches the runtime (the HA
+                        // applier's own write or an identical save) is skipped.
                         match sito_api::config_apply::apply_config_document_event(
                             &ctx,
                             &content,
                             sito_api::config_apply::FilterApply::Sync,
                             Some(&*hooks),
-                            &self_write,
                         )
                         .await
                         {
@@ -1076,12 +1035,6 @@ pub async fn run_server_full(
         dns_starter,
     };
 
-    // The watcher needs the applier's self-write tracker before the slave
-    // worker exists; the worker itself is spawned only after the listener
-    // generation and rate limiters are live (see
-    // `spawn_slave_worker_after_listeners`).
-    let self_write = Arc::new(sito_api::config_apply::AppliedDocumentTracker::new());
-
     let api_router = sito_api::create_router_with_hooks(
         server_ctx.clone(),
         sito_api::config_apply::ApplyHooks::new(apply_hooks.clone()),
@@ -1172,7 +1125,6 @@ pub async fn run_server_full(
     tokio::spawn(run_config_watcher(ConfigWatcher {
         ctx: server_ctx.clone(),
         hooks: apply_hooks.clone(),
-        self_write: self_write.clone(),
         shutdown_rx: shutdown_rx.clone(),
     }));
 
@@ -1226,7 +1178,6 @@ pub async fn run_server_full(
                     &filter_engine,
                     &metrics,
                     &config_path_buf,
-                    &self_write,
                     &shutdown_rx,
                 );
 
@@ -1269,7 +1220,6 @@ pub async fn run_server_full(
             &filter_engine,
             &metrics,
             &config_path_buf,
-            &self_write,
             &shutdown_rx,
         );
 

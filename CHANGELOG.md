@@ -98,9 +98,9 @@ exhaustive record.
   lag by up to 60 s until the pruner persists it.
 - **Corrupt embedded rule data no longer panics**: parental, service, and
   anti-bypass manifests that fail to load now refuse startup with a clear error
-  instead of aborting the process. The failure is reported by `init_runtime`
-  without panicking; operators should reinstall the packaged data rather than
-  run with a partially loaded registry.
+  instead of panicking. The failure is reported by `load_bundled_registries`;
+  operators should reinstall the packaged data rather than run with a partially
+  loaded registry.
 
 ### Security
 - **TOTP secrets encrypted at rest**: `users.toml` now stores each TOTP secret

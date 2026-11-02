@@ -104,6 +104,13 @@ impl ChainCache {
     /// Returns `true` when entries were dropped (or the policy was recorded for
     /// the first time), so the caller can log the invalidation.
     pub fn ensure_policy(&self, fingerprint: String) -> bool {
+        // Serialize against `flush`: a flush must not snapshot entries and then
+        // read a policy that was replaced in between (which would persist
+        // pre-clear entries tagged with the new fingerprint).
+        let _flush_guard = self
+            .flush_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut policy = self
             .policy
             .lock()
@@ -124,16 +131,19 @@ impl ChainCache {
         changed
     }
 
-    /// Removes `Unsigned` entries that overlap a newly configured anchor.
-    /// Signed entries remain valid: a new anchor never makes signed evidence
-    /// weaker.
-    pub fn invalidate_unsigned_overlapping(&self, anchor: &LowerName) -> usize {
+    /// Removes `Unsigned` entries that the newly configured `anchor`
+    /// contradicts: entries whose zone is at or above the anchor (the cached
+    /// zone is an ancestor of, or equal to, the anchor).
+    ///
+    /// A legitimate unsigned child below the anchor is not contradicted and is
+    /// deliberately kept. Signed entries remain valid: a new anchor never makes
+    /// signed evidence weaker.
+    pub fn invalidate_unsigned_at_or_above(&self, anchor: &LowerName) -> usize {
         let stale: Vec<LowerName> = self
             .entries
             .iter()
             .filter(|entry| {
-                entry.value().status == ZoneStatus::Unsigned
-                    && (anchor.zone_of(entry.key()) || entry.key().zone_of(anchor))
+                entry.value().status == ZoneStatus::Unsigned && entry.key().zone_of(anchor)
             })
             .map(|entry| entry.key().clone())
             .collect();

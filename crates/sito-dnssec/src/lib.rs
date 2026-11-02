@@ -1461,7 +1461,11 @@ impl DnssecValidator {
                         other => hickory_proto::dnssec::Algorithm::Unknown(other),
                     };
                     let pubkey = PublicKeyBuf::new(bytes, algorithm);
-                    validator.add_raw_trust_anchor(&pubkey, lower_name);
+                    // Policy invalidation is handled once, after every anchor
+                    // has been inserted; per-anchor invalidation would drop
+                    // legitimate unsigned children on every reload.
+                    validator.insert_raw_trust_anchor(&pubkey, &lower_name);
+                    validator.anchor_zones.insert(lower_name, ());
                 }
             }
         }
@@ -1491,31 +1495,39 @@ impl DnssecValidator {
         self
     }
 
+    /// Inserts an anchor without touching cached unsigned evidence or
+    /// `anchor_zones`. Used during construction where the policy fingerprint
+    /// owns invalidation.
+    fn insert_raw_trust_anchor(&self, key: &PublicKeyBuf, name: &LowerName) {
+        let mut anchors = (**self.trust_anchors.load()).clone();
+        anchors.insert_with_name(key, name.clone());
+        self.trust_anchors.store(Arc::new(anchors));
+    }
+
     /// Dynamically add a trusted anchor from DNSKEY.
     pub fn add_trust_anchor(&self, key: &DNSKEY, name: LowerName) {
-        let mut anchors = (**self.trust_anchors.load()).clone();
-        anchors.insert_with_name(key.public_key(), name.clone());
-        self.trust_anchors.store(Arc::new(anchors));
+        self.insert_raw_trust_anchor(key.public_key(), &name);
         self.invalidate_unsigned_evidence_under(&name);
         self.anchor_zones.insert(name, ());
     }
 
     /// Dynamically add a trusted anchor from raw public key buffer.
     pub fn add_raw_trust_anchor(&self, key: &PublicKeyBuf, name: LowerName) {
-        let mut anchors = (**self.trust_anchors.load()).clone();
-        anchors.insert_with_name(key, name.clone());
-        self.trust_anchors.store(Arc::new(anchors));
+        self.insert_raw_trust_anchor(key, &name);
         self.invalidate_unsigned_evidence_under(&name);
         self.anchor_zones.insert(name, ());
     }
 
-    /// Drops unsigned evidence that overlapped `anchor` before the anchor was
-    /// configured. An `Unsigned` proof established under the previous policy
-    /// must never downgrade the newly anchored subtree.
+    /// Drops cached unsigned evidence that the new `anchor` contradicts.
+    ///
+    /// Only a cached zone that is at or above the anchor (the cached zone is an
+    /// ancestor of, or equal to, the anchor) is invalidated. A legitimate
+    /// unsigned child *below* an anchor is not contradicted by that anchor and
+    /// must keep its cached proof, otherwise a reload would turn its stripped
+    /// answers Bogus while the DS probe is offline.
     fn invalidate_unsigned_evidence_under(&self, anchor: &LowerName) {
-        self.insecure_zones
-            .retain(|zone, _| !(anchor.zone_of(zone) || zone.zone_of(anchor)));
-        self.chain_cache.invalidate_unsigned_overlapping(anchor);
+        self.insecure_zones.retain(|zone, _| !zone.zone_of(anchor));
+        self.chain_cache.invalidate_unsigned_at_or_above(anchor);
     }
 
     /// Add a Negative Trust Anchor (NTA) dynamically.
@@ -1610,25 +1622,28 @@ impl DnssecValidator {
             .any(|entry| *entry.value() >= now && entry.key().zone_of(name))
     }
 
-    /// Whether a configured (non-root) trust anchor covers `name`.
+    /// Whether a configured non-root anchor is at or below the cached
+    /// `unsigned_zone` (the cached zone is an ancestor of, or equal to, the
+    /// anchor), and therefore contradicts that cached denial.
     ///
-    /// A cached `Unsigned` status was authenticated under the policy that
-    /// existed when it was written. If an operator later configures an anchor
-    /// at or above `name`, the cached denial must not downgrade that subtree:
-    /// fall back to a fresh probe against the current anchors instead.
-    fn configured_anchor_covers(&self, name: &LowerName) -> bool {
+    /// A cached `Unsigned` child *below* a configured anchor is legitimate: the
+    /// anchor only covers the signed parent/island, not the child delegation.
+    /// Ignoring it would re-probe on every reload and, while offline, turn the
+    /// child's stripped answers Bogus.
+    fn anchor_affects_unsigned_zone(&self, unsigned_zone: &LowerName) -> bool {
         self.anchor_zones
             .iter()
-            .any(|entry| !entry.key().is_root() && entry.key().zone_of(name))
+            .any(|entry| !entry.key().is_root() && unsigned_zone.zone_of(entry.key()))
     }
 
-    /// A cached `Unsigned` zone covering `name`, unless a configured anchor
-    /// now covers the name (see [`Self::configured_anchor_covers`]).
+    /// A cached `Unsigned` zone covering `name`, unless a configured anchor at
+    /// or below that cached zone now contradicts it.
     fn cached_unsigned_zone(&self, name: &LowerName, now: u32) -> Option<(LowerName, u32)> {
-        if self.configured_anchor_covers(name) {
+        let (zone, expiry) = self.chain_cache.covers_unsigned(name, now)?;
+        if self.anchor_affects_unsigned_zone(&zone) {
             return None;
         }
-        self.chain_cache.covers_unsigned(name, now)
+        Some((zone, expiry))
     }
 
     /// The closest zone apex that previously signed validated response data and
@@ -2096,7 +2111,7 @@ impl DnssecValidator {
     ) -> UnsignedProbe {
         if let Some(entry) = self.chain_cache.get(name, now) {
             let stale_unsigned =
-                entry.status == ZoneStatus::Unsigned && self.configured_anchor_covers(name);
+                entry.status == ZoneStatus::Unsigned && self.anchor_affects_unsigned_zone(name);
             if !stale_unsigned {
                 match entry.status {
                     ZoneStatus::Signed => {
@@ -2136,7 +2151,7 @@ impl DnssecValidator {
     fn unsigned_status_known(&self, name: &LowerName, now: u32) -> bool {
         let exact = self.chain_cache.get(name, now);
         let exact_known = exact.is_some_and(|entry| {
-            entry.status == ZoneStatus::Signed || !self.configured_anchor_covers(name)
+            entry.status == ZoneStatus::Signed || !self.anchor_affects_unsigned_zone(name)
         });
         exact_known
             || self.cached_unsigned_zone(name, now).is_some()
@@ -6177,6 +6192,112 @@ mod tests {
         );
         assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
         assert!(!response.metadata.authentic_data);
+    }
+
+    /// Regression A: a legitimate unsigned child below a configured anchor
+    /// must keep its cached proof across a reload. Only an anchor at or below
+    /// the cached unsigned zone may invalidate it.
+    #[tokio::test]
+    async fn test_cached_unsigned_child_below_anchor_survives_reload() {
+        use base64::Engine as _;
+
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let (child_origin, child_key, _child_signer) =
+            create_test_signer("unsigned.signed.example.");
+        let qname = Name::from_str("www.unsigned.signed.example.").expect("qname");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+        let anchor = format!(
+            "signed.example:13:{}",
+            base64::engine::general_purpose::STANDARD
+                .encode(parent_key.public_key().public_bytes())
+        );
+        let config = DnssecConfig {
+            trust_anchors: vec![anchor],
+            ..Default::default()
+        };
+
+        let cache = Arc::new(ChainCache::new(None));
+        let validator = DnssecValidator::from_config_with_cache(&config, Some(cache.clone()));
+
+        let ds_denial = signed_nsec_response(
+            &parent_origin,
+            &child_origin,
+            &Name::from_str("z.signed.example.").expect("next"),
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+            &child_origin,
+            &parent_key,
+            &parent_signer,
+            ResponseCode::NoError,
+        );
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(&child_origin, RecordType::DS, ds_denial);
+
+        let mut response = stripped_response(&qname);
+        let first = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+        assert_eq!(
+            first,
+            ValidationOutcome::Insecure,
+            "the child delegation is authenticated as unsigned"
+        );
+        let child_zone = LowerName::from(&child_origin);
+        assert!(
+            cache.covers_unsigned(&child_zone, now).is_some(),
+            "the unsigned child must be cached"
+        );
+
+        // Reproduce the hard case: signed evidence for the parent is also
+        // cached, so an offline probe would fail closed if the child's unsigned
+        // proof were dropped.
+        cache.insert(
+            LowerName::from(&parent_origin),
+            ZoneStatus::Signed,
+            now.saturating_add(600),
+            now,
+        );
+
+        // Reload with the same configured anchor. The child's cached unsigned
+        // proof must survive.
+        let reloaded = DnssecValidator::from_config_with_cache(&config, Some(cache.clone()));
+        assert!(
+            cache.covers_unsigned(&child_zone, now).is_some(),
+            "reload must not evict a legitimate unsigned child below the anchor"
+        );
+        let offline = OfflineFetcher::new();
+        let mut response = stripped_response(&qname);
+        let outcome = reloaded
+            .validate_with_key_fetcher(&mut response, Some("offline"), now, &offline)
+            .await;
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Insecure,
+            "a cached unsigned child must stay Insecure across reload while offline"
+        );
+
+        // An anchor at/below the child contradicts its cached denial and must
+        // still invalidate it (the original I1 protection).
+        let child_anchored = DnssecValidator::from_config_with_cache(&config, Some(cache.clone()));
+        child_anchored.add_trust_anchor(&child_key, child_zone.clone());
+        assert!(
+            cache.covers_unsigned(&child_zone, now).is_none(),
+            "an anchor at the cached unsigned zone must invalidate it"
+        );
+        let offline = OfflineFetcher::new();
+        let mut response = stripped_response(&qname);
+        let outcome = child_anchored
+            .validate_with_key_fetcher(&mut response, Some("offline"), now, &offline)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a newly anchored zone must fail closed: {outcome:?}"
+        );
     }
 
     /// Important regression (I2): an offline probe for a CNAME target in a

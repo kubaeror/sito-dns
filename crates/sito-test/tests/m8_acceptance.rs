@@ -967,7 +967,6 @@ async fn test_m8_push_applies_upstream_and_dnssec_without_watcher() {
     ));
     // Listener generation and rate limiters are live in this scenario.
     applier.mark_listeners_ready();
-    let self_write = applier.self_write_tracker();
 
     let tracker = SlaveStatusTracker::new("slave-apply".to_string(), 0, None);
     let handles = SlaveAppHandles {
@@ -1056,15 +1055,7 @@ nta = ["pushed.internal"]
         compiles_before_push + 1,
         "the push itself must have compiled the filter exactly once"
     );
-    match apply_config_document_event(
-        &ctx,
-        &persisted,
-        FilterApply::Sync,
-        Some(&*hooks),
-        &self_write,
-    )
-    .await
-    {
+    match apply_config_document_event(&ctx, &persisted, FilterApply::Sync, Some(&*hooks)).await {
         ConfigFileApplyOutcome::SelfWriteIgnored => {}
         other => panic!("the applier's own write must be ignored, got {other:?}"),
     }
@@ -1074,17 +1065,9 @@ nta = ["pushed.internal"]
         "a push must not trigger a second filter download/compile through the watcher"
     );
 
-    // A duplicate watcher event for the same recent self-write is suppressed
-    // too (the tracker keeps a bounded recent set, not just one document).
-    match apply_config_document_event(
-        &ctx,
-        &persisted,
-        FilterApply::Sync,
-        Some(&*hooks),
-        &self_write,
-    )
-    .await
-    {
+    // A duplicate watcher event is suppressed because the file still matches
+    // the live runtime configuration.
+    match apply_config_document_event(&ctx, &persisted, FilterApply::Sync, Some(&*hooks)).await {
         ConfigFileApplyOutcome::SelfWriteIgnored => {}
         other => panic!("a duplicate self-write event must be ignored, got {other:?}"),
     }
@@ -1101,14 +1084,8 @@ nta = ["pushed.internal"]
     tokio::fs::write(&ctx.config_path, &changed_document)
         .await
         .unwrap();
-    match apply_config_document_event(
-        &ctx,
-        &changed_document,
-        FilterApply::Sync,
-        Some(&*hooks),
-        &self_write,
-    )
-    .await
+    match apply_config_document_event(&ctx, &changed_document, FilterApply::Sync, Some(&*hooks))
+        .await
     {
         ConfigFileApplyOutcome::Applied(_) => {}
         other => panic!("a changed watcher document must be applied, got {other:?}"),
