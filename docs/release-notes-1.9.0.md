@@ -1,6 +1,6 @@
 # sito 1.9.0 — release notes
 
-Target release: **1.9.0**. The version bump, tag, and publication are handled
+Target release: **1.9.0** on 2026-11-02. The tag and publication are handled
 separately; this page summarizes the user-visible behavior and migration notes
 accumulated on the `feat/deferred-1.9.0` branch. The exhaustive, per-commit
 history remains in [`CHANGELOG.md`](../CHANGELOG.md).

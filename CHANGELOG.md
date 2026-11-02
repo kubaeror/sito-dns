@@ -5,10 +5,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased]
+## [1.9.0] - 2026-11-02
 
-See the [1.9.0 release notes](docs/release-notes-1.9.0.md) for the user-visible
-summary and migration checklist. This changelog remains the exhaustive record.
+Security, filtering, high-availability, observability, updater and dependency
+release. See the [1.9.0 release notes](docs/release-notes-1.9.0.md) for the
+user-visible summary and migration checklist; this changelog remains the
+exhaustive record.
 
 ### Added
 - **Configurable filter-list size cap**: `filtering.max_list_bytes` (default
@@ -19,6 +21,26 @@ summary and migration checklist. This changelog remains the exhaustive record.
   with `fail_closed = true` and no network answers SERVFAIL until a fetch under
   the new cap succeeds; a live reload keeps the previous snapshot and records
   the list in `failed_lists`.
+- **Regex compile budget**: `filtering.regex_compile_budget_ms` is an optional
+  wall-clock budget for compiling regex/wildcard rules (unset by default, must
+  be greater than 0). When a reload exceeds it, compilation aborts, the
+  previous snapshot is retained, and the failure is reported through
+  `last_error` and `last_compile_ms`. Unset disables the budget.
+- **`X-Total-Count` on bounded aggregate responses**: `GET
+  /api/v1/stats/clients` and `GET /api/v1/stats/upstreams` return the number of
+  distinct matching rows before the 1000-row response limit in the
+  `X-Total-Count` response header.
+- **`GET /api/v1/clients/unidentified` (Operator)**: returns unidentified
+  client discoveries newest-first, bounded by `?limit` (default 100, maximum
+  1024). Discoveries expire after 24 hours and are pruned on read; the response
+  also reports `max_entries` and `retention_hours`. This is an API-only view,
+  and the store is preserved across config reloads and HA applies.
+- **New HA metrics**: `sito_ha_diverged{instance}` (1 while a connected slave
+  acknowledged a version above the master's; returns to 0 after recovery and
+  the series is removed on disconnect) and
+  `sito_ha_startup_noop_total{role,reason}` for startup paths that leave
+  replication inactive (`replication_disabled`, `missing_master_url`,
+  `tls_init_failed`, `bind_failed`).
 
 ### Changed
 - **`$dnsrewrite` record-type matching**: rewrite records are now filtered by
@@ -26,7 +48,8 @@ summary and migration checklist. This changelog remains the exhaustive record.
   the same type, while `CNAME` answers any type. When matching rules contribute
   no value for the question type, the answer is `NOERROR` with zero records
   (NODATA) instead of falling back to an upstream lookup. Non-`NOERROR` rcodes
-  still take precedence over record synthesis.
+  still take precedence over record synthesis. Unsupported record types (for
+  example `NS` or `MX`) are rejected at load time with a warning.
 - **Bare `$dnsrewrite` vs explicit `$dnsrewrite=NOERROR`**: only the bare
   `@@...$dnsrewrite` exception cancels every rewrite for the owner. An explicit
   `@@...$dnsrewrite=NOERROR` now cancels only an identical NODATA rewrite, so
@@ -37,11 +60,43 @@ summary and migration checklist. This changelog remains the exhaustive record.
   `sito_upstream_health` now label a failed query with the configured server
   that failed instead of the former aggregate `upstream="all"`, and a failure
   immediately sets that server's health gauge to `0` (a later success resets it
-  to `1`). Failures that cannot be attributed to one server (for example, no
+  to `1`). The health gauge previously exposed as the synthetic
+  `upstream="default"` series is now keyed by the configured server; `default`
+  remains only as the empty-map fallback and disappears once per-server health
+  is recorded. Failures that cannot be attributed to one server (for example, no
   candidates available) use the constant `upstream="unattributed"` label and do
   not write a health gauge. The separate 3-strike active health state machine is
   unchanged. *Dashboard/alert migration:* update panels and alert rules that
-  filter, group, or alert on `upstream="all"`; that series is no longer emitted.
+  filter, group, or alert on `upstream="all"` (or the synthetic
+  `upstream="default"` health series); the aggregate error series is no longer
+  emitted.
+- **HA apply and ACK**: a slave now applies every component (runtime pipeline,
+  filtering, upstreams, DNSSEC, clients, rewrites), persists the exact document
+  atomically, and waits for the DNS listener readiness gate before acknowledging
+  a pushed bundle. A failure leaves the version watermark unchanged, marks the
+  node `Degraded`, and sends `applied: false` while retaining the last known
+  good runtime configuration. Node-local settings (`[ha]`, instance name,
+  `data_dir`, MikroTik credentials, client secrets) are preserved on apply.
+- **Updater streaming**: release downloads are streamed to a temporary file
+  with a running byte cap (256 MiB for archives, 1 MiB for `.sig`/`.pem`
+  assets). An over-cap declared `Content-Length` is rejected before the
+  destination is created, and a chunked response is aborted as soon as the
+  running total exceeds the cap. Signature and checksum verification still run
+  in the same order (signature first), the archive is never buffered whole in
+  memory, and temporary files/directories are removed on every failure path.
+- **Idle pooled DoT sockets are health-pinged**: sockets idle for at least 5 s
+  receive a root `NS` probe (2 s cap) during the periodic upstream maintenance
+  sweep. Dead sockets are dropped without failing user queries; live sockets
+  return to the pool and are reused.
+- **Auth persistence runs off the async runtime**: user, session, and token
+  writes use blocking worker threads, and user/token/session mutations are
+  async without holding a mutex guard across an await. Token revocation is
+  immediate in memory and on all request paths; the on-disk token snapshot may
+  lag by up to 60 s until the pruner persists it.
+- **Corrupt embedded rule data no longer panics**: parental, service, and
+  anti-bypass manifests that fail to load now log an error and degrade to an
+  empty registry instead of aborting the process. Skipped-rule counts are
+  logged once per load.
 
 ### Security
 - **TOTP secrets encrypted at rest**: `users.toml` now stores each TOTP secret
@@ -62,9 +117,10 @@ summary and migration checklist. This changelog remains the exhaustive record.
   Bogus/SERVFAIL regardless of process uptime, while an authenticated DS denial
   remains Insecure. Authenticated signed/unsigned delegation statuses are
   persisted in `<data_dir>/dnssec-chain-cache.toml` (0600, bounded, expiring,
-  never part of HA bundles or backups). A never-proven zone that cannot be
-  probed while offline is reported as Indeterminate with AD=0 instead of being
-  treated as signed or unsigned.
+  never part of HA bundles or backups). Every distinct name in a CNAME chain is
+  checked, and a chain that needs more than 8 distinct probes fails closed as
+  Bogus. A never-proven zone that cannot be probed while offline is reported as
+  Indeterminate with AD=0 instead of being treated as signed or unsigned.
 
 ### Migration
 - **Stats rollup schema**: migration `20260922000000_hourly_rollup_tops.sql`
@@ -76,6 +132,29 @@ summary and migration checklist. This changelog remains the exhaustive record.
   empty for per-upstream statistics. Hours still present in `query_log` are
   populated by the next retention sweep, and new rollups are populated
   normally; no manual data migration is required.
+- **Back up `users.toml` and `totp.key` together** and remove or securely store
+  pre-1.9.0 raw user backups (`users.toml.reset.*.bak`,
+  `users.toml.corrupt.*.bak`), which may still contain plaintext TOTP secrets.
+- **Review `$badfilter` rules that target bare `$dnsrewrite`** and dashboards or
+  alerts that use `upstream="all"` or the synthetic `upstream="default"` health
+  series.
+- **Keep `dnssec-chain-cache.toml` local to the node**: it contains only
+  authenticated local observations and is rebuilt automatically.
+
+### Toolchain and dependencies
+- **Rust 1.99.1** is the pinned toolchain and MSRV (`rust-toolchain.toml`,
+  `Cargo.toml`). The pin is a fixed version, not the `stable` channel.
+- **utoipa 6.0.0**, **utoipa-swagger-ui 10.0.2**, and **zip 9.2.1** are in use;
+  the zip advisories are cleared. `docs/openapi.json` was regenerated and
+  remains OpenAPI 3.1.0.
+- Compatible lockfile floors were raised for tokio 1.54, hickory-proto 0.26.3,
+  hyper 1.12, rust-embed 8.13, and croner 4.0.2.
+- **`tower-http 0.7` is not applied.** `tower-http 0.6.11` is pulled only
+  transitively by `reqwest 0.13.5`, which requires `^0.6.8`; there is no direct
+  `tower_http` use in the workspace, and a version requirement cannot be changed
+  with `[patch.crates-io]`. Revisit when reqwest or axum ships a compatible
+  requirement; 0.7 changes compression and redirect behavior and should be a
+  dedicated PR.
 
 ---
 
