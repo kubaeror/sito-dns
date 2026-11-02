@@ -1,9 +1,10 @@
 # User Management, Roles, and API Tokens
 
 sito keeps its accounts in `<data_dir>/users.toml` (mode `0600`) and has no
-self-registration or e-mail-based password reset. Accounts, roles, API tokens,
-and TOTP settings can be managed from the web panel (`/users` and `/account`)
-or through the administrative REST API under `/api/v1/auth/*`.
+self-registration or e-mail-based password reset. Accounts, roles, and API
+tokens can be managed from the web panel (`/users` and `/account`) or through
+the administrative REST API under `/api/v1/auth/*`. TOTP status and disabling
+are available in the web UI; TOTP enrollment/setup remains API-only.
 
 ## Web UI
 
