@@ -710,7 +710,10 @@ async fn test_acceptance_m5_api_backup_and_token_restore() {
     // Inspect archive contents
     let (extracted_toml, metadata) = extract_backup_archive(&archive_bytes).unwrap();
     assert_eq!(metadata.version, "1.0");
-    assert!(!extracted_toml.is_empty());
+    assert!(
+        !extracted_toml.is_empty(),
+        "backup archive must contain a TOML config"
+    );
 
     // POST /api/v1/config/restore -> prepare restore and get confirmation token
     let req = Request::builder()
@@ -728,7 +731,10 @@ async fn test_acceptance_m5_api_backup_and_token_restore() {
         .unwrap();
     let prepared: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     let confirmation_token = prepared["confirmation_token"].as_str().unwrap();
-    assert!(!confirmation_token.is_empty());
+    assert!(
+        !confirmation_token.is_empty(),
+        "restore preparation must return a confirmation token"
+    );
 
     // POST /api/v1/config/restore/confirm with confirmation token
     let confirm_body = serde_json::json!({

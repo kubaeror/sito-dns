@@ -2821,7 +2821,11 @@ mod tests {
         .await;
         assert_eq!(filter_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         // Verify in-memory filter lists was NOT mutated
-        assert!(ctx.config.load().filtering.lists.is_empty());
+        assert!(
+            ctx.config.load().filtering.lists.is_empty(),
+            "failed apply must not mutate filter lists: {:?}",
+            ctx.config.load().filtering.lists
+        );
 
         let rewrite_resp = rewrites_add_handler(
             State(ctx.clone()),
@@ -2835,11 +2839,11 @@ mod tests {
         .await;
         assert_eq!(rewrite_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         // Verify in-memory rewrites table was NOT mutated
+        let rewrites = crate::handlers::rewrites::load_rewrite_store(&ctx);
         assert!(
-            crate::handlers::rewrites::load_rewrite_store(&ctx)
-                .cfg
-                .entries
-                .is_empty()
+            rewrites.cfg.entries.is_empty(),
+            "failed apply must not mutate rewrites: {:?}",
+            rewrites.cfg.entries
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -3006,7 +3010,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
 
         let after = load_clients_config(&ctx);
-        assert!(after.entries.is_empty());
+        assert!(
+            after.entries.is_empty(),
+            "failed apply must not persist client entries: {:?}",
+            after.entries
+        );
         assert!(
             !after.client_id_secrets.contains_key("phone"),
             "the UI delete must remove the client's shared secret: {:?}",

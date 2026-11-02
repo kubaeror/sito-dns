@@ -203,7 +203,10 @@ mod tests {
             assert_eq!(code.len(), 32, "backup codes must carry >= 128 bits");
             assert!(code.chars().all(|c| c.is_ascii_hexdigit()));
         }
-        assert!(!setup.qr_code.is_empty());
+        assert!(
+            !setup.qr_code.is_empty(),
+            "TOTP setup must render a QR code"
+        );
         assert!(setup.otpauth_url.contains("sito"));
 
         // Plaintext codes are never stored; digests are fast BLAKE3 (no Argon2:

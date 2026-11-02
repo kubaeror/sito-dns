@@ -274,8 +274,14 @@ mod tests {
             .find(|l| l.id == "adult")
             .expect("adult list metadata");
         assert_eq!(adult.kind, "domains");
-        assert!(!adult.version.is_empty());
-        assert!(!adult.source.is_empty());
+        assert!(
+            !adult.version.is_empty(),
+            "adult list version must not be empty"
+        );
+        assert!(
+            !adult.source.is_empty(),
+            "adult list source must not be empty"
+        );
         assert_eq!(adult.license, "CC0-1.0");
         assert_eq!(adult.checksum_blake3.len(), 64);
     }

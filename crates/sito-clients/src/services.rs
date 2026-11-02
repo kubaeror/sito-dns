@@ -278,7 +278,11 @@ mod tests {
         assert!(!reg.is_service_domain("custom_app", "other.custom.net"));
 
         // Ad-hoc registries carry no bundled metadata.
-        assert!(reg.lists().is_empty());
+        assert!(
+            reg.lists().is_empty(),
+            "ad-hoc registry must not expose bundled lists: {:?}",
+            reg.lists()
+        );
     }
 
     #[test]

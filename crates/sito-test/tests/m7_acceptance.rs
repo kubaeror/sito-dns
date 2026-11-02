@@ -501,7 +501,10 @@ async fn test_m7_acme_certificate_management() {
     let key_auth = "token123.thumbprint456";
     let (challenge_cert, challenge_key) =
         generate_tls_alpn_01_cert("example.com", key_auth).expect("generate tls-alpn-01 cert");
-    assert!(!challenge_cert.is_empty());
+    assert!(
+        !challenge_cert.is_empty(),
+        "generated TLS-ALPN-01 certificate must not be empty"
+    );
 
     // Test dynamic challenge registration on TlsAcceptorManager
     let temp_dir = std::env::temp_dir().join(format!("sito_m7_acme_{}", rand::random::<u64>()));

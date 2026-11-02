@@ -712,7 +712,10 @@ mod tests {
         let key_auth = "sample_key_auth_token_value_1234567890";
         let (cert_der, priv_der) = generate_tls_alpn_01_cert(domain, key_auth).unwrap();
 
-        assert!(!cert_der.is_empty());
+        assert!(
+            !cert_der.is_empty(),
+            "generated TLS-ALPN-01 certificate must not be empty"
+        );
         let certified = create_certified_key(vec![cert_der], &priv_der).unwrap();
         assert_eq!(certified.cert.len(), 1);
     }

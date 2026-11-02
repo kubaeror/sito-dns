@@ -2390,7 +2390,11 @@ mod tests {
         ));
         assert_eq!(msg.metadata.response_code, ResponseCode::ServFail);
         assert!(!msg.metadata.authentic_data);
-        assert!(msg.answers.is_empty());
+        assert!(
+            msg.answers.is_empty(),
+            "bogus response must not carry answers: {:?}",
+            msg.answers
+        );
         assert_eq!(validator.metrics.get_validations("bogus"), 1);
         assert_eq!(
             validator
@@ -2970,7 +2974,11 @@ mod tests {
             assert_eq!(outcome, ValidationOutcome::Indeterminate);
         }
 
-        assert!(validator.key_cache.is_empty());
+        assert!(
+            validator.key_cache.is_empty(),
+            "unexpected cached keys: {}",
+            validator.key_cache.len()
+        );
         assert_eq!(validator.metrics.key_cache_misses(), 2);
         assert_eq!(validator.metrics.key_cache_hits(), 0);
     }
@@ -3135,7 +3143,11 @@ mod tests {
         assert_eq!(outcome, ValidationOutcome::Secure);
         assert!(response.metadata.authentic_data);
         assert_eq!(fetcher.calls(), 3);
-        assert!(response.additionals.is_empty());
+        assert!(
+            response.additionals.is_empty(),
+            "unexpected additionals: {:?}",
+            response.additionals
+        );
     }
 
     #[tokio::test]
@@ -3162,7 +3174,11 @@ mod tests {
         assert_eq!(outcome, ValidationOutcome::Indeterminate);
         // One DNSKEY and one DS lookup for the signer zone, then stop.
         assert_eq!(fetcher.calls(), 2);
-        assert!(response.additionals.is_empty());
+        assert!(
+            response.additionals.is_empty(),
+            "unexpected additionals: {:?}",
+            response.additionals
+        );
     }
 
     #[test]
@@ -3278,7 +3294,10 @@ mod tests {
 
         assert_eq!(outcome, ValidationOutcome::Secure);
         assert!(msg.metadata.authentic_data);
-        assert!(!validator.key_cache.is_empty());
+        assert!(
+            !validator.key_cache.is_empty(),
+            "expected at least one cached key"
+        );
     }
 
     #[test]
@@ -3470,7 +3489,10 @@ mod tests {
         assert!(matches!(outcome, ValidationOutcome::Bogus { .. }));
         assert_eq!(stripped.metadata.response_code, ResponseCode::NoError);
         assert!(!stripped.metadata.authentic_data);
-        assert!(!stripped.answers.is_empty());
+        assert!(
+            !stripped.answers.is_empty(),
+            "stripping NSEC records must keep the answers"
+        );
     }
 
     #[test]
@@ -3823,8 +3845,16 @@ mod tests {
         let result = validator.build_validated_key_set(&response, &dnskeys, &[], now);
 
         assert!(result.validated.contains(&(lower.clone(), fingerprint)));
-        assert!(result.forged.is_empty());
-        assert!(result.unsupported.is_empty());
+        assert!(
+            result.forged.is_empty(),
+            "unexpected forged entries: {:?}",
+            result.forged
+        );
+        assert!(
+            result.unsupported.is_empty(),
+            "unexpected unsupported entries: {:?}",
+            result.unsupported
+        );
         assert!(
             validator
                 .key_cache
@@ -4113,7 +4143,10 @@ mod tests {
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
         let result =
             validator.build_validated_key_set(&response, &[(root.clone(), root_key)], &[], now);
-        assert!(!result.validated.is_empty());
+        assert!(
+            !result.validated.is_empty(),
+            "expected validated keys, got none"
+        );
         for name in ["unsigned.example.", "com.", "www.example.org."] {
             let lower = LowerName::from(&Name::from_str(name).expect("name"));
             assert!(

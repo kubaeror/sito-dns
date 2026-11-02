@@ -1635,7 +1635,10 @@ mod tests {
         let mut next_due = FnvHashMap::default();
         let now = Instant::now();
         let (sleep_for, due) = refresh_schedule(&config, &mut next_due, now);
-        assert!(due.is_empty());
+        assert!(
+            due.is_empty(),
+            "no list should be due for refresh yet: {due:?}"
+        );
         assert_eq!(
             sleep_for,
             Duration::from_secs(3600),

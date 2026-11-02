@@ -686,7 +686,11 @@ mod tests {
             load_server_config(&def_c, &def_k, &sni_list, vec![b"dot".to_vec()]).unwrap();
 
         let acceptor_mgr = TlsAcceptorManager::new(server_config);
-        assert!(!acceptor_mgr.current_config().alpn_protocols.is_empty());
+        assert!(
+            !acceptor_mgr.current_config().alpn_protocols.is_empty(),
+            "TLS acceptor must advertise ALPN protocols: {:?}",
+            acceptor_mgr.current_config().alpn_protocols
+        );
         assert_eq!(acceptor_mgr.current_config().alpn_protocols[0], b"dot");
 
         let _ = std::fs::remove_dir_all(&temp_dir);

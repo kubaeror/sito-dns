@@ -1054,7 +1054,10 @@ url = "https://192.168.1.1"
         .unwrap();
         let secrets = read_local_client_id_secrets(Some(&path)).await;
         assert_eq!(secrets.get("phone").map(String::as_str), Some("abc"));
-        assert!(read_local_client_id_secrets(None).await.is_empty());
+        assert!(
+            read_local_client_id_secrets(None).await.is_empty(),
+            "missing secrets path must yield no client id secrets"
+        );
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 

@@ -139,7 +139,10 @@ mod tests {
     fn test_manifest_is_valid_and_unique() {
         let manifest = BundledManifest::bundled();
         assert_eq!(manifest.format_version, 1);
-        assert!(!manifest.generated.is_empty());
+        assert!(
+            !manifest.generated.is_empty(),
+            "bundled manifest must record a generation timestamp"
+        );
 
         let mut ids: Vec<&str> = manifest.lists.iter().map(|l| l.id.as_str()).collect();
         ids.sort_unstable();

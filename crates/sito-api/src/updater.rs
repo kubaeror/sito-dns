@@ -793,7 +793,10 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
     #[test]
     fn test_current_target_triple() {
         let target = current_target_triple();
-        assert!(!target.is_empty());
+        assert!(
+            !target.is_empty(),
+            "current target triple must not be empty"
+        );
     }
 
     #[test]

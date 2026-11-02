@@ -146,7 +146,10 @@ mod tests {
         sender.flush().await;
 
         let page = db.query_logs(&QueryLogFilter::default()).await.unwrap();
-        assert!(!page.entries.is_empty());
+        assert!(
+            !page.entries.is_empty(),
+            "query log must contain at least one entry"
+        );
 
         sender.shutdown().await;
     }
@@ -733,7 +736,11 @@ mod tests {
 
         // The row was aggregated and pruned, not silently deleted.
         let remaining = db.query_logs(&QueryLogFilter::default()).await.unwrap();
-        assert!(remaining.entries.is_empty());
+        assert!(
+            remaining.entries.is_empty(),
+            "pruned query log must have no entries left: {:?}",
+            remaining.entries
+        );
     }
 
     #[tokio::test]
@@ -996,12 +1003,11 @@ mod tests {
 
         let deleted = db.delete_query_logs().await.unwrap();
         assert_eq!(deleted, 2);
+        let remaining = db.query_logs(&QueryLogFilter::default()).await.unwrap();
         assert!(
-            db.query_logs(&QueryLogFilter::default())
-                .await
-                .unwrap()
-                .entries
-                .is_empty()
+            remaining.entries.is_empty(),
+            "delete_query_logs must remove all entries: {:?}",
+            remaining.entries
         );
 
         let stats = db.get_global_stats(86_400_000).await.unwrap();

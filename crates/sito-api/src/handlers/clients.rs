@@ -833,7 +833,11 @@ mod tests {
         assert_eq!(updated.ip, vec!["10.0.0.5"]);
         // DoH path is classified correctly (previously unreachable).
         assert_eq!(updated.doh_path, Some("/dns-query".to_string()));
-        assert!(updated.subnet.is_empty());
+        assert!(
+            updated.subnet.is_empty(),
+            "DoH client must not carry a subnet: {:?}",
+            updated.subnet
+        );
 
         // Renaming onto an existing name is rejected.
         let conflict = update_client(

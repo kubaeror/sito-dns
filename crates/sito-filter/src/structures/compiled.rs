@@ -455,7 +455,10 @@ mod tests {
         // Benign non-matching domain
         candidates.clear();
         compiled.collect_candidates("google.com", &interner, &mut candidates);
-        assert!(candidates.is_empty());
+        assert!(
+            candidates.is_empty(),
+            "candidates must start empty for the lookup: {candidates:?}"
+        );
     }
 
     #[test]

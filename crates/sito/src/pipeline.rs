@@ -1884,7 +1884,11 @@ mod tests {
         ];
         let resp = make_rewrite_response(&query, &rules, 9);
         assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
-        assert!(resp.answers.is_empty());
+        assert!(
+            resp.answers.is_empty(),
+            "NXDOMAIN rewrite must not carry answers: {:?}",
+            resp.answers
+        );
     }
 
     #[tokio::test]
@@ -2238,7 +2242,11 @@ mod tests {
         assert_eq!(resp.metadata.response_code, ResponseCode::BADVERS);
         let resp_edns = resp.edns.expect("BADVERS must carry an OPT record");
         assert_eq!(resp_edns.version(), 0);
-        assert!(resp_edns.options().options.is_empty());
+        assert!(
+            resp_edns.options().options.is_empty(),
+            "BADVERS response must not echo EDNS options: {:?}",
+            resp_edns.options().options
+        );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

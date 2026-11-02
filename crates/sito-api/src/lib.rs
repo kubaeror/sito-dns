@@ -57,7 +57,10 @@ mod tests {
     fn test_export_openapi_json() {
         let openapi = ApiDoc::openapi();
         let json_str = openapi.to_pretty_json().expect("valid JSON");
-        assert!(!json_str.is_empty());
+        assert!(
+            !json_str.is_empty(),
+            "OpenAPI document must not serialize to an empty string"
+        );
         // Keep the exposed spec version in lockstep with the crate version.
         assert_eq!(
             openapi.info.version,

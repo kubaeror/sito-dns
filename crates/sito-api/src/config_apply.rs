@@ -527,6 +527,10 @@ mod tests {
         // must not be reported (WP-6.5 false positive).
         let mut new2 = old.clone();
         new2.dns.doh_dedicated_hostname = "dns.example.com".to_string();
-        assert!(restart_required_fields(&old, &new2).is_empty());
+        assert!(
+            restart_required_fields(&old, &new2).is_empty(),
+            "changing only the DoH hostname must not require a restart: {:?}",
+            restart_required_fields(&old, &new2)
+        );
     }
 }
