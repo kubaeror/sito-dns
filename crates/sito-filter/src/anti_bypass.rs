@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::str::FromStr;
+use tracing::error;
 
 /// Known public resolver dataset entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,27 +27,43 @@ pub struct AntiBypassRegistry {
 
 impl Default for AntiBypassRegistry {
     fn default() -> Self {
-        Self::bundled()
+        Self::try_bundled().unwrap_or_else(|e| {
+            error!(error = %e, "Bundled DoH resolver list failed to load; continuing with an empty registry");
+            Self::empty()
+        })
     }
 }
 
 impl AntiBypassRegistry {
-    /// Create registry from bundled dataset.
-    pub fn bundled() -> Self {
-        let mut registry = Self {
+    /// An empty registry that matches no resolvers.
+    ///
+    /// Used as a non-panicking fallback when the embedded dataset is corrupt.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
             exact_domains: HashSet::new(),
             suffix_domains: Vec::new(),
             ips: HashSet::new(),
-        };
-
-        let bundled_json = include_str!("../data/doh_resolvers.json");
-        if let Ok(entries) = serde_json::from_str::<Vec<DohResolverEntry>>(bundled_json) {
-            for entry in entries {
-                registry.add_entry(&entry);
-            }
         }
+    }
 
-        registry
+    /// Parses resolver entries from a JSON string.
+    ///
+    /// Returns an error instead of silently ignoring corrupt data.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        let entries: Vec<DohResolverEntry> = serde_json::from_str(json)?;
+        let mut registry = Self::empty();
+        for entry in entries {
+            registry.add_entry(&entry);
+        }
+        Ok(registry)
+    }
+
+    /// Create registry from the bundled dataset.
+    ///
+    /// Returns an error instead of panicking when the embedded JSON is corrupt.
+    pub fn try_bundled() -> Result<Self, serde_json::Error> {
+        Self::from_json(include_str!("../data/doh_resolvers.json"))
     }
 
     /// Add an entry to the registry.
@@ -103,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_bundled_registry_matches() {
-        let reg = AntiBypassRegistry::bundled();
+        let reg = AntiBypassRegistry::try_bundled().expect("bundled DoH resolver list must load");
         assert!(reg.domain_count() > 0);
         assert!(reg.ip_count() > 0);
 
@@ -145,5 +162,17 @@ mod tests {
         assert!(!reg.matches_domain("google.com"));
         assert!(!reg.matches_domain("github.com"));
         assert!(!reg.matches_ip(&"192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_corrupt_anti_bypass_data_degrades_to_error_not_panic() {
+        let err = AntiBypassRegistry::from_json("{ not json").expect_err("corrupt JSON must fail");
+        assert_ne!(err.to_string(), "");
+
+        let empty = AntiBypassRegistry::empty();
+        assert_eq!(empty.domain_count(), 0);
+        assert_eq!(empty.ip_count(), 0);
+        assert!(!empty.matches_domain("cloudflare-dns.com"));
+        assert!(!empty.matches_ip(&"1.1.1.1".parse().unwrap()));
     }
 }

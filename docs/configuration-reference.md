@@ -199,6 +199,7 @@ blocking_ttl = 10
 cname_cloaking = true
 fail_closed = true
 anti_doh_bypass = "block_all"          # "off" | "block_all" | "block_except_trusted"
+regex_compile_budget_ms = 250          # optional; abort slow regex compilation
 custom_rules = [
     "||badtracker.com^",
     "@@||allowed-service.com^"
@@ -221,6 +222,7 @@ enabled = true
 | `anti_doh_bypass` | string | `"off"` | Block known public DoH/DoT resolvers to enforce network-wide filtering: `"off"`, `"block_all"`, or `"block_except_trusted"`. |
 | `max_rules` | integer | `2000000` | Hard cap on the total parsed rules (all lists plus custom rules). A reload above the cap is rejected and the previous snapshot is retained (or the engine stays fail-closed when nothing loaded yet). |
 | `max_list_bytes` | integer | `67108864` | Hard cap in bytes for each downloaded subscription list and its disk-cache read, enforced before the body is buffered. Must be greater than 0. Lowering it invalidates larger cached lists. After a restart (or when no previous snapshot exists), an invalidated larger cache with `fail_closed = true` and no network answers SERVFAIL until a fetch under the new cap succeeds; a live reload keeps the previous snapshot and records the list in `failed_lists`. |
+| `regex_compile_budget_ms` | integer | unset | Optional wall-clock budget for compiling regex/wildcard rules. When a reload exceeds it, compilation is aborted and the previous snapshot is retained; the failure is reported through `last_error` and `last_compile_ms`. Unset disables the budget; `0` is rejected. |
 | `custom_rules` | array of strings | `[]` | In-line custom ABP / AdGuard filter rules. |
 | `lists` | array of tables | `[]` | Subscription lists to download and compile (`name`, `url`, `enabled`). Schemes: `http://`, `https://`, `file://`. Global `refresh_interval_hours` controls update frequency. |
 

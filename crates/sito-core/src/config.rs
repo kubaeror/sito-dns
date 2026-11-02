@@ -1297,6 +1297,11 @@ pub struct FilteringConfig {
     pub lists: Vec<FilterListConfig>,
     #[serde(default)]
     pub custom_rules: Vec<String>,
+    /// Optional wall-clock budget for compiling regex/wildcard rules. When
+    /// set, a compile that takes longer is aborted and the previous snapshot
+    /// is retained. `None` disables the budget; zero is rejected.
+    #[serde(default)]
+    pub regex_compile_budget_ms: Option<u64>,
 }
 
 fn default_filtering_refresh_interval_hours() -> u64 {
@@ -1329,6 +1334,7 @@ impl Default for FilteringConfig {
             max_list_bytes: default_filtering_max_list_bytes(),
             lists: Vec::new(),
             custom_rules: Vec::new(),
+            regex_compile_budget_ms: None,
         }
     }
 }
@@ -1351,6 +1357,12 @@ impl FilteringConfig {
             return Err(ConfigError::validation(
                 "filtering.max_list_bytes",
                 "max_list_bytes must be greater than 0",
+            ));
+        }
+        if self.regex_compile_budget_ms == Some(0) {
+            return Err(ConfigError::validation(
+                "filtering.regex_compile_budget_ms",
+                "regex_compile_budget_ms must be greater than 0 when set",
             ));
         }
         let mut seen_names = std::collections::HashSet::new();
@@ -1926,6 +1938,27 @@ key = "/path/to/key.pem"
             Config::from_toml_str(&format!("{TEST_BASE}[filtering]\nmax_list_bytes = 1024\n"))
                 .expect("a positive max_list_bytes must be accepted");
         assert_eq!(custom.filtering.max_list_bytes, 1024);
+    }
+
+    /// D-11: the regex compile budget is optional but must stay positive.
+    #[test]
+    fn test_filtering_regex_compile_budget_default_and_validation() {
+        let default = Config::from_toml_str(TEST_BASE).expect("minimal config must parse");
+        assert_eq!(
+            default.filtering.regex_compile_budget_ms, None,
+            "the compile budget must be disabled by default"
+        );
+
+        expect_validation_field(
+            &format!("{TEST_BASE}[filtering]\nregex_compile_budget_ms = 0\n"),
+            "filtering.regex_compile_budget_ms",
+        );
+
+        let custom = Config::from_toml_str(&format!(
+            "{TEST_BASE}[filtering]\nregex_compile_budget_ms = 250\n"
+        ))
+        .expect("a positive compile budget must be accepted");
+        assert_eq!(custom.filtering.regex_compile_budget_ms, Some(250));
     }
 
     /// Audit 6 / WP-6.5: an empty or malformed probe domain made every

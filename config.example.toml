@@ -68,6 +68,10 @@ blocking_ttl = 10
 cname_cloaking = true
 fail_closed = true
 anti_doh_bypass = "off"
+# Optional wall-clock budget for compiling regex/wildcard rules. A reload that
+# exceeds it aborts and keeps the previous snapshot. Unset = no budget; 0 is
+# rejected.
+# regex_compile_budget_ms = 250
 # Per-list download cap in bytes (default 64 MiB), enforced before buffering.
 # Lowering it invalidates larger cached lists. After a restart (or when no
 # previous snapshot exists), an invalidated larger cache with fail_closed = true

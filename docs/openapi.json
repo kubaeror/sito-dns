@@ -1236,6 +1236,47 @@
         }
       }
     },
+    "/api/v1/clients/unidentified": {
+      "get": {
+        "tags": [
+          "Clients"
+        ],
+        "operationId": "get_unidentified_clients",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of newest entries to return (default 100, clamped to\nthe registry bound).",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Discovered but unconfigured clients, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnidentifiedClientsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
     "/api/v1/clients/{name}": {
       "get": {
         "tags": [
@@ -4240,6 +4281,73 @@
           },
           "partial_token": {
             "type": "string"
+          }
+        }
+      },
+      "UnidentifiedClientDto": {
+        "type": "object",
+        "description": "Discovered client that is not explicitly configured.",
+        "required": [
+          "ip",
+          "last_seen"
+        ],
+        "properties": {
+          "comment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "DHCP lease comment, when available."
+          },
+          "hostname": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "DHCP hostname, when available."
+          },
+          "ip": {
+            "type": "string",
+            "description": "Client IP address."
+          },
+          "last_seen": {
+            "type": "string",
+            "description": "RFC 3339 timestamp of the last query from this client."
+          },
+          "mac": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "MAC address reported by the DHCP lease, when available."
+          }
+        }
+      },
+      "UnidentifiedClientsResponse": {
+        "type": "object",
+        "description": "Bounded, newest-first list of discovered but unconfigured clients.",
+        "required": [
+          "clients",
+          "max_entries",
+          "retention_hours"
+        ],
+        "properties": {
+          "clients": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnidentifiedClientDto"
+            }
+          },
+          "max_entries": {
+            "type": "integer",
+            "description": "Maximum number of entries the registry retains.",
+            "minimum": 0
+          },
+          "retention_hours": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Age after which entries are pruned.",
+            "minimum": 0
           }
         }
       },

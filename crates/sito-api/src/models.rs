@@ -86,6 +86,34 @@ pub struct FilterCheckResponse {
     pub category: Option<String>,
 }
 
+/// Discovered client that is not explicitly configured.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UnidentifiedClientDto {
+    /// Client IP address.
+    pub ip: String,
+    /// MAC address reported by the DHCP lease, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    /// DHCP hostname, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// DHCP lease comment, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// RFC 3339 timestamp of the last query from this client.
+    pub last_seen: String,
+}
+
+/// Bounded, newest-first list of discovered but unconfigured clients.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UnidentifiedClientsResponse {
+    pub clients: Vec<UnidentifiedClientDto>,
+    /// Maximum number of entries the registry retains.
+    pub max_entries: usize,
+    /// Age after which entries are pruned.
+    pub retention_hours: u64,
+}
+
 /// Client configuration record.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClientDto {

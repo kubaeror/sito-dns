@@ -3,7 +3,7 @@
 use crate::bundled::{BundledList, BundledListError, BundledManifest, verified_content};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// Hostnames present in every hosts file that carry no blocking meaning.
 const IGNORED_HOSTNAMES: &[&str] = &[
@@ -113,21 +113,30 @@ pub struct ParentalRegistry {
 
 impl Default for ParentalRegistry {
     fn default() -> Self {
-        Self::bundled()
+        Self::try_bundled().unwrap_or_else(|e| {
+            error!(error = %e, "Bundled parental lists failed to load; continuing with an empty registry");
+            Self::empty()
+        })
     }
 }
 
 impl ParentalRegistry {
-    /// Initialize with the bundled category lists after verifying their
-    /// manifest checksums.
+    /// An empty registry that blocks nothing.
     ///
-    /// Returns an error instead of panicking when embedded data is corrupt.
-    pub fn try_bundled() -> Result<Self, BundledListError> {
-        let manifest =
-            BundledManifest::try_bundled().map_err(|e| BundledListError::InvalidContent {
-                id: "manifest".to_string(),
-                reason: e.to_string(),
-            })?;
+    /// Used as a non-panicking fallback when embedded data cannot be loaded.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            categories: HashMap::new(),
+            lists: Vec::new(),
+        }
+    }
+
+    /// Builds a registry from an already-parsed manifest after verifying each
+    /// bundled category list checksum.
+    ///
+    /// Returns an error instead of panicking when a data file is corrupt.
+    pub fn from_manifest(manifest: &BundledManifest) -> Result<Self, BundledListError> {
         let mut reg = Self {
             categories: HashMap::new(),
             lists: manifest.lists.clone(),
@@ -145,12 +154,14 @@ impl ParentalRegistry {
     /// Initialize with the bundled category lists after verifying their
     /// manifest checksums.
     ///
-    /// # Panics
-    /// Panics when the embedded manifest or a bundled file fails its integrity
-    /// check; both are covered by unit tests. Prefer
-    /// [`ParentalRegistry::try_bundled`] on non-fatal paths.
-    pub fn bundled() -> Self {
-        Self::try_bundled().unwrap_or_else(|e| panic!("bundled list integrity check failed: {e}"))
+    /// Returns an error instead of panicking when embedded data is corrupt.
+    pub fn try_bundled() -> Result<Self, BundledListError> {
+        let manifest =
+            BundledManifest::try_bundled().map_err(|e| BundledListError::InvalidContent {
+                id: "manifest".to_string(),
+                reason: e.to_string(),
+            })?;
+        Self::from_manifest(&manifest)
     }
 
     /// Metadata (version, source, license, checksum) of the bundled lists.
@@ -243,7 +254,7 @@ mod tests {
 
     #[test]
     fn test_parental_bundled_categories() {
-        let reg = ParentalRegistry::bundled();
+        let reg = ParentalRegistry::try_bundled().expect("bundled parental lists must load");
 
         // Adult matches
         assert!(reg.matches_category("adult", "pornhub.com"));
@@ -267,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_bundled_list_metadata_exposed() {
-        let reg = ParentalRegistry::bundled();
+        let reg = ParentalRegistry::try_bundled().expect("bundled parental lists must load");
         let adult = reg
             .lists()
             .iter()
@@ -290,6 +301,30 @@ mod tests {
     fn test_try_bundled_is_non_panicking() {
         let reg = ParentalRegistry::try_bundled().expect("bundled parental lists must load");
         assert!(reg.matches_category("adult", "pornhub.com"));
+    }
+
+    #[test]
+    fn test_corrupt_bundled_list_degrades_to_error_not_panic() {
+        let manifest = BundledManifest::try_bundled().expect("bundled manifest must parse");
+        let mut tampered = manifest.clone();
+        tampered.lists.retain(|list| list.id == "adult");
+        tampered.lists[0].checksum_blake3 = "0".repeat(64);
+
+        let err = ParentalRegistry::from_manifest(&tampered)
+            .expect_err("a checksum mismatch must be reported");
+        assert!(matches!(err, BundledListError::ChecksumMismatch { .. }));
+
+        let mut missing = manifest;
+        missing.lists.retain(|list| list.id == "adult");
+        missing.lists[0].file = "does-not-exist.txt".to_string();
+        let err = ParentalRegistry::from_manifest(&missing)
+            .expect_err("missing content must be reported");
+        assert!(matches!(err, BundledListError::MissingContent(_)));
+
+        assert!(
+            !ParentalRegistry::empty().matches_category("adult", "pornhub.com"),
+            "the empty fallback must block nothing"
+        );
     }
 
     #[test]

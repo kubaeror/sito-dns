@@ -26,7 +26,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tracing::{Instrument, debug, info, trace, warn};
+use tracing::{Instrument, debug, error, info, trace, warn};
 
 /// Tracks in-flight queries using RAII.
 struct InFlightGuard(Arc<AtomicUsize>);
@@ -589,7 +589,13 @@ impl DnsPipeline {
         Self {
             runtime,
             filter,
-            anti_bypass: Arc::new(AntiBypassRegistry::bundled()),
+            anti_bypass: Arc::new(AntiBypassRegistry::try_bundled().unwrap_or_else(|e| {
+                error!(
+                    error = %e,
+                    "Bundled DoH resolver list failed to load; anti-bypass domain/IP matching is disabled"
+                );
+                AntiBypassRegistry::empty()
+            })),
             cache,
             upstream,
             dnssec: Arc::new(ArcSwap::from(dnssec)),
@@ -2398,8 +2404,12 @@ mod tests {
             std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(ClientRegistry::new(
                 ClientsConfig::default(),
             )))),
-            std::sync::Arc::new(ParentalRegistry::bundled()),
-            std::sync::Arc::new(ServiceRegistry::bundled()),
+            std::sync::Arc::new(
+                ParentalRegistry::try_bundled().expect("bundled parental lists must load"),
+            ),
+            std::sync::Arc::new(
+                ServiceRegistry::try_bundled().expect("bundled services must load"),
+            ),
             std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(RewriteTable::new(
                 RewritesConfig::default(),
             )))),

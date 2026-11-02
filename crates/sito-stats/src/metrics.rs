@@ -527,6 +527,17 @@ impl MetricsRegistry {
         hist.observe(seconds);
     }
 
+    /// Returns an observer that records compile durations in this registry.
+    ///
+    /// The filter engine cannot depend on `sito-stats`; the server installs
+    /// this callback on the engine so startup and scheduled refreshes are
+    /// recorded as well as API-triggered reloads.
+    #[must_use]
+    pub fn compile_observer(&self) -> std::sync::Arc<dyn Fn(f64) + Send + Sync> {
+        let registry = self.clone();
+        std::sync::Arc::new(move |seconds| registry.observe_filter_compile(seconds))
+    }
+
     /// Returns total query count and blocked query count processed by this registry.
     pub fn get_queries_and_blocked(&self) -> (u64, u64) {
         let map = self

@@ -293,6 +293,10 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
             get(clients::get_clients).post(clients::create_client),
         )
         .route(
+            "/clients/unidentified",
+            get(clients::get_unidentified_clients),
+        )
+        .route(
             "/clients/{name}",
             get(clients::get_client_by_name)
                 .put(clients::update_client)

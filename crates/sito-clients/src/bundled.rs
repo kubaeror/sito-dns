@@ -59,15 +59,14 @@ impl BundledManifest {
         Self::parse(MANIFEST_JSON)
     }
 
-    /// Parses the embedded manifest.
-    ///
-    /// # Panics
-    /// Panics when the embedded manifest is invalid; this is a build-time
-    /// invariant covered by unit tests. Prefer [`BundledManifest::try_bundled`]
-    /// on non-fatal paths.
+    /// Empty manifest used when the embedded manifest cannot be parsed.
     #[must_use]
-    pub fn bundled() -> Self {
-        Self::try_bundled().expect("embedded bundled manifest must be valid JSON")
+    pub fn empty() -> Self {
+        Self {
+            format_version: 0,
+            generated: String::new(),
+            lists: Vec::new(),
+        }
     }
 
     /// Returns the list with the given id.
@@ -137,7 +136,7 @@ mod tests {
 
     #[test]
     fn test_manifest_is_valid_and_unique() {
-        let manifest = BundledManifest::bundled();
+        let manifest = BundledManifest::try_bundled().expect("bundled manifest must parse");
         assert_eq!(manifest.format_version, 1);
         assert!(
             !manifest.generated.is_empty(),
@@ -153,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_bundled_checksums_verify() {
-        let manifest = BundledManifest::bundled();
+        let manifest = BundledManifest::try_bundled().expect("bundled manifest must parse");
         for list in &manifest.lists {
             let content = verified_content(list).unwrap_or_else(|e| panic!("{e}"));
             assert!(!content.trim().is_empty(), "list {} is empty", list.id);
@@ -167,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_tampered_content_is_rejected() {
-        let manifest = BundledManifest::bundled();
+        let manifest = BundledManifest::try_bundled().expect("bundled manifest must parse");
         let adult = manifest.list("adult").unwrap();
         let err = verify(adult, "evil.example\n").unwrap_err();
         assert!(matches!(err, BundledListError::ChecksumMismatch { .. }));
@@ -180,6 +179,16 @@ mod tests {
             content_for(&missing),
             None,
             "unknown files must not resolve to embedded content"
+        );
+    }
+
+    #[test]
+    fn test_corrupt_manifest_is_reported_not_panicked() {
+        let err = BundledManifest::parse("{ not json").expect_err("corrupt manifest must fail");
+        assert_ne!(err.to_string(), "");
+        assert!(
+            BundledManifest::empty().lists.is_empty(),
+            "the fallback manifest must carry no lists"
         );
     }
 }

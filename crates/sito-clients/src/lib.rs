@@ -26,7 +26,10 @@ pub use config::{
 pub use mac::{MacResolver, normalize_mac, normalize_mac_id};
 pub use parental::ParentalRegistry;
 pub use policy::EffectivePolicy;
-pub use registry::{ClientRegistry, RouterOsLease, UnidentifiedClient};
+pub use registry::{
+    ClientRegistry, MAX_UNIDENTIFIED_CLIENTS, RouterOsLease, UNIDENTIFIED_CLIENT_TTL_HOURS,
+    UnidentifiedClient,
+};
 pub use routeros::{RouterOsConfig, RouterOsError, fetch_routeros_leases, spawn_routeros_sync};
 pub use runtime_lists::{ListCategoriesConfig, ListSourceConfig, RuntimeListStatus, RuntimeLists};
 pub use safe_search::{YouTubeSafeSearchMode, match_safe_search};

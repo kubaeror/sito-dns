@@ -321,7 +321,7 @@ async fn test_m7_doh_alt_svc_header_advertisement() {
 
 #[tokio::test]
 async fn test_m7_anti_doh_bypass_filter_and_pipeline() {
-    let registry = AntiBypassRegistry::bundled();
+    let registry = AntiBypassRegistry::try_bundled().expect("bundled DoH resolver list must load");
     assert!(
         registry.domain_count() > 0,
         "Bundled resolvers must not be empty"
@@ -374,8 +374,9 @@ async fn test_m7_anti_doh_bypass_filter_and_pipeline() {
         trusted: true,
     });
     let client_registry = Arc::new(ClientRegistry::new(clients_cfg));
-    let parental = Arc::new(ParentalRegistry::bundled());
-    let service = Arc::new(ServiceRegistry::bundled());
+    let parental =
+        Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load"));
+    let service = Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load"));
     let rewrites = Arc::new(RewriteTable::new(Default::default()));
     let in_flight = Arc::new(AtomicUsize::new(0));
 

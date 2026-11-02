@@ -452,9 +452,10 @@ pub(crate) mod test_support {
                 };
                 self.runtime.replace(sito_runtime::RuntimeSnapshot {
                     config: Arc::new(cfg.clone()),
-                    clients: Arc::new(sito_clients::ClientRegistry::with_routeros_leases(
+                    clients: Arc::new(sito_clients::ClientRegistry::with_stores(
                         clients,
                         previous.clients.routeros_leases_store(),
+                        previous.clients.unidentified_store(),
                     )),
                     rewrites: Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
                 });

@@ -8,6 +8,7 @@ use regex_automata::dfa::Automaton;
 use regex_automata::dfa::dense::{Builder as DfaBuilder, Config as DfaConfig, DFA};
 use regex_automata::{Input, MatchKind as RegexMatchKind, PatternSet};
 use std::cell::RefCell;
+use std::time::{Duration, Instant};
 use tracing::{error, warn};
 
 // Reused pattern-match scratch space for the regex DFA batches: a `PatternSet`
@@ -47,6 +48,56 @@ pub const REGEX_BATCH_SIZE: usize = 128;
 /// Upper bound on the number of compiled DFA batches per rule set.
 pub const MAX_REGEX_BATCHES: usize = 512;
 
+/// Wall-clock budget for regex/wildcard DFA compilation.
+///
+/// The budget is checked when a build starts and before each bounded regex
+/// batch, so a pathological rule set cannot occupy the compiler indefinitely
+/// while still allowing already-running DFA builds to finish.
+#[derive(Debug, Clone, Copy)]
+pub struct CompileBudget {
+    start: Instant,
+    max: Duration,
+}
+
+impl CompileBudget {
+    /// Starts a budget of `max`.
+    #[must_use]
+    pub fn new(max: Duration) -> Self {
+        Self {
+            start: Instant::now(),
+            max,
+        }
+    }
+
+    /// Returns true when the budget has been exhausted.
+    #[must_use]
+    pub fn expired(&self) -> bool {
+        self.start.elapsed() >= self.max
+    }
+
+    /// Builds the public abort details from the current elapsed time.
+    #[must_use]
+    pub fn exceeded(&self) -> CompileBudgetExceeded {
+        CompileBudgetExceeded {
+            elapsed_ms: duration_millis(self.start.elapsed()),
+            limit_ms: duration_millis(self.max),
+        }
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Details of a regex compilation aborted by a [`CompileBudget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompileBudgetExceeded {
+    /// Wall-clock milliseconds spent before aborting.
+    pub elapsed_ms: u64,
+    /// Configured budget in milliseconds.
+    pub limit_ms: u64,
+}
+
 /// Builds a bounded regex DFA batch, bisecting on failure so one invalid or
 /// oversized pattern cannot drop its neighbours.
 fn build_regex_batch(
@@ -54,9 +105,15 @@ fn build_regex_batch(
     rules: &[Vec<u32>],
     batches: &mut Vec<RegexBatch>,
     dropped: &mut usize,
-) {
+    budget: Option<&CompileBudget>,
+) -> Result<(), CompileBudgetExceeded> {
     if patterns.is_empty() {
-        return;
+        return Ok(());
+    }
+    if let Some(budget) = budget
+        && budget.expired()
+    {
+        return Err(budget.exceeded());
     }
     let make_builder = || {
         let mut builder = DfaBuilder::new();
@@ -72,7 +129,7 @@ fn build_regex_batch(
             dfa,
             pattern_to_rules: rules.to_vec(),
         });
-        return;
+        return Ok(());
     }
     if patterns.len() == 1 {
         error!(
@@ -80,11 +137,11 @@ fn build_regex_batch(
             "Skipping invalid/unsupported regex blocking rule"
         );
         *dropped += 1;
-        return;
+        return Ok(());
     }
     let mid = patterns.len() / 2;
-    build_regex_batch(&patterns[..mid], &rules[..mid], batches, dropped);
-    build_regex_batch(&patterns[mid..], &rules[mid..], batches, dropped);
+    build_regex_batch(&patterns[..mid], &rules[..mid], batches, dropped, budget)?;
+    build_regex_batch(&patterns[mid..], &rules[mid..], batches, dropped, budget)
 }
 
 /// Converts an ABP wildcard string into an anchored regex pattern.
@@ -254,8 +311,39 @@ impl RuleSetBuilder {
         self.regexes.push((regex_pat, rule_id));
     }
 
-    /// Compiles all accumulated patterns into high-throughput lookup structures.
+    /// Compiles all accumulated patterns without a time budget.
+    ///
+    /// A missing budget cannot expire, so this wrapper cannot abort; the
+    /// defensive branch keeps a logic error from becoming a panic.
     pub fn build(self, interner: &mut LabelInterner) -> CompiledRuleSet {
+        match self.build_with_budget(interner, None) {
+            Ok(compiled) => compiled,
+            Err(e) => {
+                error!(
+                    elapsed_ms = e.elapsed_ms,
+                    limit_ms = e.limit_ms,
+                    "Regex compilation aborted without a configured budget; returning an empty rule set"
+                );
+                CompiledRuleSet::default()
+            }
+        }
+    }
+
+    /// Compiles all accumulated patterns into high-throughput lookup structures.
+    ///
+    /// When `budget` is supplied the budget is checked at entry and before
+    /// every bounded regex batch; exceeding it returns
+    /// [`CompileBudgetExceeded`] so callers can keep a previous snapshot.
+    pub fn build_with_budget(
+        self,
+        interner: &mut LabelInterner,
+        budget: Option<&CompileBudget>,
+    ) -> Result<CompiledRuleSet, CompileBudgetExceeded> {
+        if let Some(budget) = budget
+            && budget.expired()
+        {
+            return Err(budget.exceeded());
+        }
         // 1. SuffixTrie
         let mut trie = SuffixTrie::new();
         for (dom, rule_id) in self.trie_domains {
@@ -355,7 +443,20 @@ impl RuleSetBuilder {
                     .chunks(REGEX_BATCH_SIZE)
                     .zip(pat_to_rules.chunks(REGEX_BATCH_SIZE))
                 {
-                    build_regex_batch(patterns, rules, &mut batches, &mut dropped_in_batches);
+                    // Check before every chunk: a large but individually valid
+                    // pattern set is the common way to exhaust CPU here.
+                    if let Some(budget) = budget
+                        && budget.expired()
+                    {
+                        return Err(budget.exceeded());
+                    }
+                    build_regex_batch(
+                        patterns,
+                        rules,
+                        &mut batches,
+                        &mut dropped_in_batches,
+                        budget,
+                    )?;
                 }
                 if batches.len() > MAX_REGEX_BATCHES {
                     let extra: usize = batches[MAX_REGEX_BATCHES..]
@@ -374,7 +475,7 @@ impl RuleSetBuilder {
             }
         };
 
-        CompiledRuleSet {
+        Ok(CompiledRuleSet {
             exact_rules: self.exact_rules,
             trie,
             ac,
@@ -382,7 +483,7 @@ impl RuleSetBuilder {
             regex_batches,
             dropped_regex_patterns,
             prefix_trie,
-        }
+        })
     }
 }
 
@@ -715,5 +816,45 @@ mod tests {
         candidates.clear();
         compiled.collect_candidates("valid-two.example", &interner, &mut candidates);
         assert!(candidates.contains(&3), "got candidates: {candidates:?}");
+    }
+
+    #[test]
+    fn test_compile_budget_zero_aborts_immediately() {
+        let mut interner = LabelInterner::new();
+        let mut builder = RuleSetBuilder::new();
+        builder.add_regex("^budget\\.example$".to_string(), 1);
+
+        let budget = CompileBudget::new(Duration::ZERO);
+        let err = builder
+            .build_with_budget(&mut interner, Some(&budget))
+            .expect_err("an exhausted budget must abort before compiling");
+        assert_eq!(err.limit_ms, 0);
+    }
+
+    #[test]
+    fn test_compile_budget_aborts_multi_batch_regex_set() {
+        let mut interner = LabelInterner::new();
+        let mut builder = RuleSetBuilder::new();
+        for i in 0..(REGEX_BATCH_SIZE * 8) {
+            builder.add_regex(format!("^budget-{i}\\..*\\.example$"), i as u32);
+        }
+
+        let budget = CompileBudget::new(Duration::from_millis(1));
+        let err = builder
+            .build_with_budget(&mut interner, Some(&budget))
+            .expect_err("several DFA batches must not finish inside a 1 ms budget");
+        assert_eq!(err.limit_ms, 1);
+        assert!(
+            err.elapsed_ms >= 1,
+            "the reported elapsed time must reflect the budget: {err:?}"
+        );
+
+        // Without a budget the same rule set still compiles.
+        let mut interner = LabelInterner::new();
+        let mut builder = RuleSetBuilder::new();
+        for i in 0..REGEX_BATCH_SIZE {
+            builder.add_regex(format!("^ok-{i}\\..*\\.example$"), i as u32);
+        }
+        assert!(builder.build(&mut interner).has_regex());
     }
 }

@@ -554,6 +554,83 @@ pub async fn querylog_rows_partial(
 // Filtering & Blocklists
 // ---------------------------------------------------------------------------
 
+/// Builds the bundled-list rows shown on the filtering page.
+///
+/// `manifest` may be an error (corrupt embedded JSON): the error is logged and
+/// the function degrades to the runtime-refresh rows only, so rendering the
+/// page never panics.
+fn bundled_list_views(
+    manifest: Result<sito_clients::BundledManifest, serde_json::Error>,
+    statuses: &[sito_clients::RuntimeListStatus],
+) -> Vec<crate::ui::templates::BundledListView> {
+    let manifest = match manifest {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Embedded bundled-list manifest is invalid; showing runtime refresh state only"
+            );
+            sito_clients::BundledManifest::empty()
+        }
+    };
+    let statuses: std::collections::HashMap<&str, &sito_clients::RuntimeListStatus> = statuses
+        .iter()
+        .map(|status| (status.category.as_str(), status))
+        .collect();
+    let format_refresh = |ts: Option<u64>| {
+        ts.and_then(|ts| chrono::DateTime::from_timestamp(ts.cast_signed(), 0))
+            .map_or_else(
+                || "—".to_string(),
+                |dt| dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+            )
+    };
+
+    let mut bundled_lists: Vec<crate::ui::templates::BundledListView> = manifest
+        .lists
+        .iter()
+        .map(|list| {
+            let status = statuses.get(list.id.as_str()).copied();
+            crate::ui::templates::BundledListView {
+                id: list.id.clone(),
+                kind: list.kind.clone(),
+                version: list.version.clone(),
+                source: status
+                    .and_then(|status| status.source_url.clone())
+                    .unwrap_or_else(|| list.source.clone()),
+                license: list.license.clone(),
+                entries: status.map_or(list.entries, |status| status.entries),
+                state: if status.is_some_and(|status| !status.bundled) {
+                    "runtime refresh".to_string()
+                } else {
+                    "built-in (minimal)".to_string()
+                },
+                last_refresh: format_refresh(status.and_then(|status| status.last_refresh_unix)),
+            }
+        })
+        .collect();
+    for status in statuses.values().copied() {
+        if manifest.list(&status.category).is_some() {
+            continue;
+        }
+        bundled_lists.push(crate::ui::templates::BundledListView {
+            id: status.category.clone(),
+            kind: "custom".to_string(),
+            version: "—".to_string(),
+            source: status.source_url.clone().unwrap_or_default(),
+            license: "—".to_string(),
+            entries: status.entries,
+            state: if status.bundled {
+                "built-in".to_string()
+            } else {
+                "runtime refresh".to_string()
+            },
+            last_refresh: format_refresh(status.last_refresh_unix),
+        });
+    }
+    bundled_lists.sort_by(|a, b| a.id.cmp(&b.id));
+    bundled_lists
+}
+
 pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
@@ -591,64 +668,8 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
     let custom_rules = cfg.filtering.custom_rules.join("\n");
 
     // Curated lists bundled into the binary plus any runtime refresh state.
-    let manifest = sito_clients::BundledManifest::bundled();
-    let statuses: std::collections::HashMap<String, sito_clients::RuntimeListStatus> = ctx
-        .runtime_lists
-        .statuses()
-        .into_iter()
-        .map(|status| (status.category.clone(), status))
-        .collect();
-    let format_refresh = |ts: Option<u64>| {
-        ts.and_then(|ts| chrono::DateTime::from_timestamp(ts.cast_signed(), 0))
-            .map_or_else(
-                || "—".to_string(),
-                |dt| dt.format("%Y-%m-%d %H:%M UTC").to_string(),
-            )
-    };
-
-    let mut bundled_lists: Vec<crate::ui::templates::BundledListView> = manifest
-        .lists
-        .iter()
-        .map(|list| {
-            let status = statuses.get(&list.id);
-            crate::ui::templates::BundledListView {
-                id: list.id.clone(),
-                kind: list.kind.clone(),
-                version: list.version.clone(),
-                source: status
-                    .and_then(|status| status.source_url.clone())
-                    .unwrap_or_else(|| list.source.clone()),
-                license: list.license.clone(),
-                entries: status.map_or(list.entries, |status| status.entries),
-                state: if status.is_some_and(|status| !status.bundled) {
-                    "runtime refresh".to_string()
-                } else {
-                    "built-in (minimal)".to_string()
-                },
-                last_refresh: format_refresh(status.and_then(|status| status.last_refresh_unix)),
-            }
-        })
-        .collect();
-    for status in ctx.runtime_lists.statuses() {
-        if manifest.list(&status.category).is_some() {
-            continue;
-        }
-        bundled_lists.push(crate::ui::templates::BundledListView {
-            id: status.category.clone(),
-            kind: "custom".to_string(),
-            version: "—".to_string(),
-            source: status.source_url.clone().unwrap_or_default(),
-            license: "—".to_string(),
-            entries: status.entries,
-            state: if status.bundled {
-                "built-in".to_string()
-            } else {
-                "runtime refresh".to_string()
-            },
-            last_refresh: format_refresh(status.last_refresh_unix),
-        });
-    }
-    bundled_lists.sort_by(|a, b| a.id.cmp(&b.id));
+    let manifest = sito_clients::BundledManifest::try_bundled();
+    let bundled_lists = bundled_list_views(manifest, &ctx.runtime_lists.statuses());
 
     HtmlTemplate(FilteringTemplate {
         csrf_token: &csrf,
@@ -1179,10 +1200,13 @@ pub async fn clients_add_handler(
         );
     }
     ctx.set_config(new_cfg);
-    let new_reg = sito_clients::ClientRegistry::with_routeros_leases(
+    let current = ctx.clients.load();
+    let new_reg = sito_clients::ClientRegistry::with_stores(
         clients_cfg,
-        ctx.clients.load().routeros_leases_store(),
+        current.routeros_leases_store(),
+        current.unidentified_store(),
     );
+    drop(current);
     ctx.set_clients(new_reg);
     crate::publish_bundle(&ctx).await;
 
@@ -1234,10 +1258,13 @@ pub async fn clients_delete_handler(
         );
     }
     ctx.set_config(new_cfg);
-    let new_reg = sito_clients::ClientRegistry::with_routeros_leases(
+    let current = ctx.clients.load();
+    let new_reg = sito_clients::ClientRegistry::with_stores(
         clients_cfg,
-        ctx.clients.load().routeros_leases_store(),
+        current.routeros_leases_store(),
+        current.unidentified_store(),
     );
+    drop(current);
     ctx.set_clients(new_reg);
     crate::publish_bundle(&ctx).await;
 
@@ -2343,8 +2370,13 @@ mod tests {
             rewrites.clone(),
         ));
         let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
-            Arc::new(sito_clients::ParentalRegistry::bundled()),
-            Arc::new(sito_clients::ServiceRegistry::bundled()),
+            Arc::new(
+                sito_clients::ParentalRegistry::try_bundled()
+                    .expect("bundled parental lists must load"),
+            ),
+            Arc::new(
+                sito_clients::ServiceRegistry::try_bundled().expect("bundled services must load"),
+            ),
         ));
 
         ServerContext {
@@ -2369,6 +2401,41 @@ mod tests {
             setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dns_starter: None,
         }
+    }
+
+    #[test]
+    fn test_bundled_list_views_corrupt_manifest_returns_runtime_rows_without_panic() {
+        let corrupt = serde_json::from_str::<sito_clients::BundledManifest>("{ not json")
+            .expect_err("fixture must be invalid JSON");
+        let statuses = vec![sito_clients::RuntimeListStatus {
+            category: "adult".to_string(),
+            source_url: Some("https://lists.example/adult.txt".to_string()),
+            last_refresh_unix: Some(1_700_000_000),
+            entries: 42,
+            bundled: false,
+        }];
+
+        let views = bundled_list_views(Err(corrupt), &statuses);
+        assert_eq!(
+            views.len(),
+            1,
+            "runtime rows must survive a corrupt manifest"
+        );
+        assert_eq!(views[0].id, "adult");
+        assert_eq!(views[0].kind, "custom");
+        assert_eq!(views[0].entries, 42);
+        assert_eq!(views[0].state, "runtime refresh");
+        assert!(views[0].last_refresh.contains("2023-11-14"));
+
+        // The healthy path still merges bundled metadata with runtime status.
+        let manifest =
+            sito_clients::BundledManifest::try_bundled().expect("bundled manifest must parse");
+        let views = bundled_list_views(Ok(manifest), &[]);
+        assert!(views.iter().any(|view| view.id == "adult"));
+        assert!(
+            views.iter().all(|view| view.kind != "custom"),
+            "a healthy manifest must not invent custom rows"
+        );
     }
 
     #[tokio::test]

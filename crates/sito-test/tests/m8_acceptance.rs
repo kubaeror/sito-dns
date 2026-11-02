@@ -138,8 +138,14 @@ async fn create_test_context(
 
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config.clone())));
     let cache = Arc::new(DnsCache::new(config.dns.cache.clone()));
-    let filter =
-        Arc::new(HostsFilterEngine::init(config.filtering.clone(), temp_dir.clone()).await);
+    let filter = Arc::new(
+        HostsFilterEngine::init_with_observer(
+            config.filtering.clone(),
+            temp_dir.clone(),
+            Some(metrics.compile_observer()),
+        )
+        .await,
+    );
     let bootstrap = sito_upstream::BootstrapResolver::new(
         vec!["127.0.0.1".parse().unwrap()],
         Duration::from_secs(1),
@@ -165,8 +171,11 @@ async fn create_test_context(
         rewrites.clone(),
     ));
     let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
-        Arc::new(sito_clients::ParentalRegistry::bundled()),
-        Arc::new(sito_clients::ServiceRegistry::bundled()),
+        Arc::new(
+            sito_clients::ParentalRegistry::try_bundled()
+                .expect("bundled parental lists must load"),
+        ),
+        Arc::new(sito_clients::ServiceRegistry::try_bundled().expect("bundled services must load")),
     ));
     let ctx = ServerContext {
         config: config_arc,
@@ -934,6 +943,9 @@ fn filter_compile_count(metrics: &MetricsRegistry) -> u64 {
 async fn test_m8_push_applies_upstream_and_dnssec_without_watcher() {
     let signing_key = Ed25519SigningKey::generate().unwrap();
     let (ctx, _token, temp_dir) = create_test_context("slave", None, None, None).await;
+    // The startup compile is recorded by the engine observer; the push must add
+    // exactly one more observation.
+    let compiles_before_push = filter_compile_count(&ctx.metrics);
 
     let dnssec_validator = Arc::new(ArcSwap::from_pointee(
         sito_dnssec::DnssecValidator::from_config(&Config::default().dns.dnssec),
@@ -1037,7 +1049,8 @@ nta = ["pushed.internal"]
     // reload/download) the configuration a second time.
     let filter_compiles_before = filter_compile_count(&ctx.metrics);
     assert_eq!(
-        filter_compiles_before, 1,
+        filter_compiles_before,
+        compiles_before_push + 1,
         "the push itself must have compiled the filter exactly once"
     );
     match apply_config_document_event(

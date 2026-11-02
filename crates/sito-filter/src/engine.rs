@@ -4,7 +4,8 @@ use crate::downloader::{DEFAULT_DOWNLOAD_TIMEOUT, ListDownloader};
 use crate::error::FilterError;
 use crate::parser::{DnsRewriteRule, Pattern, Rule, RuleKind, parse_rules};
 use crate::structures::{
-    CompiledRuleSet, LabelInterner, MAX_REGEX_PATTERN_BYTES, MAX_REGEX_PATTERNS, RuleSetBuilder,
+    CompileBudget, CompileBudgetExceeded, CompiledRuleSet, LabelInterner, MAX_REGEX_PATTERN_BYTES,
+    MAX_REGEX_PATTERNS, RuleSetBuilder,
 };
 use arc_swap::ArcSwap;
 use fnv::{FnvHashMap, FnvHashSet};
@@ -18,6 +19,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
+
+/// Callback receiving the wall-clock duration of each parse+compile attempt.
+pub type CompileObserver = Arc<dyn Fn(f64) + Send + Sync>;
 
 /// Lifecycle state of the filter engine's active snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -46,6 +50,9 @@ pub struct FilterStatus {
     pub failed_lists: Vec<String>,
     /// Most recent reload error, if any.
     pub last_error: Option<String>,
+    /// Wall-clock duration of the last parse+compile attempt in milliseconds,
+    /// set on success and failure.
+    pub last_compile_ms: Option<u64>,
 }
 
 /// In-memory snapshot of compiled filter rules.
@@ -83,6 +90,36 @@ impl FilterSnapshot {
     /// Compiles a slice of parsed rules into high-throughput lookup structures,
     /// resolving `$badfilter` deactivations and deduplicating identical rules.
     pub fn compile(parsed_rules: Vec<Rule>) -> Self {
+        match Self::compile_inner(parsed_rules, None) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                // A `None` budget cannot expire; keep a logic error observable
+                // and fail closed instead of panicking the reload worker.
+                error!(
+                    elapsed_ms = e.elapsed_ms,
+                    limit_ms = e.limit_ms,
+                    "Filter compilation aborted without a configured budget"
+                );
+                Self::unavailable()
+            }
+        }
+    }
+
+    /// Compiles rules while honouring an optional [`CompileBudget`].
+    ///
+    /// Returns [`CompileBudgetExceeded`] when the regex compiler runs past the
+    /// budget, allowing callers to keep the previous snapshot.
+    pub fn compile_with_budget(
+        parsed_rules: Vec<Rule>,
+        budget: Option<&CompileBudget>,
+    ) -> Result<Self, CompileBudgetExceeded> {
+        Self::compile_inner(parsed_rules, budget)
+    }
+
+    fn compile_inner(
+        parsed_rules: Vec<Rule>,
+        budget: Option<&CompileBudget>,
+    ) -> Result<Self, CompileBudgetExceeded> {
         let mut interner = LabelInterner::new();
         let mut allow_builder = RuleSetBuilder::new();
         let mut block_builder = RuleSetBuilder::new();
@@ -155,13 +192,13 @@ impl FilterSnapshot {
             active_rules.push(rule);
         }
 
-        let allowlist = allow_builder.build(&mut interner);
-        let blocklist = block_builder.build(&mut interner);
+        let allowlist = allow_builder.build_with_budget(&mut interner, budget)?;
+        let blocklist = block_builder.build_with_budget(&mut interner, budget)?;
         let rule_count = active_rules.len();
         let dropped_regex_patterns =
             allowlist.dropped_regex_patterns + blocklist.dropped_regex_patterns;
 
-        Self {
+        Ok(Self {
             interner,
             allowlist,
             blocklist,
@@ -169,7 +206,7 @@ impl FilterSnapshot {
             rule_count,
             unavailable: false,
             dropped_regex_patterns,
-        }
+        })
     }
 
     /// Evaluates a domain against only `$important` rules using pre-collected candidates (Stages 1 and 2).
@@ -707,6 +744,9 @@ pub struct HostsFilterEngine {
     group_defs: ArcSwap<Vec<GroupRuleSet>>,
     /// Compiled per-group rule sets, keyed by group name.
     group_snapshots: ArcSwap<FnvHashMap<String, Arc<FilterSnapshot>>>,
+    /// Optional sink for compile durations (wired to the metrics registry by
+    /// the server binary; the filter crate cannot depend on sito-stats).
+    compile_observer: std::sync::RwLock<Option<CompileObserver>>,
 }
 
 impl HostsFilterEngine {
@@ -729,6 +769,29 @@ impl HostsFilterEngine {
             status: ArcSwap::new(Arc::new(status)),
             group_defs: ArcSwap::new(Arc::new(Vec::new())),
             group_snapshots: ArcSwap::new(Arc::new(FnvHashMap::default())),
+            compile_observer: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Installs the compile-duration observer (usually the metrics registry).
+    ///
+    /// Every parse+compile attempt performed by this engine reports its
+    /// wall-clock duration, including the initial load and scheduled refreshes.
+    pub fn set_compile_observer(&self, observer: CompileObserver) {
+        *self
+            .compile_observer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+    }
+
+    fn observe_compile(&self, elapsed: Duration) {
+        let observer = self
+            .compile_observer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(observer) = observer {
+            observer(elapsed.as_secs_f64());
         }
     }
 
@@ -758,7 +821,10 @@ impl HostsFilterEngine {
     /// the pipeline does not evaluate an empty set.
     fn rebuild_group_snapshots(&self, list_rules: &FnvHashMap<String, Vec<Rule>>) {
         let defs = self.group_defs.load();
-        let max_rules = self.config.load().max_rules;
+        let config = self.config.load();
+        let max_rules = config.max_rules;
+        let compile_budget_ms = config.regex_compile_budget_ms;
+        let previous = self.group_snapshots.load();
         let mut compiled = FnvHashMap::default();
         for def in defs.iter() {
             let mut rules = Vec::new();
@@ -807,7 +873,25 @@ impl HostsFilterEngine {
             if rules.is_empty() {
                 continue;
             }
-            compiled.insert(def.name.clone(), Arc::new(FilterSnapshot::compile(rules)));
+            let budget = compile_budget_ms
+                .map(Duration::from_millis)
+                .map(CompileBudget::new);
+            match FilterSnapshot::compile_with_budget(rules, budget.as_ref()) {
+                Ok(snapshot) => {
+                    compiled.insert(def.name.clone(), Arc::new(snapshot));
+                }
+                Err(e) => {
+                    error!(
+                        group = %def.name,
+                        elapsed_ms = e.elapsed_ms,
+                        limit_ms = e.limit_ms,
+                        "Group snapshot exceeded the regex compile budget; retaining the previous snapshot for this group"
+                    );
+                    if let Some(previous) = previous.get(&def.name) {
+                        compiled.insert(def.name.clone(), Arc::clone(previous));
+                    }
+                }
+            }
         }
         self.group_snapshots.store(Arc::new(compiled));
     }
@@ -818,7 +902,20 @@ impl HostsFilterEngine {
     /// the engine keeps a `Failed` state instead of silently advertising an
     /// enabled-but-empty filter snapshot.
     pub async fn init(config: FilteringConfig, data_dir: PathBuf) -> Self {
+        Self::init_with_observer(config, data_dir, None).await
+    }
+
+    /// Initializes and loads lists immediately, reporting the initial compile
+    /// duration to `observer` when one is supplied.
+    pub async fn init_with_observer(
+        config: FilteringConfig,
+        data_dir: PathBuf,
+        observer: Option<CompileObserver>,
+    ) -> Self {
         let engine = Self::new(config, data_dir);
+        if let Some(observer) = observer {
+            engine.set_compile_observer(observer);
+        }
         match engine.reload().await {
             Ok(count) => info!(rule_count = count, "Filter engine initialized"),
             Err(e) => error!(
@@ -978,7 +1075,11 @@ impl HostsFilterEngine {
             .collect();
 
         // Compile rules in blocking task to avoid stalling the tokio async runtime
+        let compile_started = Instant::now();
+        let regex_compile_budget_ms = config.regex_compile_budget_ms;
         let join_result = tokio::task::spawn_blocking(move || -> Result<_, FilterError> {
+            let budget = regex_compile_budget_ms.map(Duration::from_millis);
+            let budget = budget.map(CompileBudget::new);
             // Merge instead of overwriting: rules from lists that failed to
             // fetch in this cycle (or that are not part of a partial refresh)
             // are retained so a transient failure cannot drop protection.
@@ -1042,22 +1143,34 @@ impl HostsFilterEngine {
                 all_rules.extend(map[name].iter().cloned());
             }
             all_rules.extend(parsed_custom);
-            let snapshot = FilterSnapshot::compile(all_rules);
+            let snapshot = FilterSnapshot::compile_with_budget(all_rules, budget.as_ref())
+                .map_err(|e| FilterError::CompileBudgetExceeded {
+                    elapsed_ms: e.elapsed_ms,
+                    limit_ms: e.limit_ms,
+                })?;
             let count = snapshot.rule_count;
             Ok((snapshot, count, map, rejected))
         })
         .await
         .map_err(|e| {
             error!("Filter rule compilation task failed: {e}");
+            self.observe_compile(compile_started.elapsed());
             self.set_status(FilterStatus {
                 state: FilterState::Failed,
                 rule_count: self.snapshot.load().rule_count,
                 loaded_lists: count_loaded_lists(&fetched_lists, &failed_lists),
                 failed_lists: failed_lists.clone(),
                 last_error: Some(e.to_string()),
+                last_compile_ms: Some(
+                    u64::try_from(compile_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ),
             });
             FilterError::CompileTaskFailed(e.to_string())
         })?;
+
+        self.observe_compile(compile_started.elapsed());
+        let compile_elapsed_ms =
+            u64::try_from(compile_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         let (new_snapshot, count, new_list_rules, rejected_lists) = match join_result {
             Ok(result) => result,
@@ -1075,6 +1188,7 @@ impl HostsFilterEngine {
                         loaded_lists,
                         failed_lists: failed_lists.clone(),
                         last_error: Some(e.to_string()),
+                        last_compile_ms: Some(compile_elapsed_ms),
                     });
                 } else {
                     self.set_status(FilterStatus {
@@ -1083,6 +1197,7 @@ impl HostsFilterEngine {
                         loaded_lists,
                         failed_lists: failed_lists.clone(),
                         last_error: Some(e.to_string()),
+                        last_compile_ms: Some(compile_elapsed_ms),
                     });
                 }
                 return Err(e);
@@ -1116,6 +1231,7 @@ impl HostsFilterEngine {
                 loaded_lists,
                 failed_lists,
                 last_error: Some(reason),
+                last_compile_ms: Some(compile_elapsed_ms),
             });
             return Ok(prev_count);
         }
@@ -1142,6 +1258,7 @@ impl HostsFilterEngine {
                 loaded_lists,
                 failed_lists: failed_lists.clone(),
                 last_error: Some(details.clone()),
+                last_compile_ms: Some(compile_elapsed_ms),
             });
             return Err(FilterError::NoSourcesLoaded {
                 failed: failed_lists.len(),
@@ -1182,6 +1299,7 @@ impl HostsFilterEngine {
             loaded_lists,
             failed_lists,
             last_error,
+            last_compile_ms: Some(compile_elapsed_ms),
         });
         info!(rule_count = count, "Filter snapshot compiled and loaded");
         Ok(count)
@@ -2253,6 +2371,131 @@ mod tests {
             engine.status().last_error.is_none(),
             "the rejected cap must not apply to later reloads: {:?}",
             engine.status().last_error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_reload_budget_abort_retains_previous_snapshot_and_sets_status() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_compile_budget_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let engine = HostsFilterEngine::init(
+            FilteringConfig {
+                custom_rules: vec!["||keep.example^".to_string()],
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        )
+        .await;
+        assert_eq!(engine.rule_count(), 1);
+
+        let regex_rules: Vec<String> = (0..2048)
+            .map(|i| format!("/^slow-{i}\\..*\\.example$/"))
+            .collect();
+        let err = engine
+            .reload_with_config(&FilteringConfig {
+                custom_rules: regex_rules,
+                regex_compile_budget_ms: Some(1),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a 1 ms budget cannot compile 2048 regex rules");
+        assert!(
+            matches!(err, FilterError::CompileBudgetExceeded { limit_ms: 1, .. }),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(
+            engine.rule_count(),
+            1,
+            "the previous snapshot must stay active after a budget abort"
+        );
+        let status = engine.status();
+        assert_eq!(status.state, FilterState::Ready);
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("budget")),
+            "last_error must explain the abort: {:?}",
+            status.last_error
+        );
+        assert!(
+            status.last_compile_ms.is_some(),
+            "failed compiles must still report their duration"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_group_snapshots_honor_compile_budget() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_budget_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let engine = HostsFilterEngine::new(
+            FilteringConfig {
+                regex_compile_budget_ms: Some(1),
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        );
+        let custom_rules: Vec<String> = (0..2048)
+            .map(|i| format!("/^group-{i}\\..*\\.example$/"))
+            .collect();
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: Vec::new(),
+            custom_rules,
+        }]);
+
+        assert!(
+            engine.group_snapshot("kids").is_none(),
+            "a group whose regex compile exceeds the budget must not be published"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_compile_observer_records_initial_load_and_reload() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_compile_observer_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let observer: Arc<dyn Fn(f64) + Send + Sync> = Arc::new(move |seconds| {
+            assert!(seconds >= 0.0);
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let engine = HostsFilterEngine::init_with_observer(
+            FilteringConfig::default(),
+            temp_dir.clone(),
+            Some(observer),
+        )
+        .await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the initial startup compile must be observed"
+        );
+
+        engine.reload().await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "scheduled/manual reloads must be observed"
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;

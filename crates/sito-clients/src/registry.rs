@@ -25,10 +25,13 @@ use crate::safe_search::YouTubeSafeSearchMode;
 use crate::timezone::ClientTimeZone;
 
 /// Upper bound on the discovered-but-unconfigured client list.
-const MAX_UNIDENTIFIED_CLIENTS: usize = 1024;
+pub const MAX_UNIDENTIFIED_CLIENTS: usize = 1024;
 
-/// Discovered clients older than this are dropped on the next insert.
-const UNIDENTIFIED_CLIENT_TTL: TimeDelta = TimeDelta::hours(24);
+/// Discovered clients older than this are dropped on the next insert or read.
+pub const UNIDENTIFIED_CLIENT_TTL_HOURS: u64 = 24;
+
+const UNIDENTIFIED_CLIENT_TTL: TimeDelta =
+    TimeDelta::hours(UNIDENTIFIED_CLIENT_TTL_HOURS.cast_signed());
 
 /// Information on a discovered client not explicitly configured in `clients.entries`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +95,25 @@ impl ClientRegistry {
         config: ClientsConfig,
         routeros_leases: Arc<RwLock<Vec<RouterOsLease>>>,
     ) -> Self {
+        Self::with_stores(
+            config,
+            routeros_leases,
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+    }
+
+    /// Creates a registry that shares existing RouterOS lease and discovered
+    /// client stores.
+    ///
+    /// Hot reloads replace the whole registry; carrying the discovered client
+    /// map over keeps the administrative discovery list available across
+    /// config saves and application reloads.
+    #[must_use]
+    pub fn with_stores(
+        config: ClientsConfig,
+        routeros_leases: Arc<RwLock<Vec<RouterOsLease>>>,
+        unidentified_clients: Arc<RwLock<HashMap<IpAddr, UnidentifiedClient>>>,
+    ) -> Self {
         let index = Arc::new(build_client_index(&config));
         let mac_resolver = MacResolver::new();
         // ARP resolution is only needed when an entry declares a MAC identity;
@@ -106,7 +128,7 @@ impl ClientRegistry {
             mac_resolver,
             timezone,
             routeros_leases,
-            unidentified_clients: Arc::new(RwLock::new(HashMap::new())),
+            unidentified_clients,
         }
     }
 
@@ -117,6 +139,15 @@ impl ClientRegistry {
     #[must_use]
     pub fn routeros_leases_store(&self) -> Arc<RwLock<Vec<RouterOsLease>>> {
         Arc::clone(&self.routeros_leases)
+    }
+
+    /// Returns the shared discovered-client store of this registry.
+    ///
+    /// Pass the result to [`ClientRegistry::with_stores`] when replacing the
+    /// registry so unidentified clients survive the reload.
+    #[must_use]
+    pub fn unidentified_store(&self) -> Arc<RwLock<HashMap<IpAddr, UnidentifiedClient>>> {
+        Arc::clone(&self.unidentified_clients)
     }
 
     /// Access the internal MacResolver (e.g. to inject mock ARP entries in tests).
@@ -146,19 +177,30 @@ impl ClientRegistry {
 
     /// Snapshot of discovered-but-unconfigured clients, newest first.
     ///
-    /// The list is bounded (oldest entries beyond
-    /// [`MAX_UNIDENTIFIED_CLIENTS`] and entries older than
-    /// [`UNIDENTIFIED_CLIENT_TTL`] are dropped), and is intended for
-    /// administrative discovery (e.g. an API/UI "create client" flow).
+    /// Expired entries ([`UNIDENTIFIED_CLIENT_TTL_HOURS`]) are pruned on read
+    /// before the list is sorted. The list is bounded by
+    /// [`MAX_UNIDENTIFIED_CLIENTS`] and is intended for administrative
+    /// discovery (e.g. an API/UI "create client" flow).
     #[must_use]
     pub fn unidentified_clients(&self) -> Vec<UnidentifiedClient> {
-        let mut clients: Vec<UnidentifiedClient> = self
+        self.unidentified_clients_at(Utc::now())
+    }
+
+    /// Snapshot of discovered clients as of `now`, newest first.
+    ///
+    /// This is the deterministic form used by tests; production callers use
+    /// [`ClientRegistry::unidentified_clients`].
+    #[must_use]
+    pub fn unidentified_clients_at(&self, now: DateTime<Utc>) -> Vec<UnidentifiedClient> {
+        let mut guard = self
             .unidentified_clients
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Prune on read as well as on insert: a client that stops querying must
+        // not remain visible indefinitely just because no new lease arrived.
+        guard.retain(|_, client| now - client.last_seen < UNIDENTIFIED_CLIENT_TTL);
+        let mut clients: Vec<UnidentifiedClient> = guard.values().cloned().collect();
+        drop(guard);
         clients.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then_with(|| a.ip.cmp(&b.ip)));
         clients
     }
@@ -945,6 +987,31 @@ group = "known"
     }
 
     #[test]
+    fn test_unidentified_store_is_shared_across_registry_generations() {
+        let old = ClientRegistry::new(sample_config());
+        let ip: IpAddr = "192.168.77.10".parse().unwrap();
+        old.update_routeros_leases(vec![RouterOsLease {
+            mac: "AA:BB:CC:DD:EE:02".to_string(),
+            ip: Some(ip),
+            hostname: Some("discovered-host".to_string()),
+            comment: None,
+        }]);
+        let mut ctx = ClientContext::new(ip);
+        let _ = old.resolve(&mut ctx, old.now());
+        assert_eq!(old.unidentified_clients().len(), 1);
+
+        let new = ClientRegistry::with_stores(
+            sample_config(),
+            old.routeros_leases_store(),
+            old.unidentified_store(),
+        );
+        let list = new.unidentified_clients();
+        assert_eq!(list.len(), 1, "discovery must survive a registry reload");
+        assert_eq!(list[0].ip, ip);
+        assert_eq!(list[0].hostname.as_deref(), Some("discovered-host"));
+    }
+
+    #[test]
     fn test_fallback_to_default_unknown_client() {
         let reg = ClientRegistry::new(sample_config());
         let ip = IpAddr::from_str("8.8.8.8").unwrap();
@@ -1023,7 +1090,7 @@ schedule = "0 0 15-21 * * MON-FRI"
             let _ = reg.resolve(&mut ctx, reg.timezone().at_utc(now));
         }
 
-        let list = reg.unidentified_clients();
+        let list = reg.unidentified_clients_at(base);
         assert_eq!(list.len(), MAX_UNIDENTIFIED_CLIENTS);
         // The oldest entries are evicted; the newest survive.
         let oldest = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000));
@@ -1037,7 +1104,7 @@ schedule = "0 0 15-21 * * MON-FRI"
     }
 
     #[test]
-    fn test_unidentified_clients_expire_by_age() {
+    fn test_unidentified_clients_prunes_expired_on_read() {
         let reg = ClientRegistry::new(ClientsConfig::default());
         let base = Utc.with_ymd_and_hms(2026, 9, 7, 12, 0, 0).unwrap();
 
@@ -1045,15 +1112,25 @@ schedule = "0 0 15-21 * * MON-FRI"
         reg.update_routeros_leases(vec![routeros_lease(old_ip, None)]);
         let mut ctx = ClientContext::new(old_ip);
         let _ = reg.resolve(&mut ctx, reg.timezone().at_utc(base));
-        assert_eq!(reg.unidentified_clients().len(), 1);
+        assert_eq!(reg.unidentified_clients_at(base).len(), 1);
 
-        // 25 h later a different client is seen: the stale entry is dropped.
+        // Reading 25 h later prunes the stale entry even though no insert (and
+        // therefore no write-path retain) has happened.
+        assert!(
+            reg.unidentified_clients_at(base + TimeDelta::hours(25))
+                .is_empty(),
+            "expired clients must disappear on read"
+        );
+        // The pruning is persisted in the store, not just hidden from the view.
+        assert_eq!(reg.unidentified_clients_at(base).len(), 0);
+
+        // A fresh client seen after the stale one expires is the only survivor.
         let new_ip = IpAddr::from_str("10.10.10.11").unwrap();
         reg.update_routeros_leases(vec![routeros_lease(new_ip, None)]);
         let mut ctx = ClientContext::new(new_ip);
         let _ = reg.resolve(&mut ctx, reg.timezone().at_utc(base + TimeDelta::hours(25)));
 
-        let list = reg.unidentified_clients();
+        let list = reg.unidentified_clients_at(base + TimeDelta::hours(25));
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].ip, new_ip);
         assert_eq!(list[0].last_seen, base + TimeDelta::hours(25));

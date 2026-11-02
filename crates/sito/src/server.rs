@@ -424,9 +424,15 @@ async fn init_runtime_components(
     // Initialize cache
     let cache = Arc::new(DnsCache::new(config.dns.cache.clone()));
 
-    // Initialize hosts filter
+    // Initialize hosts filter. The observer records both the initial load and
+    // every scheduled refresh in `sito_filter_compile_seconds`.
     let filter_engine = Arc::new(
-        HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
+        HostsFilterEngine::init_with_observer(
+            config.filtering.clone(),
+            config.server.data_dir.clone(),
+            Some(metrics.compile_observer()),
+        )
+        .await,
     );
     let _refresh_handle = filter_engine
         .clone()

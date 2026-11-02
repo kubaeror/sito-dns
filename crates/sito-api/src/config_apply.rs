@@ -400,7 +400,6 @@ async fn apply_inner(
 
     // 2. Filter engine (unless the caller queues the list fetch).
     if filter_apply == FilterApply::Sync {
-        let filter_started = std::time::Instant::now();
         ctx.filter
             .reload_with_config(&cfg.filtering)
             .await
@@ -408,8 +407,6 @@ async fn apply_inner(
                 ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
             })?;
         ctx.metrics.set_filter_rules(ctx.filter.rule_count());
-        ctx.metrics
-            .observe_filter_compile(filter_started.elapsed().as_secs_f64());
         // Filter rules changed: drop cached answers that may now be blocked.
         ctx.cache.flush();
     }
@@ -427,12 +424,16 @@ async fn apply_inner(
     ctx.cache.update_config(cfg.dns.cache.clone()).await;
     ctx.querylog_sender
         .set_anonymize(cfg.privacy.anonymize_querylog);
+    let current_clients = ctx.clients.load();
+    let clients_registry = sito_clients::ClientRegistry::with_stores(
+        clients,
+        current_clients.routeros_leases_store(),
+        current_clients.unidentified_store(),
+    );
+    drop(current_clients);
     ctx.runtime.replace(sito_runtime::RuntimeSnapshot {
         config: Arc::new(cfg.clone()),
-        clients: Arc::new(sito_clients::ClientRegistry::with_routeros_leases(
-            clients,
-            ctx.clients.load().routeros_leases_store(),
-        )),
+        clients: Arc::new(clients_registry),
         rewrites: Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
     });
     Ok(())
@@ -468,11 +469,9 @@ pub fn queue_filter_refresh(
     let metrics = ctx.metrics.clone();
     let cache = ctx.cache.clone();
     tokio::spawn(async move {
-        let started = std::time::Instant::now();
         match engine.reload_with_config(&filtering).await {
             Ok(_) => {
                 metrics.set_filter_rules(engine.rule_count());
-                metrics.observe_filter_compile(started.elapsed().as_secs_f64());
                 cache.flush();
                 tracing::info!("Background blocklist refresh completed");
             }
