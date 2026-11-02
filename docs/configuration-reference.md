@@ -35,7 +35,7 @@ update_require_signature = true        # require cosign-verified release signatu
 |---|---|---|---|
 | `role` | string | `"master"` | HA cluster role: `"master"` (reads/writes, replicates state) or `"slave"` (read-only replica). |
 | `instance_name` | string | `"sito-main"` | Name of this server instance, reported in metrics and logs. |
-| `data_dir` | string | `"/var/lib/sito"` | Directory where the persistent SQLite DB (`stats.db`), list caches, and TLS state are stored. |
+| `data_dir` | string | `"/var/lib/sito"` | Directory where the persistent SQLite DB (`stats.db`), list caches, TLS state, and the DNSSEC chain cache (`dnssec-chain-cache.toml`, 0600) are stored. |
 | `log_level` | string | `"info"` | Logging verbosity: `"trace"`, `"debug"`, `"info"`, `"warn"`, or `"error"`. |
 | `log_format` | string | `"json"` | Formatting for stdout logs: `"pretty"` (human readable with colors) or `"json"` (structured). |
 | `update_require_signature` | boolean | `true` | When `true`, in-app updates and `sito update` require a valid cosign signature (`.sig`/`.pem` assets). A signature that is present is always verified even when this is `false`; when `true`, a missing signature or missing `cosign` binary aborts the update. Set to `false` only if you intentionally accept same-origin SHA-256-only integrity. |

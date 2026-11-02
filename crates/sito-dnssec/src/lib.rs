@@ -5,8 +5,12 @@
 //! and validation metrics.
 
 use std::collections::{HashMap, HashSet};
+pub mod chain_cache;
 pub mod nsec;
 pub mod nsec3;
+
+use chain_cache::CHAIN_CACHE_MAX_ENTRIES;
+pub use chain_cache::{ChainCache, ChainEntry, ZoneStatus};
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -38,6 +42,13 @@ const MAX_RRSIGS: usize = 128;
 const KEY_CACHE_MAX_ENTRIES: usize = 4096;
 /// Hard bound on the known-signed-zone cache; zones are re-discoverable.
 const SIGNED_ZONE_MAX_ENTRIES: usize = 8192;
+/// Maximum number of delegation cuts probed for a single name (the previous
+/// probe used 8; deeper names fail closed instead of issuing unbounded fetches).
+const MAX_CHAIN_CUTS: usize = 8;
+/// Maximum cache lifetime for an authenticated DS status (seconds).
+const CHAIN_STATUS_TTL_MAX: u32 = 3600;
+/// How long a failed delegation probe suppresses further probes for the name.
+const PROBE_BACKOFF_SECS: u32 = 30;
 /// Accepted clock skew around RRSIG inception/expiration (RFC 4035 5.3.1).
 const MAX_CLOCK_SKEW: u32 = 300;
 /// Minimum accepted RSA modulus size in bits (RFC 8624 3.1).
@@ -938,7 +949,8 @@ fn has_valid_rrsig_for(
 /// Delegation status inferred from a DS response.
 enum DsStatus {
     /// The DS RRset is present and authenticated: the child zone is signed.
-    Signed,
+    /// The value is the DS RRset TTL used as a caching hint.
+    Signed(u32),
     /// An authenticated denial proves the delegation has no DS (unsigned),
     /// with the denial RR's TTL as the caching hint.
     Unsigned(u32),
@@ -970,12 +982,20 @@ fn ds_response_status(
             record.name == *cut && matches!(record.data, RData::DNSSEC(DNSSECRData::DS(_)))
         });
     if has_ds {
-        return if has_valid_rrsig_for(response, cut, RecordType::DS, parent_zone, parent_keys, now)
-        {
-            DsStatus::Signed
-        } else {
-            DsStatus::Unknown
-        };
+        if !has_valid_rrsig_for(response, cut, RecordType::DS, parent_zone, parent_keys, now) {
+            return DsStatus::Unknown;
+        }
+        let ttl = response
+            .answers
+            .iter()
+            .chain(response.authorities.iter())
+            .filter(|record| {
+                record.name == *cut && matches!(record.data, RData::DNSSEC(DNSSECRData::DS(_)))
+            })
+            .map(|record| record.ttl)
+            .min()
+            .unwrap_or(300);
+        return DsStatus::Signed(ttl.max(1));
     }
 
     // NSEC denial at the cut.
@@ -1002,7 +1022,7 @@ fn ds_response_status(
             if let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = &record.data {
                 let types = nsec.type_set();
                 if types.contains(RecordType::DS) {
-                    return DsStatus::Signed;
+                    return DsStatus::Signed(record.ttl.max(1));
                 }
                 if types.contains(RecordType::NS) && !types.contains(RecordType::SOA) {
                     return DsStatus::Unsigned(record.ttl.max(1));
@@ -1049,7 +1069,7 @@ fn ds_response_status(
             if let RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) = &record.data {
                 let types = nsec3.type_set();
                 if types.contains(RecordType::DS) {
-                    return DsStatus::Signed;
+                    return DsStatus::Signed(record.ttl.max(1));
                 }
                 if types.contains(RecordType::NS) && !types.contains(RecordType::SOA) {
                     return DsStatus::Unsigned(record.ttl.max(1));
@@ -1112,6 +1132,26 @@ enum DelegationProof {
     Unknown,
 }
 
+/// Candidate delegation cuts between `zone` (exclusive) and `name` (inclusive),
+/// shallowest first.
+fn delegation_cuts(name: &LowerName, zone: &LowerName) -> Vec<LowerName> {
+    if zone == name || !zone.zone_of(name) {
+        return Vec::new();
+    }
+    let mut cuts = Vec::new();
+    let mut current = name.clone();
+    while current != *zone && cuts.len() < MAX_CHAIN_CUTS {
+        cuts.push(current.clone());
+        let base = current.base_name();
+        if base == current {
+            break;
+        }
+        current = base;
+    }
+    cuts.reverse();
+    cuts
+}
+
 /// Result of the DS/DNSKEY trust-extension walk.
 #[derive(Default)]
 struct KeySetBuild {
@@ -1165,6 +1205,15 @@ pub struct DnssecValidator {
     /// is legitimately unsigned and must not be treated as a stripped
     /// signature.
     insecure_zones: DashMap<LowerName, u32>,
+    /// Authenticated chain statuses, shared across validator swaps and
+    /// optionally persisted under `<data_dir>/dnssec-chain-cache.toml`.
+    chain_cache: Arc<ChainCache>,
+    /// Configured trust-anchor zone names (the root is derived from the anchor
+    /// set itself). Used to decide where a cold-start DNSKEY fetch begins.
+    anchor_zones: DashMap<LowerName, ()>,
+    /// Short-lived probe backoff so a network outage cannot cause a DS fetch
+    /// storm for names that cannot be classified. Never persisted.
+    probe_backoff: DashMap<LowerName, u32>,
 }
 
 impl DnssecValidator {
@@ -1178,11 +1227,23 @@ impl DnssecValidator {
             metrics: Arc::new(DnssecMetrics::new()),
             signed_zones: DashMap::new(),
             insecure_zones: DashMap::new(),
+            chain_cache: Arc::new(ChainCache::new(None)),
+            anchor_zones: DashMap::new(),
+            probe_backoff: DashMap::new(),
         }
     }
 
     /// Create from a `DnssecConfig`.
     pub fn from_config(config: &DnssecConfig) -> Self {
+        Self::from_config_with_cache(config, None)
+    }
+
+    /// Create from a `DnssecConfig`, reusing a shared chain cache.
+    ///
+    /// Production passes the data-dir-backed cache so authenticated chain
+    /// statuses survive hot reloads and process restarts. Tests use
+    /// [`Self::from_config`], which keeps the cache purely in memory.
+    pub fn from_config_with_cache(config: &DnssecConfig, cache: Option<Arc<ChainCache>>) -> Self {
         use base64::Engine;
         let mode = if config.validate {
             DnssecMode::from(config.mode.as_str())
@@ -1195,7 +1256,10 @@ impl DnssecValidator {
                 ntas.push(ntp.clone());
             }
         }
-        let validator = Self::new(mode, ntas);
+        let mut validator = Self::new(mode, ntas);
+        if let Some(cache) = cache {
+            validator.chain_cache = cache;
+        }
         for ta in &config.trust_anchors {
             let parts: Vec<&str> = ta.split(':').collect();
             let (domain, alg, b64) = if parts.len() == 3 {
@@ -1233,6 +1297,12 @@ impl DnssecValidator {
         validator
     }
 
+    /// The shared chain cache (used to verify reload reuse in tests).
+    #[must_use]
+    pub fn chain_cache(&self) -> &Arc<ChainCache> {
+        &self.chain_cache
+    }
+
     /// Custom trust anchors builder.
     #[must_use]
     pub fn with_trust_anchors(mut self, trust_anchors: TrustAnchors) -> Self {
@@ -1243,15 +1313,17 @@ impl DnssecValidator {
     /// Dynamically add a trusted anchor from DNSKEY.
     pub fn add_trust_anchor(&self, key: &DNSKEY, name: LowerName) {
         let mut anchors = (**self.trust_anchors.load()).clone();
-        anchors.insert_with_name(key.public_key(), name);
+        anchors.insert_with_name(key.public_key(), name.clone());
         self.trust_anchors.store(Arc::new(anchors));
+        self.anchor_zones.insert(name, ());
     }
 
     /// Dynamically add a trusted anchor from raw public key buffer.
     pub fn add_raw_trust_anchor(&self, key: &PublicKeyBuf, name: LowerName) {
         let mut anchors = (**self.trust_anchors.load()).clone();
-        anchors.insert_with_name(key, name);
+        anchors.insert_with_name(key, name.clone());
         self.trust_anchors.store(Arc::new(anchors));
+        self.anchor_zones.insert(name, ());
     }
 
     /// Add a Negative Trust Anchor (NTA) dynamically.
@@ -1289,8 +1361,14 @@ impl DnssecValidator {
     }
 
     /// Records that `zone` was proven signed, valid until `expiry`.
-    fn mark_signed_zone(&self, zone: &LowerName, expiry: u32) {
+    fn mark_signed_zone(&self, zone: &LowerName, expiry: u32, now: u32) {
+        self.insecure_zones.remove(zone);
         self.signed_zones.insert(zone.clone(), expiry);
+        // Only authenticated evidence reaches this method: either a signer of
+        // validated response data or an authenticated DS RRset. Persist it so
+        // a restart (or hot reload) does not lose the downgrade protection.
+        self.chain_cache
+            .insert(zone.clone(), ZoneStatus::Signed, expiry, now);
     }
 
     /// Whether `name` is inside a zone previously proven signed (and not
@@ -1309,8 +1387,11 @@ impl DnssecValidator {
 
     /// Records that `zone` was proven unsigned by an authenticated DS denial,
     /// valid until `expiry`.
-    fn mark_insecure_zone(&self, zone: &LowerName, expiry: u32) {
+    fn mark_insecure_zone(&self, zone: &LowerName, expiry: u32, now: u32) {
+        self.signed_zones.remove(zone);
         self.insecure_zones.insert(zone.clone(), expiry);
+        self.chain_cache
+            .insert(zone.clone(), ZoneStatus::Unsigned, expiry, now);
     }
 
     /// Whether `name` is inside a zone proven to be an unsigned delegation.
@@ -1338,66 +1419,491 @@ impl DnssecValidator {
             .map(|entry| entry.key().clone())
     }
 
-    /// Probes the delegation status of `name` using authenticated DS responses
-    /// from the closest zone that previously signed validated data.
+    /// Probes the delegation status of `name` using authenticated DS responses.
     ///
-    /// This is what turns "no RRSIGs" from an unconditional downgrade into a
-    /// decision: an authenticated DS denial proves the delegation is unsigned
-    /// (Insecure), while an authenticated DS or a name inside the signed zone
-    /// means the signatures were stripped (Bogus).
+    /// The walk starts from the closest zone with signed evidence or, on a cold
+    /// start, from the closest configured trust anchor: the anchor DNSKEY is
+    /// fetched, its self-signature is verified against the anchor, and the
+    /// DS/DNSKEY links are followed shallowest-first. An authenticated DS
+    /// proves the cut is signed (Bogus if the response carried no RRSIGs) and
+    /// an authenticated DS denial proves the delegation is unsigned (Insecure).
+    ///
+    /// Only authenticated results are recorded. An `Unknown` result (network
+    /// failure, missing records, unsupported input) is never written to the
+    /// persistent cache.
     async fn probe_delegation(
         &self,
         name: &LowerName,
         fetcher: &dyn DnssecKeyFetcher,
         now: u32,
     ) -> DelegationProof {
-        let Some(zone) = self.closest_signed_zone(name, now) else {
-            return DelegationProof::Unknown;
-        };
-        let parent_keys = self.key_cache.validated_keys(&zone, now);
-        if parent_keys.is_empty() {
-            return DelegationProof::Unknown;
-        }
-
-        // Candidate cuts between `zone` (exclusive) and `name` (inclusive),
-        // shallowest first.
-        let mut cuts: Vec<LowerName> = Vec::new();
-        let mut current = name.clone();
-        while current != zone && cuts.len() < 8 {
-            cuts.push(current.clone());
-            let base = current.base_name();
-            if base == current {
-                break;
+        let cached_start = self.chain_cache.closest_signed(name, now);
+        let memory_start = self.closest_signed_zone(name, now);
+        let start = match (memory_start, cached_start) {
+            (Some(memory), Some((cached, expiry))) => {
+                if cached.num_labels() > memory.num_labels() {
+                    self.signed_zones.insert(cached.clone(), expiry);
+                    Some(cached)
+                } else {
+                    Some(memory)
+                }
             }
-            current = base;
-        }
-        if cuts.is_empty() {
-            return DelegationProof::ShouldBeSigned;
-        }
-        cuts.reverse();
+            (Some(memory), None) => Some(memory),
+            (None, Some((cached, expiry))) => {
+                self.signed_zones.insert(cached.clone(), expiry);
+                Some(cached)
+            }
+            (None, None) => None,
+        };
 
-        for cut in cuts {
-            let cut_name = Name::from(cut.clone());
-            let Ok(ds_response) = fetcher.query(&cut_name, RecordType::DS).await else {
+        let mut start_is_signed = false;
+        let (mut zone, mut parent_keys) = if let Some(start) = start {
+            start_is_signed = true;
+            if start == *name {
+                // The queried name itself is a zone proven signed: a response
+                // without signatures from it is already a downgrade.
+                return DelegationProof::ShouldBeSigned;
+            }
+            match self.keys_for_zone(&start, fetcher, now).await {
+                Some((actual_zone, keys)) => (actual_zone, keys),
+                // The zone is known to be signed but its keys cannot be
+                // re-established (offline restart, expired key cache). Fail
+                // closed rather than downgrading.
+                None => return DelegationProof::ShouldBeSigned,
+            }
+        } else {
+            let Some(anchor) = self.closest_anchor_zone(name) else {
                 return DelegationProof::Unknown;
             };
+            match self.seed_anchor_keys(&anchor, fetcher, now).await {
+                Some((keys, _expiry)) => (anchor, keys),
+                None => return DelegationProof::Unknown,
+            }
+        };
+
+        let cuts = delegation_cuts(name, &zone);
+        if cuts.is_empty() {
+            // `name` is the signed start/anchor zone itself.
+            self.mark_signed_zone(name, now.saturating_add(CHAIN_STATUS_TTL_MAX), now);
+            return DelegationProof::ShouldBeSigned;
+        }
+
+        let mut saw_signed = false;
+        for cut in cuts {
+            if let Some((unsigned_zone, expiry)) = self.chain_cache.covers_unsigned(&cut, now) {
+                self.signed_zones.remove(&unsigned_zone);
+                self.insecure_zones.insert(unsigned_zone, expiry);
+                return DelegationProof::Unsigned;
+            }
+            if self.insecure_zone_covers(&cut, now) {
+                return DelegationProof::Unsigned;
+            }
+
+            // A previously authenticated signed cut needs no DS refetch. Its
+            // DNSKEYs are still required to authenticate deeper cuts.
+            if let Some(entry) = self.chain_cache.get(&cut, now)
+                && entry.status == ZoneStatus::Signed
+            {
+                saw_signed = true;
+                self.signed_zones.insert(cut.clone(), entry.expires_at);
+                if cut == *name {
+                    return DelegationProof::ShouldBeSigned;
+                }
+                match self.keys_for_zone(&cut, fetcher, now).await {
+                    Some((actual_zone, keys)) if actual_zone == cut => {
+                        zone = actual_zone;
+                        parent_keys = keys;
+                    }
+                    _ => return DelegationProof::ShouldBeSigned,
+                }
+                continue;
+            }
+
+            let cut_name = Name::from(cut.clone());
+            let Ok(ds_response) = fetcher.query(&cut_name, RecordType::DS).await else {
+                return if saw_signed || start_is_signed {
+                    DelegationProof::ShouldBeSigned
+                } else {
+                    DelegationProof::Unknown
+                };
+            };
             match ds_response_status(&ds_response, &cut_name, &zone, &parent_keys, now) {
+                DsStatus::Signed(ttl) => {
+                    let expiry = now.saturating_add(ttl.clamp(1, CHAIN_STATUS_TTL_MAX));
+                    self.mark_signed_zone(&cut, expiry, now);
+                    saw_signed = true;
+                    if cut == *name {
+                        return DelegationProof::ShouldBeSigned;
+                    }
+                    // DS authenticates the child DNSKEY, which in turn is
+                    // needed to authenticate deeper DS answers. A missing
+                    // child key must not downgrade the authenticated DS.
+                    match self
+                        .validate_child_dnskeys(&cut, &ds_response, fetcher, now)
+                        .await
+                    {
+                        Some(keys) => {
+                            zone = cut;
+                            parent_keys = keys;
+                        }
+                        None => return DelegationProof::ShouldBeSigned,
+                    }
+                }
                 DsStatus::Unsigned(ttl) => {
-                    self.mark_insecure_zone(&cut, now.saturating_add(ttl.clamp(1, 3600)));
+                    let expiry = now.saturating_add(ttl.clamp(1, CHAIN_STATUS_TTL_MAX));
+                    self.mark_insecure_zone(&cut, expiry, now);
                     debug!(
                         zone = %cut,
-                        "DS denial proves an unsigned delegation; AD is cleared"
+                        "Authenticated DS denial proves an unsigned delegation; AD is cleared"
                     );
                     return DelegationProof::Unsigned;
                 }
-                DsStatus::Signed => return DelegationProof::ShouldBeSigned,
                 DsStatus::InZone => {}
-                DsStatus::Unknown => return DelegationProof::Unknown,
+                DsStatus::Unknown => {
+                    return if saw_signed || start_is_signed {
+                        DelegationProof::ShouldBeSigned
+                    } else {
+                        DelegationProof::Unknown
+                    };
+                }
             }
         }
-        // Every name between the signed zone and the query is inside that
-        // zone: the data should have been signed.
+
+        // Every cut was authenticated as signed or inside the signed parent,
+        // so `name` was proven to require signatures. Cache that decision for
+        // the queried name as well: a repeated stripped response must be Bogus
+        // without re-walking the chain, and the status survives a restart.
+        self.mark_signed_zone(name, now.saturating_add(CHAIN_STATUS_TTL_MAX), now);
         DelegationProof::ShouldBeSigned
+    }
+
+    /// The closest configured trust-anchor zone covering `name`.
+    fn closest_anchor_zone(&self, name: &LowerName) -> Option<LowerName> {
+        let anchors = self.trust_anchors.load();
+        let mut best = None;
+        if !anchors.is_empty() {
+            let root = LowerName::from(Name::root());
+            if root.zone_of(name) {
+                best = Some(root);
+            }
+        }
+        for entry in &self.anchor_zones {
+            if entry.key().zone_of(name)
+                && best
+                    .as_ref()
+                    .is_none_or(|zone| entry.key().num_labels() > zone.num_labels())
+            {
+                best = Some(entry.key().clone());
+            }
+        }
+        best
+    }
+
+    /// Fetches and validates the DNSKEY RRset at a configured trust anchor.
+    ///
+    /// Returns the policy-acceptable keys and the earliest expiry. The DNSKEY
+    /// RRset must carry a self-signature that verifies with an anchored key;
+    /// otherwise nothing is trusted.
+    async fn seed_anchor_keys(
+        &self,
+        zone: &LowerName,
+        fetcher: &dyn DnssecKeyFetcher,
+        now: u32,
+    ) -> Option<(Vec<DNSKEY>, u32)> {
+        let zone_name = Name::from(zone.clone());
+        let message = fetcher.query(&zone_name, RecordType::DNSKEY).await.ok()?;
+        let anchors = self.trust_anchors.load();
+        let keys: Vec<DNSKEY> = message
+            .answers
+            .iter()
+            .chain(message.authorities.iter())
+            .chain(message.additionals.iter())
+            .filter(|record| record.name == zone_name)
+            .filter_map(|record| match &record.data {
+                RData::DNSSEC(DNSSECRData::DNSKEY(key)) if dnskey_policy_ok(key) => {
+                    Some(key.clone())
+                }
+                _ => None,
+            })
+            .take(MAX_DNSKEYS)
+            .collect();
+        let anchored: Vec<DNSKEY> = keys
+            .iter()
+            .filter(|key| {
+                anchors.contains(key.public_key())
+                    || anchors.contains_with_name(key.public_key(), zone)
+            })
+            .cloned()
+            .collect();
+        if anchored.is_empty()
+            || !has_valid_rrsig_for(
+                &message,
+                &zone_name,
+                RecordType::DNSKEY,
+                zone,
+                &anchored,
+                now,
+            )
+        {
+            return None;
+        }
+
+        let ttl = message
+            .answers
+            .iter()
+            .chain(message.authorities.iter())
+            .chain(message.additionals.iter())
+            .filter(|record| {
+                record.name == zone_name
+                    && matches!(record.data, RData::DNSSEC(DNSSECRData::DNSKEY(_)))
+            })
+            .map(|record| record.ttl)
+            .min()
+            .unwrap_or(300);
+        let mut expiry = now.saturating_add(ttl.max(1));
+        for record in message
+            .answers
+            .iter()
+            .chain(message.authorities.iter())
+            .chain(message.additionals.iter())
+        {
+            if let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data
+                && record.name == zone_name
+                && rrsig.input().type_covered == RecordType::DNSKEY
+                && LowerName::from(&rrsig.input().signer_name) == *zone
+                && rrsig_time_ok(rrsig, now)
+            {
+                expiry = expiry.min(rrsig.input().sig_expiration.get());
+            }
+        }
+
+        for key in &keys {
+            if let Ok(tag) = key.calculate_key_tag() {
+                self.key_cache.insert_validated_with_now(
+                    zone.clone(),
+                    tag,
+                    key.clone(),
+                    expiry,
+                    now,
+                );
+            }
+        }
+        Some((keys, expiry))
+    }
+
+    /// Obtains validated DNSKEYs for `target`, walking from the closest anchor
+    /// when the in-memory key cache is cold.
+    ///
+    /// Returns the zone the keys actually belong to. If `target` is not itself
+    /// a delegation, that is the closest signed ancestor.
+    async fn keys_for_zone(
+        &self,
+        target: &LowerName,
+        fetcher: &dyn DnssecKeyFetcher,
+        now: u32,
+    ) -> Option<(LowerName, Vec<DNSKEY>)> {
+        let cached = self.key_cache.validated_keys(target, now);
+        if !cached.is_empty() {
+            return Some((target.clone(), cached));
+        }
+
+        let anchor = self.closest_anchor_zone(target)?;
+        let (mut keys, _) = self.seed_anchor_keys(&anchor, fetcher, now).await?;
+        let mut zone = anchor;
+        if zone == *target {
+            return Some((zone, keys));
+        }
+
+        for cut in delegation_cuts(target, &zone) {
+            let cut_name = Name::from(cut.clone());
+            let Ok(ds_response) = fetcher.query(&cut_name, RecordType::DS).await else {
+                return None;
+            };
+            match ds_response_status(&ds_response, &cut_name, &zone, &keys, now) {
+                DsStatus::Signed(_) => {
+                    keys = self
+                        .validate_child_dnskeys(&cut, &ds_response, fetcher, now)
+                        .await?;
+                    zone = cut;
+                }
+                DsStatus::InZone => {}
+                DsStatus::Unsigned(_) | DsStatus::Unknown => return None,
+            }
+        }
+        Some((zone, keys))
+    }
+
+    /// Fetches the DNSKEY RRset for a signed cut and validates it against the
+    /// authenticated DS records, then trusts the whole (self-signed) RRset.
+    async fn validate_child_dnskeys(
+        &self,
+        cut: &LowerName,
+        ds_message: &Message,
+        fetcher: &dyn DnssecKeyFetcher,
+        now: u32,
+    ) -> Option<Vec<DNSKEY>> {
+        let cut_name = Name::from(cut.clone());
+        let ds_records: Vec<DS> = ds_message
+            .answers
+            .iter()
+            .chain(ds_message.authorities.iter())
+            .chain(ds_message.additionals.iter())
+            .filter(|record| record.name == cut_name)
+            .filter_map(|record| match &record.data {
+                RData::DNSSEC(DNSSECRData::DS(ds)) if allowed_ds_digest(ds.digest_type()) => {
+                    Some(ds.clone())
+                }
+                _ => None,
+            })
+            .take(MAX_DS_RECORDS)
+            .collect();
+        if ds_records.is_empty() {
+            return None;
+        }
+
+        let message = fetcher.query(&cut_name, RecordType::DNSKEY).await.ok()?;
+        let keys: Vec<DNSKEY> = message
+            .answers
+            .iter()
+            .chain(message.authorities.iter())
+            .chain(message.additionals.iter())
+            .filter(|record| record.name == cut_name)
+            .filter_map(|record| match &record.data {
+                RData::DNSSEC(DNSSECRData::DNSKEY(key))
+                    if dnskey_policy_ok(key) && allowed_dnskey_algorithm(key.algorithm()) =>
+                {
+                    Some(key.clone())
+                }
+                _ => None,
+            })
+            .take(MAX_DNSKEYS)
+            .collect();
+        let matched: Vec<DNSKEY> = keys
+            .iter()
+            .filter(|key| {
+                ds_records.iter().any(|ds| {
+                    ds.algorithm() == key.algorithm() && ds.covers(&cut_name, key).unwrap_or(false)
+                })
+            })
+            .cloned()
+            .collect();
+        if matched.is_empty()
+            || !has_valid_rrsig_for(&message, &cut_name, RecordType::DNSKEY, cut, &matched, now)
+        {
+            return None;
+        }
+
+        let ttl = message
+            .answers
+            .iter()
+            .chain(message.authorities.iter())
+            .chain(message.additionals.iter())
+            .filter(|record| {
+                record.name == cut_name
+                    && matches!(record.data, RData::DNSSEC(DNSSECRData::DNSKEY(_)))
+            })
+            .map(|record| record.ttl)
+            .min()
+            .unwrap_or(300);
+        let mut expiry = now.saturating_add(ttl.max(1));
+        let ds_ttl = ds_message
+            .answers
+            .iter()
+            .chain(ds_message.authorities.iter())
+            .chain(ds_message.additionals.iter())
+            .filter(|record| {
+                record.name == cut_name && matches!(record.data, RData::DNSSEC(DNSSECRData::DS(_)))
+            })
+            .map(|record| record.ttl)
+            .min()
+            .unwrap_or(300);
+        expiry = expiry.min(now.saturating_add(ds_ttl.max(1)));
+        for record in message
+            .answers
+            .iter()
+            .chain(message.authorities.iter())
+            .chain(message.additionals.iter())
+        {
+            if let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data
+                && record.name == cut_name
+                && rrsig.input().type_covered == RecordType::DNSKEY
+                && LowerName::from(&rrsig.input().signer_name) == *cut
+                && rrsig_time_ok(rrsig, now)
+            {
+                expiry = expiry.min(rrsig.input().sig_expiration.get());
+            }
+        }
+        for key in &keys {
+            if let Ok(tag) = key.calculate_key_tag() {
+                self.key_cache.insert_validated_with_now(
+                    cut.clone(),
+                    tag,
+                    key.clone(),
+                    expiry,
+                    now,
+                );
+            }
+        }
+        Some(keys)
+    }
+
+    /// Handles a response with no RRSIGs: mirror a cached status or probe the
+    /// delegation. Returns `true` when the probe could not establish a status
+    /// (never-proven zone, network failure, or active backoff).
+    async fn prepare_unsigned_response(
+        &self,
+        name: &LowerName,
+        fetcher: &dyn DnssecKeyFetcher,
+        now: u32,
+    ) -> bool {
+        if let Some(entry) = self.chain_cache.get(name, now) {
+            match entry.status {
+                ZoneStatus::Signed => {
+                    self.insecure_zones.remove(name);
+                    self.signed_zones.insert(name.clone(), entry.expires_at);
+                }
+                ZoneStatus::Unsigned => {
+                    self.signed_zones.remove(name);
+                    self.insecure_zones.insert(name.clone(), entry.expires_at);
+                }
+            }
+            return false;
+        }
+        if let Some((zone, expiry)) = self.chain_cache.covers_unsigned(name, now) {
+            self.signed_zones.remove(&zone);
+            self.insecure_zones.insert(zone, expiry);
+            return false;
+        }
+        if self.insecure_zone_covers(name, now) {
+            return false;
+        }
+        if self.probe_backoff_active(name, now) {
+            return true;
+        }
+        if self.probe_delegation(name, fetcher, now).await == DelegationProof::Unknown {
+            self.record_probe_failure(name, now);
+            true
+        } else {
+            self.probe_backoff.remove(name);
+            false
+        }
+    }
+
+    fn probe_backoff_active(&self, name: &LowerName, now: u32) -> bool {
+        if self.probe_backoff.len() > CHAIN_CACHE_MAX_ENTRIES {
+            self.probe_backoff.retain(|_, until| *until >= now);
+            if self.probe_backoff.len() > CHAIN_CACHE_MAX_ENTRIES {
+                self.probe_backoff.clear();
+            }
+        }
+        self.probe_backoff
+            .get(name)
+            .is_some_and(|until| *until >= now)
+    }
+
+    fn record_probe_failure(&self, name: &LowerName, now: u32) {
+        self.probe_backoff
+            .insert(name.clone(), now.saturating_add(PROBE_BACKOFF_SECS));
     }
 
     /// Validates a response, resolving missing DNSKEY/DS records through the
@@ -1414,27 +1920,46 @@ impl DnssecValidator {
         now: u32,
         fetcher: &dyn DnssecKeyFetcher,
     ) -> ValidationOutcome {
-        // A name under a zone that signed validated data before, with no
-        // signatures in the response, is either a stripped-signature downgrade
+        // A response without RRSIGs is either a stripped-signature downgrade
         // or a legitimate unsigned delegation. Probe the delegation status
-        // first: only an authenticated DS denial may downgrade it to Insecure,
-        // otherwise `validate_response` keeps the fail-closed Bogus decision.
+        // regardless of prior signed-zone evidence: only an authenticated DS
+        // denial may downgrade it to Insecure, otherwise `validate_response`
+        // keeps the fail-closed Bogus decision.
+        let mut probe_failed = false;
+        let mut has_rrsigs = true;
+        let mut query_is_nta = false;
         if self.mode != DnssecMode::Disabled
             && let Some(query) = response.queries.first()
         {
             let qname = LowerName::from(query.name());
-            if !response_has_rrsigs(response)
-                && self.signed_zone_contains(&qname, now)
-                && !self.insecure_zone_covers(&qname, now)
-            {
-                let _ = self.probe_delegation(&qname, fetcher, now).await;
+            has_rrsigs = response_has_rrsigs(response);
+            query_is_nta = self.is_nta(query.name());
+            if !has_rrsigs && !query_is_nta {
+                probe_failed |= self.prepare_unsigned_response(&qname, fetcher, now).await;
+                let final_target = LowerName::from(&negative_answer_name(response, query.name()));
+                if final_target != qname {
+                    probe_failed |= self
+                        .prepare_unsigned_response(&final_target, fetcher, now)
+                        .await;
+                }
             }
-            let final_target = LowerName::from(&negative_answer_name(response, query.name()));
-            if final_target != qname
-                && self.signed_zone_contains(&final_target, now)
-                && !self.insecure_zone_covers(&final_target, now)
-            {
-                let _ = self.probe_delegation(&final_target, fetcher, now).await;
+        }
+
+        // A never-proven zone with no signatures and no authenticated
+        // delegation status is `Indeterminate` (AD=0), never a persistent
+        // Insecure/Bogus decision: the probe may simply be offline.
+        if probe_failed && !has_rrsigs && !query_is_nta {
+            let qname = LowerName::from(
+                response
+                    .queries
+                    .first()
+                    .map_or_else(Name::root, |q| q.name().clone()),
+            );
+            if !self.signed_zone_contains(&qname, now) && !self.insecure_zone_covers(&qname, now) {
+                response.metadata.authentic_data = false;
+                let outcome = ValidationOutcome::Indeterminate;
+                self.metrics.record_validation(&outcome);
+                return outcome;
             }
         }
 
@@ -1994,7 +2519,7 @@ impl DnssecValidator {
             if lower_signer.zone_of(&qname_lower) {
                 trusted_signer_covers_qname = true;
             }
-            self.mark_signed_zone(&lower_signer, expiration);
+            self.mark_signed_zone(&lower_signer, expiration, now);
             trusted_sigs.push(TrustedSignature {
                 owner: LowerName::from(rrsig_owner),
                 covered: type_covered,
@@ -4602,6 +5127,576 @@ mod tests {
             "an in-zone name still requires signatures: {outcome:?}"
         );
         assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    }
+
+    // ------------------------------------------------------------------
+    // D-05: persistent chain/negative-DS cache and cold-start delegation probe
+    // ------------------------------------------------------------------
+
+    fn chain_test_path(tag: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "sito_d05_{}_{}_{}",
+            std::process::id(),
+            tag,
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.join("dnssec-chain-cache.toml")
+    }
+
+    fn d05_validator(cache: Option<Arc<ChainCache>>) -> DnssecValidator {
+        DnssecValidator::from_config_with_cache(&DnssecConfig::default(), cache)
+            .with_trust_anchors(TrustAnchors::empty())
+    }
+
+    fn anchored_dnskey_message(
+        zone: &Name,
+        key: &DNSKEY,
+        signer: &hickory_proto::dnssec::DnssecSigner,
+    ) -> Message {
+        use hickory_proto::rr::RecordSet;
+        let mut set = RecordSet::new(zone.clone(), RecordType::DNSKEY, 0);
+        set.insert(
+            Record::from_rdata(
+                zone.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(key.clone())),
+            ),
+            0,
+        );
+        let signature = sign_test_rrset(&set, signer);
+        fetched_dnskey_message(zone, std::slice::from_ref(key), Some(signature))
+    }
+
+    fn signed_ds_message(
+        cut: &Name,
+        parent_signer: &hickory_proto::dnssec::DnssecSigner,
+        child_key: &DNSKEY,
+    ) -> Message {
+        use hickory_proto::dnssec::{DigestType, rdata::DS};
+        use hickory_proto::rr::RecordSet;
+
+        let ds = DS::from_key(child_key.public_key(), cut, DigestType::SHA256).expect("ds");
+        let ds_record = Record::from_rdata(cut.clone(), 300, RData::DNSSEC(DNSSECRData::DS(ds)));
+        let mut set = RecordSet::new(cut.clone(), RecordType::DS, 0);
+        set.insert(ds_record.clone(), 0);
+        let signature = sign_test_rrset(&set, parent_signer);
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+        message.answers.push(ds_record);
+        message.answers.push(signature);
+        message
+    }
+
+    fn stripped_response(qname: &Name) -> Message {
+        let mut response = Message::new(7, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+        response.answers.push(Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 44))),
+        ));
+        response
+    }
+
+    /// Cold start, no prior signed data: an authenticated DS for the cut must
+    /// turn a stripped response into Bogus. This is the core D-05 fix.
+    #[tokio::test]
+    async fn test_stripped_rrsig_never_validated_zone_is_bogus() {
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let (cut_origin, cut_key, _cut_signer) = create_test_signer("child.signed.example.");
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(
+                &cut_origin,
+                RecordType::DS,
+                signed_ds_message(&cut_origin, &parent_signer, &cut_key),
+            );
+
+        let mut response = stripped_response(&cut_origin);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a never-validated zone with an authenticated DS must be Bogus: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+        assert!(
+            response.answers.is_empty(),
+            "bogus response must not carry answers: {:?}",
+            response.answers
+        );
+        assert!(
+            fetcher.calls() >= 2,
+            "cold start must fetch the anchor DNSKEY and the cut DS"
+        );
+
+        // The authenticated decision is cached for the queried name: a repeat
+        // stripped response is Bogus without walking the chain again.
+        let calls_after_first = fetcher.calls();
+        let mut repeat = stripped_response(&cut_origin);
+        let repeat_outcome = validator
+            .validate_with_key_fetcher(&mut repeat, Some("probe"), now, &fetcher)
+            .await;
+        assert!(matches!(repeat_outcome, ValidationOutcome::Bogus { .. }));
+        assert_eq!(
+            fetcher.calls(),
+            calls_after_first,
+            "the cached signed decision must avoid a second DS walk"
+        );
+    }
+
+    /// A genuinely unsigned zone must stay Insecure (NOERROR, AD=0), not Bogus.
+    #[tokio::test]
+    async fn test_genuinely_unsigned_zone_authenticated_ds_denial_is_insecure() {
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let cut = Name::from_str("unsigned.signed.example.").expect("cut");
+        let qname = Name::from_str("www.unsigned.signed.example.").expect("qname");
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+
+        let ds_denial = signed_nsec_response(
+            &parent_origin,
+            &cut,
+            &Name::from_str("z.signed.example.").expect("next"),
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+            &cut,
+            &parent_key,
+            &parent_signer,
+            ResponseCode::NoError,
+        );
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(&cut, RecordType::DS, ds_denial);
+
+        let mut response = stripped_response(&qname);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Insecure,
+            "an authenticated DS denial proves the delegation is unsigned"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(!response.metadata.authentic_data);
+        assert_eq!(
+            response.answers.len(),
+            1,
+            "insecure answers are passed through"
+        );
+    }
+
+    /// A root-anchored cold start must follow a signed intermediate cut
+    /// (`tld.`) and still classify a deeper unsigned delegation as Insecure,
+    /// not Bogus. This guards the nested-unsigned false-positive case.
+    #[tokio::test]
+    async fn test_cold_start_follows_signed_cut_before_unsigned_delegation() {
+        let (root_origin, root_key, root_signer) = create_test_signer(".");
+        let (tld_origin, tld_key, tld_signer) = create_test_signer("tld.");
+        let cut = Name::from_str("unsigned.tld.").expect("cut");
+        let qname = Name::from_str("www.unsigned.tld.").expect("qname");
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&root_key, LowerName::from(&root_origin));
+
+        let tld_ds = signed_ds_message(&tld_origin, &root_signer, &tld_key);
+        let tld_denial = signed_nsec_response(
+            &tld_origin,
+            &cut,
+            &Name::from_str("z.tld.").expect("next"),
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+            &cut,
+            &tld_key,
+            &tld_signer,
+            ResponseCode::NoError,
+        );
+        let fetcher = StaticFetcher::new()
+            .with(
+                &root_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&root_origin, &root_key, &root_signer),
+            )
+            .with(&tld_origin, RecordType::DS, tld_ds)
+            .with(
+                &tld_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&tld_origin, &tld_key, &tld_signer),
+            )
+            .with(&cut, RecordType::DS, tld_denial);
+
+        let mut response = stripped_response(&qname);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Insecure,
+            "a nested unsigned delegation must remain Insecure after walking a signed TLD"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(!response.metadata.authentic_data);
+        assert!(
+            fetcher.calls() >= 4,
+            "the walk must fetch the root keys, the TLD DS/DNSKEY and the denial"
+        );
+    }
+
+    /// The authenticated unsigned status is cached: the second query under the
+    /// same zone does not fetch again.
+    #[tokio::test]
+    async fn test_delegation_cache_hit_skips_fetches() {
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let cut = Name::from_str("unsigned.signed.example.").expect("cut");
+        let qname = Name::from_str("www.unsigned.signed.example.").expect("qname");
+
+        let cache = Arc::new(ChainCache::new(None));
+        let validator = d05_validator(Some(cache.clone()));
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+
+        let ds_denial = signed_nsec_response(
+            &parent_origin,
+            &cut,
+            &Name::from_str("z.signed.example.").expect("next"),
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+            &cut,
+            &parent_key,
+            &parent_signer,
+            ResponseCode::NoError,
+        );
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(&cut, RecordType::DS, ds_denial);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let mut first = stripped_response(&qname);
+        let first_outcome = validator
+            .validate_with_key_fetcher(&mut first, Some("probe"), now, &fetcher)
+            .await;
+        assert_eq!(first_outcome, ValidationOutcome::Insecure);
+        let calls_after_first = fetcher.calls();
+        assert!(calls_after_first > 0);
+
+        let mut second = stripped_response(&qname);
+        let second_outcome = validator
+            .validate_with_key_fetcher(&mut second, Some("probe"), now, &fetcher)
+            .await;
+        assert_eq!(second_outcome, ValidationOutcome::Insecure);
+        assert_eq!(
+            fetcher.calls(),
+            calls_after_first,
+            "the cached unsigned delegation must not be re-probed"
+        );
+    }
+
+    /// A cached Signed zone makes a stripped response Bogus without any fetch.
+    #[tokio::test]
+    async fn test_signed_zone_cache_hit_avoids_ds_fetch() {
+        let zone = Name::from_str("child.signed.example.").expect("zone");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let cache = Arc::new(ChainCache::new(None));
+        cache.insert(LowerName::from(&zone), ZoneStatus::Signed, now + 600, now);
+
+        let validator = d05_validator(Some(cache.clone()));
+        assert!(
+            Arc::ptr_eq(validator.chain_cache(), &cache),
+            "the validator must reuse the supplied cache"
+        );
+        let fetcher = StaticFetcher::new();
+        let mut response = stripped_response(&zone);
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a cached signed zone must fail closed immediately: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(fetcher.calls(), 0, "a cache hit must not fetch anything");
+    }
+
+    /// Authenticated statuses survive a restart through the on-disk cache.
+    #[tokio::test]
+    async fn test_chain_cache_survives_restart() {
+        let path = chain_test_path("restart");
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let (cut_origin, cut_key, _cut_signer) = create_test_signer("child.signed.example.");
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(
+                &cut_origin,
+                RecordType::DS,
+                signed_ds_message(&cut_origin, &parent_signer, &cut_key),
+            );
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let first_cache = Arc::new(ChainCache::new(Some(path.clone())));
+        first_cache.load(now);
+        let first_validator = d05_validator(Some(first_cache.clone()));
+        first_validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+
+        let mut first = stripped_response(&cut_origin);
+        let first_outcome = first_validator
+            .validate_with_key_fetcher(&mut first, Some("probe"), now, &fetcher)
+            .await;
+        assert!(matches!(first_outcome, ValidationOutcome::Bogus { .. }));
+        assert!(
+            matches!(
+                first_cache.get(&LowerName::from(&cut_origin), now),
+                Some(ChainEntry {
+                    status: ZoneStatus::Signed,
+                    ..
+                })
+            ),
+            "the authenticated signed status must be cached"
+        );
+        first_cache.flush().expect("flush chain cache");
+
+        // "Restart": rebuild the cache and the validator from the same path.
+        let second_cache = Arc::new(ChainCache::new(Some(path.clone())));
+        second_cache.load(now);
+        let second_validator = d05_validator(Some(second_cache.clone()));
+        second_validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+        let second_fetcher = StaticFetcher::new();
+
+        let mut second = stripped_response(&cut_origin);
+        let second_outcome = second_validator
+            .validate_with_key_fetcher(&mut second, Some("probe"), now, &second_fetcher)
+            .await;
+        assert!(
+            matches!(second_outcome, ValidationOutcome::Bogus { .. }),
+            "a persisted signed zone must still fail closed after restart: {second_outcome:?}"
+        );
+        assert_eq!(
+            second_fetcher.calls(),
+            0,
+            "the persisted cache must avoid a cold-start fetch"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    /// An expired cache entry is ignored and the zone is re-probed.
+    #[tokio::test]
+    async fn test_chain_cache_expiry_reprobes() {
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let (cut_origin, cut_key, _cut_signer) = create_test_signer("child.signed.example.");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+        let cache = Arc::new(ChainCache::new(None));
+        cache.insert(
+            LowerName::from(&cut_origin),
+            ZoneStatus::Signed,
+            now - 1,
+            now - 2,
+        );
+        assert!(
+            cache.get(&LowerName::from(&cut_origin), now).is_none(),
+            "expired entries must not be returned"
+        );
+
+        let validator = d05_validator(Some(cache));
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(
+                &cut_origin,
+                RecordType::DS,
+                signed_ds_message(&cut_origin, &parent_signer, &cut_key),
+            );
+
+        let mut response = stripped_response(&cut_origin);
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+        assert!(matches!(outcome, ValidationOutcome::Bogus { .. }));
+        assert!(
+            fetcher.calls() >= 2,
+            "an expired entry must trigger a fresh walk"
+        );
+    }
+
+    /// A corrupt cache file never prevents startup; the probe still works.
+    #[tokio::test]
+    async fn test_chain_cache_corrupt_file_ignored() {
+        let path = chain_test_path("corrupt");
+        std::fs::write(&path, "entries = [ { this is not toml").expect("write corrupt");
+
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let (cut_origin, cut_key, _cut_signer) = create_test_signer("child.signed.example.");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let cache = Arc::new(ChainCache::new(Some(path.clone())));
+        cache.load(now);
+        assert!(cache.is_empty(), "a corrupt file must load as empty");
+
+        let validator = d05_validator(Some(cache));
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(
+                &cut_origin,
+                RecordType::DS,
+                signed_ds_message(&cut_origin, &parent_signer, &cut_key),
+            );
+
+        let mut response = stripped_response(&cut_origin);
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "cold-start validation must still work after a corrupt cache: {outcome:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    struct OfflineFetcher {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl OfflineFetcher {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DnssecKeyFetcher for OfflineFetcher {
+        async fn query(&self, _name: &Name, _rtype: RecordType) -> Result<Message, UpstreamError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(UpstreamError::Timeout)
+        }
+    }
+
+    /// Offline policy: a never-proven zone is Indeterminate (AD=0) and backed
+    /// off, while cached signed evidence stays fail-closed (Bogus) and cached
+    /// unsigned evidence stays Insecure.
+    #[tokio::test]
+    async fn test_offline_probe_policy() {
+        let qname = Name::from_str("www.never.example.").expect("qname");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+        let validator = DnssecValidator::from_config(&DnssecConfig::default());
+        let offline = OfflineFetcher::new();
+        let mut response = stripped_response(&qname);
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("offline"), now, &offline)
+            .await;
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Indeterminate,
+            "a never-proven zone must not be downgraded to Insecure while offline"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(!response.metadata.authentic_data);
+        let calls = offline.calls();
+        assert!(calls > 0, "the probe must have been attempted");
+        assert!(
+            validator
+                .chain_cache()
+                .get(&LowerName::from(&qname), now)
+                .is_none(),
+            "a failed probe must never be persisted"
+        );
+
+        // A second query inside the backoff window must not fetch again.
+        let mut second = stripped_response(&qname);
+        let second_outcome = validator
+            .validate_with_key_fetcher(&mut second, Some("offline"), now, &offline)
+            .await;
+        assert_eq!(second_outcome, ValidationOutcome::Indeterminate);
+        assert_eq!(
+            offline.calls(),
+            calls,
+            "a failed probe must be backed off to prevent fetch storms"
+        );
+
+        // Cached signed evidence: network failure must stay Bogus.
+        let (parent_origin, parent_key, _parent_signer) = create_test_signer("signed.example.");
+        let child = Name::from_str("child.signed.example.").expect("child");
+        let cache = Arc::new(ChainCache::new(None));
+        cache.insert(LowerName::from(&child), ZoneStatus::Signed, now + 600, now);
+        let signed_validator = d05_validator(Some(cache));
+        signed_validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+        let offline = OfflineFetcher::new();
+        let mut response =
+            stripped_response(&Name::from_str("www.child.signed.example.").expect("qname"));
+        let outcome = signed_validator
+            .validate_with_key_fetcher(&mut response, Some("offline"), now, &offline)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "cached signed evidence must fail closed offline: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(offline.calls() > 0, "the walk must try the network");
+
+        // Cached unsigned evidence: offline stays Insecure with no fetch.
+        let unsigned = Name::from_str("unsigned.signed.example.").expect("unsigned");
+        let cache = Arc::new(ChainCache::new(None));
+        cache.insert(
+            LowerName::from(&unsigned),
+            ZoneStatus::Unsigned,
+            now + 600,
+            now,
+        );
+        let unsigned_validator = d05_validator(Some(cache));
+        let offline = OfflineFetcher::new();
+        let mut response =
+            stripped_response(&Name::from_str("www.unsigned.signed.example.").expect("qname"));
+        let outcome = unsigned_validator
+            .validate_with_key_fetcher(&mut response, Some("offline"), now, &offline)
+            .await;
+        assert_eq!(outcome, ValidationOutcome::Insecure);
+        assert_eq!(offline.calls(), 0);
+        assert!(!response.metadata.authentic_data);
     }
 
     /// RFC 4035 3.2.3: AD must not be set when the Answer/Authority sections

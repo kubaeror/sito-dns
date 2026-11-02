@@ -108,6 +108,16 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const RETENTION_INTERVAL: Duration = Duration::from_hours(24);
 /// Debounce window for config file watcher events.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(100);
+/// Periodic flush interval for the persistent DNSSEC chain cache.
+const CHAIN_CACHE_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Current UNIX time truncated to the DNSSEC serial-number width.
+fn unix_now() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32
+}
 
 /// Resolves the config path to an absolute path so the file watcher can watch
 /// its parent directory even for the default relative `config.toml`. Symlinks
@@ -452,6 +462,9 @@ struct ConfigWatcher {
 struct ServerApplyHooks {
     filter: Arc<HostsFilterEngine>,
     dnssec: Arc<ArcSwap<DnssecValidator>>,
+    /// Authenticated DNSSEC chain statuses shared across validator swaps. A
+    /// hot reload must not forget that a zone was proven signed/unsigned.
+    dnssec_chain_cache: Arc<sito_dnssec::ChainCache>,
     scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>>,
     bootstrap: BootstrapResolver,
     rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
@@ -479,8 +492,13 @@ impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
 
             // DNSSEC settings are not read through the config snapshot at query
             // time; swap the validator so mode/anchors/NTAs apply immediately.
+            // The chain cache is reused so a reload does not lose authenticated
+            // signed/unsigned zone evidence.
             self.dnssec
-                .store(Arc::new(DnssecValidator::from_config(&cfg.dns.dnssec)));
+                .store(Arc::new(DnssecValidator::from_config_with_cache(
+                    &cfg.dns.dnssec,
+                    Some(self.dnssec_chain_cache.clone()),
+                )));
 
             // Rebuild per-client upstream scopes, reusing managers whose
             // upstream set is unchanged.
@@ -853,10 +871,19 @@ pub async fn run_server_full(
     let filter_engine = components.filter_engine;
     metrics.set_filter_rules(filter_engine.rule_count());
 
-    // Initialize DNSSEC validator
-    let dnssec_swap = Arc::new(ArcSwap::from(Arc::new(DnssecValidator::from_config(
-        &config.dns.dnssec,
-    ))));
+    // Initialize DNSSEC validator. The authenticated chain cache lives under
+    // the data dir and is reused across hot reloads; it is deliberately not
+    // part of HA bundles or backups (each node rebuilds its own).
+    let dnssec_chain_cache = Arc::new(sito_dnssec::ChainCache::new(Some(
+        config.server.data_dir.join("dnssec-chain-cache.toml"),
+    )));
+    dnssec_chain_cache.load(unix_now());
+    let dnssec_swap = Arc::new(ArcSwap::from(Arc::new(
+        DnssecValidator::from_config_with_cache(
+            &config.dns.dnssec,
+            Some(dnssec_chain_cache.clone()),
+        ),
+    )));
 
     // Initialize client registry
     let clients_config = clients_from_config(&config)?;
@@ -988,6 +1015,7 @@ pub async fn run_server_full(
     let apply_hooks = Arc::new(ServerApplyHooks {
         filter: filter_engine.clone(),
         dnssec: dnssec_swap.clone(),
+        dnssec_chain_cache: dnssec_chain_cache.clone(),
         scoped_upstreams: scoped_upstreams.clone(),
         bootstrap: bootstrap.clone(),
         rate_limiters: rate_limiters.clone(),
@@ -1079,6 +1107,32 @@ pub async fn run_server_full(
                     if let Err(e) = retention_db.cleanup_retention(retention_days).await {
                         warn!("Error during stats retention cleanup: {e}");
                     }
+                }
+            }
+        }
+    });
+
+    // Periodic DNSSEC chain-cache flush. The query path only updates an
+    // in-memory dirty flag; disk I/O stays on this background task (and on the
+    // shutdown path below).
+    let flush_cache = dnssec_chain_cache.clone();
+    let mut flush_shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CHAIN_CACHE_FLUSH_INTERVAL);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                result = flush_shutdown_rx.changed() => {
+                    if result.is_err() || *flush_shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if !flush_cache.is_dirty() {
+                        continue;
+                    }
+                    let cache = flush_cache.clone();
+                    let _ = tokio::task::spawn_blocking(move || cache.flush()).await;
                 }
             }
         }
@@ -1206,6 +1260,7 @@ pub async fn run_server_full(
         &in_flight,
         querylog_writer,
         cert_watchers,
+        &dnssec_chain_cache,
     )
     .await;
     Ok(())
@@ -1219,6 +1274,7 @@ async fn shutdown_server(
     in_flight: &AtomicUsize,
     querylog_writer: QueryLogWriter,
     cert_watchers: Vec<sito_transport::CertWatcher>,
+    dnssec_chain_cache: &sito_dnssec::ChainCache,
 ) {
     info!("Initiating graceful shutdown (stopping listeners)...");
     let _ = shutdown_tx.send(true);
@@ -1242,6 +1298,11 @@ async fn shutdown_server(
 
     info!("Flushing and shutting down query log writer...");
     querylog_writer.shutdown().await;
+
+    // Persist any authenticated DNSSEC chain statuses before exiting.
+    if let Err(error) = dnssec_chain_cache.flush() {
+        warn!(error = %error, "Failed to flush DNSSEC chain cache during shutdown");
+    }
 
     // Stop certificate watchers after listeners have drained.
     drop(cert_watchers);

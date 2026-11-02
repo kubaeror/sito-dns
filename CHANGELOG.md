@@ -5,6 +5,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+### Security
+- **DNSSEC cold-start signature stripping**: a response without RRSIGs is now
+  probed from the configured trust anchor even when the zone was never seen
+  signed in this process. An authenticated DS turns the response into
+  Bogus/SERVFAIL regardless of process uptime, while an authenticated DS denial
+  remains Insecure. Authenticated signed/unsigned delegation statuses are
+  persisted in `<data_dir>/dnssec-chain-cache.toml` (0600, bounded, expiring,
+  never part of HA bundles or backups). A never-proven zone that cannot be
+  probed while offline is reported as Indeterminate with AD=0 instead of being
+  treated as signed or unsigned.
+
+---
+
 ## [1.8.0] - 2026-11-01
 
 Independent audit 6 remediation. This release fixes every P0 and P1 finding

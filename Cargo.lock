@@ -3129,10 +3129,12 @@ dependencies = [
  "dashmap",
  "data-encoding",
  "hickory-proto",
+ "serde",
  "sito-core",
  "sito-proto",
  "time",
  "tokio",
+ "toml",
  "tracing",
 ]
 

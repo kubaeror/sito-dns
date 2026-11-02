@@ -1951,9 +1951,11 @@ dependencies = [
  "dashmap",
  "data-encoding",
  "hickory-proto",
+ "serde",
  "sito-core",
  "sito-proto",
  "time",
+ "toml",
  "tracing",
 ]
 

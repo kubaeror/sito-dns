@@ -1896,6 +1896,10 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let mut config = Config::default();
+        // This test exercises rewrite aggregation/cancellation, not DNSSEC.
+        // Keep validation off so the D-05 delegation probe does not add
+        // upstream DNSKEY/DS lookups to the call counts asserted below.
+        config.dns.dnssec.validate = false;
         config.filtering.custom_rules = vec![
             "||rewrite-pipeline.example^$dnsrewrite=1.2.3.4".to_string(),
             "||rewrite-pipeline.example^$dnsrewrite=5.6.7.8".to_string(),
