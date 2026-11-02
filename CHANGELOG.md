@@ -68,8 +68,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   adds `stats_hourly.top_upstreams` so retained hourly rollups can answer
   per-upstream statistics for windows older than the detailed query-log
   retention instead of silently under-reporting. Existing rows default to an
-  empty list and are populated by subsequent retention sweeps; no manual data
-  migration is required.
+  empty list. Historical per-upstream data is **not backfilled**: hours that
+  were already fully rolled up and removed from `query_log` keep `[]` and stay
+  empty for per-upstream statistics. Hours still present in `query_log` are
+  populated by the next retention sweep, and new rollups are populated
+  normally; no manual data migration is required.
 
 ---
 
