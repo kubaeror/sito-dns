@@ -1173,10 +1173,39 @@ fn ds_response_status(
         // complete non-opt-out proof means the cut is inside the parent zone.
         // An opt-out span may hide an unsigned delegation, so it stays
         // Insecure rather than being declared signed.
-        match nsec3::evaluate_nsec3_denial(&records, cut, RecordType::DS, true) {
+        //
+        // Only NSEC3 records with an RRSIG that verifies with a parent-zone key
+        // may contribute to the proof: the fetcher returns raw upstream data,
+        // so an unsigned/forged covering record must not be able to fabricate
+        // `InZone` (and thereby persist a Signed zone).
+        let authenticated_nsec3: Vec<&Record> = nsec3_records
+            .iter()
+            .copied()
+            .filter(|record| {
+                has_valid_rrsig_for(
+                    response,
+                    &record.name,
+                    RecordType::NSEC3,
+                    parent_zone,
+                    parent_keys,
+                    now,
+                )
+            })
+            .collect();
+        let authenticated_records: Vec<nsec3::Nsec3Record<'_>> = authenticated_nsec3
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) => Some(nsec3::Nsec3Record {
+                    owner: &record.name,
+                    rdata: nsec3,
+                }),
+                _ => None,
+            })
+            .collect();
+        match nsec3::evaluate_nsec3_denial(&authenticated_records, cut, RecordType::DS, true) {
             Nsec3Denial::Secure => return DsStatus::InZone,
             Nsec3Denial::OptOut => {
-                for record in &nsec3_records {
+                for record in &authenticated_nsec3 {
                     if let RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) = &record.data
                         && nsec3::covers(
                             &nsec3::Nsec3Record {
@@ -1186,14 +1215,6 @@ fn ds_response_status(
                             cut,
                         )
                         && nsec3.opt_out()
-                        && has_valid_rrsig_for(
-                            response,
-                            &record.name,
-                            RecordType::NSEC3,
-                            parent_zone,
-                            parent_keys,
-                            now,
-                        )
                     {
                         return DsStatus::Unsigned(record.ttl.max(1));
                     }
@@ -2046,15 +2067,20 @@ impl DnssecValidator {
         if self.mode != DnssecMode::Disabled
             && let Some(query) = response.queries.first()
         {
+            let qname = LowerName::from(query.name());
             has_rrsigs = response_has_rrsigs(response);
             query_is_nta = self.is_nta(query.name());
             if !has_rrsigs && !query_is_nta {
-                // Probe every name in the CNAME chain, not only the final
-                // target: an attacker can strip signatures from a chain whose
-                // original name is unsigned while a later hop is signed.
-                for name in cname_chain_names(response, query.name()) {
-                    let lower = LowerName::from(&name);
-                    probe_failed |= self.prepare_unsigned_response(&lower, fetcher, now).await;
+                // Probe the qname and the final CNAME target only. Serial
+                // probing of every hop would amplify fetches; the final target
+                // is the one whose data is served, and `signed_chain_contains`
+                // below still checks every hop for already-known evidence.
+                probe_failed |= self.prepare_unsigned_response(&qname, fetcher, now).await;
+                let final_target = LowerName::from(&negative_answer_name(response, query.name()));
+                if final_target != qname {
+                    probe_failed |= self
+                        .prepare_unsigned_response(&final_target, fetcher, now)
+                        .await;
                 }
             }
         }
@@ -5508,6 +5534,106 @@ mod tests {
         );
         assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
         assert!(!response.metadata.authentic_data);
+    }
+
+    /// Positive NSEC3 regression: a *properly signed* NSEC3 NXDOMAIN proof for
+    /// a name directly in the anchor zone still makes a stripped response
+    /// Bogus.
+    #[tokio::test]
+    async fn test_stripped_nxdomain_with_signed_nsec3_denial_is_bogus() {
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let qname = Name::from_str("missing.signed.example.").expect("qname");
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+
+        let ds_denial = signed_optout_nxdomain(
+            &parent_origin,
+            &qname,
+            &parent_key,
+            &parent_signer,
+            false,
+            0,
+        );
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(&qname, RecordType::DS, ds_denial);
+
+        let mut response = Message::new(12, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+        response.metadata.response_code = ResponseCode::NXDomain;
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a signed NSEC3 NXDOMAIN proof must still make a stripped response Bogus: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+    }
+
+    /// `InZone` may only be inferred from NSEC3 records whose RRset carries an
+    /// RRSIG verified by a parent-zone key. An unsigned/forged covering proof
+    /// must not mark the cut signed or persist a Signed zone.
+    #[tokio::test]
+    async fn test_forged_nsec3_covering_proof_is_not_inzone_or_signed() {
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let cut = Name::from_str("missing.signed.example.").expect("cut");
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+
+        let mut forged =
+            signed_optout_nxdomain(&parent_origin, &cut, &parent_key, &parent_signer, false, 0);
+        forged
+            .authorities
+            .retain(|record| !matches!(record.data, RData::DNSSEC(DNSSECRData::RRSIG(_))));
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(&cut, RecordType::DS, forged);
+
+        let mut response = Message::new(13, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(cut.clone(), RecordType::A));
+        response.metadata.response_code = ResponseCode::NXDomain;
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Indeterminate,
+            "an unauthenticated covering proof must not produce InZone/Signed"
+        );
+        assert!(!response.metadata.authentic_data);
+        assert!(
+            validator
+                .chain_cache()
+                .get(&LowerName::from(&cut), now)
+                .is_none(),
+            "a forged proof must not persist a Signed zone"
+        );
+        assert!(
+            !validator.signed_zone_contains(&LowerName::from(&cut), now),
+            "a forged proof must not mark the cut signed in memory"
+        );
     }
 
     /// Important regression: the probe must walk the *shallowest* cuts. A deep
