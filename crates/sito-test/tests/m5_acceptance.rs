@@ -561,7 +561,7 @@ async fn test_acceptance_m5_prometheus_table_14_2() {
     ctx.metrics.inc_cache_hits();
     ctx.metrics.inc_cache_misses();
     ctx.metrics.set_ha_slaves_connected(2);
-    ctx.metrics.inc_querylog_dropped();
+    ctx.metrics.set_querylog_dropped(1);
 
     let (_meta, token_resp) = ctx.auth_mgr.create_token("viewer", Role::Viewer);
     let app = sito_api::create_router(ctx);

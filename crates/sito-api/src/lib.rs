@@ -93,4 +93,21 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_openapi_documents_total_count_header() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).expect("valid OpenAPI JSON");
+        for path in ["/api/v1/stats/clients", "/api/v1/stats/upstreams"] {
+            let headers = &openapi["paths"][path]["get"]["responses"]["200"]["headers"];
+            assert_eq!(
+                headers["X-Total-Count"]["description"],
+                "Number of distinct matching rows before the response limit",
+                "{path} must document the X-Total-Count response header"
+            );
+            assert_eq!(
+                headers["X-Total-Count"]["schema"]["type"], "string",
+                "{path} X-Total-Count header must be a string"
+            );
+        }
+    }
 }

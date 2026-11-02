@@ -4,6 +4,7 @@ use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -16,16 +17,19 @@ use tracing::{debug, trace};
 use crate::plain::classify_io_error;
 use crate::upstream::Upstream;
 use sito_core::error::UpstreamError;
-use sito_proto::{Message, decode_message, encode_message};
+use sito_proto::{Message, MessageType, OpCode, Query, RecordType, decode_message, encode_message};
 
 /// Idle pooled connections older than this are discarded instead of reused.
 const POOL_IDLE_TTL: Duration = Duration::from_secs(30);
 
-// Deferred (WP-2.6 step 4 / WP-6.1): a proactive health ping for idle pooled
-// DoT sockets. The documented behavior is first-use retry: `resolve` below
-// retries once on a fresh connection when a pooled socket turns out stale, and
-// the manager's active probes exercise the upstream separately, so a separate
-// pool ping is not required for correctness.
+/// Pooled connections idle for at least this long are health-pinged.
+const PING_IDLE_AFTER: Duration = Duration::from_secs(5);
+
+/// Upper bound on a single pool health ping, regardless of the query timeout.
+const PING_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Rolling identifier for best-effort pool health pings.
+static PING_QUERY_ID: AtomicU16 = AtomicU16::new(0);
 
 /// Maximum number of simultaneously outstanding *new* DoT connections. Bounds
 /// outbound FD/TLS-handshake amplification when the upstream is slow or the
@@ -167,20 +171,22 @@ impl DotUpstream {
         }
     }
 
-    /// Send one query over the given connection, returning it to the pool on success.
-    async fn query_on_connection(
+    /// Send one already-encoded message over `conn`, returning the decoded
+    /// response together with the still-usable connection on success.
+    async fn exchange(
         &self,
         mut conn: TlsStream<TcpStream>,
         msg: &Message,
         encoded: &[u8],
-    ) -> Result<Message, UpstreamError> {
+        timeout: Duration,
+    ) -> Result<(Message, TlsStream<TcpStream>), UpstreamError> {
         let Ok(len) = u16::try_from(encoded.len()) else {
             return Err(UpstreamError::BadResponse(
                 "DoT query exceeds the 65535-byte DNS-over-TCP limit".to_string(),
             ));
         };
 
-        let query_res = timeout(self.query_timeout, async {
+        let query_res = tokio::time::timeout(timeout, async {
             conn.write_all(&len.to_be_bytes()).await?;
             conn.write_all(encoded).await?;
             conn.flush().await?;
@@ -200,8 +206,7 @@ impl DotUpstream {
                 let response = decode_message(&bytes)
                     .map_err(|e| UpstreamError::BadResponse(e.to_string()))?;
                 crate::upstream::validate_response(msg, &response)?;
-                self.release_connection(conn).await;
-                Ok(response)
+                Ok((response, conn))
             }
             Ok(Err(e)) => {
                 debug!(
@@ -213,6 +218,81 @@ impl DotUpstream {
             Err(_) => {
                 debug!("DoT connection to {} timed out", self.server_addr);
                 Err(UpstreamError::Timeout)
+            }
+        }
+    }
+
+    /// Send one query over the given connection, returning it to the pool on success.
+    async fn query_on_connection(
+        &self,
+        conn: TlsStream<TcpStream>,
+        msg: &Message,
+        encoded: &[u8],
+    ) -> Result<Message, UpstreamError> {
+        let (response, conn) = self
+            .exchange(conn, msg, encoded, self.query_timeout)
+            .await?;
+        self.release_connection(conn).await;
+        Ok(response)
+    }
+
+    /// Pings pooled connections that have been idle for at least
+    /// [`PING_IDLE_AFTER`] and drops the ones that no longer answer.
+    ///
+    /// The pool is drained under one short lock and the pings run concurrently
+    /// outside it, so a slow or dead upstream cannot block queries. Failures are
+    /// expected (servers commonly close idle DoT sessions) and are logged only:
+    /// the health-ping hook never fails a query and never returns an error.
+    async fn ping_idle(&self) {
+        let drained = {
+            let mut pool = self.pool.lock().await;
+            let mut fresh = Vec::with_capacity(pool.len());
+            let mut idle = Vec::new();
+            for pooled in pool.drain(..) {
+                if pooled.idle_since.elapsed() >= PING_IDLE_AFTER {
+                    idle.push(pooled.stream);
+                } else {
+                    fresh.push(pooled);
+                }
+            }
+            *pool = fresh;
+            idle
+        };
+
+        if drained.is_empty() {
+            return;
+        }
+
+        let id = PING_QUERY_ID.fetch_add(1, Ordering::Relaxed);
+        let mut ping = Message::new(id, MessageType::Query, OpCode::Query);
+        ping.queries
+            .push(Query::query(sito_proto::Name::root(), RecordType::NS));
+        let encoded = match encode_message(&ping) {
+            Ok(encoded) => encoded,
+            Err(e) => {
+                debug!("Failed to encode DoT health ping: {}", e);
+                for conn in drained {
+                    self.release_connection(conn).await;
+                }
+                return;
+            }
+        };
+
+        let ping_timeout = self.query_timeout.min(PING_TIMEOUT);
+        let results = futures_util::future::join_all(
+            drained
+                .into_iter()
+                .map(|conn| self.exchange(conn, &ping, &encoded, ping_timeout)),
+        )
+        .await;
+
+        for result in results {
+            match result {
+                Ok((_, conn)) => self.release_connection(conn).await,
+                Err(e) => debug!(
+                    "Dropping idle DoT connection to {} after failed health ping: {}",
+                    self.server_addr, e
+                ),
             }
         }
     }
@@ -257,6 +337,13 @@ impl Upstream for DotUpstream {
         drop(permit);
         result
     }
+
+    /// Periodic maintenance hook: probes idle pooled sockets before a query
+    /// would discover a stale one.
+    async fn refresh(&self) -> Result<(), UpstreamError> {
+        self.ping_idle().await;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -277,9 +364,19 @@ mod tests {
         query
     }
 
-    /// Minimal DoT server that answers one query per connection and closes the
-    /// first connection immediately afterwards, simulating a stale pooled socket.
-    async fn spawn_closing_dot_server() -> (SocketAddr, CertificateDer<'static>) {
+    /// Minimal DoT server that answers queries per connection.
+    ///
+    /// Each accepted connection is counted, as is every query it answers. When
+    /// `close_first_connection` is set, the first connection is closed right
+    /// after its first answer, simulating a stale pooled socket.
+    struct DotTestServer {
+        addr: SocketAddr,
+        cert: CertificateDer<'static>,
+        connections: Arc<AtomicU32>,
+        queries: Arc<AtomicU32>,
+    }
+
+    async fn spawn_dot_server(close_first_connection: bool) -> DotTestServer {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = CertificateDer::from(cert.cert.clone());
         let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
@@ -298,45 +395,106 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicU32::new(0));
-        let counter = Arc::clone(&connections);
+        let queries = Arc::new(AtomicU32::new(0));
+        let connection_counter = Arc::clone(&connections);
+        let query_counter = Arc::clone(&queries);
 
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let acceptor = acceptor.clone();
-                let connection_index = counter.fetch_add(1, Ordering::SeqCst);
+                let connection_index = connection_counter.fetch_add(1, Ordering::SeqCst);
+                let query_counter = Arc::clone(&query_counter);
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(stream).await else {
                         return;
                     };
-                    let mut len_buf = [0u8; 2];
-                    if tls.read_exact(&mut len_buf).await.is_err() {
-                        return;
-                    }
-                    let len = u16::from_be_bytes(len_buf) as usize;
-                    let mut buf = vec![0u8; len];
-                    if tls.read_exact(&mut buf).await.is_err() {
-                        return;
-                    }
-                    let Ok(query) = decode_message(&buf) else {
-                        return;
-                    };
-                    let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
-                    resp.queries = query.queries.clone();
-                    let Ok(encoded) = encode_message(&resp) else {
-                        return;
-                    };
-                    let _ = tls.write_all(&(encoded.len() as u16).to_be_bytes()).await;
-                    let _ = tls.write_all(&encoded).await;
-                    let _ = tls.flush().await;
-                    if connection_index == 0 {
-                        // Close the first connection so it becomes a stale pool entry.
-                        let _ = tls.shutdown().await;
+                    loop {
+                        let mut len_buf = [0u8; 2];
+                        if tls.read_exact(&mut len_buf).await.is_err() {
+                            break;
+                        }
+                        let len = u16::from_be_bytes(len_buf) as usize;
+                        let mut buf = vec![0u8; len];
+                        if tls.read_exact(&mut buf).await.is_err() {
+                            break;
+                        }
+                        let Ok(query) = decode_message(&buf) else {
+                            break;
+                        };
+                        query_counter.fetch_add(1, Ordering::SeqCst);
+                        let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                        resp.queries = query.queries.clone();
+                        let Ok(encoded) = encode_message(&resp) else {
+                            break;
+                        };
+                        if tls
+                            .write_all(&(encoded.len() as u16).to_be_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if tls.write_all(&encoded).await.is_err() {
+                            break;
+                        }
+                        if tls.flush().await.is_err() {
+                            break;
+                        }
+                        if connection_index == 0 && close_first_connection {
+                            // Close the first connection so it becomes a stale pool entry.
+                            let _ = tls.shutdown().await;
+                            break;
+                        }
                     }
                 });
             }
         });
 
-        (addr, cert_der)
+        DotTestServer {
+            addr,
+            cert: cert_der,
+            connections,
+            queries,
+        }
+    }
+
+    fn test_client_config(cert_der: CertificateDer<'static>) -> ClientConfig {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let mut client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        client_cfg.alpn_protocols = vec![b"dot".to_vec()];
+        client_cfg
+    }
+
+    fn test_upstream(server: &DotTestServer) -> DotUpstream {
+        DotUpstream::with_custom_config(
+            server.addr,
+            "localhost".to_string(),
+            Duration::from_secs(2),
+            2,
+            test_client_config(server.cert.clone()),
+        )
+    }
+
+    /// Ages every pooled socket beyond [`PING_IDLE_AFTER`].
+    async fn age_pool(upstream: &DotUpstream) {
+        let mut pool = upstream.pool.lock().await;
+        assert!(!pool.is_empty(), "expected a pooled DoT connection");
+        for pooled in pool.iter_mut() {
+            pooled.idle_since = Instant::now()
+                .checked_sub(PING_IDLE_AFTER + Duration::from_secs(1))
+                .expect("test instant is older than the ping idle threshold");
+        }
+    }
+
+    async fn pooled_len(upstream: &DotUpstream) -> usize {
+        upstream.pool.lock().await.len()
     }
 
     #[test]
@@ -356,26 +514,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_dot_retries_once_on_stale_pooled_connection() {
-        let (addr, cert_der) = spawn_closing_dot_server().await;
-
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(cert_der).unwrap();
-        let mut client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        client_cfg.alpn_protocols = vec![b"dot".to_vec()];
-
-        let upstream = DotUpstream::with_custom_config(
-            addr,
-            "localhost".to_string(),
-            Duration::from_secs(2),
-            2,
-            client_cfg,
-        );
+        let server = spawn_dot_server(true).await;
+        let upstream = test_upstream(&server);
 
         // First query populates the pool, then the server closes the socket.
         let first = upstream
@@ -390,5 +530,113 @@ mod tests {
             .await
             .expect("stale pooled connection must be retried on a fresh connection");
         assert_eq!(second.metadata.id, 2);
+        assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    }
+
+    /// D-13: an idle pooled socket that no longer answers is dropped by the
+    /// health ping instead of being handed to a query.
+    #[tokio::test]
+    async fn test_dot_refresh_discards_dead_idle_connection() {
+        let server = spawn_dot_server(true).await;
+        let upstream = test_upstream(&server);
+
+        upstream
+            .resolve(&make_query(1))
+            .await
+            .expect("first DoT query should succeed");
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+        age_pool(&upstream).await;
+
+        upstream
+            .refresh()
+            .await
+            .expect("a failed pool ping must not fail the refresh hook");
+
+        assert_eq!(
+            pooled_len(&upstream).await,
+            0,
+            "a dead idle socket must be dropped"
+        );
+        assert_eq!(
+            server.connections.load(Ordering::SeqCst),
+            1,
+            "a failed ping must not open a replacement connection"
+        );
+
+        // The next query still succeeds on a fresh connection.
+        upstream
+            .resolve(&make_query(2))
+            .await
+            .expect("a query after a discarded idle socket should succeed");
+        assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    }
+
+    /// D-13: a live idle socket is pinged and returned to the pool, so the
+    /// next query reuses it without a new TLS handshake.
+    #[tokio::test]
+    async fn test_dot_refresh_keeps_live_idle_connection() {
+        let server = spawn_dot_server(false).await;
+        let upstream = test_upstream(&server);
+
+        upstream
+            .resolve(&make_query(1))
+            .await
+            .expect("first DoT query should succeed");
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+        assert_eq!(server.queries.load(Ordering::SeqCst), 1);
+        age_pool(&upstream).await;
+
+        upstream
+            .refresh()
+            .await
+            .expect("a successful pool ping must not fail the refresh hook");
+
+        assert_eq!(
+            server.queries.load(Ordering::SeqCst),
+            2,
+            "the idle socket must receive exactly one health ping"
+        );
+        assert_eq!(
+            pooled_len(&upstream).await,
+            1,
+            "a live pinged socket must return to the pool"
+        );
+
+        upstream
+            .resolve(&make_query(2))
+            .await
+            .expect("a query after a successful ping should succeed");
+        assert_eq!(
+            server.connections.load(Ordering::SeqCst),
+            1,
+            "the next query must reuse the pinged socket"
+        );
+        assert_eq!(server.queries.load(Ordering::SeqCst), 3);
+    }
+
+    /// D-13: fresh pool entries are left untouched so the maintenance hook does
+    /// not add traffic for sockets that are still in active use.
+    #[tokio::test]
+    async fn test_dot_refresh_skips_recent_connection() {
+        let server = spawn_dot_server(false).await;
+        let upstream = test_upstream(&server);
+
+        upstream
+            .resolve(&make_query(1))
+            .await
+            .expect("first DoT query should succeed");
+
+        upstream
+            .refresh()
+            .await
+            .expect("a skipped ping must not fail the refresh hook");
+
+        assert_eq!(
+            server.queries.load(Ordering::SeqCst),
+            1,
+            "a recently used socket must not be pinged"
+        );
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+        assert_eq!(pooled_len(&upstream).await, 1);
     }
 }

@@ -502,16 +502,6 @@ impl MetricsRegistry {
         self.querylog_dropped.store(dropped, Ordering::Relaxed);
     }
 
-    /// Increments the query-log drop counter by one.
-    ///
-    /// Production publishes the writer's cumulative drop count through
-    /// [`Self::set_querylog_dropped`] (the writer cannot depend on the metrics
-    /// registry directly); this per-event helper exists for tests and is kept
-    /// for the `sito-test` acceptance suite.
-    pub fn inc_querylog_dropped(&self) {
-        self.querylog_dropped.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Publishes the number of active compiled filter rules.
     pub fn set_filter_rules(&self, count: usize) {
         self.filter_rules
@@ -1346,7 +1336,7 @@ mod tests {
         reg.set_ha_config_version("sito-slave-1", 42.0);
         reg.set_ha_diverged("sito-slave-1", true);
         reg.inc_ha_startup_noop("master", "replication_disabled");
-        reg.inc_querylog_dropped();
+        reg.set_querylog_dropped(1);
 
         let rendered = reg.render_prometheus();
 
@@ -1402,7 +1392,7 @@ mod tests {
         reg.set_ha_config_version("sito-slave-1", 42.0);
         reg.set_ha_diverged("sito-slave-1", true);
         reg.inc_ha_startup_noop("master", "replication_disabled");
-        reg.inc_querylog_dropped();
+        reg.set_querylog_dropped(1);
 
         let rendered = reg.render_prometheus();
         let expected = r#"# HELP sito_queries_total Total DNS queries processed

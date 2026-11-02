@@ -63,6 +63,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   probed while offline is reported as Indeterminate with AD=0 instead of being
   treated as signed or unsigned.
 
+### Migration
+- **Stats rollup schema**: migration `20260922000000_hourly_rollup_tops.sql`
+  adds `stats_hourly.top_upstreams` so retained hourly rollups can answer
+  per-upstream statistics for windows older than the detailed query-log
+  retention instead of silently under-reporting. Existing rows default to an
+  empty list and are populated by subsequent retention sweeps; no manual data
+  migration is required.
+
 ---
 
 ## [1.8.0] - 2026-11-01

@@ -2611,6 +2611,14 @@
         "responses": {
           "200": {
             "description": "Per-client statistics retrieved",
+            "headers": {
+              "X-Total-Count": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Number of distinct matching rows before the response limit"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2664,6 +2672,14 @@
         "responses": {
           "200": {
             "description": "Per-upstream statistics retrieved",
+            "headers": {
+              "X-Total-Count": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Number of distinct matching rows before the response limit"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
