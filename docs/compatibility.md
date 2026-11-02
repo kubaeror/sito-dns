@@ -95,3 +95,9 @@ Measured on reference hardware via Criterion:
 - **Label Interner:** Domain labels interned to `u32` across all trie levels.
 - **Typical 300,000 Rule Set (OISD / Hagezi normal):** Net snapshot heap footprint is ~86 MB, well within the 150 MB target budget.
 - **Large 1,000,000 Rule Set:** Compact trie nodes fit within the 512 MB total budget established in ADR-0008.
+
+---
+
+## 7. Dependency Notes
+
+- **`tower-http 0.7` is not applied (blocked upstream).** The repository resolves `tower-http 0.6.11`, pulled only transitively by `reqwest 0.13.5` (`tower-http ^0.6.8`). A direct bump fails reqwest's requirement, `[patch.crates-io]` cannot change a version requirement, and forking an unused middleware is not justified. Re-check when reqwest/axum are bumped; a compatible release unblocks a dedicated upgrade PR. See `CHANGELOG.md` and the 1.9.0 release notes.

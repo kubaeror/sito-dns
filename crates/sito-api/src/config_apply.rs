@@ -212,7 +212,23 @@ fn validate_hostname(host: &str) -> Result<(), String> {
 }
 
 /// Applies `candidate` to the live server, rolling back on failure.
+///
+/// Every apply path acquires [`ServerContext::apply_lock`], so an older
+/// document that was already read from disk cannot overwrite the runtime after
+/// a newer push acquired the lock first.
 pub async fn apply_full_config(
+    ctx: &ServerContext,
+    candidate: &Config,
+    filter_apply: FilterApply,
+    hooks: Option<&dyn ConfigApplyHooks>,
+) -> Result<AppliedReport, ProblemDetails> {
+    let _apply_guard = ctx.apply_lock.lock().await;
+    apply_full_config_locked(ctx, candidate, filter_apply, hooks).await
+}
+
+/// Apply implementation that must be called with [`ServerContext::apply_lock`]
+/// already held.
+async fn apply_full_config_locked(
     ctx: &ServerContext,
     candidate: &Config,
     filter_apply: FilterApply,
@@ -251,7 +267,8 @@ pub async fn apply_and_persist_config(
 ) -> Result<AppliedReport, ProblemDetails> {
     let document = toml::to_string_pretty(candidate)
         .map_err(|e| ProblemDetails::internal_error(format!("Serialization failed: {e}")))?;
-    apply_and_persist_document(ctx, candidate, &document, filter_apply, hooks).await
+    let _apply_guard = ctx.apply_lock.lock().await;
+    apply_and_persist_document_locked(ctx, candidate, &document, filter_apply, hooks).await
 }
 
 /// Applies `candidate` and atomically persists `document` only after the apply
@@ -267,11 +284,24 @@ pub async fn apply_and_persist_document(
     filter_apply: FilterApply,
     hooks: Option<&dyn ConfigApplyHooks>,
 ) -> Result<AppliedReport, ProblemDetails> {
+    let _apply_guard = ctx.apply_lock.lock().await;
+    apply_and_persist_document_locked(ctx, candidate, document, filter_apply, hooks).await
+}
+
+/// Persist variant that must be called with [`ServerContext::apply_lock`] held.
+async fn apply_and_persist_document_locked(
+    ctx: &ServerContext,
+    candidate: &Config,
+    document: &str,
+    filter_apply: FilterApply,
+    hooks: Option<&dyn ConfigApplyHooks>,
+) -> Result<AppliedReport, ProblemDetails> {
     let previous = (**ctx.config.load()).clone();
-    let report = apply_full_config(ctx, candidate, filter_apply, hooks).await?;
+    let report = apply_full_config_locked(ctx, candidate, filter_apply, hooks).await?;
 
     if let Err(e) = save_config_document_atomic(&ctx.config_path, document, candidate).await {
-        if let Err(rollback_err) = apply_full_config(ctx, &previous, FilterApply::Sync, hooks).await
+        if let Err(rollback_err) =
+            apply_full_config_locked(ctx, &previous, FilterApply::Sync, hooks).await
         {
             tracing::error!(
                 error = %rollback_err.detail,
@@ -284,15 +314,20 @@ pub async fn apply_and_persist_document(
     Ok(report)
 }
 
-/// Tracks the configuration document most recently written by the HA slave
-/// applier.
+/// Number of recent HA self-writes remembered for watcher suppression.
+const RECENT_SELF_WRITES: usize = 8;
+/// How long a remembered self-write may suppress a watcher event.
+const RECENT_SELF_WRITE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Tracks configuration documents recently written by the HA slave applier.
 ///
-/// The file watcher must not re-apply the applier's own write: doing so would
-/// reload every component (and download blocklists) a second time for the same
-/// push. The tracker is consumed by [`apply_config_document_event`].
+/// The file watcher must not re-apply the applier's own writes: doing so would
+/// reload every component (and download blocklists) again for the same push.
+/// The record set is bounded and time-limited so a burst of pushes cannot grow
+/// it without bound, and a genuinely later external rewrite is still applied.
 #[derive(Debug, Default)]
 pub struct AppliedDocumentTracker {
-    last: Mutex<Option<String>>,
+    recent: Mutex<std::collections::VecDeque<(String, std::time::Instant)>>,
 }
 
 impl AppliedDocumentTracker {
@@ -301,37 +336,45 @@ impl AppliedDocumentTracker {
         Self::default()
     }
 
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<(String, std::time::Instant)>> {
+        self.recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Records the exact document the applier is about to write.
     pub fn record(&self, document: &str) {
-        *self
-            .last
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(document.to_string());
+        let mut recent = self.lock();
+        recent.retain(|(_, recorded_at)| recorded_at.elapsed() < RECENT_SELF_WRITE_TTL);
+        if recent
+            .back()
+            .is_none_or(|(recorded, _)| recorded != document)
+        {
+            recent.push_back((document.to_string(), std::time::Instant::now()));
+        }
+        while recent.len() > RECENT_SELF_WRITES {
+            recent.pop_front();
+        }
     }
 
-    /// Forgets the recorded document (the write failed).
+    /// Forgets every recorded document (the write failed).
     pub fn clear(&self) {
-        *self
-            .last
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.lock().clear();
     }
 
-    /// Returns `true` (and consumes the record) when `content` is the applier's
-    /// own write.
+    /// Returns `true` when `content` matches a recent self-write.
+    ///
+    /// Matching does not consume the record: a burst of push A / push B can
+    /// leave several pending watcher events for either document, and every one
+    /// of them must be suppressed. The bounded TTL/entry count keeps the window
+    /// short.
     #[must_use]
     pub fn take_if_matches(&self, content: &str) -> bool {
-        let mut last = self
-            .last
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match last.as_deref() {
-            Some(recorded) if recorded == content => {
-                *last = None;
-                true
-            }
-            _ => false,
-        }
+        let mut recent = self.lock();
+        recent.retain(|(_, recorded_at)| recorded_at.elapsed() < RECENT_SELF_WRITE_TTL);
+        recent.iter().any(|(recorded, _)| recorded == content)
     }
 }
 
@@ -359,11 +402,29 @@ pub async fn apply_config_document_event(
     hooks: Option<&dyn ConfigApplyHooks>,
     self_write: &AppliedDocumentTracker,
 ) -> ConfigFileApplyOutcome {
-    if self_write.take_if_matches(document) {
+    // Serialize with every other apply/persist path, then re-read the file.
+    // An event for push A can be delivered after push B has already written
+    // and applied; applying the stale A document would regress the runtime to
+    // an older configuration even though B was ACKed.
+    let _apply_guard = ctx.apply_lock.lock().await;
+
+    let mut current = document.to_string();
+    match tokio::fs::read_to_string(&ctx.config_path).await {
+        Ok(on_disk) if on_disk != current => {
+            tracing::debug!(
+                path = %ctx.config_path.display(),
+                "Configuration watcher event was stale; applying the current file content"
+            );
+            current = on_disk;
+        }
+        _ => {}
+    }
+
+    if self_write.take_if_matches(&current) {
         return ConfigFileApplyOutcome::SelfWriteIgnored;
     }
 
-    let new_cfg = match Config::from_toml_str(document) {
+    let new_cfg = match Config::from_toml_str(&current) {
         Ok(cfg) => cfg,
         Err(e) => {
             return ConfigFileApplyOutcome::Rejected(ProblemDetails::bad_request(format!(
@@ -372,7 +433,7 @@ pub async fn apply_config_document_event(
         }
     };
 
-    match apply_full_config(ctx, &new_cfg, filter_apply, hooks).await {
+    match apply_full_config_locked(ctx, &new_cfg, filter_apply, hooks).await {
         Ok(report) => {
             ctx.publish_bundle().await;
             ConfigFileApplyOutcome::Applied(report)
@@ -600,13 +661,83 @@ mod tests {
         assert!(!tracker.take_if_matches("config_version = 2\n"));
         assert!(tracker.take_if_matches("config_version = 1\n"));
         assert!(
-            !tracker.take_if_matches("config_version = 1\n"),
-            "a recorded self-write is consumed exactly once"
+            tracker.take_if_matches("config_version = 1\n"),
+            "a recent self-write keeps suppressing pending watcher events"
         );
 
         tracker.record("config_version = 1\n");
         tracker.clear();
         assert!(!tracker.take_if_matches("config_version = 1\n"));
+    }
+
+    /// I3 regression: two rapid HA pushes leave both documents in the recent
+    /// set, and out-of-order watcher events are suppressed instead of applying
+    /// the older document over the newer runtime.
+    #[tokio::test]
+    async fn test_rapid_pushes_and_out_of_order_watcher_events_do_not_regress() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_rapid_pushes");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let tracker = AppliedDocumentTracker::new();
+
+        let mut first = (**ctx.config.load()).clone();
+        first.upstream.servers = vec!["1.1.1.1".to_string()];
+        let first_document = toml::to_string_pretty(&first).unwrap();
+        let mut second = first.clone();
+        second.upstream.servers = vec!["9.9.9.9".to_string()];
+        let second_document = toml::to_string_pretty(&second).unwrap();
+
+        // Push A records before writing; push B records before A's watcher
+        // event has been handled. The file already contains B when the stale
+        // A event arrives.
+        tracker.record(&first_document);
+        tokio::fs::write(&ctx.config_path, &first_document)
+            .await
+            .unwrap();
+        tracker.record(&second_document);
+        tokio::fs::write(&ctx.config_path, &second_document)
+            .await
+            .unwrap();
+
+        match apply_config_document_event(&ctx, &first_document, FilterApply::Sync, None, &tracker)
+            .await
+        {
+            ConfigFileApplyOutcome::SelfWriteIgnored => {}
+            other => panic!("stale self-write event must be ignored, got {other:?}"),
+        }
+        assert_ne!(
+            ctx.runtime.snapshot().config.upstream.servers,
+            vec!["1.1.1.1".to_string()],
+            "the older push must not overwrite the newer runtime"
+        );
+
+        // A second pending event for the newer document is also suppressed.
+        match apply_config_document_event(&ctx, &second_document, FilterApply::Sync, None, &tracker)
+            .await
+        {
+            ConfigFileApplyOutcome::SelfWriteIgnored => {}
+            other => panic!("pending self-write event must be ignored, got {other:?}"),
+        }
+
+        // A genuinely different external write still applies the file content.
+        let mut external = second.clone();
+        external.upstream.servers = vec!["8.8.8.8".to_string()];
+        let external_document = toml::to_string_pretty(&external).unwrap();
+        tokio::fs::write(&ctx.config_path, &external_document)
+            .await
+            .unwrap();
+        match apply_config_document_event(&ctx, &first_document, FilterApply::Sync, None, &tracker)
+            .await
+        {
+            ConfigFileApplyOutcome::Applied(_) => {}
+            other => panic!("external write must apply, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.runtime.snapshot().config.upstream.servers,
+            vec!["8.8.8.8".to_string()],
+            "the watcher must apply the current file, not the stale event document"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// D-01 review: only the HA applier's exact self-write is suppressed.

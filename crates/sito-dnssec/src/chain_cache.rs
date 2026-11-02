@@ -10,6 +10,7 @@
 //! corrupt or unreadable file starts an empty cache instead of failing startup.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::DashMap;
@@ -51,12 +52,20 @@ pub struct ChainCache {
     dirty: AtomicBool,
     path: Option<PathBuf>,
     max_entries: usize,
+    /// Trust-anchor/NTA policy the entries were authenticated under. A change
+    /// clears the cache so a stale `Unsigned` cannot override a new anchor.
+    policy: Mutex<Option<String>>,
+    /// Serializes disk flushes so the shutdown flush and the periodic flush
+    /// task cannot write the same temporary file concurrently.
+    flush_lock: Mutex<()>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PersistedCache {
     #[serde(default)]
     entries: Vec<PersistedEntry>,
+    #[serde(default)]
+    policy: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,7 +93,58 @@ impl ChainCache {
             dirty: AtomicBool::new(false),
             path,
             max_entries: max_entries.max(1),
+            policy: Mutex::new(None),
+            flush_lock: Mutex::new(()),
         }
+    }
+
+    /// Ensures the cache belongs to the trust-anchor/NTA policy identified by
+    /// `fingerprint`, clearing every entry when it changed.
+    ///
+    /// Returns `true` when entries were dropped (or the policy was recorded for
+    /// the first time), so the caller can log the invalidation.
+    pub fn ensure_policy(&self, fingerprint: String) -> bool {
+        let mut policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if policy.as_deref() == Some(fingerprint.as_str()) {
+            return false;
+        }
+        let changed = !self.entries.is_empty() || policy.is_some();
+        if changed {
+            self.entries.clear();
+            warn!(
+                previous = ?policy.as_deref(),
+                "DNSSEC chain cache policy changed; dropping cached delegation statuses"
+            );
+        }
+        *policy = Some(fingerprint);
+        self.dirty.store(true, Ordering::Release);
+        changed
+    }
+
+    /// Removes `Unsigned` entries that overlap a newly configured anchor.
+    /// Signed entries remain valid: a new anchor never makes signed evidence
+    /// weaker.
+    pub fn invalidate_unsigned_overlapping(&self, anchor: &LowerName) -> usize {
+        let stale: Vec<LowerName> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.value().status == ZoneStatus::Unsigned
+                    && (anchor.zone_of(entry.key()) || entry.key().zone_of(anchor))
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+        let removed = stale.len();
+        for name in stale {
+            self.entries.remove(&name);
+        }
+        if removed > 0 {
+            self.dirty.store(true, Ordering::Release);
+        }
+        removed
     }
 
     /// Path of the backing file, if any.
@@ -139,6 +199,13 @@ impl ChainCache {
             );
             return;
         };
+
+        if let Some(policy) = persisted.policy {
+            *self
+                .policy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(policy);
+        }
 
         let mut expired = 0usize;
         for entry in persisted.entries {
@@ -289,6 +356,12 @@ impl ChainCache {
             self.dirty.store(false, Ordering::Release);
             return Ok(());
         };
+        // A shutdown flush can race the periodic flush task. Serialize the
+        // whole write (including the shared `.tmp` path and rename).
+        let _flush_guard = self
+            .flush_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
@@ -305,7 +378,12 @@ impl ChainCache {
                 validated_at: entry.value().validated_at,
             })
             .collect();
-        let serialized = match toml::to_string(&PersistedCache { entries }) {
+        let policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let serialized = match toml::to_string(&PersistedCache { entries, policy }) {
             Ok(serialized) => serialized,
             Err(error) => {
                 self.dirty.store(true, Ordering::Release);
@@ -472,6 +550,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 
+    /// Minor: the periodic flush and the shutdown flush can run at the same
+    /// time. Serialized flushes must leave one valid file, not a torn write.
+    #[test]
+    fn test_concurrent_flushes_leave_a_valid_file() {
+        use std::sync::Arc;
+
+        let path = temp_path("concurrent_flush");
+        let cache = Arc::new(ChainCache::new(Some(path.clone())));
+        let now = system_now();
+        for index in 0..64 {
+            cache.insert(
+                name(&format!("z{index}.example.")),
+                ZoneStatus::Signed,
+                now + 600,
+                now + index,
+            );
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let worker = cache.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..8 {
+                    worker.flush().expect("concurrent flush");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("flush thread");
+        }
+        cache.flush().expect("final flush");
+
+        let reloaded = ChainCache::new(Some(path.clone()));
+        reloaded.load(now);
+        assert_eq!(reloaded.len(), 64, "the final file must be intact");
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
     #[test]
     fn test_corrupt_file_is_ignored() {
         let path = temp_path("corrupt");
@@ -480,6 +596,30 @@ mod tests {
         cache.load(system_now());
         assert!(cache.is_empty(), "a corrupt file must load as empty");
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    /// I1: a trust-anchor/NTA policy change must drop cached `Unsigned`
+    /// evidence, and the same policy must keep it.
+    #[test]
+    fn test_policy_change_clears_cached_statuses() {
+        let cache = ChainCache::new(None);
+        let now = system_now();
+        assert!(
+            !cache.ensure_policy("v1-aaaa".to_string()),
+            "recording the initial policy with an empty cache is not a change"
+        );
+        cache.insert(name("corp."), ZoneStatus::Unsigned, now + 600, now);
+        assert!(
+            !cache.ensure_policy("v1-aaaa".to_string()),
+            "the unchanged policy must preserve entries"
+        );
+        assert!(cache.get(&name("corp."), now).is_some());
+
+        assert!(
+            cache.ensure_policy("v1-bbbb".to_string()),
+            "a changed policy must invalidate the cache"
+        );
+        assert!(cache.is_empty());
     }
 
     #[test]

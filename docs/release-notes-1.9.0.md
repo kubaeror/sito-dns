@@ -66,9 +66,9 @@ restarting production nodes.
   `$dnsrewrite` instead of `$dnsrewrite=NOERROR;;`; review `$badfilter` entries
   that targeted the old shared form.
 - **Corrupt embedded rule data no longer panics.** Parental, service, and
-  anti-bypass manifests that fail to load now log an error and degrade to an
-  empty registry instead of aborting the process. Skipped-rule counts are
-  logged once per load.
+  anti-bypass manifests that fail to load now refuse startup with a clear error
+  instead of aborting the process; the server does not run with a partially
+  loaded registry.
 
 ### Filtering configuration
 
@@ -86,14 +86,18 @@ restarting production nodes.
 
 ### High availability
 
-- **A slave ACKs only after the complete configuration is applied and
-  persisted.** The slave now applies every component (runtime pipeline,
-  filtering, upstreams, DNSSEC, clients, rewrites), persists the exact document
-  atomically, and waits for the DNS listener readiness gate before acknowledging
-  a pushed bundle. A failure leaves the version watermark unchanged, marks the
-  node `Degraded`, and sends `applied: false`; the last known good runtime
-  configuration is retained. Node-local settings (`[ha]`, instance name,
-  `data_dir`, MikroTik credentials, client secrets) are preserved on apply.
+- **A slave ACKs only after the pushed configuration is applied and
+  persisted.** The slave applies every hot-appliable component (runtime
+  pipeline, filtering, upstreams, DNSSEC, clients, rewrites), persists the
+  exact document atomically, and waits for the DNS listener readiness gate
+  before acknowledging a pushed bundle. Restart-only sections (`auth`, `web`,
+  `tls`, `acme`, `integrations` and node role/identity changes) are persisted
+  but are **not** live until the slave restarts; the slave logs the exact
+  `restart_required` fields instead of claiming them as applied. A failure
+  leaves the version watermark unchanged, marks the node `Degraded`, and sends
+  `applied: false`; the last known good runtime configuration is retained.
+  Node-local settings (`[ha]`, instance name, `data_dir`, MikroTik credentials,
+  client secrets) are preserved on apply.
 - **New HA metrics:** `sito_ha_diverged{instance}` (1 while a connected slave
   acknowledged a version above the master's; returns to 0 after recovery and
   the series is removed on disconnect) and

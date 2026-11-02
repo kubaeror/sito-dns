@@ -293,6 +293,7 @@ mod tests {
             rewrites,
             start_time: Instant::now(),
             restore_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             master_coordinator: None,
             slave_tracker: None,
             resync_sender: None,

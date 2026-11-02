@@ -5,11 +5,11 @@ self-registration or e-mail-based password reset. Accounts, roles, API tokens,
 and TOTP settings are managed through the administrative REST API under
 `/api/v1/auth/*`.
 
-> **Management is API-only.** The web panel currently provides the login page
-> and the first-boot wizard only; it has no user-management, token-management,
-> or TOTP-settings pages. Use `curl`, a script, or the interactive Swagger UI at
-> `http://<host>:8080/api/docs` to call the endpoints below. A dedicated
-> management UI (D-17b) is a separate, optional follow-up.
+> **Account management is API-only.** The web panel covers login, the
+> first-boot wizard, and operational views, but it has no user-management,
+> token-management, or TOTP-settings pages yet. Use `curl`, a script, or the
+> interactive Swagger UI at `http://<host>:8080/api/docs` to call the endpoints
+> below. A dedicated management UI (D-17b) is a separate, optional follow-up.
 
 All examples assume:
 
@@ -256,7 +256,10 @@ recovery path.
 
 Role changes, account deletions, and administrator password overrides are logged
 with the acting administrator and the target account. Secrets, password hashes,
-TOTP secrets, and token plaintext are never logged.
+TOTP secrets, and token plaintext are never intentionally logged. One exception
+is a corrupt `users.toml` parse error: the TOML parser's diagnostic can include
+the offending source line, so treat startup logs with the same care as the users
+file itself (and never paste them into a public issue).
 
 ## See Also
 

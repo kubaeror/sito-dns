@@ -410,6 +410,7 @@ pub struct AuthManager {
     sessions_path: Option<PathBuf>,
     tokens_path: Option<PathBuf>,
     tokens_dirty: Arc<AtomicBool>,
+    sessions_dirty: Arc<AtomicBool>,
     token_default_ttl_days: u64,
     /// Global user-secret generation; sessions/tokens must match it to be valid.
     generation: u64,
@@ -551,6 +552,7 @@ impl AuthManager {
             sessions_path,
             tokens_path,
             tokens_dirty: Arc::new(AtomicBool::new(false)),
+            sessions_dirty: Arc::new(AtomicBool::new(false)),
             token_default_ttl_days,
             generation,
             secret_store: None,
@@ -735,8 +737,28 @@ impl AuthManager {
     ) -> std::io::Result<PathBuf> {
         let path = data_dir.as_ref().join("users.toml");
         // Resolve the key before copying anything: a recovery backup must never
-        // retain legacy plaintext TOTP secrets.
-        let secret_store = TotpSecretStore::load_or_create(totp_key_path(&path))?;
+        // retain legacy plaintext TOTP secrets. `reset-admin` is the recovery
+        // path, so a malformed key must not make recovery impossible: move it
+        // aside and generate a fresh one (the reset rotates credentials and
+        // invalidates existing sessions/tokens anyway).
+        let key_path = totp_key_path(&path);
+        let secret_store = match TotpSecretStore::load_or_create(&key_path) {
+            Ok(store) => store,
+            Err(e) => {
+                let backup =
+                    key_path.with_extension(format!("corrupt.{}", chrono::Utc::now().timestamp()));
+                tracing::warn!(
+                    path = %key_path.display(),
+                    backup = %backup.display(),
+                    error = %e,
+                    "Existing TOTP key is unusable; moving it aside and generating a fresh key for admin reset"
+                );
+                if key_path.exists() {
+                    std::fs::rename(&key_path, &backup)?;
+                }
+                TotpSecretStore::load_or_create(&key_path)?
+            }
+        };
         if path.exists() {
             let timestamp = chrono::Utc::now().timestamp();
             let backup_name = format!(
@@ -790,6 +812,7 @@ impl AuthManager {
             sessions_path: None,
             tokens_path: None,
             tokens_dirty: Arc::new(AtomicBool::new(false)),
+            sessions_dirty: Arc::new(AtomicBool::new(false)),
             token_default_ttl_days: 0,
             generation,
             // A reset replaces the account store; reuse an existing key so
@@ -900,21 +923,28 @@ impl AuthManager {
     /// blocking file IO on the runtime worker.
     async fn save_sessions_async(&self) {
         let Some((path, toml_str)) = self.sessions_toml() else {
+            self.sessions_dirty.store(false, Ordering::SeqCst);
             return;
         };
+        // Mark dirty before writing so a failed write is retried by the pruner
+        // instead of being lost until the next explicit session mutation.
+        self.sessions_dirty.store(true, Ordering::SeqCst);
         match tokio::task::spawn_blocking(move || write_secret_file(&path, &toml_str)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => self.sessions_dirty.store(false, Ordering::SeqCst),
             Ok(Err(e)) => tracing::error!("Failed to persist sessions file: {e}"),
             Err(e) => tracing::error!("Sessions persistence task failed: {e}"),
         }
     }
 
-    /// Persists API tokens on the blocking pool. The dirty flag is cleared only
-    /// after a successful write so a failed write is retried by the pruner.
+    /// Persists API tokens on the blocking pool. The dirty flag is set before
+    /// the write and cleared only after success, so a failed write is retried
+    /// by the pruner.
     async fn save_tokens_async(&self) {
         let Some((path, toml_str)) = self.tokens_toml() else {
+            self.tokens_dirty.store(false, Ordering::SeqCst);
             return;
         };
+        self.tokens_dirty.store(true, Ordering::SeqCst);
         match tokio::task::spawn_blocking(move || write_secret_file(&path, &toml_str)).await {
             Ok(Ok(())) => self.tokens_dirty.store(false, Ordering::SeqCst),
             Ok(Err(e)) => tracing::error!("Failed to persist API tokens file: {e}"),
@@ -1853,7 +1883,7 @@ impl AuthManager {
             sessions.retain(|_, s| !s.is_expired());
             sessions.len() != before
         };
-        if sessions_changed {
+        if sessions_changed || self.sessions_dirty.load(Ordering::SeqCst) {
             self.save_sessions_async().await;
         }
         let tokens_changed = {
@@ -2499,6 +2529,44 @@ mod tests {
             Ok(_) => panic!("Expected Err(EmptyUsersFile), got Ok"),
             Err(other) => panic!("Expected EmptyUsersFile, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Minor: `reset-admin` is the recovery path and must still work when the
+    /// existing `totp.key` is malformed.
+    #[tokio::test]
+    async fn test_reset_admin_credentials_recovers_from_corrupt_totp_key() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_auth_reset_corrupt_key_{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        {
+            let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+            mgr.update_user_password("admin", "firstpassword").await;
+        }
+        let key_path = temp_dir.join("totp.key");
+        std::fs::write(&key_path, b"not-a-valid-key").unwrap();
+
+        let reset_path = AuthManager::reset_admin_credentials(&temp_dir, "newpassword_reset")
+            .expect("admin reset must recover from a malformed TOTP key");
+        assert_eq!(reset_path, temp_dir.join("users.toml"));
+        let backups: Vec<_> = std::fs::read_dir(&temp_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("totp.corrupt.")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "the unusable key must be moved aside");
+        assert!(
+            AuthManager::with_storage(&temp_dir, 24, 5).is_ok(),
+            "the fresh key and reset credentials must load"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

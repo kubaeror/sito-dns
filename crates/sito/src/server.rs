@@ -256,6 +256,15 @@ fn init_ha(
     let (master_coordinator, slave_tracker, resync_sender, resync_receiver) = if config.server.role
         == "master"
     {
+        // The replication listener is only spawned when the port is non-zero;
+        // record the no-op here so a production master with
+        // `replication_port = 0` is observable. `spawn_master_server` no longer
+        // increments this counter (it would double count when both run).
+        if ha_config.replication_port == 0 {
+            metrics.inc_ha_startup_noop("master", "replication_disabled");
+            info!("Master HA replication is disabled (replication_port is 0)");
+        }
+
         // Load or create master Ed25519 signing key (0600 on Unix)
         let signing_key_path = config.server.data_dir.join("ha_signing.key");
         let signing_key = Arc::new(sito_ha::Ed25519SigningKey::load_or_create(
@@ -647,7 +656,19 @@ impl sito_ha::SlaveConfigApplier for HaConfigApplier {
             )
             .await
             {
-                Ok(_) => Ok(()),
+                Ok(report) => {
+                    if !report.restart_required.is_empty() {
+                        // The push is ACKed as applied because the document is
+                        // persisted and every hot-appliable component is live.
+                        // Restart-only sections are not silently claimed as
+                        // live: surface exactly which ones need a restart.
+                        warn!(
+                            fields = ?report.restart_required,
+                            "HA push applied; these fields are persisted but require a restart to take effect"
+                        );
+                    }
+                    Ok(())
+                }
                 Err(e) => {
                     self.self_write.clear();
                     Err(e.detail)
@@ -1047,6 +1068,7 @@ pub async fn run_server_full(
         rewrites: rewrites_arc.clone(),
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
+        apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         master_coordinator: master_coordinator.clone(),
         slave_tracker: slave_tracker.clone(),
         resync_sender,
@@ -1962,6 +1984,34 @@ mod tests {
             resolved.file_name(),
             Some(std::ffi::OsStr::new("config.toml"))
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// I5 regression: the production `init_ha` call site records the
+    /// `replication_disabled` no-op for a master with a zero replication port.
+    #[tokio::test]
+    async fn test_init_ha_records_master_replication_disabled_noop() {
+        let dir = std::env::temp_dir().join(format!("sito_init_ha_{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = Config::default();
+        config.server.role = "master".to_string();
+        config.server.data_dir = dir.clone();
+        config.ha = None;
+
+        let metrics = sito_stats::MetricsRegistry::new("1.9.0", "test");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let runtime = init_ha(&config, &dir.join("config.toml"), &metrics, &shutdown_rx)
+            .expect("init_ha must succeed for a master with replication disabled");
+        assert!(runtime.coordinator.is_some());
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(
+                r#"sito_ha_startup_noop_total{role="master",reason="replication_disabled"} 1"#
+            ),
+            "the production startup path must expose the no-op: {rendered}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

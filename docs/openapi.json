@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "sito DNS Administrative API",
-    "description": "Administrative REST API and OpenAPI 3.0 specification for the sito DNS server. Account, role, API-token and TOTP management is API-only; see docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
+    "description": "Administrative REST API and OpenAPI 3.1 specification for the sito DNS server. Account, role, API-token and TOTP management is API-only; see docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
     "license": {
       "name": "GPL-3.0-only"
     },

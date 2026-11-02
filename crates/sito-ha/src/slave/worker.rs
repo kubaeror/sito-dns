@@ -152,8 +152,12 @@ pub async fn apply_config_push(
         },
         None => None,
     };
+    // Node-local state is read from the live runtime snapshot, not re-read
+    // from disk: the file may be unreadable or mid-edit, and the running
+    // configuration is the authoritative node-local state.
+    let live_config = handles.runtime.config_handle().load_full();
     if let Some(ref mut clients) = staging_clients {
-        for (name, secret) in read_local_client_id_secrets(handles.config_path.as_deref()).await {
+        for (name, secret) in local_client_id_secrets(&live_config) {
             clients.client_id_secrets.entry(name).or_insert(secret);
         }
     }
@@ -192,13 +196,25 @@ pub async fn apply_config_push(
     //    and the bundle's structured clients/rewrites/lists remain
     //    authoritative. Applying exactly this document guarantees the running
     //    configuration and the file a restart loads cannot diverge.
-    let document = build_persisted_config(
+    let document = match build_persisted_config(
         &substituted_toml,
         &bundle,
         handles.config_path.as_deref(),
+        &live_config,
         staging_config.clients.clone(),
     )
-    .await;
+    .await
+    {
+        Ok(document) => document,
+        Err(e) => {
+            let reason = format!(
+                "Refusing to persist pushed configuration without the node-local configuration: {e}"
+            );
+            error!(error = %e, "Refusing to apply pushed configuration");
+            tracker.mark_degraded(reason.clone());
+            return Err(HaError::Rollback(reason));
+        }
+    };
     let apply_config = match Config::from_toml_str(&document) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -254,60 +270,91 @@ pub async fn apply_config_push(
 ///
 /// * `[ha]` (master URL, certificates, pins, token) is slave-local and is
 ///   removed by `sanitize_config_for_bundle` on the master.
-/// * `server.instance_name`/`server.data_dir` identify this node and must not
-///   be replaced by the master's values.
+/// * `server.role` is forced to `slave`; `server.instance_name` and
+///   `server.data_dir` identify this node and must not be replaced by the
+///   master's values.
 /// * `[integrations.mikrotik]` credentials are stripped from the replicated
-///   configuration and restored from the local file.
+///   configuration and restored from the live node-local configuration.
+///
+/// The node-local values come from the running configuration, not a fresh disk
+/// read: a transient read error or a mid-edit file must not silently drop
+/// `[ha]`/identity/credentials. When `local_path` is set, the file is still
+/// read once to fail the push if it is unreadable or unparseable, because
+/// persisting over it would destroy the only copy of that node-local state.
 ///
 /// The structured bundle fields (`clients`, `rewrites`, `lists`,
 /// `custom_rules`) are authoritative: a missing field removes the
 /// corresponding configuration instead of keeping the previous copy, so the
-/// persisted file matches the runtime snapshot exactly. Returns the pushed
-/// TOML unchanged when it cannot be parsed.
+/// persisted file matches the runtime snapshot exactly.
 async fn build_persisted_config(
     pushed_toml: &str,
     bundle: &ConfigBundle,
     local_path: Option<&std::path::Path>,
+    live: &Config,
     clients_value: Option<toml::Value>,
-) -> String {
-    let Ok(mut pushed) = pushed_toml.parse::<toml::Table>() else {
-        return pushed_toml.to_string();
-    };
-    let local = match local_path {
-        Some(path) => tokio::fs::read_to_string(path)
-            .await
-            .ok()
-            .and_then(|raw| raw.parse::<toml::Table>().ok()),
-        None => None,
-    };
+) -> Result<String, HaError> {
+    let mut pushed = pushed_toml
+        .parse::<toml::Table>()
+        .map_err(|e| HaError::Validation {
+            field: "config".to_string(),
+            reason: format!("Pushed configuration is not valid TOML: {e}"),
+        })?;
 
-    if let Some(ref local) = local {
-        if let Some(ha) = local.get("ha") {
+    if let Some(path) = local_path {
+        let raw = tokio::fs::read_to_string(path).await.map_err(HaError::Io)?;
+        raw.parse::<toml::Table>()
+            .map_err(|e| HaError::Validation {
+                field: "config".to_string(),
+                reason: format!(
+                    "Cannot parse node-local configuration '{}': {e}",
+                    path.display()
+                ),
+            })?;
+    }
+
+    // `[ha]` is node-local. If the live configuration has none, never leave
+    // the master's copy in place.
+    match live.ha {
+        Some(ref ha) => {
             pushed.insert("ha".to_string(), ha.clone());
         }
-        if let (Some(toml::Value::Table(local_server)), Some(toml::Value::Table(server))) =
-            (local.get("server"), pushed.get_mut("server"))
-        {
-            for key in ["instance_name", "data_dir"] {
-                if let Some(value) = local_server.get(key) {
-                    server.insert(key.to_string(), value.clone());
-                }
-            }
+        None => {
+            pushed.remove("ha");
         }
-        if let Some(local_credentials) = local
-            .get("integrations")
-            .and_then(|i| i.get("mikrotik"))
-            .and_then(toml::Value::as_table)
-            && let Some(pushed_mikrotik) = pushed
-                .get_mut("integrations")
-                .and_then(|i| i.as_table_mut())
-                .and_then(|i| i.get_mut("mikrotik"))
-                .and_then(toml::Value::as_table_mut)
-        {
-            for key in ["token", "password"] {
-                if let Some(value) = local_credentials.get(key) {
-                    pushed_mikrotik.insert(key.to_string(), value.clone());
-                }
+    }
+
+    let server = pushed
+        .entry("server".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| HaError::Validation {
+            field: "server".to_string(),
+            reason: "Pushed [server] section is not a table".to_string(),
+        })?;
+    server.insert("role".to_string(), toml::Value::String("slave".to_string()));
+    server.insert(
+        "instance_name".to_string(),
+        toml::Value::String(live.server.instance_name.clone()),
+    );
+    server.insert(
+        "data_dir".to_string(),
+        toml::Value::String(live.server.data_dir.to_string_lossy().into_owned()),
+    );
+
+    if let Some(local_credentials) = live
+        .integrations
+        .as_ref()
+        .and_then(|i| i.get("mikrotik"))
+        .and_then(toml::Value::as_table)
+        && let Some(pushed_mikrotik) = pushed
+            .get_mut("integrations")
+            .and_then(|i| i.as_table_mut())
+            .and_then(|i| i.get_mut("mikrotik"))
+            .and_then(toml::Value::as_table_mut)
+    {
+        for key in ["token", "password"] {
+            if let Some(value) = local_credentials.get(key) {
+                pushed_mikrotik.insert(key.to_string(), value.clone());
             }
         }
     }
@@ -360,22 +407,15 @@ async fn build_persisted_config(
         }
     }
 
-    toml::to_string_pretty(&pushed).unwrap_or_else(|_| pushed_toml.to_string())
+    toml::to_string_pretty(&pushed).map_err(|e| HaError::Serialization(e.to_string()))
 }
 
-/// Reads the node-local `[clients] client_id_secrets` table (name -> secret).
-async fn read_local_client_id_secrets(path: Option<&std::path::Path>) -> HashMap<String, String> {
-    let Some(path) = path else {
-        return HashMap::new();
-    };
-    let Ok(raw) = tokio::fs::read_to_string(path).await else {
-        return HashMap::new();
-    };
-    let Ok(table) = raw.parse::<toml::Table>() else {
-        return HashMap::new();
-    };
-    table
-        .get("clients")
+/// Reads the node-local `[clients] client_id_secrets` table (name -> secret)
+/// from the live configuration.
+fn local_client_id_secrets(config: &Config) -> HashMap<String, String> {
+    config
+        .clients
+        .as_ref()
         .and_then(|clients| clients.get("client_id_secrets"))
         .and_then(toml::Value::as_table)
         .map(|secrets| {
@@ -1002,7 +1042,15 @@ mod tests {
     }
 
     async fn test_handles(config_path: Option<PathBuf>) -> SlaveAppHandles {
-        let base_config = Config::default();
+        // Mirror production: the live runtime configuration is the parsed
+        // on-disk configuration (when the test provides one).
+        let base_config = match config_path.as_deref() {
+            Some(path) => match tokio::fs::read_to_string(path).await {
+                Ok(raw) => Config::from_toml_str(&raw).unwrap_or_default(),
+                Err(_) => Config::default(),
+            },
+            None => Config::default(),
+        };
         let config_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(base_config.clone())));
         let filter_engine = Arc::new(
             HostsFilterEngine::init(base_config.filtering.clone(), std::env::temp_dir()).await,
@@ -1330,8 +1378,11 @@ url = "https://192.168.1.1"
         );
 
         let bundle = test_bundle(2, pushed, Some(toml::Value::Table(sanitized_clients)), None);
+        let live = Config::from_toml_str(local).expect("node-local config");
         let merged =
-            build_persisted_config(pushed, &bundle, Some(&path), bundle.clients.clone()).await;
+            build_persisted_config(pushed, &bundle, Some(&path), &live, bundle.clients.clone())
+                .await
+                .expect("build persisted config");
         let table: toml::Table = merged.parse().unwrap();
 
         let ha = table.get("ha").expect("[ha] must be preserved");
@@ -1375,43 +1426,87 @@ url = "https://192.168.1.1"
     }
 
     #[tokio::test]
-    async fn test_local_client_id_secrets_reads_table() {
-        let dir = std::env::temp_dir().join(format!("sito_ha_secrets_{}", rand::random::<u64>()));
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join("config.toml");
-        tokio::fs::write(
-            &path,
-            "[clients]\nclient_id_secrets = { \"phone\" = \"abc\" }\n",
-        )
-        .await
-        .unwrap();
-        let secrets = read_local_client_id_secrets(Some(&path)).await;
+    async fn test_local_client_id_secrets_read_from_live_config() {
+        let live =
+            Config::from_toml_str("[clients]\nclient_id_secrets = { \"phone\" = \"abc\" }\n")
+                .expect("live config");
+        let secrets = local_client_id_secrets(&live);
         assert_eq!(secrets.get("phone").map(String::as_str), Some("abc"));
         assert!(
-            read_local_client_id_secrets(None).await.is_empty(),
-            "missing secrets path must yield no client id secrets"
+            local_client_id_secrets(&Config::default()).is_empty(),
+            "a node without client secrets must yield no client id secrets"
         );
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
+    /// I4: without a local path there is nothing to protect, so the pushed
+    /// sections survive and only the forced node-local fields are merged.
     #[tokio::test]
     async fn test_persisted_config_without_local_file_keeps_pushed_sections() {
         let pushed = "config_version = 1\n[server]\nrole = \"slave\"\n";
         let mut bundle = test_bundle(1, pushed, None, None);
         bundle.custom_rules = vec![];
-        let merged = build_persisted_config(
-            pushed,
-            &bundle,
-            Some(std::path::Path::new("/nonexistent/config.toml")),
-            None,
-        )
-        .await;
+        let live = Config::default();
+        let merged = build_persisted_config(pushed, &bundle, None, &live, None)
+            .await
+            .expect("build persisted config");
         let table: toml::Table = merged.parse().unwrap();
-        let expected: toml::Table = pushed.parse().unwrap();
         assert_eq!(
-            table, expected,
-            "a missing local file must not change the pushed configuration"
+            table
+                .get("server")
+                .and_then(|server| server.get("role"))
+                .and_then(toml::Value::as_str),
+            Some("slave")
         );
+        assert_eq!(
+            table
+                .get("server")
+                .and_then(|server| server.get("instance_name"))
+                .and_then(toml::Value::as_str),
+            Some(live.server.instance_name.as_str()),
+            "node identity must come from the live configuration"
+        );
+        let expected_data_dir = live.server.data_dir.to_string_lossy();
+        assert_eq!(
+            table
+                .get("server")
+                .and_then(|server| server.get("data_dir"))
+                .and_then(toml::Value::as_str),
+            Some(expected_data_dir.as_ref()),
+            "the node data directory must come from the live configuration"
+        );
+    }
+
+    /// I4 regression: the local file is expected but unreadable/unparseable.
+    /// The push must fail (applied:false) and the file must stay untouched.
+    #[tokio::test]
+    async fn test_unparseable_local_config_rejects_push_and_keeps_file() {
+        let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!("sito_ha_corrupt_{}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("config.toml");
+        let corrupt = "[server\nrole = \"slave\"\n";
+        tokio::fs::write(&path, corrupt).await.unwrap();
+
+        let mut handles = test_handles(None).await;
+        handles.config_path = Some(path.clone());
+        let tracker = SlaveStatusTracker::new("slave-corrupt".to_string(), 0, None);
+        let config_toml = "config_version = 1\n[server]\nrole = \"slave\"\n";
+        let push =
+            build_and_sign_push(&test_bundle(1, config_toml, None, None), &signing_key).unwrap();
+
+        let err = apply_config_push(&push, &tracker, &handles, &signing_key.public_key())
+            .await
+            .expect_err("an unparseable local config must reject the push");
+        assert!(matches!(err, HaError::Rollback(_)));
+        assert_eq!(tracker.get_state(), SlaveState::Degraded);
+        assert_eq!(tracker.get_version(), 0);
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            corrupt,
+            "the push must not overwrite the node-local configuration"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     /// Absent `clients`/`rewrites` in the bundle are authoritative removals:
@@ -1535,8 +1630,13 @@ ttl = 60
             "the live filter snapshot must be rolled back when persistence fails"
         );
 
-        // Repair the path and re-apply: the same push succeeds.
+        // Repair the path and re-apply: the same push succeeds. The local file
+        // must exist and parse because a push never overwrites node-local
+        // state it could not read.
         tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, "config_version = 1\n[server]\nrole = \"slave\"\n")
             .await
             .unwrap();
         let applied = apply_config_push(&push, &tracker, &handles, &signing_key.public_key())

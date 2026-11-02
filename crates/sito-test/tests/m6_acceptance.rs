@@ -96,6 +96,7 @@ async fn create_test_context() -> (ServerContext, PathBuf) {
         rewrites,
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
+        apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         master_coordinator: None,
         slave_tracker: None,
         resync_sender: None,

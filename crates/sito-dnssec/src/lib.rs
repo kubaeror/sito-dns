@@ -563,6 +563,37 @@ fn distinct_cname_chain_names(response: &Message, qname: &Name) -> Vec<Name> {
     names
 }
 
+/// Deterministic fingerprint of the trust-anchor and NTA policy that produced
+/// a chain-cache entry. Changing an anchor (including its key material) or an
+/// NTA invalidates every cached status, because an `Unsigned` proven under the
+/// old policy can otherwise override a newly configured anchor.
+fn policy_fingerprint(trust_anchors: &[String], ntas: &[String]) -> String {
+    // FNV-1a keeps the persisted fingerprint short and stable without pulling
+    // in a hashing dependency. Collision risk is irrelevant here: a collision
+    // only keeps cache entries that the policy would also accept.
+    let mut anchors: Vec<&str> = trust_anchors.iter().map(String::as_str).collect();
+    anchors.sort_unstable();
+    anchors.dedup();
+    let mut ntas: Vec<&str> = ntas.iter().map(String::as_str).collect();
+    ntas.sort_unstable();
+    ntas.dedup();
+
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for (tag, values) in [("anchors", anchors), ("ntas", ntas)] {
+        for byte in tag.bytes().chain([0xff]) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        for value in values {
+            for byte in value.bytes().chain([0xff]) {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+    format!("v1-{hash:016x}")
+}
+
 /// Whether a response is negative (NXDOMAIN, or a NODATA answer for the
 /// queried name after following any CNAME chain).
 fn is_negative_response(response: &Message, qname: &Name, qtype: RecordType) -> bool {
@@ -1434,6 +1465,16 @@ impl DnssecValidator {
                 }
             }
         }
+        // Cached chain statuses are only valid for the trust-anchor/NTA policy
+        // that produced them. An `Unsigned` cached before an operator anchors a
+        // zone would otherwise keep reporting the newly signed zone as
+        // Insecure for the rest of the TTL (a persistent fail-open), and a new
+        // NTA changes the classification too. Fingerprint the policy and drop
+        // entries that were established under a different one.
+        validator.chain_cache.ensure_policy(policy_fingerprint(
+            &config.trust_anchors,
+            &validator.nta_domains.load(),
+        ));
         validator
     }
 
@@ -1455,6 +1496,7 @@ impl DnssecValidator {
         let mut anchors = (**self.trust_anchors.load()).clone();
         anchors.insert_with_name(key.public_key(), name.clone());
         self.trust_anchors.store(Arc::new(anchors));
+        self.invalidate_unsigned_evidence_under(&name);
         self.anchor_zones.insert(name, ());
     }
 
@@ -1463,7 +1505,17 @@ impl DnssecValidator {
         let mut anchors = (**self.trust_anchors.load()).clone();
         anchors.insert_with_name(key, name.clone());
         self.trust_anchors.store(Arc::new(anchors));
+        self.invalidate_unsigned_evidence_under(&name);
         self.anchor_zones.insert(name, ());
+    }
+
+    /// Drops unsigned evidence that overlapped `anchor` before the anchor was
+    /// configured. An `Unsigned` proof established under the previous policy
+    /// must never downgrade the newly anchored subtree.
+    fn invalidate_unsigned_evidence_under(&self, anchor: &LowerName) {
+        self.insecure_zones
+            .retain(|zone, _| !(anchor.zone_of(zone) || zone.zone_of(anchor)));
+        self.chain_cache.invalidate_unsigned_overlapping(anchor);
     }
 
     /// Add a Negative Trust Anchor (NTA) dynamically.
@@ -1558,6 +1610,27 @@ impl DnssecValidator {
             .any(|entry| *entry.value() >= now && entry.key().zone_of(name))
     }
 
+    /// Whether a configured (non-root) trust anchor covers `name`.
+    ///
+    /// A cached `Unsigned` status was authenticated under the policy that
+    /// existed when it was written. If an operator later configures an anchor
+    /// at or above `name`, the cached denial must not downgrade that subtree:
+    /// fall back to a fresh probe against the current anchors instead.
+    fn configured_anchor_covers(&self, name: &LowerName) -> bool {
+        self.anchor_zones
+            .iter()
+            .any(|entry| !entry.key().is_root() && entry.key().zone_of(name))
+    }
+
+    /// A cached `Unsigned` zone covering `name`, unless a configured anchor
+    /// now covers the name (see [`Self::configured_anchor_covers`]).
+    fn cached_unsigned_zone(&self, name: &LowerName, now: u32) -> Option<(LowerName, u32)> {
+        if self.configured_anchor_covers(name) {
+            return None;
+        }
+        self.chain_cache.covers_unsigned(name, now)
+    }
+
     /// The closest zone apex that previously signed validated response data and
     /// is a proper ancestor of `name`.
     fn closest_signed_zone(&self, name: &LowerName, now: u32) -> Option<LowerName> {
@@ -1641,7 +1714,7 @@ impl DnssecValidator {
 
         let mut saw_signed = false;
         for cut in cuts {
-            if let Some((unsigned_zone, expiry)) = self.chain_cache.covers_unsigned(&cut, now) {
+            if let Some((unsigned_zone, expiry)) = self.cached_unsigned_zone(&cut, now) {
                 self.signed_zones.remove(&unsigned_zone);
                 self.insecure_zones.insert(unsigned_zone, expiry);
                 return DelegationProof::Unsigned;
@@ -2022,19 +2095,23 @@ impl DnssecValidator {
         now: u32,
     ) -> UnsignedProbe {
         if let Some(entry) = self.chain_cache.get(name, now) {
-            match entry.status {
-                ZoneStatus::Signed => {
-                    self.insecure_zones.remove(name);
-                    self.signed_zones.insert(name.clone(), entry.expires_at);
+            let stale_unsigned =
+                entry.status == ZoneStatus::Unsigned && self.configured_anchor_covers(name);
+            if !stale_unsigned {
+                match entry.status {
+                    ZoneStatus::Signed => {
+                        self.insecure_zones.remove(name);
+                        self.signed_zones.insert(name.clone(), entry.expires_at);
+                    }
+                    ZoneStatus::Unsigned => {
+                        self.signed_zones.remove(name);
+                        self.insecure_zones.insert(name.clone(), entry.expires_at);
+                    }
                 }
-                ZoneStatus::Unsigned => {
-                    self.signed_zones.remove(name);
-                    self.insecure_zones.insert(name.clone(), entry.expires_at);
-                }
+                return UnsignedProbe::Covered;
             }
-            return UnsignedProbe::Covered;
         }
-        if let Some((zone, expiry)) = self.chain_cache.covers_unsigned(name, now) {
+        if let Some((zone, expiry)) = self.cached_unsigned_zone(name, now) {
             self.signed_zones.remove(&zone);
             self.insecure_zones.insert(zone, expiry);
             return UnsignedProbe::Covered;
@@ -2057,8 +2134,12 @@ impl DnssecValidator {
     /// Whether `name` already has cached or in-memory coverage, so consulting
     /// it will not consume the per-response probe budget.
     fn unsigned_status_known(&self, name: &LowerName, now: u32) -> bool {
-        self.chain_cache.get(name, now).is_some()
-            || self.chain_cache.covers_unsigned(name, now).is_some()
+        let exact = self.chain_cache.get(name, now);
+        let exact_known = exact.is_some_and(|entry| {
+            entry.status == ZoneStatus::Signed || !self.configured_anchor_covers(name)
+        });
+        exact_known
+            || self.cached_unsigned_zone(name, now).is_some()
             || self.insecure_zone_covers(name, now)
     }
 
@@ -2148,14 +2229,18 @@ impl DnssecValidator {
         // delegation status is `Indeterminate` (AD=0), never a persistent
         // Insecure/Bogus decision: the probe may simply be offline. Signed
         // evidence anywhere in the CNAME chain must still fail closed.
+        //
+        // A failed probe on *any* hop is enough. Even when the queried name is
+        // a legitimately unsigned delegation, a CNAME can point into a signed
+        // zone whose probe failed (offline or blocked DS/DNSKEY fetch); treating
+        // that as Insecure would let an on-path attacker strip RRSIGs and drop
+        // the probe traffic to get an unvalidated signed-target answer.
         if probe_failed && !has_rrsigs && !query_is_nta {
             let qname = response
                 .queries
                 .first()
                 .map_or_else(Name::root, |q| q.name().clone());
-            if !self.signed_chain_contains(response, &qname, now)
-                && !self.insecure_zone_covers(&LowerName::from(&qname), now)
-            {
+            if !self.signed_chain_contains(response, &qname, now) {
                 response.metadata.authentic_data = false;
                 let outcome = ValidationOutcome::Indeterminate;
                 self.metrics.record_validation(&outcome);
@@ -6027,6 +6112,120 @@ mod tests {
         );
     }
 
+    /// Important regression (I1): a persistent `Unsigned` chain-cache entry
+    /// established before `corp.` was anchored must not keep a stripped
+    /// response under the newly anchored zone Insecure. Adding the anchor
+    /// invalidates the cached denial and the fresh probe makes it Bogus.
+    #[tokio::test]
+    async fn test_cached_unsigned_does_not_override_new_trust_anchor() {
+        let (corp_origin, corp_key, corp_signer) = create_test_signer("corp.");
+        let qname = Name::from_str("www.corp.").expect("qname");
+        let corp_zone = LowerName::from(&corp_origin);
+
+        let cache = Arc::new(ChainCache::new(None));
+        let validator =
+            DnssecValidator::from_config_with_cache(&DnssecConfig::default(), Some(cache.clone()))
+                .with_trust_anchors(TrustAnchors::empty());
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+        // A previous (unanchored) run authenticated a DS denial for `corp.`
+        // and persisted it for an hour.
+        cache.insert(
+            corp_zone.clone(),
+            ZoneStatus::Unsigned,
+            now.saturating_add(3600),
+            now,
+        );
+        assert!(
+            !validator.insecure_zone_covers(&corp_zone, now),
+            "sanity: the in-memory map starts empty"
+        );
+
+        // The operator now anchors `corp.` and reloads.
+        validator.add_trust_anchor(&corp_key, corp_zone.clone());
+        assert!(
+            cache.get(&corp_zone, now).is_none(),
+            "the stale unsigned entry must be invalidated by the new anchor"
+        );
+
+        let in_zone = signed_nsec_response(
+            &corp_origin,
+            &qname,
+            &Name::from_str("z.corp.").expect("next"),
+            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+            &qname,
+            &corp_key,
+            &corp_signer,
+            ResponseCode::NoError,
+        );
+        let fetcher = StaticFetcher::new()
+            .with(
+                &corp_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&corp_origin, &corp_key, &corp_signer),
+            )
+            .with(&qname, RecordType::DS, in_zone);
+
+        let mut response = stripped_response(&qname);
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a stripped response under a newly anchored zone must be Bogus: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+    }
+
+    /// Important regression (I2): an offline probe for a CNAME target in a
+    /// signed zone must not fall through to Insecure just because the original
+    /// qname is a legitimately unsigned delegation.
+    #[tokio::test]
+    async fn test_failed_cname_target_probe_is_indeterminate_not_insecure() {
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let unsigned_cut = Name::from_str("unsigned.signed.example.").expect("cut");
+        let qname = Name::from_str("www.unsigned.signed.example.").expect("qname");
+        let target = Name::from_str("www.signed.example.").expect("target");
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+
+        let unsigned_denial = signed_nsec_response(
+            &parent_origin,
+            &unsigned_cut,
+            &Name::from_str("z.signed.example.").expect("next"),
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+            &unsigned_cut,
+            &parent_key,
+            &parent_signer,
+            ResponseCode::NoError,
+        );
+        // The target's DS lookup is deliberately absent: the probe is offline.
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(&unsigned_cut, RecordType::DS, unsigned_denial);
+
+        let mut response = stripped_cname_response(&qname, &target);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Indeterminate,
+            "a failed probe for a signed CNAME target must fail closed with AD=0, not Insecure"
+        );
+        assert!(!response.metadata.authentic_data);
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    }
+
     /// A root-anchored cold start must follow a signed intermediate cut
     /// (`tld.`) and still classify a deeper unsigned delegation as Insecure,
     /// not Bogus. This guards the nested-unsigned false-positive case.
@@ -6141,13 +6340,14 @@ mod tests {
         let zone = Name::from_str("child.signed.example.").expect("zone");
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
         let cache = Arc::new(ChainCache::new(None));
-        cache.insert(LowerName::from(&zone), ZoneStatus::Signed, now + 600, now);
-
+        // The validator records the policy fingerprint on construction; seed
+        // the entry afterwards so it belongs to the active policy.
         let validator = d05_validator(Some(cache.clone()));
         assert!(
             Arc::ptr_eq(validator.chain_cache(), &cache),
             "the validator must reuse the supplied cache"
         );
+        cache.insert(LowerName::from(&zone), ZoneStatus::Signed, now + 600, now);
         let fetcher = StaticFetcher::new();
         let mut response = stripped_response(&zone);
         let outcome = validator
@@ -6381,8 +6581,8 @@ mod tests {
         let (parent_origin, parent_key, _parent_signer) = create_test_signer("signed.example.");
         let child = Name::from_str("child.signed.example.").expect("child");
         let cache = Arc::new(ChainCache::new(None));
+        let signed_validator = d05_validator(Some(cache.clone()));
         cache.insert(LowerName::from(&child), ZoneStatus::Signed, now + 600, now);
-        let signed_validator = d05_validator(Some(cache));
         signed_validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
         let offline = OfflineFetcher::new();
         let mut response =
@@ -6400,13 +6600,13 @@ mod tests {
         // Cached unsigned evidence: offline stays Insecure with no fetch.
         let unsigned = Name::from_str("unsigned.signed.example.").expect("unsigned");
         let cache = Arc::new(ChainCache::new(None));
+        let unsigned_validator = d05_validator(Some(cache.clone()));
         cache.insert(
             LowerName::from(&unsigned),
             ZoneStatus::Unsigned,
             now + 600,
             now,
         );
-        let unsigned_validator = d05_validator(Some(cache));
         let offline = OfflineFetcher::new();
         let mut response =
             stripped_response(&Name::from_str("www.unsigned.signed.example.").expect("qname"));

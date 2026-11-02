@@ -154,37 +154,36 @@ impl MasterCoordinator {
         std::fs::rename(&tmp, path)
     }
 
-    /// Serializes the active bundle on the caller thread, if a state path and
-    /// an active bundle exist.
-    fn serialized_state(&self) -> std::io::Result<Option<(PathBuf, Vec<u8>)>> {
+    /// Serializes `bundle` for the state file, if a state path exists.
+    fn serialized_bundle(
+        &self,
+        bundle: &ConfigBundle,
+    ) -> std::io::Result<Option<(PathBuf, Vec<u8>)>> {
         let path = self.state_path.lock().unwrap().clone();
         let Some(path) = path else {
             return Ok(None);
         };
-        let Some(bundle) = self.active_bundle.lock().unwrap().clone() else {
-            return Ok(None);
-        };
-        let payload = serde_json::to_vec_pretty(&bundle).map_err(|e| {
+        let payload = serde_json::to_vec_pretty(bundle).map_err(|e| {
             std::io::Error::other(format!("failed to serialize HA master state: {e}"))
         })?;
         Ok(Some((path, payload)))
     }
 
-    /// Persists the active bundle and version synchronously.
-    fn persist_state(&self) -> std::io::Result<()> {
-        if let Some((path, payload)) = self.serialized_state()? {
+    /// Persists `bundle` synchronously.
+    fn persist_bundle(&self, bundle: &ConfigBundle) -> std::io::Result<()> {
+        if let Some((path, payload)) = self.serialized_bundle(bundle)? {
             Self::write_state_file(&path, &payload)?;
         }
         Ok(())
     }
 
-    /// Persists the active bundle and version on the blocking pool.
+    /// Persists `bundle` on the blocking pool.
     ///
     /// The caller thread only clones the path/payload; all filesystem work
     /// (directory creation, 0600 write, `sync_all`, rename) runs in
     /// `spawn_blocking` so a slow disk cannot stall a tokio worker.
-    async fn persist_state_async(&self) -> std::io::Result<()> {
-        let Some((path, payload)) = self.serialized_state()? else {
+    async fn persist_bundle_async(&self, bundle: &ConfigBundle) -> std::io::Result<()> {
+        let Some((path, payload)) = self.serialized_bundle(bundle)? else {
             return Ok(());
         };
         tokio::task::spawn_blocking(move || Self::write_state_file(&path, &payload))
@@ -373,9 +372,14 @@ impl MasterCoordinator {
         true
     }
 
-    /// Validates monotonicity, sanitizes and signs `bundle`, then stores it as
-    /// the active bundle/push. The caller must hold [`Self::publish_lock`].
-    fn store_bundle(&self, bundle: ConfigBundle) -> Result<(u64, HaMessage), HaError> {
+    /// Validates monotonicity, sanitizes and signs `bundle` without publishing
+    /// it. Returns the prepared bundle, version, push message and the version
+    /// that was current at validation time. The caller must hold
+    /// [`Self::publish_lock`].
+    fn prepare_bundle(
+        &self,
+        bundle: ConfigBundle,
+    ) -> Result<(ConfigBundle, u64, HaMessage, u64), HaError> {
         // Secret material must never be stored, persisted or signed: the
         // structured `clients` value is sanitized exactly like `config_toml`.
         let mut bundle = bundle;
@@ -391,13 +395,17 @@ impl MasterCoordinator {
                 ),
             });
         }
-        self.current_version.store(version, Ordering::SeqCst);
 
         let push_msg = build_and_sign_push(&bundle, &self.signing_key)?;
+        Ok((bundle, version, push_msg, current))
+    }
 
+    /// Publishes a prepared bundle. The caller must hold
+    /// [`Self::publish_lock`] and have persisted the bundle first.
+    fn publish_prepared(&self, bundle: ConfigBundle, version: u64, push_msg: HaMessage) {
+        self.current_version.store(version, Ordering::SeqCst);
         *self.active_bundle.lock().unwrap() = Some(bundle);
-        *self.active_push.lock().unwrap() = Some(push_msg.clone());
-        Ok((version, push_msg))
+        *self.active_push.lock().unwrap() = Some(push_msg);
     }
 
     /// Publishes the active configuration version to the HA metrics.
@@ -420,8 +428,11 @@ impl MasterCoordinator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let (version, push_msg) = self.store_bundle(bundle)?;
-        self.persist_state()?;
+        let (bundle, version, push_msg, _previous) = self.prepare_bundle(bundle)?;
+        // Persist before publishing: a failed write must leave both the
+        // in-memory active bundle/push and the version sequence untouched.
+        self.persist_bundle(&bundle)?;
+        self.publish_prepared(bundle, version, push_msg.clone());
         self.record_published_version(version);
 
         // Broadcast to all active slaves
@@ -445,17 +456,48 @@ impl MasterCoordinator {
     pub async fn update_bundle_async(&self, bundle: ConfigBundle) -> Result<u64, HaError> {
         let _persist_guard = self.persist_lock.lock().await;
 
-        let (version, push_msg) = {
+        let (bundle, version, push_msg, previous_version) = {
             let _publish_guard = self
                 .publish_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.store_bundle(bundle)?
+            self.prepare_bundle(bundle)?
         };
 
-        if let Err(e) = self.persist_state_async().await {
+        // Persist the prepared document first. Until this succeeds nothing is
+        // visible through `active_push`/`current_version`, so a newly
+        // connecting slave can never receive a bundle the master did not
+        // durably publish.
+        if let Err(e) = self.persist_bundle_async(&bundle).await {
             error!(error = %e, "Failed to persist HA master state");
             return Err(HaError::Io(e));
+        }
+
+        {
+            let publish_guard = self
+                .publish_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A synchronous publisher may have advanced the sequence while the
+            // write was in flight. Publishing our older prepared version would
+            // regress the cluster, so restore the now-active state file and
+            // report the conflict instead.
+            if self.current_version.load(Ordering::SeqCst) != previous_version {
+                drop(publish_guard);
+                let active = self.active_bundle.lock().unwrap().clone();
+                if let Some(active) = active
+                    && let Err(e) = self.persist_bundle_async(&active).await
+                {
+                    error!(error = %e, "Failed to restore HA master state after a concurrent publish");
+                }
+                return Err(HaError::Validation {
+                    field: "version".to_string(),
+                    reason: format!(
+                        "Concurrent publish advanced the HA configuration version above {version}"
+                    ),
+                });
+            }
+            self.publish_prepared(bundle, version, push_msg.clone());
         }
 
         self.record_published_version(version);
@@ -1091,9 +1133,9 @@ pub fn spawn_master_server(
     coordinator = coordinator.with_ping_interval_secs(ha_config.ping_interval_secs);
     tokio::spawn(async move {
         if ha_config.replication_port == 0 {
-            coordinator
-                .metrics
-                .inc_ha_startup_noop("master", "replication_disabled");
+            // The startup no-op metric is recorded by the production call site
+            // (`init_ha`); incrementing it here would double count when both
+            // paths run, and this function is not called for port 0 there.
             info!("Master HA replication is disabled (replication_port is 0)");
             return;
         }
@@ -1448,6 +1490,7 @@ mod tests {
         let blocker = dir.join("not-a-directory");
         std::fs::write(&blocker, b"blocked").unwrap();
         let coordinator = test_coordinator().with_state_path(blocker.join("ha_state.toml"));
+        let before_version = coordinator.get_current_version();
 
         let err = coordinator
             .update_bundle_async(test_bundle(2))
@@ -1457,14 +1500,30 @@ mod tests {
             matches!(err, HaError::Io(_)),
             "expected an I/O error, got {err:?}"
         );
+        assert_eq!(
+            coordinator.get_current_version(),
+            before_version,
+            "a failed persist must not advance the published version"
+        );
+        assert!(
+            coordinator.active_push.lock().unwrap().is_none(),
+            "a failed persist must not expose an active push to new slaves"
+        );
+        assert!(
+            coordinator.active_bundle.lock().unwrap().is_none(),
+            "a failed persist must not leave an active bundle"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// I5: `init_ha` owns the `replication_disabled` no-op counter. The spawned
+    /// listener must not double count it when `init_ha` already recorded it.
     #[tokio::test]
-    async fn test_master_replication_disabled_records_startup_noop() {
+    async fn test_master_replication_disabled_is_not_double_counted() {
         let coordinator = test_coordinator();
         let metrics = coordinator.metrics.clone();
+        metrics.inc_ha_startup_noop("master", "replication_disabled");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = spawn_master_server(
             HaConfig {
@@ -1481,7 +1540,13 @@ mod tests {
             rendered.contains(
                 r#"sito_ha_startup_noop_total{role="master",reason="replication_disabled"} 1"#
             ),
-            "the disabled listener must be observable: {rendered}"
+            "the disabled listener must stay observable without double counting: {rendered}"
+        );
+        assert!(
+            !rendered.contains(
+                r#"sito_ha_startup_noop_total{role="master",reason="replication_disabled"} 2"#
+            ),
+            "spawn_master_server must not increment the startup no-op again"
         );
         let _ = shutdown_tx.send(true);
     }

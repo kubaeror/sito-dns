@@ -70,12 +70,15 @@ exhaustive record.
   filter, group, or alert on `upstream="all"` (or the synthetic
   `upstream="default"` health series); the aggregate error series is no longer
   emitted.
-- **HA apply and ACK**: a slave now applies every component (runtime pipeline,
-  filtering, upstreams, DNSSEC, clients, rewrites), persists the exact document
-  atomically, and waits for the DNS listener readiness gate before acknowledging
-  a pushed bundle. A failure leaves the version watermark unchanged, marks the
-  node `Degraded`, and sends `applied: false` while retaining the last known
-  good runtime configuration. Node-local settings (`[ha]`, instance name,
+- **HA apply and ACK**: a slave now applies every hot-appliable component
+  (runtime pipeline, filtering, upstreams, DNSSEC, clients, rewrites), persists
+  the exact document atomically, and waits for the DNS listener readiness gate
+  before acknowledging a pushed bundle. Restart-only sections (`auth`, `web`,
+  `tls`, `acme`, `integrations`, role/identity changes) are persisted but only
+  take effect after a slave restart; the exact fields are logged instead of
+  being reported as live. A failure leaves the version watermark unchanged,
+  marks the node `Degraded`, and sends `applied: false` while retaining the last
+  known good runtime configuration. Node-local settings (`[ha]`, instance name,
   `data_dir`, MikroTik credentials, client secrets) are preserved on apply.
 - **Updater streaming**: release downloads are streamed to a temporary file
   with a running byte cap (256 MiB for archives, 1 MiB for `.sig`/`.pem`
@@ -94,9 +97,10 @@ exhaustive record.
   immediate in memory and on all request paths; the on-disk token snapshot may
   lag by up to 60 s until the pruner persists it.
 - **Corrupt embedded rule data no longer panics**: parental, service, and
-  anti-bypass manifests that fail to load now log an error and degrade to an
-  empty registry instead of aborting the process. Skipped-rule counts are
-  logged once per load.
+  anti-bypass manifests that fail to load now refuse startup with a clear error
+  instead of aborting the process. The failure is reported by `init_runtime`
+  without panicking; operators should reinstall the packaged data rather than
+  run with a partially loaded registry.
 
 ### Security
 - **TOTP secrets encrypted at rest**: `users.toml` now stores each TOTP secret
@@ -120,7 +124,13 @@ exhaustive record.
   never part of HA bundles or backups). Every distinct name in a CNAME chain is
   checked, and a chain that needs more than 8 distinct probes fails closed as
   Bogus. A never-proven zone that cannot be probed while offline is reported as
-  Indeterminate with AD=0 instead of being treated as signed or unsigned.
+  Indeterminate with AD=0 instead of being treated as signed or unsigned; a
+  failed probe for any CNAME hop fails closed even when the original qname is
+  legitimately unsigned. NSEC3 covering proofs are only accepted from an RRset
+  signed by a validated parent key, so a forged covering proof cannot mark a
+  cut signed or persist a `Signed` cache entry. Cached delegation statuses are
+  scoped to the trust-anchor/NTA policy that produced them, so adding an anchor
+  cannot be overridden by an older cached `Unsigned` delegation.
 
 ### Migration
 - **Stats rollup schema**: migration `20260922000000_hourly_rollup_tops.sql`

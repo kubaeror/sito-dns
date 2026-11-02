@@ -195,6 +195,7 @@ async fn create_test_context(
         rewrites,
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
+        apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         master_coordinator: master_coord,
         slave_tracker: slave_track,
         resync_sender: resync_tx,
@@ -1073,9 +1074,8 @@ nta = ["pushed.internal"]
         "a push must not trigger a second filter download/compile through the watcher"
     );
 
-    // Non-HA watcher behavior is unchanged: once the self-write record is
-    // consumed, an equal external document (touch / no-op save) still goes
-    // through the normal apply path.
+    // A duplicate watcher event for the same recent self-write is suppressed
+    // too (the tracker keeps a bounded recent set, not just one document).
     match apply_config_document_event(
         &ctx,
         &persisted,
@@ -1085,19 +1085,22 @@ nta = ["pushed.internal"]
     )
     .await
     {
-        ConfigFileApplyOutcome::Applied(_) => {}
-        other => panic!("an equal non-HA document must still be applied, got {other:?}"),
+        ConfigFileApplyOutcome::SelfWriteIgnored => {}
+        other => panic!("a duplicate self-write event must be ignored, got {other:?}"),
     }
     assert_eq!(
         filter_compile_count(&ctx.metrics),
-        filter_compiles_before + 1,
-        "a non-HA equal document retains the old watcher apply behavior"
+        filter_compiles_before,
+        "a duplicate self-write event must not recompile the filter"
     );
 
     // A changed watcher document is applied normally.
     let mut changed = (**ctx.config.load()).clone();
     changed.upstream.servers = vec!["8.8.8.8".to_string()];
     let changed_document = toml::to_string_pretty(&changed).unwrap();
+    tokio::fs::write(&ctx.config_path, &changed_document)
+        .await
+        .unwrap();
     match apply_config_document_event(
         &ctx,
         &changed_document,
@@ -1116,7 +1119,7 @@ nta = ["pushed.internal"]
     );
     assert_eq!(
         filter_compile_count(&ctx.metrics),
-        filter_compiles_before + 2
+        filter_compiles_before + 1
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
