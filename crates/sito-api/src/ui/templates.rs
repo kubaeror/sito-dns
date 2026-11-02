@@ -69,6 +69,8 @@ pub struct TokenViewItem {
     pub id: String,
     pub name: String,
     pub scope: String,
+    /// Display label for Admins; ordinary users only see their own tokens.
+    pub owner: String,
     pub created_at: String,
     pub last_used: String,
     pub expires_at: String,

@@ -406,14 +406,40 @@ pub async fn list_tokens(
     security(("bearer_auth" = []), ("cookie_auth" = []))
 )]
 pub async fn create_token(
-    _admin: RequireAdmin,
+    admin: RequireAdmin,
     State(ctx): State<ServerContext>,
     Json(req): Json<CreateTokenRequest>,
 ) -> Result<Json<CreateTokenResponse>, ProblemDetails> {
     let scope = Role::from_str(&req.scope)
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid token scope: {e}")))?;
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ProblemDetails::bad_request("Token name is required"));
+    }
+    if name.len() > 128 {
+        return Err(ProblemDetails::bad_request(
+            "Token name must be at most 128 characters",
+        ));
+    }
 
-    let (_meta, resp) = ctx.auth_mgr.create_token(&req.name, scope).await;
+    // Session-created tokens belong to the signed-in account. A bearer-token
+    // caller inherits the owner of the token it authenticated with (or stays
+    // ownerless for legacy tokens), so ownership chains correctly.
+    let owner = match admin.token_id.as_deref() {
+        Some(token_id) => ctx
+            .auth_mgr
+            .list_tokens()
+            .into_iter()
+            .find(|token| token.id == token_id)
+            .and_then(|token| token.owner),
+        None => Some(admin.username.clone()),
+    };
+
+    let (_meta, resp) = ctx
+        .auth_mgr
+        .create_token(name, scope, owner.as_deref())
+        .await
+        .map_err(|e| ProblemDetails::bad_request(e.to_string()))?;
     Ok(Json(resp))
 }
 
@@ -456,6 +482,11 @@ pub(crate) fn validate_username(username: &str) -> Result<(), ProblemDetails> {
     if trimmed.len() > 64 {
         return Err(ProblemDetails::bad_request(
             "Username must be at most 64 characters",
+        ));
+    }
+    if matches!(trimmed, "." | "..") {
+        return Err(ProblemDetails::bad_request(
+            "Username must not be '.' or '..'",
         ));
     }
     if trimmed
@@ -575,18 +606,20 @@ pub async fn create_user(
     validate_password_policy(&req.password)?;
     let role = Role::from_str(req.role.trim())
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid role: {e}")))?;
+    // Normalize surrounding whitespace exactly like the web UI so both paths
+    // create the same account name.
+    let username = req.username.trim();
 
-    if ctx.auth_mgr.has_user(&req.username) {
+    if ctx.auth_mgr.has_user(username) {
         return Err(ProblemDetails::conflict(format!(
-            "User '{}' already exists",
-            req.username
+            "User '{username}' already exists"
         )));
     }
     ctx.auth_mgr
-        .create_user(&req.username, &req.password, role)
+        .create_user(username, &req.password, role)
         .await;
     Ok(Json(UserDto {
-        username: req.username,
+        username: username.to_string(),
         role: role.to_string(),
         totp_enabled: false,
     }))
@@ -936,7 +969,11 @@ mod tests {
     async fn test_token_api_never_returns_hashes() {
         let temp_dir = crate::test_support::temp_dir("sito_auth_tokens");
         let ctx = crate::test_support::mock_context(&temp_dir).await;
-        let (meta, _resp) = ctx.auth_mgr.create_token("grafana", Role::Viewer).await;
+        let (meta, _resp) = ctx
+            .auth_mgr
+            .create_token("grafana", Role::Viewer, None)
+            .await
+            .expect("token");
 
         let Json(dtos) = list_tokens(admin(), State(ctx.clone())).await;
         assert_eq!(dtos.len(), 1);
@@ -1123,6 +1160,76 @@ mod tests {
             .expect_err("weak password rejected");
             assert_eq!(err.status, 400, "password '{password}' must be rejected");
         }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_user_trims_whitespace_and_rejects_dot_names() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_user_names");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let created = create_user(
+            admin(),
+            State(ctx.clone()),
+            Json(CreateUserRequest {
+                username: "  alice  ".to_string(),
+                password: "AlicePassword1".to_string(),
+                role: "viewer".to_string(),
+            }),
+        )
+        .await
+        .expect("user created");
+        assert_eq!(created.0.username, "alice");
+        assert!(ctx.auth_mgr.has_user("alice"));
+        assert!(
+            !ctx.auth_mgr.has_user("  alice  "),
+            "the stored username must be normalized exactly like the UI"
+        );
+
+        for username in [".", ".."] {
+            let err = create_user(
+                admin(),
+                State(ctx.clone()),
+                Json(CreateUserRequest {
+                    username: username.to_string(),
+                    password: "AlicePassword1".to_string(),
+                    role: "viewer".to_string(),
+                }),
+            )
+            .await
+            .expect_err("dot names must be rejected");
+            assert_eq!(err.status, 400, "username '{username}' must be rejected");
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_token_trims_name_and_records_owner() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_token_name");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let Json(resp) = create_token(
+            admin(),
+            State(ctx.clone()),
+            Json(CreateTokenRequest {
+                name: "  ci-deploy  ".to_string(),
+                scope: "viewer".to_string(),
+            }),
+        )
+        .await
+        .expect("token created");
+        assert_eq!(resp.name, "ci-deploy");
+
+        let token = ctx
+            .auth_mgr
+            .list_tokens()
+            .into_iter()
+            .find(|token| token.id == resp.id)
+            .expect("token listed");
+        assert_eq!(token.name, "ci-deploy");
+        assert_eq!(token.owner.as_deref(), Some("admin"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

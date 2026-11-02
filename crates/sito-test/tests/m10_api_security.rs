@@ -201,8 +201,9 @@ async fn test_acceptance_m10_csrf_and_origin_enforcement() {
     // 5. Bearer-token mutation is exempt from the double submit.
     let admin_tok = ctx
         .auth_mgr
-        .create_token("csrf-test", Role::Admin)
+        .create_token("csrf-test", Role::Admin, None)
         .await
+        .expect("token")
         .1
         .token;
     let req = Request::builder()
@@ -387,8 +388,9 @@ async fn test_acceptance_m10_metrics_token_auth() {
     // Query token is not accepted outside WebSocket upgrades.
     let tok = ctx
         .auth_mgr
-        .create_token("metrics", Role::Viewer)
+        .create_token("metrics", Role::Viewer, None)
         .await
+        .expect("token")
         .1
         .token;
     let req = Request::builder()
@@ -417,7 +419,13 @@ async fn test_acceptance_m10_restore_preview_is_masked() {
     tokio::fs::create_dir_all(&temp_dir).await.unwrap();
     let ctx = create_test_context(&temp_dir, false).await;
     let app = sito_api::create_router(ctx.clone());
-    let admin_tok = ctx.auth_mgr.create_token("mask", Role::Admin).await.1.token;
+    let admin_tok = ctx
+        .auth_mgr
+        .create_token("mask", Role::Admin, None)
+        .await
+        .expect("token")
+        .1
+        .token;
 
     let secret_toml = r#"
 [server]
@@ -581,6 +589,35 @@ async fn test_acceptance_m10_ui_users_csrf_and_rbac() {
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
     assert!(ctx.auth_mgr.has_user("alice"));
+
+    // 5. The full router serves the account token form (CSRF-protected) and
+    //    records the authenticated account as the token owner.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ui/account/tokens")
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://localhost")
+        .header(header::COOKIE, &admin_cookies)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!(
+            "csrf_token={admin_csrf}&name=router-token&scope=viewer"
+        )))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_string(res).await;
+    assert!(body.contains("router-token"));
+    assert!(
+        body.contains("sito_"),
+        "the one-time plaintext token must be rendered"
+    );
+    let router_token = ctx
+        .auth_mgr
+        .list_tokens()
+        .into_iter()
+        .find(|token| token.name == "router-token")
+        .expect("token stored");
+    assert_eq!(router_token.owner.as_deref(), Some("admin"));
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

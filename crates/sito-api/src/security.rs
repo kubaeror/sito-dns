@@ -54,6 +54,8 @@ fn is_sensitive_path(path: &str) -> bool {
                 | "/upstreams"
                 | "/settings"
                 | "/system"
+                | "/users"
+                | "/account"
         )
 }
 
@@ -603,6 +605,8 @@ mod tests {
         assert!(is_sensitive_path("/wizard"));
         assert!(is_sensitive_path("/dashboard"));
         assert!(is_sensitive_path("/querylog"));
+        assert!(is_sensitive_path("/users"));
+        assert!(is_sensitive_path("/account"));
         assert!(!is_sensitive_path("/static/app.js"));
         assert!(!is_sensitive_path("/assets/app.js"));
         assert!(!is_sensitive_path("/health"));

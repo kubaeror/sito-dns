@@ -163,8 +163,9 @@ async fn create_test_context(
     ))));
     let auth_mgr = Arc::new(AuthManager::new());
     let (_meta, token_resp) = auth_mgr
-        .create_token("admin", sito_api::auth::Role::Admin)
-        .await;
+        .create_token("admin", sito_api::auth::Role::Admin, None)
+        .await
+        .expect("token");
     let admin_token = token_resp.token;
 
     let runtime = Arc::new(sito_runtime::RuntimeState::new(

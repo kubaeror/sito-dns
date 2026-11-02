@@ -185,20 +185,23 @@ async fn test_acceptance_m5_rbac_matrix() {
     // Create tokens for all 3 roles
     let admin_tok = ctx
         .auth_mgr
-        .create_token("adm-test", Role::Admin)
+        .create_token("adm-test", Role::Admin, None)
         .await
+        .expect("token")
         .1
         .token;
     let oper_tok = ctx
         .auth_mgr
-        .create_token("opr-test", Role::Operator)
+        .create_token("opr-test", Role::Operator, None)
         .await
+        .expect("token")
         .1
         .token;
     let view_tok = ctx
         .auth_mgr
-        .create_token("viw-test", Role::Viewer)
+        .create_token("viw-test", Role::Viewer, None)
         .await
+        .expect("token")
         .1
         .token;
 
@@ -366,8 +369,9 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
     let (ctx, _cfg_path, _writer) = create_test_context(&temp_dir).await;
     let admin_tok = ctx
         .auth_mgr
-        .create_token("adm-ql", Role::Admin)
+        .create_token("adm-ql", Role::Admin, None)
         .await
+        .expect("token")
         .1
         .token;
 
@@ -503,8 +507,9 @@ async fn test_acceptance_m5_websocket_livetail() {
     let (ctx, _cfg_path, _writer) = create_test_context(&temp_dir).await;
     let view_tok = ctx
         .auth_mgr
-        .create_token("ws-viewer", Role::Viewer)
+        .create_token("ws-viewer", Role::Viewer, None)
         .await
+        .expect("token")
         .1
         .token;
     let sender = ctx.querylog_sender.clone();
@@ -585,7 +590,11 @@ async fn test_acceptance_m5_prometheus_table_14_2() {
     ctx.metrics.set_ha_slaves_connected(2);
     ctx.metrics.set_querylog_dropped(1);
 
-    let (_meta, token_resp) = ctx.auth_mgr.create_token("viewer", Role::Viewer).await;
+    let (_meta, token_resp) = ctx
+        .auth_mgr
+        .create_token("viewer", Role::Viewer, None)
+        .await
+        .expect("token");
     let app = sito_api::create_router(ctx);
 
     let req = Request::builder()
@@ -714,8 +723,9 @@ async fn test_acceptance_m5_api_backup_and_token_restore() {
     let (ctx, _config_path, _writer) = create_test_context(&temp_dir).await;
     let admin_tok = ctx
         .auth_mgr
-        .create_token("adm-bck", Role::Admin)
+        .create_token("adm-bck", Role::Admin, None)
         .await
+        .expect("token")
         .1
         .token;
     let app = sito_api::create_router(ctx.clone());
@@ -807,8 +817,9 @@ async fn test_acceptance_m5_metrics_auth() {
     // Create viewer account
     let view_tok = ctx
         .auth_mgr
-        .create_token("viewer", Role::Viewer)
+        .create_token("viewer", Role::Viewer, None)
         .await
+        .expect("token")
         .1
         .token;
 

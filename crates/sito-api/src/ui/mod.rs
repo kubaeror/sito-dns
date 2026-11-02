@@ -395,6 +395,7 @@ mod tests {
                 id: "tok_abc".to_string(),
                 name: "ci-deploy".to_string(),
                 scope: "viewer".to_string(),
+                owner: "alice".to_string(),
                 created_at: "2026-01-01 00:00 UTC".to_string(),
                 last_used: "—".to_string(),
                 expires_at: "—".to_string(),

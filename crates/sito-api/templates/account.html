@@ -79,6 +79,7 @@
         <tr>
           <th>Name</th>
           <th>Scope</th>
+          {% if user_role == "admin" %}<th>Owner</th>{% endif %}
           <th>Created</th>
           <th>Last Used</th>
           <th>Expires</th>
@@ -90,6 +91,7 @@
         <tr>
           <td class="td-strong">{{ t.name }}</td>
           <td><span class="badge badge-info">{{ t.scope }}</span></td>
+          {% if user_role == "admin" %}<td class="mono" style="color: var(--text-secondary);">{{ t.owner }}</td>{% endif %}
           <td class="mono" style="color: var(--text-secondary);">{{ t.created_at }}</td>
           <td class="mono" style="color: var(--text-secondary);">{{ t.last_used }}</td>
           <td class="mono" style="color: var(--text-secondary);">{{ t.expires_at }}</td>
@@ -106,7 +108,7 @@
         </tr>
         {% else %}
         <tr>
-          <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 24px;">No API tokens yet</td>
+          <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 24px;">No API tokens yet</td>
         </tr>
         {% endfor %}
       </tbody>

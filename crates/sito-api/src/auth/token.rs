@@ -62,6 +62,11 @@ pub struct ApiTokenMeta {
     /// invalidates tokens even if their persisted file survives.
     #[serde(default)]
     pub generation: u64,
+    /// Account that created the token. `None` covers legacy tokens written
+    /// before ownership was tracked; those are managed by Admins only.
+    /// Deliberately not exposed through `ApiTokenDto`/OpenAPI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 /// Response returned when creating an API token.
@@ -97,6 +102,7 @@ pub fn generate_token(name: &str, scope: Role) -> (ApiTokenMeta, CreateTokenResp
         last_used: None,
         expires_at: None,
         generation: 0,
+        owner: None,
     };
 
     let response = CreateTokenResponse {

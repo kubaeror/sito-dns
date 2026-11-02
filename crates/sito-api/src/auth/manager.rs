@@ -90,6 +90,16 @@ pub const SETUP_TOKEN_RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Age at which a still-pending setup emits a one-time operator warning.
 pub const SETUP_TOKEN_PENDING_WARN: Duration = Duration::from_hours(24);
 
+/// Failure to create an API token at the global capacity limit when the
+/// requesting account has no token of its own to evict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CreateTokenError {
+    #[error(
+        "API token capacity reached and this account has no revocable tokens; revoke a token and try again"
+    )]
+    CapacityReached,
+}
+
 #[derive(Debug, Clone)]
 struct PendingTotp {
     config: TotpConfig,
@@ -1246,6 +1256,17 @@ impl AuthManager {
             // A deleted account must lose access immediately: sessions are
             // not re-validated against the user table on every request.
             self.purge_user_sessions(username).await;
+            // API tokens are credentials for the account too: never leave
+            // them usable after the account is gone.
+            let removed_tokens = {
+                let mut tokens = lock(&self.tokens);
+                let before = tokens.len();
+                tokens.retain(|_, token| token.owner.as_deref() != Some(username));
+                tokens.len() != before
+            };
+            if removed_tokens {
+                self.save_tokens_async().await;
+            }
             self.save_users_async().await;
         }
         removed
@@ -1763,14 +1784,20 @@ impl AuthManager {
         }
     }
 
-    /// Creates a new API token with the specified scope.
+    /// Creates a new API token owned by `owner`.
+    ///
+    /// At the global capacity limit only a token owned by the same account is
+    /// evicted (oldest first). If the owner has no token to evict, the create
+    /// fails instead of silently deleting another account's credential.
     pub async fn create_token(
         &self,
         name: &str,
         scope: Role,
-    ) -> (ApiTokenMeta, CreateTokenResponse) {
+        owner: Option<&str>,
+    ) -> Result<(ApiTokenMeta, CreateTokenResponse), CreateTokenError> {
         let (mut meta, resp) = generate_token(name, scope);
         meta.generation = self.generation;
+        meta.owner = owner.map(str::to_string);
         if self.token_default_ttl_days > 0 {
             let ttl_secs = i64::try_from(self.token_default_ttl_days)
                 .unwrap_or(i64::MAX / 86_400)
@@ -1781,20 +1808,23 @@ impl AuthManager {
             let mut tokens = lock(&self.tokens);
             let now = chrono::Utc::now().timestamp();
             tokens.retain(|_, t| t.expires_at.is_none_or(|exp| now < exp));
-            while tokens.len() >= MAX_API_TOKENS {
-                let Some(oldest_key) = tokens
+            if tokens.len() >= MAX_API_TOKENS {
+                let oldest_same_owner = tokens
                     .iter()
+                    .filter(|(_, t)| t.owner.as_deref() == owner)
                     .min_by_key(|(_, t)| (t.created_at, t.id.clone()))
-                    .map(|(k, _)| k.clone())
-                else {
-                    break;
-                };
-                tokens.remove(&oldest_key);
+                    .map(|(k, _)| k.clone());
+                match oldest_same_owner {
+                    Some(key) => {
+                        tokens.remove(&key);
+                    }
+                    None => return Err(CreateTokenError::CapacityReached),
+                }
             }
             tokens.insert(meta.hash.clone(), meta.clone());
         }
         self.save_tokens_async().await;
-        (meta, resp)
+        Ok((meta, resp))
     }
 
     /// Lists all active API tokens.
@@ -2197,12 +2227,16 @@ mod tests {
     #[tokio::test]
     async fn test_auth_manager_api_tokens() {
         let mgr = AuthManager::new();
-        let (meta, resp) = mgr.create_token("grafana", Role::Viewer).await;
+        let (meta, resp) = mgr
+            .create_token("grafana", Role::Viewer, Some("admin"))
+            .await
+            .expect("token");
 
         assert_eq!(mgr.list_tokens().len(), 1);
         let validated = mgr.validate_token(&resp.token).expect("valid token");
         assert_eq!(validated.id, meta.id);
         assert_eq!(validated.scope, Role::Viewer);
+        assert_eq!(validated.owner.as_deref(), Some("admin"));
 
         assert!(mgr.delete_token(&meta.id).await);
         assert!(mgr.validate_token(&resp.token).is_none());
@@ -2213,9 +2247,77 @@ mod tests {
     async fn test_api_token_cap_evicts() {
         let mgr = AuthManager::new();
         for i in 0..(MAX_API_TOKENS + 5) {
-            mgr.create_token(&format!("tok-{i}"), Role::Viewer).await;
+            mgr.create_token(&format!("tok-{i}"), Role::Viewer, None)
+                .await
+                .expect("token");
         }
         assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
+    }
+
+    #[tokio::test]
+    async fn test_api_token_capacity_never_evicts_another_owners_token() {
+        let mgr = AuthManager::new();
+        for i in 0..MAX_API_TOKENS {
+            mgr.create_token(&format!("admin-{i}"), Role::Admin, Some("admin"))
+                .await
+                .expect("admin token");
+        }
+        assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
+
+        let err = mgr
+            .create_token("viewer-new", Role::Viewer, Some("viewer"))
+            .await
+            .expect_err("full store must not evict another owner's token");
+        assert_eq!(err, CreateTokenError::CapacityReached);
+        assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
+        assert!(
+            mgr.list_tokens()
+                .iter()
+                .all(|token| token.owner.as_deref() == Some("admin"))
+        );
+
+        // The same owner can still rotate its oldest token.
+        mgr.create_token("admin-new", Role::Admin, Some("admin"))
+            .await
+            .expect("same-owner rotation");
+        assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
+        assert!(
+            mgr.list_tokens()
+                .iter()
+                .any(|token| token.name == "admin-new")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_user_revokes_owned_tokens() {
+        let mgr = AuthManager::new();
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        let (alice_token, _) = mgr
+            .create_token("alice-token", Role::Operator, Some("alice"))
+            .await
+            .expect("alice token");
+        let (admin_token, _) = mgr
+            .create_token("admin-token", Role::Admin, Some("admin"))
+            .await
+            .expect("admin token");
+        mgr.create_token("legacy", Role::Viewer, None)
+            .await
+            .expect("legacy token");
+
+        assert!(mgr.delete_user("alice").await);
+
+        let ids: Vec<String> = mgr
+            .list_tokens()
+            .into_iter()
+            .map(|token| token.id)
+            .collect();
+        assert!(
+            !ids.contains(&alice_token.id),
+            "deleting a user must revoke their API tokens"
+        );
+        assert!(ids.contains(&admin_token.id));
+        assert_eq!(ids.len(), 2, "admin-owned and legacy tokens must survive");
     }
 
     #[test]
@@ -2693,7 +2795,10 @@ mod tests {
                 30, // 30-day token TTL
             )
             .unwrap();
-            let (meta, resp) = mgr.create_token("ci", Role::Operator).await;
+            let (meta, resp) = mgr
+                .create_token("ci", Role::Operator, None)
+                .await
+                .expect("token");
             assert!(meta.expires_at.is_some(), "default TTL must be applied");
             resp.token
         };
@@ -2727,7 +2832,10 @@ mod tests {
         let _ = std::fs::create_dir_all(&temp_dir);
 
         let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
-        let (mut meta, resp) = mgr.create_token("expired", Role::Viewer).await;
+        let (mut meta, resp) = mgr
+            .create_token("expired", Role::Viewer, None)
+            .await
+            .expect("token");
         meta.expires_at = Some(chrono::Utc::now().timestamp() - 10);
         lock(&mgr.tokens).insert(meta.hash.clone(), meta);
         mgr.save_tokens_async().await;
@@ -2794,7 +2902,10 @@ mod tests {
         }));
         // The manager must keep working instead of panicking.
         assert!(mgr.has_user("admin"));
-        let (meta, resp) = mgr.create_token("post-poison", Role::Viewer).await;
+        let (meta, resp) = mgr
+            .create_token("post-poison", Role::Viewer, None)
+            .await
+            .expect("token");
         assert!(mgr.validate_token(&resp.token).is_some());
         assert!(mgr.delete_token(&meta.id).await);
     }
@@ -2813,7 +2924,10 @@ mod tests {
             else {
                 panic!("login failed");
             };
-            let (_meta, resp) = mgr.create_token("ci", Role::Operator).await;
+            let (_meta, resp) = mgr
+                .create_token("ci", Role::Operator, None)
+                .await
+                .expect("token");
             assert!(mgr.validate_session(&session.id).is_some());
             assert!(mgr.validate_token(&resp.token).is_some());
             let token_hash = hash_token(&resp.token);
@@ -2953,7 +3067,10 @@ mod tests {
         let caller_thread = std::thread::current().id();
         mgr.create_user("alice", "AlicePassword1", Role::Operator)
             .await;
-        let (meta, _resp) = mgr.create_token("ci", Role::Viewer).await;
+        let (meta, _resp) = mgr
+            .create_token("ci", Role::Viewer, None)
+            .await
+            .expect("token");
         let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1").await
         else {
             panic!("expected direct login");
@@ -3246,7 +3363,7 @@ mod send_checks {
         assert_send(mgr.delete_user("a"));
         assert_send(mgr.disable_totp("a"));
         assert_send(mgr.logout("a"));
-        assert_send(mgr.create_token("a", Role::Viewer));
+        assert_send(mgr.create_token("a", Role::Viewer, None));
         assert_send(mgr.delete_token("a"));
         assert_send(mgr.prune());
     }

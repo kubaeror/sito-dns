@@ -2353,6 +2353,16 @@ fn format_token_timestamp(ts: Option<i64>) -> String {
         )
 }
 
+/// `expires_at` is persisted as Unix seconds (unlike millisecond audit
+/// timestamps), so format it through the seconds constructor.
+fn format_token_expiry_timestamp(ts: Option<i64>) -> String {
+    ts.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+        .map_or_else(
+            || "—".to_string(),
+            |dt| dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+        )
+}
+
 fn user_view_items(ctx: &ServerContext, current_username: &str) -> Vec<UserViewItem> {
     ctx.auth_mgr
         .list_users()
@@ -2371,18 +2381,26 @@ fn user_view_items(ctx: &ServerContext, current_username: &str) -> Vec<UserViewI
         .collect()
 }
 
-fn token_view_items(ctx: &ServerContext, max_scope: Role) -> Vec<TokenViewItem> {
+fn token_view_items(ctx: &ServerContext, user: &AuthUser) -> Vec<TokenViewItem> {
+    let is_admin = user.role == Role::Admin;
     ctx.auth_mgr
         .list_tokens()
         .iter()
-        .filter(|token| token.scope <= max_scope)
+        .filter(|token| {
+            token.owner.as_deref() == Some(user.username.as_str())
+                || (is_admin && token.owner.is_none())
+        })
         .map(|token| TokenViewItem {
             id: token.id.clone(),
             name: token.name.clone(),
             scope: token.scope.to_string(),
+            owner: token
+                .owner
+                .clone()
+                .unwrap_or_else(|| "(legacy / ownerless)".to_string()),
             created_at: format_token_timestamp(Some(token.created_at)),
             last_used: format_token_timestamp(token.last_used),
-            expires_at: format_token_timestamp(token.expires_at),
+            expires_at: format_token_expiry_timestamp(token.expires_at),
         })
         .collect()
 }
@@ -2419,7 +2437,7 @@ fn render_account_page(
     new_token: Option<&crate::auth::token::CreateTokenResponse>,
     status: StatusCode,
 ) -> Response {
-    let tokens = token_view_items(ctx, user.role);
+    let tokens = token_view_items(ctx, user);
     let totp_enabled = ctx.auth_mgr.totp_enabled(&user.username);
     let (token_value, token_name, token_scope) = match new_token {
         Some(token) => (
@@ -2665,7 +2683,7 @@ pub async fn account_password_handler(
     }
     if !ctx
         .auth_mgr
-        .verify_user_password(&user.username, &form.current_password)
+        .verify_user_password(&user.username, form.current_password.trim())
         .await
     {
         return account_problem_page(
@@ -2737,8 +2755,7 @@ pub async fn account_token_create_handler(
             );
         }
     };
-    // API tokens are global in the current auth model, so never let a lower
-    // role mint a token that outranks it.
+    // Tokens are owned per account, and a token must never outrank its owner.
     if scope > user.role {
         return account_problem_page(
             &ctx,
@@ -2748,7 +2765,21 @@ pub async fn account_token_create_handler(
         );
     }
 
-    let (_meta, token) = ctx.auth_mgr.create_token(name, scope).await;
+    let (_meta, token) = match ctx
+        .auth_mgr
+        .create_token(name, scope, Some(&user.username))
+        .await
+    {
+        Ok(token) => token,
+        Err(e) => {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request(e.to_string()),
+            );
+        }
+    };
     tracing::info!(user = %user.username, token = %token.id, "User created an API token from the web UI");
     // The plaintext token is shown only in this response and is never stored
     // or logged; reloading the page lists metadata only.
@@ -2778,13 +2809,17 @@ pub async fn account_token_delete_handler(
             ProblemDetails::not_found(format!("Token '{id}' not found")),
         );
     };
-    // Tokens are global; prevent a lower role from revoking a higher one.
-    if token.scope > user.role {
+    // Only the owner may revoke a token. Admins additionally manage legacy
+    // ownerless tokens created before ownership was tracked. Another user's
+    // token ID must look indistinguishable from a missing token.
+    let is_own = token.owner.as_deref() == Some(user.username.as_str());
+    let is_admin_legacy = user.role == Role::Admin && token.owner.is_none();
+    if !is_own && !is_admin_legacy {
         return account_problem_page(
             &ctx,
             &user,
             &csrf,
-            ProblemDetails::forbidden("A token scope may not exceed your own role"),
+            ProblemDetails::not_found(format!("Token '{id}' not found")),
         );
     }
 
@@ -3827,7 +3862,7 @@ mod tests {
             State(ctx.clone()),
             headers.clone(),
             Form(CreateUserForm {
-                username: "alice".to_string(),
+                username: "  alice  ".to_string(),
                 password: "AlicePassword1".to_string(),
                 role: "operator".to_string(),
             }),
@@ -3964,7 +3999,7 @@ mod tests {
             State(ctx.clone()),
             headers,
             Form(AccountPasswordForm {
-                current_password: "adminadmin".to_string(),
+                current_password: "  adminadmin  ".to_string(),
                 new_password: "NewAdminPassword1".to_string(),
             }),
         )
@@ -3998,7 +4033,7 @@ mod tests {
             State(ctx.clone()),
             headers.clone(),
             Form(CreateAccountTokenForm {
-                name: "ci-deploy".to_string(),
+                name: "  ci-deploy  ".to_string(),
                 scope: "viewer".to_string(),
             }),
         )
@@ -4086,6 +4121,164 @@ mod tests {
         assert_eq!(ctx.auth_mgr.list_tokens().len(), 1);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_account_tokens_are_per_owner() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_token_owner_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+        ctx.auth_mgr
+            .create_user("view_user", "ViewerPass1", Role::Viewer)
+            .await;
+
+        let (oper_token, _) = ctx
+            .auth_mgr
+            .create_token("oper-token", Role::Operator, Some("oper_user"))
+            .await
+            .expect("operator token");
+        let (admin_token, _) = ctx
+            .auth_mgr
+            .create_token("admin-token", Role::Admin, Some("admin"))
+            .await
+            .expect("admin token");
+        let (legacy_token, _) = ctx
+            .auth_mgr
+            .create_token("legacy-token", Role::Viewer, None)
+            .await
+            .expect("legacy token");
+        let (viewer_token, _) = ctx
+            .auth_mgr
+            .create_token("viewer-token", Role::Viewer, Some("view_user"))
+            .await
+            .expect("viewer token");
+
+        let LoginResult::Success(view_session) = ctx
+            .auth_mgr
+            .login("view_user", "ViewerPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("viewer login failed");
+        };
+        let view_headers = session_headers(&view_session);
+
+        let resp = account_page(State(ctx.clone()), view_headers.clone()).await;
+        let body = response_body(resp).await;
+        assert!(body.contains("viewer-token"));
+        assert!(!body.contains("oper-token"));
+        assert!(!body.contains("admin-token"));
+        assert!(!body.contains("legacy-token"));
+        assert!(
+            !body.contains("<th>Owner</th>"),
+            "non-admins must not see the owner column"
+        );
+
+        // Viewer cannot revoke an Operator, Admin, or legacy token, and the
+        // response is indistinguishable from a missing token.
+        for foreign_id in [&oper_token.id, &admin_token.id, &legacy_token.id] {
+            let resp = account_token_delete_handler(
+                State(ctx.clone()),
+                view_headers.clone(),
+                Path(foreign_id.clone()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert!(
+                ctx.auth_mgr
+                    .list_tokens()
+                    .iter()
+                    .any(|token| &token.id == foreign_id),
+                "a foreign token must survive a Viewer revoke attempt"
+            );
+        }
+
+        let resp = account_token_delete_handler(
+            State(ctx.clone()),
+            view_headers,
+            Path(viewer_token.id.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(
+            !ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == viewer_token.id)
+        );
+
+        // An Operator also cannot revoke an Admin token or a legacy token.
+        let LoginResult::Success(oper_session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+        let oper_headers = session_headers(&oper_session);
+        for foreign_id in [&admin_token.id, &legacy_token.id] {
+            let resp = account_token_delete_handler(
+                State(ctx.clone()),
+                oper_headers.clone(),
+                Path(foreign_id.clone()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert!(
+                ctx.auth_mgr
+                    .list_tokens()
+                    .iter()
+                    .any(|token| &token.id == foreign_id)
+            );
+        }
+        let resp = account_page(State(ctx.clone()), oper_headers).await;
+        let body = response_body(resp).await;
+        assert!(body.contains("oper-token"));
+        assert!(!body.contains("admin-token"));
+        assert!(!body.contains("legacy-token"));
+
+        // The Admin sees their own tokens plus legacy ownerless tokens, never
+        // another account's tokens, and may revoke the legacy ones.
+        let LoginResult::Success(admin_session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let admin_headers = session_headers(&admin_session);
+        let resp = account_page(State(ctx.clone()), admin_headers.clone()).await;
+        let body = response_body(resp).await;
+        assert!(body.contains("admin-token"));
+        assert!(body.contains("legacy-token"));
+        assert!(!body.contains("oper-token"));
+        assert!(body.contains("<th>Owner</th>"));
+
+        let resp = account_token_delete_handler(
+            State(ctx.clone()),
+            admin_headers,
+            Path(legacy_token.id.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(
+            !ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == legacy_token.id)
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_format_token_expiry_uses_seconds() {
+        assert_eq!(
+            format_token_expiry_timestamp(Some(1_800_000_000)),
+            "2027-01-15 08:00 UTC"
+        );
+        assert_eq!(format_token_expiry_timestamp(None), "—");
     }
 
     #[tokio::test]
