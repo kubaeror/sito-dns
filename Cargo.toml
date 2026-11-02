@@ -82,7 +82,7 @@ subtle = "2.6"
 mimalloc = { version = "0.1", default-features = false }
 flate2 = "1.1"
 tar = "0.4"
-utoipa = { version = "5.5", features = ["axum_extras"] }
+utoipa = { version = "6.0", features = ["axum_extras"] }
 
 # Internal workspace dependencies
 sito = { path = "crates/sito", version = "1.8.0" }

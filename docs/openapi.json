@@ -2693,10 +2693,10 @@
               "schema": {
                 "oneOf": [
                   {
-                    "type": "null"
+                    "$ref": "#/components/schemas/ApplyUpdatePayload"
                   },
                   {
-                    "$ref": "#/components/schemas/ApplyUpdatePayload"
+                    "type": "null"
                   }
                 ]
               }
@@ -3711,10 +3711,10 @@
           "last_stats": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/HaSlaveStatsSummary"
               },
               {
-                "$ref": "#/components/schemas/HaSlaveStatsSummary"
+                "type": "null"
               }
             ]
           },

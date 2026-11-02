@@ -13,14 +13,6 @@ feature-depth = 1
 [advisories]
 version = 2
 ignore = [
-    # `zip` is a BUILD dependency of utoipa-swagger-ui, used only to unpack
-    # the Swagger UI static assets that are embedded in that crate. It never
-    # processes user-controlled archives at runtime. The fixes require zip 9
-    # (via utoipa-swagger-ui 10 and utoipa 6), a breaking major upgrade that is
-    # scheduled separately; track RUSTSEC-2026-0367/0368/0369.
-    "RUSTSEC-2026-0367",
-    "RUSTSEC-2026-0368",
-    "RUSTSEC-2026-0369",
     # `basic-toml` is a build-time-only dependency of askama_macros (parsing
     # template configuration during compilation); it is not linked into the
     # runtime binary. The crate is unmaintained (RUSTSEC-2026-0374) and
