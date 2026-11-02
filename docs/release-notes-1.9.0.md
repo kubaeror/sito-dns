@@ -137,8 +137,9 @@ restarting production nodes.
 - **New `GET /api/v1/clients/unidentified` endpoint (Operator).** Returns
   unidentified client discoveries newest-first, bounded by `?limit` (default
   100, maximum 1024). Discoveries expire after 24 hours and are pruned on read.
-  The response also reports `max_entries` and `retention_hours`. This is an
-  API-only view; there is no UI table. Discovery data is preserved across
+  The response also reports `max_entries` and `retention_hours`. Operators also
+  see the same bounded data in the **Clients** page's read-only “Discovered but
+  unidentified” table; Viewers do not. Discovery data is preserved across
   config reloads and HA applies.
 
 ### Updater
@@ -159,6 +160,26 @@ restarting production nodes.
   async without holding a mutex guard across an await. Token revocation is
   immediate in memory and on all request paths; the on-disk token snapshot may
   lag by up to 60 s until the pruner persists it.
+
+### Web UI
+
+- **Admin Users page (`/users`).** Admins can list accounts (role and TOTP
+  status), create users, change roles, and delete users without the REST API.
+  The last-admin demote/delete guard is the same one used by the API, and every
+  mutation is CSRF- and RBAC-protected. Operators and Viewers receive `403`.
+- **Per-user Account page (`/account`).** Every signed-in user can view their
+  profile/TOTP status, change their own password, create/list/revoke their own
+  API tokens, and disable their own TOTP after re-authentication. A new token's
+  plaintext is displayed exactly once. Admins additionally see legacy ownerless
+  tokens and an Owner column.
+- **API-token ownership and lifecycle.** Tokens now record their creating
+  account. Deleting that account revokes its owned tokens; legacy ownerless
+  tokens remain Admin-managed. At the global cap, only the oldest token owned by
+  the same account is evicted; otherwise creation returns `400` rather than
+  evicting another account's token. Role demotion does not change an existing
+  token's scope, so revoke/reissue tokens after demotion when needed.
+- **Operator unidentified-clients table.** The **Clients** page now includes the
+  read-only discovery table described under “Statistics and API”.
 
 ## Toolchain and dependencies
 

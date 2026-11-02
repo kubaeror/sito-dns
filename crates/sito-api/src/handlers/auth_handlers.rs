@@ -1233,4 +1233,49 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[tokio::test]
+    async fn test_create_token_via_bearer_inherits_owner_not_token_name() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_bearer_owner");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        // The authenticating bearer token is named "ci-auth" but is owned by
+        // the admin account; RBAC exposes the name as `AuthUser.username`.
+        let (parent, _) = ctx
+            .auth_mgr
+            .create_token("ci-auth", Role::Admin, Some("admin"))
+            .await
+            .expect("parent token");
+        let bearer = RequireAdmin(AuthUser {
+            username: "ci-auth".to_string(),
+            role: Role::Admin,
+            token_id: Some(parent.id.clone()),
+        });
+
+        let Json(resp) = create_token(
+            bearer,
+            State(ctx.clone()),
+            Json(CreateTokenRequest {
+                name: "child".to_string(),
+                scope: "viewer".to_string(),
+            }),
+        )
+        .await
+        .expect("child token created");
+
+        let child = ctx
+            .auth_mgr
+            .list_tokens()
+            .into_iter()
+            .find(|token| token.id == resp.id)
+            .expect("child token listed");
+        assert_eq!(child.owner.as_deref(), Some("admin"));
+        assert_ne!(
+            child.owner.as_deref(),
+            Some("ci-auth"),
+            "ownership must chain through the authenticating token, not its name"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

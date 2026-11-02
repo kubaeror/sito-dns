@@ -2320,6 +2320,56 @@ mod tests {
         assert_eq!(ids.len(), 2, "admin-owned and legacy tokens must survive");
     }
 
+    #[tokio::test]
+    async fn test_token_owner_persists_and_delete_user_removes_it_from_disk() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_token_owner_persist_{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        {
+            let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+            mgr.create_user("alice", "AlicePassword1", Role::Operator)
+                .await;
+            mgr.create_token("alice-persisted", Role::Operator, Some("alice"))
+                .await
+                .expect("alice token");
+        }
+
+        let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        let reloaded = mgr
+            .list_tokens()
+            .into_iter()
+            .find(|token| token.name == "alice-persisted")
+            .expect("token must survive reload");
+        assert_eq!(reloaded.owner.as_deref(), Some("alice"));
+
+        assert!(mgr.delete_user("alice").await);
+        assert!(
+            !mgr.list_tokens()
+                .iter()
+                .any(|token| token.name == "alice-persisted")
+        );
+        drop(mgr);
+
+        let tokens_toml = std::fs::read_to_string(temp_dir.join("tokens.toml")).unwrap();
+        assert!(
+            !tokens_toml.contains("alice-persisted"),
+            "deletion must rewrite tokens.toml without the owned token"
+        );
+
+        let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        assert!(
+            !mgr.list_tokens()
+                .iter()
+                .any(|token| token.name == "alice-persisted"),
+            "the deletion must survive a reload"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[test]
     fn test_setup_token_lifecycle_and_rate_limit() {
         let mgr = AuthManager::with_storage(

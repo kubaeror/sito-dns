@@ -33,8 +33,22 @@ exhaustive record.
 - **`GET /api/v1/clients/unidentified` (Operator)**: returns unidentified
   client discoveries newest-first, bounded by `?limit` (default 100, maximum
   1024). Discoveries expire after 24 hours and are pruned on read; the response
-  also reports `max_entries` and `retention_hours`. This is an API-only view,
-  and the store is preserved across config reloads and HA applies.
+  also reports `max_entries` and `retention_hours`. Operators also see the same
+  bounded data in the read-only “Discovered but unidentified” table on the
+  Clients page; Viewers do not. The store is preserved across config reloads
+  and HA applies.
+- **Web UI user management**: Admins get a `/users` page to list/create/delete
+  accounts and change roles (same last-admin guard as the REST API). Every
+  signed-in user gets an `/account` page for profile/TOTP status, their own
+  password change, their own API tokens (create/list/revoke, plaintext shown
+  once), and TOTP disable after re-authentication. Forms are CSRF- and
+  RBAC-protected; unauthorized pages return `403` and anonymous requests
+  redirect to `/login`.
+- **API-token ownership**: tokens record their creating account. `/account`
+  lists only the caller's tokens (Admins also see legacy ownerless tokens and
+  an Owner column); deleting an account revokes its owned tokens; at the global
+  cap only the same owner's oldest token is evicted, otherwise creation returns
+  `400`. Role demotion does not rewrite an existing token's scope.
 - **New HA metrics**: `sito_ha_diverged{instance}` (1 while a connected slave
   acknowledged a version above the master's; returns to 0 after recovery and
   the series is removed on disconnect) and

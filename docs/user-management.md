@@ -2,16 +2,42 @@
 
 sito keeps its accounts in `<data_dir>/users.toml` (mode `0600`) and has no
 self-registration or e-mail-based password reset. Accounts, roles, API tokens,
-and TOTP settings are managed through the administrative REST API under
-`/api/v1/auth/*`.
+and TOTP settings can be managed from the web panel (`/users` and `/account`)
+or through the administrative REST API under `/api/v1/auth/*`.
 
-> **Account management is API-only.** The web panel covers login, the
-> first-boot wizard, and operational views, but it has no user-management,
-> token-management, or TOTP-settings pages yet. Use `curl`, a script, or the
-> interactive Swagger UI at `http://<host>:8080/api/docs` to call the endpoints
-> below. A dedicated management UI (D-17b) is a separate, optional follow-up.
+## Web UI
 
-All examples assume:
+The embedded web panel provides the common account workflows without `curl`.
+Navigation links are role-aware: **Users** is shown only to Admins and
+**Account** is shown to every signed-in user.
+
+| Page | Who can open it | What it does |
+|---|---|---|
+| `/users` | Admin only | Lists local accounts with role and TOTP status; creates accounts; changes roles; deletes accounts with last-admin protection. |
+| `/account` | Any authenticated user | Shows profile and TOTP status; changes the caller's own password; creates, lists, and revokes the caller's own API tokens; disables the caller's own TOTP. |
+
+- **Visibility.** Operators and Viewers receive `403 Forbidden` from `/users`.
+  Anonymous requests to either page redirect to `/login`.
+- **Token visibility.** `/account` lists only tokens owned by the signed-in
+  account. Admins additionally see legacy ownerless tokens and an Owner column;
+  non-Admins cannot see those tokens. Token creation is capped at the caller's
+  role, so a Viewer cannot mint an Operator or Admin token.
+- **CSRF/RBAC.** Every mutating form includes a session-bound CSRF token and is
+  rejected with `403` when the token is missing or wrong. Role checks are
+  enforced server-side, not just by hiding navigation links.
+- **Flows.** Successful mutations redirect (POST/Redirect/GET) back to the page;
+  validation failures re-render the page with a visible error. Password changes
+  and TOTP disable revoke all sessions for the account, so they return to
+  `/login`. A newly created token's plaintext is shown exactly once; reloading
+  `/account` never reveals it again.
+- **TOTP.** The Account page can disable TOTP after re-authentication with the
+  current password and a valid TOTP or backup code. Initial TOTP setup/enable
+  remains an API workflow (section 7).
+- The **Clients** page shows the operator-only “Discovered but unidentified”
+  table, matching `GET /api/v1/clients/unidentified`. Viewers see only the
+  configured clients.
+
+All examples below use the REST API:
 
 ```bash
 export SITO=http://127.0.0.1:8080
@@ -24,11 +50,14 @@ export TOKEN='sito_...'   # an Admin API token, or use a session cookie instead
    the setup wizard at `/wizard` (or, for headless installs, by
    `sito --no-setup`, which generates a random password and binds the panel to
    loopback). The bootstrap account is named `admin`.
-2. **Create** additional accounts with `POST /api/v1/auth/users`.
+2. **Create** additional accounts with `POST /api/v1/auth/users` or the Admin
+   **Users** page at `/users`.
 3. **Operate.** Users sign in at `/login` (session cookie) or authenticate with
    an API token (`Authorization: Bearer ...`).
-4. **Delete** an account with `DELETE /api/v1/auth/users/{username}`. Sessions
-   for that account are revoked immediately.
+4. **Delete** an account with `DELETE /api/v1/auth/users/{username}` or the
+   **Users** page. Sessions and every API token owned by that account are
+   revoked immediately. Legacy ownerless tokens are not tied to an account and
+   remain Admin-managed until explicitly revoked.
 5. **Recover.** If credentials are lost, an operator with shell access can run
    `sito reset-admin --config /etc/sito/config.toml --password '<new-password>'`.
    This recreates the `admin` account and invalidates **all** sessions and
@@ -93,9 +122,11 @@ The last remaining `admin` account cannot be deleted (or demoted); the API
 returns `400 Bad Request`. Create or promote another admin first. This guard
 prevents locking every administrator out of the API and UI.
 
-Deleting an account revokes that account's sessions, but it does **not** revoke
-API tokens that happen to share its name: tokens are independent credentials
-with their own IDs and scopes (see section 6).
+Deleting an account revokes that account's sessions **and every API token it
+owns**. Tokens created before ownership tracking (ownerless/legacy tokens) are
+not linked to an account, so they survive account deletion and remain
+Admin-managed; revoke them explicitly if they were issued to the deleted user.
+Password changes and TOTP changes revoke sessions but do not revoke API tokens.
 
 ## 4. Change a Role
 
@@ -109,6 +140,11 @@ curl -sS -X PUT "$SITO/api/v1/auth/users/alice" \
 A role change revokes all sessions belonging to the target account so the new
 role is enforced on the next request. Demoting the last admin is rejected with
 `400 Bad Request`.
+
+Role demotion does **not** rewrite the scope of API tokens the account already
+created. A token keeps its original scope until it is revoked or reissued.
+After demoting an account, review and revoke/reissue its tokens if the old
+scope is no longer appropriate.
 
 ## 5. Change a Password
 
@@ -142,13 +178,19 @@ when changing your own password.
 
 API tokens are long-lived credentials for scripts and integrations. Only a
 Blake3 hash is stored in `<data_dir>/tokens.toml`; the plaintext value is
-returned **once**, when the token is created.
+returned **once**, when the token is created. Each token records the account
+that created it as its owner.
 
 List token metadata (never the hash or plaintext):
 
 ```bash
 curl -sS -H "Authorization: Bearer $TOKEN" "$SITO/api/v1/auth/tokens"
 ```
+
+The REST listing is Admin-only and returns metadata for all tokens. The
+`/account` page instead lists only the signed-in user's own tokens; Admins also
+see legacy ownerless tokens there and get an Owner column. The owner is stored
+internally and is not part of the REST response schema.
 
 Create a token:
 
@@ -162,8 +204,22 @@ curl -sS -X POST "$SITO/api/v1/auth/tokens" \
 The response contains `id`, `name`, `scope`, and the plaintext `token`
 (`sito_...`). Store it in a secret manager; it cannot be retrieved again.
 New tokens expire after `auth.token_default_ttl_days` (default 90 days, `0`
-disables expiry). The number of tokens is capped; creating a new token when the
-cap is reached evicts the oldest one.
+disables expiry).
+
+Tokens created from an Admin session or from `/account` are owned by that
+account. Tokens created with a bearer credential inherit the owner of the
+authenticating token. Tokens written by older releases have no owner; they are
+legacy/ownerless and remain Admin-managed.
+
+When the global token cap (`MAX_API_TOKENS`, currently 256) is reached, creating
+another token evicts only the oldest token owned by the same account. If that
+account has no token to evict, creation fails with `400 Bad Request` instead of
+deleting another account's credential. A role demotion does not change the
+scope of existing tokens; revoke or reissue them when the old scope is no longer
+appropriate.
+
+Deleting the owning account revokes its tokens immediately. Legacy ownerless
+tokens survive account deletion and must be revoked explicitly by an Admin.
 
 Use a token as a Bearer credential:
 
@@ -178,6 +234,10 @@ curl -sS -X DELETE -H "Authorization: Bearer $TOKEN" \
   "$SITO/api/v1/auth/tokens/<token-id>"
 ```
 
+The REST revoke endpoint is Admin-only. On `/account`, a user may revoke only
+their own tokens (Admins may also revoke legacy ownerless tokens); another
+user's token ID returns `404`, indistinguishable from a missing token.
+
 Revocation takes effect immediately. To invalidate every session and token at
 once, run `sito reset-sessions --config /etc/sito/config.toml` (or
 `sito reset-admin`), which also rotates the auth generation so copies of the
@@ -189,8 +249,9 @@ session.
 
 ## 7. TOTP Two-Factor Authentication
 
-TOTP is per-account and managed by the signed-in user (Admin session required
-by the current API guards).
+TOTP is per-account and managed by the signed-in user. Initial setup/enable is
+an API workflow (Admin session required by the current API guards); the
+**Account** page at `/account` can show the current status and disable TOTP.
 
 1. Start setup:
 
