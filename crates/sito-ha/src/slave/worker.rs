@@ -3,7 +3,9 @@
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::ServerName;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -12,10 +14,10 @@ use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{error, info, warn};
 
-use sito_clients::{ClientRegistry, ClientsConfig};
+use sito_clients::ClientsConfig;
 use sito_core::config::{Config, FilterListConfig};
 use sito_filter::HostsFilterEngine;
-use sito_rewrites::{RewriteTable, RewritesConfig};
+use sito_rewrites::RewritesConfig;
 use sito_stats::MetricsRegistry;
 use sito_stats::metrics::MetricsSnapshot;
 
@@ -29,17 +31,39 @@ use crate::transport::{
     ExponentialBackoff, SLAVE_HANDSHAKE_TIMEOUT, build_client_tls_config, ws_config,
 };
 
+/// Applies and persists a configuration pushed by the master.
+///
+/// Implemented by the `sito` binary on top of
+/// `sito_api::config_apply::apply_and_persist_document`, so every component
+/// (upstreams, filter, clients, rewrites, cache, query-log privacy, runtime
+/// snapshot and the hook-owned DNSSEC/scoped-upstream/rate-limiter/listener/log
+/// level pieces) is applied before a pushed bundle is acknowledged. The trait
+/// lives here so `sito-ha` does not depend on `sito-api`.
+pub trait SlaveConfigApplier: Send + Sync {
+    /// Applies `cfg` to the live server and atomically persists `document`.
+    ///
+    /// On failure the live components must have been rolled back to the
+    /// previous configuration and no document may have been persisted.
+    fn apply_and_persist<'a>(
+        &'a self,
+        cfg: &'a Config,
+        document: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
 /// Active server handles that the slave atomically updates when a new bundle is applied.
 ///
 /// Config/clients/rewrites are published through [`RuntimeState`] so the query
 /// pipeline observes them in the same coherent snapshot as the file watcher
 /// and API paths do; the individual handles must not be written directly.
+/// [`SlaveAppHandles::applier`] is the single apply/persist path.
 #[derive(Clone)]
 pub struct SlaveAppHandles {
     pub runtime: Arc<sito_runtime::RuntimeState>,
     pub filter: Arc<HostsFilterEngine>,
     pub metrics: MetricsRegistry,
     pub config_path: Option<PathBuf>,
+    pub applier: Arc<dyn SlaveConfigApplier>,
 }
 
 /// Applies a configuration push to the local server handles.
@@ -94,9 +118,10 @@ pub async fn apply_config_push(
 
     // The structured bundle fields are authoritative: a `null` `rewrites`
     // value means "remove the local rewrites", not "keep the previous ones".
-    // The same decision is applied to the live runtime and to the persisted
-    // file below so a restart observes exactly what was applied.
-    let staging_rewrites: Option<RewritesConfig> = match bundle.rewrites {
+    // Validate the typed rewrites here; the raw value is copied verbatim into
+    // the applied/persisted configuration below so a restart observes exactly
+    // what was applied.
+    let _staging_rewrites: Option<RewritesConfig> = match bundle.rewrites {
         Some(ref r_val) => match r_val.clone().try_into() {
             Ok(rc) => Some(rc),
             Err(e) => {
@@ -162,67 +187,49 @@ pub async fn apply_config_push(
         })
         .collect();
 
-    // 4. Staging filter engine test
+    // 4. Build the document that will be persisted. Node-local settings
+    //    (`[ha]`, instance identity, RouterOS credentials) are merged back in,
+    //    and the bundle's structured clients/rewrites/lists remain
+    //    authoritative. Applying exactly this document guarantees the running
+    //    configuration and the file a restart loads cannot diverge.
+    let document = build_persisted_config(
+        &substituted_toml,
+        &bundle,
+        handles.config_path.as_deref(),
+        staging_config.clients.clone(),
+    )
+    .await;
+    let apply_config = match Config::from_toml_str(&document) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            let reason = format!("Merged pushed configuration is invalid: {e}");
+            tracker.mark_degraded(reason.clone());
+            return Err(HaError::Validation {
+                field: "config".to_string(),
+                reason,
+            });
+        }
+    };
+
+    // 5. Single apply/persist path. The applier applies every component
+    //    (including the hook-owned DNSSEC/listener/scoped-upstream pieces) and
+    //    persists the document atomically. It rolls the in-memory apply back
+    //    when the persist fails, so on `Err` nothing has changed durably or
+    //    live, the version does not advance, and the caller ACKs
+    //    `applied: false`.
     if let Err(e) = handles
-        .filter
-        .reload_with_config(&staging_config.filtering)
+        .applier
+        .apply_and_persist(&apply_config, &document)
         .await
     {
-        let reason = format!("Staging filter reload failed: {e}");
+        let reason = format!("Failed to apply pushed configuration: {e}");
+        error!(
+            error = %e,
+            "Failed to apply pushed configuration; refusing to acknowledge the push"
+        );
         tracker.mark_degraded(reason.clone());
         return Err(HaError::Rollback(reason));
     }
-
-    // 5. Persist before the configuration becomes live or is acknowledged. A
-    // failed atomic write is an apply failure: never advance the applied
-    // watermark or ACK `applied: true` for a push that is not durable. The
-    // local `[ha]`/identity settings are merged back in.
-    if let Some(ref path) = handles.config_path {
-        let persisted = build_persisted_config(
-            &substituted_toml,
-            &bundle,
-            path,
-            staging_config.clients.clone(),
-        )
-        .await;
-        if let Err(e) = write_private_atomic(path, &persisted).await {
-            let reason = format!(
-                "Failed to persist applied configuration to '{}': {e}",
-                path.display()
-            );
-            error!(
-                error = %e,
-                path = %path.display(),
-                "Failed to persist pushed configuration; refusing to acknowledge the push"
-            );
-            tracker.mark_degraded(reason.clone());
-            return Err(HaError::Rollback(reason));
-        }
-    }
-
-    // 6. Atomic swap into the coherent runtime snapshot. Publishing through
-    // `RuntimeState::replace` keeps the pipeline from observing a torn mix of
-    // old and new components (direct handle stores bypassed the snapshot).
-    // An absent `clients`/`rewrites` bundle field removes the component
-    // (authoritative removal), matching the persisted file.
-    let current = handles.runtime.snapshot();
-    let snapshot = sito_runtime::RuntimeSnapshot {
-        config: Arc::new(staging_config),
-        clients: staging_clients.map_or_else(
-            || Arc::new(ClientRegistry::new(Default::default())),
-            |cfg| {
-                Arc::new(ClientRegistry::with_routeros_leases(
-                    cfg,
-                    current.clients.routeros_leases_store(),
-                ))
-            },
-        ),
-        rewrites: staging_rewrites.map_or_else(
-            || Arc::new(RewriteTable::new(Default::default())),
-            |cfg| Arc::new(RewriteTable::new(cfg)),
-        ),
-    };
-    handles.runtime.replace(snapshot);
 
     // Mark tracker as synced (a successful apply is the only path that clears
     // a `Degraded` state).
@@ -260,16 +267,19 @@ pub async fn apply_config_push(
 async fn build_persisted_config(
     pushed_toml: &str,
     bundle: &ConfigBundle,
-    local_path: &std::path::Path,
+    local_path: Option<&std::path::Path>,
     clients_value: Option<toml::Value>,
 ) -> String {
     let Ok(mut pushed) = pushed_toml.parse::<toml::Table>() else {
         return pushed_toml.to_string();
     };
-    let local = tokio::fs::read_to_string(local_path)
-        .await
-        .ok()
-        .and_then(|raw| raw.parse::<toml::Table>().ok());
+    let local = match local_path {
+        Some(path) => tokio::fs::read_to_string(path)
+            .await
+            .ok()
+            .and_then(|raw| raw.parse::<toml::Table>().ok()),
+        None => None,
+    };
 
     if let Some(ref local) = local {
         if let Some(ha) = local.get("ha") {
@@ -381,31 +391,90 @@ async fn read_local_client_id_secrets(path: Option<&std::path::Path>) -> HashMap
         .unwrap_or_default()
 }
 
-/// Atomically writes `contents` to `path`, restricting permissions to the
-/// owner on Unix. Used for pushed configuration that may embed credentials.
+/// Test-only applier used by the `sito-ha` unit and end-to-end tests.
 ///
-/// Uses `tokio::fs` so the async apply path never blocks a runtime worker.
-async fn write_private_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt as _;
+/// Production implements [`SlaveConfigApplier`] in the `sito` binary on top of
+/// `sito-api`. This stand-in mirrors the observable ordering that matters for
+/// the worker tests: apply to the live handles, persist, and roll back when the
+/// write fails.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::SlaveConfigApplier;
+    use sito_core::config::Config;
+    use sito_filter::HostsFilterEngine;
+    use std::future::Future;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::Arc;
 
-    let tmp_path = path.with_extension("tmp");
-    #[cfg(unix)]
-    {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp_path)
-            .await?;
-        file.write_all(contents.as_bytes()).await?;
-        file.sync_all().await?;
+    pub(crate) struct TestApplier {
+        runtime: Arc<sito_runtime::RuntimeState>,
+        filter: Arc<HostsFilterEngine>,
+        config_path: Option<PathBuf>,
     }
-    #[cfg(not(unix))]
-    {
-        tokio::fs::write(&tmp_path, contents).await?;
+
+    impl TestApplier {
+        pub(crate) fn new(
+            runtime: Arc<sito_runtime::RuntimeState>,
+            filter: Arc<HostsFilterEngine>,
+            config_path: Option<PathBuf>,
+        ) -> Self {
+            Self {
+                runtime,
+                filter,
+                config_path,
+            }
+        }
     }
-    tokio::fs::rename(&tmp_path, path).await
+
+    impl SlaveConfigApplier for TestApplier {
+        fn apply_and_persist<'a>(
+            &'a self,
+            cfg: &'a Config,
+            document: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                let previous = self.runtime.snapshot();
+                let previous_config = previous.config.clone();
+
+                self.filter
+                    .reload_with_config(&cfg.filtering)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                let clients: sito_clients::ClientsConfig = match cfg.clients.as_ref() {
+                    Some(value) => value.clone().try_into().map_err(|e| format!("{e}"))?,
+                    None => sito_clients::ClientsConfig::default(),
+                };
+                let rewrites: sito_rewrites::RewritesConfig = match cfg.rewrites.as_ref() {
+                    Some(value) => value.clone().try_into().map_err(|e| format!("{e}"))?,
+                    None => sito_rewrites::RewritesConfig::default(),
+                };
+                self.runtime.replace(sito_runtime::RuntimeSnapshot {
+                    config: Arc::new(cfg.clone()),
+                    clients: Arc::new(sito_clients::ClientRegistry::with_routeros_leases(
+                        clients,
+                        previous.clients.routeros_leases_store(),
+                    )),
+                    rewrites: Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
+                });
+
+                if let Some(path) = self.config_path.as_deref()
+                    && let Err(e) = tokio::fs::write(path, document).await
+                {
+                    // Persist failures must leave the live configuration
+                    // untouched, exactly like the production applier.
+                    self.runtime.replace((*previous).clone());
+                    let _ = self
+                        .filter
+                        .reload_with_config(&previous_config.filtering)
+                        .await;
+                    return Err(e.to_string());
+                }
+                Ok(())
+            })
+        }
+    }
 }
 
 /// Spawns the slave replication worker loop.
@@ -904,22 +973,28 @@ mod tests {
         let filter_engine = Arc::new(
             HostsFilterEngine::init(base_config.filtering.clone(), std::env::temp_dir()).await,
         );
-        let rewrites_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(RewriteTable::new(
-            Default::default(),
-        ))));
-        let clients_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(ClientRegistry::new(
-            Default::default(),
-        ))));
+        let rewrites_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            sito_rewrites::RewriteTable::new(Default::default()),
+        )));
+        let clients_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            sito_clients::ClientRegistry::new(Default::default()),
+        )));
         let runtime = Arc::new(sito_runtime::RuntimeState::new(
             config_arc,
             clients_arc,
             rewrites_arc,
+        ));
+        let applier = Arc::new(crate::slave::worker::test_support::TestApplier::new(
+            runtime.clone(),
+            filter_engine.clone(),
+            config_path.clone(),
         ));
         SlaveAppHandles {
             runtime,
             filter: filter_engine,
             metrics: MetricsRegistry::new("0.1.0", "slave"),
             config_path,
+            applier,
         }
     }
 
@@ -937,6 +1012,229 @@ mod tests {
             rewrites,
             clients,
             lists: vec![],
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ApplierObservation {
+        upstream_servers: Vec<String>,
+        dnssec_validate: bool,
+        dnssec_nta: Vec<String>,
+        state: SlaveState,
+        version: u64,
+    }
+
+    struct RecordingApplier {
+        observation: Arc<std::sync::Mutex<Option<ApplierObservation>>>,
+        tracker: SlaveStatusTracker,
+    }
+
+    impl SlaveConfigApplier for RecordingApplier {
+        fn apply_and_persist<'a>(
+            &'a self,
+            cfg: &'a Config,
+            _document: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                *self
+                    .observation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(ApplierObservation {
+                        upstream_servers: cfg.upstream.servers.clone(),
+                        dnssec_validate: cfg.dns.dnssec.validate,
+                        dnssec_nta: cfg.dns.dnssec.nta.clone(),
+                        state: self.tracker.get_state(),
+                        version: self.tracker.get_version(),
+                    });
+                Ok(())
+            })
+        }
+    }
+
+    struct FailingApplier;
+
+    impl SlaveConfigApplier for FailingApplier {
+        fn apply_and_persist<'a>(
+            &'a self,
+            _cfg: &'a Config,
+            _document: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Err("listener rebind failed".to_string()) })
+        }
+    }
+
+    /// Reads the next slave ACK from the peer end of an in-memory WebSocket.
+    async fn read_ack<S>(peer: &mut tokio_tungstenite::WebSocketStream<S>) -> HaMessage
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use futures_util::StreamExt as _;
+        let message = peer.next().await.unwrap().unwrap();
+        HaMessage::from_json(&message.into_text().unwrap()).unwrap()
+    }
+
+    /// D-01: every component must be applied before the push is acknowledged.
+    /// The recording applier sees the new upstream/DNSSEC configuration, the
+    /// tracker is still `Applying`, and the applied-version watermark is still
+    /// the old one inside the callback.
+    #[tokio::test]
+    async fn test_push_applies_all_components_before_ack() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+        let tracker = SlaveStatusTracker::new("slave-before-ack".to_string(), 4, None);
+        let observation = Arc::new(std::sync::Mutex::new(None));
+        let mut handles = test_handles(None).await;
+        handles.applier = Arc::new(RecordingApplier {
+            observation: observation.clone(),
+            tracker: tracker.clone(),
+        });
+
+        let config_toml = r#"
+config_version = 1
+
+[server]
+role = "slave"
+
+[upstream]
+servers = ["9.9.9.9"]
+
+[dns.dnssec]
+validate = true
+mode = "validate"
+nta = ["internal.example"]
+"#;
+        let push =
+            build_and_sign_push(&test_bundle(5, config_toml, None, None), &signing_key).unwrap();
+
+        let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            slave_socket,
+            Role::Client,
+            Some(ws_config()),
+        )
+        .await;
+        let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer_socket,
+            Role::Server,
+            Some(ws_config()),
+        )
+        .await;
+
+        tracker.set_state(SlaveState::HelloSent);
+        handle_master_message(
+            &push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+
+        let observation = observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("the applier must run before the ACK");
+        assert_eq!(
+            observation.state,
+            SlaveState::Applying,
+            "the push must still be in flight while components are applied"
+        );
+        assert_eq!(
+            observation.version, 4,
+            "the watermark must not advance before the apply succeeds"
+        );
+        assert_eq!(observation.upstream_servers, vec!["9.9.9.9".to_string()]);
+        assert!(observation.dnssec_validate);
+        assert_eq!(observation.dnssec_nta, vec!["internal.example".to_string()]);
+
+        assert!(matches!(
+            read_ack(&mut peer).await,
+            HaMessage::Ack {
+                version: 5,
+                applied: true,
+                ..
+            }
+        ));
+        assert_eq!(tracker.get_state(), SlaveState::Synced);
+        assert_eq!(tracker.get_version(), 5);
+    }
+
+    /// D-01: a component failure is an apply failure: the watermark stays put,
+    /// the state becomes `Degraded`, and the ACK says `applied: false`.
+    #[tokio::test]
+    async fn test_component_failure_is_apply_failure() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+        let tracker = SlaveStatusTracker::new("slave-apply-fail".to_string(), 4, None);
+        let mut handles = test_handles(None).await;
+        let before_config = handles.runtime.snapshot().config.clone();
+        handles.applier = Arc::new(FailingApplier);
+
+        let push = build_and_sign_push(
+            &test_bundle(
+                5,
+                "config_version = 1\n[server]\nrole = \"slave\"\n",
+                None,
+                None,
+            ),
+            &signing_key,
+        )
+        .unwrap();
+
+        let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            slave_socket,
+            Role::Client,
+            Some(ws_config()),
+        )
+        .await;
+        let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer_socket,
+            Role::Server,
+            Some(ws_config()),
+        )
+        .await;
+
+        tracker.set_state(SlaveState::HelloSent);
+        handle_master_message(
+            &push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(tracker.get_state(), SlaveState::Degraded);
+        assert_eq!(
+            tracker.get_version(),
+            4,
+            "a failed component apply must not advance the watermark"
+        );
+        assert!(
+            Arc::ptr_eq(&before_config, &handles.runtime.snapshot().config),
+            "the live runtime must not be replaced by a failed apply"
+        );
+        match read_ack(&mut peer).await {
+            HaMessage::Ack {
+                version,
+                applied,
+                error,
+            } => {
+                assert_eq!(version, 5);
+                assert!(!applied);
+                assert!(
+                    error.unwrap_or_default().contains("listener rebind failed"),
+                    "the ACK must carry the apply failure"
+                );
+            }
+            other => panic!("expected an ACK, got {other:?}"),
         }
     }
 
@@ -998,7 +1296,8 @@ url = "https://192.168.1.1"
         );
 
         let bundle = test_bundle(2, pushed, Some(toml::Value::Table(sanitized_clients)), None);
-        let merged = build_persisted_config(pushed, &bundle, &path, bundle.clients.clone()).await;
+        let merged =
+            build_persisted_config(pushed, &bundle, Some(&path), bundle.clients.clone()).await;
         let table: toml::Table = merged.parse().unwrap();
 
         let ha = table.get("ha").expect("[ha] must be preserved");
@@ -1069,7 +1368,7 @@ url = "https://192.168.1.1"
         let merged = build_persisted_config(
             pushed,
             &bundle,
-            std::path::Path::new("/nonexistent/config.toml"),
+            Some(std::path::Path::new("/nonexistent/config.toml")),
             None,
         )
         .await;
@@ -1195,6 +1494,11 @@ ttl = 60
                 .custom_rules
                 .is_empty(),
             "runtime configuration must not be replaced when persistence fails"
+        );
+        assert_eq!(
+            handles.filter.rule_count(),
+            0,
+            "the live filter snapshot must be rolled back when persistence fails"
         );
 
         // Repair the path and re-apply: the same push succeeds.

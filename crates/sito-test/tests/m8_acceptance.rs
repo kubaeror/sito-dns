@@ -13,6 +13,9 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use hickory_proto::rr::RecordType;
 use sito_api::auth::AuthManager;
+use sito_api::config_apply::{
+    ApplyFuture, ConfigApplyHooks, ConfigFileApplyOutcome, FilterApply, apply_config_document_event,
+};
 use sito_api::router::create_router;
 use sito_api::state::ServerContext;
 use sito_cache::DnsCache;
@@ -21,15 +24,17 @@ use sito_core::config::Config;
 use sito_filter::HostsFilterEngine;
 use sito_ha::{
     ConfigBundle, Ed25519SigningKey, HaConfig, HaError, HaMessage, MasterCoordinator,
-    SlaveAppHandles, SlaveState, SlaveStatusTracker, build_and_sign_push, generate_ha_certs,
-    sanitize_config_for_bundle, scan_for_secrets, spawn_master_server, spawn_slave_worker,
-    verify_and_unpack_push,
+    SlaveAppHandles, SlaveConfigApplier, SlaveState, SlaveStatusTracker, build_and_sign_push,
+    generate_ha_certs, sanitize_config_for_bundle, scan_for_secrets, spawn_master_server,
+    spawn_slave_worker, verify_and_unpack_push,
 };
 use sito_stats::{MetricsRegistry, QueryLogWriter, StatsDb};
 use sito_test::wait_until;
 use sito_upstream::UpstreamManager;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -39,6 +44,73 @@ use tower::ServiceExt;
 fn reserve_tcp_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve tcp port");
     listener.local_addr().expect("local addr").port()
+}
+
+/// Minimal applier for tests that only need the push to update the filter and
+/// the coherent runtime snapshot. The production applier is covered by
+/// `test_m8_push_applies_upstream_and_dnssec_without_watcher`.
+struct HarnessApplier {
+    runtime: Arc<sito_runtime::RuntimeState>,
+    filter: Arc<HostsFilterEngine>,
+    config_path: Option<PathBuf>,
+}
+
+impl HarnessApplier {
+    fn arc(
+        runtime: Arc<sito_runtime::RuntimeState>,
+        filter: Arc<HostsFilterEngine>,
+        config_path: Option<PathBuf>,
+    ) -> Arc<dyn SlaveConfigApplier> {
+        Arc::new(Self {
+            runtime,
+            filter,
+            config_path,
+        })
+    }
+}
+
+impl SlaveConfigApplier for HarnessApplier {
+    fn apply_and_persist<'a>(
+        &'a self,
+        cfg: &'a Config,
+        document: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let previous = self.runtime.snapshot();
+            let previous_config = previous.config.clone();
+            self.filter
+                .reload_with_config(&cfg.filtering)
+                .await
+                .map_err(|e| e.to_string())?;
+            let clients: sito_clients::ClientsConfig = match cfg.clients.as_ref() {
+                Some(value) => value.clone().try_into().map_err(|e| format!("{e}"))?,
+                None => sito_clients::ClientsConfig::default(),
+            };
+            let rewrites: sito_rewrites::RewritesConfig = match cfg.rewrites.as_ref() {
+                Some(value) => value.clone().try_into().map_err(|e| format!("{e}"))?,
+                None => sito_rewrites::RewritesConfig::default(),
+            };
+            self.runtime.replace(sito_runtime::RuntimeSnapshot {
+                config: Arc::new(cfg.clone()),
+                clients: Arc::new(sito_clients::ClientRegistry::with_routeros_leases(
+                    clients,
+                    previous.clients.routeros_leases_store(),
+                )),
+                rewrites: Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
+            });
+            if let Some(path) = self.config_path.as_deref()
+                && let Err(e) = tokio::fs::write(path, document).await
+            {
+                self.runtime.replace((*previous).clone());
+                let _ = self
+                    .filter
+                    .reload_with_config(&previous_config.filtering)
+                    .await;
+                return Err(e.to_string());
+            }
+            Ok(())
+        })
+    }
 }
 
 /// Creates a test ServerContext and temp directory.
@@ -216,15 +288,17 @@ async fn test_m8_mtls_handshake_rejects_foreign_cert() {
         Default::default(),
     ))));
 
+    let runtime = Arc::new(sito_runtime::RuntimeState::new(
+        config_arc.clone(),
+        clients_arc.clone(),
+        rewrites_arc.clone(),
+    ));
     let handles = SlaveAppHandles {
-        runtime: Arc::new(sito_runtime::RuntimeState::new(
-            config_arc.clone(),
-            clients_arc.clone(),
-            rewrites_arc.clone(),
-        )),
+        runtime: runtime.clone(),
         filter: filter_engine.clone(),
         metrics: metrics.clone(),
         config_path: None,
+        applier: HarnessApplier::arc(runtime, filter_engine.clone(), None),
     };
 
     let (_resync_tx, resync_rx) = tokio::sync::mpsc::channel(1);
@@ -415,15 +489,17 @@ async fn test_m8_slave_rollback_on_invalid_bundle() {
     ))));
     let metrics = MetricsRegistry::new("0.1.0", "test");
 
+    let runtime = Arc::new(sito_runtime::RuntimeState::new(
+        config_arc.clone(),
+        clients_arc.clone(),
+        rewrites_arc.clone(),
+    ));
     let handles = SlaveAppHandles {
-        runtime: Arc::new(sito_runtime::RuntimeState::new(
-            config_arc.clone(),
-            clients_arc.clone(),
-            rewrites_arc.clone(),
-        )),
+        runtime: runtime.clone(),
         filter: filter_engine.clone(),
         metrics,
         config_path: None,
+        applier: HarnessApplier::arc(runtime, filter_engine.clone(), None),
     };
 
     // Verify initial rule is active
@@ -684,19 +760,21 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
     let slave1_filter = Arc::new(
         HostsFilterEngine::init(slave1_cfg.filtering.clone(), temp_dir.join("slave1")).await,
     );
+    let slave1_runtime = Arc::new(sito_runtime::RuntimeState::new(
+        Arc::new(ArcSwap::new(Arc::new(slave1_cfg))),
+        Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
+            Default::default(),
+        )))),
+        Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
+            Default::default(),
+        )))),
+    ));
     let slave1_handles = SlaveAppHandles {
-        runtime: Arc::new(sito_runtime::RuntimeState::new(
-            Arc::new(ArcSwap::new(Arc::new(slave1_cfg))),
-            Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
-                Default::default(),
-            )))),
-            Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
-                Default::default(),
-            )))),
-        )),
+        runtime: slave1_runtime.clone(),
         filter: slave1_filter.clone(),
         metrics: metrics.clone(),
         config_path: None,
+        applier: HarnessApplier::arc(slave1_runtime, slave1_filter.clone(), None),
     };
     let slave1_ha_cfg = HaConfig {
         master_url: Some(format!("wss://127.0.0.1:{replication_port}")),
@@ -722,19 +800,21 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
     let slave2_filter = Arc::new(
         HostsFilterEngine::init(slave2_cfg.filtering.clone(), temp_dir.join("slave2")).await,
     );
+    let slave2_runtime = Arc::new(sito_runtime::RuntimeState::new(
+        Arc::new(ArcSwap::new(Arc::new(slave2_cfg))),
+        Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
+            Default::default(),
+        )))),
+        Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
+            Default::default(),
+        )))),
+    ));
     let slave2_handles = SlaveAppHandles {
-        runtime: Arc::new(sito_runtime::RuntimeState::new(
-            Arc::new(ArcSwap::new(Arc::new(slave2_cfg))),
-            Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
-                Default::default(),
-            )))),
-            Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
-                Default::default(),
-            )))),
-        )),
+        runtime: slave2_runtime.clone(),
         filter: slave2_filter.clone(),
         metrics: metrics.clone(),
         config_path: None,
+        applier: HarnessApplier::arc(slave2_runtime, slave2_filter.clone(), None),
     };
     let slave2_ha_cfg = HaConfig {
         master_url: Some(format!("wss://127.0.0.1:{replication_port}")),
@@ -813,6 +893,189 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
 }
 
 // ----------------------------------------------------------------------------
+// Test 8b: D-01 — a push applies every component without a file-watcher event
+// ----------------------------------------------------------------------------
+
+/// Records the DNSSEC settings the apply hooks receive and installs a real
+/// validator, mirroring the production hook.
+struct RecordingDnssecHooks {
+    validator: Arc<ArcSwap<sito_dnssec::DnssecValidator>>,
+    observed_nta: Arc<Mutex<Vec<String>>>,
+}
+
+impl ConfigApplyHooks for RecordingDnssecHooks {
+    fn apply<'a>(
+        &'a self,
+        cfg: &'a Config,
+        _clients: &'a sito_clients::ClientsConfig,
+    ) -> ApplyFuture<'a> {
+        Box::pin(async move {
+            *self.observed_nta.lock().unwrap() = cfg.dns.dnssec.nta.clone();
+            self.validator
+                .store(Arc::new(sito_dnssec::DnssecValidator::from_config(
+                    &cfg.dns.dnssec,
+                )));
+            Ok(())
+        })
+    }
+}
+
+fn filter_compile_count(metrics: &MetricsRegistry) -> u64 {
+    metrics
+        .render_prometheus()
+        .lines()
+        .find(|line| line.starts_with("sito_filter_compile_seconds_count "))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse().ok())
+        .expect("filter compile counter must be rendered")
+}
+
+#[tokio::test]
+async fn test_m8_push_applies_upstream_and_dnssec_without_watcher() {
+    let signing_key = Ed25519SigningKey::generate().unwrap();
+    let (ctx, _token, temp_dir) = create_test_context("slave", None, None, None).await;
+
+    let dnssec_validator = Arc::new(ArcSwap::from_pointee(
+        sito_dnssec::DnssecValidator::from_config(&Config::default().dns.dnssec),
+    ));
+    let observed_nta = Arc::new(Mutex::new(Vec::new()));
+    let hooks = Arc::new(RecordingDnssecHooks {
+        validator: dnssec_validator.clone(),
+        observed_nta: observed_nta.clone(),
+    });
+
+    // The production applier: real ServerContext + real apply hooks, no
+    // watcher task anywhere in this test.
+    let applier = Arc::new(sito::server::HaConfigApplier::new(
+        ctx.clone(),
+        hooks.clone(),
+    ));
+    let self_write = applier.self_write_tracker();
+
+    let tracker = SlaveStatusTracker::new("slave-apply".to_string(), 0, None);
+    let handles = SlaveAppHandles {
+        runtime: ctx.runtime.clone(),
+        filter: ctx.filter.clone(),
+        metrics: ctx.metrics.clone(),
+        config_path: Some(ctx.config_path.clone()),
+        applier,
+    };
+
+    let config_toml = r#"
+config_version = 1
+
+[server]
+role = "slave"
+instance_name = "master-value"
+
+[upstream]
+servers = ["9.9.9.9"]
+
+[dns.dnssec]
+validate = true
+mode = "validate"
+nta = ["pushed.internal"]
+"#;
+    let push = build_and_sign_push(
+        &ConfigBundle {
+            version: 2,
+            timestamp: 1,
+            config_toml: config_toml.to_string(),
+            custom_rules: vec!["||pushed-d01.test^".to_string()],
+            rewrites: None,
+            clients: None,
+            lists: vec![],
+        },
+        &signing_key,
+    )
+    .unwrap();
+
+    let applied =
+        sito_ha::apply_config_push(&push, &tracker, &handles, signing_key.public_key().as_ref())
+            .await
+            .expect("push must apply through the real context");
+    assert_eq!(applied, 2);
+    assert_eq!(tracker.get_state(), SlaveState::Synced);
+    assert_eq!(tracker.get_version(), 2);
+
+    // Runtime snapshot: upstream and filter applied immediately, without the
+    // watcher.
+    let snapshot = ctx.runtime.snapshot();
+    assert_eq!(snapshot.config.upstream.servers, vec!["9.9.9.9"]);
+    assert!(
+        snapshot
+            .config
+            .filtering
+            .custom_rules
+            .iter()
+            .any(|rule| rule == "||pushed-d01.test^")
+    );
+    let statuses = ctx.upstream.statuses().await;
+    assert!(
+        statuses.iter().any(|(name, _)| name.contains("9.9.9.9")),
+        "the upstream manager must be reloaded from the pushed config: {statuses:?}"
+    );
+
+    // Hook-owned DNSSEC component applied too.
+    assert_eq!(
+        *observed_nta.lock().unwrap(),
+        vec!["pushed.internal".to_string()]
+    );
+    assert_eq!(
+        dnssec_validator.load().nta_domains.load().as_slice(),
+        &["pushed.internal".to_string()][..]
+    );
+
+    // Persisted file carries the pushed components.
+    let persisted = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
+    assert!(persisted.contains("9.9.9.9"));
+    assert!(persisted.contains("pushed.internal"));
+
+    // A watcher notification for the applier's own write must not apply (and
+    // reload/download) the configuration a second time.
+    let filter_compiles_before = filter_compile_count(&ctx.metrics);
+    assert_eq!(
+        filter_compiles_before, 1,
+        "the push itself must have compiled the filter exactly once"
+    );
+    match apply_config_document_event(
+        &ctx,
+        &persisted,
+        FilterApply::Sync,
+        Some(&*hooks),
+        &self_write,
+    )
+    .await
+    {
+        ConfigFileApplyOutcome::SelfWriteIgnored => {}
+        other => panic!("the applier's own write must be ignored, got {other:?}"),
+    }
+    assert_eq!(
+        filter_compile_count(&ctx.metrics),
+        filter_compiles_before,
+        "a push must not trigger a second filter download/compile through the watcher"
+    );
+
+    // Even without the exact self-write record (for example after a restart),
+    // an identical document is a no-op.
+    match apply_config_document_event(
+        &ctx,
+        &persisted,
+        FilterApply::Sync,
+        Some(&*hooks),
+        &self_write,
+    )
+    .await
+    {
+        ConfigFileApplyOutcome::Unchanged => {}
+        other => panic!("an identical document must be a no-op, got {other:?}"),
+    }
+    assert_eq!(filter_compile_count(&ctx.metrics), filter_compiles_before);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ----------------------------------------------------------------------------
 // Test 9: Chaos: Master kill mid-push leaves slave consistent at N or N+1
 // ----------------------------------------------------------------------------
 #[tokio::test]
@@ -857,19 +1120,21 @@ async fn test_m8_chaos_master_mid_push_kill() {
     let slave_filter = Arc::new(
         HostsFilterEngine::init(slave_cfg.filtering.clone(), temp_dir.join("slave")).await,
     );
+    let slave_runtime = Arc::new(sito_runtime::RuntimeState::new(
+        Arc::new(ArcSwap::new(Arc::new(slave_cfg))),
+        Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
+            Default::default(),
+        )))),
+        Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
+            Default::default(),
+        )))),
+    ));
     let slave_handles = SlaveAppHandles {
-        runtime: Arc::new(sito_runtime::RuntimeState::new(
-            Arc::new(ArcSwap::new(Arc::new(slave_cfg))),
-            Arc::new(ArcSwap::new(Arc::new(sito_clients::ClientRegistry::new(
-                Default::default(),
-            )))),
-            Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
-                Default::default(),
-            )))),
-        )),
+        runtime: slave_runtime.clone(),
         filter: slave_filter.clone(),
         metrics: metrics.clone(),
         config_path: None,
+        applier: HarnessApplier::arc(slave_runtime, slave_filter.clone(), None),
     };
     let slave_ha_cfg = HaConfig {
         master_url: Some(format!("wss://127.0.0.1:{replication_port}")),

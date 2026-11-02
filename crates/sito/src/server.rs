@@ -213,17 +213,19 @@ struct HaRuntime {
     coordinator: Option<sito_ha::MasterCoordinator>,
     tracker: Option<sito_ha::SlaveStatusTracker>,
     resync_sender: Option<tokio::sync::mpsc::Sender<()>>,
+    /// Slave worker receiver, spawned only after [`ServerContext`] and the
+    /// apply hooks exist so the worker can receive the shared
+    /// [`HaConfigApplier`].
+    resync_receiver: Option<tokio::sync::mpsc::Receiver<()>>,
 }
 
-/// Initializes the HA role (master replication server or slave worker) and
-/// returns the shared handles plus the validated HA configuration.
-#[allow(clippy::too_many_arguments)]
+/// Initializes the HA role. Master setup is complete on return; a slave only
+/// gets its tracker and resync channel here because its worker needs the
+/// server context and apply hooks built later in startup.
 fn init_ha(
     config: &Config,
     config_path: &Path,
     metrics: &sito_stats::MetricsRegistry,
-    runtime: &Arc<sito_runtime::RuntimeState>,
-    filter_engine: &Arc<HostsFilterEngine>,
     shutdown_rx: &watch::Receiver<bool>,
 ) -> anyhow::Result<HaRuntime> {
     let ha_config: sito_ha::HaConfig = config
@@ -241,7 +243,9 @@ fn init_ha(
         .validate(&config.server.role)
         .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
 
-    let (master_coordinator, slave_tracker, resync_sender) = if config.server.role == "master" {
+    let (master_coordinator, slave_tracker, resync_sender, resync_receiver) = if config.server.role
+        == "master"
+    {
         // Load or create master Ed25519 signing key (0600 on Unix)
         let signing_key_path = config.server.data_dir.join("ha_signing.key");
         let signing_key = Arc::new(sito_ha::Ed25519SigningKey::load_or_create(
@@ -311,35 +315,18 @@ fn init_ha(
             None
         };
 
-        (Some(coordinator), None, None)
+        (Some(coordinator), None, None, None)
     } else {
-        // Slave role
+        // Slave role. The worker is spawned by `run_server_full` once the
+        // server context and apply hooks exist, so a push can apply every
+        // component before it is acknowledged.
         let tracker = sito_ha::SlaveStatusTracker::new(
             config.server.instance_name.clone(),
             0,
             ha_config.master_url.clone(),
         );
-
-        let slave_handles = sito_ha::SlaveAppHandles {
-            runtime: runtime.clone(),
-            filter: filter_engine.clone(),
-            metrics: metrics.clone(),
-            config_path: Some(config_path.to_path_buf()),
-        };
-
         let (resync_tx, resync_rx) = tokio::sync::mpsc::channel(4);
-
-        if ha_config.master_url.is_some() {
-            let _slave_worker_handle = sito_ha::spawn_slave_worker(
-                ha_config.clone(),
-                tracker.clone(),
-                slave_handles,
-                resync_rx,
-                shutdown_rx.clone(),
-            );
-        }
-
-        (None, Some(tracker), Some(resync_tx))
+        (None, Some(tracker), Some(resync_tx), Some(resync_rx))
     };
 
     Ok(HaRuntime {
@@ -347,6 +334,7 @@ fn init_ha(
         coordinator: master_coordinator,
         tracker: slave_tracker,
         resync_sender,
+        resync_receiver,
     })
 }
 
@@ -451,6 +439,9 @@ struct ConfigWatcher {
     ctx: sito_api::ServerContext,
     /// Hook-owned components shared with the REST/UI config write paths.
     hooks: Arc<ServerApplyHooks>,
+    /// Exact document written by the HA slave applier; consumed by the watcher
+    /// so a push is not applied a second time.
+    self_write: Arc<sito_api::config_apply::AppliedDocumentTracker>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -540,6 +531,68 @@ impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
     }
 }
 
+/// Production [`sito_ha::SlaveConfigApplier`] backed by the shared
+/// [`ServerContext`] and the hook-owned components.
+///
+/// This is the single apply/persist path for pushed HA configurations: the
+/// slave worker calls it before advancing the applied-version watermark or
+/// ACKing `applied: true`.
+pub struct HaConfigApplier {
+    ctx: sito_api::ServerContext,
+    hooks: Arc<dyn sito_api::config_apply::ConfigApplyHooks>,
+    self_write: Arc<sito_api::config_apply::AppliedDocumentTracker>,
+}
+
+impl HaConfigApplier {
+    #[must_use]
+    pub fn new(
+        ctx: sito_api::ServerContext,
+        hooks: Arc<dyn sito_api::config_apply::ConfigApplyHooks>,
+    ) -> Self {
+        Self {
+            ctx,
+            hooks,
+            self_write: Arc::new(sito_api::config_apply::AppliedDocumentTracker::new()),
+        }
+    }
+
+    /// Tracks the documents written by this applier so the file watcher can
+    /// ignore its own write.
+    #[must_use]
+    pub fn self_write_tracker(&self) -> Arc<sito_api::config_apply::AppliedDocumentTracker> {
+        self.self_write.clone()
+    }
+}
+
+impl sito_ha::SlaveConfigApplier for HaConfigApplier {
+    fn apply_and_persist<'a>(
+        &'a self,
+        cfg: &'a Config,
+        document: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        // Record before the write so a watcher event racing the rename is
+        // recognised as this applier's own output.
+        self.self_write.record(document);
+        Box::pin(async move {
+            match sito_api::config_apply::apply_and_persist_document(
+                &self.ctx,
+                cfg,
+                document,
+                sito_api::config_apply::FilterApply::Sync,
+                Some(&*self.hooks),
+            )
+            .await
+            {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    self.self_write.clear();
+                    Err(e.detail)
+                }
+            }
+        })
+    }
+}
+
 /// Watches the configuration file and applies hot reloads in-process. Returns
 /// when shutdown is signalled, when the watcher cannot be initialized, or when
 /// the watched directory disappears.
@@ -547,6 +600,7 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
     let ConfigWatcher {
         ctx,
         hooks,
+        self_write,
         shutdown_rx: mut watcher_shutdown_rx,
     } = watcher;
     let watcher_config_path = ctx.config_path.clone();
@@ -600,42 +654,48 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
                 while rx.try_recv().is_ok() {}
 
                 match tokio::fs::read_to_string(&watcher_config_path).await {
-                    Ok(content) => match Config::from_toml_str(&content) {
-                        Ok(new_cfg) => {
-                            info!("Detected configuration file change, hot-reloading");
-                            // Same apply/validate pipeline as every API write
-                            // path; a rejected configuration leaves the running
-                            // components untouched.
-                            match sito_api::config_apply::apply_full_config(
-                                &ctx,
-                                &new_cfg,
-                                sito_api::config_apply::FilterApply::Sync,
-                                Some(&*hooks),
-                            )
-                            .await
-                            {
-                                Ok(report) => {
-                                    if !report.restart_required.is_empty() {
-                                        warn!(
-                                            fields = ?report.restart_required,
-                                            "Configuration hot-reloaded; these settings need a restart to take effect"
-                                        );
-                                    }
-                                    ctx.publish_bundle().await;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        status = e.status,
-                                        detail = %e.detail,
-                                        "Rejecting config hot-reload: configuration cannot be applied"
+                    Ok(content) => {
+                        use sito_api::config_apply::ConfigFileApplyOutcome;
+                        // Same apply/validate pipeline as every API write path;
+                        // the HA applier's own write and no-op documents are
+                        // skipped instead of reloading every component again.
+                        match sito_api::config_apply::apply_config_document_event(
+                            &ctx,
+                            &content,
+                            sito_api::config_apply::FilterApply::Sync,
+                            Some(&*hooks),
+                            &self_write,
+                        )
+                        .await
+                        {
+                            ConfigFileApplyOutcome::SelfWriteIgnored => {
+                                info!(
+                                    "Ignoring file-watcher event for the configuration written by the HA push"
+                                );
+                            }
+                            ConfigFileApplyOutcome::Unchanged => {
+                                info!(
+                                    "Configuration file matches the running configuration; skipping reload"
+                                );
+                            }
+                            ConfigFileApplyOutcome::Applied(report) => {
+                                info!("Detected configuration file change, hot-reloaded");
+                                if !report.restart_required.is_empty() {
+                                    warn!(
+                                        fields = ?report.restart_required,
+                                        "Configuration hot-reloaded; these settings need a restart to take effect"
                                     );
                                 }
                             }
+                            ConfigFileApplyOutcome::Rejected(e) => {
+                                error!(
+                                    status = e.status,
+                                    detail = %e.detail,
+                                    "Rejecting config hot-reload: configuration cannot be applied"
+                                );
+                            }
                         }
-                        Err(e) => {
-                            warn!("Ignoring invalid hot-reloaded configuration: {e}");
-                        }
-                    },
+                    }
                     Err(e) => {
                         warn!("Failed to read modified configuration file: {e}");
                     }
@@ -797,19 +857,12 @@ pub async fn run_server_full(
     );
 
     // Initialize High Availability (HA) clustering subsystem per role
-    let ha_runtime = init_ha(
-        &config,
-        &config_path_buf,
-        &metrics,
-        &runtime,
-        &filter_engine,
-        &shutdown_rx,
-    )?;
-    let _ha_config = ha_runtime.config;
+    let mut ha_runtime = init_ha(&config, &config_path_buf, &metrics, &shutdown_rx)?;
+    let _ha_config = ha_runtime.config.clone();
     let (master_coordinator, slave_tracker, resync_sender) = (
-        ha_runtime.coordinator,
-        ha_runtime.tracker,
-        ha_runtime.resync_sender,
+        ha_runtime.coordinator.clone(),
+        ha_runtime.tracker.clone(),
+        ha_runtime.resync_sender.clone(),
     );
 
     // Administrative REST API server
@@ -880,6 +933,42 @@ pub async fn run_server_full(
         dns_starter,
     };
 
+    // Spawn the slave replication worker now that the context and apply hooks
+    // exist. A push is applied through `HaConfigApplier`, which owns the single
+    // apply/persist path used before the worker ACKs `applied: true`.
+    let self_write = if let (Some(tracker), Some(resync_rx)) = (
+        ha_runtime.tracker.clone(),
+        ha_runtime.resync_receiver.take(),
+    ) {
+        if ha_runtime.config.master_url.is_some() {
+            let applier = Arc::new(HaConfigApplier::new(
+                server_ctx.clone(),
+                apply_hooks.clone(),
+            ));
+            let self_write = applier.self_write_tracker();
+            let slave_handles = sito_ha::SlaveAppHandles {
+                runtime: runtime.clone(),
+                filter: filter_engine.clone(),
+                metrics: metrics.clone(),
+                config_path: Some(config_path_buf.clone()),
+                applier,
+            };
+            let _slave_worker_handle = sito_ha::spawn_slave_worker(
+                ha_runtime.config.clone(),
+                tracker,
+                slave_handles,
+                resync_rx,
+                shutdown_rx.clone(),
+            );
+            self_write
+        } else {
+            warn!("Slave role configured without master_url; replication worker idle");
+            Arc::new(sito_api::config_apply::AppliedDocumentTracker::new())
+        }
+    } else {
+        Arc::new(sito_api::config_apply::AppliedDocumentTracker::new())
+    };
+
     let api_router = sito_api::create_router_with_hooks(
         server_ctx.clone(),
         sito_api::config_apply::ApplyHooks::new(apply_hooks.clone()),
@@ -944,6 +1033,7 @@ pub async fn run_server_full(
     tokio::spawn(run_config_watcher(ConfigWatcher {
         ctx: server_ctx,
         hooks: apply_hooks,
+        self_write,
         shutdown_rx: shutdown_rx.clone(),
     }));
 

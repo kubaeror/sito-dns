@@ -21,6 +21,38 @@ pub async fn save_config_atomic(path: &Path, config: &Config) -> Result<(), Prob
     let toml_str = toml::to_string_pretty(config)
         .map_err(|e| ProblemDetails::internal_error(format!("Serialization failed: {e}")))?;
 
+    write_config_document_atomic(path, &toml_str).await
+}
+
+/// Atomically persists an already-rendered configuration document.
+///
+/// Used by the HA slave apply path, which must keep the exact document built
+/// from the pushed configuration plus node-local fields (`[ha]`, identity,
+/// RouterOS credentials) instead of re-serializing the typed config. The
+/// document is still validated before it is committed so a restart cannot
+/// observe an unloadable file.
+pub async fn save_config_document_atomic(
+    path: &Path,
+    document: &str,
+    config: &Config,
+) -> Result<(), ProblemDetails> {
+    if let Err(e) = config.validate() {
+        return Err(ProblemDetails::bad_request(format!(
+            "Configuration validation failed: {e}"
+        )));
+    }
+    // The persisted document must parse and validate as a full config: the
+    // next process start reads exactly this text.
+    if let Err(e) = Config::from_toml_str(document) {
+        return Err(ProblemDetails::bad_request(format!(
+            "Configuration document validation failed: {e}"
+        )));
+    }
+
+    write_config_document_atomic(path, document).await
+}
+
+async fn write_config_document_atomic(path: &Path, document: &str) -> Result<(), ProblemDetails> {
     // 3. Write to a unique temporary sibling file (avoids concurrent-writer races)
     let suffix: u64 = rand::rng().random();
     let file_name = path.file_name().map_or_else(
@@ -48,7 +80,7 @@ pub async fn save_config_atomic(path: &Path, config: &Config) -> Result<(), Prob
         })?;
     }
 
-    file.write_all(toml_str.as_bytes()).await.map_err(|e| {
+    file.write_all(document.as_bytes()).await.map_err(|e| {
         ProblemDetails::internal_error(format!("Failed to write temporary config file: {e}"))
     })?;
 

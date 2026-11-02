@@ -17,12 +17,12 @@
 //! and the runtime never diverge silently.
 
 use crate::config_validation::validate_typed_sections;
-use crate::config_writer::save_config_atomic;
+use crate::config_writer::save_config_document_atomic;
 use crate::error::ProblemDetails;
 use crate::state::ServerContext;
 use sito_core::config::Config;
 use sito_upstream::BootstrapResolver;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Future returned by [`ConfigApplyHooks::apply`] (boxed so the trait stays
@@ -249,10 +249,28 @@ pub async fn apply_and_persist_config(
     filter_apply: FilterApply,
     hooks: Option<&dyn ConfigApplyHooks>,
 ) -> Result<AppliedReport, ProblemDetails> {
+    let document = toml::to_string_pretty(candidate)
+        .map_err(|e| ProblemDetails::internal_error(format!("Serialization failed: {e}")))?;
+    apply_and_persist_document(ctx, candidate, &document, filter_apply, hooks).await
+}
+
+/// Applies `candidate` and atomically persists `document` only after the apply
+/// succeeded.
+///
+/// The HA slave uses this variant to keep the exact document built from the
+/// pushed configuration plus node-local fields. A persist failure rolls the
+/// in-memory apply back so the file and the running server stay in sync.
+pub async fn apply_and_persist_document(
+    ctx: &ServerContext,
+    candidate: &Config,
+    document: &str,
+    filter_apply: FilterApply,
+    hooks: Option<&dyn ConfigApplyHooks>,
+) -> Result<AppliedReport, ProblemDetails> {
     let previous = (**ctx.config.load()).clone();
     let report = apply_full_config(ctx, candidate, filter_apply, hooks).await?;
 
-    if let Err(e) = save_config_atomic(&ctx.config_path, candidate).await {
+    if let Err(e) = save_config_document_atomic(&ctx.config_path, document, candidate).await {
         if let Err(rollback_err) = apply_full_config(ctx, &previous, FilterApply::Sync, hooks).await
         {
             tracing::error!(
@@ -264,6 +282,108 @@ pub async fn apply_and_persist_config(
     }
     ctx.publish_bundle().await;
     Ok(report)
+}
+
+/// Tracks the configuration document most recently written by the HA slave
+/// applier.
+///
+/// The file watcher must not re-apply the applier's own write: doing so would
+/// reload every component (and download blocklists) a second time for the same
+/// push. The tracker is consumed by [`apply_config_document_event`].
+#[derive(Debug, Default)]
+pub struct AppliedDocumentTracker {
+    last: Mutex<Option<String>>,
+}
+
+impl AppliedDocumentTracker {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records the exact document the applier is about to write.
+    pub fn record(&self, document: &str) {
+        *self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(document.to_string());
+    }
+
+    /// Forgets the recorded document (the write failed).
+    pub fn clear(&self) {
+        *self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Returns `true` (and consumes the record) when `content` is the applier's
+    /// own write.
+    #[must_use]
+    pub fn take_if_matches(&self, content: &str) -> bool {
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match last.as_deref() {
+            Some(recorded) if recorded == content => {
+                *last = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Result of handling a configuration file change.
+#[derive(Debug)]
+pub enum ConfigFileApplyOutcome {
+    /// The change was the HA applier's own write; nothing was re-applied.
+    SelfWriteIgnored,
+    /// The file already matches the running configuration; nothing was applied.
+    Unchanged,
+    /// The new configuration was applied and published to slaves.
+    Applied(AppliedReport),
+    /// The document was rejected; the running configuration is untouched.
+    Rejected(ProblemDetails),
+}
+
+/// Applies a configuration document read from disk (file-watcher path).
+///
+/// This is idempotent with respect to the HA slave applier: an exact self-write
+/// is suppressed, and a document that is semantically identical to the running
+/// configuration is skipped instead of reloading every component again.
+pub async fn apply_config_document_event(
+    ctx: &ServerContext,
+    document: &str,
+    filter_apply: FilterApply,
+    hooks: Option<&dyn ConfigApplyHooks>,
+    self_write: &AppliedDocumentTracker,
+) -> ConfigFileApplyOutcome {
+    if self_write.take_if_matches(document) {
+        return ConfigFileApplyOutcome::SelfWriteIgnored;
+    }
+
+    let new_cfg = match Config::from_toml_str(document) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return ConfigFileApplyOutcome::Rejected(ProblemDetails::bad_request(format!(
+                "Invalid hot-reloaded configuration: {e}"
+            )));
+        }
+    };
+
+    if new_cfg == **ctx.config.load() {
+        return ConfigFileApplyOutcome::Unchanged;
+    }
+
+    match apply_full_config(ctx, &new_cfg, filter_apply, hooks).await {
+        Ok(report) => {
+            ctx.publish_bundle().await;
+            ConfigFileApplyOutcome::Applied(report)
+        }
+        Err(e) => ConfigFileApplyOutcome::Rejected(e),
+    }
 }
 
 async fn apply_inner(
@@ -477,6 +597,93 @@ mod tests {
                 "target '{target}' must be accepted"
             );
         }
+    }
+
+    #[test]
+    fn test_applied_document_tracker_matches_only_the_exact_document() {
+        let tracker = AppliedDocumentTracker::new();
+        tracker.record("config_version = 1\n");
+        assert!(!tracker.take_if_matches("config_version = 2\n"));
+        assert!(tracker.take_if_matches("config_version = 1\n"));
+        assert!(
+            !tracker.take_if_matches("config_version = 1\n"),
+            "a recorded self-write is consumed exactly once"
+        );
+
+        tracker.record("config_version = 1\n");
+        tracker.clear();
+        assert!(!tracker.take_if_matches("config_version = 1\n"));
+    }
+
+    /// D-01: the HA path persists the exact document it built (preserving
+    /// `[ha]`, identity and credentials) while applying the same config.
+    #[tokio::test]
+    async fn test_apply_and_persist_document_preserves_document() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_document");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut candidate = (**ctx.config.load()).clone();
+        candidate.upstream.servers = vec!["9.9.9.9".to_string()];
+        candidate.dns.cache.min_ttl = 60;
+        // The document intentionally contains formatting/comments the typed
+        // serializer would drop; it must be written byte-for-byte.
+        let document = format!(
+            "{}\n# node-local section preserved by the HA applier\n",
+            toml::to_string_pretty(&candidate).unwrap()
+        );
+
+        apply_and_persist_document(&ctx, &candidate, &document, FilterApply::Sync, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            document,
+            "the persisted document must not be re-serialized"
+        );
+        assert_eq!(
+            ctx.runtime.snapshot().config.upstream.servers,
+            vec!["9.9.9.9".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// D-01: a persist failure rolls the applied components back, including
+    /// the live filter snapshot.
+    #[tokio::test]
+    async fn test_apply_and_persist_document_rolls_back_on_persist_failure() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_document_rollback");
+        let mut ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.config_path = std::path::PathBuf::from("/proc/forbidden_document_test/config.toml");
+
+        let original_ttl = ctx.config.load().dns.cache.min_ttl;
+        let mut candidate = (**ctx.config.load()).clone();
+        candidate.dns.cache.min_ttl = original_ttl.saturating_add(42);
+        candidate.filtering.custom_rules = vec!["||must-not-stick.test^".to_string()];
+        let document = toml::to_string_pretty(&candidate).unwrap();
+
+        let err = apply_and_persist_document(&ctx, &candidate, &document, FilterApply::Sync, None)
+            .await
+            .expect_err("persist must fail");
+        assert_eq!(err.status, 500);
+        assert_eq!(ctx.config.load().dns.cache.min_ttl, original_ttl);
+        assert!(
+            ctx.runtime
+                .snapshot()
+                .config
+                .filtering
+                .custom_rules
+                .is_empty(),
+            "the runtime snapshot must be rolled back"
+        );
+        assert_eq!(
+            ctx.filter.rule_count(),
+            0,
+            "the live filter snapshot must be rolled back"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
