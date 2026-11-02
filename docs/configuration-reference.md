@@ -220,6 +220,7 @@ enabled = true
 | `fail_closed` | boolean | `true` | Answer SERVFAIL while filtering is enabled but no rule snapshot has ever loaded (e.g. every list failed at boot), instead of silently allowing traffic. |
 | `anti_doh_bypass` | string | `"off"` | Block known public DoH/DoT resolvers to enforce network-wide filtering: `"off"`, `"block_all"`, or `"block_except_trusted"`. |
 | `max_rules` | integer | `2000000` | Hard cap on the total parsed rules (all lists plus custom rules). A reload above the cap is rejected and the previous snapshot is retained (or the engine stays fail-closed when nothing loaded yet). |
+| `max_list_bytes` | integer | `67108864` | Hard cap in bytes for each downloaded subscription list and its disk-cache read, enforced before the body is buffered. Must be greater than 0. Lowering it invalidates larger cached lists; with `fail_closed = true` and no network, queries answer SERVFAIL until a fetch under the new cap succeeds. |
 | `custom_rules` | array of strings | `[]` | In-line custom ABP / AdGuard filter rules. |
 | `lists` | array of tables | `[]` | Subscription lists to download and compile (`name`, `url`, `enabled`). Schemes: `http://`, `https://`, `file://`. Global `refresh_interval_hours` controls update frequency. |
 
@@ -459,7 +460,7 @@ and `POST /api/v1/config/reload`.
 | `dns.cache.enabled`, `dns.cache.size_mb`, `dns.cache.min_ttl`, `dns.cache.max_ttl`, `dns.cache.negative_ttl_max`, `dns.cache.prefetch`, `dns.cache.serve_stale_hours` | Cache configuration updated. |
 | `dns.dnssec.mode`, `dns.dnssec.validate`, `dns.dnssec.ntp`, `dns.dnssec.nta`, `dns.dnssec.trust_anchors` | DNSSEC validator swapped for the new configuration. |
 | `upstream.servers`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.ecs`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt. |
-| `filtering.enabled`, `filtering.refresh_interval_hours`, `filtering.blocking_mode`, `filtering.blocking_ttl`, `filtering.cname_cloaking`, `filtering.fail_closed`, `filtering.anti_doh_bypass`, `filtering.max_rules`, `filtering.lists`, `filtering.custom_rules` | Filter engine reloaded with the new lists/rules; cached answers are flushed. List downloads continue asynchronously after the reload. |
+| `filtering.enabled`, `filtering.refresh_interval_hours`, `filtering.blocking_mode`, `filtering.blocking_ttl`, `filtering.cname_cloaking`, `filtering.fail_closed`, `filtering.anti_doh_bypass`, `filtering.max_rules`, `filtering.max_list_bytes`, `filtering.lists`, `filtering.custom_rules` | Filter engine reloaded with the new lists/rules; cached answers are flushed. List downloads continue asynchronously after the reload. |
 | `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
 | `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |
 | `privacy.anonymize_querylog` | Query-log writer updated. |

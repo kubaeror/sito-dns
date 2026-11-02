@@ -69,7 +69,7 @@ Per ADR-0005 and plan section 4.5:
 
 Per plan section 4.6:
 - **HTTP Caching:** Sends `If-None-Match` (`ETag`) and `If-Modified-Since`. HTTP 304 skips re-downloading and retains compiled state.
-- **Resilience:** 3 retries with exponential backoff on network failures; 64 MB size limit enforcement.
+- **Resilience:** 3 retries with exponential backoff on network failures; a per-list size limit (`filtering.max_list_bytes`, default 64 MiB) is enforced before the body is buffered.
 - **Disk Caching:** Every fetched list is persisted to `data_dir/lists/<sanitized_name>.txt` with `.meta.json` metadata, enabling offline server startup.
 - **Drop Guard:** If a subscription update drops > 50% of its active rules compared to the previous version, the new list is rejected with a warning and the existing snapshot is retained to protect against broken or truncated remote lists.
 

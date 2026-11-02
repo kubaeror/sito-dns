@@ -1,6 +1,6 @@
 //! High-throughput filter engine implementation supporting ABP syntax and multi-structure matching.
 
-use crate::downloader::ListDownloader;
+use crate::downloader::{DEFAULT_DOWNLOAD_TIMEOUT, ListDownloader};
 use crate::error::FilterError;
 use crate::parser::{DnsRewriteRule, Pattern, Rule, RuleKind, parse_rules};
 use crate::structures::{
@@ -692,7 +692,8 @@ pub struct HostsFilterEngine {
     snapshot: ArcSwap<FilterSnapshot>,
     config: ArcSwap<FilteringConfig>,
     data_dir: PathBuf,
-    downloader: ListDownloader,
+    /// Fetches lists with the committed `filtering.max_list_bytes` cap.
+    downloader: ArcSwap<ListDownloader>,
     /// Parsed rules per list, used to refresh individual lists without refetching all.
     list_rules: std::sync::Mutex<FnvHashMap<String, Vec<Rule>>>,
     /// Serializes reload/refresh cycles so concurrent scheduled and API-driven
@@ -717,11 +718,12 @@ impl HostsFilterEngine {
             },
             ..FilterStatus::default()
         };
+        let downloader = ListDownloader::new(DEFAULT_DOWNLOAD_TIMEOUT, config.max_list_bytes);
         Self {
             snapshot: ArcSwap::new(Arc::new(FilterSnapshot::unavailable())),
             config: ArcSwap::new(Arc::new(config)),
             data_dir,
-            downloader: ListDownloader::default(),
+            downloader: ArcSwap::new(Arc::new(downloader)),
             list_rules: std::sync::Mutex::new(FnvHashMap::default()),
             reload_lock: tokio::sync::Mutex::new(()),
             status: ArcSwap::new(Arc::new(status)),
@@ -871,7 +873,8 @@ impl HostsFilterEngine {
     /// Applies the >50% drop guard to protect against corrupted remote sources.
     pub async fn reload(&self) -> Result<usize, FilterError> {
         let config = self.config.load_full();
-        self.reload_internal(&config, true, None).await
+        let downloader = self.downloader.load_full();
+        self.reload_internal(&config, &downloader, true, None).await
     }
 
     /// Reloads blocklists and custom rules using an updated filtering configuration.
@@ -884,20 +887,29 @@ impl HostsFilterEngine {
     pub async fn reload_with_config(&self, config: &FilteringConfig) -> Result<usize, FilterError> {
         // Staged load: `self.config` still holds the previous configuration
         // for the whole attempt, so a rejected candidate is simply dropped.
-        let count = self.reload_internal(config, false, None).await?;
+        // The downloader is staged too so a changed byte cap applies to this
+        // reload before it is committed.
+        let downloader = ListDownloader::new(DEFAULT_DOWNLOAD_TIMEOUT, config.max_list_bytes);
+        let count = self
+            .reload_internal(config, &downloader, false, None)
+            .await?;
         self.config.store(Arc::new(config.clone()));
+        self.downloader.store(Arc::new(downloader));
         Ok(count)
     }
 
     /// Refreshes only the named blocklists, keeping rules from all other lists.
     pub async fn reload_lists(&self, names: &[String]) -> Result<usize, FilterError> {
         let config = self.config.load_full();
-        self.reload_internal(&config, true, Some(names)).await
+        let downloader = self.downloader.load_full();
+        self.reload_internal(&config, &downloader, true, Some(names))
+            .await
     }
 
     async fn reload_internal(
         &self,
         config: &FilteringConfig,
+        downloader: &ListDownloader,
         apply_drop_guard: bool,
         only_lists: Option<&[String]>,
     ) -> Result<usize, FilterError> {
@@ -937,8 +949,7 @@ impl HostsFilterEngine {
                 continue;
             }
 
-            match self
-                .downloader
+            match downloader
                 .fetch_or_cached(&list.name, &list.url, &self.data_dir)
                 .await
             {
@@ -2321,6 +2332,124 @@ mod tests {
         assert!(
             engine.evaluate(&probe, RecordType::A, &client).is_blocked(),
             "the previous snapshot must keep filtering"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// D-07: lowering `filtering.max_list_bytes` must make the reload reject
+    /// the oversized list, record it as failed, and keep the previous
+    /// snapshot filtering until a fetch under the cap succeeds.
+    #[tokio::test]
+    async fn test_reload_rejects_list_over_configured_max_list_bytes() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_max_list_reload_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let path = temp_dir.join("capped.txt");
+        tokio::fs::write(&path, "0.0.0.0 capped.example\n")
+            .await
+            .unwrap();
+        let list = FilterListConfig {
+            name: "capped".to_string(),
+            url: format!("file://{}", path.display()),
+            enabled: true,
+            refresh_hours: None,
+        };
+
+        let accepted = FilteringConfig {
+            max_list_bytes: 1024,
+            lists: vec![list.clone()],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(accepted, temp_dir.clone()).await;
+        assert_eq!(engine.state(), FilterState::Ready);
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let blocked = Name::from_str("capped.example.").unwrap();
+        assert!(
+            engine
+                .evaluate(&blocked, RecordType::A, &client)
+                .is_blocked()
+        );
+
+        // The new cap is committed only after the reload. The list cannot be
+        // fetched, but merging keeps the already-compiled rules active and the
+        // failure stays observable instead of silently dropping protection.
+        let count = engine
+            .reload_with_config(&FilteringConfig {
+                max_list_bytes: 4,
+                lists: vec![list],
+                ..Default::default()
+            })
+            .await
+            .expect("retaining the previous snapshot keeps the reload usable");
+        assert_eq!(count, 1);
+        let status = engine.status();
+        assert_eq!(status.failed_lists, vec!["capped".to_string()]);
+        assert_eq!(status.state, FilterState::Ready);
+        assert!(
+            status.last_error.is_some(),
+            "the oversized list must be reported"
+        );
+        assert_eq!(engine.rule_count(), 1, "previous snapshot retained");
+        assert!(
+            engine
+                .evaluate(&blocked, RecordType::A, &client)
+                .is_blocked(),
+            "the previous snapshot must keep filtering"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// D-07: the cap staged by `reload_with_config` must be the one used for
+    /// that reload, so raising it can recover a list the old cap rejected.
+    #[tokio::test]
+    async fn test_reload_applies_new_max_list_bytes_after_config_change() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_max_list_grow_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let path = temp_dir.join("capped.txt");
+        tokio::fs::write(&path, "0.0.0.0 capped.example\n")
+            .await
+            .unwrap();
+        let list = FilterListConfig {
+            name: "capped".to_string(),
+            url: format!("file://{}", path.display()),
+            enabled: true,
+            refresh_hours: None,
+        };
+
+        let engine = HostsFilterEngine::init(
+            FilteringConfig {
+                max_list_bytes: 4,
+                lists: vec![list.clone()],
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        )
+        .await;
+        assert_eq!(engine.state(), FilterState::Failed);
+        assert_eq!(engine.rule_count(), 0);
+
+        let count = engine
+            .reload_with_config(&FilteringConfig {
+                max_list_bytes: 1024,
+                lists: vec![list],
+                ..Default::default()
+            })
+            .await
+            .expect("the enlarged cap must apply to this reload");
+        assert_eq!(count, 1);
+        assert_eq!(engine.state(), FilterState::Ready);
+        assert_eq!(engine.config.load_full().max_list_bytes, 1024);
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let blocked = Name::from_str("capped.example.").unwrap();
+        assert!(
+            engine
+                .evaluate(&blocked, RecordType::A, &client)
+                .is_blocked()
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;

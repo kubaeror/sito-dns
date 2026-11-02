@@ -7,6 +7,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- **Configurable filter-list size cap**: `filtering.max_list_bytes` (default
+  `67108864`, 64 MiB) bounds each downloaded subscription list and its
+  disk-cache read, enforced before the body is buffered. The value must be
+  greater than 0. Lowering the cap invalidates larger cached lists; with
+  `fail_closed = true` and no network, queries answer SERVFAIL until a fetch
+  under the new cap succeeds.
+
 ### Security
 - **DNSSEC cold-start signature stripping**: a response without RRSIGs is now
   probed from the configured trust anchor even when the zone was never seen

@@ -1288,6 +1288,11 @@ pub struct FilteringConfig {
     /// materialising an unbounded rule set.
     #[serde(default = "default_filtering_max_rules")]
     pub max_rules: usize,
+    /// Per-list download cap in bytes. Applied before a list (or its disk
+    /// cache) is read into memory, so a hostile or misconfigured source cannot
+    /// exhaust memory. Lowering it can invalidate larger cached lists.
+    #[serde(default = "default_filtering_max_list_bytes")]
+    pub max_list_bytes: usize,
     #[serde(default)]
     pub lists: Vec<FilterListConfig>,
     #[serde(default)]
@@ -1306,6 +1311,9 @@ fn default_filtering_anti_doh_bypass() -> String {
 fn default_filtering_max_rules() -> usize {
     2_000_000
 }
+fn default_filtering_max_list_bytes() -> usize {
+    64 * 1024 * 1024
+}
 
 impl Default for FilteringConfig {
     fn default() -> Self {
@@ -1318,6 +1326,7 @@ impl Default for FilteringConfig {
             fail_closed: true,
             anti_doh_bypass: default_filtering_anti_doh_bypass(),
             max_rules: default_filtering_max_rules(),
+            max_list_bytes: default_filtering_max_list_bytes(),
             lists: Vec::new(),
             custom_rules: Vec::new(),
         }
@@ -1336,6 +1345,12 @@ impl FilteringConfig {
             return Err(ConfigError::validation(
                 "filtering.max_rules",
                 "max_rules must be greater than 0",
+            ));
+        }
+        if self.max_list_bytes == 0 {
+            return Err(ConfigError::validation(
+                "filtering.max_list_bytes",
+                "max_list_bytes must be greater than 0",
             ));
         }
         let mut seen_names = std::collections::HashSet::new();
@@ -1890,6 +1905,27 @@ key = "/path/to/key.pem"
             "{TEST_BASE}[filtering]\nlists = [{{ name = \"ads\", url = \"https://example.com/a.txt\", refresh_hours = 24 }}]\n"
         );
         Config::from_toml_str(&positive).expect("a positive refresh_hours must be accepted");
+    }
+
+    /// D-07: the per-list download cap is configurable and must stay positive.
+    #[test]
+    fn test_filtering_max_list_bytes_default_and_validation() {
+        let default = Config::from_toml_str(TEST_BASE).expect("minimal config must parse");
+        assert_eq!(
+            default.filtering.max_list_bytes,
+            64 * 1024 * 1024,
+            "the default per-list cap must stay at 64 MiB"
+        );
+
+        expect_validation_field(
+            &format!("{TEST_BASE}[filtering]\nmax_list_bytes = 0\n"),
+            "filtering.max_list_bytes",
+        );
+
+        let custom =
+            Config::from_toml_str(&format!("{TEST_BASE}[filtering]\nmax_list_bytes = 1024\n"))
+                .expect("a positive max_list_bytes must be accepted");
+        assert_eq!(custom.filtering.max_list_bytes, 1024);
     }
 
     /// Audit 6 / WP-6.5: an empty or malformed probe domain made every

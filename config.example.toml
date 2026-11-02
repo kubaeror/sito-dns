@@ -68,6 +68,10 @@ blocking_ttl = 10
 cname_cloaking = true
 fail_closed = true
 anti_doh_bypass = "off"
+# Per-list download cap in bytes (default 64 MiB), enforced before buffering.
+# Lowering it invalidates larger cached lists; with fail_closed = true and no
+# network, queries answer SERVFAIL until a fetch under the new cap succeeds.
+max_list_bytes = 67108864
 lists = []
 custom_rules = [
     "0.0.0.0 ads.example.com",

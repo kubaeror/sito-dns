@@ -401,6 +401,34 @@ mod tests {
         );
     }
 
+    /// D-07: the byte cap passed to `ListDownloader::new` must be enforced for
+    /// `file://` lists, not just for HTTP responses.
+    #[tokio::test]
+    async fn test_downloader_enforces_configured_cap_for_file_lists() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_downloader_cap_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let file_path = temp_dir.join("ten-bytes.txt");
+        tokio::fs::write(&file_path, "0123456789").await.unwrap();
+
+        let downloader = ListDownloader::new(DEFAULT_DOWNLOAD_TIMEOUT, 4);
+        let err = downloader
+            .fetch_or_cached(
+                "capped",
+                &format!("file://{}", file_path.display()),
+                &temp_dir,
+            )
+            .await
+            .expect_err("a 10-byte list must exceed a 4-byte cap");
+        assert!(
+            matches!(err, FilterError::ListTooLarge { limit: 4, .. }),
+            "unexpected error: {err}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
     #[tokio::test]
     async fn test_fetch_file_uri_inside_data_dir() {
         let temp_dir =
