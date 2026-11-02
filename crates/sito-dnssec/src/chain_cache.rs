@@ -139,6 +139,15 @@ impl ChainCache {
     /// deliberately kept. Signed entries remain valid: a new anchor never makes
     /// signed evidence weaker.
     pub fn invalidate_unsigned_at_or_above(&self, anchor: &LowerName) -> usize {
+        // Serialize with `flush`: a flush snapshots the map under this lock, so
+        // taking it here guarantees an entry invalidated now cannot be picked
+        // up by a flush that starts afterwards. (A flush already in progress
+        // completes before the removal; the dirty flag then makes the next
+        // flush persist the invalidated view.)
+        let _flush_guard = self
+            .flush_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stale: Vec<LowerName> = self
             .entries
             .iter()
@@ -605,6 +614,33 @@ mod tests {
         let cache = ChainCache::new(Some(path.clone()));
         cache.load(system_now());
         assert!(cache.is_empty(), "a corrupt file must load as empty");
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    /// An unsigned entry invalidated before a flush must not be persisted by
+    /// that flush; signed evidence below the anchor survives.
+    #[test]
+    fn test_invalidated_unsigned_entries_are_not_persisted() {
+        let path = temp_path("invalidate");
+        let cache = ChainCache::new(Some(path.clone()));
+        let now = system_now();
+        cache.insert(name("corp."), ZoneStatus::Unsigned, now + 600, now);
+        cache.insert(name("signed.corp."), ZoneStatus::Signed, now + 600, now + 1);
+
+        assert_eq!(cache.invalidate_unsigned_at_or_above(&name("corp.")), 1);
+        cache.flush().expect("flush");
+
+        let reloaded = ChainCache::new(Some(path.clone()));
+        reloaded.load(now);
+        assert!(
+            reloaded.get(&name("corp."), now).is_none(),
+            "the invalidated unsigned entry must not reach disk"
+        );
+        assert!(
+            reloaded.get(&name("signed.corp."), now).is_some(),
+            "signed evidence below the anchor must survive"
+        );
+
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 

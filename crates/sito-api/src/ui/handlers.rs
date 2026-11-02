@@ -1126,23 +1126,27 @@ pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
         .collect();
 
     // Discovered-client rows carry DHCP PII (IP/MAC/hostname), so they are
-    // loaded and rendered for Operators and above only.
+    // loaded and rendered for Operators and above only. The UI shows at most
+    // the API's default page size; the registry itself keeps its hard cap.
     let can_view_discovered = user.role >= Role::Operator;
-    let discovered: Vec<ClientDiscoveryViewItem> = if can_view_discovered {
-        ctx.clients
-            .load()
-            .unidentified_clients()
-            .into_iter()
-            .map(|client| ClientDiscoveryViewItem {
-                ip: client.ip.to_string(),
-                mac: client.mac,
-                hostname: client.hostname,
-                last_seen: client.last_seen.format("%Y-%m-%d %H:%M UTC").to_string(),
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let (discovered, discovered_total): (Vec<ClientDiscoveryViewItem>, usize) =
+        if can_view_discovered {
+            let all = ctx.clients.load().unidentified_clients();
+            let total = all.len();
+            let rows = all
+                .into_iter()
+                .take(crate::handlers::clients::DEFAULT_UNIDENTIFIED_LIMIT)
+                .map(|client| ClientDiscoveryViewItem {
+                    ip: client.ip.to_string(),
+                    mac: client.mac,
+                    hostname: client.hostname,
+                    last_seen: client.last_seen.format("%Y-%m-%d %H:%M UTC").to_string(),
+                })
+                .collect();
+            (rows, total)
+        } else {
+            (Vec::new(), 0)
+        };
 
     HtmlTemplate(ClientsTemplate {
         csrf_token: &csrf,
@@ -1153,6 +1157,7 @@ pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
         version: env!("CARGO_PKG_VERSION"),
         clients,
         discovered,
+        discovered_total,
         can_view_discovered,
         max_entries: sito_clients::MAX_UNIDENTIFIED_CLIENTS,
         retention_hours: sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS,
@@ -3778,17 +3783,32 @@ mod tests {
 
     /// Records discovered clients through the same resolve path the DNS
     /// listener uses, so the UI sees production-shaped registry entries.
-    fn seed_discovered(
-        ctx: &ServerContext,
-        entries: &[(
-            std::net::IpAddr,
-            &str,
-            Option<&str>,
-            chrono::DateTime<chrono::Utc>,
-        )],
-    ) {
+    type SeedDiscovery<'a> = (
+        std::net::IpAddr,
+        Option<&'a str>,
+        Option<&'a str>,
+        chrono::DateTime<chrono::Utc>,
+    );
+
+    fn seed_discovered(ctx: &ServerContext, entries: &[SeedDiscovery<'_>]) {
         let registry = ctx.clients.load();
         for (ip, mac, hostname, last_seen) in entries {
+            let Some(mac) = mac else {
+                // The resolve path only records a discovery when a lease is
+                // present. Seed the no-identifier case directly so the UI
+                // fallback (`-`) is exercised.
+                registry.unidentified_store().write().unwrap().insert(
+                    *ip,
+                    sito_clients::UnidentifiedClient {
+                        ip: *ip,
+                        mac: None,
+                        hostname: hostname.map(str::to_string),
+                        comment: None,
+                        last_seen: *last_seen,
+                    },
+                );
+                continue;
+            };
             registry.update_routeros_leases(vec![sito_clients::RouterOsLease {
                 mac: (*mac).to_string(),
                 ip: Some(*ip),
@@ -3798,6 +3818,16 @@ mod tests {
             let mut client = sito_core::client::ClientContext::new(*ip);
             let _ = registry.resolve(&mut client, registry.timezone().at_utc(*last_seen));
         }
+    }
+
+    /// A fixed midday UTC instant: deterministic formatting with no risk of
+    /// crossing a day (or UTC midnight) while the test runs.
+    fn midday() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .expect("midday is a valid time")
+            .and_utc()
     }
 
     #[tokio::test]
@@ -3813,24 +3843,29 @@ mod tests {
             .create_user("oper_user", "OperPass1", Role::Operator)
             .await;
 
-        let now = chrono::Utc::now();
+        let base = midday();
+        let older_seen = base - chrono::TimeDelta::minutes(5);
+        let newer_seen = base - chrono::TimeDelta::minutes(1);
+        let no_id_seen = base - chrono::TimeDelta::minutes(3);
         let older: std::net::IpAddr = "10.42.0.10".parse().unwrap();
         let newer: std::net::IpAddr = "10.42.0.11".parse().unwrap();
+        let no_id: std::net::IpAddr = "10.42.0.12".parse().unwrap();
         seed_discovered(
             &ctx,
             &[
                 (
                     older,
-                    "aa:bb:cc:dd:ee:01",
+                    Some("aa:bb:cc:dd:ee:01"),
                     Some("older-host"),
-                    now - chrono::TimeDelta::minutes(5),
+                    older_seen,
                 ),
                 (
                     newer,
-                    "aa:bb:cc:dd:ee:02",
+                    Some("aa:bb:cc:dd:ee:02"),
                     Some("newer-host"),
-                    now - chrono::TimeDelta::minutes(1),
+                    newer_seen,
                 ),
+                (no_id, None, None, no_id_seen),
             ],
         );
 
@@ -3856,9 +3891,21 @@ mod tests {
         assert!(body.contains("older-host"), "{body}");
         assert!(body.contains("newer-host"), "{body}");
         assert!(body.contains("Last Seen"), "{body}");
+        for seen in [older_seen, newer_seen, no_id_seen] {
+            let rendered = seen.format("%Y-%m-%d %H:%M UTC").to_string();
+            assert!(
+                body.contains(&rendered),
+                "last-seen timestamp {rendered:?} must render exactly: {body}"
+            );
+        }
+
+        // A discovery with neither a MAC nor a hostname must render the `-`
+        // fallback instead of an empty cell.
+        let no_id_pos = body.find("10.42.0.12").expect("no-identifier row");
+        let no_id_row_end = body[no_id_pos..].find("</tr>").expect("row terminator") + no_id_pos;
         assert!(
-            body.contains(&now.format("%Y-%m-%d").to_string()),
-            "last-seen timestamps must render: {body}"
+            body[no_id_pos..no_id_row_end].contains("<div>-</div>"),
+            "missing MAC and hostname must render '-': {body}"
         );
         assert!(
             body.contains(&format!(
@@ -3886,6 +3933,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_clients_page_caps_discovered_rows_at_api_default() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_cap_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+
+        // 105 discoveries: the newest 100 render, the 5 oldest are omitted
+        // even though the registry hard cap (1024) is not reached.
+        let base = midday();
+        let entries: Vec<(
+            std::net::IpAddr,
+            String,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+        )> = (0..105)
+            .map(|index: i64| {
+                let ip = format!("10.44.0.{}", index + 1).parse().unwrap();
+                let mac = format!("aa:bb:cc:dd:ef:{index:02x}");
+                (ip, mac, None, base - chrono::TimeDelta::minutes(index))
+            })
+            .collect();
+        for (ip, mac, hostname, seen) in &entries {
+            seed_discovered(
+                &ctx,
+                &[(*ip, Some(mac.as_str()), hostname.as_deref(), *seen)],
+            );
+        }
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+
+        assert!(
+            body.contains("Showing 100 of 105 discovered clients"),
+            "the truncated count must be accurate: {body}"
+        );
+        let rendered_rows = body
+            .matches("<td class=\"td-strong mono\">10.44.0.")
+            .count();
+        assert_eq!(rendered_rows, 100, "at most 100 discovered rows may render");
+        assert!(body.contains("10.44.0.1<"), "the newest row must render");
+        assert!(body.contains("10.44.0.100<"), "row 100 must render");
+        for index in 101..=105 {
+            assert!(
+                !body.contains(&format!("10.44.0.{index}<")),
+                "row {index} is outside the 100-row window: {body}"
+            );
+        }
+        assert!(
+            body.contains(&format!(
+                "capped at {} entries",
+                sito_clients::MAX_UNIDENTIFIED_CLIENTS
+            )),
+            "the registry hard cap must stay visible: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
     async fn test_clients_page_hides_unidentified_for_viewer() {
         let temp_dir = std::env::temp_dir().join(format!(
             "sito_ui_clients_discovered_viewer_{}",
@@ -3898,15 +4018,27 @@ mod tests {
             .create_user("view_user", "ViewerPass1", Role::Viewer)
             .await;
 
+        // Viewers still see explicitly configured clients; only the
+        // discovered (DHCP PII) section is hidden.
+        let mut clients_cfg = load_clients_config(&ctx);
+        clients_cfg.entries.push(sito_clients::ClientEntryConfig {
+            name: "Viewer Laptop".to_string(),
+            ids: vec!["10.43.0.99".to_string()],
+            group: "default".to_string(),
+            ignore_query_log: false,
+            ignore_stats: false,
+            use_global_upstreams: true,
+            upstreams: None,
+            trusted: false,
+        });
+        let mut new_cfg = (**ctx.config.load()).clone();
+        new_cfg.clients = Some(toml::Value::try_from(&clients_cfg).unwrap());
+        ctx.set_config(new_cfg);
+
         let ip: std::net::IpAddr = "10.43.0.20".parse().unwrap();
         seed_discovered(
             &ctx,
-            &[(
-                ip,
-                "aa:bb:cc:dd:ee:03",
-                Some("secret-host"),
-                chrono::Utc::now(),
-            )],
+            &[(ip, Some("aa:bb:cc:dd:ee:03"), Some("secret-host"), midday())],
         );
 
         let LoginResult::Success(session) = ctx
@@ -3923,6 +4055,10 @@ mod tests {
         assert!(
             body.contains("Identified Clients & Device Policies"),
             "viewers still see configured clients: {body}"
+        );
+        assert!(
+            body.contains("Viewer Laptop") && body.contains("10.43.0.99"),
+            "the configured client row must remain visible: {body}"
         );
         assert!(
             !body.contains("Discovered but unidentified"),
@@ -4277,6 +4413,10 @@ mod tests {
 
         let tokens = ctx.auth_mgr.list_tokens();
         assert_eq!(tokens.len(), 1);
+        assert_eq!(
+            tokens[0].name, "ci-deploy",
+            "the token name must be stored exactly as trimmed"
+        );
         let token_id = tokens[0].id.clone();
         assert!(
             !body.contains(&tokens[0].hash),
@@ -4295,6 +4435,51 @@ mod tests {
         let resp = account_token_delete_handler(State(ctx.clone()), headers, Path(token_id)).await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert!(ctx.auth_mgr.list_tokens().is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_account_token_empty_table_colspan_matches_role() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_token_colspan_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("view_user", "ViewerPass1", Role::Viewer)
+            .await;
+
+        let LoginResult::Success(view_session) = ctx
+            .auth_mgr
+            .login("view_user", "ViewerPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("viewer login failed");
+        };
+        let body =
+            response_body(account_page(State(ctx.clone()), session_headers(&view_session)).await)
+                .await;
+        assert!(
+            body.contains("colspan=\"6\""),
+            "non-Admins have six token columns: {body}"
+        );
+        assert!(
+            !body.contains("colspan=\"7\""),
+            "the empty-state span must not count the hidden Owner column: {body}"
+        );
+
+        let LoginResult::Success(admin_session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let body =
+            response_body(account_page(State(ctx.clone()), session_headers(&admin_session)).await)
+                .await;
+        assert!(
+            body.contains("colspan=\"7\""),
+            "Admins have seven token columns: {body}"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -4478,6 +4663,24 @@ mod tests {
         assert!(body.contains("legacy-token"));
         assert!(!body.contains("oper-token"));
         assert!(body.contains("<th>Owner</th>"));
+
+        // Admin privilege does not extend to another account's owned token:
+        // the response is indistinguishable from a missing token and the
+        // token survives.
+        let resp = account_token_delete_handler(
+            State(ctx.clone()),
+            admin_headers.clone(),
+            Path(oper_token.id.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == oper_token.id),
+            "an Admin must not revoke another user's owned token"
+        );
 
         let resp = account_token_delete_handler(
             State(ctx.clone()),

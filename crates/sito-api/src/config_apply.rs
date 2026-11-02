@@ -331,9 +331,15 @@ pub enum ConfigFileApplyOutcome {
 /// Every event is serialized with the other apply/persist paths and then
 /// re-reads the file. The document is suppressed only when it parses to the
 /// *current* runtime configuration (typically the HA applier's own write, a
-/// duplicate event, or an identical external save). A file that differs from
-/// the runtime — including an external revert to an older document — is always
-/// applied, so the runtime can never be left ahead of the file.
+/// duplicate event, or an identical external save). An identical external save
+/// therefore does not force a full re-apply; use `POST /api/v1/config/reload`
+/// when an explicit reload is required. A file that differs from the runtime —
+/// including an external revert to an older document — is always applied.
+///
+/// If the on-disk document is rejected (parse or validation failure), the
+/// running configuration is left untouched by design. In that case the file
+/// and runtime can diverge until an operator fixes the file or restores a
+/// valid document; the runtime is not rolled forward to a rejected file.
 pub async fn apply_config_document_event(
     ctx: &ServerContext,
     document: &str,

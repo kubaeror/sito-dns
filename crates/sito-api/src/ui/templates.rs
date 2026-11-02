@@ -211,6 +211,8 @@ pub struct ClientsTemplate<'a> {
     pub clients: Vec<ClientViewItem>,
     /// Newest-first discovered clients; empty for roles below Operator.
     pub discovered: Vec<ClientDiscoveryViewItem>,
+    /// Total discoveries before the UI row cap, used for the truncation count.
+    pub discovered_total: usize,
     /// True when the signed-in role may see discovered-client PII.
     pub can_view_discovered: bool,
     /// Maximum number of entries the registry retains.

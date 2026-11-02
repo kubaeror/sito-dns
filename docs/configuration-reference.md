@@ -459,6 +459,13 @@ previous settings stay active and the error is logged. The REST API reports
 restart-only changes in the `restart_required` field of `PUT /api/v1/config`
 and `POST /api/v1/config/reload`.
 
+> [!NOTE]
+> The watcher compares the parsed file with the running configuration before
+> applying it. An identical external save (including a file already written by
+> the HA applier) is ignored and does **not** force a full re-apply. When an
+> explicit reload is required, use `POST /api/v1/config/reload`: it re-reads
+> the file and applies it even when the content matches the current runtime.
+
 ### 16.1 Applied live (no restart)
 
 | Setting | How it is applied |

@@ -273,6 +273,7 @@ mod tests {
                 hostname: Some("laptop <b>&".to_string()),
                 last_seen: "2026-01-02 03:04 UTC".to_string(),
             }],
+            discovered_total: 1,
             can_view_discovered: true,
             max_entries: sito_clients::MAX_UNIDENTIFIED_CLIENTS,
             retention_hours: sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS,

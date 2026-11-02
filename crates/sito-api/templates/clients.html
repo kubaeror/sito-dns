@@ -136,6 +136,12 @@
     </table>
   </div>
 
+  {% if discovered.len() < discovered_total %}
+  <div style="padding: 12px 18px 0; color: var(--text-muted); font-size: 0.8rem;">
+    Showing {{ discovered.len() }} of {{ discovered_total }} discovered clients (newest first).
+  </div>
+  {% endif %}
+
   <div style="padding: 12px 18px; color: var(--text-muted); font-size: 0.8rem; border-top: 1px solid var(--border-color);">
     Read-only view of recent devices that are not explicitly configured. Newest first, capped at {{ max_entries }} entries and pruned after {{ retention_hours }} hours.
   </div>

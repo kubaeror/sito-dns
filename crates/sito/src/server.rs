@@ -766,11 +766,11 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
                         {
                             ConfigFileApplyOutcome::SelfWriteIgnored => {
                                 info!(
-                                    "Ignoring file-watcher event for the configuration written by the HA push"
+                                    "Ignoring file-watcher event: the file already matches the running configuration (self-write or unchanged)"
                                 );
                             }
                             ConfigFileApplyOutcome::Applied(report) => {
-                                info!("Detected configuration file change, hot-reloaded");
+                                info!("Detected external configuration file change; hot-reloaded");
                                 if !report.restart_required.is_empty() {
                                     warn!(
                                         fields = ?report.restart_required,

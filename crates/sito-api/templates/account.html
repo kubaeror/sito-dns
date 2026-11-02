@@ -108,7 +108,7 @@
         </tr>
         {% else %}
         <tr>
-          <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 24px;">No API tokens yet</td>
+          <td colspan="{% if user_role == "admin" %}7{% else %}6{% endif %}" style="text-align: center; color: var(--text-muted); padding: 24px;">No API tokens yet</td>
         </tr>
         {% endfor %}
       </tbody>

@@ -44,8 +44,8 @@ pub struct UnidentifiedClientsQuery {
     pub limit: Option<usize>,
 }
 
-/// Default page size for the discovered-client list.
-const DEFAULT_UNIDENTIFIED_LIMIT: usize = 100;
+/// Default page size for the discovered-client list (also the web UI cap).
+pub(crate) const DEFAULT_UNIDENTIFIED_LIMIT: usize = 100;
 
 fn load_clients_config(ctx: &ServerContext) -> ClientsConfig {
     ctx.config

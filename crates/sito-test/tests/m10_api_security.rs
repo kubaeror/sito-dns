@@ -607,10 +607,17 @@ async fn test_acceptance_m10_ui_users_csrf_and_rbac() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = body_string(res).await;
     assert!(body.contains("router-token"));
-    assert!(
-        body.contains("sito_"),
-        "the one-time plaintext token must be rendered"
-    );
+    // Extract the one-time plaintext token instead of matching a bare
+    // `sito_` prefix (the page also contains `sito_theme`).
+    let plaintext = body
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .find(|part| {
+            part.len() == 69
+                && part.starts_with("sito_")
+                && part[5..].chars().all(|c| c.is_ascii_hexdigit())
+        })
+        .expect("the one-time plaintext token must be rendered");
+    assert_ne!(plaintext, "sito_theme");
     let router_token = ctx
         .auth_mgr
         .list_tokens()

@@ -96,6 +96,12 @@ exhaustive record.
   filter, group, or alert on `upstream="all"` (or the synthetic
   `upstream="default"` health series); the aggregate error series is no longer
   emitted.
+- **Config watcher skips identical documents**: a file that parses to the
+  running configuration (an HA self-write, a duplicate event, or an identical
+  external save) is ignored instead of triggering a full re-apply. Use
+  `POST /api/v1/config/reload` for an explicit reload. A differing file —
+  including an external revert — is still applied; a rejected file leaves the
+  last good runtime configuration active.
 - **HA apply and ACK**: a slave now applies every hot-appliable component
   (runtime pipeline, filtering, upstreams, DNSSEC, clients, rewrites), persists
   the exact document atomically, and waits for the DNS listener readiness gate
