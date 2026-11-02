@@ -49,6 +49,10 @@ const MAX_CHAIN_CUTS: usize = 8;
 const CHAIN_STATUS_TTL_MAX: u32 = 3600;
 /// How long a failed delegation probe suppresses further probes for the name.
 const PROBE_BACKOFF_SECS: u32 = 30;
+/// Maximum number of *distinct CNAME chain names* probed per response. Names
+/// already covered by cached/in-memory evidence do not consume the budget.
+/// A chain that needs more probes fails closed instead of amplifying fetches.
+const MAX_CNAME_PROBES: usize = 8;
 /// Accepted clock skew around RRSIG inception/expiration (RFC 4035 5.3.1).
 const MAX_CLOCK_SKEW: u32 = 300;
 /// Minimum accepted RSA modulus size in bits (RFC 8624 3.1).
@@ -541,6 +545,20 @@ fn cname_chain_names(response: &Message, qname: &Name) -> Vec<Name> {
         }
         names.push(next.clone());
         current = next;
+    }
+    names
+}
+
+/// Distinct names in the CNAME chain (query name plus targets), preserving
+/// first-seen order. Deduplication matters because a loop or repeated target
+/// must not consume the per-response probe budget twice.
+fn distinct_cname_chain_names(response: &Message, qname: &Name) -> Vec<Name> {
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    for name in cname_chain_names(response, qname) {
+        if seen.insert(LowerName::from(&name)) {
+            names.push(name);
+        }
     }
     names
 }
@@ -1261,6 +1279,17 @@ fn delegation_cuts(name: &LowerName, zone: &LowerName) -> (Vec<LowerName>, bool)
     let truncated = cuts.len() > MAX_CHAIN_CUTS;
     cuts.truncate(MAX_CHAIN_CUTS);
     (cuts, truncated)
+}
+
+/// Result of consulting the cache/probe for one name in a CNAME chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsignedProbe {
+    /// Cached or in-memory evidence already answered the question; no fetch.
+    Covered,
+    /// A probe ran and established an authenticated status.
+    Probed,
+    /// A probe ran but could not establish a status (network/unknown).
+    Failed,
 }
 
 /// Result of the DS/DNSKEY trust-extension walk.
@@ -1991,7 +2020,7 @@ impl DnssecValidator {
         name: &LowerName,
         fetcher: &dyn DnssecKeyFetcher,
         now: u32,
-    ) -> bool {
+    ) -> UnsignedProbe {
         if let Some(entry) = self.chain_cache.get(name, now) {
             match entry.status {
                 ZoneStatus::Signed => {
@@ -2003,26 +2032,34 @@ impl DnssecValidator {
                     self.insecure_zones.insert(name.clone(), entry.expires_at);
                 }
             }
-            return false;
+            return UnsignedProbe::Covered;
         }
         if let Some((zone, expiry)) = self.chain_cache.covers_unsigned(name, now) {
             self.signed_zones.remove(&zone);
             self.insecure_zones.insert(zone, expiry);
-            return false;
+            return UnsignedProbe::Covered;
         }
         if self.insecure_zone_covers(name, now) {
-            return false;
+            return UnsignedProbe::Covered;
         }
         if self.probe_backoff_active(name, now) {
-            return true;
+            return UnsignedProbe::Failed;
         }
         if self.probe_delegation(name, fetcher, now).await == DelegationProof::Unknown {
             self.record_probe_failure(name, now);
-            true
+            UnsignedProbe::Failed
         } else {
             self.probe_backoff.remove(name);
-            false
+            UnsignedProbe::Probed
         }
+    }
+
+    /// Whether `name` already has cached or in-memory coverage, so consulting
+    /// it will not consume the per-response probe budget.
+    fn unsigned_status_known(&self, name: &LowerName, now: u32) -> bool {
+        self.chain_cache.get(name, now).is_some()
+            || self.chain_cache.covers_unsigned(name, now).is_some()
+            || self.insecure_zone_covers(name, now)
     }
 
     fn probe_backoff_active(&self, name: &LowerName, now: u32) -> bool {
@@ -2062,27 +2099,49 @@ impl DnssecValidator {
         // denial may downgrade it to Insecure, otherwise `validate_response`
         // keeps the fail-closed Bogus decision.
         let mut probe_failed = false;
+        let mut budget_exhausted = false;
         let mut has_rrsigs = true;
         let mut query_is_nta = false;
         if self.mode != DnssecMode::Disabled
             && let Some(query) = response.queries.first()
         {
-            let qname = LowerName::from(query.name());
             has_rrsigs = response_has_rrsigs(response);
             query_is_nta = self.is_nta(query.name());
             if !has_rrsigs && !query_is_nta {
-                // Probe the qname and the final CNAME target only. Serial
-                // probing of every hop would amplify fetches; the final target
-                // is the one whose data is served, and `signed_chain_contains`
-                // below still checks every hop for already-known evidence.
-                probe_failed |= self.prepare_unsigned_response(&qname, fetcher, now).await;
-                let final_target = LowerName::from(&negative_answer_name(response, query.name()));
-                if final_target != qname {
-                    probe_failed |= self
-                        .prepare_unsigned_response(&final_target, fetcher, now)
-                        .await;
+                // Probe every distinct name in the CNAME chain, including
+                // intermediate hops: a chain can leave an unsigned zone for a
+                // signed one and return to an unsigned zone. A shared
+                // per-response budget bounds amplification; names already
+                // covered by cached/in-memory evidence are free. A chain that
+                // needs more probes than the budget fails closed below.
+                let mut probes = 0usize;
+                for name in distinct_cname_chain_names(response, query.name()) {
+                    let lower = LowerName::from(&name);
+                    if probes >= MAX_CNAME_PROBES && !self.unsigned_status_known(&lower, now) {
+                        budget_exhausted = true;
+                        break;
+                    }
+                    match self.prepare_unsigned_response(&lower, fetcher, now).await {
+                        UnsignedProbe::Covered => {}
+                        UnsignedProbe::Probed => probes += 1,
+                        UnsignedProbe::Failed => {
+                            probes += 1;
+                            probe_failed = true;
+                        }
+                    }
                 }
             }
+        }
+
+        // A chain that could not be fully probed within the shared budget is
+        // treated as a stripped/fail-closed response, not Insecure/AD=0.
+        if budget_exhausted && !has_rrsigs && !query_is_nta {
+            return self.handle_bogus(
+                response,
+                upstream,
+                "CNAME chain exceeds DNSSEC probe budget",
+                EDE_DNSSEC_BOGUS,
+            );
         }
 
         // A never-proven zone with no signatures and no authenticated
@@ -5534,6 +5593,146 @@ mod tests {
         );
         assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
         assert!(!response.metadata.authentic_data);
+    }
+
+    /// A stripped multi-hop CNAME chain ending in an A record. `targets` are
+    /// the successive CNAME targets (the first target replaces `qname`).
+    fn stripped_cname_chain_response(qname: &Name, targets: &[Name]) -> Message {
+        use hickory_proto::rr::rdata::CNAME;
+        let mut response = Message::new(9, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+        let mut current = qname.clone();
+        for target in targets {
+            response.answers.push(Record::from_rdata(
+                current,
+                300,
+                RData::CNAME(CNAME(target.clone())),
+            ));
+            current = target.clone();
+        }
+        response.answers.push(Record::from_rdata(
+            current,
+            300,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 46))),
+        ));
+        response
+    }
+
+    /// Critical regression: unsigned qname → signed intermediate CNAME hop →
+    /// unsigned final target, all signatures stripped, must be Bogus. Probing
+    /// only the qname and final target would miss the signed intermediate.
+    #[tokio::test]
+    async fn test_stripped_signed_intermediate_cname_hop_is_bogus() {
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let unsigned_cut = Name::from_str("unsigned.signed.example.").expect("unsigned cut");
+        let qname = Name::from_str("www.unsigned.signed.example.").expect("qname");
+        let mid = Name::from_str("mid.signed.example.").expect("mid");
+        let final_cut = Name::from_str("unsigned2.signed.example.").expect("final cut");
+        let final_target = Name::from_str("www.unsigned2.signed.example.").expect("final");
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+
+        let unsigned_denial = signed_nsec_response(
+            &parent_origin,
+            &unsigned_cut,
+            &Name::from_str("z.signed.example.").expect("next"),
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+            &unsigned_cut,
+            &parent_key,
+            &parent_signer,
+            ResponseCode::NoError,
+        );
+        // The intermediate name lives directly in the signed anchor zone and
+        // is not a delegation.
+        let mid_in_zone = signed_nsec_response(
+            &parent_origin,
+            &mid,
+            &Name::from_str("z.signed.example.").expect("next"),
+            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+            &mid,
+            &parent_key,
+            &parent_signer,
+            ResponseCode::NoError,
+        );
+        let final_denial = signed_nsec_response(
+            &parent_origin,
+            &final_cut,
+            &Name::from_str("z.signed.example.").expect("next"),
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+            &final_cut,
+            &parent_key,
+            &parent_signer,
+            ResponseCode::NoError,
+        );
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(&unsigned_cut, RecordType::DS, unsigned_denial)
+            .with(&mid, RecordType::DS, mid_in_zone)
+            .with(&final_cut, RecordType::DS, final_denial);
+
+        let mut response = stripped_cname_chain_response(&qname, &[mid, final_target]);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a stripped signed intermediate CNAME hop must be Bogus: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+        assert!(
+            response.answers.is_empty(),
+            "bogus response must not carry the chain: {:?}",
+            response.answers
+        );
+    }
+
+    /// The shared per-response probe budget fails closed instead of probing an
+    /// unbounded CNAME chain or returning AD=0.
+    #[tokio::test]
+    async fn test_cname_probe_budget_exhaustion_fails_closed() {
+        let (origin, key, signer) = create_test_signer("example.");
+        let qname = Name::from_str("n0.example.").expect("qname");
+        let targets: Vec<Name> = (1..=9)
+            .map(|index| Name::from_str(&format!("n{index}.example.")).expect("target"))
+            .collect();
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&key, LowerName::from(&origin));
+        // Only the anchor DNSKEY is available; every DS lookup returns an
+        // empty message, so each probe is a genuine failed walk.
+        let fetcher = StaticFetcher::new().with(
+            &origin,
+            RecordType::DNSKEY,
+            anchored_dnskey_message(&origin, &key, &signer),
+        );
+
+        let mut response = stripped_cname_chain_response(&qname, &targets);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "an over-budget CNAME chain must fail closed: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+        assert!(
+            fetcher.calls() <= 2 * MAX_CNAME_PROBES + 2,
+            "probing must stay within the shared budget, got {} fetches",
+            fetcher.calls()
+        );
     }
 
     /// Positive NSEC3 regression: a *properly signed* NSEC3 NXDOMAIN proof for
