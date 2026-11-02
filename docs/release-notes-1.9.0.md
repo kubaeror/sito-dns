@@ -43,8 +43,10 @@ restarting production nodes.
   **Back up `totp.key` together with `users.toml`.**
 - **Recovery copies are sanitized.** `users.toml.reset.*.bak` copies are written
   as sanitized TOML with legacy plaintext TOTP secrets sealed. An unparseable
-  `users.toml` is no longer copied verbatim; the raw contents are not retained.
-  `TotpConfig` and the one-time setup response redact secrets in `Debug` output.
+  `users.toml` no longer gets a verbatim backup copy; the original file remains
+  on disk until `sito reset-admin` replaces it, so protect or remove it as part
+  of recovery because it may still contain plaintext TOTP secrets. `TotpConfig`
+  and the one-time setup response redact secrets in `Debug` output.
 
 ## Behavior changes
 
@@ -101,13 +103,16 @@ restarting production nodes.
 
 ### Upstreams
 
-- **Per-upstream failure attribution.** `sito_upstream_errors_total` and
-  `sito_upstream_health` label a failure with the configured upstream server
-  that failed instead of the aggregate `upstream="all"`. A failure immediately
-  sets that server's health gauge to `0`; a later success resets it to `1`.
-  Failures that cannot be attributed to one server use the constant
-  `upstream="unattributed"` label and do not write a health gauge. The separate
-  3-strike active health state machine is unchanged.
+- **Per-upstream failure attribution.** `sito_upstream_errors_total` no longer
+  records every failure under the aggregate `upstream="all"` label; it uses the
+  configured upstream server that failed. A failure immediately sets that
+  server's `sito_upstream_health` gauge to `0`, and a later success resets it to
+  `1`. The health gauge previously exposed as the synthetic
+  `upstream="default"` series is now keyed by the configured server; `default`
+  remains only as the empty-map fallback and disappears once per-server health
+  is recorded. Failures that cannot be attributed to one server use the
+  constant `upstream="unattributed"` label and do not write a health gauge. The
+  separate 3-strike active health state machine is unchanged.
 - **Idle pooled DoT sockets are health-pinged.** Sockets idle for at least 5 s
   receive a root `NS` probe (2 s cap) during the periodic upstream maintenance
   sweep. Dead sockets are dropped without failing user queries; live sockets
@@ -175,21 +180,27 @@ restarting production nodes.
    start, TOTP secrets are encrypted; restoring only one of the two files is a
    lockout. Keep the key out of logs and backups that are shared more widely
    than the user store.
-2. **Review `$badfilter` rules that target bare `$dnsrewrite`.** Bare rules now
+2. **Remove or securely store pre-1.9.0 raw user backups.** Upgrade does not
+   rewrite existing `users.toml.reset.*.bak` / `users.toml.corrupt.*.bak` files
+   from earlier releases; they may contain plaintext TOTP secrets. Delete them
+   or move them to the same protected storage as `totp.key`.
+3. **Review `$badfilter` rules that target bare `$dnsrewrite`.** Bare rules now
    canonicalize as `$dnsrewrite`, distinct from `$dnsrewrite=NOERROR`.
-3. **Update dashboards and alerts** that filter, group, or alert on
-   `upstream="all"`. That series is no longer emitted; use the per-server
-   `upstream` label and account for `upstream="unattributed"`.
-4. **Expect a one-time first start after lowering `filtering.max_list_bytes`.**
+4. **Update dashboards and alerts.** `sito_upstream_errors_total` no longer
+   emits `upstream="all"`, and `sito_upstream_health` no longer stays on the
+   synthetic `upstream="default"` series once per-server health is recorded.
+   Switch both panels and alerts to the per-server `upstream` label and account
+   for `upstream="unattributed"` on the error counter.
+5. **Expect a one-time first start after lowering `filtering.max_list_bytes`.**
    Larger cached lists are invalidated and re-downloaded. With
    `fail_closed = true` and no network, DNS answers SERVFAIL until a fetch
    succeeds. A live reload keeps the previous snapshot.
-5. **Expect no historical backfill for `stats_hourly.top_upstreams`.** Hours
+6. **Expect no historical backfill for `stats_hourly.top_upstreams`.** Hours
    already rolled up and removed from `query_log` remain empty for per-upstream
    statistics. Hours still present in `query_log` are populated by the next
    retention sweep, and new rollups are populated normally. No manual data
    migration is required.
-6. **Keep the DNSSEC chain cache local to the node.** Do not copy
+7. **Keep the DNSSEC chain cache local to the node.** Do not copy
    `dnssec-chain-cache.toml` between nodes; it contains only authenticated
    local observations and is rebuilt automatically.
 
