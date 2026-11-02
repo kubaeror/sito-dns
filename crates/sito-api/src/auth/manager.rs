@@ -2427,6 +2427,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_global_cap_evicts_only_same_owner_below_per_owner_quota() {
+        let mgr = AuthManager::new();
+        // 15 owners at the per-owner quota => 240 tokens.
+        for owner in 0..(MAX_API_TOKENS / MAX_API_TOKENS_PER_OWNER - 1) {
+            let owner = format!("owner-{owner}");
+            for i in 0..MAX_API_TOKENS_PER_OWNER {
+                create_owned_token(&mgr, &owner, &format!("{owner}-{i}")).await;
+            }
+        }
+        // A 16th owner with 15 tokens => 255, leaving one free global slot.
+        let partial_owner = "owner-partial";
+        for i in 0..(MAX_API_TOKENS_PER_OWNER - 1) {
+            create_owned_token(&mgr, partial_owner, &format!("partial-{i}")).await;
+        }
+        assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS - 1);
+
+        // The requester owns exactly one token and is below the per-owner
+        // quota, so only the global same-owner branch can make room.
+        create_owned_token(&mgr, "solo", "solo-old").await;
+        assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
+
+        create_owned_token(&mgr, "solo", "solo-new").await;
+
+        assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
+        assert_eq!(
+            owned_token_names(&mgr, "solo"),
+            vec!["solo-new".to_string()],
+            "the global cap must evict the requester's own oldest token"
+        );
+        assert_eq!(
+            owned_token_names(&mgr, partial_owner).len(),
+            MAX_API_TOKENS_PER_OWNER - 1,
+            "other owners' tokens must survive the global same-owner eviction"
+        );
+        assert_eq!(
+            owned_token_names(&mgr, "owner-0").len(),
+            MAX_API_TOKENS_PER_OWNER,
+            "other owners' tokens must survive the global same-owner eviction"
+        );
+    }
+
+    #[tokio::test]
     async fn test_delete_user_revokes_owned_tokens() {
         let mgr = AuthManager::new();
         mgr.create_user("alice", "AlicePassword1", Role::Operator)
@@ -2598,62 +2640,128 @@ mod tests {
 
     #[tokio::test]
     async fn test_role_change_revokes_owned_tokens() {
-        let mgr = AuthManager::new();
-        mgr.create_user("alice", "AlicePassword1", Role::Operator)
-            .await;
-        create_owned_token(&mgr, "alice", "before-demotion").await;
-        create_owned_token(&mgr, "admin", "admin-token").await;
+        let dir = auth_temp_dir("role_revokes_tokens");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            mgr.create_user("alice", "AlicePassword1", Role::Operator)
+                .await;
+            create_owned_token(&mgr, "alice", "before-demotion").await;
+            create_owned_token(&mgr, "admin", "admin-token").await;
+            mgr.create_token("legacy", Role::Viewer, None)
+                .await
+                .expect("legacy token");
 
-        assert!(mgr.set_user_role("alice", Role::Viewer).await);
+            // Exercise the handler-facing checked path.
+            assert_eq!(
+                mgr.set_user_role_checked("alice", Role::Viewer).await,
+                Ok(true)
+            );
+            assert!(
+                owned_token_names(&mgr, "alice").is_empty(),
+                "demotion must revoke existing tokens so the old scope cannot survive"
+            );
+            assert_eq!(
+                owned_token_names(&mgr, "admin"),
+                vec!["admin-token".to_string()]
+            );
+            assert!(mgr.list_tokens().iter().any(|token| token.name == "legacy"));
+        }
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
         assert!(
             owned_token_names(&mgr, "alice").is_empty(),
-            "demotion must revoke existing tokens so the old scope cannot survive"
+            "demotion token revocation must survive a reload"
         );
         assert_eq!(
             owned_token_names(&mgr, "admin"),
             vec!["admin-token".to_string()]
         );
+        assert!(mgr.list_tokens().iter().any(|token| token.name == "legacy"));
 
+        // Promotion also revokes, and must persist.
         create_owned_token(&mgr, "alice", "before-promotion").await;
-        assert!(mgr.set_user_role("alice", Role::Admin).await);
+        assert_eq!(
+            mgr.set_user_role_checked("alice", Role::Admin).await,
+            Ok(true)
+        );
         assert!(
             owned_token_names(&mgr, "alice").is_empty(),
             "promotion also revokes existing tokens"
         );
+        drop(mgr);
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            owned_token_names(&mgr, "alice").is_empty(),
+            "promotion token revocation must survive a reload"
+        );
         assert_eq!(
             owned_token_names(&mgr, "admin"),
             vec!["admin-token".to_string()]
         );
+        assert!(mgr.list_tokens().iter().any(|token| token.name == "legacy"));
 
-        // A no-op role update must not revoke anything.
+        // A no-op role update must not revoke anything, before or after reload.
         create_owned_token(&mgr, "alice", "unchanged-role").await;
-        assert!(mgr.set_user_role("alice", Role::Admin).await);
+        assert_eq!(
+            mgr.set_user_role_checked("alice", Role::Admin).await,
+            Ok(false)
+        );
         assert!(
             mgr.list_tokens()
                 .iter()
                 .any(|token| token.name == "unchanged-role"),
             "setting the same role must not revoke tokens"
         );
+        drop(mgr);
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            mgr.list_tokens()
+                .iter()
+                .any(|token| token.name == "unchanged-role"),
+            "a no-op role update must not revoke tokens across reload"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn test_overwriting_user_revokes_owned_tokens() {
-        let mgr = AuthManager::new();
-        mgr.create_user("alice", "AlicePassword1", Role::Operator)
-            .await;
-        create_owned_token(&mgr, "alice", "alice-old").await;
-        create_owned_token(&mgr, "admin", "admin-token").await;
+        let dir = auth_temp_dir("overwrite_revokes_tokens");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            mgr.create_user("alice", "AlicePassword1", Role::Operator)
+                .await;
+            create_owned_token(&mgr, "alice", "alice-old").await;
+            create_owned_token(&mgr, "admin", "admin-token").await;
+            mgr.create_token("legacy", Role::Viewer, None)
+                .await
+                .expect("legacy token");
 
-        mgr.create_user("alice", "AlicePassword2", Role::Viewer)
-            .await;
+            mgr.create_user("alice", "AlicePassword2", Role::Viewer)
+                .await;
+            assert!(
+                owned_token_names(&mgr, "alice").is_empty(),
+                "overwriting a user account must revoke its API tokens"
+            );
+            assert_eq!(
+                owned_token_names(&mgr, "admin"),
+                vec!["admin-token".to_string()]
+            );
+            assert!(mgr.list_tokens().iter().any(|token| token.name == "legacy"));
+        }
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
         assert!(
             owned_token_names(&mgr, "alice").is_empty(),
-            "overwriting a user account must revoke its API tokens"
+            "overwrite token revocation must survive a reload"
         );
         assert_eq!(
             owned_token_names(&mgr, "admin"),
             vec!["admin-token".to_string()]
         );
+        assert!(mgr.list_tokens().iter().any(|token| token.name == "legacy"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

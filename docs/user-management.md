@@ -221,9 +221,12 @@ authenticating token. Tokens written by older releases have no owner; they are
 legacy/ownerless and remain Admin-managed.
 
 A single account may hold at most **16 tokens**
-(`MAX_API_TOKENS_PER_OWNER`). Creating a 17th token evicts that account's oldest
-token; another account's tokens are never touched. Independently, the global
-store is capped at **256 tokens** (`MAX_API_TOKENS`). When the global cap is
+(`MAX_API_TOKENS_PER_OWNER`). The limit is enforced when tokens are created:
+creating a 17th token evicts that account's oldest token; another account's
+tokens are never touched. A `tokens.toml` written before this quota existed may
+temporarily contain more than 16 tokens for one owner; that owner's next create
+trims the excess down to 16. Independently, the global store is capped at
+**256 tokens** (`MAX_API_TOKENS`). When the global cap is
 reached, creating another token evicts only the oldest token owned by the same
 account. If that account has no token to evict, creation fails with
 `400 Bad Request` instead of deleting another account's credential. Legacy
@@ -235,6 +238,7 @@ API tokens are revoked automatically by:
 * an account password change (self-service or Admin override);
 * disabling TOTP for the account;
 * any role change (promotion or demotion);
+* overwriting/recreating the account (for example via the setup wizard or CLI);
 * deleting the account.
 
 The revocation is immediate in memory and persisted to `tokens.toml`; the

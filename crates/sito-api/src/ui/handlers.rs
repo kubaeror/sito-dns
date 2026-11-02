@@ -2304,9 +2304,17 @@ pub async fn wizard_complete_handler(
             ctx.auth_mgr
                 .create_user(admin_user, effective_password, Role::Admin)
                 .await;
-            // If custom admin username chosen, remove default 'admin' account if still on bootstrap password
-            if admin_user != "admin" && ctx.auth_mgr.is_default_admin_active() {
-                ctx.auth_mgr.delete_user("admin").await;
+            // If custom admin username chosen, remove default 'admin' account if still on bootstrap password.
+            // Use the last-admin-protected path: if creating the custom admin
+            // failed, the bootstrap account is the sole Admin and must remain.
+            if admin_user != "admin"
+                && ctx.auth_mgr.is_default_admin_active()
+                && let Err(err) = ctx.auth_mgr.delete_user_checked("admin").await
+            {
+                tracing::warn!(
+                    error = %err,
+                    "Wizard could not remove the bootstrap admin account; leaving it in place"
+                );
             }
         }
         ctx.auth_mgr.mark_setup_complete();

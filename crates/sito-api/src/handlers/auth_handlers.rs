@@ -424,14 +424,20 @@ pub async fn create_token(
 
     // Session-created tokens belong to the signed-in account. A bearer-token
     // caller inherits the owner of the token it authenticated with (or stays
-    // ownerless for legacy tokens), so ownership chains correctly.
+    // ownerless for legacy tokens), so ownership chains correctly. If the
+    // authenticating token was revoked between middleware validation and here,
+    // fail closed instead of minting an ownerless token that escapes quota and
+    // revocation.
     let owner = match admin.token_id.as_deref() {
         Some(token_id) => ctx
             .auth_mgr
             .list_tokens()
             .into_iter()
             .find(|token| token.id == token_id)
-            .and_then(|token| token.owner),
+            .map(|token| token.owner)
+            .ok_or_else(|| {
+                ProblemDetails::unauthorized("Authenticating API token is no longer valid")
+            })?,
         None => Some(admin.username.clone()),
     };
 
@@ -1267,6 +1273,33 @@ mod tests {
             child.owner.as_deref(),
             Some("ci-auth"),
             "ownership must chain through the authenticating token, not its name"
+        );
+
+        // A bearer token revoked between middleware validation and the handler
+        // must fail closed instead of minting an ownerless token.
+        assert!(ctx.auth_mgr.delete_token(&parent.id).await);
+        let stale_bearer = RequireAdmin(AuthUser {
+            username: "ci-auth".to_string(),
+            role: Role::Admin,
+            token_id: Some(parent.id.clone()),
+        });
+        let err = create_token(
+            stale_bearer,
+            State(ctx.clone()),
+            Json(CreateTokenRequest {
+                name: "escaped".to_string(),
+                scope: "viewer".to_string(),
+            }),
+        )
+        .await
+        .expect_err("a revoked authenticating token must not mint a token");
+        assert_eq!(err.status, 401);
+        assert!(
+            !ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|token| token.name == "escaped"),
+            "no ownerless token may be created under a revoke race"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
