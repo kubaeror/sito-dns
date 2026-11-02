@@ -1693,7 +1693,11 @@ impl QueryHandler for DnsPipeline {
                         "Upstream resolution failed"
                     );
                     if let Some(ref m) = self.metrics {
-                        m.inc_upstream_errors("all", e.kind());
+                        let label = e.upstream.as_deref().unwrap_or("unattributed");
+                        m.inc_upstream_errors(label, e.kind());
+                        if e.upstream.is_some() {
+                            m.set_upstream_health(label, 0.0);
+                        }
                     }
 
                     if cache_enabled
@@ -2311,19 +2315,16 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
-    /// Builds a pipeline backed by a UDP mock that answers every query with an
-    /// A record and (dishonestly) AD=1, counting upstream calls.
-    async fn test_pipeline(
-        mut config: Config,
+    /// Spawns a UDP mock upstream that answers every query with an A record and
+    /// (dishonestly) AD=1, counting upstream calls. When `fail` is set and
+    /// true, the mock answers `SERVFAIL` instead so callers can exercise the
+    /// pipeline failure path and then recover by clearing the flag.
+    async fn spawn_mock_upstream(
+        fail: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> (
-        DnsPipeline,
+        std::net::SocketAddr,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        std::path::PathBuf,
     ) {
-        use sito_clients::{ClientRegistry, ClientsConfig, ParentalRegistry, ServiceRegistry};
-        use sito_filter::HostsFilterEngine;
-        use sito_rewrites::{RewriteTable, RewritesConfig};
-        use sito_upstream::{BootstrapResolver, UpstreamManager};
         use std::sync::atomic::AtomicUsize;
 
         let mock_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2335,13 +2336,20 @@ mod tests {
             while let Ok((len, src)) = mock_socket.recv_from(&mut buf).await {
                 if let Ok(query) = sito_proto::decode_message(&buf[..len]) {
                     call_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let failing = fail
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
                     let mut resp =
                         Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-                    resp.metadata.response_code = ResponseCode::NoError;
+                    resp.metadata.response_code = if failing {
+                        ResponseCode::ServFail
+                    } else {
+                        ResponseCode::NoError
+                    };
                     // A compromised upstream: AD=1 without any signature.
                     resp.metadata.authentic_data = true;
                     resp.queries = query.queries.clone();
-                    if let Some(question) = query.queries.first() {
+                    if !failing && let Some(question) = query.queries.first() {
                         resp.answers.push(Record::from_rdata(
                             question.name().clone(),
                             300,
@@ -2353,6 +2361,18 @@ mod tests {
                 }
             }
         });
+        (mock_addr, calls)
+    }
+
+    /// Builds a pipeline around `upstream` with the standard test registries.
+    async fn build_test_pipeline(
+        mut config: Config,
+        upstream: std::sync::Arc<UpstreamManager>,
+    ) -> (DnsPipeline, std::path::PathBuf) {
+        use sito_clients::{ClientRegistry, ClientsConfig, ParentalRegistry, ServiceRegistry};
+        use sito_filter::HostsFilterEngine;
+        use sito_rewrites::{RewriteTable, RewritesConfig};
+        use std::sync::atomic::AtomicUsize;
 
         let temp_dir = std::env::temp_dir().join(format!(
             "sito-pipeline-audit6-{}-{}",
@@ -2361,15 +2381,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&temp_dir).unwrap();
         config.server.data_dir = temp_dir.clone();
-        config.upstream.servers = vec![mock_addr.to_string()];
         config.dns.cache.enabled = true;
 
-        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
-        let upstream = std::sync::Arc::new(
-            UpstreamManager::from_config(&config.upstream, &bootstrap)
-                .await
-                .unwrap(),
-        );
         let cache = std::sync::Arc::new(DnsCache::new(config.dns.cache.clone()));
         let filter = std::sync::Arc::new(
             HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
@@ -2392,7 +2405,185 @@ mod tests {
             )))),
             std::sync::Arc::new(AtomicUsize::new(0)),
         );
+        (pipeline, temp_dir)
+    }
+
+    /// Builds a pipeline backed by the default successful UDP mock upstream.
+    async fn test_pipeline(
+        mut config: Config,
+    ) -> (
+        DnsPipeline,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::path::PathBuf,
+    ) {
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+        let (mock_addr, calls) = spawn_mock_upstream(None).await;
+        config.upstream.servers = vec![mock_addr.to_string()];
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
         (pipeline, calls, temp_dir)
+    }
+
+    /// Builds a pipeline whose mock upstream fails while `fail` is true.
+    async fn test_pipeline_with_failure_toggle(
+        mut config: Config,
+        fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        DnsPipeline,
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::path::PathBuf,
+    ) {
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+        let (mock_addr, calls) = spawn_mock_upstream(Some(std::sync::Arc::clone(&fail))).await;
+        let server = mock_addr.to_string();
+        config.upstream.servers = vec![server.clone()];
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+        (pipeline, server, calls, temp_dir)
+    }
+
+    /// Attaches metrics (and an in-memory query log writer) to a test pipeline.
+    async fn with_test_metrics(
+        pipeline: DnsPipeline,
+    ) -> (DnsPipeline, sito_stats::MetricsRegistry) {
+        let stats_db = sito_stats::StatsDb::in_memory().await.unwrap();
+        let writer = sito_stats::QueryLogWriter::spawn(stats_db, 100);
+        let metrics = sito_stats::MetricsRegistry::new("test", "test");
+        let pipeline = pipeline.with_stats(writer.sender(), metrics.clone());
+        (pipeline, metrics)
+    }
+
+    /// D-12: a failing upstream is labelled by its configured name, lowers that
+    /// server's health gauge immediately, and recovers to 1 after a success.
+    /// No failure may ever be recorded under the legacy `upstream="all"` label.
+    #[tokio::test]
+    async fn test_pipeline_upstream_metrics_attribution_and_recovery() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        let fail = std::sync::Arc::new(AtomicBool::new(true));
+        let (pipeline, server, calls, temp_dir) =
+            test_pipeline_with_failure_toggle(config, std::sync::Arc::clone(&fail)).await;
+        let (pipeline, metrics) = with_test_metrics(pipeline).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("metrics-recovery.example.").unwrap();
+
+        let resp = pipeline
+            .handle(
+                rewrite_query("metrics-recovery.example.", RecordType::A),
+                client.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::ServFail,
+            "the failing upstream must surface SERVFAIL"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(&format!(
+                "sito_upstream_errors_total{{upstream=\"{server}\",kind=\"bad_response\"}} 1"
+            )),
+            "error must be attributed to the configured server: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("sito_upstream_health{{upstream=\"{server}\"}} 0")),
+            "a failed query must set that server's health gauge to 0: {rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"upstream="all""#),
+            "the legacy aggregate label must never be emitted: {rendered}"
+        );
+
+        // Recover: the next successful query resets the same server's gauge.
+        fail.store(false, Ordering::SeqCst);
+        let resp = pipeline
+            .handle(rewrite_query(&name.to_ascii(), RecordType::A), client)
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(&format!("sito_upstream_health{{upstream=\"{server}\"}} 1")),
+            "a success must recover the server's health gauge: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "sito_upstream_errors_total{{upstream=\"{server}\",kind=\"bad_response\"}} 1"
+            )),
+            "the error counter is monotonic and keeps the attributed label: {rendered}"
+        );
+        assert!(!rendered.contains(r#"upstream="all""#));
+        assert!(!rendered.contains("unattributed"));
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// D-12: failures that cannot be attributed to one configured server use
+    /// the constant `unattributed` label and must not write a health gauge.
+    #[tokio::test]
+    async fn test_pipeline_unattributed_upstream_label_is_constant() {
+        use sito_core::config::UpstreamStrategy;
+        use sito_upstream::UpstreamManager;
+
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        let upstream = std::sync::Arc::new(UpstreamManager::with_upstreams(
+            Vec::new(),
+            UpstreamStrategy::Failover,
+            std::time::Duration::from_millis(500),
+        ));
+        let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+        let (pipeline, metrics) = with_test_metrics(pipeline).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+        for id in 1..=2 {
+            let name = format!("unattributed-{id}.example.");
+            let resp = pipeline
+                .handle(rewrite_query(&name, RecordType::A), client.clone())
+                .await
+                .unwrap();
+            assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+        }
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(
+                r#"sito_upstream_errors_total{upstream="unattributed",kind="all_down"} 2"#
+            ),
+            "unattributable failures must use the constant `unattributed` label: {rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"sito_upstream_health{upstream="unattributed""#),
+            "an unattributed failure must not write a health gauge: {rendered}"
+        );
+        assert!(!rendered.contains(r#"upstream="all""#));
+        assert_eq!(
+            rendered.matches(r#"upstream="unattributed""#).count(),
+            1,
+            "`unattributed` is one constant series, not a per-query label: {rendered}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     fn do_query(id: u16, name: &Name) -> Message {

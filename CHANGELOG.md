@@ -30,6 +30,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   valued rewrites survive it. Canonical strings for bare rules changed from
   `$dnsrewrite=NOERROR;;` to `$dnsrewrite`; existing `$badfilter` entries that
   targeted a bare rewrite must be reviewed.
+- **Per-upstream metric attribution**: `sito_upstream_errors_total` and
+  `sito_upstream_health` now label a failed query with the configured server
+  that failed instead of the former aggregate `upstream="all"`, and a failure
+  immediately sets that server's health gauge to `0` (a later success resets it
+  to `1`). Failures that cannot be attributed to one server (for example, no
+  candidates available) use the constant `upstream="unattributed"` label and do
+  not write a health gauge. The separate 3-strike active health state machine is
+  unchanged. *Dashboard/alert migration:* update panels and alert rules that
+  filter, group, or alert on `upstream="all"`; that series is no longer emitted.
 
 ### Security
 - **DNSSEC cold-start signature stripping**: a response without RRSIGs is now

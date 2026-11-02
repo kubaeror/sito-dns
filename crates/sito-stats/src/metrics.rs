@@ -1485,6 +1485,7 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         let reg = MetricsRegistry::new("1.0.0", "test");
         for i in 0..(MAX_INTERNER_LABELS + 100) {
             reg.inc_upstream_errors(&format!("bounded-{i}"), "io");
+            reg.set_upstream_health(&format!("bounded-{i}"), 0.0);
         }
         let labels = reg
             .labels
@@ -1501,6 +1502,10 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         assert!(
             rendered.contains(r#"upstream="__other__""#),
             "overflow label must be used once the cap is reached"
+        );
+        assert!(
+            rendered.contains(r#"sito_upstream_health{upstream="__other__"} 0"#),
+            "health gauges must share the same bounded label set: {rendered}"
         );
     }
 
