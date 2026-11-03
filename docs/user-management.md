@@ -237,7 +237,7 @@ Admin-managed.
 API tokens are revoked automatically by:
 
 * an account password change (self-service or Admin override);
-* disabling TOTP for the account;
+* enabling or disabling TOTP for the account;
 * any role change (promotion or demotion);
 * overwriting/recreating the account (for example via the setup wizard or CLI);
 * deleting the account.

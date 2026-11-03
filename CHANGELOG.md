@@ -5,18 +5,62 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased]
+## [1.9.1] - 2026-11-04
+
+Patch release fixing residual correctness, concurrency, and UI issues found
+after 1.9.0. See the [1.9.1 release notes](docs/release-notes-1.9.1.md) for the
+user-visible summary and upgrade notes; this changelog remains the exhaustive
+record.
 
 ### Fixed
-- **TOTP enable revokes owned API tokens**: enabling TOTP for an account now
-  revokes every API token that account owns, matching the existing disable
-  lifecycle. Automations using an owned token must create a new one after 2FA
-  is enabled. Legacy ownerless tokens are unaffected.
-- **Retry-safe token/session persistence**: removals and `last_used` updates
-  performed by the synchronous token/session validators now advance a
-  revision counter, and a concurrent save clears the dirty flag only when no
-  mutation landed since its snapshot. The background pruner therefore rewrites
-  the store instead of leaving a stale snapshot on disk.
+- **DNSSEC chain-cache policy invalidation is targeted**: a configuration
+  reload now clears only cached `Unsigned` evidence at or above newly added
+  trust anchors instead of discarding the whole cache. Adding an unrelated
+  anchor no longer forces re-probes of unaffected zones. Anchor removal,
+  non-additive policy changes, and NTA changes still clear the cache; a legacy
+  cache file without anchor/NTA metadata is cleared on its first policy change.
+- **Chain-cache flush writes are serialized**: cache flushes use a dedicated
+  flush lock and do not hold the policy state lock across disk I/O, so reloads
+  cannot block behind a flush. The dirty flag is restored on serialization or
+  write failure, and the parent directory is fsynced after the atomic rename.
+  Malformed individual cache entries are skipped with a path-only warning.
+- **All configuration writers are serialized through the apply pipeline**:
+  admin writes from the REST API and web UI (filter lists/rules, clients,
+  groups, rewrites, upstreams, settings, and the setup wizard) acquire the
+  shared apply lock before reading the running configuration and use the
+  locked apply/persist/rollback path. Concurrent writes can no longer overwrite
+  each other, and a persistence failure rolls back live state. Filter list,
+  rule, and settings writes apply synchronously; clients, rewrites, upstreams,
+  and the setup wizard defer blocklist work.
+- **HA conflict restore runs off the async worker**: when an async bundle
+  publish detects that another publisher advanced the version, the active
+  bundle is restored through the blocking writer under the persistence lock
+  instead of synchronous filesystem I/O on the async worker. Published versions
+  cannot regress, and a failed restore leaves the conflict error intact.
+- **Auth store persistence is retry-safe**: token/session removals and token
+  `last_used` updates advance per-store revision counters. A concurrent save
+  clears the dirty flag only when no mutation landed after its snapshot, so the
+  pruner rewrites a stale snapshot instead of losing the mutation. Expired
+  session removals now mark the session store dirty, and a serialization or
+  write failure no longer drops the pending retry.
+- **Enabling TOTP revokes owned API tokens**: enabling TOTP now revokes every
+  API token owned by that account, matching the existing disable lifecycle.
+  Automations using an owned token must create a new one after 2FA is enabled.
+  Legacy ownerless tokens are unaffected. The synchronous users writer is now
+  private and constructor-only (`save_users_initial`); runtime user writes use
+  the serialized async path.
+- **Discovered-clients pagination (D-09)**: the read-only discovered-clients
+  table on the Clients page is paginated at 100 rows per page with clamped page
+  numbers and Previous/Next controls. The total remains the full registry count,
+  the Operator gate still runs server-side before slicing, and Viewers never
+  load or render discovery data. The 1024-entry registry cap is unchanged.
+
+### Known issues
+- **`tower-http 0.7` remains blocked (D-20)**: the repository still resolves
+  `tower-http 0.6.11`, pulled transitively by `reqwest 0.13.5`, which requires
+  `tower-http ^0.6.8`. There is no direct `tower_http` use in the workspace and
+  the requirement cannot be widened with `[patch.crates-io]`. Revisit when
+  reqwest or axum widen the range.
 
 ## [1.9.0] - 2026-11-02
 
