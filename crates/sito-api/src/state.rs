@@ -49,7 +49,22 @@ pub struct ServerContext {
 }
 
 impl ServerContext {
+    /// Acquires the configuration apply/persist lock.
+    ///
+    /// Every writer must hold this guard from *before* it reads
+    /// [`ServerContext::config`] until it has called a `*_locked` apply variant,
+    /// so a concurrent writer cannot read an older snapshot and overwrite a
+    /// newer one (lost update).
+    pub async fn lock_config_apply(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.apply_lock.clone().lock_owned().await
+    }
+
     /// Publishes a new configuration to the pipeline and UI atomically.
+    ///
+    /// Only for startup/restore paths that cannot use the runtime apply
+    /// pipeline; admin write handlers must go through
+    /// [`crate::config_apply::apply_and_persist_config`] or its `_locked`
+    /// variant.
     pub fn set_config(&self, config: Config) {
         self.runtime.set_config(config);
     }

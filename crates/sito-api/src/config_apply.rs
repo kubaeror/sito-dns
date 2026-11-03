@@ -265,9 +265,27 @@ pub async fn apply_and_persist_config(
     filter_apply: FilterApply,
     hooks: Option<&dyn ConfigApplyHooks>,
 ) -> Result<AppliedReport, ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
+    apply_and_persist_config_locked(ctx, candidate, filter_apply, hooks).await
+}
+
+/// Applies `candidate` and persists it, assuming the caller already holds
+/// [`ServerContext::apply_lock`].
+///
+/// The caller **must** hold `ServerContext::apply_lock` (acquired through
+/// [`ServerContext::lock_config_apply`]) from before it reads the current
+/// configuration until this future completes. Calling this without the guard
+/// re-introduces the lost-update race; do not call
+/// [`apply_and_persist_config`] while already holding the lock (it would
+/// deadlock).
+pub async fn apply_and_persist_config_locked(
+    ctx: &ServerContext,
+    candidate: &Config,
+    filter_apply: FilterApply,
+    hooks: Option<&dyn ConfigApplyHooks>,
+) -> Result<AppliedReport, ProblemDetails> {
     let document = toml::to_string_pretty(candidate)
         .map_err(|e| ProblemDetails::internal_error(format!("Serialization failed: {e}")))?;
-    let _apply_guard = ctx.apply_lock.lock().await;
     apply_and_persist_document_locked(ctx, candidate, &document, filter_apply, hooks).await
 }
 
@@ -822,5 +840,308 @@ mod tests {
             "changing only the DoH hostname must not require a restart: {:?}",
             restart_required_fields(&old, &new2)
         );
+    }
+
+    mod write_serialization {
+        use super::*;
+        use crate::auth::AuthUser;
+        use crate::auth::RequireOperator;
+        use crate::auth::token::Role;
+        use crate::models::{ClientDto, UpdateFilterListRequest, UpstreamConfigDto};
+        use axum::Json;
+        use axum::extract::{Extension, Path, State};
+        use sito_core::config::FilterListConfig;
+
+        fn operator() -> RequireOperator {
+            RequireOperator(AuthUser {
+                username: "operator".to_string(),
+                role: Role::Operator,
+                token_id: None,
+            })
+        }
+
+        fn local_list(temp_dir: &std::path::Path) -> FilterListConfig {
+            let list_path = temp_dir.join("local-list.txt");
+            std::fs::write(&list_path, "||ads.example^\n||tracker.example^\n").unwrap();
+            FilterListConfig {
+                name: "Local".to_string(),
+                url: format!("file://{}", list_path.display()),
+                enabled: true,
+                refresh_hours: None,
+            }
+        }
+
+        /// Two admin writers started concurrently must both survive: the second
+        /// one re-reads the config only after acquiring `apply_lock`, so it
+        /// cannot overwrite the first one's change with a stale snapshot.
+        #[tokio::test]
+        async fn test_concurrent_filter_toggle_and_client_save_preserve_both() {
+            let temp_dir = crate::test_support::temp_dir("sito_cfg_concurrent_writers");
+            let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+            let mut seed = (**ctx.config.load()).clone();
+            seed.filtering.lists = vec![local_list(&temp_dir)];
+            apply_and_persist_config(&ctx, &seed, FilterApply::Sync, None)
+                .await
+                .unwrap();
+
+            let toggle = crate::handlers::filtering::update_filter_list(
+                operator(),
+                State(ctx.clone()),
+                Path("Local".to_string()),
+                Json(UpdateFilterListRequest {
+                    name: None,
+                    url: None,
+                    enabled: Some(false),
+                    refresh_hours: None,
+                }),
+            );
+            let add = crate::handlers::clients::create_client(
+                operator(),
+                State(ctx.clone()),
+                Extension(ApplyHooks::default()),
+                Json(ClientDto {
+                    name: "phone".to_string(),
+                    ip: vec!["10.50.0.5".to_string()],
+                    mac: Vec::new(),
+                    subnet: Vec::new(),
+                    group: "default".to_string(),
+                    doh_path: None,
+                    dot_sni: None,
+                    ignore_query_log: false,
+                    ignore_stats: false,
+                    use_global_upstreams: None,
+                    upstreams: None,
+                    trusted: None,
+                    has_secret: false,
+                    secret_hint: None,
+                }),
+            );
+
+            let (toggle_result, add_result) = tokio::join!(toggle, add);
+            let _ = toggle_result.expect("filter toggle must succeed");
+            let _ = add_result.expect("client save must succeed");
+
+            let live = ctx.config.load();
+            assert_eq!(
+                live.filtering.lists.len(),
+                1,
+                "the filter list must not be lost by the concurrent client save"
+            );
+            assert!(
+                !live.filtering.lists[0].enabled,
+                "the filter toggle must not be overwritten by the client save"
+            );
+            let live_clients: sito_clients::ClientsConfig =
+                live.clients.clone().unwrap().try_into().unwrap();
+            assert!(
+                live_clients.entries.iter().any(|c| c.name == "phone"),
+                "the client save must not be overwritten by the filter toggle"
+            );
+
+            // The same both-changes invariant must hold in the runtime snapshot
+            // and in the persisted file (which is what a restart reads).
+            let snapshot = ctx.runtime.snapshot();
+            assert!(!snapshot.config.filtering.lists[0].enabled);
+            let runtime_clients: sito_clients::ClientsConfig =
+                snapshot.config.clients.clone().unwrap().try_into().unwrap();
+            assert!(runtime_clients.entries.iter().any(|c| c.name == "phone"));
+
+            let persisted =
+                Config::from_toml_str(&tokio::fs::read_to_string(&ctx.config_path).await.unwrap())
+                    .expect("persisted config must parse");
+            assert_eq!(persisted.filtering.lists.len(), 1);
+            assert!(!persisted.filtering.lists[0].enabled);
+            let persisted_clients: sito_clients::ClientsConfig =
+                persisted.clients.clone().unwrap().try_into().unwrap();
+            assert!(persisted_clients.entries.iter().any(|c| c.name == "phone"));
+
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        }
+
+        /// A persist failure must not leave a partially applied writer live.
+        #[tokio::test]
+        async fn test_config_write_persist_failure_rolls_back_live_state() {
+            let temp_dir = crate::test_support::temp_dir("sito_cfg_write_rollback");
+            let mut ctx = crate::test_support::mock_context(&temp_dir).await;
+
+            let mut seed = (**ctx.config.load()).clone();
+            seed.filtering.lists = vec![local_list(&temp_dir)];
+            seed.filtering.custom_rules = vec!["||keep.test^".to_string()];
+            seed.upstream.servers = vec!["1.1.1.1".to_string()];
+            let mut clients: sito_clients::ClientsConfig = seed
+                .clients
+                .clone()
+                .map_or_else(Default::default, |value| value.try_into().unwrap());
+            clients.entries.push(sito_clients::ClientEntryConfig {
+                name: "keep".to_string(),
+                ids: vec!["10.60.0.5".to_string()],
+                group: "default".to_string(),
+                ignore_query_log: false,
+                ignore_stats: false,
+                use_global_upstreams: true,
+                upstreams: None,
+                trusted: false,
+            });
+            seed.clients = Some(toml::Value::try_from(&clients).unwrap());
+            apply_and_persist_config(&ctx, &seed, FilterApply::Sync, None)
+                .await
+                .unwrap();
+
+            let previous_runtime = ctx.runtime.snapshot();
+            let previous_upstreams = ctx.upstream.statuses().await;
+            let previous_rules = ctx.filter.snapshot().rules.len();
+
+            // Every write now fails at the persist step, after the live apply.
+            ctx.config_path = std::path::PathBuf::from("/proc/forbidden_writer_test/config.toml");
+
+            let filter_err = crate::handlers::filtering::set_filtering_rules(
+                operator(),
+                State(ctx.clone()),
+                Json(crate::models::CustomRulesDto {
+                    rules: vec!["||must-not-stick.test^".to_string()],
+                }),
+            )
+            .await
+            .expect_err("filter persist must fail");
+            assert_eq!(filter_err.status, 500);
+            assert_eq!(
+                ctx.config.load().filtering.custom_rules,
+                vec!["||keep.test^".to_string()],
+                "the previous filter rules must stay live"
+            );
+            assert_eq!(
+                ctx.filter.snapshot().rules.len(),
+                previous_rules,
+                "the previous filter snapshot must stay live"
+            );
+
+            let client_err = crate::handlers::clients::create_client(
+                operator(),
+                State(ctx.clone()),
+                Extension(ApplyHooks::default()),
+                Json(ClientDto {
+                    name: "must-not-stick".to_string(),
+                    ip: vec!["10.60.0.9".to_string()],
+                    mac: Vec::new(),
+                    subnet: Vec::new(),
+                    group: "default".to_string(),
+                    doh_path: None,
+                    dot_sni: None,
+                    ignore_query_log: false,
+                    ignore_stats: false,
+                    use_global_upstreams: None,
+                    upstreams: None,
+                    trusted: None,
+                    has_secret: false,
+                    secret_hint: None,
+                }),
+            )
+            .await
+            .expect_err("client persist must fail");
+            assert_eq!(client_err.status, 500);
+            let live_clients: sito_clients::ClientsConfig = ctx
+                .config
+                .load()
+                .clients
+                .clone()
+                .unwrap()
+                .try_into()
+                .unwrap();
+            assert_eq!(
+                live_clients
+                    .entries
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["keep"],
+                "the previous client must stay live"
+            );
+            let registry = ctx.clients.load();
+            let mut probe = sito_core::client::ClientContext::new("10.60.0.9".parse().unwrap());
+            let _ = registry.resolve(&mut probe, registry.timezone().at_utc(chrono::Utc::now()));
+            assert!(
+                probe.client_name.is_none(),
+                "the rejected client must not reach the registry"
+            );
+
+            let upstream_err = crate::handlers::upstream::update_upstream_config(
+                operator(),
+                State(ctx.clone()),
+                Extension(ApplyHooks::default()),
+                Json(UpstreamConfigDto {
+                    servers: vec!["9.9.9.9".to_string()],
+                    bootstrap: vec!["1.0.0.1".to_string()],
+                    strategy: "failover".to_string(),
+                    timeout_ms: 2000,
+                    probe_domain: "example.com".to_string(),
+                    pool_size: 2,
+                }),
+            )
+            .await
+            .expect_err("upstream persist must fail");
+            assert_eq!(upstream_err.status, 500);
+            assert_eq!(
+                ctx.config.load().upstream.servers,
+                vec!["1.1.1.1".to_string()],
+                "the previous upstream config must stay live"
+            );
+            assert_eq!(
+                ctx.upstream.statuses().await,
+                previous_upstreams,
+                "the previous upstream manager must stay live"
+            );
+            assert_eq!(
+                ctx.runtime.snapshot().config.filtering.custom_rules,
+                previous_runtime.config.filtering.custom_rules,
+                "the runtime snapshot must be rolled back after each failure"
+            );
+
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        }
+
+        /// Guard against re-introducing a direct `save_config_atomic` call in
+        /// an admin handler: every write must acquire `apply_lock` and persist
+        /// through the apply pipeline.
+        ///
+        /// Startup/restore-only code that cannot use the runtime pipeline may
+        /// be whitelisted by adding its `src/...` path here with a comment.
+        #[test]
+        fn test_no_direct_config_writes_in_handlers_or_ui() {
+            let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(src.join("handlers"))
+                .expect("handlers directory")
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+                .collect();
+            files.push(src.join("ui").join("handlers.rs"));
+
+            // Startup/restore-only exceptions (none today).
+            let allowlist: &[&str] = &[];
+            let mut offenders = Vec::new();
+            for file in files {
+                let Ok(content) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                let relative = file
+                    .strip_prefix(&src)
+                    .unwrap_or(&file)
+                    .display()
+                    .to_string();
+                for (index, line) in content.lines().enumerate() {
+                    if line.contains("save_config_atomic(")
+                        && !allowlist.contains(&relative.as_str())
+                    {
+                        offenders.push(format!("{relative}:{}", index + 1));
+                    }
+                }
+            }
+
+            assert!(
+                offenders.is_empty(),
+                "direct config writes bypass the apply lock: {offenders:?}"
+            );
+        }
     }
 }

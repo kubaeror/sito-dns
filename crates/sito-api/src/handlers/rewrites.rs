@@ -6,7 +6,7 @@
 //! as an index resolves positionally, and `legacy-N` ids map to index `N`.
 
 use crate::auth::RequireOperator;
-use crate::config_writer::save_config_atomic;
+use crate::config_apply::{FilterApply, apply_and_persist_config_locked};
 use crate::error::ProblemDetails;
 use crate::models::{AddRewriteRequest, GenericMessageResponse, RewriteDto};
 use crate::state::ServerContext;
@@ -64,8 +64,10 @@ pub(crate) fn load_rewrite_store(ctx: &ServerContext) -> RewriteStore {
     RewriteStore { cfg, ids }
 }
 
-/// Persists rewrites with their stable ids embedded in the raw TOML value.
-pub(crate) async fn save_rewrite_store(
+/// Applies and persists rewrites with their stable ids embedded in the raw TOML
+/// value. The caller **must** hold [`ServerContext::apply_lock`] and must have
+/// read the store after acquiring it.
+pub(crate) async fn save_rewrite_store_locked(
     ctx: &ServerContext,
     store: &RewriteStore,
 ) -> Result<(), ProblemDetails> {
@@ -82,13 +84,9 @@ pub(crate) async fn save_rewrite_store(
     }
     new_cfg.rewrites = Some(value);
 
-    save_config_atomic(&ctx.config_path, &new_cfg).await?;
-    ctx.set_config(new_cfg);
-
-    // Update active rewrite table
-    let new_table = sito_rewrites::RewriteTable::new(store.cfg.clone());
-    ctx.set_rewrites(new_table);
-    crate::publish_bundle(ctx).await;
+    // `apply_inner` rebuilds the rewrite table together with the runtime
+    // snapshot; a persist failure rolls the live table back.
+    apply_and_persist_config_locked(ctx, &new_cfg, FilterApply::Deferred, None).await?;
     Ok(())
 }
 
@@ -156,6 +154,7 @@ pub async fn add_rewrite(
     State(ctx): State<ServerContext>,
     Json(payload): Json<AddRewriteRequest>,
 ) -> Result<Json<RewriteDto>, ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut store = load_rewrite_store(&ctx);
 
     let id = new_rewrite_id();
@@ -168,7 +167,7 @@ pub async fn add_rewrite(
 
     store.cfg.entries.push(entry);
     store.ids.push(id.clone());
-    save_rewrite_store(&ctx, &store).await?;
+    save_rewrite_store_locked(&ctx, &store).await?;
 
     Ok(Json(RewriteDto {
         id,
@@ -198,6 +197,7 @@ pub async fn update_rewrite(
     Path(id): Path<String>,
     Json(payload): Json<AddRewriteRequest>,
 ) -> Result<Json<RewriteDto>, ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut store = load_rewrite_store(&ctx);
     let idx = resolve_rewrite_index(&store, &id)
         .ok_or_else(|| ProblemDetails::not_found(format!("Rewrite with ID {id} not found")))?;
@@ -209,7 +209,7 @@ pub async fn update_rewrite(
         exception_clients: payload.exception_clients.clone(),
     };
 
-    save_rewrite_store(&ctx, &store).await?;
+    save_rewrite_store_locked(&ctx, &store).await?;
 
     Ok(Json(RewriteDto {
         id,
@@ -237,13 +237,14 @@ pub async fn delete_rewrite(
     State(ctx): State<ServerContext>,
     Path(id): Path<String>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut store = load_rewrite_store(&ctx);
     let idx = resolve_rewrite_index(&store, &id)
         .ok_or_else(|| ProblemDetails::not_found(format!("Rewrite with ID {id} not found")))?;
 
     let removed = store.cfg.entries.remove(idx);
     store.ids.remove(idx);
-    save_rewrite_store(&ctx, &store).await?;
+    save_rewrite_store_locked(&ctx, &store).await?;
 
     Ok(Json(GenericMessageResponse {
         message: format!("Rewrite for '{}' deleted successfully", removed.domain),

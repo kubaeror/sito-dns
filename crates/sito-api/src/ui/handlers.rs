@@ -16,8 +16,9 @@ use crate::auth::session::{
     build_clear_csrf_cookie, build_clear_session_cookie, build_csrf_cookie, extract_session_cookie,
 };
 use crate::auth::token::Role;
-use crate::config_apply::{ApplyHooks, FilterApply, apply_and_persist_config, apply_full_config};
-use crate::config_writer::save_config_atomic;
+use crate::config_apply::{
+    ApplyHooks, FilterApply, apply_and_persist_config_locked, apply_full_config,
+};
 use crate::error::ProblemDetails;
 use crate::handlers::auth_handlers::{
     user_mutation_problem, validate_password_policy, validate_username,
@@ -713,29 +714,19 @@ pub async fn filtering_toggle_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     let Some(idx) = find_filter_list_index(&new_cfg, &id) else {
         return error_response(StatusCode::NOT_FOUND, "Filter list not found");
     };
     new_cfg.filtering.lists[idx].enabled = !new_cfg.filtering.lists[idx].enabled;
-    if let Err(e) = ctx.filter.reload_with_config(&new_cfg.filtering).await {
-        tracing::error!("Failed to apply filter configuration: {e}");
+    if let Err(e) = apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await {
+        tracing::error!("Failed to apply filter configuration: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to apply filter configuration: {e}"),
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to apply filter configuration: {}", e.detail),
         );
     }
-    // Filter rules changed: drop cached answers that may now be blocked.
-    ctx.cache.flush();
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist configuration",
-        );
-    }
-    ctx.set_config(new_cfg.clone());
-    crate::publish_bundle(&ctx).await;
     Redirect::to("/filtering").into_response()
 }
 
@@ -768,6 +759,7 @@ pub async fn filtering_add_handler(
         );
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     if new_cfg.filtering.lists.iter().any(|list| list.name == name) {
         return error_response(StatusCode::CONFLICT, "A list with that name already exists");
@@ -778,24 +770,13 @@ pub async fn filtering_add_handler(
         enabled: true,
         refresh_hours: form.refresh_hours.map(u64::from),
     });
-    if let Err(e) = ctx.filter.reload_with_config(&new_cfg.filtering).await {
-        tracing::error!("Failed to apply filter configuration: {e}");
+    if let Err(e) = apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await {
+        tracing::error!("Failed to apply filter configuration: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to apply filter configuration: {e}"),
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to apply filter configuration: {}", e.detail),
         );
     }
-    // Filter rules changed: drop cached answers that may now be blocked.
-    ctx.cache.flush();
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist configuration",
-        );
-    }
-    ctx.set_config(new_cfg.clone());
-    crate::publish_bundle(&ctx).await;
 
     Redirect::to("/filtering").into_response()
 }
@@ -812,29 +793,19 @@ pub async fn filtering_delete_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     let Some(idx) = find_filter_list_index(&new_cfg, &id) else {
         return error_response(StatusCode::NOT_FOUND, "Filter list not found");
     };
     new_cfg.filtering.lists.remove(idx);
-    if let Err(e) = ctx.filter.reload_with_config(&new_cfg.filtering).await {
-        tracing::error!("Failed to apply filter configuration: {e}");
+    if let Err(e) = apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await {
+        tracing::error!("Failed to apply filter configuration: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to apply filter configuration: {e}"),
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to apply filter configuration: {}", e.detail),
         );
     }
-    // Filter rules changed: drop cached answers that may now be blocked.
-    ctx.cache.flush();
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist configuration",
-        );
-    }
-    ctx.set_config(new_cfg.clone());
-    crate::publish_bundle(&ctx).await;
     Redirect::to("/filtering").into_response()
 }
 
@@ -855,6 +826,7 @@ pub async fn filtering_custom_rules_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     new_cfg.filtering.custom_rules = form
         .rules
@@ -864,24 +836,13 @@ pub async fn filtering_custom_rules_handler(
         .map(String::from)
         .collect();
 
-    if let Err(e) = ctx.filter.reload_with_config(&new_cfg.filtering).await {
-        tracing::error!("Failed to apply filter configuration: {e}");
+    if let Err(e) = apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await {
+        tracing::error!("Failed to apply filter configuration: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to apply filter configuration: {e}"),
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to apply filter configuration: {}", e.detail),
         );
     }
-    // Filter rules changed: drop cached answers that may now be blocked.
-    ctx.cache.flush();
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist configuration",
-        );
-    }
-    ctx.set_config(new_cfg.clone());
-    crate::publish_bundle(&ctx).await;
 
     Redirect::to("/filtering").into_response()
 }
@@ -1024,6 +985,7 @@ pub async fn rewrites_add_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut store = crate::handlers::rewrites::load_rewrite_store(&ctx);
     store.cfg.entries.push(sito_rewrites::RewriteEntryConfig {
         domain: form.domain,
@@ -1033,7 +995,7 @@ pub async fn rewrites_add_handler(
     });
     store.ids.push(crate::handlers::rewrites::new_rewrite_id());
 
-    if let Err(e) = crate::handlers::rewrites::save_rewrite_store(&ctx, &store).await {
+    if let Err(e) = crate::handlers::rewrites::save_rewrite_store_locked(&ctx, &store).await {
         tracing::error!("Failed to persist rewrites: {e:?}");
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1068,6 +1030,7 @@ pub async fn rewrites_delete_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut store = crate::handlers::rewrites::load_rewrite_store(&ctx);
     let idx = if let Some(ref id) = form.id {
         crate::handlers::rewrites::resolve_rewrite_index(&store, id)
@@ -1084,10 +1047,10 @@ pub async fn rewrites_delete_handler(
     store.cfg.entries.remove(idx);
     store.ids.remove(idx);
 
-    if let Err(e) = crate::handlers::rewrites::save_rewrite_store(&ctx, &store).await {
+    if let Err(e) = crate::handlers::rewrites::save_rewrite_store_locked(&ctx, &store).await {
         tracing::error!("Failed to persist rewrites: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             &format!("Failed to persist rewrites: {}", e.detail),
         );
     }
@@ -1174,6 +1137,7 @@ pub struct AddClientForm {
 
 pub async fn clients_add_handler(
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     headers: HeaderMap,
     Form(form): Form<AddClientForm>,
 ) -> Response {
@@ -1184,6 +1148,7 @@ pub async fn clients_add_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut clients_cfg = load_clients_config(&ctx);
     if clients_cfg.entries.iter().any(|c| c.name == form.name) {
         return error_response(
@@ -1225,23 +1190,15 @@ pub async fn clients_add_handler(
     };
     let mut new_cfg = (**ctx.config.load()).clone();
     new_cfg.clients = Some(val);
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
+    if let Err(e) =
+        apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Deferred, hooks.as_dyn()).await
+    {
+        tracing::error!("Failed to apply clients: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist clients",
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to persist clients: {}", e.detail),
         );
     }
-    ctx.set_config(new_cfg);
-    let current = ctx.clients.load();
-    let new_reg = sito_clients::ClientRegistry::with_stores(
-        clients_cfg,
-        current.routeros_leases_store(),
-        current.unidentified_store(),
-    );
-    drop(current);
-    ctx.set_clients(new_reg);
-    crate::publish_bundle(&ctx).await;
 
     Redirect::to("/clients").into_response()
 }
@@ -1253,6 +1210,7 @@ pub struct DeleteClientForm {
 
 pub async fn clients_delete_handler(
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     headers: HeaderMap,
     Form(form): Form<DeleteClientForm>,
 ) -> Response {
@@ -1263,6 +1221,7 @@ pub async fn clients_delete_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut clients_cfg = load_clients_config(&ctx);
     let before = clients_cfg.entries.len();
     clients_cfg.entries.retain(|c| c.name != form.name);
@@ -1283,23 +1242,15 @@ pub async fn clients_delete_handler(
     };
     let mut new_cfg = (**ctx.config.load()).clone();
     new_cfg.clients = Some(val);
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
+    if let Err(e) =
+        apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Deferred, hooks.as_dyn()).await
+    {
+        tracing::error!("Failed to apply clients: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist clients",
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to persist clients: {}", e.detail),
         );
     }
-    ctx.set_config(new_cfg);
-    let current = ctx.clients.load();
-    let new_reg = sito_clients::ClientRegistry::with_stores(
-        clients_cfg,
-        current.routeros_leases_store(),
-        current.unidentified_store(),
-    );
-    drop(current);
-    ctx.set_clients(new_reg);
-    crate::publish_bundle(&ctx).await;
 
     Redirect::to("/clients").into_response()
 }
@@ -1336,6 +1287,7 @@ pub struct AddUpstreamForm {
 
 pub async fn upstreams_add_handler(
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     headers: HeaderMap,
     Form(form): Form<AddUpstreamForm>,
 ) -> Response {
@@ -1346,35 +1298,26 @@ pub async fn upstreams_add_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let mut new_cfg = (**ctx.config.load()).clone();
     let clean = form.address.trim().to_string();
     if clean.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "Upstream address is required");
     }
+
+    let _apply_guard = ctx.lock_config_apply().await;
+    let mut new_cfg = (**ctx.config.load()).clone();
     if new_cfg.upstream.servers.contains(&clean) {
         return error_response(StatusCode::CONFLICT, "Upstream is already configured");
     }
     new_cfg.upstream.servers.push(clean);
-    let bootstrap = sito_upstream::BootstrapResolver::new(
-        new_cfg.upstream.bootstrap.clone(),
-        std::time::Duration::from_millis(new_cfg.upstream.timeout_ms),
-    );
-    if let Err(e) = ctx.upstream.reload(&new_cfg.upstream, &bootstrap).await {
-        tracing::error!("Failed to reload upstream manager: {e:?}");
+    if let Err(e) =
+        apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Deferred, hooks.as_dyn()).await
+    {
+        tracing::error!("Failed to apply upstream configuration: {e:?}");
         return error_response(
-            StatusCode::BAD_REQUEST,
-            &format!("Invalid upstream configuration: {e}"),
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to apply upstream configuration: {}", e.detail),
         );
     }
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist configuration",
-        );
-    }
-    ctx.set_config(new_cfg.clone());
-    crate::publish_bundle(&ctx).await;
 
     Redirect::to("/upstreams").into_response()
 }
@@ -1526,6 +1469,9 @@ pub async fn settings_save_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    // Read the current config only after taking the apply lock so a concurrent
+    // clients/filter write cannot be overwritten by a stale settings snapshot.
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     new_cfg.dns.cache.size_mb = form.cache_size_mb;
     new_cfg.dns.cache.min_ttl = form.min_ttl;
@@ -1536,7 +1482,7 @@ pub async fn settings_save_handler(
     // effect (and are validated) before the file is written, and a failed
     // write rolls the in-memory apply back.
     if let Err(e) =
-        apply_and_persist_config(&ctx, &new_cfg, FilterApply::Sync, hooks.as_dyn()).await
+        apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, hooks.as_dyn()).await
     {
         tracing::error!("Failed to apply settings: {e:?}");
         return StatusCode::from_u16(e.status)
@@ -2256,25 +2202,36 @@ pub async fn wizard_complete_handler(
         admin_pass_input
     };
 
-    let base_cfg = (**ctx.config.load()).clone();
-    let new_cfg = match form.build_config(&base_cfg) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Invalid configuration: {e}"),
-            )
-                .into_response();
-        }
-    };
+    // Read the base config only after taking the apply lock so a concurrent
+    // writer cannot be overwritten by a stale wizard snapshot. The guard is
+    // scoped to the apply/persist section; credential changes below do not
+    // write the configuration file.
+    let (report, filtering) = {
+        let _apply_guard = ctx.lock_config_apply().await;
+        let base_cfg = (**ctx.config.load()).clone();
+        let new_cfg = match form.build_config(&base_cfg) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid configuration: {e}"),
+                )
+                    .into_response();
+            }
+        };
 
-    // Apply first, persist second (WP-4.2): a configuration that cannot be
-    // applied never reaches the file. The blocklist fetch is deferred to a
-    // background refresh so the wizard request does not download lists
-    // synchronously; the DNS listeners are only started after the refresh
-    // finished.
-    let report =
-        match apply_and_persist_config(&ctx, &new_cfg, FilterApply::Deferred, hooks.as_dyn()).await
+        // Apply first, persist second (WP-4.2): a configuration that cannot be
+        // applied never reaches the file. The blocklist fetch is deferred to a
+        // background refresh so the wizard request does not download lists
+        // synchronously; the DNS listeners are only started after the refresh
+        // finished.
+        let report = match apply_and_persist_config_locked(
+            &ctx,
+            &new_cfg,
+            FilterApply::Deferred,
+            hooks.as_dyn(),
+        )
+        .await
         {
             Ok(report) => report,
             Err(e) => {
@@ -2285,6 +2242,8 @@ pub async fn wizard_complete_handler(
                 );
             }
         };
+        (report, new_cfg.filtering.clone())
+    };
     if !report.restart_required.is_empty() {
         tracing::warn!(
             fields = ?report.restart_required,
@@ -2347,7 +2306,7 @@ pub async fn wizard_complete_handler(
     // Queue the blocklist fetch/compile off the request path. When the DNS
     // listeners are still gated (first boot), start them only after the
     // filter engine has the new rules.
-    let filter_handle = crate::config_apply::queue_filter_refresh(&ctx, new_cfg.filtering.clone());
+    let filter_handle = crate::config_apply::queue_filter_refresh(&ctx, filtering);
     match ctx.dns_starter.clone() {
         Some(starter) => {
             tokio::spawn(async move {
@@ -3677,6 +3636,7 @@ mod tests {
 
         let resp = clients_delete_handler(
             State(ctx.clone()),
+            Extension(ApplyHooks::default()),
             headers,
             Form(DeleteClientForm {
                 name: "phone".to_string(),

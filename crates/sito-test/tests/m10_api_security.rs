@@ -412,6 +412,105 @@ async fn test_acceptance_m10_metrics_token_auth() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// 1.9.1: two concurrent admin writes must both survive. Each handler reads
+/// the config only after acquiring `apply_lock`, so neither can persist a stale
+/// snapshot that overwrites the other.
+#[tokio::test]
+async fn test_acceptance_m10_concurrent_writes_preserve_both() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_m10_concurrent_{}", rand::random::<u64>()));
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    let ctx = create_test_context(&temp_dir, false).await;
+    let app = sito_api::create_router(ctx.clone());
+    let token = ctx
+        .auth_mgr
+        .create_token("concurrent-writer", Role::Admin, None)
+        .await
+        .expect("token")
+        .1
+        .token;
+
+    // Seed one local filter list so the toggle has something to flip.
+    let list_path = temp_dir.join("local-list.txt");
+    tokio::fs::write(&list_path, "||ads.example^\n")
+        .await
+        .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/filtering/lists")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "name": "Local",
+                "url": format!("file://{}", list_path.display()),
+                "enabled": true,
+                "refresh_hours": 24,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let toggle_app = app.clone();
+    let toggle_token = token.clone();
+    let toggle = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/filtering/lists/Local")
+            .header(header::AUTHORIZATION, format!("Bearer {toggle_token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"enabled":false}"#))
+            .unwrap();
+        toggle_app.oneshot(req).await.unwrap().status()
+    });
+    let client_app = app.clone();
+    let client_token = token;
+    let add_client = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/clients")
+            .header(header::AUTHORIZATION, format!("Bearer {client_token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "name": "phone",
+                    "ip": ["10.70.0.5"],
+                    "group": "default",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        client_app.oneshot(req).await.unwrap().status()
+    });
+
+    let (toggle_status, client_status) = tokio::join!(toggle, add_client);
+    assert_eq!(toggle_status.unwrap(), StatusCode::OK);
+    assert_eq!(client_status.unwrap(), StatusCode::OK);
+
+    let persisted =
+        Config::from_toml_str(&tokio::fs::read_to_string(&ctx.config_path).await.unwrap())
+            .expect("persisted config parses");
+    assert_eq!(persisted.filtering.lists.len(), 1);
+    assert!(
+        !persisted.filtering.lists[0].enabled,
+        "the filter toggle must not be overwritten by the concurrent client save"
+    );
+    let clients: sito_clients::ClientsConfig = persisted
+        .clients
+        .clone()
+        .expect("clients section")
+        .try_into()
+        .unwrap();
+    assert!(
+        clients.entries.iter().any(|entry| entry.name == "phone"),
+        "the client save must not be overwritten by the concurrent filter toggle"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 /// WP-12: restore previews mask secrets (tokens, arrays and inline tables).
 #[tokio::test]
 async fn test_acceptance_m10_restore_preview_is_masked() {

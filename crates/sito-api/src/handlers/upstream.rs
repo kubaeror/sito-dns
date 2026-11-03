@@ -1,14 +1,12 @@
 //! Upstream DNS server configuration and latency probing handlers.
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use sito_core::config::{UpstreamConfig, UpstreamStrategy};
-use sito_upstream::BootstrapResolver;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::auth::rbac::RequireOperator;
-use crate::config_writer::save_config_atomic;
+use crate::config_apply::{ApplyHooks, FilterApply, apply_and_persist_config_locked};
 use crate::error::ProblemDetails;
 use crate::models::{
     UpstreamConfigDto, UpstreamTestItem, UpstreamTestRequest, UpstreamTestResponse,
@@ -71,6 +69,7 @@ pub async fn get_upstream_config(
 pub async fn update_upstream_config(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     Json(dto): Json<UpstreamConfigDto>,
 ) -> Result<Json<UpstreamConfigDto>, ProblemDetails> {
     let strategy = match dto.strategy.as_str() {
@@ -92,6 +91,7 @@ pub async fn update_upstream_config(
         bootstrap_ips.push(ip);
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_config = (**ctx.config.load()).clone();
     new_config.upstream = UpstreamConfig {
         servers: dto.servers.clone(),
@@ -104,37 +104,11 @@ pub async fn update_upstream_config(
         per_domain: new_config.upstream.per_domain,
     };
 
-    let bootstrap = BootstrapResolver::new(
-        new_config.upstream.bootstrap.clone(),
-        Duration::from_millis(new_config.upstream.timeout_ms),
-    );
-
-    // Reload upstream manager with new configuration (also validates upstreams)
-    ctx.upstream
-        .reload(&new_config.upstream, &bootstrap)
-        .await
-        .map_err(|e| ProblemDetails::bad_request(format!("Invalid upstream configuration: {e}")))?;
-
-    // Pre-commit validation and atomic write
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_config).await {
-        let prev_cfg = ctx.config.load();
-        let prev_bootstrap = BootstrapResolver::new(
-            prev_cfg.upstream.bootstrap.clone(),
-            Duration::from_millis(prev_cfg.upstream.timeout_ms),
-        );
-        if let Err(rollback_err) = ctx
-            .upstream
-            .reload(&prev_cfg.upstream, &prev_bootstrap)
-            .await
-        {
-            tracing::error!(
-                "Failed to roll back upstream configuration after persist error: {rollback_err:?}"
-            );
-        }
-        return Err(e);
-    }
-    ctx.set_config(new_config);
-    crate::publish_bundle(&ctx).await;
+    // The shared pipeline reloads (and validates) the upstream manager,
+    // applies hook-owned scoped upstreams, and rolls every live component back
+    // when the persist step fails.
+    apply_and_persist_config_locked(&ctx, &new_config, FilterApply::Deferred, hooks.as_dyn())
+        .await?;
 
     Ok(Json(dto))
 }
@@ -231,7 +205,7 @@ mod tests {
     use arc_swap::ArcSwap;
     use sito_core::config::Config;
     use std::sync::Mutex;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     async fn mock_context(temp_dir: &std::path::Path) -> ServerContext {
         let db_path = temp_dir.join("test.db");
@@ -324,7 +298,13 @@ mod tests {
             pool_size: 4,
         };
 
-        let res = update_upstream_config(operator.clone(), State(ctx.clone()), Json(dto)).await;
+        let res = update_upstream_config(
+            operator.clone(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(dto),
+        )
+        .await;
         assert!(res.is_ok());
 
         assert_eq!(ctx.upstream.strategy(), UpstreamStrategy::LoadBalance);
@@ -343,7 +323,13 @@ mod tests {
             pool_size: 2,
         };
 
-        let bad_res = update_upstream_config(operator, State(ctx.clone()), Json(bad_dto)).await;
+        let bad_res = update_upstream_config(
+            operator,
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(bad_dto),
+        )
+        .await;
         assert!(bad_res.is_err());
         // Strategy remains LoadBalance
         assert_eq!(ctx.upstream.strategy(), UpstreamStrategy::LoadBalance);
