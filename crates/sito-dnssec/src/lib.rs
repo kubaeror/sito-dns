@@ -10,7 +10,7 @@ pub mod nsec;
 pub mod nsec3;
 
 use chain_cache::CHAIN_CACHE_MAX_ENTRIES;
-pub use chain_cache::{ChainCache, ChainEntry, ZoneStatus};
+pub use chain_cache::{ChainCache, ChainEntry, PolicyChange, PolicyState, ZoneStatus};
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -1473,12 +1473,38 @@ impl DnssecValidator {
         // that produced them. An `Unsigned` cached before an operator anchors a
         // zone would otherwise keep reporting the newly signed zone as
         // Insecure for the rest of the TTL (a persistent fail-open), and a new
-        // NTA changes the classification too. Fingerprint the policy and drop
-        // entries that were established under a different one.
-        validator.chain_cache.ensure_policy(policy_fingerprint(
-            &config.trust_anchors,
-            &validator.nta_domains.load(),
-        ));
+        // NTA changes the classification too. Diff the policy so an unrelated
+        // anchor addition preserves legitimate unsigned children.
+        let mut anchor_zones: Vec<String> = validator
+            .anchor_zones
+            .iter()
+            .map(|entry| entry.key().to_string())
+            .collect();
+        anchor_zones.sort_unstable();
+        anchor_zones.dedup();
+        let mut nta_names: Vec<String> = (**validator.nta_domains.load()).clone();
+        nta_names.sort_unstable();
+        nta_names.dedup();
+        let change = validator.chain_cache.ensure_policy(
+            policy_fingerprint(&config.trust_anchors, &validator.nta_domains.load()),
+            anchor_zones,
+            nta_names,
+        );
+        match change {
+            PolicyChange::None => {}
+            PolicyChange::FullClear => {
+                // The cache already dropped every persisted status; mirror that
+                // decision in the process-local unsigned evidence.
+                validator.insecure_zones.clear();
+            }
+            PolicyChange::AddedAnchors(added) => {
+                // `ensure_policy` already evicted the contradicted cache
+                // entries; only the in-memory mirror still needs pruning.
+                for anchor in added {
+                    validator.invalidate_in_memory_unsigned_at_or_above(&anchor);
+                }
+            }
+        }
         validator
     }
 
@@ -1526,8 +1552,22 @@ impl DnssecValidator {
     /// must keep its cached proof, otherwise a reload would turn its stripped
     /// answers Bogus while the DS probe is offline.
     fn invalidate_unsigned_evidence_under(&self, anchor: &LowerName) {
-        self.insecure_zones.retain(|zone, _| !zone.zone_of(anchor));
+        self.invalidate_in_memory_unsigned_at_or_above(anchor);
         self.chain_cache.invalidate_unsigned_at_or_above(anchor);
+    }
+
+    /// Memory-only half of [`Self::invalidate_unsigned_evidence_under`], used
+    /// after `ChainCache::ensure_policy` already did the targeted cache prune.
+    fn invalidate_in_memory_unsigned_at_or_above(&self, anchor: &LowerName) -> usize {
+        let mut removed = 0usize;
+        self.insecure_zones.retain(|zone, _| {
+            let keep = !zone.zone_of(anchor);
+            if !keep {
+                removed += 1;
+            }
+            keep
+        });
+        removed
     }
 
     /// Add a Negative Trust Anchor (NTA) dynamically.
@@ -5488,6 +5528,63 @@ mod tests {
         message
     }
 
+    /// A DS response proving (via an exact-match parent-side NSEC3) that the
+    /// delegation at `cut` has no DS and is legitimately unsigned.
+    fn signed_nsec3_ds_denial(
+        parent: &Name,
+        cut: &Name,
+        key: &DNSKEY,
+        signer: &hickory_proto::dnssec::DnssecSigner,
+    ) -> Message {
+        use data_encoding::BASE32_DNSSEC;
+        use hickory_proto::dnssec::Nsec3HashAlgorithm;
+        use hickory_proto::dnssec::rdata::NSEC3;
+        use hickory_proto::rr::RecordSet;
+
+        let algorithm = Nsec3HashAlgorithm::SHA1;
+        let cut_hash = algorithm.hash(&[], cut, 0).expect("hash").as_ref().to_vec();
+        let mut next = cut_hash.clone();
+        for byte in next.iter_mut().rev() {
+            *byte = byte.wrapping_add(1);
+            if *byte != 0 {
+                break;
+            }
+        }
+        let nsec3 = NSEC3::new(
+            algorithm,
+            false,
+            0,
+            Vec::new(),
+            next,
+            [RecordType::NS, RecordType::RRSIG, RecordType::NSEC3],
+        );
+        let owner = Name::from_ascii(format!(
+            "{}.{}",
+            BASE32_DNSSEC.encode(&cut_hash),
+            parent.to_ascii()
+        ))
+        .expect("NSEC3 owner");
+        let record =
+            Record::from_rdata(owner.clone(), 300, RData::DNSSEC(DNSSECRData::NSEC3(nsec3)));
+        let mut set = RecordSet::new(owner, RecordType::NSEC3, 0);
+        set.insert(record.clone(), 0);
+        let signature = sign_test_rrset(&set, signer);
+
+        let mut message = Message::new(26, MessageType::Response, OpCode::Query);
+        message
+            .queries
+            .push(Query::query(cut.clone(), RecordType::DS));
+        message.metadata.response_code = ResponseCode::NoError;
+        message.authorities.push(record);
+        message.authorities.push(signature);
+        message.additionals.push(Record::from_rdata(
+            parent.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(key.clone())),
+        ));
+        message
+    }
+
     fn stripped_response(qname: &Name) -> Message {
         let mut response = Message::new(7, MessageType::Response, OpCode::Query);
         response
@@ -6124,6 +6221,49 @@ mod tests {
             response.answers.len(),
             1,
             "insecure answers are passed through"
+        );
+    }
+
+    /// A genuinely unsigned zone whose DS denial is authenticated by an exact
+    /// NSEC3 record (not an NSEC/opt-out covering proof) must also be Insecure,
+    /// including on a cold start.
+    #[tokio::test]
+    async fn test_cold_start_nsec3_ds_denial_is_insecure() {
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+        let cut = Name::from_str("unsigned.signed.example.").expect("cut");
+        let qname = Name::from_str("www.unsigned.signed.example.").expect("qname");
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+
+        let ds_denial = signed_nsec3_ds_denial(&parent_origin, &cut, &parent_key, &parent_signer);
+        let fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(&cut, RecordType::DS, ds_denial);
+
+        let mut response = stripped_response(&qname);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Insecure,
+            "an exact NSEC3 DS denial must prove the delegation is unsigned"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(!response.metadata.authentic_data);
+        assert!(
+            validator
+                .chain_cache()
+                .covers_unsigned(&LowerName::from(&cut), now)
+                .is_some(),
+            "the authenticated unsigned delegation must be cached"
         );
     }
 
