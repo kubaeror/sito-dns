@@ -39,6 +39,12 @@ pub struct ResyncOutcome {
     pub slaves_notified: usize,
 }
 
+/// Test-only hook invoked inside the blocking state writer before the file is
+/// written. It receives the version of the bundle being persisted so a test can
+/// observe and slow down individual writes without affecting production builds.
+#[cfg(test)]
+type StateWriteHook = Arc<dyn Fn(u64) + Send + Sync>;
+
 /// A version-continuity violation observed on a slave acknowledgement.
 #[derive(Debug, Clone)]
 struct Divergence {
@@ -73,6 +79,9 @@ pub struct MasterCoordinator {
     persist_lock: Arc<tokio::sync::Mutex<()>>,
     /// Monotonic id assigned to each accepted slave connection.
     next_connection_id: Arc<AtomicU64>,
+    /// Test-only hook called by the asynchronous state writer.
+    #[cfg(test)]
+    state_write_hook: Arc<Mutex<Option<StateWriteHook>>>,
     /// Version-continuity violations per currently connected slave; an entry is
     /// removed when a push above its version is applied or the slave
     /// disconnects, so the metric series cannot outlive the record.
@@ -110,6 +119,8 @@ impl MasterCoordinator {
             publish_lock: Arc::new(Mutex::new(())),
             persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             next_connection_id: Arc::new(AtomicU64::new(1)),
+            #[cfg(test)]
+            state_write_hook: Arc::new(Mutex::new(None)),
             diverged: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -118,6 +129,14 @@ impl MasterCoordinator {
     #[must_use]
     pub fn with_state_path(mut self, path: PathBuf) -> Self {
         self.state_path = Arc::new(Mutex::new(Some(path)));
+        self
+    }
+
+    /// Installs a test-only hook invoked inside the blocking state writer.
+    #[cfg(test)]
+    #[must_use]
+    fn with_state_write_hook(mut self, hook: StateWriteHook) -> Self {
+        self.state_write_hook = Arc::new(Mutex::new(Some(hook)));
         self
     }
 
@@ -186,9 +205,19 @@ impl MasterCoordinator {
         let Some((path, payload)) = self.serialized_bundle(bundle)? else {
             return Ok(());
         };
-        tokio::task::spawn_blocking(move || Self::write_state_file(&path, &payload))
-            .await
-            .map_err(|e| std::io::Error::other(format!("HA state writer task failed: {e}")))?
+        #[cfg(test)]
+        let version = bundle.version;
+        #[cfg(test)]
+        let hook = self.state_write_hook.lock().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(hook) = hook.as_ref() {
+                hook(version);
+            }
+            Self::write_state_file(&path, &payload)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("HA state writer task failed: {e}")))?
     }
 
     /// Restores the persisted version/bundle, if any.
@@ -419,6 +448,12 @@ impl MasterCoordinator {
     }
 
     /// Sets and signs a new configuration bundle, immediately broadcasting it to all connected slaves.
+    ///
+    /// This synchronous variant is startup/test-only: `init_ha` publishes the
+    /// initial bundle before the async replication loop starts. It does not take
+    /// [`Self::persist_lock`], so it must not race [`Self::update_bundle_async`]
+    /// in production, otherwise a sync write landing during an async
+    /// conflict-restore could overwrite the newer state file.
     pub fn update_bundle(&self, bundle: ConfigBundle) -> Result<u64, HaError> {
         // Serialize the check-then-store: two concurrent publishers could
         // otherwise both pass the monotonicity check and store out of order,
@@ -473,31 +508,39 @@ impl MasterCoordinator {
             return Err(HaError::Io(e));
         }
 
-        {
+        let conflict = {
             let _publish_guard = self
                 .publish_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // A synchronous publisher may have advanced the sequence while the
             // write was in flight. Publishing our older prepared version would
-            // regress the cluster, so restore the now-active state file and
-            // report the conflict instead. Keep `publish_guard` for the restore
-            // write so no newer publisher can interleave and be overwritten.
-            if self.current_version.load(Ordering::SeqCst) != previous_version {
-                let active = self.active_bundle.lock().unwrap().clone();
-                if let Some(active) = active
-                    && let Err(e) = self.persist_bundle(&active)
-                {
-                    error!(error = %e, "Failed to restore HA master state after a concurrent publish");
-                }
-                return Err(HaError::Validation {
-                    field: "version".to_string(),
-                    reason: format!(
-                        "Concurrent publish advanced the HA configuration version above {version}"
-                    ),
-                });
+            // regress the cluster, so report the conflict and restore the
+            // now-active bundle instead. Only detect and clone under the
+            // standard lock: it must never be held across the awaited write.
+            if self.current_version.load(Ordering::SeqCst) == previous_version {
+                self.publish_prepared(bundle, version, push_msg.clone());
+                None
+            } else {
+                Some(self.active_bundle.lock().unwrap().clone())
             }
-            self.publish_prepared(bundle, version, push_msg.clone());
+        };
+
+        if let Some(active) = conflict {
+            // `persist_lock` is still held, so no async publisher can interleave
+            // with this restore. The write runs on the blocking pool: a
+            // synchronous `std::fs` write here would stall a tokio worker.
+            if let Some(active) = active
+                && let Err(e) = self.persist_bundle_async(&active).await
+            {
+                error!(error = %e, "Failed to restore HA master state after a concurrent publish");
+            }
+            return Err(HaError::Validation {
+                field: "version".to_string(),
+                reason: format!(
+                    "Concurrent publish advanced the HA configuration version above {version}"
+                ),
+            });
         }
 
         self.record_published_version(version);
@@ -1477,6 +1520,158 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Forces the conflict branch and asserts the state write restoring the
+    /// concurrent publisher's active bundle runs on the blocking pool: on a
+    /// current-thread runtime a synchronous write would starve the ticker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_conflict_restore_uses_blocking_pool() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_conflict_blocking_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticker_ticks = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                ticker_ticks.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Track each async state write and how far the ticker advanced while
+        // the conflict-restore write ran (the second write).
+        let writes = Arc::new(AtomicU64::new(0));
+        let restore_ticks = Arc::new(AtomicU64::new(0));
+        let written_versions = Arc::new(Mutex::new(Vec::new()));
+        let first_write_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook = {
+            let ticks = ticks.clone();
+            let writes = writes.clone();
+            let restore_ticks = restore_ticks.clone();
+            let written_versions = written_versions.clone();
+            let first_write_started = first_write_started.clone();
+            Arc::new(move |version: u64| {
+                let write_index = writes.fetch_add(1, Ordering::SeqCst) + 1;
+                written_versions.lock().unwrap().push(version);
+                if write_index == 1 {
+                    first_write_started.store(true, Ordering::SeqCst);
+                }
+                let start = ticks.load(Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(150));
+                if write_index == 2 {
+                    let end = ticks.load(Ordering::Relaxed);
+                    restore_ticks.store(end.saturating_sub(start), Ordering::SeqCst);
+                }
+            })
+        };
+
+        let coordinator = test_coordinator()
+            .with_state_path(dir.join("ha_state.toml"))
+            .with_state_write_hook(hook);
+
+        // Advance the sequence synchronously while the stale publisher's first
+        // write is in flight: this forces the conflict-restore branch.
+        let sync_coordinator = coordinator.clone();
+        let started = first_write_started.clone();
+        let sync_advance = tokio::spawn(async move {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            sync_coordinator.update_bundle(test_bundle(3)).unwrap();
+        });
+
+        let err = coordinator
+            .update_bundle_async(test_bundle(2))
+            .await
+            .expect_err("the stale async publish must report a conflict");
+        assert!(
+            matches!(err, HaError::Validation { .. }),
+            "expected a version conflict, got {err:?}"
+        );
+        sync_advance.await.unwrap();
+
+        assert_eq!(
+            *written_versions.lock().unwrap(),
+            vec![2, 3],
+            "both the stale write and the conflict restore must use the async writer"
+        );
+        assert!(
+            restore_ticks.load(Ordering::SeqCst) > 0,
+            "the tokio runtime must keep ticking while the conflict restore writes state"
+        );
+
+        ticker.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The conflict restore must leave the concurrently published active bundle
+    /// (not the stale prepared one) on disk.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_conflict_restore_persists_active_bundle() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_conflict_persist_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("ha_state.toml");
+
+        let first_write_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook = {
+            let started = first_write_started.clone();
+            Arc::new(move |_version: u64| {
+                started.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+            })
+        };
+        let coordinator = test_coordinator()
+            .with_state_path(state_path.clone())
+            .with_state_write_hook(hook);
+
+        let sync_coordinator = coordinator.clone();
+        let started = first_write_started.clone();
+        let sync_advance = tokio::spawn(async move {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            sync_coordinator.update_bundle(test_bundle(3)).unwrap();
+        });
+
+        let err = coordinator
+            .update_bundle_async(test_bundle(2))
+            .await
+            .expect_err("the stale async publish must report a conflict");
+        assert!(
+            matches!(err, HaError::Validation { .. }),
+            "expected a version conflict, got {err:?}"
+        );
+        sync_advance.await.unwrap();
+
+        assert_eq!(
+            coordinator.get_current_version(),
+            3,
+            "the concurrent publish must not regress"
+        );
+        let active = coordinator
+            .active_bundle
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("active bundle");
+        assert_eq!(active.version, 3);
+        let persisted: ConfigBundle =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted, active,
+            "the restored state file must contain the active bundle"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn test_persist_failure_propagates() {
         let dir = std::env::temp_dir().join(format!(
@@ -1485,15 +1680,35 @@ mod tests {
             rand::random::<u64>()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        let coordinator = test_coordinator().with_state_path(dir.join("ha_state.toml"));
+        // Establish a previous good publish so "unchanged" is meaningful.
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+        let before_version = coordinator.get_current_version();
+        let before_bundle = coordinator
+            .active_bundle
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("previous active bundle");
+        let before_push = coordinator
+            .active_push
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("previous active push");
+        let before_push_version = match before_push {
+            HaMessage::ConfigPush { version, .. } => version,
+            other => panic!("expected a ConfigPush, got {other:?}"),
+        };
+
         // A regular file where the state directory should be makes every
         // create_dir_all/write attempt fail deterministically.
         let blocker = dir.join("not-a-directory");
         std::fs::write(&blocker, b"blocked").unwrap();
-        let coordinator = test_coordinator().with_state_path(blocker.join("ha_state.toml"));
-        let before_version = coordinator.get_current_version();
+        *coordinator.state_path.lock().unwrap() = Some(blocker.join("ha_state.toml"));
 
         let err = coordinator
-            .update_bundle_async(test_bundle(2))
+            .update_bundle_async(test_bundle(3))
             .await
             .expect_err("a failed state write must not be reported as success");
         assert!(
@@ -1505,13 +1720,24 @@ mod tests {
             before_version,
             "a failed persist must not advance the published version"
         );
-        assert!(
-            coordinator.active_push.lock().unwrap().is_none(),
-            "a failed persist must not expose an active push to new slaves"
+        assert_eq!(
+            *coordinator.active_bundle.lock().unwrap(),
+            Some(before_bundle),
+            "a failed persist must leave the previously active bundle in place"
         );
-        assert!(
-            coordinator.active_bundle.lock().unwrap().is_none(),
-            "a failed persist must not leave an active bundle"
+        let after_push = coordinator
+            .active_push
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("active push must remain");
+        let after_push_version = match after_push {
+            HaMessage::ConfigPush { version, .. } => version,
+            other => panic!("expected a ConfigPush, got {other:?}"),
+        };
+        assert_eq!(
+            after_push_version, before_push_version,
+            "a failed persist must not replace the active push"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
