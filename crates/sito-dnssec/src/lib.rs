@@ -1475,37 +1475,48 @@ impl DnssecValidator {
         // Insecure for the rest of the TTL (a persistent fail-open), and a new
         // NTA changes the classification too. Diff the policy so an unrelated
         // anchor addition preserves legitimate unsigned children.
-        let mut anchor_zones: Vec<String> = validator
+        validator.apply_chain_cache_policy(config);
+        validator
+    }
+
+    /// Applies the trust-anchor/NTA policy diff to the shared chain cache and
+    /// the process-local unsigned evidence.
+    ///
+    /// Factored out of [`Self::from_config_with_cache`] so tests can exercise
+    /// the policy diff on a validator whose seeded process-local maps are
+    /// retained; the constructor always starts with empty maps.
+    fn apply_chain_cache_policy(&self, config: &DnssecConfig) -> PolicyChange {
+        let mut anchor_zones: Vec<String> = self
             .anchor_zones
             .iter()
             .map(|entry| entry.key().to_string())
             .collect();
         anchor_zones.sort_unstable();
         anchor_zones.dedup();
-        let mut nta_names: Vec<String> = (**validator.nta_domains.load()).clone();
+        let mut nta_names: Vec<String> = (**self.nta_domains.load()).clone();
         nta_names.sort_unstable();
         nta_names.dedup();
-        let change = validator.chain_cache.ensure_policy(
-            policy_fingerprint(&config.trust_anchors, &validator.nta_domains.load()),
+        let change = self.chain_cache.ensure_policy(
+            policy_fingerprint(&config.trust_anchors, &self.nta_domains.load()),
             anchor_zones,
             nta_names,
         );
-        match change {
+        match &change {
             PolicyChange::None => {}
             PolicyChange::FullClear => {
                 // The cache already dropped every persisted status; mirror that
                 // decision in the process-local unsigned evidence.
-                validator.insecure_zones.clear();
+                self.insecure_zones.clear();
             }
             PolicyChange::AddedAnchors(added) => {
                 // `ensure_policy` already evicted the contradicted cache
                 // entries; only the in-memory mirror still needs pruning.
                 for anchor in added {
-                    validator.invalidate_in_memory_unsigned_at_or_above(&anchor);
+                    self.invalidate_in_memory_unsigned_at_or_above(anchor);
                 }
             }
         }
-        validator
+        change
     }
 
     /// The shared chain cache (used to verify reload reuse in tests).
@@ -6437,6 +6448,71 @@ mod tests {
         assert!(
             matches!(outcome, ValidationOutcome::Bogus { .. }),
             "a newly anchored zone must fail closed: {outcome:?}"
+        );
+    }
+
+    /// The `AddedAnchors` arm of `from_config_with_cache` must prune only the
+    /// affected process-local unsigned zones, leaving unrelated ones intact.
+    #[test]
+    fn test_reload_added_anchor_prunes_only_affected_in_memory_unsigned_zones() {
+        use base64::Engine as _;
+
+        let (signed_origin, signed_key, _signed_signer) = create_test_signer("signed.example.");
+        let (other_origin, other_key, _other_signer) = create_test_signer("other.example.");
+        let anchor = |origin: &Name, key: &DNSKEY| {
+            format!(
+                "{}:13:{}",
+                origin.to_ascii().trim_end_matches('.'),
+                base64::engine::general_purpose::STANDARD.encode(key.public_key().public_bytes())
+            )
+        };
+        let config_one = DnssecConfig {
+            trust_anchors: vec![anchor(&signed_origin, &signed_key)],
+            ..Default::default()
+        };
+        let config_two = DnssecConfig {
+            trust_anchors: vec![
+                anchor(&signed_origin, &signed_key),
+                anchor(&other_origin, &other_key),
+            ],
+            ..Default::default()
+        };
+
+        let validator = DnssecValidator::from_config_with_cache(
+            &config_one,
+            Some(Arc::new(ChainCache::new(None))),
+        );
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let affected = LowerName::from(&other_origin);
+        let unrelated = LowerName::from(
+            &Name::from_str("unsigned.signed.example.").expect("unrelated unsigned zone"),
+        );
+        validator
+            .insecure_zones
+            .insert(affected.clone(), now.saturating_add(600));
+        validator
+            .insecure_zones
+            .insert(unrelated.clone(), now.saturating_add(600));
+
+        // A reload builds a new validator with empty process-local maps, so the
+        // shared policy-apply path is exercised on this validator to retain the
+        // seeded `insecure_zones`. Insert the anchor without the direct
+        // `add_trust_anchor` invalidation that the policy diff must perform.
+        validator.insert_raw_trust_anchor(other_key.public_key(), &affected);
+        validator.anchor_zones.insert(affected.clone(), ());
+        let change = validator.apply_chain_cache_policy(&config_two);
+        assert_eq!(
+            change,
+            PolicyChange::AddedAnchors(vec![affected.clone()]),
+            "the second config only adds the other.example. anchor"
+        );
+        assert!(
+            !validator.insecure_zones.contains_key(&affected),
+            "an added anchor must clear the in-memory unsigned zone at the anchor"
+        );
+        assert!(
+            validator.insecure_zones.contains_key(&unrelated),
+            "an unrelated in-memory unsigned zone must survive an anchor addition"
         );
     }
 

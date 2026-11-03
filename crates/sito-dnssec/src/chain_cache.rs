@@ -43,6 +43,16 @@ pub struct PolicyState {
     pub ntas: Vec<String>,
 }
 
+/// Internal policy record: the public state plus whether the anchor/NTA lists
+/// came from a format that explicitly persisted them. A legacy fingerprint
+/// without metadata must full-clear on any policy change, while a new-format
+/// policy with genuinely empty lists can still diff/target additions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicyRecord {
+    state: PolicyState,
+    metadata_known: bool,
+}
+
 /// Effect of [`ChainCache::ensure_policy`] on the cached entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyChange {
@@ -78,10 +88,12 @@ pub struct ChainCache {
     /// Trust-anchor/NTA policy the entries were authenticated under. This lock
     /// also serializes entry snapshots during a flush: a flush must never
     /// combine entries from one policy with the metadata of another.
-    policy: Mutex<Option<PolicyState>>,
-    /// Serializes disk flushes so the shutdown flush and the periodic flush
-    /// task cannot write the same temporary file concurrently. Policy changes
-    /// never take this lock, so a slow disk write cannot block them.
+    policy: Mutex<Option<PolicyRecord>>,
+    /// Serializes the whole flush (snapshot, serialization, temp-file write,
+    /// rename and parent fsync) so a shutdown flush and the periodic flush
+    /// task cannot interleave and an older snapshot cannot overwrite a newer
+    /// one. Policy changes never take this lock, so a slow disk write cannot
+    /// block them.
     flush_lock: Mutex<()>,
     /// Test-only hook invoked after the snapshot is released and before the
     /// disk write, used to prove policy changes are not blocked by I/O.
@@ -95,14 +107,16 @@ struct PersistedCache {
     entries: Vec<PersistedEntry>,
     #[serde(default)]
     policy: Option<String>,
-    /// Anchor zones in force when the entries were authenticated. Missing in
+    /// Anchor zones in force when the entries were authenticated. `None` in
     /// files written before 1.9.1, which forces a safe full clear on the first
-    /// policy change.
+    /// policy change. `Some(empty)` is a new-format policy that genuinely has
+    /// no configured non-root anchors.
     #[serde(default)]
-    policy_anchors: Vec<String>,
+    policy_anchors: Option<Vec<String>>,
     /// Negative trust anchors in force when the entries were authenticated.
+    /// `None` marks legacy files exactly like `policy_anchors`.
     #[serde(default)]
-    policy_ntas: Vec<String>,
+    policy_ntas: Option<Vec<String>>,
 }
 
 /// Counters collected while loading a persisted cache (used for diagnostics
@@ -152,7 +166,9 @@ impl ChainCache {
     /// diffed safely (missing metadata or an NTA change) drops every entry.
     /// Adding anchors only invalidates cached `Unsigned` zones at or above the
     /// added anchors, so legitimate unsigned children below an unchanged
-    /// anchor survive a reload.
+    /// anchor survive a reload. Any removal or non-additive fingerprint change
+    /// (for example anchor key material) also full-clears: evidence must never
+    /// survive an anchor removal.
     pub fn ensure_policy(
         &self,
         fingerprint: String,
@@ -166,62 +182,109 @@ impl ChainCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let Some(previous) = policy.as_ref() else {
-            *policy = Some(PolicyState {
-                fingerprint,
-                anchors,
-                ntas,
+        let Some(previous) = policy.clone() else {
+            // A legacy file can contain entries with no policy at all. Those
+            // entries were never authenticated under the current policy, so
+            // they must not be adopted by the first `ensure_policy` call.
+            if !self.entries.is_empty() {
+                warn!(
+                    removed = self.entries.len(),
+                    "DNSSEC chain cache had entries without policy metadata; dropping cached delegation statuses"
+                );
+                self.entries.clear();
+            }
+            *policy = Some(PolicyRecord {
+                state: PolicyState {
+                    fingerprint,
+                    anchors,
+                    ntas,
+                },
+                metadata_known: true,
             });
             self.dirty.store(true, Ordering::Release);
             return PolicyChange::FullClear;
         };
 
-        if previous.fingerprint == fingerprint {
+        if previous.state.fingerprint == fingerprint {
             return PolicyChange::None;
         }
 
-        // Files written before 1.9.1 carry a fingerprint but no anchor list.
-        // We cannot prove which cached `Unsigned` zones are legitimate under
-        // the new policy, so clear rather than risk a stale fail-open.
-        if previous.anchors.is_empty() && previous.ntas.is_empty() {
+        // Files written before 1.9.1 carry a fingerprint but no anchor/NTA
+        // metadata. We cannot prove which cached `Unsigned` zones are
+        // legitimate under the new policy, so clear rather than risk a stale
+        // fail-open.
+        if !previous.metadata_known {
             self.entries.clear();
             warn!(
-                previous = ?previous.fingerprint,
+                previous = ?previous.state.fingerprint,
                 "DNSSEC chain cache policy changed without anchor metadata; dropping cached delegation statuses"
             );
-            *policy = Some(PolicyState {
-                fingerprint,
-                anchors,
-                ntas,
+            *policy = Some(PolicyRecord {
+                state: PolicyState {
+                    fingerprint,
+                    anchors,
+                    ntas,
+                },
+                metadata_known: true,
             });
             self.dirty.store(true, Ordering::Release);
             return PolicyChange::FullClear;
         }
 
-        if previous.ntas != ntas {
+        if previous.state.ntas != ntas {
             self.entries.clear();
             warn!(
-                previous = ?previous.fingerprint,
+                previous = ?previous.state.fingerprint,
                 "DNSSEC chain cache NTA policy changed; dropping cached delegation statuses"
             );
-            *policy = Some(PolicyState {
-                fingerprint,
-                anchors,
-                ntas,
+            *policy = Some(PolicyRecord {
+                state: PolicyState {
+                    fingerprint,
+                    anchors,
+                    ntas,
+                },
+                metadata_known: true,
             });
             self.dirty.store(true, Ordering::Release);
             return PolicyChange::FullClear;
         }
 
+        let removed_any = previous
+            .state
+            .anchors
+            .iter()
+            .any(|anchor| !anchors.contains(anchor));
         let added: Vec<LowerName> = anchors
             .iter()
-            .filter(|anchor| !previous.anchors.contains(anchor))
+            .filter(|anchor| !previous.state.anchors.contains(anchor))
             .filter_map(|anchor| {
                 Name::from_ascii(anchor)
                     .ok()
                     .map(|name| LowerName::from(&name))
             })
             .collect();
+        // Only a genuine addition may keep evidence. An anchor removal (or a
+        // fingerprint-only change such as new key material for the same zone)
+        // invalidates signed and unsigned evidence alike, so fail closed with
+        // a full clear instead of returning an empty targeted change.
+        if removed_any || added.is_empty() {
+            self.entries.clear();
+            warn!(
+                previous = ?previous.state.fingerprint,
+                "DNSSEC chain cache trust-anchor policy changed without new anchors; dropping cached delegation statuses"
+            );
+            *policy = Some(PolicyRecord {
+                state: PolicyState {
+                    fingerprint,
+                    anchors,
+                    ntas,
+                },
+                metadata_known: true,
+            });
+            self.dirty.store(true, Ordering::Release);
+            return PolicyChange::FullClear;
+        }
+
         let mut removed = 0usize;
         for anchor in &added {
             removed += self.remove_unsigned_at_or_above_locked(anchor);
@@ -233,10 +296,13 @@ impl ChainCache {
                 "DNSSEC trust-anchor policy added anchors; dropped contradicted unsigned cache entries"
             );
         }
-        *policy = Some(PolicyState {
-            fingerprint,
-            anchors,
-            ntas,
+        *policy = Some(PolicyRecord {
+            state: PolicyState {
+                fingerprint,
+                anchors,
+                ntas,
+            },
+            metadata_known: true,
         });
         // The metadata (at least the fingerprint) changed even when no entry
         // was invalidated, so the next flush must persist it.
@@ -343,18 +409,29 @@ impl ChainCache {
             return stats;
         };
 
-        if let Some(fingerprint) = persisted.policy {
+        let PersistedCache {
+            entries,
+            policy,
+            policy_anchors,
+            policy_ntas,
+        } = persisted;
+
+        if let Some(fingerprint) = policy {
+            let metadata_known = policy_anchors.is_some() && policy_ntas.is_some();
             *self
                 .policy
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PolicyState {
-                fingerprint,
-                anchors: normalize_policy_names(&persisted.policy_anchors),
-                ntas: normalize_policy_names(&persisted.policy_ntas),
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PolicyRecord {
+                state: PolicyState {
+                    fingerprint,
+                    anchors: normalize_policy_names(policy_anchors.unwrap_or_default()),
+                    ntas: normalize_policy_names(policy_ntas.unwrap_or_default()),
+                },
+                metadata_known,
             });
         }
 
-        for entry in persisted.entries {
+        for entry in entries {
             if entry.expires_at < now {
                 stats.expired += 1;
                 continue;
@@ -509,9 +586,10 @@ impl ChainCache {
     ///
     /// The state lock is held only while snapshotting entries and policy; the
     /// disk write uses `flush_lock` alone so a slow filesystem cannot block a
-    /// policy change. Returns `Ok(())` when there is nothing to write or the
-    /// write succeeded. On failure the dirty flag is restored so a later
-    /// attempt retries.
+    /// policy change. (`flush_lock` still spans the whole flush to serialize
+    /// snapshots and prevent an older write from overwriting a newer one.)
+    /// Returns `Ok(())` when there is nothing to write or the write succeeded.
+    /// On failure the dirty flag is restored so a later attempt retries.
     pub fn flush(&self) -> std::io::Result<()> {
         let Some(path) = self.path.as_deref() else {
             self.dirty.store(false, Ordering::Release);
@@ -545,17 +623,17 @@ impl ChainCache {
                 })
                 .collect();
             match policy.as_ref() {
-                Some(state) => PersistedCache {
+                Some(record) => PersistedCache {
                     entries,
-                    policy: Some(state.fingerprint.clone()),
-                    policy_anchors: state.anchors.clone(),
-                    policy_ntas: state.ntas.clone(),
+                    policy: Some(record.state.fingerprint.clone()),
+                    policy_anchors: record.metadata_known.then(|| record.state.anchors.clone()),
+                    policy_ntas: record.metadata_known.then(|| record.state.ntas.clone()),
                 },
                 None => PersistedCache {
                     entries,
                     policy: None,
-                    policy_anchors: Vec::new(),
-                    policy_ntas: Vec::new(),
+                    policy_anchors: None,
+                    policy_ntas: None,
                 },
             }
         };
@@ -909,7 +987,7 @@ mod tests {
         assert_eq!(
             cache.ensure_policy("v1-bbbb".to_string(), Vec::new(), Vec::new()),
             PolicyChange::FullClear,
-            "a changed policy from an old/empty metadata state must clear safely"
+            "a fingerprint change without an anchor addition must clear safely"
         );
         assert!(cache.is_empty());
     }
@@ -947,6 +1025,43 @@ mod tests {
             cache.get(&child, now).is_some(),
             "an unrelated added anchor must not evict a legitimate unsigned child"
         );
+    }
+
+    /// A new-format policy that genuinely has no configured anchors/NTAs must
+    /// still support targeted additions. The old empty-list sentinel treated
+    /// this as legacy metadata and full-cleared an unrelated unsigned child.
+    #[test]
+    fn test_empty_new_format_policy_preserves_unrelated_unsigned_child() {
+        let path = temp_path("empty_policy_restart");
+        let now = system_now();
+        let cache = ChainCache::new(Some(path.clone()));
+        assert_eq!(
+            cache.ensure_policy("fp-1".to_string(), Vec::new(), Vec::new()),
+            PolicyChange::FullClear
+        );
+        let child = name("unsigned.signed.example.");
+        cache.insert(child.clone(), ZoneStatus::Unsigned, now + 600, now);
+        cache.flush().expect("flush");
+
+        // Reload proves the empty-but-present lists were persisted explicitly,
+        // not mistaken for legacy missing metadata.
+        let reloaded = ChainCache::new(Some(path.clone()));
+        reloaded.load(now);
+        assert_eq!(
+            reloaded.ensure_policy(
+                "fp-2".to_string(),
+                vec!["unrelated.example.".to_string()],
+                Vec::new()
+            ),
+            PolicyChange::AddedAnchors(vec![name("unrelated.example.")]),
+            "adding an unrelated anchor to an empty new-format policy is targeted"
+        );
+        assert!(
+            reloaded.get(&child, now).is_some(),
+            "an unrelated addition must preserve an existing unsigned child"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 
     /// An added anchor at or above a cached unsigned zone contradicts that
@@ -998,6 +1113,46 @@ mod tests {
             cache.get(&corp, now).is_none(),
             "an anchor below the cached unsigned zone must invalidate the ancestor"
         );
+    }
+
+    /// Removing an anchor (or any non-additive fingerprint change) must clear
+    /// all evidence, including `Signed`, rather than return an empty targeted
+    /// change that could let old trust survive.
+    #[test]
+    fn test_anchor_removal_full_clears_cache() {
+        let cache = ChainCache::new(None);
+        let now = system_now();
+        assert_eq!(
+            cache.ensure_policy(
+                "fp-1".to_string(),
+                vec!["a.example.".to_string(), "b.example.".to_string()],
+                Vec::new()
+            ),
+            PolicyChange::FullClear
+        );
+        cache.insert(
+            name("unsigned.a.example."),
+            ZoneStatus::Unsigned,
+            now + 600,
+            now,
+        );
+        cache.insert(
+            name("signed.b.example."),
+            ZoneStatus::Signed,
+            now + 600,
+            now + 1,
+        );
+
+        assert_eq!(
+            cache.ensure_policy(
+                "fp-2".to_string(),
+                vec!["a.example.".to_string()],
+                Vec::new()
+            ),
+            PolicyChange::FullClear,
+            "anchor removal must full-clear cached evidence"
+        );
+        assert!(cache.is_empty());
     }
 
     /// Any NTA change makes previously authenticated classifications unsafe.
@@ -1053,12 +1208,14 @@ mod tests {
 
         let reloaded = ChainCache::new(Some(path.clone()));
         reloaded.load(now);
-        let state = reloaded
+        let record = reloaded
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .expect("policy metadata must survive restart");
+        assert!(record.metadata_known);
+        let state = record.state;
         assert_eq!(state.fingerprint, "fp-1");
         assert_eq!(
             state.anchors,
@@ -1079,6 +1236,82 @@ mod tests {
             "an unchanged policy after reload must be a no-op"
         );
         assert!(reloaded.get(&child, now).is_some());
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    /// A legacy file with a fingerprint but no `policy_anchors`/`policy_ntas`
+    /// must full-clear when the policy changes, because the old anchors are
+    /// unknown and a stale `Unsigned` could otherwise become a fail-open.
+    #[test]
+    fn test_legacy_policy_file_without_anchor_metadata_full_clears_on_change() {
+        let path = temp_path("legacy_policy_metadata");
+        let now = system_now();
+        let cache = ChainCache::new(Some(path.clone()));
+        std::fs::write(
+            &path,
+            format!(
+                "policy = \"v1-legacy\"\n\n[[entries]]\nname = \"unsigned.signed.example.\"\nstatus = \"unsigned\"\nexpires_at = {}\nvalidated_at = {}\n",
+                now + 600,
+                now
+            ),
+        )
+        .expect("write legacy cache");
+
+        cache.load(now);
+        let stale = name("unsigned.signed.example.");
+        assert!(
+            cache.get(&stale, now).is_some(),
+            "the legacy entry itself must still load"
+        );
+        assert_eq!(
+            cache.ensure_policy(
+                "v1-new".to_string(),
+                vec!["signed.example.".to_string()],
+                Vec::new()
+            ),
+            PolicyChange::FullClear,
+            "missing anchor metadata must force a safe full clear"
+        );
+        assert!(
+            cache.is_empty(),
+            "no entry may survive a legacy-metadata policy change"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    /// A legacy file without even a policy fingerprint can still load entries,
+    /// but the first `ensure_policy` must not adopt them.
+    #[test]
+    fn test_legacy_file_without_policy_full_clears_on_first_policy() {
+        let path = temp_path("legacy_no_policy");
+        let now = system_now();
+        let cache = ChainCache::new(Some(path.clone()));
+        std::fs::write(
+            &path,
+            format!(
+                "[[entries]]\nname = \"unsigned.signed.example.\"\nstatus = \"unsigned\"\nexpires_at = {}\nvalidated_at = {}\n",
+                now + 600,
+                now
+            ),
+        )
+        .expect("write legacy cache");
+
+        cache.load(now);
+        let stale = name("unsigned.signed.example.");
+        assert!(
+            cache.get(&stale, now).is_some(),
+            "the legacy entry itself must still load"
+        );
+        assert_eq!(
+            cache.ensure_policy("v1-new".to_string(), Vec::new(), Vec::new()),
+            PolicyChange::FullClear
+        );
+        assert!(
+            cache.is_empty(),
+            "entries with no prior policy must not be adopted"
+        );
 
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
@@ -1167,11 +1400,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 
-    /// A concurrent flush and invalidate must leave a valid TOML file that no
-    /// longer contains the invalidated unsigned entry.
+    /// A concurrent flush and invalidate must leave a valid TOML file, and an
+    /// invalidation that happens while a flush is in flight must mark the cache
+    /// dirty so the invalidated view is persisted by the next flush.
     #[test]
     fn test_concurrent_flush_and_invalidate_leave_valid_file() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::{Arc, Condvar, Mutex};
 
         let path = temp_path("concurrent_invalidate");
         let cache = Arc::new(ChainCache::new(Some(path.clone())));
@@ -1195,28 +1429,81 @@ mod tests {
         let corp = name("corp.");
         cache.insert(corp.clone(), ZoneStatus::Unsigned, now + 600, now);
 
-        let barrier = Arc::new(Barrier::new(3));
-        let flush_cache = cache.clone();
-        let flush_barrier = barrier.clone();
-        let flush = std::thread::spawn(move || {
-            flush_barrier.wait();
-            for _ in 0..16 {
-                flush_cache.flush().expect("concurrent flush");
-            }
-        });
-        let invalidate_cache = cache.clone();
-        let invalidate_barrier = barrier.clone();
-        let invalidate = std::thread::spawn(move || {
-            invalidate_barrier.wait();
-            invalidate_cache.invalidate_unsigned_at_or_above(&corp)
-        });
-        barrier.wait();
-        flush.join().expect("flush thread");
-        let removed = invalidate.join().expect("invalidate thread");
-        assert_eq!(removed, 1, "the unsigned entry must be invalidated");
+        // Block the flush after it has snapshotted (and cleared dirty) but
+        // before it writes, so the invalidation is genuinely concurrent with
+        // an in-flight disk write.
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        {
+            let entered = entered.clone();
+            let release = release.clone();
+            cache.set_flush_hook(Some(Box::new(move || {
+                let (lock, condvar) = &*entered;
+                *lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                condvar.notify_all();
+                let (lock, condvar) = &*release;
+                let mut released = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*released {
+                    released = condvar
+                        .wait(released)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            })));
+        }
 
+        let flush_cache = cache.clone();
+        let flush = std::thread::spawn(move || flush_cache.flush().expect("concurrent flush"));
+        {
+            let (lock, condvar) = &*entered;
+            let mut flag = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*flag {
+                flag = condvar
+                    .wait(flag)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+
+        // The flush has cleared dirty for its snapshot; invalidation must set
+        // it again so the stale snapshot is not the final state.
+        let removed = cache.invalidate_unsigned_at_or_above(&corp);
+        assert_eq!(removed, 1, "the unsigned entry must be invalidated");
+        assert!(
+            cache.is_dirty(),
+            "an invalidation during an in-flight flush must mark the cache dirty"
+        );
+
+        {
+            let (lock, condvar) = &*release;
+            *lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            condvar.notify_all();
+        }
+        flush.join().expect("flush thread");
+        cache.set_flush_hook(None);
+
+        // The in-flight flush wrote its pre-invalidation snapshot. It must
+        // still be a complete, parseable file (never a torn write).
+        let content = std::fs::read_to_string(&path).expect("read in-flight cache file");
+        let in_flight: PersistedCache =
+            toml::from_str(&content).expect("the in-flight flush must leave valid TOML");
+        assert!(
+            in_flight.entries.len() >= 32,
+            "the in-flight snapshot must contain the signed entries"
+        );
+
+        // The dirty mark from the invalidation must make the final flush
+        // persist the invalidated view.
+        assert!(cache.is_dirty(), "the invalidation must still be pending");
         cache.flush().expect("final flush");
-        let content = std::fs::read_to_string(&path).expect("read cache file");
+        assert!(!cache.is_dirty());
+        let content = std::fs::read_to_string(&path).expect("read final cache file");
         let persisted: PersistedCache = toml::from_str(&content).expect("valid TOML cache");
         assert!(
             !persisted
@@ -1255,8 +1542,8 @@ mod tests {
                 },
             ],
             policy: Some("fp-1".to_string()),
-            policy_anchors: Vec::new(),
-            policy_ntas: Vec::new(),
+            policy_anchors: Some(Vec::new()),
+            policy_ntas: Some(Vec::new()),
         };
         std::fs::write(
             &path,
