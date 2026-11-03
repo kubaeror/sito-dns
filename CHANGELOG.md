@@ -5,6 +5,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **TOTP enable revokes owned API tokens**: enabling TOTP for an account now
+  revokes every API token that account owns, matching the existing disable
+  lifecycle. Automations using an owned token must create a new one after 2FA
+  is enabled. Legacy ownerless tokens are unaffected.
+- **Retry-safe token/session persistence**: removals and `last_used` updates
+  performed by the synchronous token/session validators now advance a
+  revision counter, and a concurrent save clears the dirty flag only when no
+  mutation landed since its snapshot. The background pruner therefore rewrites
+  the store instead of leaving a stale snapshot on disk.
+
 ## [1.9.0] - 2026-11-02
 
 Security, filtering, high-availability, observability, updater and dependency
