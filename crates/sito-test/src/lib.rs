@@ -110,6 +110,9 @@ mod tests {
 
         let mut config = Config::default();
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
+        // This test counts upstream lookups; keep DNSSEC validation off so the
+        // D-05 delegation probe does not add DNSKEY/DS queries.
+        config.dns.dnssec.validate = false;
         config.dns.cache.min_ttl = 10;
         config.dns.cache.max_ttl = 3600;
 
@@ -156,6 +159,9 @@ mod tests {
 
         let mut config = Config::default();
         config.upstream.timeout_ms = 400; // 400ms timeout
+        // This test counts upstream lookups; keep DNSSEC validation off so the
+        // D-05 delegation probe does not add DNSKEY/DS queries.
+        config.dns.dnssec.validate = false;
         config.upstream.servers = vec![
             mock_upstream1.addr().to_string(),
             mock_upstream2.addr().to_string(),
@@ -775,6 +781,9 @@ mod tests {
 
         let mut config = Config::default();
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
+        // This test counts upstream lookups; keep DNSSEC validation off so the
+        // D-05 delegation probe does not add DNSKEY/DS queries.
+        config.dns.dnssec.validate = false;
         config.dns.dot_port = 0;
         config.dns.doh_port = 0;
         config.filtering.custom_rules = vec!["||blocked-matrix.com^".to_string()];

@@ -100,7 +100,10 @@ def main() -> None:
 
     # --- clients, web, tls, rewrites ---------------------------------------
     check(data["web"]["port"] == 3000, "http.port was not mapped to web.port")
-    check(data["tls"]["cert"] == "/etc/sito/cert.pem", "tls certificate path missing")
+    check(
+        data["tls"]["cert"] == "/tmp/sito-adguard-e2e/cert.pem",
+        "tls certificate path missing",
+    )
     check(len(data["clients"]["entries"]) == 2, "persistent clients were not emitted")
     guest = next(c for c in data["clients"]["entries"] if c["name"] == "Guest")
     check(guest["group"] == "no-filtering", "filtering-disabled client was not grouped")

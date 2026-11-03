@@ -295,8 +295,13 @@ mod tests {
             rewrites.clone(),
         ));
         let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
-            Arc::new(sito_clients::ParentalRegistry::bundled()),
-            Arc::new(sito_clients::ServiceRegistry::bundled()),
+            Arc::new(
+                sito_clients::ParentalRegistry::try_bundled()
+                    .expect("bundled parental lists must load"),
+            ),
+            Arc::new(
+                sito_clients::ServiceRegistry::try_bundled().expect("bundled services must load"),
+            ),
         ));
 
         ServerContext {
@@ -315,6 +320,7 @@ mod tests {
             rewrites,
             start_time: std::time::Instant::now(),
             restore_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             master_coordinator: None,
             slave_tracker: None,
             resync_sender: None,

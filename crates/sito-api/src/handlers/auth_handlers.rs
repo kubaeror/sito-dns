@@ -6,7 +6,7 @@ use axum::http::header::{HeaderMap, SET_COOKIE};
 use axum::response::{IntoResponse, Response};
 use std::str::FromStr;
 
-use crate::auth::manager::{LoginResult, TotpVerifyResult};
+use crate::auth::manager::{LoginResult, TotpVerifyResult, UserMutationError};
 use crate::auth::rbac::RequireAdmin;
 use crate::auth::session::{
     Session, build_clear_csrf_cookie, build_clear_partial_cookie, build_clear_session_cookie,
@@ -229,7 +229,7 @@ pub async fn logout(
         && let Ok(cookie_str) = cookie_header.to_str()
         && let Some(session_id) = crate::auth::session::extract_session_cookie(cookie_str)
     {
-        ctx.auth_mgr.logout(&session_id);
+        ctx.auth_mgr.logout(&session_id).await;
     }
 
     let config = ctx.config.load();
@@ -350,7 +350,7 @@ pub async fn disable_totp(
         }
     }
 
-    if !ctx.auth_mgr.disable_totp(&username) {
+    if !ctx.auth_mgr.disable_totp(&username).await {
         return Err(ProblemDetails::not_found("User account not found"));
     }
     Ok(Json(GenericMessageResponse {
@@ -406,14 +406,46 @@ pub async fn list_tokens(
     security(("bearer_auth" = []), ("cookie_auth" = []))
 )]
 pub async fn create_token(
-    _admin: RequireAdmin,
+    admin: RequireAdmin,
     State(ctx): State<ServerContext>,
     Json(req): Json<CreateTokenRequest>,
 ) -> Result<Json<CreateTokenResponse>, ProblemDetails> {
     let scope = Role::from_str(&req.scope)
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid token scope: {e}")))?;
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ProblemDetails::bad_request("Token name is required"));
+    }
+    if name.len() > 128 {
+        return Err(ProblemDetails::bad_request(
+            "Token name must be at most 128 characters",
+        ));
+    }
 
-    let (_meta, resp) = ctx.auth_mgr.create_token(&req.name, scope);
+    // Session-created tokens belong to the signed-in account. A bearer-token
+    // caller inherits the owner of the token it authenticated with (or stays
+    // ownerless for legacy tokens), so ownership chains correctly. If the
+    // authenticating token was revoked between middleware validation and here,
+    // fail closed instead of minting an ownerless token that escapes quota and
+    // revocation.
+    let owner = match admin.token_id.as_deref() {
+        Some(token_id) => ctx
+            .auth_mgr
+            .list_tokens()
+            .into_iter()
+            .find(|token| token.id == token_id)
+            .map(|token| token.owner)
+            .ok_or_else(|| {
+                ProblemDetails::unauthorized("Authenticating API token is no longer valid")
+            })?,
+        None => Some(admin.username.clone()),
+    };
+
+    let (_meta, resp) = ctx
+        .auth_mgr
+        .create_token(name, scope, owner.as_deref())
+        .await
+        .map_err(|e| ProblemDetails::bad_request(e.to_string()))?;
     Ok(Json(resp))
 }
 
@@ -434,7 +466,7 @@ pub async fn delete_token(
     State(ctx): State<ServerContext>,
     Path(id): Path<String>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
-    if ctx.auth_mgr.delete_token(&id) {
+    if ctx.auth_mgr.delete_token(&id).await {
         Ok(Json(GenericMessageResponse {
             message: format!("Token {id} successfully revoked"),
         }))
@@ -448,7 +480,7 @@ pub async fn delete_token(
 // ---------------------------------------------------------------------------
 
 /// Rejects usernames that would be ambiguous in logs/config or empty.
-fn validate_username(username: &str) -> Result<(), ProblemDetails> {
+pub(crate) fn validate_username(username: &str) -> Result<(), ProblemDetails> {
     let trimmed = username.trim();
     if trimmed.is_empty() {
         return Err(ProblemDetails::bad_request("Username must not be empty"));
@@ -456,6 +488,11 @@ fn validate_username(username: &str) -> Result<(), ProblemDetails> {
     if trimmed.len() > 64 {
         return Err(ProblemDetails::bad_request(
             "Username must be at most 64 characters",
+        ));
+    }
+    if matches!(trimmed, "." | "..") {
+        return Err(ProblemDetails::bad_request(
+            "Username must not be '.' or '..'",
         ));
     }
     if trimmed
@@ -490,6 +527,23 @@ pub fn validate_password_policy(password: &str) -> Result<(), ProblemDetails> {
         ));
     }
     Ok(())
+}
+
+/// Maps an atomic user-mutation failure onto the REST error contract:
+/// `404` for unknown accounts and `400` for the last-admin guard.
+pub(crate) fn user_mutation_problem(
+    username: &str,
+    action: &str,
+    err: UserMutationError,
+) -> ProblemDetails {
+    match err {
+        UserMutationError::NotFound => {
+            ProblemDetails::not_found(format!("User '{username}' not found"))
+        }
+        UserMutationError::LastAdmin => {
+            ProblemDetails::bad_request(format!("Cannot {action} the last remaining admin account"))
+        }
+    }
 }
 
 /// List local user accounts.
@@ -533,18 +587,20 @@ pub async fn create_user(
     validate_password_policy(&req.password)?;
     let role = Role::from_str(req.role.trim())
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid role: {e}")))?;
+    // Normalize surrounding whitespace exactly like the web UI so both paths
+    // create the same account name.
+    let username = req.username.trim();
 
-    if ctx.auth_mgr.has_user(&req.username) {
+    if ctx.auth_mgr.has_user(username) {
         return Err(ProblemDetails::conflict(format!(
-            "User '{}' already exists",
-            req.username
+            "User '{username}' already exists"
         )));
     }
     ctx.auth_mgr
-        .create_user(&req.username, &req.password, role)
+        .create_user(username, &req.password, role)
         .await;
     Ok(Json(UserDto {
-        username: req.username,
+        username: username.to_string(),
         role: role.to_string(),
         totp_enabled: false,
     }))
@@ -573,25 +629,13 @@ pub async fn update_user(
 ) -> Result<Json<UserDto>, ProblemDetails> {
     let role = Role::from_str(req.role.trim())
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid role: {e}")))?;
-    if !ctx.auth_mgr.has_user(&username) {
-        return Err(ProblemDetails::not_found(format!(
-            "User '{username}' not found"
-        )));
-    }
-    if role != Role::Admin
-        && ctx.auth_mgr.role_of(&username) == Some(Role::Admin)
-        && ctx.auth_mgr.admin_count() <= 1
-    {
-        return Err(ProblemDetails::bad_request(
-            "Cannot demote the last remaining admin account",
-        ));
-    }
 
-    if !ctx.auth_mgr.set_user_role(&username, role) {
-        return Err(ProblemDetails::not_found(format!(
-            "User '{username}' not found"
-        )));
-    }
+    // Check and mutate atomically so concurrent demotions cannot race past the
+    // last-admin guard.
+    ctx.auth_mgr
+        .set_user_role_checked(&username, role)
+        .await
+        .map_err(|err| user_mutation_problem(&username, "demote", err))?;
     tracing::info!(
         actor = %admin.username,
         target = %username,
@@ -624,21 +668,12 @@ pub async fn delete_user(
     State(ctx): State<ServerContext>,
     Path(username): Path<String>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
-    if !ctx.auth_mgr.has_user(&username) {
-        return Err(ProblemDetails::not_found(format!(
-            "User '{username}' not found"
-        )));
-    }
-    if ctx.auth_mgr.role_of(&username) == Some(Role::Admin) && ctx.auth_mgr.admin_count() <= 1 {
-        return Err(ProblemDetails::bad_request(
-            "Cannot delete the last remaining admin account",
-        ));
-    }
-    if !ctx.auth_mgr.delete_user(&username) {
-        return Err(ProblemDetails::not_found(format!(
-            "User '{username}' not found"
-        )));
-    }
+    // Check and delete atomically so concurrent deletions/demotions cannot
+    // race past the last-admin guard.
+    ctx.auth_mgr
+        .delete_user_checked(&username)
+        .await
+        .map_err(|err| user_mutation_problem(&username, "delete", err))?;
     tracing::info!(
         actor = %admin.username,
         target = %username,
@@ -915,7 +950,11 @@ mod tests {
     async fn test_token_api_never_returns_hashes() {
         let temp_dir = crate::test_support::temp_dir("sito_auth_tokens");
         let ctx = crate::test_support::mock_context(&temp_dir).await;
-        let (meta, _resp) = ctx.auth_mgr.create_token("grafana", Role::Viewer);
+        let (meta, _resp) = ctx
+            .auth_mgr
+            .create_token("grafana", Role::Viewer, None)
+            .await
+            .expect("token");
 
         let Json(dtos) = list_tokens(admin(), State(ctx.clone())).await;
         assert_eq!(dtos.len(), 1);
@@ -996,6 +1035,24 @@ mod tests {
             .await
             .expect_err("last admin cannot be deleted");
         assert_eq!(delete.status, 400);
+
+        // Unknown accounts stay 404 on both mutations.
+        let unknown_role = update_user(
+            admin(),
+            State(ctx.clone()),
+            AxumPath("ghost".to_string()),
+            Json(UpdateUserRequest {
+                role: "admin".to_string(),
+            }),
+        )
+        .await
+        .expect_err("unknown user rejected");
+        assert_eq!(unknown_role.status, 404);
+        let unknown_delete =
+            delete_user(admin(), State(ctx.clone()), AxumPath("ghost".to_string()))
+                .await
+                .expect_err("unknown user rejected");
+        assert_eq!(unknown_delete.status, 404);
 
         // Self-service password change requires the current password.
         let wrong = change_password(
@@ -1102,6 +1159,148 @@ mod tests {
             .expect_err("weak password rejected");
             assert_eq!(err.status, 400, "password '{password}' must be rejected");
         }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_user_trims_whitespace_and_rejects_dot_names() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_user_names");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let created = create_user(
+            admin(),
+            State(ctx.clone()),
+            Json(CreateUserRequest {
+                username: "  alice  ".to_string(),
+                password: "AlicePassword1".to_string(),
+                role: "viewer".to_string(),
+            }),
+        )
+        .await
+        .expect("user created");
+        assert_eq!(created.0.username, "alice");
+        assert!(ctx.auth_mgr.has_user("alice"));
+        assert!(
+            !ctx.auth_mgr.has_user("  alice  "),
+            "the stored username must be normalized exactly like the UI"
+        );
+
+        for username in [".", ".."] {
+            let err = create_user(
+                admin(),
+                State(ctx.clone()),
+                Json(CreateUserRequest {
+                    username: username.to_string(),
+                    password: "AlicePassword1".to_string(),
+                    role: "viewer".to_string(),
+                }),
+            )
+            .await
+            .expect_err("dot names must be rejected");
+            assert_eq!(err.status, 400, "username '{username}' must be rejected");
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_token_trims_name_and_records_owner() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_token_name");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let Json(resp) = create_token(
+            admin(),
+            State(ctx.clone()),
+            Json(CreateTokenRequest {
+                name: "  ci-deploy  ".to_string(),
+                scope: "viewer".to_string(),
+            }),
+        )
+        .await
+        .expect("token created");
+        assert_eq!(resp.name, "ci-deploy");
+
+        let token = ctx
+            .auth_mgr
+            .list_tokens()
+            .into_iter()
+            .find(|token| token.id == resp.id)
+            .expect("token listed");
+        assert_eq!(token.name, "ci-deploy");
+        assert_eq!(token.owner.as_deref(), Some("admin"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_token_via_bearer_inherits_owner_not_token_name() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_bearer_owner");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        // The authenticating bearer token is named "ci-auth" but is owned by
+        // the admin account; RBAC exposes the name as `AuthUser.username`.
+        let (parent, _) = ctx
+            .auth_mgr
+            .create_token("ci-auth", Role::Admin, Some("admin"))
+            .await
+            .expect("parent token");
+        let bearer = RequireAdmin(AuthUser {
+            username: "ci-auth".to_string(),
+            role: Role::Admin,
+            token_id: Some(parent.id.clone()),
+        });
+
+        let Json(resp) = create_token(
+            bearer,
+            State(ctx.clone()),
+            Json(CreateTokenRequest {
+                name: "child".to_string(),
+                scope: "viewer".to_string(),
+            }),
+        )
+        .await
+        .expect("child token created");
+
+        let child = ctx
+            .auth_mgr
+            .list_tokens()
+            .into_iter()
+            .find(|token| token.id == resp.id)
+            .expect("child token listed");
+        assert_eq!(child.owner.as_deref(), Some("admin"));
+        assert_ne!(
+            child.owner.as_deref(),
+            Some("ci-auth"),
+            "ownership must chain through the authenticating token, not its name"
+        );
+
+        // A bearer token revoked between middleware validation and the handler
+        // must fail closed instead of minting an ownerless token.
+        assert!(ctx.auth_mgr.delete_token(&parent.id).await);
+        let stale_bearer = RequireAdmin(AuthUser {
+            username: "ci-auth".to_string(),
+            role: Role::Admin,
+            token_id: Some(parent.id.clone()),
+        });
+        let err = create_token(
+            stale_bearer,
+            State(ctx.clone()),
+            Json(CreateTokenRequest {
+                name: "escaped".to_string(),
+                scope: "viewer".to_string(),
+            }),
+        )
+        .await
+        .expect_err("a revoked authenticating token must not mint a token");
+        assert_eq!(err.status, 401);
+        assert!(
+            !ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|token| token.name == "escaped"),
+            "no ownerless token may be created under a revoke race"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

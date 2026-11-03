@@ -4,4 +4,4 @@ pub mod state;
 pub mod worker;
 
 pub use state::{SlaveState, SlaveStatusTracker};
-pub use worker::{SlaveAppHandles, apply_config_push, spawn_slave_worker};
+pub use worker::{SlaveAppHandles, SlaveConfigApplier, apply_config_push, spawn_slave_worker};

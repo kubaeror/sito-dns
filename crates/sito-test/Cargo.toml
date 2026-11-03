@@ -49,7 +49,7 @@ sito-api.workspace = true
 sito-stats.workspace = true
 tokio-tungstenite.workspace = true
 tower = { version = "0.5", features = ["util"] }
-utoipa = "5.3"
+utoipa = "6.0"
 subtle.workspace = true
 
 [features]

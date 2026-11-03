@@ -1,5 +1,7 @@
 # Phase M1 — MVP: Resolver with hosts blocking (3 weeks)
 
+> **Historical phase plan.** This document records the original M1 plan and exit criteria; it is not a description of current behavior. Current behavior is documented in the [configuration reference](../configuration-reference.md), HA operations in the [HA runbook](../runbook-ha.md), and user-visible changes in the [1.9.0 release notes](../release-notes-1.9.0.md).
+
 Goal: a working DNS server that forwards, caches, and blocks domains from a hosts list — the pipeline skeleton everything else plugs into. References: plan sections 3, 5.1, 5.2, 6, 7.
 
 ## Scope

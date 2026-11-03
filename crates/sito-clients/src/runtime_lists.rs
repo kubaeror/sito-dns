@@ -323,8 +323,8 @@ mod tests {
 
     fn store() -> RuntimeLists {
         RuntimeLists::from_arcs(
-            Arc::new(ParentalRegistry::bundled()),
-            Arc::new(ServiceRegistry::bundled()),
+            Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load")),
+            Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load")),
         )
     }
 

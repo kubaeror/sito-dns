@@ -108,6 +108,16 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const RETENTION_INTERVAL: Duration = Duration::from_hours(24);
 /// Debounce window for config file watcher events.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(100);
+/// Periodic flush interval for the persistent DNSSEC chain cache.
+const CHAIN_CACHE_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Current UNIX time truncated to the DNSSEC serial-number width.
+fn unix_now() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32
+}
 
 /// Resolves the config path to an absolute path so the file watcher can watch
 /// its parent directory even for the default relative `config.toml`. Symlinks
@@ -213,17 +223,19 @@ struct HaRuntime {
     coordinator: Option<sito_ha::MasterCoordinator>,
     tracker: Option<sito_ha::SlaveStatusTracker>,
     resync_sender: Option<tokio::sync::mpsc::Sender<()>>,
+    /// Slave worker receiver, spawned only after [`ServerContext`] and the
+    /// apply hooks exist so the worker can receive the shared
+    /// [`HaConfigApplier`].
+    resync_receiver: Option<tokio::sync::mpsc::Receiver<()>>,
 }
 
-/// Initializes the HA role (master replication server or slave worker) and
-/// returns the shared handles plus the validated HA configuration.
-#[allow(clippy::too_many_arguments)]
+/// Initializes the HA role. Master setup is complete on return; a slave only
+/// gets its tracker and resync channel here because its worker needs the
+/// server context and apply hooks built later in startup.
 fn init_ha(
     config: &Config,
     config_path: &Path,
     metrics: &sito_stats::MetricsRegistry,
-    runtime: &Arc<sito_runtime::RuntimeState>,
-    filter_engine: &Arc<HostsFilterEngine>,
     shutdown_rx: &watch::Receiver<bool>,
 ) -> anyhow::Result<HaRuntime> {
     let ha_config: sito_ha::HaConfig = config
@@ -241,7 +253,18 @@ fn init_ha(
         .validate(&config.server.role)
         .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
 
-    let (master_coordinator, slave_tracker, resync_sender) = if config.server.role == "master" {
+    let (master_coordinator, slave_tracker, resync_sender, resync_receiver) = if config.server.role
+        == "master"
+    {
+        // The replication listener is only spawned when the port is non-zero;
+        // record the no-op here so a production master with
+        // `replication_port = 0` is observable. `spawn_master_server` no longer
+        // increments this counter (it would double count when both run).
+        if ha_config.replication_port == 0 {
+            metrics.inc_ha_startup_noop("master", "replication_disabled");
+            info!("Master HA replication is disabled (replication_port is 0)");
+        }
+
         // Load or create master Ed25519 signing key (0600 on Unix)
         let signing_key_path = config.server.data_dir.join("ha_signing.key");
         let signing_key = Arc::new(sito_ha::Ed25519SigningKey::load_or_create(
@@ -311,35 +334,18 @@ fn init_ha(
             None
         };
 
-        (Some(coordinator), None, None)
+        (Some(coordinator), None, None, None)
     } else {
-        // Slave role
+        // Slave role. The worker is spawned by `run_server_full` once the
+        // server context and apply hooks exist, so a push can apply every
+        // component before it is acknowledged.
         let tracker = sito_ha::SlaveStatusTracker::new(
             config.server.instance_name.clone(),
             0,
             ha_config.master_url.clone(),
         );
-
-        let slave_handles = sito_ha::SlaveAppHandles {
-            runtime: runtime.clone(),
-            filter: filter_engine.clone(),
-            metrics: metrics.clone(),
-            config_path: Some(config_path.to_path_buf()),
-        };
-
         let (resync_tx, resync_rx) = tokio::sync::mpsc::channel(4);
-
-        if ha_config.master_url.is_some() {
-            let _slave_worker_handle = sito_ha::spawn_slave_worker(
-                ha_config.clone(),
-                tracker.clone(),
-                slave_handles,
-                resync_rx,
-                shutdown_rx.clone(),
-            );
-        }
-
-        (None, Some(tracker), Some(resync_tx))
+        (None, Some(tracker), Some(resync_tx), Some(resync_rx))
     };
 
     Ok(HaRuntime {
@@ -347,6 +353,7 @@ fn init_ha(
         coordinator: master_coordinator,
         tracker: slave_tracker,
         resync_sender,
+        resync_receiver,
     })
 }
 
@@ -426,9 +433,15 @@ async fn init_runtime_components(
     // Initialize cache
     let cache = Arc::new(DnsCache::new(config.dns.cache.clone()));
 
-    // Initialize hosts filter
+    // Initialize hosts filter. The observer records both the initial load and
+    // every scheduled refresh in `sito_filter_compile_seconds`.
     let filter_engine = Arc::new(
-        HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
+        HostsFilterEngine::init_with_observer(
+            config.filtering.clone(),
+            config.server.data_dir.clone(),
+            Some(metrics.compile_observer()),
+        )
+        .await,
     );
     let _refresh_handle = filter_engine
         .clone()
@@ -461,6 +474,9 @@ struct ConfigWatcher {
 struct ServerApplyHooks {
     filter: Arc<HostsFilterEngine>,
     dnssec: Arc<ArcSwap<DnssecValidator>>,
+    /// Authenticated DNSSEC chain statuses shared across validator swaps. A
+    /// hot reload must not forget that a zone was proven signed/unsigned.
+    dnssec_chain_cache: Arc<sito_dnssec::ChainCache>,
     scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>>,
     bootstrap: BootstrapResolver,
     rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
@@ -488,8 +504,13 @@ impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
 
             // DNSSEC settings are not read through the config snapshot at query
             // time; swap the validator so mode/anchors/NTAs apply immediately.
+            // The chain cache is reused so a reload does not lose authenticated
+            // signed/unsigned zone evidence.
             self.dnssec
-                .store(Arc::new(DnssecValidator::from_config(&cfg.dns.dnssec)));
+                .store(Arc::new(DnssecValidator::from_config_with_cache(
+                    &cfg.dns.dnssec,
+                    Some(self.dnssec_chain_cache.clone()),
+                )));
 
             // Rebuild per-client upstream scopes, reusing managers whose
             // upstream set is unchanged.
@@ -538,6 +559,136 @@ impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
             Ok(())
         })
     }
+}
+
+/// Production [`sito_ha::SlaveConfigApplier`] backed by the shared
+/// [`ServerContext`] and the hook-owned components.
+///
+/// This is the single apply/persist path for pushed HA configurations: the
+/// slave worker calls it before advancing the applied-version watermark or
+/// ACKing `applied: true`.
+pub struct HaConfigApplier {
+    ctx: sito_api::ServerContext,
+    hooks: Arc<dyn sito_api::config_apply::ConfigApplyHooks>,
+    /// Set only after `init_tls_and_acme` and `DnsListenerManager::start` have
+    /// produced the listener generation and shared rate limiters. Before that,
+    /// a push must not be acknowledged: applying it would silently skip the
+    /// listener/rate-limit components.
+    listeners_ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HaConfigApplier {
+    #[must_use]
+    pub fn new(
+        ctx: sito_api::ServerContext,
+        hooks: Arc<dyn sito_api::config_apply::ConfigApplyHooks>,
+    ) -> Self {
+        Self {
+            ctx,
+            hooks,
+            listeners_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Opens the readiness gate after the DNS listeners and rate limiters exist.
+    pub fn mark_listeners_ready(&self) {
+        self.listeners_ready
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl sito_ha::SlaveConfigApplier for HaConfigApplier {
+    fn apply_and_persist<'a>(
+        &'a self,
+        cfg: &'a Config,
+        document: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        // Never acknowledge a push before the listener generation and shared
+        // rate limiters exist: otherwise a listener/rate-limit change would be
+        // silently skipped while the rest is applied and persisted.
+        if !self
+            .listeners_ready
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Box::pin(async {
+                Err("DNS listeners and rate limiters are not initialized yet".to_string())
+            });
+        }
+
+        Box::pin(async move {
+            match sito_api::config_apply::apply_and_persist_document(
+                &self.ctx,
+                cfg,
+                document,
+                sito_api::config_apply::FilterApply::Sync,
+                Some(&*self.hooks),
+            )
+            .await
+            {
+                Ok(report) => {
+                    if !report.restart_required.is_empty() {
+                        // The push is ACKed as applied because the document is
+                        // persisted and every hot-appliable component is live.
+                        // Restart-only sections are not silently claimed as
+                        // live: surface exactly which ones need a restart.
+                        warn!(
+                            fields = ?report.restart_required,
+                            "HA push applied; these fields are persisted but require a restart to take effect"
+                        );
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e.detail),
+            }
+        })
+    }
+}
+
+/// Spawns the pending slave worker once the listener generation and shared
+/// rate limiters exist.
+///
+/// The applier's readiness gate is opened here, immediately before spawning, so
+/// a push can never be acknowledged while listener/rate-limit components are
+/// still uninitialized. Master roles have no pending receiver and are a no-op.
+#[allow(clippy::too_many_arguments)]
+fn spawn_slave_worker_after_listeners(
+    ha_runtime: &mut HaRuntime,
+    server_ctx: &sito_api::ServerContext,
+    hooks: &Arc<ServerApplyHooks>,
+    runtime: &Arc<sito_runtime::RuntimeState>,
+    filter_engine: &Arc<HostsFilterEngine>,
+    metrics: &sito_stats::MetricsRegistry,
+    config_path: &Path,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    let (Some(tracker), Some(resync_rx)) = (
+        ha_runtime.tracker.clone(),
+        ha_runtime.resync_receiver.take(),
+    ) else {
+        return;
+    };
+    if ha_runtime.config.master_url.is_none() {
+        metrics.inc_ha_startup_noop("slave", "missing_master_url");
+        warn!("Slave role configured without master_url; replication worker idle");
+        return;
+    }
+
+    let applier = Arc::new(HaConfigApplier::new(server_ctx.clone(), hooks.clone()));
+    applier.mark_listeners_ready();
+    let slave_handles = sito_ha::SlaveAppHandles {
+        runtime: runtime.clone(),
+        filter: filter_engine.clone(),
+        metrics: metrics.clone(),
+        config_path: Some(config_path.to_path_buf()),
+        applier,
+    };
+    let _slave_worker_handle = sito_ha::spawn_slave_worker(
+        ha_runtime.config.clone(),
+        tracker,
+        slave_handles,
+        resync_rx,
+        shutdown_rx.clone(),
+    );
 }
 
 /// Watches the configuration file and applies hot reloads in-process. Returns
@@ -600,42 +751,42 @@ async fn run_config_watcher(watcher: ConfigWatcher) {
                 while rx.try_recv().is_ok() {}
 
                 match tokio::fs::read_to_string(&watcher_config_path).await {
-                    Ok(content) => match Config::from_toml_str(&content) {
-                        Ok(new_cfg) => {
-                            info!("Detected configuration file change, hot-reloading");
-                            // Same apply/validate pipeline as every API write
-                            // path; a rejected configuration leaves the running
-                            // components untouched.
-                            match sito_api::config_apply::apply_full_config(
-                                &ctx,
-                                &new_cfg,
-                                sito_api::config_apply::FilterApply::Sync,
-                                Some(&*hooks),
-                            )
-                            .await
-                            {
-                                Ok(report) => {
-                                    if !report.restart_required.is_empty() {
-                                        warn!(
-                                            fields = ?report.restart_required,
-                                            "Configuration hot-reloaded; these settings need a restart to take effect"
-                                        );
-                                    }
-                                    ctx.publish_bundle().await;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        status = e.status,
-                                        detail = %e.detail,
-                                        "Rejecting config hot-reload: configuration cannot be applied"
+                    Ok(content) => {
+                        use sito_api::config_apply::ConfigFileApplyOutcome;
+                        // Same apply/validate pipeline as every API write path.
+                        // A document that already matches the runtime (the HA
+                        // applier's own write or an identical save) is skipped.
+                        match sito_api::config_apply::apply_config_document_event(
+                            &ctx,
+                            &content,
+                            sito_api::config_apply::FilterApply::Sync,
+                            Some(&*hooks),
+                        )
+                        .await
+                        {
+                            ConfigFileApplyOutcome::SelfWriteIgnored => {
+                                info!(
+                                    "Ignoring file-watcher event: the file already matches the running configuration (self-write or unchanged)"
+                                );
+                            }
+                            ConfigFileApplyOutcome::Applied(report) => {
+                                info!("Detected external configuration file change; hot-reloaded");
+                                if !report.restart_required.is_empty() {
+                                    warn!(
+                                        fields = ?report.restart_required,
+                                        "Configuration hot-reloaded; these settings need a restart to take effect"
                                     );
                                 }
                             }
+                            ConfigFileApplyOutcome::Rejected(e) => {
+                                error!(
+                                    status = e.status,
+                                    detail = %e.detail,
+                                    "Rejecting config hot-reload: configuration cannot be applied"
+                                );
+                            }
                         }
-                        Err(e) => {
-                            warn!("Ignoring invalid hot-reloaded configuration: {e}");
-                        }
-                    },
+                    }
                     Err(e) => {
                         warn!("Failed to read modified configuration file: {e}");
                     }
@@ -707,10 +858,19 @@ pub async fn run_server_full(
     let filter_engine = components.filter_engine;
     metrics.set_filter_rules(filter_engine.rule_count());
 
-    // Initialize DNSSEC validator
-    let dnssec_swap = Arc::new(ArcSwap::from(Arc::new(DnssecValidator::from_config(
-        &config.dns.dnssec,
-    ))));
+    // Initialize DNSSEC validator. The authenticated chain cache lives under
+    // the data dir and is reused across hot reloads; it is deliberately not
+    // part of HA bundles or backups (each node rebuilds its own).
+    let dnssec_chain_cache = Arc::new(sito_dnssec::ChainCache::new(Some(
+        config.server.data_dir.join("dnssec-chain-cache.toml"),
+    )));
+    dnssec_chain_cache.load(unix_now());
+    let dnssec_swap = Arc::new(ArcSwap::from(Arc::new(
+        DnssecValidator::from_config_with_cache(
+            &config.dns.dnssec,
+            Some(dnssec_chain_cache.clone()),
+        ),
+    )));
 
     // Initialize client registry
     let clients_config = clients_from_config(&config)?;
@@ -797,19 +957,12 @@ pub async fn run_server_full(
     );
 
     // Initialize High Availability (HA) clustering subsystem per role
-    let ha_runtime = init_ha(
-        &config,
-        &config_path_buf,
-        &metrics,
-        &runtime,
-        &filter_engine,
-        &shutdown_rx,
-    )?;
-    let _ha_config = ha_runtime.config;
+    let mut ha_runtime = init_ha(&config, &config_path_buf, &metrics, &shutdown_rx)?;
+    let _ha_config = ha_runtime.config.clone();
     let (master_coordinator, slave_tracker, resync_sender) = (
-        ha_runtime.coordinator,
-        ha_runtime.tracker,
-        ha_runtime.resync_sender,
+        ha_runtime.coordinator.clone(),
+        ha_runtime.tracker.clone(),
+        ha_runtime.resync_sender.clone(),
     );
 
     // Administrative REST API server
@@ -849,6 +1002,7 @@ pub async fn run_server_full(
     let apply_hooks = Arc::new(ServerApplyHooks {
         filter: filter_engine.clone(),
         dnssec: dnssec_swap.clone(),
+        dnssec_chain_cache: dnssec_chain_cache.clone(),
         scoped_upstreams: scoped_upstreams.clone(),
         bootstrap: bootstrap.clone(),
         rate_limiters: rate_limiters.clone(),
@@ -873,6 +1027,7 @@ pub async fn run_server_full(
         rewrites: rewrites_arc.clone(),
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
+        apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         master_coordinator: master_coordinator.clone(),
         slave_tracker: slave_tracker.clone(),
         resync_sender,
@@ -939,11 +1094,37 @@ pub async fn run_server_full(
         }
     });
 
+    // Periodic DNSSEC chain-cache flush. The query path only updates an
+    // in-memory dirty flag; disk I/O stays on this background task (and on the
+    // shutdown path below).
+    let flush_cache = dnssec_chain_cache.clone();
+    let mut flush_shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CHAIN_CACHE_FLUSH_INTERVAL);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                result = flush_shutdown_rx.changed() => {
+                    if result.is_err() || *flush_shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if !flush_cache.is_dirty() {
+                        continue;
+                    }
+                    let cache = flush_cache.clone();
+                    let _ = tokio::task::spawn_blocking(move || cache.flush()).await;
+                }
+            }
+        }
+    });
+
     // Spawn config file watcher for hot-reload. It shares the same
     // apply/validate pipeline and hook components as the API/UI write paths.
     tokio::spawn(run_config_watcher(ConfigWatcher {
-        ctx: server_ctx,
-        hooks: apply_hooks,
+        ctx: server_ctx.clone(),
+        hooks: apply_hooks.clone(),
         shutdown_rx: shutdown_rx.clone(),
     }));
 
@@ -989,6 +1170,16 @@ pub async fn run_server_full(
                 )
                 .await?;
                 *listener_manager.lock().await = Some(manager);
+                spawn_slave_worker_after_listeners(
+                    &mut ha_runtime,
+                    &server_ctx,
+                    &apply_hooks,
+                    &runtime,
+                    &filter_engine,
+                    &metrics,
+                    &config_path_buf,
+                    &shutdown_rx,
+                );
 
                 info!(
                     port = current_cfg.dns.port,
@@ -1010,14 +1201,31 @@ pub async fn run_server_full(
                 doq: None,
                 doh3: None,
             });
-        let manager =
-            DnsListenerManager::start(&config, pipeline.clone(), acceptors, rate_limiters.clone())
-                .await?;
+        // Start from the current configuration (the watcher may already have
+        // applied a file change during startup), not the stale startup copy.
+        let listener_config = config_arc.load();
+        let manager = DnsListenerManager::start(
+            &listener_config,
+            pipeline.clone(),
+            acceptors,
+            rate_limiters.clone(),
+        )
+        .await?;
         *listener_manager.lock().await = Some(manager);
+        spawn_slave_worker_after_listeners(
+            &mut ha_runtime,
+            &server_ctx,
+            &apply_hooks,
+            &runtime,
+            &filter_engine,
+            &metrics,
+            &config_path_buf,
+            &shutdown_rx,
+        );
 
         info!(
-            port = config.dns.port,
-            bind = ?config.dns.bind,
+            port = listener_config.dns.port,
+            bind = ?listener_config.dns.bind,
             "sito DNS server successfully initialized and listening"
         );
 
@@ -1031,6 +1239,7 @@ pub async fn run_server_full(
         &in_flight,
         querylog_writer,
         cert_watchers,
+        &dnssec_chain_cache,
     )
     .await;
     Ok(())
@@ -1044,6 +1253,7 @@ async fn shutdown_server(
     in_flight: &AtomicUsize,
     querylog_writer: QueryLogWriter,
     cert_watchers: Vec<sito_transport::CertWatcher>,
+    dnssec_chain_cache: &sito_dnssec::ChainCache,
 ) {
     info!("Initiating graceful shutdown (stopping listeners)...");
     let _ = shutdown_tx.send(true);
@@ -1067,6 +1277,11 @@ async fn shutdown_server(
 
     info!("Flushing and shutting down query log writer...");
     querylog_writer.shutdown().await;
+
+    // Persist any authenticated DNSSEC chain statuses before exiting.
+    if let Err(error) = dnssec_chain_cache.flush() {
+        warn!(error = %error, "Failed to flush DNSSEC chain cache during shutdown");
+    }
 
     // Stop certificate watchers after listeners have drained.
     drop(cert_watchers);
@@ -1719,6 +1934,34 @@ mod tests {
             resolved.file_name(),
             Some(std::ffi::OsStr::new("config.toml"))
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// I5 regression: the production `init_ha` call site records the
+    /// `replication_disabled` no-op for a master with a zero replication port.
+    #[tokio::test]
+    async fn test_init_ha_records_master_replication_disabled_noop() {
+        let dir = std::env::temp_dir().join(format!("sito_init_ha_{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = Config::default();
+        config.server.role = "master".to_string();
+        config.server.data_dir = dir.clone();
+        config.ha = None;
+
+        let metrics = sito_stats::MetricsRegistry::new("1.9.0", "test");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let runtime = init_ha(&config, &dir.join("config.toml"), &metrics, &shutdown_rx)
+            .expect("init_ha must succeed for a master with replication disabled");
+        assert!(runtime.coordinator.is_some());
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(
+                r#"sito_ha_startup_noop_total{role="master",reason="replication_disabled"} 1"#
+            ),
+            "the production startup path must expose the no-op: {rendered}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

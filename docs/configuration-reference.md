@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v1.8.0**.
+This document is the exhaustive configuration reference for **sito v1.9.0**.
 
 `sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the `DNSD_SECRET_<name>` environment variable, then a bare `<name>` environment variable; there is no on-disk local secret store, and a placeholder that cannot be resolved rejects the whole pushed configuration.
 
@@ -35,7 +35,7 @@ update_require_signature = true        # require cosign-verified release signatu
 |---|---|---|---|
 | `role` | string | `"master"` | HA cluster role: `"master"` (reads/writes, replicates state) or `"slave"` (read-only replica). |
 | `instance_name` | string | `"sito-main"` | Name of this server instance, reported in metrics and logs. |
-| `data_dir` | string | `"/var/lib/sito"` | Directory where the persistent SQLite DB (`stats.db`), list caches, and TLS state are stored. |
+| `data_dir` | string | `"/var/lib/sito"` | Directory where the persistent SQLite DB (`stats.db`), list caches, TLS state, user credentials (`users.toml`, 0600), the TOTP encryption key (`totp.key`, 0600), and the DNSSEC chain cache (`dnssec-chain-cache.toml`, 0600) are stored. |
 | `log_level` | string | `"info"` | Logging verbosity: `"trace"`, `"debug"`, `"info"`, `"warn"`, or `"error"`. |
 | `log_format` | string | `"json"` | Formatting for stdout logs: `"pretty"` (human readable with colors) or `"json"` (structured). |
 | `update_require_signature` | boolean | `true` | When `true`, in-app updates and `sito update` require a valid cosign signature (`.sig`/`.pem` assets). A signature that is present is always verified even when this is `false`; when `true`, a missing signature or missing `cosign` binary aborts the update. Set to `false` only if you intentionally accept same-origin SHA-256-only integrity. |
@@ -199,6 +199,7 @@ blocking_ttl = 10
 cname_cloaking = true
 fail_closed = true
 anti_doh_bypass = "block_all"          # "off" | "block_all" | "block_except_trusted"
+regex_compile_budget_ms = 250          # optional; abort slow regex compilation
 custom_rules = [
     "||badtracker.com^",
     "@@||allowed-service.com^"
@@ -220,6 +221,8 @@ enabled = true
 | `fail_closed` | boolean | `true` | Answer SERVFAIL while filtering is enabled but no rule snapshot has ever loaded (e.g. every list failed at boot), instead of silently allowing traffic. |
 | `anti_doh_bypass` | string | `"off"` | Block known public DoH/DoT resolvers to enforce network-wide filtering: `"off"`, `"block_all"`, or `"block_except_trusted"`. |
 | `max_rules` | integer | `2000000` | Hard cap on the total parsed rules (all lists plus custom rules). A reload above the cap is rejected and the previous snapshot is retained (or the engine stays fail-closed when nothing loaded yet). |
+| `max_list_bytes` | integer | `67108864` | Hard cap in bytes for each downloaded subscription list and its disk-cache read, enforced before the body is buffered. Must be greater than 0. Lowering it invalidates larger cached lists. After a restart (or when no previous snapshot exists), an invalidated larger cache with `fail_closed = true` and no network answers SERVFAIL until a fetch under the new cap succeeds; a live reload keeps the previous snapshot and records the list in `failed_lists`. |
+| `regex_compile_budget_ms` | integer | unset | Optional wall-clock budget for compiling regex/wildcard rules. When a reload exceeds it, compilation is aborted and the previous snapshot is retained; the failure is reported through `last_error` and `last_compile_ms`. Unset disables the budget; `0` is rejected. |
 | `custom_rules` | array of strings | `[]` | In-line custom ABP / AdGuard filter rules. |
 | `lists` | array of tables | `[]` | Subscription lists to download and compile (`name`, `url`, `enabled`). Schemes: `http://`, `https://`, `file://`. Global `refresh_interval_hours` controls update frequency. |
 
@@ -317,6 +320,15 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
 | `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL; corrupt stores are backed up and start empty. Use `sito reset-sessions` to invalidate everything. |
 | `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
+
+Accounts are stored in `<data_dir>/users.toml` (0600). TOTP secrets are
+encrypted at rest with AES-256-GCM using `<data_dir>/totp.key` (0600, created
+automatically). Treat `totp.key` as a credential: **back it up together with
+`users.toml`**. Restoring both is equivalent to the previous plaintext user
+store; restoring only one is a lockout. If the key is missing or does not match
+the stored secrets, the server refuses to start rather than silently disabling
+2FA (`sito reset-admin` is the recovery path). An HA slave keeps its own
+`totp.key`; `users.toml` is never replicated or included in HA bundles.
 
 Two additional `[web]` keys are read from the raw table:
 
@@ -447,6 +459,13 @@ previous settings stay active and the error is logged. The REST API reports
 restart-only changes in the `restart_required` field of `PUT /api/v1/config`
 and `POST /api/v1/config/reload`.
 
+> [!NOTE]
+> The watcher compares the parsed file with the running configuration before
+> applying it. An identical external save (including a file already written by
+> the HA applier) is ignored and does **not** force a full re-apply. When an
+> explicit reload is required, use `POST /api/v1/config/reload`: it re-reads
+> the file and applies it even when the content matches the current runtime.
+
 ### 16.1 Applied live (no restart)
 
 | Setting | How it is applied |
@@ -459,7 +478,7 @@ and `POST /api/v1/config/reload`.
 | `dns.cache.enabled`, `dns.cache.size_mb`, `dns.cache.min_ttl`, `dns.cache.max_ttl`, `dns.cache.negative_ttl_max`, `dns.cache.prefetch`, `dns.cache.serve_stale_hours` | Cache configuration updated. |
 | `dns.dnssec.mode`, `dns.dnssec.validate`, `dns.dnssec.ntp`, `dns.dnssec.nta`, `dns.dnssec.trust_anchors` | DNSSEC validator swapped for the new configuration. |
 | `upstream.servers`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.ecs`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt. |
-| `filtering.enabled`, `filtering.refresh_interval_hours`, `filtering.blocking_mode`, `filtering.blocking_ttl`, `filtering.cname_cloaking`, `filtering.fail_closed`, `filtering.anti_doh_bypass`, `filtering.max_rules`, `filtering.lists`, `filtering.custom_rules` | Filter engine reloaded with the new lists/rules; cached answers are flushed. List downloads continue asynchronously after the reload. |
+| `filtering.enabled`, `filtering.refresh_interval_hours`, `filtering.blocking_mode`, `filtering.blocking_ttl`, `filtering.cname_cloaking`, `filtering.fail_closed`, `filtering.anti_doh_bypass`, `filtering.max_rules`, `filtering.max_list_bytes`, `filtering.regex_compile_budget_ms`, `filtering.lists`, `filtering.custom_rules` | Filter engine reloaded with the new lists/rules; cached answers are flushed. List downloads continue asynchronously after the reload. |
 | `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
 | `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |
 | `privacy.anonymize_querylog` | Query-log writer updated. |

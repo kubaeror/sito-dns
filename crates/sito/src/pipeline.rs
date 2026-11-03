@@ -26,7 +26,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tracing::{Instrument, debug, info, trace, warn};
+use tracing::{Instrument, debug, error, info, trace, warn};
 
 /// Tracks in-flight queries using RAII.
 struct InFlightGuard(Arc<AtomicUsize>);
@@ -349,11 +349,32 @@ fn txt_chunks(value: &str) -> Vec<String> {
     chunks
 }
 
+/// Whether a `$dnsrewrite` record type can answer the given question type.
+///
+/// DNS applies exact record-type matching, except that a CNAME answers any
+/// query type. Unsupported types are rejected by the parser; they fall through
+/// so the synthesis path can still warn about programmatically built rules.
+fn rewrite_applies_to_qtype(rtype: &str, qtype: RecordType) -> bool {
+    if rtype == "CNAME" {
+        return true;
+    }
+    match rtype {
+        "A" => qtype == RecordType::A,
+        "AAAA" => qtype == RecordType::AAAA,
+        "PTR" => qtype == RecordType::PTR,
+        "TXT" => qtype == RecordType::TXT,
+        _ => true,
+    }
+}
+
 /// Builds a synthesized response for all matching ABP `$dnsrewrite` rules.
 ///
 /// AdGuard aggregates every matching rewrite for an owner: two `A` rewrites
-/// produce two answer records. A non-`NOERROR` rcode is exclusive and wins over
-/// any record synthesis.
+/// produce two answer records. Records are filtered by the question type
+/// (`A`/`AAAA`/`PTR`/`TXT` exact match, `CNAME` answers any type); when no
+/// matching value applies the result is NOERROR/NODATA, never an upstream
+/// fallback. A non-`NOERROR` rcode is exclusive and wins over any record
+/// synthesis.
 fn make_rewrite_response(query: &Message, rules: &[DnsRewriteRule], query_id: u16) -> Message {
     let mut resp = Message::new(query_id, MessageType::Response, query.metadata.op_code);
     copy_query_response_flags(&mut resp, query);
@@ -379,6 +400,9 @@ fn make_rewrite_response(query: &Message, rules: &[DnsRewriteRule], query_id: u1
                 continue;
             };
             let rtype = rtype.to_ascii_uppercase();
+            if !rewrite_applies_to_qtype(&rtype, question.query_type()) {
+                continue;
+            }
             let rdata = match rtype.as_str() {
                 "A" => value
                     .parse::<std::net::Ipv4Addr>()
@@ -565,7 +589,13 @@ impl DnsPipeline {
         Self {
             runtime,
             filter,
-            anti_bypass: Arc::new(AntiBypassRegistry::bundled()),
+            anti_bypass: Arc::new(AntiBypassRegistry::try_bundled().unwrap_or_else(|e| {
+                error!(
+                    error = %e,
+                    "Bundled DoH resolver list failed to load; anti-bypass domain/IP matching is disabled"
+                );
+                AntiBypassRegistry::empty()
+            })),
             cache,
             upstream,
             dnssec: Arc::new(ArcSwap::from(dnssec)),
@@ -1669,7 +1699,11 @@ impl QueryHandler for DnsPipeline {
                         "Upstream resolution failed"
                     );
                     if let Some(ref m) = self.metrics {
-                        m.inc_upstream_errors("all", e.kind());
+                        let label = e.upstream.as_deref().unwrap_or("unattributed");
+                        m.inc_upstream_errors(label, e.kind());
+                        if e.upstream.is_some() {
+                            m.set_upstream_health(label, 0.0);
+                        }
                     }
 
                     if cache_enabled
@@ -1803,6 +1837,7 @@ mod tests {
             rcode: rcode.to_string(),
             rtype: rtype.map(str::to_string),
             value: value.map(str::to_string),
+            bare: false,
         }
     }
 
@@ -1817,7 +1852,6 @@ mod tests {
 
     #[test]
     fn test_make_rewrite_response_synthesizes_ptr_txt_and_aggregates() {
-        let query = rewrite_query("4.3.2.1.in-addr.arpa.", RecordType::PTR);
         let long_txt = "x".repeat(300);
         let rules = vec![
             rewrite_rule("NOERROR", Some("A"), Some("10.0.0.1")),
@@ -1827,15 +1861,16 @@ mod tests {
             rewrite_rule("NOERROR", Some("TXT"), Some(&long_txt)),
         ];
 
+        // A questions aggregate every A value and ignore PTR/TXT rewrites.
+        let query = rewrite_query("rewrite.example.", RecordType::A);
         let resp = make_rewrite_response(&query, &rules, 7);
         assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
         assert_eq!(resp.metadata.id, 7);
         assert_eq!(
             resp.answers.len(),
-            5,
-            "all matching rewrites are synthesized"
+            2,
+            "only the two A rewrites are synthesized for an A question"
         );
-
         let a_values: Vec<_> = resp
             .answers
             .iter()
@@ -1852,14 +1887,21 @@ mod tests {
             ]
         );
 
+        // PTR questions only receive the PTR rewrite.
+        let query = rewrite_query("4.3.2.1.in-addr.arpa.", RecordType::PTR);
+        let resp = make_rewrite_response(&query, &rules, 8);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1, "only the PTR rewrite applies");
         assert!(
-            resp.answers.iter().any(|record| {
-                matches!(&record.data, RData::PTR(ptr) if ptr.0.to_ascii().trim_end_matches('.') == "printer.lan")
-            }),
+            matches!(&resp.answers[0].data, RData::PTR(ptr) if ptr.0.to_ascii().trim_end_matches('.') == "printer.lan"),
             "missing PTR record: {:?}",
             resp.answers
         );
 
+        // TXT questions receive the TXT rewrites with 255-byte chunking.
+        let query = rewrite_query("txt.example.", RecordType::TXT);
+        let resp = make_rewrite_response(&query, &rules, 9);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
         let txt_chunk_counts: Vec<usize> = resp
             .answers
             .iter()
@@ -1876,6 +1918,90 @@ mod tests {
     }
 
     #[test]
+    fn test_make_rewrite_response_matches_query_type() {
+        let rules = vec![rewrite_rule("NOERROR", Some("A"), Some("10.0.0.1"))];
+
+        let query = rewrite_query("host.example.", RecordType::A);
+        let resp = make_rewrite_response(&query, &rules, 1);
+        assert_eq!(resp.answers.len(), 1, "an A rule answers an A question");
+
+        for qtype in [RecordType::AAAA, RecordType::TXT, RecordType::PTR] {
+            let query = rewrite_query("host.example.", qtype);
+            let resp = make_rewrite_response(&query, &rules, 2);
+            assert_eq!(
+                resp.metadata.response_code,
+                ResponseCode::NoError,
+                "{qtype:?} must be NODATA, not an error"
+            );
+            assert!(
+                resp.answers.is_empty(),
+                "{qtype:?} must be NODATA for an A-only rewrite: {:?}",
+                resp.answers
+            );
+        }
+    }
+
+    #[test]
+    fn test_make_rewrite_response_aggregates_same_type_only() {
+        let rules = vec![
+            rewrite_rule("NOERROR", Some("A"), Some("10.0.0.1")),
+            rewrite_rule("NOERROR", Some("A"), Some("10.0.0.2")),
+            rewrite_rule("NOERROR", Some("AAAA"), Some("2001:db8::1")),
+            rewrite_rule("NOERROR", Some("TXT"), Some("ignored")),
+        ];
+
+        let query = rewrite_query("multi.example.", RecordType::A);
+        let resp = make_rewrite_response(&query, &rules, 3);
+        assert_eq!(resp.answers.len(), 2, "only the two A rules aggregate");
+        assert!(
+            resp.answers
+                .iter()
+                .all(|record| matches!(record.data, RData::A(_))),
+            "an A question must not receive AAAA/TXT records: {:?}",
+            resp.answers
+        );
+
+        let query = rewrite_query("multi.example.", RecordType::AAAA);
+        let resp = make_rewrite_response(&query, &rules, 4);
+        assert_eq!(resp.answers.len(), 1);
+        assert!(matches!(resp.answers[0].data, RData::AAAA(_)));
+    }
+
+    #[test]
+    fn test_make_rewrite_response_cname_answers_any_type() {
+        let rules = vec![rewrite_rule(
+            "NOERROR",
+            Some("CNAME"),
+            Some("target.example.net."),
+        )];
+
+        for qtype in [
+            RecordType::A,
+            RecordType::AAAA,
+            RecordType::TXT,
+            RecordType::PTR,
+        ] {
+            let query = rewrite_query("alias.example.", qtype);
+            let resp = make_rewrite_response(&query, &rules, 5);
+            assert_eq!(
+                resp.metadata.response_code,
+                ResponseCode::NoError,
+                "{qtype:?}"
+            );
+            assert_eq!(
+                resp.answers.len(),
+                1,
+                "a CNAME rewrite answers any question type ({qtype:?})"
+            );
+            assert!(
+                matches!(&resp.answers[0].data, RData::CNAME(cname) if cname.0.to_ascii().trim_end_matches('.') == "target.example.net"),
+                "expected CNAME answer for {qtype:?}: {:?}",
+                resp.answers
+            );
+        }
+    }
+
+    #[test]
     fn test_make_rewrite_response_rcode_wins_over_records() {
         let query = rewrite_query("rewrite.example.", RecordType::A);
         let rules = vec![
@@ -1884,7 +2010,17 @@ mod tests {
         ];
         let resp = make_rewrite_response(&query, &rules, 9);
         assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
-        assert!(resp.answers.is_empty());
+        assert!(
+            resp.answers.is_empty(),
+            "NXDOMAIN rewrite must not carry answers: {:?}",
+            resp.answers
+        );
+
+        // A non-NOERROR rcode wins even when no record matches the qtype.
+        let query = rewrite_query("rewrite.example.", RecordType::AAAA);
+        let resp = make_rewrite_response(&query, &rules, 10);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(resp.answers.len(), 0);
     }
 
     #[tokio::test]
@@ -1892,6 +2028,10 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let mut config = Config::default();
+        // This test exercises rewrite aggregation/cancellation, not DNSSEC.
+        // Keep validation off so the D-05 delegation probe does not add
+        // upstream DNSKEY/DS lookups to the call counts asserted below.
+        config.dns.dnssec.validate = false;
         config.filtering.custom_rules = vec![
             "||rewrite-pipeline.example^$dnsrewrite=1.2.3.4".to_string(),
             "||rewrite-pipeline.example^$dnsrewrite=5.6.7.8".to_string(),
@@ -1961,6 +2101,77 @@ mod tests {
             matches!(resp.answers[0].data, RData::A(A(ip)) if ip == std::net::Ipv4Addr::new(203, 0, 113, 9))
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_rewrite_matches_query_type_without_upstream() {
+        use std::sync::atomic::Ordering;
+
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        config.filtering.custom_rules = vec![
+            "||rewrite-type-pipeline.example^$dnsrewrite=1.2.3.4".to_string(),
+            "||rewrite-cname-pipeline.example^$dnsrewrite=cname.example.net".to_string(),
+        ];
+        let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+        // The rewrite answers an A question and never queries upstream.
+        let resp = pipeline
+            .handle(
+                rewrite_query("rewrite-type-pipeline.example.", RecordType::A),
+                client.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.answers.len(), 1);
+        assert!(
+            matches!(resp.answers[0].data, RData::A(A(ip)) if ip == std::net::Ipv4Addr::new(1, 2, 3, 4))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Other qtypes match the rule set but have no applicable value: the
+        // answer is NOERROR/NODATA, not an upstream fallback.
+        for qtype in [RecordType::AAAA, RecordType::TXT] {
+            let resp = pipeline
+                .handle(
+                    rewrite_query("rewrite-type-pipeline.example.", qtype),
+                    client.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.metadata.response_code,
+                ResponseCode::NoError,
+                "{qtype:?}"
+            );
+            assert!(
+                resp.answers.is_empty(),
+                "{qtype:?} must be NODATA instead of querying upstream: {:?}",
+                resp.answers
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{qtype:?} must not query upstream"
+            );
+        }
+
+        // A CNAME rewrite answers any question type.
+        let resp = pipeline
+            .handle(
+                rewrite_query("rewrite-cname-pipeline.example.", RecordType::TXT),
+                client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.answers.len(), 1);
+        assert!(
+            matches!(&resp.answers[0].data, RData::CNAME(cname) if cname.0.to_ascii().trim_end_matches('.') == "cname.example.net")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
@@ -2110,19 +2321,16 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
-    /// Builds a pipeline backed by a UDP mock that answers every query with an
-    /// A record and (dishonestly) AD=1, counting upstream calls.
-    async fn test_pipeline(
-        mut config: Config,
+    /// Spawns a UDP mock upstream that answers every query with an A record and
+    /// (dishonestly) AD=1, counting upstream calls. When `fail` is set and
+    /// true, the mock answers `SERVFAIL` instead so callers can exercise the
+    /// pipeline failure path and then recover by clearing the flag.
+    async fn spawn_mock_upstream(
+        fail: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> (
-        DnsPipeline,
+        std::net::SocketAddr,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        std::path::PathBuf,
     ) {
-        use sito_clients::{ClientRegistry, ClientsConfig, ParentalRegistry, ServiceRegistry};
-        use sito_filter::HostsFilterEngine;
-        use sito_rewrites::{RewriteTable, RewritesConfig};
-        use sito_upstream::{BootstrapResolver, UpstreamManager};
         use std::sync::atomic::AtomicUsize;
 
         let mock_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2134,13 +2342,20 @@ mod tests {
             while let Ok((len, src)) = mock_socket.recv_from(&mut buf).await {
                 if let Ok(query) = sito_proto::decode_message(&buf[..len]) {
                     call_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let failing = fail
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
                     let mut resp =
                         Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-                    resp.metadata.response_code = ResponseCode::NoError;
+                    resp.metadata.response_code = if failing {
+                        ResponseCode::ServFail
+                    } else {
+                        ResponseCode::NoError
+                    };
                     // A compromised upstream: AD=1 without any signature.
                     resp.metadata.authentic_data = true;
                     resp.queries = query.queries.clone();
-                    if let Some(question) = query.queries.first() {
+                    if !failing && let Some(question) = query.queries.first() {
                         resp.answers.push(Record::from_rdata(
                             question.name().clone(),
                             300,
@@ -2152,6 +2367,18 @@ mod tests {
                 }
             }
         });
+        (mock_addr, calls)
+    }
+
+    /// Builds a pipeline around `upstream` with the standard test registries.
+    async fn build_test_pipeline(
+        mut config: Config,
+        upstream: std::sync::Arc<UpstreamManager>,
+    ) -> (DnsPipeline, std::path::PathBuf) {
+        use sito_clients::{ClientRegistry, ClientsConfig, ParentalRegistry, ServiceRegistry};
+        use sito_filter::HostsFilterEngine;
+        use sito_rewrites::{RewriteTable, RewritesConfig};
+        use std::sync::atomic::AtomicUsize;
 
         let temp_dir = std::env::temp_dir().join(format!(
             "sito-pipeline-audit6-{}-{}",
@@ -2160,15 +2387,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&temp_dir).unwrap();
         config.server.data_dir = temp_dir.clone();
-        config.upstream.servers = vec![mock_addr.to_string()];
         config.dns.cache.enabled = true;
 
-        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
-        let upstream = std::sync::Arc::new(
-            UpstreamManager::from_config(&config.upstream, &bootstrap)
-                .await
-                .unwrap(),
-        );
         let cache = std::sync::Arc::new(DnsCache::new(config.dns.cache.clone()));
         let filter = std::sync::Arc::new(
             HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
@@ -2184,14 +2404,196 @@ mod tests {
             std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(ClientRegistry::new(
                 ClientsConfig::default(),
             )))),
-            std::sync::Arc::new(ParentalRegistry::bundled()),
-            std::sync::Arc::new(ServiceRegistry::bundled()),
+            std::sync::Arc::new(
+                ParentalRegistry::try_bundled().expect("bundled parental lists must load"),
+            ),
+            std::sync::Arc::new(
+                ServiceRegistry::try_bundled().expect("bundled services must load"),
+            ),
             std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(RewriteTable::new(
                 RewritesConfig::default(),
             )))),
             std::sync::Arc::new(AtomicUsize::new(0)),
         );
+        (pipeline, temp_dir)
+    }
+
+    /// Builds a pipeline backed by the default successful UDP mock upstream.
+    async fn test_pipeline(
+        mut config: Config,
+    ) -> (
+        DnsPipeline,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::path::PathBuf,
+    ) {
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+        let (mock_addr, calls) = spawn_mock_upstream(None).await;
+        config.upstream.servers = vec![mock_addr.to_string()];
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
         (pipeline, calls, temp_dir)
+    }
+
+    /// Builds a pipeline whose mock upstream fails while `fail` is true.
+    async fn test_pipeline_with_failure_toggle(
+        mut config: Config,
+        fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        DnsPipeline,
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::path::PathBuf,
+    ) {
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+        let (mock_addr, calls) = spawn_mock_upstream(Some(std::sync::Arc::clone(&fail))).await;
+        let server = mock_addr.to_string();
+        config.upstream.servers = vec![server.clone()];
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+        (pipeline, server, calls, temp_dir)
+    }
+
+    /// Attaches metrics (and an in-memory query log writer) to a test pipeline.
+    async fn with_test_metrics(
+        pipeline: DnsPipeline,
+    ) -> (DnsPipeline, sito_stats::MetricsRegistry) {
+        let stats_db = sito_stats::StatsDb::in_memory().await.unwrap();
+        let writer = sito_stats::QueryLogWriter::spawn(stats_db, 100);
+        let metrics = sito_stats::MetricsRegistry::new("test", "test");
+        let pipeline = pipeline.with_stats(writer.sender(), metrics.clone());
+        (pipeline, metrics)
+    }
+
+    /// D-12: a failing upstream is labelled by its configured name, lowers that
+    /// server's health gauge immediately, and recovers to 1 after a success.
+    /// No failure may ever be recorded under the legacy `upstream="all"` label.
+    #[tokio::test]
+    async fn test_pipeline_upstream_metrics_attribution_and_recovery() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        let fail = std::sync::Arc::new(AtomicBool::new(true));
+        let (pipeline, server, calls, temp_dir) =
+            test_pipeline_with_failure_toggle(config, std::sync::Arc::clone(&fail)).await;
+        let (pipeline, metrics) = with_test_metrics(pipeline).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("metrics-recovery.example.").unwrap();
+
+        let resp = pipeline
+            .handle(
+                rewrite_query("metrics-recovery.example.", RecordType::A),
+                client.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::ServFail,
+            "the failing upstream must surface SERVFAIL"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(&format!(
+                "sito_upstream_errors_total{{upstream=\"{server}\",kind=\"bad_response\"}} 1"
+            )),
+            "error must be attributed to the configured server: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("sito_upstream_health{{upstream=\"{server}\"}} 0")),
+            "a failed query must set that server's health gauge to 0: {rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"upstream="all""#),
+            "the legacy aggregate label must never be emitted: {rendered}"
+        );
+
+        // Recover: the next successful query resets the same server's gauge.
+        fail.store(false, Ordering::SeqCst);
+        let resp = pipeline
+            .handle(rewrite_query(&name.to_ascii(), RecordType::A), client)
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(&format!("sito_upstream_health{{upstream=\"{server}\"}} 1")),
+            "a success must recover the server's health gauge: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "sito_upstream_errors_total{{upstream=\"{server}\",kind=\"bad_response\"}} 1"
+            )),
+            "the error counter is monotonic and keeps the attributed label: {rendered}"
+        );
+        assert!(!rendered.contains(r#"upstream="all""#));
+        assert!(!rendered.contains("unattributed"));
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// D-12: failures that cannot be attributed to one configured server use
+    /// the constant `unattributed` label and must not write a health gauge.
+    #[tokio::test]
+    async fn test_pipeline_unattributed_upstream_label_is_constant() {
+        use sito_core::config::UpstreamStrategy;
+        use sito_upstream::UpstreamManager;
+
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        let upstream = std::sync::Arc::new(UpstreamManager::with_upstreams(
+            Vec::new(),
+            UpstreamStrategy::Failover,
+            std::time::Duration::from_millis(500),
+        ));
+        let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+        let (pipeline, metrics) = with_test_metrics(pipeline).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+        for id in 1..=2 {
+            let name = format!("unattributed-{id}.example.");
+            let resp = pipeline
+                .handle(rewrite_query(&name, RecordType::A), client.clone())
+                .await
+                .unwrap();
+            assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+        }
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(
+                r#"sito_upstream_errors_total{upstream="unattributed",kind="all_down"} 2"#
+            ),
+            "unattributable failures must use the constant `unattributed` label: {rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"sito_upstream_health{upstream="unattributed""#),
+            "an unattributed failure must not write a health gauge: {rendered}"
+        );
+        assert!(!rendered.contains(r#"upstream="all""#));
+        assert_eq!(
+            rendered.matches(r#"upstream="unattributed""#).count(),
+            1,
+            "`unattributed` is one constant series, not a per-query label: {rendered}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     fn do_query(id: u16, name: &Name) -> Message {
@@ -2238,7 +2640,11 @@ mod tests {
         assert_eq!(resp.metadata.response_code, ResponseCode::BADVERS);
         let resp_edns = resp.edns.expect("BADVERS must carry an OPT record");
         assert_eq!(resp_edns.version(), 0);
-        assert!(resp_edns.options().options.is_empty());
+        assert!(
+            resp_edns.options().options.is_empty(),
+            "BADVERS response must not echo EDNS options: {:?}",
+            resp_edns.options().options
+        );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

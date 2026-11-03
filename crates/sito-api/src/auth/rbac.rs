@@ -243,10 +243,13 @@ mod tests {
         assert!(!is_websocket_upgrade(&plain.into_parts().0));
     }
 
-    #[test]
-    fn test_query_token_ignored_for_non_websocket_requests() {
+    #[tokio::test]
+    async fn test_query_token_ignored_for_non_websocket_requests() {
         let mgr = AuthManager::new();
-        let (_, resp) = mgr.create_token("ws", Role::Viewer);
+        let (_, resp) = mgr
+            .create_token("ws", Role::Viewer, None)
+            .await
+            .expect("token");
         let req = Request::builder()
             .uri(format!("/api/v1/querylog?token={}", resp.token))
             .body(())

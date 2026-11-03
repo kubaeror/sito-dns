@@ -5,7 +5,7 @@
 # build (fat LTO) out of QEMU for linux/arm64 and linux/arm/v7, where full
 # binary emulation made it many times slower. Only the C dependencies need the
 # cross compilers; the Rust side is driven by the target triple.
-FROM --platform=$BUILDPLATFORM rust:1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS builder
+FROM --platform=$BUILDPLATFORM rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS builder
 
 # BuildKit provides these built-in arguments for the requested target platform.
 ARG TARGETARCH

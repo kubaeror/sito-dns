@@ -1,5 +1,7 @@
 # Phase M2 — Filtering Engine (4 weeks)
 
+> **Historical phase plan.** This document records the original M2 plan and exit criteria; it is not a description of current behavior. Current behavior is documented in the [configuration reference](../configuration-reference.md), HA operations in the [HA runbook](../runbook-ha.md), and user-visible changes in the [1.9.0 release notes](../release-notes-1.9.0.md).
+
 Goal: full AdGuard Home-compatible rule syntax, compilation to fast structures, subscriptions with atomic swap. The heart of the project — performance is won or lost here. References: plan sections 4.1–4.6.
 
 ## Scope

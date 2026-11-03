@@ -5,6 +5,15 @@ independent review of v1.5.0 (source-verified, `file:line` references in the
 WP scopes). It is a working roadmap: each work package (WP) is self-contained,
 independently reviewable, and gated by tests.
 
+> **Current-state pointer.** This is the historical v1.6.0 remediation plan;
+> `file:line` references and findings describe the pre-remediation code. For the
+> current admin-URL, cookie, HSTS and CSRF behavior, see
+> [`docs/configuration-reference.md`](configuration-reference.md) §11
+> (`[web]` & `[auth]`): `web.public_url` is authoritative when set. Otherwise a
+> trusted proxy's `X-Forwarded-Proto` can select the scheme, with
+> `web.tls_terminated_by_proxy` as the explicit fallback. The admin scheme is
+> never derived from the DNS `[tls]` certificate configuration.
+
 ## Approved decisions
 
 1. **No breaking config/API changes.** The web UI keeps its default bind;
@@ -163,6 +172,13 @@ no `Cache-Control: no-store`; HSTS trusts client-supplied proto.
 strict Origin/Referer (reject `null` and missing); `__Host-` session cookie;
 `no-store` on auth/config responses; tightened CSP; HSTS only when TLS is
 terminated by the server or a trusted proxy; complete header set.
+
+> **Annotated (current behavior):** the implementation is described in
+> [`docs/configuration-reference.md`](configuration-reference.md) §11.
+> `web.public_url` decides the admin scheme when set and overrides request
+> headers. Otherwise `X-Forwarded-Proto` from an immediate peer in
+> `web.trusted_proxies` is honored, falling back to
+> `web.tls_terminated_by_proxy`. Untrusted peers cannot influence the scheme.
 
 ### WP-5 — Auth hardening (M)
 

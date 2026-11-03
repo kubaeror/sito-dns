@@ -57,7 +57,10 @@ mod tests {
     fn test_export_openapi_json() {
         let openapi = ApiDoc::openapi();
         let json_str = openapi.to_pretty_json().expect("valid JSON");
-        assert!(!json_str.is_empty());
+        assert!(
+            !json_str.is_empty(),
+            "OpenAPI document must not serialize to an empty string"
+        );
         // Keep the exposed spec version in lockstep with the crate version.
         assert_eq!(
             openapi.info.version,
@@ -87,6 +90,23 @@ mod tests {
                 committed, json_str,
                 "docs/openapi.json is stale; regenerate with \
                  `SITO_UPDATE_OPENAPI=1 cargo test -p sito-api`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_openapi_documents_total_count_header() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).expect("valid OpenAPI JSON");
+        for path in ["/api/v1/stats/clients", "/api/v1/stats/upstreams"] {
+            let headers = &openapi["paths"][path]["get"]["responses"]["200"]["headers"];
+            assert_eq!(
+                headers["X-Total-Count"]["description"],
+                "Number of distinct matching rows before the response limit",
+                "{path} must document the X-Total-Count response header"
+            );
+            assert_eq!(
+                headers["X-Total-Count"]["schema"]["type"], "string",
+                "{path} X-Total-Count header must be a string"
             );
         }
     }

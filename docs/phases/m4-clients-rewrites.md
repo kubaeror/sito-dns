@@ -1,5 +1,7 @@
 # Phase M4 — Clients, Policies and Local Records (4 weeks)
 
+> **Historical phase plan.** This document records the original M4 plan and exit criteria; it is not a description of current behavior. Current behavior is documented in the [configuration reference](../configuration-reference.md), HA operations in the [HA runbook](../runbook-ha.md), and user-visible changes in the [1.9.0 release notes](../release-notes-1.9.0.md).
+
 Goal: the full "who sees what" model like AdGuard Home, plus local DNS records. References: plan sections 9, 10.
 
 ## Scope

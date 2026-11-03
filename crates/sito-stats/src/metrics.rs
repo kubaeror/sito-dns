@@ -306,6 +306,10 @@ pub struct MetricsRegistry {
     transport_queries_total: Arc<CounterMap<u32>>,
     ha_slaves_connected: Arc<AtomicI64>,
     ha_config_version: Arc<Mutex<BTreeMap<String, f64>>>,
+    /// Master-observed version divergence per slave instance (1 = diverged).
+    ha_diverged: Arc<Mutex<BTreeMap<String, bool>>>,
+    /// HA startup paths that left replication inactive, keyed by (role, reason).
+    ha_startup_noop: Arc<Mutex<BTreeMap<(String, String), u64>>>,
     querylog_dropped: Arc<AtomicU64>,
     filter_rules: Arc<AtomicU64>,
     filter_compile_seconds: Arc<Mutex<HistogramState>>,
@@ -340,6 +344,8 @@ impl MetricsRegistry {
             transport_queries_total: Arc::new(RwLock::new(HashMap::new())),
             ha_slaves_connected: Arc::new(AtomicI64::new(0)),
             ha_config_version: Arc::new(Mutex::new(BTreeMap::new())),
+            ha_diverged: Arc::new(Mutex::new(BTreeMap::new())),
+            ha_startup_noop: Arc::new(Mutex::new(BTreeMap::new())),
             querylog_dropped: Arc::new(AtomicU64::new(0)),
             filter_rules: Arc::new(AtomicU64::new(0)),
             filter_compile_seconds: Arc::new(Mutex::new(HistogramState::new())),
@@ -458,18 +464,42 @@ impl MetricsRegistry {
         map.remove(instance);
     }
 
-    pub fn set_querylog_dropped(&self, dropped: u64) {
-        self.querylog_dropped.store(dropped, Ordering::Relaxed);
+    /// Publishes whether the master observed a version-continuity divergence
+    /// with a slave instance (`1` = diverged, `0` = continuity restored).
+    pub fn set_ha_diverged(&self, instance: &str, diverged: bool) {
+        let mut map = self
+            .ha_diverged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        map.insert(instance.to_string(), diverged);
     }
 
-    /// Increments the query-log drop counter by one.
+    /// Removes the per-instance HA divergence series (e.g. on disconnect) so
+    /// metric cardinality cannot grow with churn.
+    pub fn remove_ha_diverged(&self, instance: &str) {
+        let mut map = self
+            .ha_diverged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        map.remove(instance);
+    }
+
+    /// Counts an HA startup path that left replication inactive.
     ///
-    /// Production publishes the writer's cumulative drop count through
-    /// [`Self::set_querylog_dropped`] (the writer cannot depend on the metrics
-    /// registry directly); this per-event helper exists for tests and is kept
-    /// for the `sito-test` acceptance suite.
-    pub fn inc_querylog_dropped(&self) {
-        self.querylog_dropped.fetch_add(1, Ordering::Relaxed);
+    /// `role` is `master`/`slave` and `reason` is a fixed, low-cardinality
+    /// identifier (`replication_disabled`, `missing_master_url`,
+    /// `tls_init_failed`, `bind_failed`).
+    pub fn inc_ha_startup_noop(&self, role: &str, reason: &str) {
+        let mut map = self
+            .ha_startup_noop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *map.entry((role.to_string(), reason.to_string()))
+            .or_insert(0) += 1;
+    }
+
+    pub fn set_querylog_dropped(&self, dropped: u64) {
+        self.querylog_dropped.store(dropped, Ordering::Relaxed);
     }
 
     /// Publishes the number of active compiled filter rules.
@@ -485,6 +515,17 @@ impl MetricsRegistry {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         hist.observe(seconds);
+    }
+
+    /// Returns an observer that records compile durations in this registry.
+    ///
+    /// The filter engine cannot depend on `sito-stats`; the server installs
+    /// this callback on the engine so startup and scheduled refreshes are
+    /// recorded as well as API-triggered reloads.
+    #[must_use]
+    pub fn compile_observer(&self) -> std::sync::Arc<dyn Fn(f64) + Send + Sync> {
+        let registry = self.clone();
+        std::sync::Arc::new(move |seconds| registry.observe_filter_compile(seconds))
     }
 
     /// Returns total query count and blocked query count processed by this registry.
@@ -1049,7 +1090,47 @@ impl MetricsRegistry {
             }
         }
 
-        // 16. sito_querylog_dropped_total
+        // 16. sito_ha_diverged
+        out.push_str(
+            "# HELP sito_ha_diverged Whether the master observed a version-continuity divergence with a slave (1 = diverged)\n",
+        );
+        out.push_str("# TYPE sito_ha_diverged gauge\n");
+        {
+            let map = self
+                .ha_diverged
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (instance, diverged) in map.iter() {
+                let _ = writeln!(
+                    out,
+                    "sito_ha_diverged{{instance=\"{}\"}} {}",
+                    escape_label_value(instance),
+                    u8::from(*diverged)
+                );
+            }
+        }
+
+        // 17. sito_ha_startup_noop_total
+        out.push_str(
+            "# HELP sito_ha_startup_noop_total HA startup paths that left replication inactive\n",
+        );
+        out.push_str("# TYPE sito_ha_startup_noop_total counter\n");
+        {
+            let map = self
+                .ha_startup_noop
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for ((role, reason), count) in map.iter() {
+                let _ = writeln!(
+                    out,
+                    "sito_ha_startup_noop_total{{role=\"{}\",reason=\"{}\"}} {count}",
+                    escape_label_value(role),
+                    escape_label_value(reason)
+                );
+            }
+        }
+
+        // 18. sito_querylog_dropped_total
         out.push_str("# HELP sito_querylog_dropped_total Total query log entries dropped due to buffer overflow\n");
         out.push_str("# TYPE sito_querylog_dropped_total counter\n");
         let _ = writeln!(
@@ -1058,7 +1139,7 @@ impl MetricsRegistry {
             self.querylog_dropped.load(Ordering::Relaxed)
         );
 
-        // 17. sito_build_info
+        // 19. sito_build_info
         out.push_str("# HELP sito_build_info Build and version metadata\n");
         out.push_str("# TYPE sito_build_info gauge\n");
         let _ = writeln!(
@@ -1253,7 +1334,9 @@ mod tests {
         reg.inc_doh_bypass_blocked();
         reg.set_ha_slaves_connected(2);
         reg.set_ha_config_version("sito-slave-1", 42.0);
-        reg.inc_querylog_dropped();
+        reg.set_ha_diverged("sito-slave-1", true);
+        reg.inc_ha_startup_noop("master", "replication_disabled");
+        reg.set_querylog_dropped(1);
 
         let rendered = reg.render_prometheus();
 
@@ -1276,6 +1359,8 @@ mod tests {
         assert!(rendered.contains("sito_doh_bypass_blocked_total"));
         assert!(rendered.contains("sito_ha_slaves_connected"));
         assert!(rendered.contains("sito_ha_config_version"));
+        assert!(rendered.contains("sito_ha_diverged"));
+        assert!(rendered.contains("sito_ha_startup_noop_total"));
         assert!(rendered.contains("sito_querylog_dropped_total"));
         assert!(rendered.contains("sito_build_info"));
     }
@@ -1305,7 +1390,9 @@ mod tests {
         reg.inc_doh_bypass_blocked();
         reg.set_ha_slaves_connected(2);
         reg.set_ha_config_version("sito-slave-1", 42.0);
-        reg.inc_querylog_dropped();
+        reg.set_ha_diverged("sito-slave-1", true);
+        reg.inc_ha_startup_noop("master", "replication_disabled");
+        reg.set_querylog_dropped(1);
 
         let rendered = reg.render_prometheus();
         let expected = r#"# HELP sito_queries_total Total DNS queries processed
@@ -1433,6 +1520,12 @@ sito_ha_slaves_connected 2
 # HELP sito_ha_config_version Configuration version of HA node instances
 # TYPE sito_ha_config_version gauge
 sito_ha_config_version{instance="sito-slave-1"} 42
+# HELP sito_ha_diverged Whether the master observed a version-continuity divergence with a slave (1 = diverged)
+# TYPE sito_ha_diverged gauge
+sito_ha_diverged{instance="sito-slave-1"} 1
+# HELP sito_ha_startup_noop_total HA startup paths that left replication inactive
+# TYPE sito_ha_startup_noop_total counter
+sito_ha_startup_noop_total{role="master",reason="replication_disabled"} 1
 # HELP sito_querylog_dropped_total Total query log entries dropped due to buffer overflow
 # TYPE sito_querylog_dropped_total counter
 sito_querylog_dropped_total 1
@@ -1456,6 +1549,63 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         reg.remove_ha_config_version(hostile);
         let rendered_after = reg.render_prometheus();
         assert!(!rendered_after.contains("evil"));
+    }
+
+    #[test]
+    fn test_ha_diverged_gauge_transitions_and_removal() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        assert!(
+            !reg.render_prometheus()
+                .contains(r#"sito_ha_diverged{instance="slave-1"}"#),
+            "no divergence series is rendered before a divergence is observed"
+        );
+
+        reg.set_ha_diverged("slave-1", true);
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains(r#"sito_ha_diverged{instance="slave-1"} 1"#));
+
+        reg.set_ha_diverged("slave-1", false);
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains(r#"sito_ha_diverged{instance="slave-1"} 0"#));
+
+        reg.remove_ha_diverged("slave-1");
+        assert!(
+            !reg.render_prometheus()
+                .contains(r#"sito_ha_diverged{instance="slave-1"}"#),
+            "the series must be removed on disconnect"
+        );
+    }
+
+    #[test]
+    fn test_ha_startup_noop_counter_is_keyed_by_role_and_reason() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.inc_ha_startup_noop("master", "replication_disabled");
+        reg.inc_ha_startup_noop("master", "replication_disabled");
+        reg.inc_ha_startup_noop("slave", "missing_master_url");
+
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains(
+            r#"sito_ha_startup_noop_total{role="master",reason="replication_disabled"} 2"#
+        ));
+        assert!(
+            rendered.contains(
+                r#"sito_ha_startup_noop_total{role="slave",reason="missing_master_url"} 1"#
+            )
+        );
+    }
+
+    #[test]
+    fn test_ha_diverged_label_escaping_and_removal() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        let hostile = "evil\"}\ninjected";
+        reg.set_ha_diverged(hostile, true);
+
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains(r#"instance="evil\"}\ninjected""#));
+        assert!(!rendered.contains("\ninjected"));
+
+        reg.remove_ha_diverged(hostile);
+        assert!(!reg.render_prometheus().contains("evil"));
     }
 
     #[test]
@@ -1485,6 +1635,7 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         let reg = MetricsRegistry::new("1.0.0", "test");
         for i in 0..(MAX_INTERNER_LABELS + 100) {
             reg.inc_upstream_errors(&format!("bounded-{i}"), "io");
+            reg.set_upstream_health(&format!("bounded-{i}"), 0.0);
         }
         let labels = reg
             .labels
@@ -1501,6 +1652,10 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         assert!(
             rendered.contains(r#"upstream="__other__""#),
             "overflow label must be used once the cap is reached"
+        );
+        assert!(
+            rendered.contains(r#"sito_upstream_health{upstream="__other__"} 0"#),
+            "health gauges must share the same bounded label set: {rendered}"
         );
     }
 

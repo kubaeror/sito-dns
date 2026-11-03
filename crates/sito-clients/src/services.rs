@@ -3,7 +3,7 @@
 use crate::bundled::{BundledList, BundledListError, BundledManifest, verified_content};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use tracing::warn;
+use tracing::{error, warn};
 
 /// Service blocking database mapping service IDs to domain patterns.
 ///
@@ -15,15 +15,14 @@ pub struct ServiceRegistry {
     services: HashMap<String, HashSet<String>>,
     #[serde(skip)]
     lists: Vec<BundledList>,
-    /// Number of source rules skipped because they are not addressable
-    /// domains (regex, wildcard, malformed).
-    #[serde(skip)]
-    skipped_rules: usize,
 }
 
 impl Default for ServiceRegistry {
     fn default() -> Self {
-        Self::bundled()
+        Self::try_bundled().unwrap_or_else(|e| {
+            error!(error = %e, "Bundled service list failed to load; continuing with an empty registry");
+            Self::empty()
+        })
     }
 }
 
@@ -35,6 +34,36 @@ struct ServiceEntry {
 }
 
 impl ServiceRegistry {
+    /// An empty registry that matches no services.
+    ///
+    /// Used as a non-panicking fallback when embedded data cannot be loaded.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            services: HashMap::new(),
+            lists: Vec::new(),
+        }
+    }
+
+    /// Builds the service registry from an already-parsed manifest after
+    /// verifying the bundled `services.json` checksum.
+    ///
+    /// Returns an error instead of panicking when embedded data is corrupt.
+    pub fn from_manifest(manifest: &BundledManifest) -> Result<Self, BundledListError> {
+        let list = manifest
+            .list("services")
+            .ok_or_else(|| BundledListError::MissingContent("services".to_string()))?
+            .clone();
+        let content = verified_content(&list)?;
+        let mut registry =
+            Self::from_json(content).map_err(|e| BundledListError::InvalidContent {
+                id: "services".to_string(),
+                reason: e.to_string(),
+            })?;
+        registry.lists = vec![list];
+        Ok(registry)
+    }
+
     /// Load the bundled service definitions after verifying the manifest
     /// checksum.
     ///
@@ -45,41 +74,13 @@ impl ServiceRegistry {
                 id: "manifest".to_string(),
                 reason: e.to_string(),
             })?;
-        let list = manifest
-            .list("services")
-            .ok_or_else(|| BundledListError::MissingContent("services".to_string()))?;
-        let content = verified_content(list)?;
-        let mut registry =
-            Self::from_json(content).map_err(|e| BundledListError::InvalidContent {
-                id: "services".to_string(),
-                reason: e.to_string(),
-            })?;
-        registry.lists = vec![list.clone()];
-        Ok(registry)
-    }
-
-    /// Load the bundled service definitions after verifying the manifest
-    /// checksum.
-    ///
-    /// # Panics
-    /// Panics when the embedded manifest or `services.json` fails its integrity
-    /// check; both are covered by unit tests. Prefer
-    /// [`ServiceRegistry::try_bundled`] on non-fatal paths.
-    pub fn bundled() -> Self {
-        Self::try_bundled().unwrap_or_else(|e| panic!("bundled list integrity check failed: {e}"))
+        Self::from_manifest(&manifest)
     }
 
     /// Metadata (version, source, license, checksum) of the loaded bundled list.
     #[must_use]
     pub fn lists(&self) -> &[BundledList] {
         &self.lists
-    }
-
-    /// Number of service rules skipped because they are not plain domains
-    /// (regex/wildcard rules are explicitly unsupported by the suffix matcher).
-    #[must_use]
-    pub fn skipped_rule_count(&self) -> usize {
-        self.skipped_rules
     }
 
     /// Number of services in the registry.
@@ -108,10 +109,10 @@ impl ServiceRegistry {
                     .collect();
                 normalized.insert(svc.to_ascii_lowercase(), cleaned_domains);
             }
+            log_skipped_rules(skipped_rules);
             return Ok(Self {
                 services: normalized,
                 lists: Vec::new(),
-                skipped_rules,
             });
         }
 
@@ -125,10 +126,10 @@ impl ServiceRegistry {
                 .collect();
             services.insert(id.to_ascii_lowercase(), cleaned);
         }
+        log_skipped_rules(skipped_rules);
         Ok(Self {
             services,
             lists: Vec::new(),
-            skipped_rules,
         })
     }
 
@@ -171,8 +172,17 @@ impl ServiceRegistry {
     }
 }
 
+/// Logs a summary when unsupported service rules were dropped at load time.
+fn log_skipped_rules(skipped: usize) {
+    if skipped > 0 {
+        warn!(
+            skipped,
+            "Skipped unsupported regex/wildcard or malformed service rules"
+        );
+    }
+}
+
 /// Normalizes a service rule to a literal lowercase domain.
-///
 /// Returns `None` (and logs) for rules the suffix matcher cannot represent:
 /// regex rules (`/.../`), wildcards (`*`, `?`) and malformed domains. Storing
 /// them as domains would silently never match.
@@ -233,7 +243,7 @@ mod tests {
 
     #[test]
     fn test_bundled_services_loaded() {
-        let reg = ServiceRegistry::bundled();
+        let reg = ServiceRegistry::try_bundled().expect("bundled services must load");
         assert!(reg.is_service_domain("tiktok", "tiktok.com"));
         assert!(reg.is_service_domain("tiktok", "p16-sign.tiktokcdn.com"));
         assert!(reg.is_service_domain("tiktok", "www.musical.ly"));
@@ -249,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_matches_any_service() {
-        let reg = ServiceRegistry::bundled();
+        let reg = ServiceRegistry::try_bundled().expect("bundled services must load");
         let blocked = ["tiktok", "steam"];
 
         assert_eq!(
@@ -278,7 +288,11 @@ mod tests {
         assert!(!reg.is_service_domain("custom_app", "other.custom.net"));
 
         // Ad-hoc registries carry no bundled metadata.
-        assert!(reg.lists().is_empty());
+        assert!(
+            reg.lists().is_empty(),
+            "ad-hoc registry must not expose bundled lists: {:?}",
+            reg.lists()
+        );
     }
 
     #[test]
@@ -301,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_bundled_service_metadata_exposed() {
-        let reg = ServiceRegistry::bundled();
+        let reg = ServiceRegistry::try_bundled().expect("bundled services must load");
         let list = reg.lists().first().expect("services list metadata");
         assert_eq!(list.id, "services");
         assert_eq!(list.kind, "services");
@@ -317,10 +331,9 @@ mod tests {
         assert!(reg.is_service_domain("custom_app", "good.com"));
         assert!(reg.is_service_domain("custom_app", "ok.net"));
         assert!(!reg.is_service_domain("custom_app", "wild.com"));
-        assert_eq!(
-            reg.skipped_rule_count(),
-            3,
-            "regex, wildcard and malformed rules must be dropped, not stored"
+        assert!(
+            !reg.is_service_domain("custom_app", "re.foo"),
+            "regex rules must be dropped, not stored"
         );
     }
 
@@ -328,6 +341,23 @@ mod tests {
     fn test_try_bundled_is_non_panicking() {
         let reg = ServiceRegistry::try_bundled().expect("bundled services must load");
         assert!(reg.is_service_domain("tiktok", "tiktok.com"));
-        assert_eq!(reg.skipped_rule_count(), 0);
+    }
+
+    #[test]
+    fn test_corrupt_service_data_degrades_to_error_not_panic() {
+        let err = ServiceRegistry::from_json("{ not json").expect_err("corrupt JSON must fail");
+        assert_ne!(err.to_string(), "");
+
+        let manifest = BundledManifest::try_bundled().expect("bundled manifest must parse");
+        let mut tampered = manifest;
+        tampered.lists.retain(|list| list.id == "services");
+        tampered.lists[0].checksum_blake3 = "0".repeat(64);
+        let err = ServiceRegistry::from_manifest(&tampered)
+            .expect_err("a checksum mismatch must be reported");
+        assert!(matches!(err, BundledListError::ChecksumMismatch { .. }));
+
+        let empty = ServiceRegistry::empty();
+        assert_eq!(empty.service_count(), 0);
+        assert!(!empty.is_service_domain("tiktok", "tiktok.com"));
     }
 }

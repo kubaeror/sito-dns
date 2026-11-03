@@ -21,7 +21,11 @@ use totp_rs::{Builder, Secret};
 pub const BACKUP_HASH_PREFIX: &str = "b3:";
 
 /// TOTP configuration and state for a user.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The secret is encrypted at rest by [`super::manager::AuthManager`]; the
+/// `Debug` implementation redacts it so an accidental `{:?}` cannot leak the
+/// second factor.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TotpConfig {
     pub enabled: bool,
     pub secret: String,
@@ -31,6 +35,17 @@ pub struct TotpConfig {
     /// ±1 window. `None` until the first successful dynamic-code login.
     #[serde(default)]
     pub last_used_step: Option<u64>,
+}
+
+impl std::fmt::Debug for TotpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpConfig")
+            .field("enabled", &self.enabled)
+            .field("secret", &"<redacted>")
+            .field("backup_code_hashes", &self.backup_code_hashes)
+            .field("last_used_step", &self.last_used_step)
+            .finish()
+    }
 }
 
 impl TotpConfig {
@@ -45,12 +60,30 @@ impl TotpConfig {
 }
 
 /// Returned during TOTP setup.
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+//
+// This is the only response that intentionally carries the plaintext secret
+// and backup codes; it is emitted once. `Debug` is redacted so the material
+// cannot leak through logging.
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TotpSetupResponse {
     pub secret: String,
     pub otpauth_url: String,
     pub qr_code: String,
     pub backup_codes: Vec<String>,
+}
+
+impl std::fmt::Debug for TotpSetupResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpSetupResponse")
+            .field("secret", &"<redacted>")
+            .field("otpauth_url", &"<redacted>")
+            .field("qr_code", &"<redacted>")
+            .field(
+                "backup_codes",
+                &format_args!("<{} redacted>", self.backup_codes.len()),
+            )
+            .finish()
+    }
 }
 
 impl TotpConfig {
@@ -203,7 +236,10 @@ mod tests {
             assert_eq!(code.len(), 32, "backup codes must carry >= 128 bits");
             assert!(code.chars().all(|c| c.is_ascii_hexdigit()));
         }
-        assert!(!setup.qr_code.is_empty());
+        assert!(
+            !setup.qr_code.is_empty(),
+            "TOTP setup must render a QR code"
+        );
         assert!(setup.otpauth_url.contains("sito"));
 
         // Plaintext codes are never stored; digests are fast BLAKE3 (no Argon2:
@@ -279,5 +315,25 @@ mod tests {
             !config.verify(&setup.backup_codes[0], "admin", "sito"),
             "legacy Argon2 backup hashes must be refused, never verified"
         );
+    }
+
+    #[test]
+    fn test_totp_debug_redacts_secrets() {
+        let (config, setup) = TotpConfig::generate("sito", "admin");
+
+        let config_debug = format!("{config:?}");
+        assert!(!config_debug.contains(&config.secret));
+        assert!(config_debug.contains("<redacted>"));
+
+        // The one-time setup response intentionally carries the secret, but
+        // `{:?}` must never print it (or the QR/otpauth URL that encode it).
+        let setup_debug = format!("{setup:?}");
+        assert!(!setup_debug.contains(&setup.secret));
+        assert!(!setup_debug.contains(&setup.qr_code));
+        assert!(!setup_debug.contains(&setup.otpauth_url));
+        for code in &setup.backup_codes {
+            assert!(!setup_debug.contains(code));
+        }
+        assert!(setup_debug.contains("<redacted>"));
     }
 }

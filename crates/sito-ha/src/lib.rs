@@ -28,7 +28,8 @@ pub use error::HaError;
 pub use master::{MasterCoordinator, ResyncOutcome, SlaveSummary, spawn_master_server};
 pub use protocol::{HaMessage, PROTOCOL_VERSION, UpstreamReport};
 pub use slave::{
-    SlaveAppHandles, SlaveState, SlaveStatusTracker, apply_config_push, spawn_slave_worker,
+    SlaveAppHandles, SlaveConfigApplier, SlaveState, SlaveStatusTracker, apply_config_push,
+    spawn_slave_worker,
 };
 pub use transport::{
     ExponentialBackoff, MAX_WS_MESSAGE_SIZE, PinnedClientCertVerifier, PinnedServerCertVerifier,
@@ -104,11 +105,17 @@ mod tests {
             clients_arc.clone(),
             rewrites_arc.clone(),
         ));
+        let applier = Arc::new(crate::slave::worker::test_support::TestApplier::new(
+            runtime.clone(),
+            filter_engine.clone(),
+            None,
+        ));
         let handles = SlaveAppHandles {
             runtime,
             filter: filter_engine.clone(),
             metrics: slave_metrics.clone(),
             config_path: None,
+            applier,
         };
 
         let slave_ha_cfg = HaConfig {
@@ -290,11 +297,17 @@ mod tests {
             clients_arc,
             rewrites_arc,
         ));
+        let applier = Arc::new(crate::slave::worker::test_support::TestApplier::new(
+            runtime.clone(),
+            filter_engine.clone(),
+            None,
+        ));
         let handles = SlaveAppHandles {
             runtime,
             filter: filter_engine,
             metrics: metrics.clone(),
             config_path: None,
+            applier,
         };
 
         // Slave with wrong token
@@ -347,11 +360,17 @@ mod tests {
             clients_arc,
             rewrites_arc,
         ));
+        let applier = Arc::new(crate::slave::worker::test_support::TestApplier::new(
+            runtime.clone(),
+            filter_engine.clone(),
+            None,
+        ));
         SlaveAppHandles {
             runtime,
             filter: filter_engine,
             metrics: sito_stats::MetricsRegistry::new("0.1.0", "slave"),
             config_path: None,
+            applier,
         }
     }
 

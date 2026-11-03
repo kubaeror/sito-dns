@@ -100,7 +100,8 @@ pub async fn get_stats(
     path = "/api/v1/stats/clients",
     params(StatsQuery),
     responses(
-        (status = 200, description = "Per-client statistics retrieved", body = Vec<ClientStats>),
+        (status = 200, description = "Per-client statistics retrieved", body = Vec<ClientStats>,
+            headers(("X-Total-Count", description = "Number of distinct matching rows before the response limit"))),
         (status = 400, description = "Invalid window", body = ProblemDetails),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
@@ -131,7 +132,8 @@ pub async fn get_client_stats(
     path = "/api/v1/stats/upstreams",
     params(StatsQuery),
     responses(
-        (status = 200, description = "Per-upstream statistics retrieved", body = Vec<UpstreamStats>),
+        (status = 200, description = "Per-upstream statistics retrieved", body = Vec<UpstreamStats>,
+            headers(("X-Total-Count", description = "Number of distinct matching rows before the response limit"))),
         (status = 400, description = "Invalid window", body = ProblemDetails),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
@@ -219,8 +221,13 @@ mod tests {
             rewrites.clone(),
         ));
         let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
-            Arc::new(sito_clients::ParentalRegistry::bundled()),
-            Arc::new(sito_clients::ServiceRegistry::bundled()),
+            Arc::new(
+                sito_clients::ParentalRegistry::try_bundled()
+                    .expect("bundled parental lists must load"),
+            ),
+            Arc::new(
+                sito_clients::ServiceRegistry::try_bundled().expect("bundled services must load"),
+            ),
         ));
 
         ServerContext {
@@ -239,6 +246,7 @@ mod tests {
             rewrites,
             start_time: std::time::Instant::now(),
             restore_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             master_coordinator: None,
             slave_tracker: None,
             resync_sender: None,

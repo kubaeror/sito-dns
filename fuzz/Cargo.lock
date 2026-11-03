@@ -1912,7 +1912,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sito-clients"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1930,7 +1930,7 @@ dependencies = [
 
 [[package]]
 name = "sito-core"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1944,22 +1944,24 @@ dependencies = [
 
 [[package]]
 name = "sito-dnssec"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
  "dashmap",
  "data-encoding",
  "hickory-proto",
+ "serde",
  "sito-core",
  "sito-proto",
  "time",
+ "toml",
  "tracing",
 ]
 
 [[package]]
 name = "sito-filter"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -1991,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "sito-ha"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2024,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "sito-proto"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "hickory-proto",
  "idna",
@@ -2034,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "sito-rewrites"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "hickory-proto",
  "serde",
@@ -2048,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "sito-runtime"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "arc-swap",
  "sito-clients",
@@ -2058,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "sito-stats"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "chrono",
  "serde",
@@ -2710,9 +2712,9 @@ checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
 
 [[package]]
 name = "utoipa"
-version = "5.5.0"
+version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bde15df68e80b16c7d16b9616e80770ad158988daa56a27dccd1e55558b0160"
+checksum = "8765fe27aeff71012a3f90fa474cf1df863a7d0dd81ed25de4e63fff2544994f"
 dependencies = [
  "indexmap",
  "serde",
@@ -2722,13 +2724,13 @@ dependencies = [
 
 [[package]]
 name = "utoipa-gen"
-version = "5.5.0"
+version = "6.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba0b99ee52df3028635d93840c797102da61f8a7bb3cf751032455895b52ef8"
+checksum = "d935f1c83fdf8b88f09bbe050d0cea78ea4afee6d7b0317403228c1200b2c8ab"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.9",
 ]
 
 [[package]]

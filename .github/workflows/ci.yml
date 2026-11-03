@@ -106,6 +106,114 @@ jobs:
           python3 -c "import yaml" >/dev/null 2>&1 || python3 -m pip install --quiet --break-system-packages pyyaml
           python3 contrib/tests/test_adguard_to_sito.py
 
+  docker-smoke:
+    name: docker smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Both compose files are shipped to users, so a syntax/typo regression
+      # must fail before release. The HA file is validated only: its macvlan
+      # network needs a real parent interface and cannot run on a runner.
+      - name: Validate compose files
+        run: |
+          docker compose -f docker-compose.yml config >/dev/null
+          docker compose -f docker-compose.ha.yml config >/dev/null
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build the image
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: sito:ci
+          # Same backend as release.yml, separate scope so the PR cache does
+          # not evict the release build cache.
+          cache-from: type=gha,scope=docker-smoke
+          cache-to: type=gha,mode=max,scope=docker-smoke
+
+      - name: Write the smoke configuration
+        run: |
+          mkdir -p ci-smoke/config
+          cat > ci-smoke/config/config.toml <<'EOF'
+          config_version = 1
+
+          [dns]
+          bind = ["0.0.0.0"]
+          port = 5353
+          dot_port = 0
+          doh_port = 0
+          doq_port = 0
+          doh3_port = 0
+
+          [web]
+          enabled = false
+
+          # A plain upstream keeps the smoke run independent of TLS/DoH setup;
+          # the asserted name below is answered from a local rewrite anyway.
+          [upstream]
+          servers = ["1.1.1.1"]
+
+          [rewrites]
+          auto_ptr = true
+
+          [[rewrites.entries]]
+          domain = "smoke.test"
+          type = "A"
+          answer = "192.0.2.1"
+          EOF
+          docker run --rm \
+            -v "$PWD/ci-smoke/config:/etc/sito:ro" \
+            sito:ci check-config --config /etc/sito/config.toml
+
+      - name: Start the container
+        run: |
+          # A config file present with no users.toml makes the server refuse to
+          # start (fail closed). Seed one throwaway admin in the named data
+          # volume first; the volume inherits uid/gid 65532 from the image.
+          docker run --rm \
+            -v sito-smoke-data:/var/lib/sito \
+            -v "$PWD/ci-smoke/config:/etc/sito:ro" \
+            sito:ci reset-admin --password ci-smoke-admin
+          docker run -d --name sito-smoke \
+            -p 5353:5353/udp \
+            -v "$PWD/ci-smoke/config:/etc/sito:ro" \
+            -v sito-smoke-data:/var/lib/sito \
+            sito:ci
+
+      - name: Assert the rewrite is served
+        run: |
+          command -v dig >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y dnsutils)
+          expected="192.0.2.1"
+          answer=""
+          for _ in $(seq 1 30); do
+            if ! docker inspect -f '{{.State.Running}}' sito-smoke 2>/dev/null | grep -qx true; then
+              echo "::error::sito container exited before answering"
+              break
+            fi
+            answer="$(dig +short +time=1 +tries=1 @127.0.0.1 -p 5353 smoke.test A | head -n1 || true)"
+            if [ "${answer}" = "${expected}" ]; then
+              echo "smoke.test -> ${answer}"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::expected smoke.test -> ${expected}, got '${answer}'"
+          docker logs sito-smoke || true
+          exit 1
+
+      - name: Remove the smoke container and volume
+        if: always()
+        run: |
+          docker rm -f sito-smoke || true
+          docker volume rm sito-smoke-data || true
+
   build:
     name: build (${{ matrix.target }})
     runs-on: ubuntu-latest
@@ -141,6 +249,20 @@ jobs:
       - name: Verify binary output
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: ./target/${{ matrix.target }}/debug/sito --version
+      # D-21: the converter is only useful if its output is accepted by
+      # `check-config`, not merely parseable TOML. The fixture points [tls] at
+      # these throwaway paths, so generate a matching self-signed pair first.
+      - name: Convert an AdGuard Home config and validate it
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          python3 -c "import yaml" >/dev/null 2>&1 || python3 -m pip install --quiet --break-system-packages pyyaml
+          mkdir -p /tmp/sito-adguard-e2e
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj "/CN=sito-adguard-e2e" \
+            -keyout /tmp/sito-adguard-e2e/key.pem \
+            -out /tmp/sito-adguard-e2e/cert.pem 2>/dev/null
+          python3 contrib/adguard_to_sito.py -i contrib/tests/adguardhome_fixture.yaml -o /tmp/agh.toml
+          ./target/${{ matrix.target }}/debug/sito check-config --config /tmp/agh.toml
       - name: Smoke build release binary (x86_64)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |

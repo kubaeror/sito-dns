@@ -66,8 +66,11 @@ async fn create_test_context(temp_dir: &Path) -> (ServerContext, PathBuf, QueryL
         rewrites.clone(),
     ));
     let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
-        Arc::new(sito_clients::ParentalRegistry::bundled()),
-        Arc::new(sito_clients::ServiceRegistry::bundled()),
+        Arc::new(
+            sito_clients::ParentalRegistry::try_bundled()
+                .expect("bundled parental lists must load"),
+        ),
+        Arc::new(sito_clients::ServiceRegistry::try_bundled().expect("bundled services must load")),
     ));
     let ctx = ServerContext {
         config: config_arc,
@@ -85,6 +88,7 @@ async fn create_test_context(temp_dir: &Path) -> (ServerContext, PathBuf, QueryL
         rewrites,
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
+        apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         master_coordinator: None,
         slave_tracker: None,
         resync_sender: None,
@@ -179,13 +183,27 @@ async fn test_acceptance_m5_rbac_matrix() {
     let (ctx, _cfg_path, _writer) = create_test_context(&temp_dir).await;
 
     // Create tokens for all 3 roles
-    let admin_tok = ctx.auth_mgr.create_token("adm-test", Role::Admin).1.token;
-    let oper_tok = ctx
+    let admin_tok = ctx
         .auth_mgr
-        .create_token("opr-test", Role::Operator)
+        .create_token("adm-test", Role::Admin, None)
+        .await
+        .expect("token")
         .1
         .token;
-    let view_tok = ctx.auth_mgr.create_token("viw-test", Role::Viewer).1.token;
+    let oper_tok = ctx
+        .auth_mgr
+        .create_token("opr-test", Role::Operator, None)
+        .await
+        .expect("token")
+        .1
+        .token;
+    let view_tok = ctx
+        .auth_mgr
+        .create_token("viw-test", Role::Viewer, None)
+        .await
+        .expect("token")
+        .1
+        .token;
 
     let app = sito_api::create_router(ctx);
 
@@ -349,7 +367,13 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
     tokio::fs::create_dir_all(&temp_dir).await.unwrap();
 
     let (ctx, _cfg_path, _writer) = create_test_context(&temp_dir).await;
-    let admin_tok = ctx.auth_mgr.create_token("adm-ql", Role::Admin).1.token;
+    let admin_tok = ctx
+        .auth_mgr
+        .create_token("adm-ql", Role::Admin, None)
+        .await
+        .expect("token")
+        .1
+        .token;
 
     // Seed test query logs into SQLite
     let now = chrono::Utc::now().timestamp_millis();
@@ -481,7 +505,13 @@ async fn test_acceptance_m5_websocket_livetail() {
     tokio::fs::create_dir_all(&temp_dir).await.unwrap();
 
     let (ctx, _cfg_path, _writer) = create_test_context(&temp_dir).await;
-    let view_tok = ctx.auth_mgr.create_token("ws-viewer", Role::Viewer).1.token;
+    let view_tok = ctx
+        .auth_mgr
+        .create_token("ws-viewer", Role::Viewer, None)
+        .await
+        .expect("token")
+        .1
+        .token;
     let sender = ctx.querylog_sender.clone();
     let app = sito_api::create_router(ctx);
 
@@ -558,9 +588,13 @@ async fn test_acceptance_m5_prometheus_table_14_2() {
     ctx.metrics.inc_cache_hits();
     ctx.metrics.inc_cache_misses();
     ctx.metrics.set_ha_slaves_connected(2);
-    ctx.metrics.inc_querylog_dropped();
+    ctx.metrics.set_querylog_dropped(1);
 
-    let (_meta, token_resp) = ctx.auth_mgr.create_token("viewer", Role::Viewer);
+    let (_meta, token_resp) = ctx
+        .auth_mgr
+        .create_token("viewer", Role::Viewer, None)
+        .await
+        .expect("token");
     let app = sito_api::create_router(ctx);
 
     let req = Request::builder()
@@ -687,7 +721,13 @@ async fn test_acceptance_m5_api_backup_and_token_restore() {
     tokio::fs::create_dir_all(&temp_dir).await.unwrap();
 
     let (ctx, _config_path, _writer) = create_test_context(&temp_dir).await;
-    let admin_tok = ctx.auth_mgr.create_token("adm-bck", Role::Admin).1.token;
+    let admin_tok = ctx
+        .auth_mgr
+        .create_token("adm-bck", Role::Admin, None)
+        .await
+        .expect("token")
+        .1
+        .token;
     let app = sito_api::create_router(ctx.clone());
 
     // GET /api/v1/config/backup -> download tar.gz
@@ -710,7 +750,10 @@ async fn test_acceptance_m5_api_backup_and_token_restore() {
     // Inspect archive contents
     let (extracted_toml, metadata) = extract_backup_archive(&archive_bytes).unwrap();
     assert_eq!(metadata.version, "1.0");
-    assert!(!extracted_toml.is_empty());
+    assert!(
+        !extracted_toml.is_empty(),
+        "backup archive must contain a TOML config"
+    );
 
     // POST /api/v1/config/restore -> prepare restore and get confirmation token
     let req = Request::builder()
@@ -728,7 +771,10 @@ async fn test_acceptance_m5_api_backup_and_token_restore() {
         .unwrap();
     let prepared: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     let confirmation_token = prepared["confirmation_token"].as_str().unwrap();
-    assert!(!confirmation_token.is_empty());
+    assert!(
+        !confirmation_token.is_empty(),
+        "restore preparation must return a confirmation token"
+    );
 
     // POST /api/v1/config/restore/confirm with confirmation token
     let confirm_body = serde_json::json!({
@@ -769,7 +815,13 @@ async fn test_acceptance_m5_metrics_auth() {
     let (ctx, _cfg_path, _writer) = create_test_context(&temp_dir).await;
 
     // Create viewer account
-    let view_tok = ctx.auth_mgr.create_token("viewer", Role::Viewer).1.token;
+    let view_tok = ctx
+        .auth_mgr
+        .create_token("viewer", Role::Viewer, None)
+        .await
+        .expect("token")
+        .1
+        .token;
 
     let app = sito_api::create_router(ctx.clone());
 

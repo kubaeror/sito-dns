@@ -211,7 +211,11 @@ schedule = "0 0 15-21 * * MON-FRI"
         // Both settings are opt-in: absent means path/SNI identity off and
         // RouterOS lease names untrusted.
         let defaults: ClientsConfig = toml::from_str("").unwrap();
-        assert!(defaults.client_id_secrets.is_empty());
+        assert!(
+            defaults.client_id_secrets.is_empty(),
+            "default config must not define client id secrets: {:?}",
+            defaults.client_id_secrets
+        );
         assert!(!defaults.trust_routeros_lease_names);
     }
 }

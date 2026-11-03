@@ -2,6 +2,7 @@
 
 use crate::auth::lockout::LockoutTracker;
 use crate::auth::password::{hash_password, verify_password};
+use crate::auth::secret_store::TotpSecretStore;
 use crate::auth::session::{DEFAULT_SESSION_TTL_SECS, Session};
 use crate::auth::token::{ApiTokenMeta, CreateTokenResponse, Role, generate_token, hash_token};
 use crate::auth::totp::{TotpConfig, TotpSetupResponse};
@@ -79,6 +80,10 @@ pub const MAX_PENDING_TOTP: usize = 10_000;
 pub const MAX_PARTIAL_TOKENS: usize = 10_000;
 /// Maximum number of API tokens kept in memory/on disk.
 pub const MAX_API_TOKENS: usize = 256;
+/// Maximum number of API tokens a single owner may hold. When the limit is
+/// reached, creating another token evicts that owner's oldest token; other
+/// owners' tokens are never touched.
+pub const MAX_API_TOKENS_PER_OWNER: usize = 16;
 pub const PENDING_TOTP_TTL: Duration = Duration::from_secs(600); // 10 minutes
 /// Maximum wrong TOTP codes per partial token before it is invalidated.
 pub const MAX_TOTP_ATTEMPTS: u32 = 5;
@@ -88,6 +93,26 @@ pub const MAX_SETUP_TOKEN_FAILURES: u32 = 10;
 pub const SETUP_TOKEN_RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Age at which a still-pending setup emits a one-time operator warning.
 pub const SETUP_TOKEN_PENDING_WARN: Duration = Duration::from_hours(24);
+
+/// Failure to create an API token at the global capacity limit when the
+/// requesting account has no token of its own to evict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CreateTokenError {
+    #[error(
+        "API token capacity reached and this account has no revocable tokens; revoke a token and try again"
+    )]
+    CapacityReached,
+}
+
+/// Failure to apply a user mutation that must never leave the deployment
+/// without an Admin account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum UserMutationError {
+    #[error("user not found")]
+    NotFound,
+    #[error("operation would remove the last remaining admin account")]
+    LastAdmin,
+}
 
 #[derive(Debug, Clone)]
 struct PendingTotp {
@@ -110,11 +135,10 @@ struct FailureWindow {
 #[derive(Debug, thiserror::Error)]
 pub enum AuthStorageError {
     #[error(
-        "Corrupt users file '{path}': {source}. Corrupt file backed up to '{backup_path}'. Refusing to start to prevent unauthorized bootstrap; use `sito reset-admin` to recover."
+        "Corrupt users file '{path}': {source}. The corrupt file was not retained because it may contain plaintext TOTP secrets. Refusing to start to prevent unauthorized bootstrap; use `sito reset-admin` to recover."
     )]
     CorruptUsersFile {
         path: PathBuf,
-        backup_path: PathBuf,
         #[source]
         source: Box<toml::de::Error>,
     },
@@ -131,6 +155,38 @@ pub enum AuthStorageError {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error(
+        "TOTP key file '{key_path}' is missing but '{users_path}' contains encrypted TOTP secrets. Restore '{key_path}' from the same backup as 'users.toml'; restoring only one is a lockout. Refusing to start to avoid silently disabling 2FA."
+    )]
+    MissingTotpKey {
+        key_path: PathBuf,
+        users_path: PathBuf,
+    },
+    #[error(
+        "TOTP key file '{key_path}' is invalid: {reason}. Refusing to start to avoid silently disabling 2FA."
+    )]
+    InvalidTotpKey { key_path: PathBuf, reason: String },
+    #[error(
+        "Failed to decrypt the TOTP secret for user '{username}' in '{users_path}' with key '{key_path}': {reason}. Refusing to start to avoid silently disabling 2FA; restore the matching 'totp.key' or use `sito reset-admin`."
+    )]
+    TotpSecretDecrypt {
+        username: String,
+        users_path: PathBuf,
+        key_path: PathBuf,
+        reason: String,
+    },
+    #[error("Failed to encrypt the TOTP secret for user '{username}': {reason}")]
+    TotpSecretEncrypt { username: String, reason: String },
+    #[error(
+        "TOTP encryption key is unavailable while persisting '{path}'; refusing to write plaintext secrets"
+    )]
+    MissingSecretStore { path: PathBuf },
+    #[error("Failed to serialize users file '{path}': {source}")]
+    Serialize {
+        path: PathBuf,
+        #[source]
+        source: Box<toml::ser::Error>,
     },
 }
 
@@ -184,8 +240,60 @@ async fn verify_password_blocking(password: String, hash: String) -> bool {
         .unwrap_or(false)
 }
 
+/// Test-only record of `(path, thread)` for every secret-file write, used to
+/// prove that auth persistence runs off the calling runtime thread.
+#[cfg(test)]
+pub(crate) static SECRET_WRITE_THREADS: Mutex<Vec<(PathBuf, std::thread::ThreadId)>> =
+    Mutex::new(Vec::new());
+
+/// Test-only one-shot delays for the next write of a matching path. Tests use
+/// this to widen a real persistence interleaving (a slow filesystem) without
+/// changing production behavior.
+#[cfg(test)]
+pub(crate) static SECRET_WRITE_DELAYS: Mutex<Vec<(PathBuf, std::time::Duration)>> =
+    Mutex::new(Vec::new());
+
+/// Test-only one-shot signals sent when a write for a matching path has
+/// started. Kept separate from [`SECRET_WRITE_THREADS`] so a test never depends
+/// on globally cleared state.
+#[cfg(test)]
+pub(crate) static SECRET_WRITE_START_SIGNALS: Mutex<
+    Vec<(PathBuf, tokio::sync::oneshot::Sender<()>)>,
+> = Mutex::new(Vec::new());
+
 /// Atomically writes a secret file with owner-only permissions.
 fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        let signal = {
+            let mut signals = SECRET_WRITE_START_SIGNALS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            signals
+                .iter()
+                .position(|(signal_path, _)| signal_path == path)
+                .map(|index| signals.remove(index).1)
+        };
+        if let Some(sender) = signal {
+            let _ = sender.send(());
+        }
+        let delay = {
+            let mut delays = SECRET_WRITE_DELAYS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            delays
+                .iter()
+                .position(|(delayed_path, _)| delayed_path == path)
+                .map(|index| delays.remove(index).1)
+        };
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
+        SECRET_WRITE_THREADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path.to_path_buf(), std::thread::current().id()));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -227,9 +335,76 @@ fn atomic_write_secret(path: &Path, content: &str) {
     let _ = write_secret_file(path, content);
 }
 
+/// Writes a sanitized copy of `users.toml` to `backup_path`.
+///
+/// Recovery copies must not reintroduce the plaintext-at-rest problem the
+/// encrypted store fixes: legacy plaintext TOTP secrets are sealed before the
+/// backup is written. An unparseable source is never copied raw; the function
+/// logs a value-free warning and removes any pre-existing copy at
+/// `backup_path`.
+///
+/// Returns `Ok(true)` when a sanitized backup was written, `Ok(false)` when the
+/// source was unparseable and no backup was retained.
+fn write_sanitized_users_backup(
+    source: &Path,
+    backup_path: &Path,
+    store: &TotpSecretStore,
+) -> Result<bool, AuthStorageError> {
+    let content = std::fs::read_to_string(source).map_err(|e| AuthStorageError::Io {
+        path: source.to_path_buf(),
+        source: e,
+    })?;
+
+    let mut file: UsersFile = if let Ok(file) = toml::from_str(&content) {
+        file
+    } else {
+        tracing::warn!(
+            source = %source.display(),
+            "Users file is unparseable; not retaining a backup because it may contain plaintext TOTP secrets"
+        );
+        // Never leave a raw copy from an earlier attempt behind.
+        let _ = std::fs::remove_file(backup_path);
+        return Ok(false);
+    };
+
+    for user in &mut file.users {
+        let username = user.username.clone();
+        let Some(totp) = user.totp.as_mut() else {
+            continue;
+        };
+        if TotpSecretStore::is_encrypted(&totp.secret) {
+            continue;
+        }
+        totp.secret = store.seal(&username, &totp.secret).map_err(|e| {
+            AuthStorageError::TotpSecretEncrypt {
+                username,
+                reason: e.to_string(),
+            }
+        })?;
+    }
+
+    let toml_str = toml::to_string_pretty(&file).map_err(|e| AuthStorageError::Serialize {
+        path: backup_path.to_path_buf(),
+        source: Box::new(e),
+    })?;
+    write_secret_file(backup_path, &toml_str).map_err(|e| AuthStorageError::Io {
+        path: backup_path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(true)
+}
+
 /// Path of the file holding the global user-secret generation counter.
 fn auth_generation_path(data_dir: &Path) -> PathBuf {
     data_dir.join("auth_generation")
+}
+
+/// Path of the AES-256-GCM key that protects TOTP secrets in `users.toml`.
+fn totp_key_path(users_path: &Path) -> PathBuf {
+    users_path.parent().map_or_else(
+        || users_path.with_file_name("totp.key"),
+        |dir| dir.join("totp.key"),
+    )
 }
 
 /// Reads the persisted user-secret generation (`0` when no file exists).
@@ -296,13 +471,22 @@ pub struct AuthManager {
     /// Serializes second-factor verification so a backup code cannot be
     /// consumed by two concurrent requests.
     totp_verification_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes snapshot + persist of the auth state files so a stale
+    /// snapshot can never overwrite a newer revocation/creation on disk.
+    /// Held only across the snapshot and its `spawn_blocking` write; callers
+    /// must not nest `save_*_async` calls while it is held.
+    persist_lock: Arc<tokio::sync::Mutex<()>>,
     users_path: Option<PathBuf>,
     sessions_path: Option<PathBuf>,
     tokens_path: Option<PathBuf>,
     tokens_dirty: Arc<AtomicBool>,
+    sessions_dirty: Arc<AtomicBool>,
     token_default_ttl_days: u64,
     /// Global user-secret generation; sessions/tokens must match it to be valid.
     generation: u64,
+    /// AES-256-GCM key for TOTP secrets (`<data_dir>/totp.key`); `None` for
+    /// memory-only managers.
+    secret_store: Option<TotpSecretStore>,
 }
 
 impl Default for AuthManager {
@@ -419,7 +603,7 @@ impl AuthManager {
         };
 
         let generation = data_dir.map_or(0, read_auth_generation);
-        let mgr = Self {
+        let mut mgr = Self {
             users: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             tokens: Arc::new(Mutex::new(HashMap::new())),
@@ -434,12 +618,15 @@ impl AuthManager {
             setup_token_failures: Arc::new(Mutex::new(HashMap::new())),
             setup_pending_warned: Arc::new(AtomicBool::new(false)),
             totp_verification_lock: Arc::new(tokio::sync::Mutex::new(())),
+            persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             users_path,
             sessions_path,
             tokens_path,
             tokens_dirty: Arc::new(AtomicBool::new(false)),
+            sessions_dirty: Arc::new(AtomicBool::new(false)),
             token_default_ttl_days,
             generation,
+            secret_store: None,
         };
 
         if let Some(ref path) = mgr.users_path {
@@ -458,38 +645,20 @@ impl AuthManager {
                 let file: UsersFile = match toml::from_str(&content) {
                     Ok(f) => f,
                     Err(e) => {
-                        let timestamp = chrono::Utc::now().timestamp();
-                        let backup_name = format!(
-                            "{}.corrupt.{}.bak",
-                            path.file_name().unwrap_or_default().to_string_lossy(),
-                            timestamp
+                        // Do not retain a raw copy: an unparseable file may still
+                        // contain legacy plaintext TOTP secrets.
+                        tracing::warn!(
+                            path = %path.display(),
+                            "Corrupt users file detected; not retaining a backup because it may contain plaintext TOTP secrets"
                         );
-                        let backup_path = path.with_file_name(backup_name);
-                        if let Err(copy_err) = std::fs::copy(path, &backup_path) {
-                            tracing::error!(
-                                source = %path.display(),
-                                dest = %backup_path.display(),
-                                error = %copy_err,
-                                "Failed to back up corrupt users file"
-                            );
-                        } else {
-                            tracing::warn!(
-                                source = %path.display(),
-                                backup = %backup_path.display(),
-                                "Backed up corrupt users file"
-                            );
-                        }
-
                         tracing::error!(
                             path = %path.display(),
-                            backup = %backup_path.display(),
                             error = %e,
                             "Corrupt users file detected; refusing to start"
                         );
 
                         return Err(AuthStorageError::CorruptUsersFile {
                             path: path.clone(),
-                            backup_path,
                             source: Box::new(e),
                         });
                     }
@@ -503,9 +672,67 @@ impl AuthManager {
                     return Err(AuthStorageError::EmptyUsersFile { path: path.clone() });
                 }
 
+                // Resolve the TOTP encryption key before touching the users so
+                // encrypted values can never be mistaken for plaintext.
+                let key_path = totp_key_path(path);
+                let has_encrypted_totp = file.users.iter().any(|u| {
+                    u.totp
+                        .as_ref()
+                        .is_some_and(|totp| TotpSecretStore::is_encrypted(&totp.secret))
+                });
+                let store = if has_encrypted_totp {
+                    // Encrypted secrets are useless without their key: never
+                    // generate a replacement that would silently disable 2FA.
+                    TotpSecretStore::load_existing(&key_path).map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            AuthStorageError::MissingTotpKey {
+                                key_path: key_path.clone(),
+                                users_path: path.clone(),
+                            }
+                        } else {
+                            AuthStorageError::InvalidTotpKey {
+                                key_path: key_path.clone(),
+                                reason: e.to_string(),
+                            }
+                        }
+                    })?
+                } else {
+                    TotpSecretStore::load_or_create(&key_path).map_err(|e| {
+                        AuthStorageError::Io {
+                            path: key_path.clone(),
+                            source: e,
+                        }
+                    })?
+                };
+                mgr.secret_store = Some(store);
+
+                let mut migrated_plaintext = Vec::new();
+                let mut users = file.users;
+                for user in &mut users {
+                    let Some(totp) = user.totp.as_mut() else {
+                        continue;
+                    };
+                    if TotpSecretStore::is_encrypted(&totp.secret) {
+                        let store = mgr
+                            .secret_store
+                            .as_ref()
+                            .expect("key resolved for encrypted secrets");
+                        totp.secret = store.open(&user.username, &totp.secret).map_err(|e| {
+                            AuthStorageError::TotpSecretDecrypt {
+                                username: user.username.clone(),
+                                users_path: path.clone(),
+                                key_path: store.key_path().to_path_buf(),
+                                reason: e.to_string(),
+                            }
+                        })?;
+                    } else {
+                        migrated_plaintext.push(user.username.clone());
+                    }
+                }
+
                 let (has_admin, admin_default_active) = {
                     let mut map = lock(&mgr.users);
-                    for u in file.users {
+                    for u in users {
                         map.insert(u.username.clone(), u);
                     }
                     if let Some(admin) = map.get("admin") {
@@ -514,6 +741,26 @@ impl AuthManager {
                         (false, false)
                     }
                 };
+
+                // Legacy plaintext secrets are encrypted on this startup with
+                // exactly one atomic rewrite. Warnings name the account only.
+                if !migrated_plaintext.is_empty() {
+                    let (save_path, toml_str) =
+                        mgr.users_toml()?
+                            .ok_or_else(|| AuthStorageError::MissingSecretStore {
+                                path: path.clone(),
+                            })?;
+                    write_secret_file(&save_path, &toml_str).map_err(|e| AuthStorageError::Io {
+                        path: save_path,
+                        source: e,
+                    })?;
+                    for username in &migrated_plaintext {
+                        tracing::warn!(
+                            user = %username,
+                            "migrated legacy plaintext TOTP secret"
+                        );
+                    }
+                }
                 mgr.default_admin_active
                     .store(admin_default_active, Ordering::SeqCst);
                 mgr.setup_complete
@@ -533,6 +780,13 @@ impl AuthManager {
                 );
                 return Err(AuthStorageError::MissingUsersFile { path: path.clone() });
             }
+            let key_path = totp_key_path(path);
+            mgr.secret_store = Some(TotpSecretStore::load_or_create(&key_path).map_err(|e| {
+                AuthStorageError::Io {
+                    path: key_path,
+                    source: e,
+                }
+            })?);
             mgr.create_user_internal("admin", "adminadmin", Role::Admin);
             mgr.save_users();
         } else {
@@ -553,6 +807,29 @@ impl AuthManager {
         new_password: &str,
     ) -> std::io::Result<PathBuf> {
         let path = data_dir.as_ref().join("users.toml");
+        // Resolve the key before copying anything: a recovery backup must never
+        // retain legacy plaintext TOTP secrets. `reset-admin` is the recovery
+        // path, so a malformed key must not make recovery impossible: move it
+        // aside and generate a fresh one (the reset rotates credentials and
+        // invalidates existing sessions/tokens anyway).
+        let key_path = totp_key_path(&path);
+        let secret_store = match TotpSecretStore::load_or_create(&key_path) {
+            Ok(store) => store,
+            Err(e) => {
+                let backup =
+                    key_path.with_extension(format!("corrupt.{}", chrono::Utc::now().timestamp()));
+                tracing::warn!(
+                    path = %key_path.display(),
+                    backup = %backup.display(),
+                    error = %e,
+                    "Existing TOTP key is unusable; moving it aside and generating a fresh key for admin reset"
+                );
+                if key_path.exists() {
+                    std::fs::rename(&key_path, &backup)?;
+                }
+                TotpSecretStore::load_or_create(&key_path)?
+            }
+        };
         if path.exists() {
             let timestamp = chrono::Utc::now().timestamp();
             let backup_name = format!(
@@ -561,7 +838,19 @@ impl AuthManager {
                 timestamp
             );
             let backup_path = path.with_file_name(backup_name);
-            let _ = std::fs::copy(&path, &backup_path);
+            match write_sanitized_users_backup(&path, &backup_path, &secret_store) {
+                Ok(true) => tracing::warn!(
+                    source = %path.display(),
+                    backup = %backup_path.display(),
+                    "Backed up users file with TOTP secrets sealed"
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::error!(
+                    source = %path.display(),
+                    error = %e,
+                    "Failed to write sanitized users backup; no backup retained"
+                ),
+            }
         }
         // Rotate the user-secret generation *before* installing the new
         // credentials so every live session and API token is rejected as soon
@@ -590,12 +879,18 @@ impl AuthManager {
             setup_token_failures: Arc::new(Mutex::new(HashMap::new())),
             setup_pending_warned: Arc::new(AtomicBool::new(false)),
             totp_verification_lock: Arc::new(tokio::sync::Mutex::new(())),
+            persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             users_path: Some(path.clone()),
             sessions_path: None,
             tokens_path: None,
             tokens_dirty: Arc::new(AtomicBool::new(false)),
+            sessions_dirty: Arc::new(AtomicBool::new(false)),
             token_default_ttl_days: 0,
             generation,
+            // A reset replaces the account store; reuse an existing key so
+            // backups of the previous users file stay decryptable, or create
+            // one when the key was lost (the reset is the documented recovery).
+            secret_store: Some(secret_store),
         };
         mgr.create_user_internal("admin", new_password, Role::Admin);
         mgr.save_users();
@@ -603,59 +898,172 @@ impl AuthManager {
     }
 
     /// Serializes the current user accounts to TOML, returning the target path.
-    fn users_toml(&self) -> Option<(PathBuf, String)> {
-        let path = self.users_path.clone()?;
-        let users_list: Vec<UserAccount> = {
+    ///
+    /// TOTP secrets are sealed on cloned accounts, so the in-memory plaintext
+    /// (needed to verify codes) never reaches the file. An encryption failure
+    /// is returned instead of falling back to plaintext.
+    fn users_toml(&self) -> Result<Option<(PathBuf, String)>, AuthStorageError> {
+        let Some(path) = self.users_path.clone() else {
+            return Ok(None);
+        };
+        let mut users_list: Vec<UserAccount> = {
             let users = lock(&self.users);
             users.values().cloned().collect()
         };
+        for user in &mut users_list {
+            let username = user.username.clone();
+            let Some(totp) = user.totp.as_mut() else {
+                continue;
+            };
+            if TotpSecretStore::is_encrypted(&totp.secret) {
+                continue;
+            }
+            let store = self
+                .secret_store
+                .as_ref()
+                .ok_or_else(|| AuthStorageError::MissingSecretStore { path: path.clone() })?;
+            totp.secret = store.seal(&username, &totp.secret).map_err(|e| {
+                AuthStorageError::TotpSecretEncrypt {
+                    username: username.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+        }
         let file_content = UsersFile { users: users_list };
-        let toml_str = toml::to_string_pretty(&file_content).ok()?;
-        Some((path, toml_str))
+        let toml_str =
+            toml::to_string_pretty(&file_content).map_err(|e| AuthStorageError::Serialize {
+                path: path.clone(),
+                source: Box::new(e),
+            })?;
+        Ok(Some((path, toml_str)))
     }
 
     fn save_users(&self) {
-        if let Some((path, toml_str)) = self.users_toml() {
-            atomic_write_secret(&path, &toml_str);
+        match self.users_toml() {
+            Ok(Some((path, toml_str))) => atomic_write_secret(&path, &toml_str),
+            Ok(None) => {}
+            Err(e) => tracing::error!(error = %e, "Refusing to persist users file"),
         }
     }
 
     /// Persists users on the blocking pool so async handlers never perform
     /// blocking file IO on the runtime worker.
+    ///
+    /// The snapshot is taken while holding `persist_lock` and the lock is held
+    /// until the write finishes, so a stale snapshot cannot land after a newer
+    /// one. The guard is owned by the blocking task, so cancelling the caller
+    /// cannot release it before the write completes.
     async fn save_users_async(&self) {
-        let Some((path, toml_str)) = self.users_toml() else {
-            return;
+        // Use an owned guard moved into the blocking closure: if the caller is
+        // cancelled mid-write, the closure keeps the lock until the write
+        // finishes so a newer save cannot complete (and be overwritten) first.
+        let persist = self.persist_lock.clone().lock_owned().await;
+        let (path, toml_str) = match self.users_toml() {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!(error = %e, "Refusing to persist users file");
+                return;
+            }
         };
-        match tokio::task::spawn_blocking(move || write_secret_file(&path, &toml_str)).await {
+        match tokio::task::spawn_blocking(move || {
+            let _persist = persist;
+            write_secret_file(&path, &toml_str)
+        })
+        .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::error!("Failed to persist users file: {e}"),
             Err(e) => tracing::error!("Users persistence task failed: {e}"),
         }
     }
 
-    fn save_sessions(&self) {
-        let Some(ref path) = self.sessions_path else {
-            return;
-        };
+    /// Serializes the current sessions to TOML, returning the target path.
+    ///
+    /// The snapshot is taken before any blocking IO so no lock is held across
+    /// an `.await` or a filesystem write.
+    fn sessions_toml(&self) -> Option<(PathBuf, String)> {
+        let path = self.sessions_path.clone()?;
         let sessions: Vec<Session> = lock(&self.sessions).values().cloned().collect();
-        let Ok(toml_str) = toml::to_string_pretty(&SessionsFile { sessions }) else {
+        if let Ok(toml_str) = toml::to_string_pretty(&SessionsFile { sessions }) {
+            Some((path, toml_str))
+        } else {
             tracing::error!("Failed to serialize sessions to TOML");
-            return;
-        };
-        atomic_write_secret(path, &toml_str);
+            None
+        }
     }
 
-    fn save_tokens(&self) {
-        let Some(ref path) = self.tokens_path else {
-            return;
-        };
+    /// Serializes the current API tokens to TOML, returning the target path.
+    fn tokens_toml(&self) -> Option<(PathBuf, String)> {
+        let path = self.tokens_path.clone()?;
         let tokens: Vec<ApiTokenMeta> = lock(&self.tokens).values().cloned().collect();
-        let Ok(toml_str) = toml::to_string_pretty(&TokensFile { tokens }) else {
+        if let Ok(toml_str) = toml::to_string_pretty(&TokensFile { tokens }) {
+            Some((path, toml_str))
+        } else {
             tracing::error!("Failed to serialize API tokens to TOML");
+            None
+        }
+    }
+
+    /// Persists sessions on the blocking pool so async handlers never perform
+    /// blocking file IO on the runtime worker.
+    async fn save_sessions_async(&self) {
+        let persist = self.persist_lock.clone().lock_owned().await;
+        let Some((path, toml_str)) = self.sessions_toml() else {
+            self.sessions_dirty.store(false, Ordering::SeqCst);
             return;
         };
-        atomic_write_secret(path, &toml_str);
-        self.tokens_dirty.store(false, Ordering::SeqCst);
+        // Mark dirty before writing so a failed write is retried by the pruner
+        // instead of being lost until the next explicit session mutation.
+        self.sessions_dirty.store(true, Ordering::SeqCst);
+        let sessions_dirty = self.sessions_dirty.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _persist = persist;
+            let result = write_secret_file(&path, &toml_str);
+            if result.is_ok() {
+                // Clear while the persist guard is still held: a newer save
+                // woken by its release must not be able to set the flag again
+                // and then have this older caller clear it after a failure.
+                sessions_dirty.store(false, Ordering::SeqCst);
+            }
+            result
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("Failed to persist sessions file: {e}"),
+            Err(e) => tracing::error!("Sessions persistence task failed: {e}"),
+        }
+    }
+
+    /// Persists API tokens on the blocking pool. The dirty flag is set before
+    /// the write and cleared only after success, so a failed write is retried
+    /// by the pruner.
+    async fn save_tokens_async(&self) {
+        let persist = self.persist_lock.clone().lock_owned().await;
+        let Some((path, toml_str)) = self.tokens_toml() else {
+            self.tokens_dirty.store(false, Ordering::SeqCst);
+            return;
+        };
+        self.tokens_dirty.store(true, Ordering::SeqCst);
+        let tokens_dirty = self.tokens_dirty.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _persist = persist;
+            let result = write_secret_file(&path, &toml_str);
+            if result.is_ok() {
+                // Clear while the persist guard is still held: a newer save
+                // woken by its release must not be able to set the flag again
+                // and then have this older caller clear it after a failure.
+                tokens_dirty.store(false, Ordering::SeqCst);
+            }
+            result
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("Failed to persist API tokens file: {e}"),
+            Err(e) => tracing::error!("API tokens persistence task failed: {e}"),
+        }
     }
 
     fn load_sessions(&self) {
@@ -918,42 +1326,111 @@ impl AuthManager {
             .count()
     }
 
-    /// Updates a user's role, revoking their sessions (a role change must take
-    /// effect immediately). Returns false when the user does not exist.
-    pub fn set_user_role(&self, username: &str, role: Role) -> bool {
+    /// Updates a user's role, revoking their sessions and owned API tokens (a
+    /// role change must take effect immediately). Returns false when the user
+    /// does not exist.
+    ///
+    /// This variant does not check the last-admin invariant; request handlers
+    /// must use [`Self::set_user_role_checked`].
+    pub async fn set_user_role(&self, username: &str, role: Role) -> bool {
+        self.set_user_role_inner(username, role, false)
+            .await
+            .is_ok()
+    }
+
+    /// Atomically updates a user's role while protecting the last remaining
+    /// Admin account.
+    ///
+    /// The last-admin check and the mutation happen under the same users lock,
+    /// so two concurrent demotions cannot both pass. Returns whether the role
+    /// actually changed, or a distinct [`UserMutationError`].
+    pub async fn set_user_role_checked(
+        &self,
+        username: &str,
+        role: Role,
+    ) -> Result<bool, UserMutationError> {
+        self.set_user_role_inner(username, role, true).await
+    }
+
+    async fn set_user_role_inner(
+        &self,
+        username: &str,
+        role: Role,
+        protect_last_admin: bool,
+    ) -> Result<bool, UserMutationError> {
         let changed = {
             let mut users = lock(&self.users);
-            match users.get_mut(username) {
-                Some(user) => {
-                    if user.role == role {
-                        return true;
-                    }
-                    user.role = role;
-                    true
-                }
-                None => false,
+            let admin_count = users.values().filter(|u| u.role == Role::Admin).count();
+            let Some(user) = users.get_mut(username) else {
+                return Err(UserMutationError::NotFound);
+            };
+            if protect_last_admin
+                && user.role == Role::Admin
+                && role != Role::Admin
+                && admin_count <= 1
+            {
+                return Err(UserMutationError::LastAdmin);
             }
+            let changed = user.role != role;
+            user.role = role;
+            changed
         };
         if changed {
-            self.purge_user_sessions(username);
-            self.save_users();
+            self.purge_user_sessions(username).await;
+            // An Admin-scoped token must not survive a demotion, and a
+            // promotion changes the account's effective privileges too.
+            self.revoke_tokens_for_owner(username).await;
+            self.save_users_async().await;
         }
-        changed
+        Ok(changed)
     }
 
     /// Deletes a user account by username. Returns true if the user existed and was removed.
-    pub fn delete_user(&self, username: &str) -> bool {
-        let removed = lock(&self.users).remove(username).is_some();
-        if removed {
-            if username == "admin" {
-                self.default_admin_active.store(false, Ordering::SeqCst);
+    ///
+    /// This variant does not check the last-admin invariant; request handlers
+    /// must use [`Self::delete_user_checked`].
+    pub async fn delete_user(&self, username: &str) -> bool {
+        self.delete_user_inner(username, false).await.is_ok()
+    }
+
+    /// Atomically deletes a user account while protecting the last remaining
+    /// Admin account.
+    ///
+    /// The last-admin check and the removal happen under the same users lock,
+    /// so concurrent deletions/demotions cannot both pass.
+    pub async fn delete_user_checked(&self, username: &str) -> Result<(), UserMutationError> {
+        self.delete_user_inner(username, true).await
+    }
+
+    async fn delete_user_inner(
+        &self,
+        username: &str,
+        protect_last_admin: bool,
+    ) -> Result<(), UserMutationError> {
+        {
+            let mut users = lock(&self.users);
+            let Some(role) = users.get(username).map(|user| user.role) else {
+                return Err(UserMutationError::NotFound);
+            };
+            if protect_last_admin
+                && role == Role::Admin
+                && users.values().filter(|u| u.role == Role::Admin).count() <= 1
+            {
+                return Err(UserMutationError::LastAdmin);
             }
-            // A deleted account must lose access immediately: sessions are
-            // not re-validated against the user table on every request.
-            self.purge_user_sessions(username);
-            self.save_users();
+            users.remove(username);
         }
-        removed
+        if username == "admin" {
+            self.default_admin_active.store(false, Ordering::SeqCst);
+        }
+        // A deleted account must lose access immediately: sessions are
+        // not re-validated against the user table on every request.
+        self.purge_user_sessions(username).await;
+        // API tokens are credentials for the account too: never leave
+        // them usable after the account is gone.
+        self.revoke_tokens_for_owner(username).await;
+        self.save_users_async().await;
+        Ok(())
     }
 
     /// Returns true if the default bootstrapped admin user is still active with default password.
@@ -972,22 +1449,39 @@ impl AuthManager {
             tracing::error!(user = username, "Failed to hash password for new user");
             return;
         };
-        if username == "admin" {
-            self.default_admin_active
-                .store(is_default, Ordering::SeqCst);
-        }
         let user = UserAccount {
             username: username.to_string(),
             password_hash: hash,
             role,
             totp: None,
         };
-        let existed = lock(&self.users)
-            .insert(username.to_string(), user)
-            .is_some();
+        let existed = {
+            let mut users = lock(&self.users);
+            if let Some(existing) = users.get(username)
+                && existing.role == Role::Admin
+                && role != Role::Admin
+                && users.values().filter(|u| u.role == Role::Admin).count() <= 1
+            {
+                // The internal create path can overwrite an existing
+                // account. Never let that remove the sole remaining Admin,
+                // even though request handlers already reject duplicates.
+                tracing::error!(
+                    user = %username,
+                    "Refusing to overwrite the last remaining Admin with a non-Admin role"
+                );
+                return;
+            }
+            users.insert(username.to_string(), user).is_some()
+        };
+        if username == "admin" {
+            self.default_admin_active
+                .store(is_default, Ordering::SeqCst);
+        }
         if existed {
-            // Overwriting an account (new password/role) revokes its sessions.
-            self.purge_user_sessions(username);
+            // Overwriting an account (new password/role) revokes its sessions
+            // and credentials so the previous identity cannot keep access.
+            self.purge_user_sessions(username).await;
+            self.revoke_tokens_for_owner(username).await;
         }
         self.save_users_async().await;
     }
@@ -1016,7 +1510,10 @@ impl AuthManager {
                 .store(is_default, Ordering::SeqCst);
         }
         self.save_users_async().await;
-        self.purge_user_sessions(username);
+        self.purge_user_sessions(username).await;
+        // A password change invalidates every credential derived from the old
+        // password, including owned API tokens.
+        self.revoke_tokens_for_owner(username).await;
         true
     }
 
@@ -1036,40 +1533,45 @@ impl AuthManager {
         exists && verified
     }
 
-    /// Removes all active sessions belonging to a user (used after credential changes).
-    pub fn purge_user_sessions(&self, username: &str) {
-        let removed = {
-            let mut sessions = lock(&self.sessions);
-            let before = sessions.len();
-            sessions.retain(|_, session| session.username != username);
-            sessions.len() != before
-        };
-        if removed {
-            self.save_sessions();
+    /// Removes all active sessions belonging to a user (used after credential
+    /// changes) and persists the revocation.
+    pub async fn purge_user_sessions(&self, username: &str) {
+        if self.purge_user_sessions_in_memory(username) {
+            self.save_sessions_async().await;
         }
     }
 
-    fn insert_session(&self, session: Session) {
-        let session = session.with_generation(self.generation);
+    /// In-memory half of [`purge_user_sessions`]; returns whether anything was
+    /// removed. Kept separate so callers can batch the persistence step.
+    fn purge_user_sessions_in_memory(&self, username: &str) -> bool {
         let mut sessions = lock(&self.sessions);
-        if !sessions.contains_key(&session.id) && sessions.len() >= MAX_SESSIONS {
-            sessions.retain(|_, s| !s.is_expired());
-            // Deterministic eviction: oldest created_at first, then earliest
-            // expiry, then id for total ordering.
-            while sessions.len() >= MAX_SESSIONS {
-                let Some(oldest_key) = sessions
-                    .values()
-                    .min_by_key(|s| (s.created_at, s.expires_at, s.id.clone()))
-                    .map(|s| s.id.clone())
-                else {
-                    break;
-                };
-                sessions.remove(&oldest_key);
+        let before = sessions.len();
+        sessions.retain(|_, session| session.username != username);
+        sessions.len() != before
+    }
+
+    async fn insert_session(&self, session: Session) {
+        let session = session.with_generation(self.generation);
+        {
+            let mut sessions = lock(&self.sessions);
+            if !sessions.contains_key(&session.id) && sessions.len() >= MAX_SESSIONS {
+                sessions.retain(|_, s| !s.is_expired());
+                // Deterministic eviction: oldest created_at first, then earliest
+                // expiry, then id for total ordering.
+                while sessions.len() >= MAX_SESSIONS {
+                    let Some(oldest_key) = sessions
+                        .values()
+                        .min_by_key(|s| (s.created_at, s.expires_at, s.id.clone()))
+                        .map(|s| s.id.clone())
+                    else {
+                        break;
+                    };
+                    sessions.remove(&oldest_key);
+                }
             }
+            sessions.insert(session.id.clone(), session);
         }
-        sessions.insert(session.id.clone(), session);
-        drop(sessions);
-        self.save_sessions();
+        self.save_sessions_async().await;
     }
 
     // ------------------------------------------------------------------
@@ -1174,7 +1676,7 @@ impl AuthManager {
         // Authentication successful
         self.lockout.record_success(username);
         let session = Session::new(username, role, self.session_ttl_secs);
-        self.insert_session(session.clone());
+        self.insert_session(session.clone()).await;
         LoginResult::Success(session)
     }
 
@@ -1266,10 +1768,10 @@ impl AuthManager {
                     user.totp = Some(updated_totp);
                 }
             }
-            self.save_users();
+            self.save_users_async().await;
 
             let session = Session::new(&username, role, self.session_ttl_secs);
-            self.insert_session(session.clone());
+            self.insert_session(session.clone()).await;
             return TotpVerifyResult::Success(session);
         }
 
@@ -1368,7 +1870,7 @@ impl AuthManager {
         }
         self.save_users_async().await;
         // Changing the second factor invalidates existing sessions.
-        self.purge_user_sessions(username);
+        self.purge_user_sessions(username).await;
         true
     }
 
@@ -1417,17 +1919,26 @@ impl AuthManager {
     }
 
     /// Disables TOTP 2FA for a user and invalidates their sessions.
-    pub fn disable_totp(&self, username: &str) -> bool {
-        let mut users = lock(&self.users);
-        if let Some(user) = users.get_mut(username) {
-            user.totp = None;
-            drop(users);
-            self.save_users();
-            self.purge_user_sessions(username);
-            true
-        } else {
-            false
+    pub async fn disable_totp(&self, username: &str) -> bool {
+        let found = {
+            let mut users = lock(&self.users);
+            match users.get_mut(username) {
+                Some(user) => {
+                    user.totp = None;
+                    true
+                }
+                None => false,
+            }
+        };
+        if !found {
+            return false;
         }
+        self.purge_user_sessions(username).await;
+        // Disabling a second factor is a credential change: owned API tokens
+        // must not outlive it.
+        self.revoke_tokens_for_owner(username).await;
+        self.save_users_async().await;
+        true
     }
 
     /// Validates an active session from a cookie.
@@ -1450,40 +1961,100 @@ impl AuthManager {
     }
 
     /// Logs out and destroys an active session.
-    pub fn logout(&self, session_id: &str) {
+    pub async fn logout(&self, session_id: &str) {
         let removed = lock(&self.sessions).remove(session_id).is_some();
         if removed {
-            self.save_sessions();
+            self.save_sessions_async().await;
         }
     }
 
-    /// Creates a new API token with the specified scope.
-    pub fn create_token(&self, name: &str, scope: Role) -> (ApiTokenMeta, CreateTokenResponse) {
+    /// Revokes every API token owned by `username` and persists the change.
+    ///
+    /// Legacy ownerless tokens are intentionally not matched: they are not
+    /// tied to an account and remain Admin-managed.
+    pub async fn revoke_tokens_for_owner(&self, username: &str) {
+        if self.revoke_tokens_for_owner_in_memory(username) {
+            self.save_tokens_async().await;
+        }
+    }
+
+    /// In-memory half of [`revoke_tokens_for_owner`]; returns whether anything
+    /// was removed so callers can skip an unnecessary persistence write.
+    fn revoke_tokens_for_owner_in_memory(&self, username: &str) -> bool {
+        let mut tokens = lock(&self.tokens);
+        let before = tokens.len();
+        tokens.retain(|_, token| token.owner.as_deref() != Some(username));
+        tokens.len() != before
+    }
+
+    /// Creates a new API token owned by `owner`.
+    ///
+    /// A single owner may hold at most [`MAX_API_TOKENS_PER_OWNER`] tokens;
+    /// creating one more evicts that owner's oldest token. At the global
+    /// capacity limit only a token owned by the same account is evicted
+    /// (oldest first). If the owner has no token to evict, the create fails
+    /// instead of silently deleting another account's credential.
+    pub async fn create_token(
+        &self,
+        name: &str,
+        scope: Role,
+        owner: Option<&str>,
+    ) -> Result<(ApiTokenMeta, CreateTokenResponse), CreateTokenError> {
         let (mut meta, resp) = generate_token(name, scope);
         meta.generation = self.generation;
+        meta.owner = owner.map(str::to_string);
         if self.token_default_ttl_days > 0 {
             let ttl_secs = i64::try_from(self.token_default_ttl_days)
                 .unwrap_or(i64::MAX / 86_400)
                 .saturating_mul(86_400);
             meta.expires_at = Some(chrono::Utc::now().timestamp().saturating_add(ttl_secs));
         }
-        let mut tokens = lock(&self.tokens);
-        let now = chrono::Utc::now().timestamp();
-        tokens.retain(|_, t| t.expires_at.is_none_or(|exp| now < exp));
-        while tokens.len() >= MAX_API_TOKENS {
-            let Some(oldest_key) = tokens
-                .iter()
-                .min_by_key(|(_, t)| (t.created_at, t.id.clone()))
-                .map(|(k, _)| k.clone())
-            else {
-                break;
-            };
-            tokens.remove(&oldest_key);
+        {
+            let mut tokens = lock(&self.tokens);
+            let now = chrono::Utc::now().timestamp();
+            tokens.retain(|_, t| t.expires_at.is_none_or(|exp| now < exp));
+
+            // Per-owner quota. Legacy ownerless tokens are not an owner and
+            // keep relying on the global cap below. The loop also trims state
+            // persisted before the per-owner quota existed.
+            if let Some(owner_name) = owner {
+                loop {
+                    let owner_count = tokens
+                        .values()
+                        .filter(|token| token.owner.as_deref() == Some(owner_name))
+                        .count();
+                    if owner_count < MAX_API_TOKENS_PER_OWNER {
+                        break;
+                    }
+                    let oldest_key = tokens
+                        .iter()
+                        .filter(|(_, token)| token.owner.as_deref() == Some(owner_name))
+                        .min_by_key(|(_, token)| (token.created_at, token.id.clone()))
+                        .map(|(key, _)| key.clone());
+                    let Some(key) = oldest_key else {
+                        break;
+                    };
+                    tokens.remove(&key);
+                }
+            }
+
+            if tokens.len() >= MAX_API_TOKENS {
+                let oldest_same_owner = tokens
+                    .iter()
+                    .filter(|(_, t)| t.owner.as_deref() == owner)
+                    .min_by_key(|(_, t)| (t.created_at, t.id.clone()))
+                    .map(|(k, _)| k.clone());
+                match oldest_same_owner {
+                    Some(key) => {
+                        tokens.remove(&key);
+                    }
+                    None => return Err(CreateTokenError::CapacityReached),
+                }
+            }
+            tokens.insert(meta.hash.clone(), meta.clone());
         }
-        tokens.insert(meta.hash.clone(), meta.clone());
-        drop(tokens);
-        self.save_tokens();
-        (meta, resp)
+        self.save_tokens_async().await;
+        Ok((meta, resp))
     }
 
     /// Lists all active API tokens.
@@ -1492,23 +2063,34 @@ impl AuthManager {
     }
 
     /// Revokes an API token by ID.
-    pub fn delete_token(&self, id: &str) -> bool {
-        let mut tokens = lock(&self.tokens);
-        if let Some(key) = tokens
-            .iter()
-            .find(|(_, m)| m.id == id)
-            .map(|(k, _)| k.clone())
-        {
-            tokens.remove(&key);
-            drop(tokens);
-            self.save_tokens();
-            true
-        } else {
-            false
+    pub async fn delete_token(&self, id: &str) -> bool {
+        let removed = {
+            let mut tokens = lock(&self.tokens);
+            if let Some(key) = tokens
+                .iter()
+                .find(|(_, m)| m.id == id)
+                .map(|(k, _)| k.clone())
+            {
+                tokens.remove(&key);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.save_tokens_async().await;
         }
+        removed
     }
 
     /// Validates a bearer API token string against stored Blake3 hashes using constant-time comparison.
+    ///
+    /// This stays synchronous because it runs in the request extractor. A token
+    /// that is expired or was issued under a previous auth generation is
+    /// removed from memory and the store is marked dirty; the background
+    /// pruner persists that removal within 60 seconds. Revocation is effective
+    /// immediately on every replica (the in-memory entry is gone and the
+    /// generation check rejects stale copies), only the on-disk snapshot lags.
     pub fn validate_token(&self, token: &str) -> Option<ApiTokenMeta> {
         let hash = hash_token(token);
         let hash_bytes = hash.as_bytes();
@@ -1530,8 +2112,7 @@ impl AuthManager {
                 .is_some_and(|meta| meta.generation != self.generation)
             {
                 tokens.remove(&key);
-                drop(tokens);
-                self.save_tokens();
+                self.tokens_dirty.store(true, Ordering::SeqCst);
                 return None;
             }
             if tokens
@@ -1540,8 +2121,7 @@ impl AuthManager {
                 .is_some_and(|expires_at| now >= expires_at)
             {
                 tokens.remove(&key);
-                drop(tokens);
-                self.save_tokens();
+                self.tokens_dirty.store(true, Ordering::SeqCst);
                 return None;
             }
             if let Some(meta) = tokens.get_mut(&key) {
@@ -1555,7 +2135,7 @@ impl AuthManager {
 
     /// Prunes expired sessions, partial tokens, pending TOTP setups, API
     /// tokens and rate-limit state.
-    pub fn prune(&self) {
+    pub async fn prune(&self) {
         self.lockout.prune();
         let sessions_changed = {
             let mut sessions = lock(&self.sessions);
@@ -1563,8 +2143,8 @@ impl AuthManager {
             sessions.retain(|_, s| !s.is_expired());
             sessions.len() != before
         };
-        if sessions_changed {
-            self.save_sessions();
+        if sessions_changed || self.sessions_dirty.load(Ordering::SeqCst) {
+            self.save_sessions_async().await;
         }
         let tokens_changed = {
             let now = chrono::Utc::now().timestamp();
@@ -1574,7 +2154,7 @@ impl AuthManager {
             tokens.len() != before
         };
         if tokens_changed || self.tokens_dirty.load(Ordering::SeqCst) {
-            self.save_tokens();
+            self.save_tokens_async().await;
         }
         {
             let now = Instant::now();
@@ -1641,7 +2221,7 @@ impl AuthManager {
                         }
                     }
                     _ = interval.tick() => {
-                        mgr.prune();
+                        mgr.prune().await;
                     }
                 }
             }
@@ -1694,6 +2274,30 @@ impl AuthManager {
 mod tests {
     use super::*;
 
+    fn auth_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sito_auth_{label}_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn in_memory_totp_secret(mgr: &AuthManager, username: &str) -> String {
+        lock(&mgr.users)
+            .get(username)
+            .and_then(|u| u.totp.as_ref())
+            .map(|t| t.secret.clone())
+            .expect("user has TOTP configured")
+    }
+
+    async fn enable_totp(mgr: &AuthManager, username: &str) -> TotpSetupResponse {
+        let setup = mgr.init_totp_setup(username).await.expect("totp setup");
+        assert!(
+            mgr.confirm_totp_setup(username, &setup.backup_codes[0])
+                .await,
+            "TOTP setup must be confirmed"
+        );
+        setup
+    }
+
     #[tokio::test]
     async fn test_auth_manager_login_and_session() {
         let mgr = AuthManager::new();
@@ -1703,7 +2307,7 @@ mod tests {
                 assert_eq!(session.username, "admin");
                 assert_eq!(session.role, Role::Admin);
                 assert!(mgr.validate_session(&session.id).is_some());
-                mgr.logout(&session.id);
+                mgr.logout(&session.id).await;
                 assert!(mgr.validate_session(&session.id).is_none());
             }
             _ => panic!("Expected successful login"),
@@ -1843,7 +2447,7 @@ mod tests {
         };
         assert!(mgr.validate_session(&session.id).is_some());
 
-        assert!(mgr.delete_user("admin"));
+        assert!(mgr.delete_user("admin").await);
         assert!(
             mgr.validate_session(&session.id).is_none(),
             "a deleted account's sessions must be invalidated"
@@ -1853,25 +2457,482 @@ mod tests {
     #[tokio::test]
     async fn test_auth_manager_api_tokens() {
         let mgr = AuthManager::new();
-        let (meta, resp) = mgr.create_token("grafana", Role::Viewer);
+        let (meta, resp) = mgr
+            .create_token("grafana", Role::Viewer, Some("admin"))
+            .await
+            .expect("token");
 
         assert_eq!(mgr.list_tokens().len(), 1);
         let validated = mgr.validate_token(&resp.token).expect("valid token");
         assert_eq!(validated.id, meta.id);
         assert_eq!(validated.scope, Role::Viewer);
+        assert_eq!(validated.owner.as_deref(), Some("admin"));
 
-        assert!(mgr.delete_token(&meta.id));
+        assert!(mgr.delete_token(&meta.id).await);
         assert!(mgr.validate_token(&resp.token).is_none());
         assert_eq!(mgr.list_tokens().len(), 0);
     }
 
-    #[test]
-    fn test_api_token_cap_evicts() {
+    #[tokio::test]
+    async fn test_api_token_cap_evicts() {
         let mgr = AuthManager::new();
         for i in 0..(MAX_API_TOKENS + 5) {
-            mgr.create_token(&format!("tok-{i}"), Role::Viewer);
+            mgr.create_token(&format!("tok-{i}"), Role::Viewer, None)
+                .await
+                .expect("token");
         }
         assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
+    }
+
+    #[tokio::test]
+    async fn test_api_token_capacity_never_evicts_another_owners_token() {
+        let mgr = AuthManager::new();
+        // Fill the global store to MAX_API_TOKENS with owned tokens only:
+        // 15 owners at the per-owner quota plus a 16th owner.
+        for owner in 0..(MAX_API_TOKENS / MAX_API_TOKENS_PER_OWNER - 1) {
+            let owner = format!("owner-{owner}");
+            for i in 0..MAX_API_TOKENS_PER_OWNER {
+                create_owned_token(&mgr, &owner, &format!("{owner}-{i}")).await;
+            }
+        }
+        for i in 0..MAX_API_TOKENS_PER_OWNER {
+            create_owned_token(&mgr, "admin", &format!("admin-{i}")).await;
+        }
+        assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
+
+        let err = mgr
+            .create_token("viewer-new", Role::Viewer, Some("viewer"))
+            .await
+            .expect_err("full store must not evict another owner's token");
+        assert_eq!(err, CreateTokenError::CapacityReached);
+        assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
+        assert!(
+            mgr.list_tokens().iter().all(|token| token.owner.is_some()),
+            "the failed create must not have evicted another owner's token"
+        );
+
+        // The same owner can still rotate its oldest token at the global cap.
+        mgr.create_token("admin-new", Role::Admin, Some("admin"))
+            .await
+            .expect("same-owner rotation");
+        assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
+        assert!(
+            mgr.list_tokens()
+                .iter()
+                .any(|token| token.name == "admin-new")
+        );
+        assert_eq!(
+            mgr.list_tokens()
+                .iter()
+                .filter(|token| token.owner.as_deref() == Some("owner-0"))
+                .count(),
+            MAX_API_TOKENS_PER_OWNER,
+            "another owner's tokens must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_global_cap_evicts_only_same_owner_below_per_owner_quota() {
+        let mgr = AuthManager::new();
+        // 15 owners at the per-owner quota => 240 tokens.
+        for owner in 0..(MAX_API_TOKENS / MAX_API_TOKENS_PER_OWNER - 1) {
+            let owner = format!("owner-{owner}");
+            for i in 0..MAX_API_TOKENS_PER_OWNER {
+                create_owned_token(&mgr, &owner, &format!("{owner}-{i}")).await;
+            }
+        }
+        // A 16th owner with 15 tokens => 255, leaving one free global slot.
+        let partial_owner = "owner-partial";
+        for i in 0..(MAX_API_TOKENS_PER_OWNER - 1) {
+            create_owned_token(&mgr, partial_owner, &format!("partial-{i}")).await;
+        }
+        assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS - 1);
+
+        // The requester owns exactly one token and is below the per-owner
+        // quota, so only the global same-owner branch can make room.
+        create_owned_token(&mgr, "solo", "solo-old").await;
+        assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
+
+        create_owned_token(&mgr, "solo", "solo-new").await;
+
+        assert_eq!(mgr.list_tokens().len(), MAX_API_TOKENS);
+        assert_eq!(
+            owned_token_names(&mgr, "solo"),
+            vec!["solo-new".to_string()],
+            "the global cap must evict the requester's own oldest token"
+        );
+        assert_eq!(
+            owned_token_names(&mgr, partial_owner).len(),
+            MAX_API_TOKENS_PER_OWNER - 1,
+            "other owners' tokens must survive the global same-owner eviction"
+        );
+        assert_eq!(
+            owned_token_names(&mgr, "owner-0").len(),
+            MAX_API_TOKENS_PER_OWNER,
+            "other owners' tokens must survive the global same-owner eviction"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_user_revokes_owned_tokens() {
+        let mgr = AuthManager::new();
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        let (alice_token, _) = mgr
+            .create_token("alice-token", Role::Operator, Some("alice"))
+            .await
+            .expect("alice token");
+        let (admin_token, _) = mgr
+            .create_token("admin-token", Role::Admin, Some("admin"))
+            .await
+            .expect("admin token");
+        mgr.create_token("legacy", Role::Viewer, None)
+            .await
+            .expect("legacy token");
+
+        assert!(mgr.delete_user("alice").await);
+
+        let ids: Vec<String> = mgr
+            .list_tokens()
+            .into_iter()
+            .map(|token| token.id)
+            .collect();
+        assert!(
+            !ids.contains(&alice_token.id),
+            "deleting a user must revoke their API tokens"
+        );
+        assert!(ids.contains(&admin_token.id));
+        assert_eq!(ids.len(), 2, "admin-owned and legacy tokens must survive");
+    }
+
+    #[tokio::test]
+    async fn test_token_owner_persists_and_delete_user_removes_it_from_disk() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_token_owner_persist_{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        {
+            let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+            mgr.create_user("alice", "AlicePassword1", Role::Operator)
+                .await;
+            mgr.create_token("alice-persisted", Role::Operator, Some("alice"))
+                .await
+                .expect("alice token");
+        }
+
+        let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        let reloaded = mgr
+            .list_tokens()
+            .into_iter()
+            .find(|token| token.name == "alice-persisted")
+            .expect("token must survive reload");
+        assert_eq!(reloaded.owner.as_deref(), Some("alice"));
+
+        assert!(mgr.delete_user("alice").await);
+        assert!(
+            !mgr.list_tokens()
+                .iter()
+                .any(|token| token.name == "alice-persisted")
+        );
+        drop(mgr);
+
+        let tokens_toml = std::fs::read_to_string(temp_dir.join("tokens.toml")).unwrap();
+        assert!(
+            !tokens_toml.contains("alice-persisted"),
+            "deletion must rewrite tokens.toml without the owned token"
+        );
+
+        let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        assert!(
+            !mgr.list_tokens()
+                .iter()
+                .any(|token| token.name == "alice-persisted"),
+            "the deletion must survive a reload"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn owned_token_names(mgr: &AuthManager, owner: &str) -> Vec<String> {
+        let mut names: Vec<String> = mgr
+            .list_tokens()
+            .into_iter()
+            .filter(|token| token.owner.as_deref() == Some(owner))
+            .map(|token| token.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    async fn create_owned_token(mgr: &AuthManager, owner: &str, name: &str) {
+        mgr.create_token(name, Role::Viewer, Some(owner))
+            .await
+            .expect("owned token");
+    }
+
+    #[tokio::test]
+    async fn test_password_change_revokes_owned_tokens() {
+        let dir = auth_temp_dir("pw_revokes_tokens");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            mgr.create_user("alice", "AlicePassword1", Role::Operator)
+                .await;
+            create_owned_token(&mgr, "alice", "alice-token").await;
+            create_owned_token(&mgr, "admin", "admin-token").await;
+            mgr.create_token("legacy", Role::Viewer, None)
+                .await
+                .expect("legacy token");
+
+            assert!(mgr.update_user_password("alice", "AlicePassword2").await);
+            assert!(
+                owned_token_names(&mgr, "alice").is_empty(),
+                "a password change must revoke the account's API tokens"
+            );
+            assert_eq!(
+                owned_token_names(&mgr, "admin"),
+                vec!["admin-token".to_string()]
+            );
+            assert!(
+                mgr.list_tokens().iter().any(|token| token.name == "legacy"),
+                "legacy ownerless tokens stay Admin-managed"
+            );
+        }
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            owned_token_names(&mgr, "alice").is_empty(),
+            "password-change token revocation must survive a reload"
+        );
+        assert!(
+            mgr.list_tokens()
+                .iter()
+                .any(|token| token.name == "admin-token")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_disable_totp_revokes_owned_tokens() {
+        let dir = auth_temp_dir("totp_revokes_tokens");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            mgr.create_user("alice", "AlicePassword1", Role::Operator)
+                .await;
+            enable_totp(&mgr, "alice").await;
+            create_owned_token(&mgr, "alice", "alice-token").await;
+            create_owned_token(&mgr, "admin", "admin-token").await;
+
+            assert!(mgr.disable_totp("alice").await);
+            assert!(
+                owned_token_names(&mgr, "alice").is_empty(),
+                "disabling TOTP must revoke the account's API tokens"
+            );
+            assert_eq!(
+                owned_token_names(&mgr, "admin"),
+                vec!["admin-token".to_string()]
+            );
+        }
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            owned_token_names(&mgr, "alice").is_empty(),
+            "TOTP-disable token revocation must survive a reload"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_role_change_revokes_owned_tokens() {
+        let dir = auth_temp_dir("role_revokes_tokens");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            mgr.create_user("alice", "AlicePassword1", Role::Operator)
+                .await;
+            create_owned_token(&mgr, "alice", "before-demotion").await;
+            create_owned_token(&mgr, "admin", "admin-token").await;
+            mgr.create_token("legacy", Role::Viewer, None)
+                .await
+                .expect("legacy token");
+
+            // Exercise the handler-facing checked path.
+            assert_eq!(
+                mgr.set_user_role_checked("alice", Role::Viewer).await,
+                Ok(true)
+            );
+            assert!(
+                owned_token_names(&mgr, "alice").is_empty(),
+                "demotion must revoke existing tokens so the old scope cannot survive"
+            );
+            assert_eq!(
+                owned_token_names(&mgr, "admin"),
+                vec!["admin-token".to_string()]
+            );
+            assert!(mgr.list_tokens().iter().any(|token| token.name == "legacy"));
+        }
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            owned_token_names(&mgr, "alice").is_empty(),
+            "demotion token revocation must survive a reload"
+        );
+        assert_eq!(
+            owned_token_names(&mgr, "admin"),
+            vec!["admin-token".to_string()]
+        );
+        assert!(mgr.list_tokens().iter().any(|token| token.name == "legacy"));
+
+        // Promotion also revokes, and must persist.
+        create_owned_token(&mgr, "alice", "before-promotion").await;
+        assert_eq!(
+            mgr.set_user_role_checked("alice", Role::Admin).await,
+            Ok(true)
+        );
+        assert!(
+            owned_token_names(&mgr, "alice").is_empty(),
+            "promotion also revokes existing tokens"
+        );
+        drop(mgr);
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            owned_token_names(&mgr, "alice").is_empty(),
+            "promotion token revocation must survive a reload"
+        );
+        assert_eq!(
+            owned_token_names(&mgr, "admin"),
+            vec!["admin-token".to_string()]
+        );
+        assert!(mgr.list_tokens().iter().any(|token| token.name == "legacy"));
+
+        // A no-op role update must not revoke anything, before or after reload.
+        create_owned_token(&mgr, "alice", "unchanged-role").await;
+        assert_eq!(
+            mgr.set_user_role_checked("alice", Role::Admin).await,
+            Ok(false)
+        );
+        assert!(
+            mgr.list_tokens()
+                .iter()
+                .any(|token| token.name == "unchanged-role"),
+            "setting the same role must not revoke tokens"
+        );
+        drop(mgr);
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            mgr.list_tokens()
+                .iter()
+                .any(|token| token.name == "unchanged-role"),
+            "a no-op role update must not revoke tokens across reload"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_overwriting_user_revokes_owned_tokens() {
+        let dir = auth_temp_dir("overwrite_revokes_tokens");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            mgr.create_user("alice", "AlicePassword1", Role::Operator)
+                .await;
+            create_owned_token(&mgr, "alice", "alice-old").await;
+            create_owned_token(&mgr, "admin", "admin-token").await;
+            mgr.create_token("legacy", Role::Viewer, None)
+                .await
+                .expect("legacy token");
+
+            mgr.create_user("alice", "AlicePassword2", Role::Viewer)
+                .await;
+            assert!(
+                owned_token_names(&mgr, "alice").is_empty(),
+                "overwriting a user account must revoke its API tokens"
+            );
+            assert_eq!(
+                owned_token_names(&mgr, "admin"),
+                vec!["admin-token".to_string()]
+            );
+            assert!(mgr.list_tokens().iter().any(|token| token.name == "legacy"));
+        }
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            owned_token_names(&mgr, "alice").is_empty(),
+            "overwrite token revocation must survive a reload"
+        );
+        assert_eq!(
+            owned_token_names(&mgr, "admin"),
+            vec!["admin-token".to_string()]
+        );
+        assert!(mgr.list_tokens().iter().any(|token| token.name == "legacy"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_per_owner_token_quota_evicts_only_that_owner() {
+        let mgr = AuthManager::new();
+        let (bob_token, _) = mgr
+            .create_token("bob-keep", Role::Viewer, Some("bob"))
+            .await
+            .expect("bob token");
+
+        for i in 0..MAX_API_TOKENS_PER_OWNER {
+            create_owned_token(&mgr, "alice", &format!("alice-{i}")).await;
+            // Keep created_at strictly increasing so "oldest" is unambiguous.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let alice_before = owned_token_names(&mgr, "alice");
+        assert_eq!(alice_before.len(), MAX_API_TOKENS_PER_OWNER);
+
+        create_owned_token(&mgr, "alice", "alice-new").await;
+
+        let alice_after = owned_token_names(&mgr, "alice");
+        assert_eq!(
+            alice_after.len(),
+            MAX_API_TOKENS_PER_OWNER,
+            "one owner must never exceed the per-owner quota"
+        );
+        assert!(
+            !alice_after.iter().any(|name| name == "alice-0"),
+            "the owner's oldest token must be evicted: {alice_after:?}"
+        );
+        assert!(alice_after.iter().any(|name| name == "alice-new"));
+        assert!(
+            mgr.list_tokens()
+                .iter()
+                .any(|token| token.id == bob_token.id),
+            "another owner's token must never be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_per_owner_token_quota_trims_persisted_overflow() {
+        let mgr = AuthManager::new();
+        // Simulate a tokens.toml written before the per-owner quota existed.
+        {
+            let mut tokens = lock(&mgr.tokens);
+            for i in 0..20 {
+                let (mut meta, _) = generate_token(&format!("legacy-{i}"), Role::Viewer);
+                meta.owner = Some("alice".to_string());
+                meta.created_at = i;
+                tokens.insert(meta.hash.clone(), meta);
+            }
+        }
+
+        create_owned_token(&mgr, "alice", "new").await;
+
+        let names = owned_token_names(&mgr, "alice");
+        assert_eq!(
+            names.len(),
+            MAX_API_TOKENS_PER_OWNER,
+            "legacy overflow must be trimmed to the per-owner quota"
+        );
+        assert!(names.iter().any(|name| name == "new"));
+        assert!(
+            !names.iter().any(|name| name == "legacy-0"),
+            "the oldest overflow token must be trimmed first"
+        );
     }
 
     #[test]
@@ -1916,8 +2977,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_setup_token_does_not_expire_before_setup_completes() {
+    #[tokio::test]
+    async fn test_setup_token_does_not_expire_before_setup_completes() {
         let mgr = AuthManager::with_storage(
             std::env::temp_dir().join(format!("sito_setup_tok_age_{}", rand::random::<u64>())),
             24,
@@ -1930,7 +2991,7 @@ mod tests {
         // expiry must still require the token; an expired token previously
         // enabled unauthenticated `/ui/wizard/complete`.
         mgr.age_setup_token_for_test(Duration::from_hours(72));
-        mgr.prune();
+        mgr.prune().await;
 
         assert!(
             mgr.setup_token_required(),
@@ -1943,7 +3004,7 @@ mod tests {
 
         // Once setup is complete the residual token is cleared.
         mgr.mark_setup_complete();
-        mgr.prune();
+        mgr.prune().await;
         assert!(!mgr.setup_token_required());
     }
 
@@ -2014,31 +3075,159 @@ mod tests {
     }
 
     #[test]
-    fn test_corrupt_users_file_creates_backup_and_refuses_to_start() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("sito_auth_corrupt_test_{}", rand::random::<u64>()));
-        let _ = std::fs::create_dir_all(&temp_dir);
+    fn test_corrupt_users_file_is_not_backed_up_and_refuses_to_start() {
+        let temp_dir = auth_temp_dir("corrupt");
         let users_file = temp_dir.join("users.toml");
-        let corrupt_content = "[[users]]\nusername = 'admin'\npassword_hash = invalid_syntax\n";
-        std::fs::write(&users_file, corrupt_content).unwrap();
+        let plaintext = "JBSWY3DPEHPK3PXP";
+        let corrupt_content = format!(
+            "[[users]]\nusername = 'admin'\npassword_hash = invalid_syntax\n\
+             [users.totp]\nenabled = true\nsecret = '{plaintext}'\n\
+             backup_code_hashes = []\nbroken = [\n"
+        );
+        std::fs::write(&users_file, &corrupt_content).unwrap();
 
-        let res = AuthManager::with_storage(&temp_dir, 24, 5);
-        match res {
-            Err(AuthStorageError::CorruptUsersFile {
-                path,
-                backup_path,
-                source: _,
-            }) => {
+        match AuthManager::with_storage(&temp_dir, 24, 5) {
+            Err(AuthStorageError::CorruptUsersFile { path, source: _ }) => {
                 assert_eq!(path, users_file);
-                assert!(backup_path.exists());
-                let backup_content = std::fs::read_to_string(&backup_path).unwrap();
-                assert_eq!(backup_content, corrupt_content);
             }
             Ok(_) => panic!("Expected Err(CorruptUsersFile), got Ok"),
             Err(other) => panic!("Expected CorruptUsersFile, got {other:?}"),
         }
 
+        // A corrupt file may still contain legacy plaintext TOTP secrets, so
+        // it must never be retained as a raw backup.
+        let backups: Vec<_> = std::fs::read_dir(&temp_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt."))
+            .collect();
+        assert!(
+            backups.is_empty(),
+            "corrupt users files must not be backed up raw"
+        );
+        for entry in std::fs::read_dir(&temp_dir).unwrap().filter_map(Result::ok) {
+            if entry.path() == users_file {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                assert!(
+                    !text.contains(plaintext),
+                    "recovery file {} leaked the legacy TOTP secret",
+                    entry.path().display()
+                );
+            }
+        }
+
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_reset_admin_backup_seals_legacy_plaintext() {
+        let dir = auth_temp_dir("reset_backup_plaintext");
+        let plaintext;
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            enable_totp(&mgr, "admin").await;
+            plaintext = in_memory_totp_secret(&mgr, "admin");
+        }
+
+        // Restore a pre-1.9 plaintext secret without starting the manager, so
+        // the reset itself is the first code path to see this file.
+        let users_file = dir.join("users.toml");
+        let raw = std::fs::read_to_string(&users_file).unwrap();
+        let parsed: UsersFile = toml::from_str(&raw).unwrap();
+        let sealed = parsed
+            .users
+            .iter()
+            .find(|u| u.username == "admin")
+            .and_then(|u| u.totp.as_ref())
+            .expect("stored TOTP config")
+            .secret
+            .clone();
+        let legacy = raw.replace(&sealed, &plaintext);
+        assert!(legacy.contains(&plaintext));
+        std::fs::write(&users_file, &legacy).unwrap();
+
+        AuthManager::reset_admin_credentials(&dir, "resetpassword1").unwrap();
+
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                let name = p.file_name().unwrap_or_default().to_string_lossy();
+                name.starts_with("users.toml.reset.") && name.ends_with(".bak")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "reset must retain one sanitized backup");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "recovery backup must be owner-only");
+        }
+        let backup_raw = std::fs::read_to_string(&backups[0]).unwrap();
+        assert!(
+            !backup_raw.contains(&plaintext),
+            "reset backup leaked the legacy plaintext TOTP secret"
+        );
+        let backup: UsersFile = toml::from_str(&backup_raw).unwrap();
+        let backup_secret = backup
+            .users
+            .iter()
+            .find(|u| u.username == "admin")
+            .and_then(|u| u.totp.as_ref())
+            .expect("backup keeps the TOTP config")
+            .secret
+            .clone();
+        assert!(backup_secret.starts_with("enc:v1:"));
+
+        // The live store is the freshly reset account and contains no TOTP.
+        let current = std::fs::read_to_string(&users_file).unwrap();
+        assert!(!current.contains(&plaintext));
+        assert!(!current.contains("enc:v1:"));
+
+        // No temporary files left by either atomic write.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("users.tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left behind");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reset_admin_skips_backup_for_unparseable_users_file() {
+        let dir = auth_temp_dir("reset_backup_corrupt");
+        let plaintext = "JBSWY3DPEHPK3PXP";
+        let corrupt_content = format!(
+            "[[users]]\nusername = 'admin'\npassword_hash = invalid_syntax\n\
+             [users.totp]\nenabled = true\nsecret = '{plaintext}'\n\
+             backup_code_hashes = []\nbroken = [\n"
+        );
+        std::fs::write(dir.join("users.toml"), corrupt_content).unwrap();
+
+        AuthManager::reset_admin_credentials(&dir, "resetpassword1").unwrap();
+
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                let name = p.file_name().unwrap_or_default().to_string_lossy();
+                name.starts_with("users.toml.reset.") && name.ends_with(".bak")
+            })
+            .collect();
+        assert!(
+            backups.is_empty(),
+            "unparseable users file must not be retained as a backup"
+        );
+        let current = std::fs::read_to_string(dir.join("users.toml")).unwrap();
+        assert!(!current.contains(plaintext));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2057,6 +3246,44 @@ mod tests {
             Ok(_) => panic!("Expected Err(EmptyUsersFile), got Ok"),
             Err(other) => panic!("Expected EmptyUsersFile, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Minor: `reset-admin` is the recovery path and must still work when the
+    /// existing `totp.key` is malformed.
+    #[tokio::test]
+    async fn test_reset_admin_credentials_recovers_from_corrupt_totp_key() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_auth_reset_corrupt_key_{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        {
+            let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+            mgr.update_user_password("admin", "firstpassword").await;
+        }
+        let key_path = temp_dir.join("totp.key");
+        std::fs::write(&key_path, b"not-a-valid-key").unwrap();
+
+        let reset_path = AuthManager::reset_admin_credentials(&temp_dir, "newpassword_reset")
+            .expect("admin reset must recover from a malformed TOTP key");
+        assert_eq!(reset_path, temp_dir.join("users.toml"));
+        let backups: Vec<_> = std::fs::read_dir(&temp_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("totp.corrupt.")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "the unusable key must be moved aside");
+        assert!(
+            AuthManager::with_storage(&temp_dir, 24, 5).is_ok(),
+            "the fresh key and reset credentials must load"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -2113,7 +3340,7 @@ mod tests {
         mgr.expire_pending_totp_for_test();
 
         // 3. Prune
-        mgr.prune();
+        mgr.prune().await;
         assert_eq!(mgr.sessions_len(), 0);
         assert_eq!(mgr.pending_totp_len(), 0);
 
@@ -2160,15 +3387,15 @@ mod tests {
         }
 
         // Logout must persist the revocation across another restart.
-        mgr.logout(&session_id);
+        mgr.logout(&session_id).await;
         let mgr2 = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
         assert!(mgr2.validate_session(&session_id).is_none());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    #[test]
-    fn test_token_persistence_and_expiry() {
+    #[tokio::test]
+    async fn test_token_persistence_and_expiry() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_tok_test_{}", rand::random::<u64>()));
         let _ = std::fs::create_dir_all(&temp_dir);
@@ -2183,7 +3410,10 @@ mod tests {
                 30, // 30-day token TTL
             )
             .unwrap();
-            let (meta, resp) = mgr.create_token("ci", Role::Operator);
+            let (meta, resp) = mgr
+                .create_token("ci", Role::Operator, None)
+                .await
+                .expect("token");
             assert!(meta.expires_at.is_some(), "default TTL must be applied");
             resp.token
         };
@@ -2204,23 +3434,26 @@ mod tests {
         );
 
         // Revocation persists.
-        assert!(mgr.delete_token(&meta.id));
+        assert!(mgr.delete_token(&meta.id).await);
         let mgr2 = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
         assert!(mgr2.validate_token(&plaintext).is_none());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    #[test]
-    fn test_expired_token_rejected_on_load() {
+    #[tokio::test]
+    async fn test_expired_token_rejected_on_load() {
         let temp_dir = std::env::temp_dir().join(format!("sito_tokexp_{}", rand::random::<u64>()));
         let _ = std::fs::create_dir_all(&temp_dir);
 
         let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
-        let (mut meta, resp) = mgr.create_token("expired", Role::Viewer);
+        let (mut meta, resp) = mgr
+            .create_token("expired", Role::Viewer, None)
+            .await
+            .expect("token");
         meta.expires_at = Some(chrono::Utc::now().timestamp() - 10);
         lock(&mgr.tokens).insert(meta.hash.clone(), meta);
-        mgr.save_tokens();
+        mgr.save_tokens_async().await;
         drop(mgr);
 
         let mgr2 = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
@@ -2274,8 +3507,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    #[test]
-    fn test_lock_recovery_after_poisoning() {
+    #[tokio::test]
+    async fn test_lock_recovery_after_poisoning() {
         let mgr = AuthManager::new();
         let users = mgr.users.clone();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -2284,9 +3517,12 @@ mod tests {
         }));
         // The manager must keep working instead of panicking.
         assert!(mgr.has_user("admin"));
-        let (meta, resp) = mgr.create_token("post-poison", Role::Viewer);
+        let (meta, resp) = mgr
+            .create_token("post-poison", Role::Viewer, None)
+            .await
+            .expect("token");
         assert!(mgr.validate_token(&resp.token).is_some());
-        assert!(mgr.delete_token(&meta.id));
+        assert!(mgr.delete_token(&meta.id).await);
     }
 
     /// WP-4.4: `reset-admin` must invalidate every live session and API token,
@@ -2303,7 +3539,10 @@ mod tests {
             else {
                 panic!("login failed");
             };
-            let (_meta, resp) = mgr.create_token("ci", Role::Operator);
+            let (_meta, resp) = mgr
+                .create_token("ci", Role::Operator, None)
+                .await
+                .expect("token");
             assert!(mgr.validate_session(&session.id).is_some());
             assert!(mgr.validate_token(&resp.token).is_some());
             let token_hash = hash_token(&resp.token);
@@ -2366,7 +3605,7 @@ mod tests {
         else {
             panic!("login failed");
         };
-        assert!(mgr.set_user_role("ops", Role::Viewer));
+        assert!(mgr.set_user_role("ops", Role::Viewer).await);
         assert_eq!(mgr.role_of("ops"), Some(Role::Viewer));
         assert!(
             mgr.validate_session(&session.id).is_none(),
@@ -2374,8 +3613,633 @@ mod tests {
         );
 
         // Unknown user.
-        assert!(!mgr.set_user_role("ghost", Role::Admin));
+        assert!(!mgr.set_user_role("ghost", Role::Admin).await);
+        assert_eq!(
+            mgr.set_user_role_checked("ghost", Role::Admin).await,
+            Err(UserMutationError::NotFound)
+        );
+        assert_eq!(
+            mgr.delete_user_checked("ghost").await,
+            Err(UserMutationError::NotFound)
+        );
         assert_eq!(mgr.list_users().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_demotions_keep_at_least_one_admin() {
+        let mgr = AuthManager::new();
+        mgr.create_user("admin2", "Admin2Password1", Role::Admin)
+            .await;
+        assert_eq!(mgr.admin_count(), 2);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let demote = |username: &'static str| {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                mgr.set_user_role_checked(username, Role::Viewer).await
+            })
+        };
+        let (first, second) = tokio::join!(demote("admin"), demote("admin2"));
+        let first = first.expect("demotion task");
+        let second = second.expect("demotion task");
+
+        let successes = [&first, &second]
+            .iter()
+            .filter(|result| matches!(result, Ok(true)))
+            .count();
+        let blocked = [&first, &second]
+            .iter()
+            .filter(|result| matches!(result, Err(UserMutationError::LastAdmin)))
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one concurrent demotion may succeed: {first:?} / {second:?}"
+        );
+        assert_eq!(
+            blocked, 1,
+            "the losing demotion must return LastAdmin: {first:?} / {second:?}"
+        );
+        assert_eq!(
+            mgr.admin_count(),
+            1,
+            "concurrent demotions must leave at least one Admin"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_demote_and_delete_keep_at_least_one_admin() {
+        let mgr = AuthManager::new();
+        mgr.create_user("admin2", "Admin2Password1", Role::Admin)
+            .await;
+        assert_eq!(mgr.admin_count(), 2);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let demote = {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                mgr.set_user_role_checked("admin", Role::Viewer).await
+            })
+        };
+        let delete = {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                mgr.delete_user_checked("admin2").await
+            })
+        };
+        let (demote, delete) = tokio::join!(demote, delete);
+        let demote = demote.expect("demotion task");
+        let delete = delete.expect("deletion task");
+
+        match (&demote, &delete) {
+            (Ok(true), Ok(())) => panic!("both operations removed an Admin"),
+            (Ok(true), Err(UserMutationError::LastAdmin))
+            | (Err(UserMutationError::LastAdmin), Ok(())) => {}
+            other => panic!("unexpected concurrent results: {other:?}"),
+        }
+        assert_eq!(
+            mgr.admin_count(),
+            1,
+            "concurrent demote/delete must leave at least one Admin"
+        );
+    }
+
+    /// Overwriting an existing account must not be able to remove the sole
+    /// remaining Admin, even through the internal (non-handler) path.
+    #[tokio::test]
+    async fn test_create_user_cannot_overwrite_sole_admin_with_non_admin_role() {
+        for role in [Role::Viewer, Role::Operator] {
+            let mgr = AuthManager::new();
+            assert_eq!(mgr.admin_count(), 1);
+            assert!(mgr.is_default_admin_active());
+
+            mgr.create_user("admin", "ReplacementPass1", role).await;
+
+            assert_eq!(
+                mgr.role_of("admin"),
+                Some(Role::Admin),
+                "a blocked overwrite must leave the Admin role unchanged ({role:?})"
+            );
+            assert_eq!(
+                mgr.admin_count(),
+                1,
+                "a blocked overwrite must leave exactly one Admin ({role:?})"
+            );
+            assert!(
+                mgr.is_default_admin_active(),
+                "a blocked overwrite must not change the default-admin flag ({role:?})"
+            );
+            assert!(
+                matches!(
+                    mgr.login("admin", "adminadmin", "127.0.0.1").await,
+                    LoginResult::Success(_)
+                ),
+                "a blocked overwrite must not change the password ({role:?})"
+            );
+        }
+    }
+
+    /// Concurrent create/delete writes must not let an older snapshot land
+    /// after a newer one: the persisted file must match the final in-memory
+    /// state (no resurrected deletions, no lost creations).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_token_mutations_persist_final_state() {
+        const MUTATIONS: usize = 30;
+        let dir = auth_temp_dir("concurrent_token_persist");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+
+        let mut seeded = Vec::with_capacity(MUTATIONS);
+        for i in 0..MUTATIONS {
+            let (meta, _resp) = mgr
+                .create_token(&format!("seed-{i}"), Role::Viewer, None)
+                .await
+                .expect("seed token");
+            seeded.push(meta.id);
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(MUTATIONS * 2));
+        // Model a slow disk for the first concurrent write so an older
+        // snapshot can complete after newer ones if writes are not serialized.
+        SECRET_WRITE_DELAYS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((dir.join("tokens.toml"), Duration::from_millis(300)));
+        let mut tasks = Vec::with_capacity(MUTATIONS * 2);
+        for id in seeded {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                assert!(mgr.delete_token(&id).await, "seeded token must be deleted");
+            }));
+        }
+        for i in 0..MUTATIONS {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                mgr.create_token(&format!("new-{i}"), Role::Viewer, None)
+                    .await
+                    .expect("new token");
+            }));
+        }
+        for task in tasks {
+            task.await.expect("token mutation task");
+        }
+
+        let mut expected: Vec<(String, String)> = mgr
+            .list_tokens()
+            .into_iter()
+            .map(|token| (token.id, token.name))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            expected.len(),
+            MUTATIONS,
+            "only the newly created tokens should remain"
+        );
+        assert!(
+            expected.iter().all(|(_, name)| name.starts_with("new-")),
+            "no deleted seed token may remain in memory: {expected:?}"
+        );
+
+        // Read the file directly instead of relying on a reload's filtering.
+        let raw = std::fs::read_to_string(dir.join("tokens.toml")).unwrap();
+        let persisted_file: TokensFile = toml::from_str(&raw).unwrap();
+        let mut persisted: Vec<(String, String)> = persisted_file
+            .tokens
+            .into_iter()
+            .map(|token| (token.id, token.name))
+            .collect();
+        persisted.sort();
+        assert_eq!(
+            persisted, expected,
+            "tokens.toml must reflect the final in-memory state after concurrent mutations"
+        );
+
+        drop(mgr);
+        let reloaded = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        let mut after_reload: Vec<(String, String)> = reloaded
+            .list_tokens()
+            .into_iter()
+            .map(|token| (token.id, token.name))
+            .collect();
+        after_reload.sort();
+        assert_eq!(
+            after_reload, expected,
+            "a reload must reproduce the final in-memory token state"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cancelling the future that awaits a persistence write must not release
+    /// the persist lock early: the detached blocking write owns the lock until
+    /// it finishes, so a newer save cannot be overwritten by the orphan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_token_save_keeps_lock_until_write_finishes() {
+        let dir = auth_temp_dir("cancelled_token_save");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        let (meta, _resp) = mgr
+            .create_token("doomed", Role::Viewer, None)
+            .await
+            .expect("token");
+        let tokens_path = dir.join("tokens.toml");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        SECRET_WRITE_START_SIGNALS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((tokens_path.clone(), started_tx));
+        SECRET_WRITE_DELAYS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((tokens_path.clone(), Duration::from_millis(500)));
+
+        let save_mgr = mgr.clone();
+        let save = tokio::spawn(async move {
+            save_mgr.save_tokens_async().await;
+        });
+
+        // Wait until the blocking write has started and is sleeping. The signal
+        // is path-scoped and one-shot, so parallel tests cannot consume it.
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("timed out waiting for the delayed write to start")
+            .expect("write-start signal was dropped");
+
+        // Cancel the caller while the orphaned blocking write is still running.
+        save.abort();
+        let _ = save.await;
+
+        // The newer revocation must persist after (not before) the orphan write.
+        assert!(mgr.delete_token(&meta.id).await);
+        // Give a broken implementation time to let the orphan land afterwards.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let raw = std::fs::read_to_string(&tokens_path).unwrap();
+        let persisted: TokensFile = toml::from_str(&raw).unwrap();
+        assert!(
+            !persisted.tokens.iter().any(|token| token.id == meta.id),
+            "a cancelled stale write must not resurrect a deleted token: {raw}"
+        );
+
+        drop(mgr);
+        let reloaded = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            !reloaded
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == meta.id),
+            "a reload must not resurrect a deleted token"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_user_mutations_persist_across_restart() {
+        // Each mutation is the last write in its own store so a missing async
+        // save cannot be masked by a later unrelated save.
+        let role_dir = auth_temp_dir("async_role");
+        {
+            let mgr = AuthManager::with_storage(&role_dir, 24, 5).unwrap();
+            mgr.create_user("alice", "AlicePassword1", Role::Operator)
+                .await;
+            assert!(mgr.set_user_role("alice", Role::Viewer).await);
+        }
+        let mgr = AuthManager::with_storage(&role_dir, 24, 5).unwrap();
+        assert_eq!(
+            mgr.role_of("alice"),
+            Some(Role::Viewer),
+            "a role change must be persisted"
+        );
+        drop(mgr);
+        let _ = std::fs::remove_dir_all(&role_dir);
+
+        let totp_dir = auth_temp_dir("async_totp");
+        {
+            let mgr = AuthManager::with_storage(&totp_dir, 24, 5).unwrap();
+            mgr.create_user("alice", "AlicePassword1", Role::Operator)
+                .await;
+            enable_totp(&mgr, "alice").await;
+            assert!(mgr.disable_totp("alice").await);
+        }
+        let mgr = AuthManager::with_storage(&totp_dir, 24, 5).unwrap();
+        assert!(
+            !mgr.totp_enabled("alice"),
+            "disabling TOTP must be persisted"
+        );
+        drop(mgr);
+        let _ = std::fs::remove_dir_all(&totp_dir);
+
+        let delete_dir = auth_temp_dir("async_delete");
+        {
+            let mgr = AuthManager::with_storage(&delete_dir, 24, 5).unwrap();
+            mgr.create_user("bob", "BobPassword01", Role::Operator)
+                .await;
+            assert!(mgr.delete_user("bob").await);
+        }
+        let mgr = AuthManager::with_storage(&delete_dir, 24, 5).unwrap();
+        assert!(!mgr.has_user("bob"), "deleting a user must be persisted");
+        drop(mgr);
+        let _ = std::fs::remove_dir_all(&delete_dir);
+    }
+
+    /// Blocking persistence (users, sessions, tokens) must run on the blocking
+    /// pool, never inline on the async runtime thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_auth_writes_run_off_runtime_thread() {
+        let dir = auth_temp_dir("off_runtime");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+
+        // Ignore the synchronous bootstrap write performed by the constructor.
+        SECRET_WRITE_THREADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+
+        let caller_thread = std::thread::current().id();
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        let (meta, _resp) = mgr
+            .create_token("ci", Role::Viewer, None)
+            .await
+            .expect("token");
+        let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("expected direct login");
+        };
+        mgr.logout(&session.id).await;
+        assert!(mgr.delete_token(&meta.id).await);
+
+        let writes: Vec<(PathBuf, std::thread::ThreadId)> = SECRET_WRITE_THREADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(path, _)| path.starts_with(&dir))
+            .cloned()
+            .collect();
+        for name in ["users.toml", "sessions.toml", "tokens.toml"] {
+            let matching: Vec<_> = writes
+                .iter()
+                .filter(|(path, _)| path.ends_with(name))
+                .collect();
+            assert!(
+                !matching.is_empty(),
+                "expected a persisted {name} write from the async path"
+            );
+            assert!(
+                matching.iter().all(|(_, tid)| *tid != caller_thread),
+                "{name} persistence must not run on the calling async thread"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_users_file_encrypts_totp_secret() {
+        let dir = auth_temp_dir("totp_encrypt");
+        let plaintext;
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            let _setup = enable_totp(&mgr, "admin").await;
+            plaintext = in_memory_totp_secret(&mgr, "admin");
+            assert_ne!(plaintext, "");
+        }
+
+        let users_file = dir.join("users.toml");
+        let raw = std::fs::read_to_string(&users_file).unwrap();
+        assert!(
+            raw.contains("enc:v1:"),
+            "TOTP secret must be sealed in users.toml: {raw}"
+        );
+        assert!(
+            !raw.contains(&plaintext),
+            "users.toml must not contain the recoverable TOTP secret: {raw}"
+        );
+
+        let parsed: UsersFile = toml::from_str(&raw).unwrap();
+        let stored = parsed
+            .users
+            .iter()
+            .find(|u| u.username == "admin")
+            .and_then(|u| u.totp.as_ref())
+            .expect("stored TOTP config");
+        assert!(stored.secret.starts_with("enc:v1:"));
+        assert_ne!(stored.secret, plaintext);
+
+        // The atomic rewrite must not leave temporary files behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("users.tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left behind");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_plaintext_totp_secret_migrates_on_load() {
+        let dir = auth_temp_dir("totp_migrate");
+        let plaintext;
+        let backup_code;
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            let setup = enable_totp(&mgr, "admin").await;
+            plaintext = in_memory_totp_secret(&mgr, "admin");
+            backup_code = setup.backup_codes[1].clone();
+        }
+
+        // Rewrite the file as a pre-1.9 plaintext store.
+        let users_file = dir.join("users.toml");
+        let raw = std::fs::read_to_string(&users_file).unwrap();
+        let parsed: UsersFile = toml::from_str(&raw).unwrap();
+        let sealed = parsed
+            .users
+            .iter()
+            .find(|u| u.username == "admin")
+            .and_then(|u| u.totp.as_ref())
+            .expect("stored TOTP config")
+            .secret
+            .clone();
+        assert!(sealed.starts_with("enc:v1:"));
+        let legacy = raw.replace(&sealed, &plaintext);
+        assert_ne!(legacy, raw);
+        assert!(legacy.contains(&plaintext));
+        std::fs::write(&users_file, &legacy).unwrap();
+
+        // Startup migrates the legacy value and rewrites the file once.
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        let migrated = std::fs::read_to_string(&users_file).unwrap();
+        assert!(
+            migrated.contains("enc:v1:"),
+            "migration must seal the plaintext secret"
+        );
+        assert!(
+            !migrated.contains(&plaintext),
+            "migration must not leave the plaintext secret behind"
+        );
+
+        // The migration's atomic rewrite must not leave a temp file behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("users.tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "migration left temporary files behind"
+        );
+
+        // The account still logs in with its remaining backup code.
+        let LoginResult::TotpRequired { partial_token } =
+            mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("expected TOTP required after migration");
+        };
+        match mgr
+            .verify_totp(&partial_token, &backup_code, "127.0.0.1")
+            .await
+        {
+            TotpVerifyResult::Success(session) => assert_eq!(session.username, "admin"),
+            other => panic!("expected successful login after migration, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_totp_login_survives_restart() {
+        let dir = auth_temp_dir("totp_restart");
+        let backup_code;
+        let plaintext;
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            let setup = enable_totp(&mgr, "admin").await;
+            backup_code = setup.backup_codes[1].clone();
+            plaintext = in_memory_totp_secret(&mgr, "admin");
+        }
+
+        let raw = std::fs::read_to_string(dir.join("users.toml")).unwrap();
+        assert!(raw.contains("enc:v1:"));
+        assert!(!raw.contains(&plaintext));
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        let LoginResult::TotpRequired { partial_token } =
+            mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("expected TOTP required after restart");
+        };
+        match mgr
+            .verify_totp(&partial_token, &backup_code, "127.0.0.1")
+            .await
+        {
+            TotpVerifyResult::Success(session) => assert_eq!(session.username, "admin"),
+            other => panic!("expected successful login after restart, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_missing_totp_key_refuses_start() {
+        let dir = auth_temp_dir("totp_missing_key");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            enable_totp(&mgr, "admin").await;
+        }
+
+        let key_path = dir.join("totp.key");
+        let users_path = dir.join("users.toml");
+        std::fs::remove_file(&key_path).unwrap();
+
+        match AuthManager::with_storage(&dir, 24, 5) {
+            Err(AuthStorageError::MissingTotpKey {
+                key_path: actual_key,
+                users_path: actual_users,
+            }) => {
+                assert_eq!(actual_key, key_path);
+                assert_eq!(actual_users, users_path);
+            }
+            Ok(_) => panic!("startup must fail closed when the TOTP key is missing"),
+            Err(other) => panic!("expected MissingTotpKey, got {other:?}"),
+        }
+        assert!(users_path.exists(), "the users file must not be rewritten");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_wrong_totp_key_refuses_start() {
+        let dir = auth_temp_dir("totp_wrong_key");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            enable_totp(&mgr, "admin").await;
+        }
+
+        std::fs::write(dir.join("totp.key"), [0x5au8; 32]).unwrap();
+
+        match AuthManager::with_storage(&dir, 24, 5) {
+            Err(AuthStorageError::TotpSecretDecrypt { username, .. }) => {
+                assert_eq!(username, "admin");
+            }
+            Ok(_) => panic!("startup must fail closed with the wrong TOTP key"),
+            Err(other) => panic!("expected TotpSecretDecrypt, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_totp_key_file_is_0600() {
+        let dir = auth_temp_dir("totp_key_0600");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        enable_totp(&mgr, "admin").await;
+        drop(mgr);
+
+        let key_path = dir.join("totp.key");
+        assert!(key_path.exists());
+        assert_eq!(std::fs::metadata(&key_path).unwrap().len(), 32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_totp_secret_not_in_list_users_or_debug() {
+        let mgr = AuthManager::new();
+        enable_totp(&mgr, "admin").await;
+        let secret = in_memory_totp_secret(&mgr, "admin");
+        assert_ne!(secret, "");
+
+        let json = serde_json::to_string(&mgr.list_users()).unwrap();
+        assert!(!json.contains(&secret), "list_users leaked the TOTP secret");
+        assert!(!json.contains("secret"));
+
+        let user_debug = {
+            let users = lock(&mgr.users);
+            format!("{:?}", users.get("admin").unwrap())
+        };
+        assert!(!user_debug.contains(&secret));
+        assert!(user_debug.contains("<redacted>"));
+
+        let totp_debug = {
+            let users = lock(&mgr.users);
+            format!("{:?}", users.get("admin").unwrap().totp.as_ref().unwrap())
+        };
+        assert!(!totp_debug.contains(&secret));
+        assert!(totp_debug.contains("<redacted>"));
     }
 }
 
@@ -2391,5 +4255,14 @@ mod send_checks {
         assert_send(mgr.verify_second_factor("admin", "x"));
         assert_send(mgr.confirm_totp_setup("admin", "x"));
         assert_send(mgr.create_user("a", "b", Role::Viewer));
+        assert_send(mgr.login("a", "b", "c"));
+        assert_send(mgr.verify_totp("a", "b", "c"));
+        assert_send(mgr.set_user_role("a", Role::Viewer));
+        assert_send(mgr.delete_user("a"));
+        assert_send(mgr.disable_totp("a"));
+        assert_send(mgr.logout("a"));
+        assert_send(mgr.create_token("a", Role::Viewer, None));
+        assert_send(mgr.delete_token("a"));
+        assert_send(mgr.prune());
     }
 }

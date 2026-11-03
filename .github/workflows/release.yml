@@ -11,6 +11,8 @@ on:
 # `...release.yml@refs/heads/<branch>` which neither contrib/install.sh nor
 # crates/sito-api/src/updater.rs accepts (both pin `@refs/tags/.*`). Tag pushes
 # sign with `...release.yml@refs/tags/<tag>` and verify end-to-end.
+# The published assets are re-verified by artifact-e2e.yml, which can also be
+# dispatched manually for an existing tag without publishing anything.
 
 # Least privilege by default; jobs grant the narrow permissions they need.
 permissions:
@@ -170,6 +172,15 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
+
+  artifact-e2e:
+    name: Verify release artifacts
+    needs: [sbom-and-release]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/artifact-e2e.yml
+    with:
+      tag: ${{ github.ref_name }}
 
   docker-build-push:
     name: Build and Push Multi-Arch Container Image

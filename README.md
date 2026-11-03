@@ -4,7 +4,7 @@
 [![Nightly Fuzzing](https://github.com/kubaeror/sito-dns/actions/workflows/nightly-fuzz.yml/badge.svg)](https://github.com/kubaeror/sito-dns/actions/workflows/nightly-fuzz.yml)
 [![Release](https://img.shields.io/github/v/release/kubaeror/sito-dns?include_prereleases&color=brightgreen)](https://github.com/kubaeror/sito-dns/releases)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
-[![MSRV: 1.98.1](https://img.shields.io/badge/MSRV-1.98.1-orange.svg)](rust-toolchain.toml)
+[![MSRV: 1.99.1](https://img.shields.io/badge/MSRV-1.99.1-orange.svg)](rust-toolchain.toml)
 [![Rust Edition 2024](https://img.shields.io/badge/Edition-2024-purple.svg)](Cargo.toml)
 
 > **sito** (noun, Polish for *sieve* / *strainer*) — A high-performance, memory-safe, self-hosted filtering DNS server written in Rust.
@@ -15,7 +15,7 @@
 
 ## 📊 Feature Comparison: sito vs. AdGuard Home vs. Pi-hole
 
-| Feature / Capability | **sito** (v1.8) | **AdGuard Home** | **Pi-hole (FTL)** |
+| Feature / Capability | **sito** (v1.9) | **AdGuard Home** | **Pi-hole (FTL)** |
 |---|---|---|---|
 | **Language & Runtime** | **Rust (edition 2024, zero GC, zero Node.js)** | Go (GC overhead under load) | C (FTL) + PHP Web UI |
 | **Max Cache Throughput** | **≥ 500,000 QPS** (measured 584k) | ~100,000 QPS | ~50,000 QPS |
@@ -23,7 +23,7 @@
 | **Memory @ 1M Rules** | **~ 285 MB RSS** (Trie + Interning) | 400 – 800 MB RSS | ~ 350 MB RSS |
 | **Encrypted Transports** | **DoT, DoH (H2), DoQ, DoH3** | DoT, DoH, DoQ | Plain only (requires proxy) |
 | **High Availability (HA)** | **Native mTLS WebSocket Push (<2s)** | External tool (adguardhome-sync) | External tool (gravity-sync) |
-| **Filter Rule Engine** | **ABP/AdGuard syntax (see [compatibility matrix](docs/compatibility.md); `$dnsrewrite` partial)** | Full ABP + modifiers | Domain regex & wildcards |
+| **Filter Rule Engine** | **ABP/AdGuard syntax (see [compatibility matrix](docs/compatibility.md); qtype-aware `$dnsrewrite`)** | Full ABP + modifiers | Domain regex & wildcards |
 | **ReDoS Defense** | **Pure Dense DFA (no backtracking)** | RE2 linear time | POSIX regex (risk of backtrack) |
 | **ACME Certificates** | **Native TLS-ALPN-01 & HTTP-01** | Built-in ACME | External (Certbot) |
 | **RouterOS Integration** | **Native DHCP Lease Sync** | None | None |
@@ -160,9 +160,11 @@ Swagger UI / OpenAPI documentation is available at `http://localhost:8080/api/do
 * **[Benchmarking Report](docs/benchmarks.md):** Empirical benchmark results vs. Plan Section 16.1 and ADR-0008 contracts.
 * **[Performance Tuning Guide](docs/performance.md):** Kernel sysctl parameters, NIC RSS hashing, and PGO instructions.
 * **[Security Review & Threat Model](docs/security-audit.md):** Security vectors, SSRF allowlists, ReDoS DFA bounds, and constant-time auth.
+* **[User Management & Authentication](docs/user-management.md):** Accounts, roles/RBAC, password changes, API tokens, TOTP 2FA, last-admin protection, and recovery — including the Admin **Users** page (`/users`), the per-user **Account** page (`/account`), and the Operator-only unidentified-clients table in the web panel.
 * **[Migrating from AdGuard Home](docs/migration-adguard.md):** Migration instructions and automated converter script (`contrib/adguard_to_sito.py`).
 * **[High-Availability Runbook](docs/runbook-ha.md):** Deployment architectures, mTLS certificates, failover, and slave promotion.
-* **[Changelog](CHANGELOG.md):** Release notes for v1.8.0 and complete history of phases M0 through M9.
+* **[1.9.0 Release Notes](docs/release-notes-1.9.0.md):** User-visible behavior changes, migration checklist, and dependency notes for 1.9.0.
+* **[Changelog](CHANGELOG.md):** Release notes for v1.9.0 and complete history of phases M0 through M9.
 
 ---
 

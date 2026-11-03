@@ -227,7 +227,10 @@ mod tests {
 
         candidates.clear();
         trie.lookup_candidates("nomatch.example", &mut candidates);
-        assert!(candidates.is_empty());
+        assert!(
+            candidates.is_empty(),
+            "non-matching name must yield no candidates: {candidates:?}"
+        );
     }
 
     #[test]
@@ -262,7 +265,10 @@ mod tests {
         // Unrelated domain
         candidates.clear();
         trie.lookup_candidates("google.com", &interner, &mut candidates);
-        assert!(candidates.is_empty());
+        assert!(
+            candidates.is_empty(),
+            "candidates must start empty for the lookup: {candidates:?}"
+        );
 
         // Evil.org
         candidates.clear();

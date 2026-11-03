@@ -5,6 +5,7 @@ pub mod lockout;
 pub mod manager;
 pub mod password;
 pub mod rbac;
+pub mod secret_store;
 pub mod session;
 pub mod token;
 pub mod totp;

@@ -12,12 +12,14 @@ argon2 = "0.6"
 arc-swap.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+base64.workspace = true
 blake3.workspace = true
 chrono.workspace = true
 flate2.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 rand.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -39,7 +41,7 @@ toml.workspace = true
 totp-rs = { version = "6.0", features = ["gen_secret", "qr", "otpauth"] }
 tracing.workspace = true
 utoipa.workspace = true
-utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+utoipa-swagger-ui = { version = "10.0", features = ["axum"] }
 rust-embed = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
 askama = { workspace = true, optional = true }

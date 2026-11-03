@@ -28,8 +28,8 @@ This document defines the compatibility of the `sito` DNS filtering engine (`sit
 | `$denyallow` | `||domain^$denyallow=domain1\|domain2` | **Yes** | Excludes specified domains (and their subdomains) from being blocked by the enclosing rule. On exception rules (`@@...$denyallow=...`) the listed domains stay covered by the block rules instead of being allowed. |
 | `$client` | `$client=192.168.1.10`, `$client=10.0.0.0/24`, `$client=laptop`, `$client=~tv` | **Yes** | Restricts rule to matching client IP, CIDR range, or client identifier. Supports negation with `~`. AdGuard quoting/escaping is supported: single and double ASCII quotes allow names containing spaces, quotes, commas or pipes, and `\` escapes `'`, `"`, `,` and `\|` (e.g. `$client='Frank\'s laptop'`, `$client=~'Mary\'s\, John\'s laptops'`). The `~` must stay outside the quotes. |
 | `$dnstype` | `$dnstype=A\|AAAA`, `$dnstype=HTTPS`, `$dnstype=65`, `$dnstype=~TXT` | **Yes** | Restricts rule to specific DNS query types (by name or RFC type number). Supports negation with `~`. |
-| `$dnsrewrite` | `$dnsrewrite=NOERROR;A;1.2.3.4` or shorthand `$dnsrewrite=1.2.3.4` | **Yes** | Synthesizes `A`, `AAAA`, `CNAME`, `PTR` and `TXT` answers; the `NXDOMAIN`, `REFUSED`, `SERVFAIL`, `FORMERR` and `NOTIMP` response codes are honored. All matching rewrite rules for an owner are aggregated (two `A` rewrites produce two answer records). Bare `@@...$dnsrewrite` cancels every matching rewrite, and `@@...$dnsrewrite=value` cancels only the identical rewrite; such a cancellation-only exception never unblocks ordinary block rules. Unsupported record types (e.g. `NS`, `MX`) are rejected at load time with a warning instead of being accepted and answered as NODATA. |
-| `$badfilter` | `||domain^$badfilter` | **Yes** | Deactivates identical earlier rule in the same or lower-priority lists based on canonical representation. |
+| `$dnsrewrite` | `$dnsrewrite=NOERROR;A;1.2.3.4` or shorthand `$dnsrewrite=1.2.3.4` | **Yes** | Synthesizes `A`, `AAAA`, `CNAME`, `PTR` and `TXT` answers. Records match the query type: `A`, `AAAA`, `PTR` and `TXT` rules answer only the same type, while `CNAME` answers any type. If matching rules have no value for the query type, the response is `NOERROR` with zero answers (NODATA) and is never looked up upstream. The `NXDOMAIN`, `REFUSED`, `SERVFAIL`, `FORMERR` and `NOTIMP` response codes are honored and win over record synthesis. All matching rewrite rules for an owner are aggregated (two `A` rewrites produce two answer records). Bare `@@...$dnsrewrite` cancels every matching rewrite, `@@...$dnsrewrite=NOERROR` cancels only an identical NODATA rewrite, and `@@...$dnsrewrite=value` cancels only the identical rewrite; such a cancellation-only exception never unblocks ordinary block rules. Unsupported record types (e.g. `NS`, `MX`) are rejected at load time with a warning instead of being accepted and answered as NODATA. |
+| `$badfilter` | `||domain^$badfilter` | **Yes** | Deactivates identical earlier rule in the same or lower-priority lists based on canonical representation. Bare `$dnsrewrite` rules canonicalize as `$dnsrewrite` (distinct from `$dnsrewrite=NOERROR`), so `$badfilter` entries written against the old shared form should be reviewed. |
 | Browser modifiers | `$third-party`, `$popup`, `$script`, `$image`, `$stylesheet`, `$websocket` | **Ignored** | Safely skipped with `tracing::warn!` without failing list compilation (fail-safe parity with AdGuard Home). |
 
 ---
@@ -44,7 +44,7 @@ Evaluation follows plan section 4.3 and ADR-0007:
 4. **Standard Blocklist (`...`):** Standard blocking rules. Respects `$denyallow` exceptions. Returns `Verdict::Block(rule)` or `Verdict::Rewrite`.
 5. **No Match:** Returns `Verdict::Allow(None)` and query proceeds to upstream resolvers / cache.
 
-Exception rules that carry `$dnsrewrite` are cancellation-only: they remove matching rewrites instead of acting as step 3 allow rules. A value-less `@@...$dnsrewrite` cancels all rewrites for the owner; a valued one cancels only the identical rewrite (see the `$dnsrewrite` row above).
+Exception rules that carry `$dnsrewrite` are cancellation-only: they remove matching rewrites instead of acting as step 3 allow rules. A bare `@@...$dnsrewrite` cancels all rewrites for the owner; `@@...$dnsrewrite=NOERROR` cancels only the identical NODATA rewrite, and a valued one cancels only the identical rewrite (see the `$dnsrewrite` row above).
 
 ---
 
@@ -69,7 +69,7 @@ Per ADR-0005 and plan section 4.5:
 
 Per plan section 4.6:
 - **HTTP Caching:** Sends `If-None-Match` (`ETag`) and `If-Modified-Since`. HTTP 304 skips re-downloading and retains compiled state.
-- **Resilience:** 3 retries with exponential backoff on network failures; 64 MB size limit enforcement.
+- **Resilience:** 3 retries with exponential backoff on network failures; a per-list size limit (`filtering.max_list_bytes`, default 64 MiB) is enforced before the body is buffered.
 - **Disk Caching:** Every fetched list is persisted to `data_dir/lists/<sanitized_name>.txt` with `.meta.json` metadata, enabling offline server startup.
 - **Drop Guard:** If a subscription update drops > 50% of its active rules compared to the previous version, the new list is rejected with a warning and the existing snapshot is retained to protect against broken or truncated remote lists.
 
@@ -95,3 +95,9 @@ Measured on reference hardware via Criterion:
 - **Label Interner:** Domain labels interned to `u32` across all trie levels.
 - **Typical 300,000 Rule Set (OISD / Hagezi normal):** Net snapshot heap footprint is ~86 MB, well within the 150 MB target budget.
 - **Large 1,000,000 Rule Set:** Compact trie nodes fit within the 512 MB total budget established in ADR-0008.
+
+---
+
+## 7. Dependency Notes
+
+- **`tower-http 0.7` is not applied (blocked upstream).** The repository resolves `tower-http 0.6.11`, pulled only transitively by `reqwest 0.13.5` (`tower-http ^0.6.8`). A direct bump fails reqwest's requirement, `[patch.crates-io]` cannot change a version requirement, and forking an unused middleware is not justified. Re-check when reqwest/axum are bumped; a compatible release unblocks a dedicated upgrade PR. See `CHANGELOG.md` and the 1.9.0 release notes.

@@ -21,6 +21,7 @@ use utoipa::OpenApi;
         crate::handlers::filtering::set_filtering_rules,
         crate::handlers::filtering::check_filtering,
         crate::handlers::clients::get_clients,
+        crate::handlers::clients::get_unidentified_clients,
         crate::handlers::clients::get_client_by_name,
         crate::handlers::clients::create_client,
         crate::handlers::clients::update_client,
@@ -79,6 +80,8 @@ use utoipa::OpenApi;
             crate::models::FilterCheckRequest,
             crate::models::FilterCheckResponse,
             crate::models::ClientDto,
+            crate::models::UnidentifiedClientDto,
+            crate::models::UnidentifiedClientsResponse,
             crate::models::ClientGroupDto,
             crate::models::UpdateClientRequest,
             crate::models::UpdateClientGroupRequest,
@@ -139,7 +142,7 @@ use utoipa::OpenApi;
     info(
         title = "sito DNS Administrative API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Administrative REST API and OpenAPI 3.0 specification for the sito DNS server",
+        description = "Administrative REST API and OpenAPI 3.1 specification for the sito DNS server. Account, role, and API-token management plus TOTP status/disabling are available in the web UI (/users and /account); TOTP enrollment/setup remains REST-only. See docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
         license(name = "GPL-3.0-only")
     )
 )]

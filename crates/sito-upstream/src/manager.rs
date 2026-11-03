@@ -386,6 +386,12 @@ impl Upstream for FailoverUpstream {
 
     async fn refresh(&self) -> Result<(), UpstreamError> {
         let _ = self.try_re_resolve().await;
+        // Propagate the maintenance hook to the transport candidates so idle
+        // pooled connections are health-checked even when the candidate set
+        // does not need re-resolution.
+        let candidates = self.candidates.read().await.clone();
+        futures_util::future::join_all(candidates.iter().map(|candidate| candidate.refresh()))
+            .await;
         Ok(())
     }
 }

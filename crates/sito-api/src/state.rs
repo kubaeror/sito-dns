@@ -42,6 +42,10 @@ pub struct ServerContext {
     pub resync_sender: Option<tokio::sync::mpsc::Sender<()>>,
     pub setup_pending: Arc<AtomicBool>,
     pub dns_starter: Option<UnboundedSender<()>>,
+    /// Serializes every configuration apply/persist path (HA applier, file
+    /// watcher, REST/UI handlers) so a slower older document cannot overwrite
+    /// a newer one after the newer push already reached the runtime.
+    pub apply_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ServerContext {
@@ -136,7 +140,7 @@ impl ServerContext {
             lists: list_metadata,
         };
 
-        if let Err(e) = coordinator.update_bundle(bundle) {
+        if let Err(e) = coordinator.update_bundle_async(bundle).await {
             tracing::error!(
                 version = new_version,
                 "Failed to update HA bundle and broadcast to slaves: {e}"

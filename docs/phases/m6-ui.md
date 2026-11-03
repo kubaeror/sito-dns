@@ -1,5 +1,7 @@
 # Phase M6 — Web Panel (5 weeks, can run in parallel from M2)
 
+> **Historical phase plan.** This document records the original M6 plan and exit criteria; it is not a description of current behavior. Current behavior is documented in the [configuration reference](../configuration-reference.md), HA operations in the [HA runbook](../runbook-ha.md), and user-visible changes in the [1.9.0 release notes](../release-notes-1.9.0.md).
+
 Goal: full server operation without touching TOML — a single binary with an embedded SPA. References: plan section 13.
 
 ## Scope

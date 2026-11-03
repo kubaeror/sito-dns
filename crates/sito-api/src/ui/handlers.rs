@@ -18,14 +18,19 @@ use crate::auth::session::{
 use crate::auth::token::Role;
 use crate::config_apply::{ApplyHooks, FilterApply, apply_and_persist_config, apply_full_config};
 use crate::config_writer::save_config_atomic;
+use crate::error::ProblemDetails;
+use crate::handlers::auth_handlers::{
+    user_mutation_problem, validate_password_policy, validate_username,
+};
 use crate::models::{FilterListDto, StatusResponse};
 use crate::probe::probe_upstream_target;
 use crate::state::ServerContext;
 use crate::ui::templates::{
-    ClientViewItem, ClientsTemplate, DashboardStatsPartialTemplate, DashboardTemplate,
-    FilteringTemplate, HtmlTemplate, LoginTemplate, QueryLogRowItem, QueryLogRowsPartialTemplate,
-    QueryLogTemplate, RewriteViewItem, RewritesTemplate, SettingsTemplate, SystemTemplate,
-    UpstreamViewItem, UpstreamsTemplate, WizardTemplate,
+    AccountTemplate, ClientDiscoveryViewItem, ClientViewItem, ClientsTemplate,
+    DashboardStatsPartialTemplate, DashboardTemplate, FilteringTemplate, HtmlTemplate,
+    LoginTemplate, QueryLogRowItem, QueryLogRowsPartialTemplate, QueryLogTemplate, RewriteViewItem,
+    RewritesTemplate, SettingsTemplate, SystemTemplate, TokenViewItem, UpstreamViewItem,
+    UpstreamsTemplate, UserViewItem, UsersTemplate, WizardTemplate,
 };
 use sito_core::FilterEngine;
 use sito_core::config::{BlockingMode, Config, FilterListConfig, UpstreamStrategy};
@@ -283,7 +288,7 @@ pub async fn logout_handler(
         && let Ok(s) = cookie_hdr.to_str()
         && let Some(session_id) = extract_session_cookie(s)
     {
-        ctx.auth_mgr.logout(&session_id);
+        ctx.auth_mgr.logout(&session_id).await;
     }
     let is_secure = {
         let config = ctx.config.load();
@@ -554,6 +559,83 @@ pub async fn querylog_rows_partial(
 // Filtering & Blocklists
 // ---------------------------------------------------------------------------
 
+/// Builds the bundled-list rows shown on the filtering page.
+///
+/// `manifest` may be an error (corrupt embedded JSON): the error is logged and
+/// the function degrades to the runtime-refresh rows only, so rendering the
+/// page never panics.
+fn bundled_list_views(
+    manifest: Result<sito_clients::BundledManifest, serde_json::Error>,
+    statuses: &[sito_clients::RuntimeListStatus],
+) -> Vec<crate::ui::templates::BundledListView> {
+    let manifest = match manifest {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Embedded bundled-list manifest is invalid; showing runtime refresh state only"
+            );
+            sito_clients::BundledManifest::empty()
+        }
+    };
+    let statuses: std::collections::HashMap<&str, &sito_clients::RuntimeListStatus> = statuses
+        .iter()
+        .map(|status| (status.category.as_str(), status))
+        .collect();
+    let format_refresh = |ts: Option<u64>| {
+        ts.and_then(|ts| chrono::DateTime::from_timestamp(ts.cast_signed(), 0))
+            .map_or_else(
+                || "—".to_string(),
+                |dt| dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+            )
+    };
+
+    let mut bundled_lists: Vec<crate::ui::templates::BundledListView> = manifest
+        .lists
+        .iter()
+        .map(|list| {
+            let status = statuses.get(list.id.as_str()).copied();
+            crate::ui::templates::BundledListView {
+                id: list.id.clone(),
+                kind: list.kind.clone(),
+                version: list.version.clone(),
+                source: status
+                    .and_then(|status| status.source_url.clone())
+                    .unwrap_or_else(|| list.source.clone()),
+                license: list.license.clone(),
+                entries: status.map_or(list.entries, |status| status.entries),
+                state: if status.is_some_and(|status| !status.bundled) {
+                    "runtime refresh".to_string()
+                } else {
+                    "built-in (minimal)".to_string()
+                },
+                last_refresh: format_refresh(status.and_then(|status| status.last_refresh_unix)),
+            }
+        })
+        .collect();
+    for status in statuses.values().copied() {
+        if manifest.list(&status.category).is_some() {
+            continue;
+        }
+        bundled_lists.push(crate::ui::templates::BundledListView {
+            id: status.category.clone(),
+            kind: "custom".to_string(),
+            version: "—".to_string(),
+            source: status.source_url.clone().unwrap_or_default(),
+            license: "—".to_string(),
+            entries: status.entries,
+            state: if status.bundled {
+                "built-in".to_string()
+            } else {
+                "runtime refresh".to_string()
+            },
+            last_refresh: format_refresh(status.last_refresh_unix),
+        });
+    }
+    bundled_lists.sort_by(|a, b| a.id.cmp(&b.id));
+    bundled_lists
+}
+
 pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
@@ -591,64 +673,8 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
     let custom_rules = cfg.filtering.custom_rules.join("\n");
 
     // Curated lists bundled into the binary plus any runtime refresh state.
-    let manifest = sito_clients::BundledManifest::bundled();
-    let statuses: std::collections::HashMap<String, sito_clients::RuntimeListStatus> = ctx
-        .runtime_lists
-        .statuses()
-        .into_iter()
-        .map(|status| (status.category.clone(), status))
-        .collect();
-    let format_refresh = |ts: Option<u64>| {
-        ts.and_then(|ts| chrono::DateTime::from_timestamp(ts.cast_signed(), 0))
-            .map_or_else(
-                || "—".to_string(),
-                |dt| dt.format("%Y-%m-%d %H:%M UTC").to_string(),
-            )
-    };
-
-    let mut bundled_lists: Vec<crate::ui::templates::BundledListView> = manifest
-        .lists
-        .iter()
-        .map(|list| {
-            let status = statuses.get(&list.id);
-            crate::ui::templates::BundledListView {
-                id: list.id.clone(),
-                kind: list.kind.clone(),
-                version: list.version.clone(),
-                source: status
-                    .and_then(|status| status.source_url.clone())
-                    .unwrap_or_else(|| list.source.clone()),
-                license: list.license.clone(),
-                entries: status.map_or(list.entries, |status| status.entries),
-                state: if status.is_some_and(|status| !status.bundled) {
-                    "runtime refresh".to_string()
-                } else {
-                    "built-in (minimal)".to_string()
-                },
-                last_refresh: format_refresh(status.and_then(|status| status.last_refresh_unix)),
-            }
-        })
-        .collect();
-    for status in ctx.runtime_lists.statuses() {
-        if manifest.list(&status.category).is_some() {
-            continue;
-        }
-        bundled_lists.push(crate::ui::templates::BundledListView {
-            id: status.category.clone(),
-            kind: "custom".to_string(),
-            version: "—".to_string(),
-            source: status.source_url.clone().unwrap_or_default(),
-            license: "—".to_string(),
-            entries: status.entries,
-            state: if status.bundled {
-                "built-in".to_string()
-            } else {
-                "runtime refresh".to_string()
-            },
-            last_refresh: format_refresh(status.last_refresh_unix),
-        });
-    }
-    bundled_lists.sort_by(|a, b| a.id.cmp(&b.id));
+    let manifest = sito_clients::BundledManifest::try_bundled();
+    let bundled_lists = bundled_list_views(manifest, &ctx.runtime_lists.statuses());
 
     HtmlTemplate(FilteringTemplate {
         csrf_token: &csrf,
@@ -1099,6 +1125,29 @@ pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
         })
         .collect();
 
+    // Discovered-client rows carry DHCP PII (IP/MAC/hostname), so they are
+    // loaded and rendered for Operators and above only. The UI shows at most
+    // the API's default page size; the registry itself keeps its hard cap.
+    let can_view_discovered = user.role >= Role::Operator;
+    let (discovered, discovered_total): (Vec<ClientDiscoveryViewItem>, usize) =
+        if can_view_discovered {
+            let all = ctx.clients.load().unidentified_clients();
+            let total = all.len();
+            let rows = all
+                .into_iter()
+                .take(crate::handlers::clients::DEFAULT_UNIDENTIFIED_LIMIT)
+                .map(|client| ClientDiscoveryViewItem {
+                    ip: client.ip.to_string(),
+                    mac: client.mac,
+                    hostname: client.hostname,
+                    last_seen: client.last_seen.format("%Y-%m-%d %H:%M UTC").to_string(),
+                })
+                .collect();
+            (rows, total)
+        } else {
+            (Vec::new(), 0)
+        };
+
     HtmlTemplate(ClientsTemplate {
         csrf_token: &csrf,
         is_authenticated: true,
@@ -1107,6 +1156,11 @@ pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
         active_tab: "clients",
         version: env!("CARGO_PKG_VERSION"),
         clients,
+        discovered,
+        discovered_total,
+        can_view_discovered,
+        max_entries: sito_clients::MAX_UNIDENTIFIED_CLIENTS,
+        retention_hours: sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS,
     })
     .into_response()
 }
@@ -1179,10 +1233,13 @@ pub async fn clients_add_handler(
         );
     }
     ctx.set_config(new_cfg);
-    let new_reg = sito_clients::ClientRegistry::with_routeros_leases(
+    let current = ctx.clients.load();
+    let new_reg = sito_clients::ClientRegistry::with_stores(
         clients_cfg,
-        ctx.clients.load().routeros_leases_store(),
+        current.routeros_leases_store(),
+        current.unidentified_store(),
     );
+    drop(current);
     ctx.set_clients(new_reg);
     crate::publish_bundle(&ctx).await;
 
@@ -1234,10 +1291,13 @@ pub async fn clients_delete_handler(
         );
     }
     ctx.set_config(new_cfg);
-    let new_reg = sito_clients::ClientRegistry::with_routeros_leases(
+    let current = ctx.clients.load();
+    let new_reg = sito_clients::ClientRegistry::with_stores(
         clients_cfg,
-        ctx.clients.load().routeros_leases_store(),
+        current.routeros_leases_store(),
+        current.unidentified_store(),
     );
+    drop(current);
     ctx.set_clients(new_reg);
     crate::publish_bundle(&ctx).await;
 
@@ -2249,9 +2309,17 @@ pub async fn wizard_complete_handler(
             ctx.auth_mgr
                 .create_user(admin_user, effective_password, Role::Admin)
                 .await;
-            // If custom admin username chosen, remove default 'admin' account if still on bootstrap password
-            if admin_user != "admin" && ctx.auth_mgr.is_default_admin_active() {
-                ctx.auth_mgr.delete_user("admin");
+            // If custom admin username chosen, remove default 'admin' account if still on bootstrap password.
+            // Use the last-admin-protected path: if creating the custom admin
+            // failed, the bootstrap account is the sole Admin and must remain.
+            if admin_user != "admin"
+                && ctx.auth_mgr.is_default_admin_active()
+                && let Err(err) = ctx.auth_mgr.delete_user_checked("admin").await
+            {
+                tracing::warn!(
+                    error = %err,
+                    "Wizard could not remove the bootstrap admin account; leaving it in place"
+                );
             }
         }
         ctx.auth_mgr.mark_setup_complete();
@@ -2292,6 +2360,573 @@ pub async fn wizard_complete_handler(
         None => drop(filter_handle),
     }
 
+    Redirect::to("/login").into_response()
+}
+
+// ---------------------------------------------------------------------------
+// User Management & Account (D-17b)
+// ---------------------------------------------------------------------------
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+fn format_token_timestamp(ts: Option<i64>) -> String {
+    ts.and_then(chrono::DateTime::from_timestamp_millis)
+        .map_or_else(
+            || "—".to_string(),
+            |dt| dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+        )
+}
+
+/// `expires_at` is persisted as Unix seconds (unlike millisecond audit
+/// timestamps), so format it through the seconds constructor.
+fn format_token_expiry_timestamp(ts: Option<i64>) -> String {
+    ts.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+        .map_or_else(
+            || "—".to_string(),
+            |dt| dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+        )
+}
+
+fn user_view_items(ctx: &ServerContext, current_username: &str) -> Vec<UserViewItem> {
+    ctx.auth_mgr
+        .list_users()
+        .into_iter()
+        .map(|user| {
+            let encoded = percent_encode_path_segment(&user.username);
+            UserViewItem {
+                is_current: user.username == current_username,
+                username: user.username,
+                role: user.role,
+                totp_enabled: user.totp_enabled,
+                role_action: format!("/ui/users/{encoded}/role"),
+                delete_action: format!("/ui/users/{encoded}/delete"),
+            }
+        })
+        .collect()
+}
+
+fn token_view_items(ctx: &ServerContext, user: &AuthUser) -> Vec<TokenViewItem> {
+    let is_admin = user.role == Role::Admin;
+    ctx.auth_mgr
+        .list_tokens()
+        .iter()
+        .filter(|token| {
+            token.owner.as_deref() == Some(user.username.as_str())
+                || (is_admin && token.owner.is_none())
+        })
+        .map(|token| TokenViewItem {
+            id: token.id.clone(),
+            name: token.name.clone(),
+            scope: token.scope.to_string(),
+            owner: token
+                .owner
+                .clone()
+                .unwrap_or_else(|| "(legacy / ownerless)".to_string()),
+            created_at: format_token_timestamp(Some(token.created_at)),
+            last_used: format_token_timestamp(token.last_used),
+            expires_at: format_token_expiry_timestamp(token.expires_at),
+        })
+        .collect()
+}
+
+fn render_users_page(
+    ctx: &ServerContext,
+    user: &AuthUser,
+    csrf: &str,
+    error_message: &str,
+    status: StatusCode,
+) -> Response {
+    let users = user_view_items(ctx, &user.username);
+    let mut response = HtmlTemplate(UsersTemplate {
+        csrf_token: csrf,
+        is_authenticated: true,
+        username: &user.username,
+        user_role: user.role.as_str(),
+        active_tab: "users",
+        version: env!("CARGO_PKG_VERSION"),
+        users,
+        error_message,
+    })
+    .into_response();
+    *response.status_mut() = status;
+    response
+}
+
+fn render_account_page(
+    ctx: &ServerContext,
+    user: &AuthUser,
+    csrf: &str,
+    error_message: &str,
+    notice_message: &str,
+    new_token: Option<&crate::auth::token::CreateTokenResponse>,
+    status: StatusCode,
+) -> Response {
+    let tokens = token_view_items(ctx, user);
+    let totp_enabled = ctx.auth_mgr.totp_enabled(&user.username);
+    let (token_value, token_name, token_scope) = match new_token {
+        Some(token) => (
+            Some(token.token.as_str()),
+            token.name.as_str(),
+            token.scope.to_string(),
+        ),
+        None => (None, "", String::new()),
+    };
+    let mut response = HtmlTemplate(AccountTemplate {
+        csrf_token: csrf,
+        is_authenticated: true,
+        username: &user.username,
+        user_role: user.role.as_str(),
+        active_tab: "account",
+        version: env!("CARGO_PKG_VERSION"),
+        tokens,
+        totp_enabled,
+        can_create_operator_token: user.role >= Role::Operator,
+        can_create_admin_token: user.role >= Role::Admin,
+        error_message,
+        notice_message,
+        new_token: token_value,
+        new_token_name: token_name,
+        new_token_scope: &token_scope,
+    })
+    .into_response();
+    *response.status_mut() = status;
+    response
+}
+
+fn session_or_redirect(
+    ctx: &ServerContext,
+    headers: &HeaderMap,
+) -> Result<(AuthUser, String), Box<Response>> {
+    match get_session_user(ctx, headers) {
+        Some(user) => Ok((user, get_csrf_token(ctx, headers))),
+        None => Err(Box::new(Redirect::to("/login").into_response())),
+    }
+}
+
+fn admin_or_forbidden(
+    ctx: &ServerContext,
+    headers: &HeaderMap,
+) -> Result<(AuthUser, String), Box<Response>> {
+    let (user, csrf) = session_or_redirect(ctx, headers)?;
+    if user.role < Role::Admin {
+        return Err(Box::new(StatusCode::FORBIDDEN.into_response()));
+    }
+    Ok((user, csrf))
+}
+
+fn users_problem_page(
+    ctx: &ServerContext,
+    user: &AuthUser,
+    csrf: &str,
+    problem: ProblemDetails,
+) -> Response {
+    let status = StatusCode::from_u16(problem.status).unwrap_or(StatusCode::BAD_REQUEST);
+    let detail = problem.detail;
+    render_users_page(ctx, user, csrf, &detail, status)
+}
+
+fn account_problem_page(
+    ctx: &ServerContext,
+    user: &AuthUser,
+    csrf: &str,
+    problem: ProblemDetails,
+) -> Response {
+    let status = StatusCode::from_u16(problem.status).unwrap_or(StatusCode::BAD_REQUEST);
+    let detail = problem.detail;
+    render_account_page(ctx, user, csrf, &detail, "", None, status)
+}
+
+pub async fn users_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
+    let (user, csrf) = match admin_or_forbidden(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    render_users_page(&ctx, &user, &csrf, "", StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+pub struct CreateUserForm {
+    pub username: String,
+    pub password: String,
+    pub role: String,
+}
+
+pub async fn users_create_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Form(form): Form<CreateUserForm>,
+) -> Response {
+    let (user, csrf) = match admin_or_forbidden(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    let username = form.username.trim();
+    let role = match validate_username(username)
+        .and_then(|()| validate_password_policy(&form.password))
+        .and_then(|()| {
+            Role::from_str(form.role.trim())
+                .map_err(|e| ProblemDetails::bad_request(format!("Invalid role: {e}")))
+        }) {
+        Ok(role) => role,
+        Err(problem) => return users_problem_page(&ctx, &user, &csrf, problem),
+    };
+
+    if ctx.auth_mgr.has_user(username) {
+        return users_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::conflict(format!("User '{username}' already exists")),
+        );
+    }
+
+    ctx.auth_mgr
+        .create_user(username, &form.password, role)
+        .await;
+    tracing::info!(
+        actor = %user.username,
+        target = %username,
+        role = %role,
+        "Administrator created a user account"
+    );
+    Redirect::to("/users").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct UpdateUserRoleForm {
+    pub role: String,
+}
+
+pub async fn users_role_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+    Form(form): Form<UpdateUserRoleForm>,
+) -> Response {
+    let (user, csrf) = match admin_or_forbidden(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    let role = match Role::from_str(form.role.trim()) {
+        Ok(role) => role,
+        Err(e) => {
+            return users_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request(format!("Invalid role: {e}")),
+            );
+        }
+    };
+    if let Err(err) = ctx.auth_mgr.set_user_role_checked(&username, role).await {
+        let problem = user_mutation_problem(&username, "demote", err);
+        return users_problem_page(&ctx, &user, &csrf, problem);
+    }
+    tracing::info!(
+        actor = %user.username,
+        target = %username,
+        role = %role,
+        "Administrator changed a user role"
+    );
+    Redirect::to("/users").into_response()
+}
+
+pub async fn users_delete_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+) -> Response {
+    let (user, csrf) = match admin_or_forbidden(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    if let Err(err) = ctx.auth_mgr.delete_user_checked(&username).await {
+        let problem = user_mutation_problem(&username, "delete", err);
+        return users_problem_page(&ctx, &user, &csrf, problem);
+    }
+    tracing::info!(
+        actor = %user.username,
+        target = %username,
+        "Administrator deleted a user account"
+    );
+    Redirect::to("/users").into_response()
+}
+
+pub async fn account_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
+    let (user, csrf) = match session_or_redirect(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    render_account_page(&ctx, &user, &csrf, "", "", None, StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+pub struct AccountPasswordForm {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+pub async fn account_password_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Form(form): Form<AccountPasswordForm>,
+) -> Response {
+    let (user, csrf) = match session_or_redirect(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    if let Err(problem) = validate_password_policy(&form.new_password) {
+        return account_problem_page(&ctx, &user, &csrf, problem);
+    }
+    if form.current_password.is_empty() {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::bad_request("Current password is required"),
+        );
+    }
+    if !ctx
+        .auth_mgr
+        .verify_user_password(&user.username, form.current_password.trim())
+        .await
+    {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::bad_request("Current password is incorrect"),
+        );
+    }
+    if !ctx
+        .auth_mgr
+        .update_user_password(&user.username, &form.new_password)
+        .await
+    {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::not_found("User account not found"),
+        );
+    }
+    tracing::info!(user = %user.username, "User changed their password from the web UI");
+    // Password changes revoke every session for the account, including this
+    // one, so send the browser back to the login page.
+    Redirect::to("/login").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CreateAccountTokenForm {
+    pub name: String,
+    pub scope: String,
+}
+
+pub async fn account_token_create_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Form(form): Form<CreateAccountTokenForm>,
+) -> Response {
+    let (user, csrf) = match session_or_redirect(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    let name = form.name.trim();
+    if name.is_empty() {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::bad_request("Token name is required"),
+        );
+    }
+    if name.len() > 128 {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::bad_request("Token name must be at most 128 characters"),
+        );
+    }
+    let scope = match Role::from_str(form.scope.trim()) {
+        Ok(scope) => scope,
+        Err(e) => {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request(format!("Invalid token scope: {e}")),
+            );
+        }
+    };
+    // Tokens are owned per account, and a token must never outrank its owner.
+    if scope > user.role {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::forbidden("A token scope may not exceed your own role"),
+        );
+    }
+
+    let (_meta, token) = match ctx
+        .auth_mgr
+        .create_token(name, scope, Some(&user.username))
+        .await
+    {
+        Ok(token) => token,
+        Err(e) => {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request(e.to_string()),
+            );
+        }
+    };
+    tracing::info!(user = %user.username, token = %token.id, "User created an API token from the web UI");
+    // The plaintext token is shown only in this response and is never stored
+    // or logged; reloading the page lists metadata only.
+    render_account_page(&ctx, &user, &csrf, "", "", Some(&token), StatusCode::OK)
+}
+
+pub async fn account_token_delete_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let (user, csrf) = match session_or_redirect(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    let Some(token) = ctx
+        .auth_mgr
+        .list_tokens()
+        .into_iter()
+        .find(|token| token.id == id)
+    else {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::not_found(format!("Token '{id}' not found")),
+        );
+    };
+    // Only the owner may revoke a token. Admins additionally manage legacy
+    // ownerless tokens created before ownership was tracked. Another user's
+    // token ID must look indistinguishable from a missing token.
+    let is_own = token.owner.as_deref() == Some(user.username.as_str());
+    let is_admin_legacy = user.role == Role::Admin && token.owner.is_none();
+    if !is_own && !is_admin_legacy {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::not_found(format!("Token '{id}' not found")),
+        );
+    }
+
+    if !ctx.auth_mgr.delete_token(&id).await {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::not_found(format!("Token '{id}' not found")),
+        );
+    }
+    tracing::info!(user = %user.username, token = %id, "User revoked an API token from the web UI");
+    Redirect::to("/account").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct DisableAccountTotpForm {
+    pub password: String,
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+pub async fn account_totp_disable_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Form(form): Form<DisableAccountTotpForm>,
+) -> Response {
+    let (user, csrf) = match session_or_redirect(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+
+    // Mirror the REST disable handler: the current password is always
+    // required, and when TOTP is enabled a valid TOTP or backup code must
+    // accompany it.
+    if !ctx
+        .auth_mgr
+        .verify_user_password(&user.username, &form.password)
+        .await
+    {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::bad_request("Re-authentication failed: invalid password"),
+        );
+    }
+    if ctx.auth_mgr.totp_enabled(&user.username) {
+        let Some(code) = form
+            .code
+            .as_deref()
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+        else {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request("A TOTP or backup code is required to disable 2FA"),
+            );
+        };
+        if !ctx
+            .auth_mgr
+            .verify_second_factor(&user.username, code)
+            .await
+        {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request(
+                    "Re-authentication failed: invalid TOTP or backup code",
+                ),
+            );
+        }
+    }
+
+    if !ctx.auth_mgr.disable_totp(&user.username).await {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::not_found("User account not found"),
+        );
+    }
+    tracing::info!(user = %user.username, "User disabled TOTP 2FA from the web UI");
+    // Disabling 2FA revokes every session for the account by design.
     Redirect::to("/login").into_response()
 }
 
@@ -2343,8 +2978,13 @@ mod tests {
             rewrites.clone(),
         ));
         let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
-            Arc::new(sito_clients::ParentalRegistry::bundled()),
-            Arc::new(sito_clients::ServiceRegistry::bundled()),
+            Arc::new(
+                sito_clients::ParentalRegistry::try_bundled()
+                    .expect("bundled parental lists must load"),
+            ),
+            Arc::new(
+                sito_clients::ServiceRegistry::try_bundled().expect("bundled services must load"),
+            ),
         ));
 
         ServerContext {
@@ -2363,12 +3003,48 @@ mod tests {
             rewrites,
             start_time: Instant::now(),
             restore_tokens: Arc::new(Mutex::new(HashMap::new())),
+            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             master_coordinator: None,
             slave_tracker: None,
             resync_sender: None,
             setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dns_starter: None,
         }
+    }
+
+    #[test]
+    fn test_bundled_list_views_corrupt_manifest_returns_runtime_rows_without_panic() {
+        let corrupt = serde_json::from_str::<sito_clients::BundledManifest>("{ not json")
+            .expect_err("fixture must be invalid JSON");
+        let statuses = vec![sito_clients::RuntimeListStatus {
+            category: "adult".to_string(),
+            source_url: Some("https://lists.example/adult.txt".to_string()),
+            last_refresh_unix: Some(1_700_000_000),
+            entries: 42,
+            bundled: false,
+        }];
+
+        let views = bundled_list_views(Err(corrupt), &statuses);
+        assert_eq!(
+            views.len(),
+            1,
+            "runtime rows must survive a corrupt manifest"
+        );
+        assert_eq!(views[0].id, "adult");
+        assert_eq!(views[0].kind, "custom");
+        assert_eq!(views[0].entries, 42);
+        assert_eq!(views[0].state, "runtime refresh");
+        assert!(views[0].last_refresh.contains("2023-11-14"));
+
+        // The healthy path still merges bundled metadata with runtime status.
+        let manifest =
+            sito_clients::BundledManifest::try_bundled().expect("bundled manifest must parse");
+        let views = bundled_list_views(Ok(manifest), &[]);
+        assert!(views.iter().any(|view| view.id == "adult"));
+        assert!(
+            views.iter().all(|view| view.kind != "custom"),
+            "a healthy manifest must not invent custom rows"
+        );
     }
 
     #[tokio::test]
@@ -2821,7 +3497,11 @@ mod tests {
         .await;
         assert_eq!(filter_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         // Verify in-memory filter lists was NOT mutated
-        assert!(ctx.config.load().filtering.lists.is_empty());
+        assert!(
+            ctx.config.load().filtering.lists.is_empty(),
+            "failed apply must not mutate filter lists: {:?}",
+            ctx.config.load().filtering.lists
+        );
 
         let rewrite_resp = rewrites_add_handler(
             State(ctx.clone()),
@@ -2835,11 +3515,11 @@ mod tests {
         .await;
         assert_eq!(rewrite_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         // Verify in-memory rewrites table was NOT mutated
+        let rewrites = crate::handlers::rewrites::load_rewrite_store(&ctx);
         assert!(
-            crate::handlers::rewrites::load_rewrite_store(&ctx)
-                .cfg
-                .entries
-                .is_empty()
+            rewrites.cfg.entries.is_empty(),
+            "failed apply must not mutate rewrites: {:?}",
+            rewrites.cfg.entries
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -3006,7 +3686,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
 
         let after = load_clients_config(&ctx);
-        assert!(after.entries.is_empty());
+        assert!(
+            after.entries.is_empty(),
+            "failed apply must not persist client entries: {:?}",
+            after.entries
+        );
         assert!(
             !after.client_id_secrets.contains_key("phone"),
             "the UI delete must remove the client's shared secret: {:?}",
@@ -3080,6 +3764,1021 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn session_headers(session: &crate::auth::session::Session) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, session.to_cookie_header().parse().unwrap());
+        headers
+    }
+
+    async fn response_body(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Records discovered clients through the same resolve path the DNS
+    /// listener uses, so the UI sees production-shaped registry entries.
+    type SeedDiscovery<'a> = (
+        std::net::IpAddr,
+        Option<&'a str>,
+        Option<&'a str>,
+        chrono::DateTime<chrono::Utc>,
+    );
+
+    fn seed_discovered(ctx: &ServerContext, entries: &[SeedDiscovery<'_>]) {
+        let registry = ctx.clients.load();
+        for (ip, mac, hostname, last_seen) in entries {
+            let Some(mac) = mac else {
+                // The resolve path only records a discovery when a lease is
+                // present. Seed the no-identifier case directly so the UI
+                // fallback (`-`) is exercised.
+                registry.unidentified_store().write().unwrap().insert(
+                    *ip,
+                    sito_clients::UnidentifiedClient {
+                        ip: *ip,
+                        mac: None,
+                        hostname: hostname.map(str::to_string),
+                        comment: None,
+                        last_seen: *last_seen,
+                    },
+                );
+                continue;
+            };
+            registry.update_routeros_leases(vec![sito_clients::RouterOsLease {
+                mac: (*mac).to_string(),
+                ip: Some(*ip),
+                hostname: hostname.map(str::to_string),
+                comment: None,
+            }]);
+            let mut client = sito_core::client::ClientContext::new(*ip);
+            let _ = registry.resolve(&mut client, registry.timezone().at_utc(*last_seen));
+        }
+    }
+
+    /// A fixed midday UTC instant: deterministic formatting with no risk of
+    /// crossing a day (or UTC midnight) while the test runs.
+    fn midday() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .expect("midday is a valid time")
+            .and_utc()
+    }
+
+    #[tokio::test]
+    async fn test_clients_page_shows_unidentified_for_operator() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_operator_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+
+        let base = midday();
+        let older_seen = base - chrono::TimeDelta::minutes(5);
+        let newer_seen = base - chrono::TimeDelta::minutes(1);
+        let no_id_seen = base - chrono::TimeDelta::minutes(3);
+        let older: std::net::IpAddr = "10.42.0.10".parse().unwrap();
+        let newer: std::net::IpAddr = "10.42.0.11".parse().unwrap();
+        let no_id: std::net::IpAddr = "10.42.0.12".parse().unwrap();
+        seed_discovered(
+            &ctx,
+            &[
+                (
+                    older,
+                    Some("aa:bb:cc:dd:ee:01"),
+                    Some("older-host"),
+                    older_seen,
+                ),
+                (
+                    newer,
+                    Some("aa:bb:cc:dd:ee:02"),
+                    Some("newer-host"),
+                    newer_seen,
+                ),
+                (no_id, None, None, no_id_seen),
+            ],
+        );
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+
+        assert!(
+            body.contains("Discovered but unidentified"),
+            "operators must see the discovered card: {body}"
+        );
+        assert!(body.contains("10.42.0.10"), "{body}");
+        assert!(body.contains("10.42.0.11"), "{body}");
+        assert!(body.contains("aa:bb:cc:dd:ee:01"), "{body}");
+        assert!(body.contains("aa:bb:cc:dd:ee:02"), "{body}");
+        assert!(body.contains("older-host"), "{body}");
+        assert!(body.contains("newer-host"), "{body}");
+        assert!(body.contains("Last Seen"), "{body}");
+        for seen in [older_seen, newer_seen, no_id_seen] {
+            let rendered = seen.format("%Y-%m-%d %H:%M UTC").to_string();
+            assert!(
+                body.contains(&rendered),
+                "last-seen timestamp {rendered:?} must render exactly: {body}"
+            );
+        }
+
+        // A discovery with neither a MAC nor a hostname must render the `-`
+        // fallback instead of an empty cell.
+        let no_id_pos = body.find("10.42.0.12").expect("no-identifier row");
+        let no_id_row_end = body[no_id_pos..].find("</tr>").expect("row terminator") + no_id_pos;
+        assert!(
+            body[no_id_pos..no_id_row_end].contains("<div>-</div>"),
+            "missing MAC and hostname must render '-': {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "capped at {} entries",
+                sito_clients::MAX_UNIDENTIFIED_CLIENTS
+            )),
+            "the entry bound must be visible: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "pruned after {} hours",
+                sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS
+            )),
+            "the retention window must be visible: {body}"
+        );
+
+        let newer_pos = body.find("10.42.0.11").expect("newer row");
+        let older_pos = body.find("10.42.0.10").expect("older row");
+        assert!(
+            newer_pos < older_pos,
+            "discovered rows must be newest first"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_clients_page_caps_discovered_rows_at_api_default() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_cap_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+
+        // 105 discoveries: the newest 100 render, the 5 oldest are omitted
+        // even though the registry hard cap (1024) is not reached.
+        let base = midday();
+        let entries: Vec<(
+            std::net::IpAddr,
+            String,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+        )> = (0..105)
+            .map(|index: i64| {
+                let ip = format!("10.44.0.{}", index + 1).parse().unwrap();
+                let mac = format!("aa:bb:cc:dd:ef:{index:02x}");
+                (ip, mac, None, base - chrono::TimeDelta::minutes(index))
+            })
+            .collect();
+        for (ip, mac, hostname, seen) in &entries {
+            seed_discovered(
+                &ctx,
+                &[(*ip, Some(mac.as_str()), hostname.as_deref(), *seen)],
+            );
+        }
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+
+        assert!(
+            body.contains("Showing 100 of 105 discovered clients"),
+            "the truncated count must be accurate: {body}"
+        );
+        let rendered_rows = body
+            .matches("<td class=\"td-strong mono\">10.44.0.")
+            .count();
+        assert_eq!(rendered_rows, 100, "at most 100 discovered rows may render");
+        assert!(body.contains("10.44.0.1<"), "the newest row must render");
+        assert!(body.contains("10.44.0.100<"), "row 100 must render");
+        for index in 101..=105 {
+            assert!(
+                !body.contains(&format!("10.44.0.{index}<")),
+                "row {index} is outside the 100-row window: {body}"
+            );
+        }
+        assert!(
+            body.contains(&format!(
+                "capped at {} entries",
+                sito_clients::MAX_UNIDENTIFIED_CLIENTS
+            )),
+            "the registry hard cap must stay visible: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_clients_page_hides_unidentified_for_viewer() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_viewer_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("view_user", "ViewerPass1", Role::Viewer)
+            .await;
+
+        // Viewers still see explicitly configured clients; only the
+        // discovered (DHCP PII) section is hidden.
+        let mut clients_cfg = load_clients_config(&ctx);
+        clients_cfg.entries.push(sito_clients::ClientEntryConfig {
+            name: "Viewer Laptop".to_string(),
+            ids: vec!["10.43.0.99".to_string()],
+            group: "default".to_string(),
+            ignore_query_log: false,
+            ignore_stats: false,
+            use_global_upstreams: true,
+            upstreams: None,
+            trusted: false,
+        });
+        let mut new_cfg = (**ctx.config.load()).clone();
+        new_cfg.clients = Some(toml::Value::try_from(&clients_cfg).unwrap());
+        ctx.set_config(new_cfg);
+
+        let ip: std::net::IpAddr = "10.43.0.20".parse().unwrap();
+        seed_discovered(
+            &ctx,
+            &[(ip, Some("aa:bb:cc:dd:ee:03"), Some("secret-host"), midday())],
+        );
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("view_user", "ViewerPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("viewer login failed");
+        };
+        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+
+        assert!(
+            body.contains("Identified Clients & Device Policies"),
+            "viewers still see configured clients: {body}"
+        );
+        assert!(
+            body.contains("Viewer Laptop") && body.contains("10.43.0.99"),
+            "the configured client row must remain visible: {body}"
+        );
+        assert!(
+            !body.contains("Discovered but unidentified"),
+            "the discovered section must be operator-only: {body}"
+        );
+        assert!(
+            !body.contains("No unidentified clients discovered yet"),
+            "the empty state must not leak the section: {body}"
+        );
+        assert!(!body.contains("10.43.0.20"), "discovered IP leaked: {body}");
+        assert!(
+            !body.contains("aa:bb:cc:dd:ee:03"),
+            "discovered MAC leaked: {body}"
+        );
+        assert!(
+            !body.contains("secret-host"),
+            "discovered hostname leaked: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_clients_page_empty_unidentified_state() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_empty_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+
+        assert!(body.contains("Discovered but unidentified"), "{body}");
+        assert!(
+            body.contains("No unidentified clients discovered yet."),
+            "the empty state must render for operators: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "capped at {} entries",
+                sito_clients::MAX_UNIDENTIFIED_CLIENTS
+            )),
+            "the bound must stay visible when the list is empty: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_users_page_requires_admin() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_users_rbac_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        // Anonymous visitors are sent to the login page.
+        let resp = users_page(State(ctx.clone()), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/login")
+        );
+
+        ctx.auth_mgr
+            .create_user("view_user", "ViewerPass1", Role::Viewer)
+            .await;
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+
+        let LoginResult::Success(view_session) = ctx
+            .auth_mgr
+            .login("view_user", "ViewerPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("viewer login failed");
+        };
+        let view_headers = session_headers(&view_session);
+
+        let resp = users_page(State(ctx.clone()), view_headers.clone()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a Viewer must not list user accounts"
+        );
+
+        let LoginResult::Success(oper_session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+        let resp = users_page(State(ctx.clone()), session_headers(&oper_session)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "an Operator must not list user accounts"
+        );
+
+        // /account is available to every authenticated role.
+        let resp = account_page(State(ctx.clone()), view_headers).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let LoginResult::Success(admin_session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let resp = users_page(State(ctx.clone()), session_headers(&admin_session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_users_create_role_delete_flow() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_users_flow_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let LoginResult::Success(session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let headers = session_headers(&session);
+
+        // Weak passwords and invalid roles are rejected by the shared policy.
+        let resp = users_create_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(CreateUserForm {
+                username: "bob".to_string(),
+                password: "short".to_string(),
+                role: "viewer".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(!ctx.auth_mgr.has_user("bob"));
+
+        let resp = users_create_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(CreateUserForm {
+                username: "  alice  ".to_string(),
+                password: "AlicePassword1".to_string(),
+                role: "operator".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/users")
+        );
+        assert!(ctx.auth_mgr.has_user("alice"));
+        assert_eq!(ctx.auth_mgr.role_of("alice"), Some(Role::Operator));
+
+        // Duplicate creation is a conflict and does not overwrite the account.
+        let resp = users_create_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(CreateUserForm {
+                username: "alice".to_string(),
+                password: "OtherPassword1".to_string(),
+                role: "viewer".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(ctx.auth_mgr.role_of("alice"), Some(Role::Operator));
+
+        let resp = users_role_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Path("alice".to_string()),
+            Form(UpdateUserRoleForm {
+                role: "viewer".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(ctx.auth_mgr.role_of("alice"), Some(Role::Viewer));
+
+        let resp = users_delete_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Path("alice".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(!ctx.auth_mgr.has_user("alice"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_users_last_admin_protected() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_users_last_admin_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let LoginResult::Success(session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let headers = session_headers(&session);
+
+        let resp = users_role_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Path("admin".to_string()),
+            Form(UpdateUserRoleForm {
+                role: "viewer".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_body(resp).await;
+        assert!(
+            body.contains("last remaining admin"),
+            "visible error missing: {body}"
+        );
+        assert_eq!(ctx.auth_mgr.role_of("admin"), Some(Role::Admin));
+
+        let resp =
+            users_delete_handler(State(ctx.clone()), headers, Path("admin".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_body(resp).await;
+        assert!(
+            body.contains("last remaining admin"),
+            "visible error missing: {body}"
+        );
+        assert!(ctx.auth_mgr.has_user("admin"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_account_password_change() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_account_pw_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let LoginResult::Success(session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let headers = session_headers(&session);
+
+        let resp = account_password_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(AccountPasswordForm {
+                current_password: "wrong-password".to_string(),
+                new_password: "NewAdminPassword1".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_body(resp).await;
+        assert!(body.contains("Current password is incorrect"), "{body}");
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("admin", "adminadmin")
+                .await,
+            "wrong current password must not change the password"
+        );
+
+        let resp = account_password_handler(
+            State(ctx.clone()),
+            headers,
+            Form(AccountPasswordForm {
+                current_password: "  adminadmin  ".to_string(),
+                new_password: "NewAdminPassword1".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(matches!(
+            ctx.auth_mgr
+                .login("admin", "NewAdminPassword1", "127.0.0.1")
+                .await,
+            LoginResult::Success(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_account_tokens_create_and_revoke() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_account_tokens_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let LoginResult::Success(session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let headers = session_headers(&session);
+
+        let resp = account_token_create_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(CreateAccountTokenForm {
+                name: "  ci-deploy  ".to_string(),
+                scope: "viewer".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+        let plaintext = body
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .find(|part| part.starts_with("sito_") && part.len() == 69)
+            .expect("plaintext token must be rendered")
+            .to_string();
+        assert!(body.contains("ci-deploy"));
+        assert!(
+            body.contains("only time"),
+            "one-time warning missing: {body}"
+        );
+
+        let tokens = ctx.auth_mgr.list_tokens();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(
+            tokens[0].name, "ci-deploy",
+            "the token name must be stored exactly as trimmed"
+        );
+        let token_id = tokens[0].id.clone();
+        assert!(
+            !body.contains(&tokens[0].hash),
+            "the stored token hash must never be rendered"
+        );
+
+        // Reloading the account page lists metadata only, not the plaintext.
+        let resp = account_page(State(ctx.clone()), headers.clone()).await;
+        let reloaded = response_body(resp).await;
+        assert!(
+            !reloaded.contains(&plaintext),
+            "plaintext token must not survive the one-time response: {reloaded}"
+        );
+        assert!(reloaded.contains("ci-deploy"));
+
+        let resp = account_token_delete_handler(State(ctx.clone()), headers, Path(token_id)).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(ctx.auth_mgr.list_tokens().is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_account_token_empty_table_colspan_matches_role() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_token_colspan_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("view_user", "ViewerPass1", Role::Viewer)
+            .await;
+
+        let LoginResult::Success(view_session) = ctx
+            .auth_mgr
+            .login("view_user", "ViewerPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("viewer login failed");
+        };
+        let body =
+            response_body(account_page(State(ctx.clone()), session_headers(&view_session)).await)
+                .await;
+        assert!(
+            body.contains("colspan=\"6\""),
+            "non-Admins have six token columns: {body}"
+        );
+        assert!(
+            !body.contains("colspan=\"7\""),
+            "the empty-state span must not count the hidden Owner column: {body}"
+        );
+
+        let LoginResult::Success(admin_session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let body =
+            response_body(account_page(State(ctx.clone()), session_headers(&admin_session)).await)
+                .await;
+        assert!(
+            body.contains("colspan=\"7\""),
+            "Admins have seven token columns: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_account_token_scope_capped_at_user_role() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_token_scope_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("view_user", "ViewerPass1", Role::Viewer)
+            .await;
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("view_user", "ViewerPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("viewer login failed");
+        };
+        let headers = session_headers(&session);
+
+        let resp = account_token_create_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(CreateAccountTokenForm {
+                name: "escalation".to_string(),
+                scope: "admin".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            ctx.auth_mgr.list_tokens().is_empty(),
+            "a Viewer must not mint an Admin token"
+        );
+
+        let resp = account_token_create_handler(
+            State(ctx.clone()),
+            headers,
+            Form(CreateAccountTokenForm {
+                name: "read-only".to_string(),
+                scope: "viewer".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(ctx.auth_mgr.list_tokens().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_account_tokens_are_per_owner() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_token_owner_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+        ctx.auth_mgr
+            .create_user("view_user", "ViewerPass1", Role::Viewer)
+            .await;
+
+        let (oper_token, _) = ctx
+            .auth_mgr
+            .create_token("oper-token", Role::Operator, Some("oper_user"))
+            .await
+            .expect("operator token");
+        let (admin_token, _) = ctx
+            .auth_mgr
+            .create_token("admin-token", Role::Admin, Some("admin"))
+            .await
+            .expect("admin token");
+        let (legacy_token, _) = ctx
+            .auth_mgr
+            .create_token("legacy-token", Role::Viewer, None)
+            .await
+            .expect("legacy token");
+        let (viewer_token, _) = ctx
+            .auth_mgr
+            .create_token("viewer-token", Role::Viewer, Some("view_user"))
+            .await
+            .expect("viewer token");
+
+        let LoginResult::Success(view_session) = ctx
+            .auth_mgr
+            .login("view_user", "ViewerPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("viewer login failed");
+        };
+        let view_headers = session_headers(&view_session);
+
+        let resp = account_page(State(ctx.clone()), view_headers.clone()).await;
+        let body = response_body(resp).await;
+        assert!(body.contains("viewer-token"));
+        assert!(!body.contains("oper-token"));
+        assert!(!body.contains("admin-token"));
+        assert!(!body.contains("legacy-token"));
+        assert!(
+            !body.contains("<th>Owner</th>"),
+            "non-admins must not see the owner column"
+        );
+
+        // Viewer cannot revoke an Operator, Admin, or legacy token, and the
+        // response is indistinguishable from a missing token.
+        for foreign_id in [&oper_token.id, &admin_token.id, &legacy_token.id] {
+            let resp = account_token_delete_handler(
+                State(ctx.clone()),
+                view_headers.clone(),
+                Path(foreign_id.clone()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert!(
+                ctx.auth_mgr
+                    .list_tokens()
+                    .iter()
+                    .any(|token| &token.id == foreign_id),
+                "a foreign token must survive a Viewer revoke attempt"
+            );
+        }
+
+        let resp = account_token_delete_handler(
+            State(ctx.clone()),
+            view_headers,
+            Path(viewer_token.id.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(
+            !ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == viewer_token.id)
+        );
+
+        // An Operator also cannot revoke an Admin token or a legacy token.
+        let LoginResult::Success(oper_session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+        let oper_headers = session_headers(&oper_session);
+        for foreign_id in [&admin_token.id, &legacy_token.id] {
+            let resp = account_token_delete_handler(
+                State(ctx.clone()),
+                oper_headers.clone(),
+                Path(foreign_id.clone()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert!(
+                ctx.auth_mgr
+                    .list_tokens()
+                    .iter()
+                    .any(|token| &token.id == foreign_id)
+            );
+        }
+        let resp = account_page(State(ctx.clone()), oper_headers).await;
+        let body = response_body(resp).await;
+        assert!(body.contains("oper-token"));
+        assert!(!body.contains("admin-token"));
+        assert!(!body.contains("legacy-token"));
+
+        // The Admin sees their own tokens plus legacy ownerless tokens, never
+        // another account's tokens, and may revoke the legacy ones.
+        let LoginResult::Success(admin_session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let admin_headers = session_headers(&admin_session);
+        let resp = account_page(State(ctx.clone()), admin_headers.clone()).await;
+        let body = response_body(resp).await;
+        assert!(body.contains("admin-token"));
+        assert!(body.contains("legacy-token"));
+        assert!(!body.contains("oper-token"));
+        assert!(body.contains("<th>Owner</th>"));
+
+        // Admin privilege does not extend to another account's owned token:
+        // the response is indistinguishable from a missing token and the
+        // token survives.
+        let resp = account_token_delete_handler(
+            State(ctx.clone()),
+            admin_headers.clone(),
+            Path(oper_token.id.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == oper_token.id),
+            "an Admin must not revoke another user's owned token"
+        );
+
+        let resp = account_token_delete_handler(
+            State(ctx.clone()),
+            admin_headers,
+            Path(legacy_token.id.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(
+            !ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == legacy_token.id)
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_format_token_expiry_uses_seconds() {
+        assert_eq!(
+            format_token_expiry_timestamp(Some(1_800_000_000)),
+            "2027-01-15 08:00 UTC"
+        );
+        assert_eq!(format_token_expiry_timestamp(None), "—");
+    }
+
+    #[tokio::test]
+    async fn test_account_totp_disable() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_account_totp_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let setup = ctx.auth_mgr.init_totp_setup("admin").await.expect("setup");
+        assert!(
+            ctx.auth_mgr
+                .confirm_totp_setup("admin", &setup.backup_codes[0])
+                .await
+        );
+        assert!(ctx.auth_mgr.totp_enabled("admin"));
+
+        // Enabling TOTP revokes the old session, and logging in now needs a
+        // second factor. Use a backup code to obtain a real session.
+        let LoginResult::TotpRequired { partial_token } =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("TOTP login should require a second factor");
+        };
+        let crate::auth::manager::TotpVerifyResult::Success(session) = ctx
+            .auth_mgr
+            .verify_totp(&partial_token, &setup.backup_codes[1], "127.0.0.1")
+            .await
+        else {
+            panic!("TOTP verification failed");
+        };
+        let headers = session_headers(&session);
+
+        let resp = account_totp_disable_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(DisableAccountTotpForm {
+                password: "wrong-password".to_string(),
+                code: Some(setup.backup_codes[2].clone()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(ctx.auth_mgr.totp_enabled("admin"));
+
+        let resp = account_totp_disable_handler(
+            State(ctx.clone()),
+            headers.clone(),
+            Form(DisableAccountTotpForm {
+                password: "adminadmin".to_string(),
+                code: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_body(resp).await;
+        assert!(body.contains("A TOTP or backup code is required"), "{body}");
+        assert!(ctx.auth_mgr.totp_enabled("admin"));
+
+        let resp = account_totp_disable_handler(
+            State(ctx.clone()),
+            headers,
+            Form(DisableAccountTotpForm {
+                password: "adminadmin".to_string(),
+                code: Some(setup.backup_codes[2].clone()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(
+            !ctx.auth_mgr.totp_enabled("admin"),
+            "TOTP status must flip to disabled"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

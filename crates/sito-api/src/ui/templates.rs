@@ -50,6 +50,42 @@ pub struct ClientViewItem {
     pub group: String,
 }
 
+/// One discovered-but-unconfigured client row.
+#[derive(Debug, Clone)]
+pub struct ClientDiscoveryViewItem {
+    pub ip: String,
+    pub mac: Option<String>,
+    pub hostname: Option<String>,
+    /// Pre-formatted UTC timestamp for display.
+    pub last_seen: String,
+}
+
+/// One row on the user-management page.
+#[derive(Debug, Clone)]
+pub struct UserViewItem {
+    pub username: String,
+    pub role: String,
+    pub totp_enabled: bool,
+    /// Percent-encoded action URLs so usernames cannot break out of the path.
+    pub role_action: String,
+    pub delete_action: String,
+    /// True for the authenticated account viewing the page.
+    pub is_current: bool,
+}
+
+/// One API-token row on the account page.
+#[derive(Debug, Clone)]
+pub struct TokenViewItem {
+    pub id: String,
+    pub name: String,
+    pub scope: String,
+    /// Display label for Admins; ordinary users only see their own tokens.
+    pub owner: String,
+    pub created_at: String,
+    pub last_used: String,
+    pub expires_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryLogRowItem {
     pub ts: i64,
@@ -173,6 +209,16 @@ pub struct ClientsTemplate<'a> {
     pub active_tab: &'a str,
     pub version: &'a str,
     pub clients: Vec<ClientViewItem>,
+    /// Newest-first discovered clients; empty for roles below Operator.
+    pub discovered: Vec<ClientDiscoveryViewItem>,
+    /// Total discoveries before the UI row cap, used for the truncation count.
+    pub discovered_total: usize,
+    /// True when the signed-in role may see discovered-client PII.
+    pub can_view_discovered: bool,
+    /// Maximum number of entries the registry retains.
+    pub max_entries: usize,
+    /// Age after which discovered entries are pruned.
+    pub retention_hours: u64,
 }
 
 #[derive(Template)]
@@ -213,6 +259,44 @@ pub struct SystemTemplate<'a> {
     pub version: &'a str,
     pub status: &'a StatusResponse,
     pub uptime_str: String,
+}
+
+#[derive(Template)]
+#[template(path = "users.html")]
+pub struct UsersTemplate<'a> {
+    pub csrf_token: &'a str,
+    pub is_authenticated: bool,
+    pub username: &'a str,
+    pub user_role: &'a str,
+    pub active_tab: &'a str,
+    pub version: &'a str,
+    pub users: Vec<UserViewItem>,
+    pub error_message: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "account.html")]
+pub struct AccountTemplate<'a> {
+    pub csrf_token: &'a str,
+    pub is_authenticated: bool,
+    pub username: &'a str,
+    pub user_role: &'a str,
+    pub active_tab: &'a str,
+    pub version: &'a str,
+    pub tokens: Vec<TokenViewItem>,
+    pub totp_enabled: bool,
+    /// Scope options the signed-in role is allowed to mint. Tokens are global
+    /// in the current auth model, so a role must never create a token above
+    /// its own privilege level.
+    pub can_create_operator_token: bool,
+    pub can_create_admin_token: bool,
+    pub error_message: &'a str,
+    pub notice_message: &'a str,
+    /// Plaintext token from the request that just created it. Rendered exactly
+    /// once and never stored or re-listed.
+    pub new_token: Option<&'a str>,
+    pub new_token_name: &'a str,
+    pub new_token_scope: &'a str,
 }
 
 #[derive(Template)]

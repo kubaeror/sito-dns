@@ -111,8 +111,10 @@ mod tests {
         ));
 
         let clients = Arc::new(ClientRegistry::new(ClientsConfig::default()));
-        let parental = Arc::new(ParentalRegistry::bundled());
-        let services = Arc::new(ServiceRegistry::bundled());
+        let parental =
+            Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load"));
+        let services =
+            Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load"));
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
 
         let stats_db = sito_stats::StatsDb::in_memory().await.unwrap();
@@ -259,8 +261,10 @@ mod tests {
             &config.dns.dnssec,
         ));
         let clients = Arc::new(ClientRegistry::new(ClientsConfig::default()));
-        let parental = Arc::new(ParentalRegistry::bundled());
-        let services = Arc::new(ServiceRegistry::bundled());
+        let parental =
+            Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load"));
+        let services =
+            Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load"));
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
 
         let pipeline = DnsPipeline::new(
@@ -431,8 +435,10 @@ mod tests {
         let cache = Arc::new(DnsCache::new(base.dns.cache.clone()));
         let dnssec = Arc::new(sito_dnssec::DnssecValidator::from_config(&base.dns.dnssec));
         let clients = Arc::new(ClientRegistry::new(clients_cfg));
-        let parental = Arc::new(ParentalRegistry::bundled());
-        let services = Arc::new(ServiceRegistry::bundled());
+        let parental =
+            Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load"));
+        let services =
+            Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load"));
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
         let stats_db = sito_stats::StatsDb::in_memory().await.unwrap();
         let writer = sito_stats::QueryLogWriter::spawn(stats_db.clone(), 100);
@@ -551,8 +557,10 @@ mod tests {
         ));
 
         let clients = Arc::new(ClientRegistry::new(ClientsConfig::default()));
-        let parental = Arc::new(ParentalRegistry::bundled());
-        let services = Arc::new(ServiceRegistry::bundled());
+        let parental =
+            Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load"));
+        let services =
+            Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load"));
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
 
         let pipeline = DnsPipeline::new(
@@ -722,8 +730,8 @@ mod tests {
         lists_cfg.validate().unwrap();
 
         let store = Arc::new(sito_clients::RuntimeLists::from_arcs(
-            Arc::new(ParentalRegistry::bundled()),
-            Arc::new(ServiceRegistry::bundled()),
+            Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load")),
+            Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load")),
         ));
         assert!(store.parental().matches_category("adult", "pornhub.com"));
 
@@ -955,8 +963,10 @@ mod tests {
         let client_registry = Arc::new(ArcSwap::new(Arc::new(ClientRegistry::new(
             ClientsConfig::default(),
         ))));
-        let parental_registry = Arc::new(ParentalRegistry::bundled());
-        let service_registry = Arc::new(ServiceRegistry::bundled());
+        let parental_registry =
+            Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load"));
+        let service_registry =
+            Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load"));
         let rewrites = Arc::new(ArcSwap::new(Arc::new(RewriteTable::new(
             RewritesConfig::default(),
         ))));
@@ -1086,8 +1096,10 @@ mod tests {
             &config.dns.dnssec,
         ));
         let clients = Arc::new(ClientRegistry::new(ClientsConfig::default()));
-        let parental = Arc::new(ParentalRegistry::bundled());
-        let services = Arc::new(ServiceRegistry::bundled());
+        let parental =
+            Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load"));
+        let services =
+            Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load"));
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
 
         let pipeline = DnsPipeline::new(
@@ -1213,8 +1225,8 @@ mod tests {
             Arc::new(arc_swap::ArcSwap::new(Arc::new(ClientRegistry::new(
                 ClientsConfig::default(),
             )))),
-            Arc::new(ParentalRegistry::bundled()),
-            Arc::new(ServiceRegistry::bundled()),
+            Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load")),
+            Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load")),
             Arc::new(arc_swap::ArcSwap::new(Arc::new(RewriteTable::new(
                 RewritesConfig::default(),
             )))),
@@ -1318,8 +1330,10 @@ mod tests {
             &config.dns.dnssec,
         ));
         let clients = Arc::new(ClientRegistry::new(ClientsConfig::default()));
-        let parental = Arc::new(ParentalRegistry::bundled());
-        let services = Arc::new(ServiceRegistry::bundled());
+        let parental =
+            Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load"));
+        let services =
+            Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load"));
         let rewrites = Arc::new(RewriteTable::new(RewritesConfig::default()));
 
         let pipeline = DnsPipeline::new(
@@ -1453,8 +1467,8 @@ mod tests {
             Arc::new(arc_swap::ArcSwap::new(Arc::new(ClientRegistry::new(
                 ClientsConfig::default(),
             )))),
-            Arc::new(ParentalRegistry::bundled()),
-            Arc::new(ServiceRegistry::bundled()),
+            Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load")),
+            Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load")),
             Arc::new(arc_swap::ArcSwap::new(Arc::new(RewriteTable::new(
                 RewritesConfig::default(),
             )))),

@@ -9,8 +9,8 @@ use crate::auth::token::Role;
 use crate::config_writer::save_config_atomic;
 use crate::error::ProblemDetails;
 use crate::models::{
-    ClientDto, ClientGroupDto, GenericMessageResponse, UpdateClientGroupRequest,
-    UpdateClientRequest,
+    ClientDto, ClientGroupDto, GenericMessageResponse, UnidentifiedClientDto,
+    UnidentifiedClientsResponse, UpdateClientGroupRequest, UpdateClientRequest,
 };
 use crate::state::ServerContext;
 use axum::Json;
@@ -35,6 +35,18 @@ impl ClientRevealQuery {
     }
 }
 
+/// Query parameters for the discovered-client list.
+#[derive(Debug, Clone, Default, Deserialize, utoipa::IntoParams)]
+pub struct UnidentifiedClientsQuery {
+    /// Maximum number of newest entries to return (default 100, clamped to
+    /// the registry bound).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Default page size for the discovered-client list (also the web UI cap).
+pub(crate) const DEFAULT_UNIDENTIFIED_LIMIT: usize = 100;
+
 fn load_clients_config(ctx: &ServerContext) -> ClientsConfig {
     ctx.config
         .load()
@@ -57,11 +69,15 @@ async fn save_clients_config(
     save_config_atomic(&ctx.config_path, &new_cfg).await?;
     ctx.set_config(new_cfg);
 
-    // Update active registry, keeping the RouterOS lease store shared.
-    let new_reg = sito_clients::ClientRegistry::with_routeros_leases(
+    // Update active registry, keeping the RouterOS lease and discovered-client
+    // stores shared so a config save does not hide unidentified clients.
+    let current = ctx.clients.load();
+    let new_reg = sito_clients::ClientRegistry::with_stores(
         clients_cfg.clone(),
-        ctx.clients.load().routeros_leases_store(),
+        current.routeros_leases_store(),
+        current.unidentified_store(),
     );
+    drop(current);
     ctx.set_clients(new_reg);
     crate::publish_bundle(ctx).await;
     Ok(())
@@ -232,6 +248,48 @@ pub async fn get_clients(
             .map(|entry| client_to_dto(entry, cfg.client_id_secrets.get(&entry.name), false))
             .collect(),
     )
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/clients/unidentified",
+    params(UnidentifiedClientsQuery),
+    responses(
+        (status = 200, description = "Discovered but unconfigured clients, newest first", body = UnidentifiedClientsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden")
+    ),
+    tag = "Clients"
+)]
+pub async fn get_unidentified_clients(
+    _operator: RequireOperator,
+    State(ctx): State<ServerContext>,
+    Query(query): Query<UnidentifiedClientsQuery>,
+) -> Json<UnidentifiedClientsResponse> {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_UNIDENTIFIED_LIMIT)
+        .clamp(1, sito_clients::MAX_UNIDENTIFIED_CLIENTS);
+    let clients = ctx
+        .clients
+        .load()
+        .unidentified_clients()
+        .into_iter()
+        .take(limit)
+        .map(|client| UnidentifiedClientDto {
+            ip: client.ip.to_string(),
+            mac: client.mac,
+            hostname: client.hostname,
+            comment: client.comment,
+            last_seen: client.last_seen.to_rfc3339(),
+        })
+        .collect();
+
+    Json(UnidentifiedClientsResponse {
+        clients,
+        max_entries: sito_clients::MAX_UNIDENTIFIED_CLIENTS,
+        retention_hours: sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS,
+    })
 }
 
 #[utoipa::path(
@@ -734,8 +792,13 @@ mod tests {
             rewrites.clone(),
         ));
         let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
-            Arc::new(sito_clients::ParentalRegistry::bundled()),
-            Arc::new(sito_clients::ServiceRegistry::bundled()),
+            Arc::new(
+                sito_clients::ParentalRegistry::try_bundled()
+                    .expect("bundled parental lists must load"),
+            ),
+            Arc::new(
+                sito_clients::ServiceRegistry::try_bundled().expect("bundled services must load"),
+            ),
         ));
 
         ServerContext {
@@ -754,6 +817,7 @@ mod tests {
             rewrites,
             start_time: std::time::Instant::now(),
             restore_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             master_coordinator: None,
             slave_tracker: None,
             resync_sender: None,
@@ -778,6 +842,186 @@ mod tests {
             role: Role::Admin,
             token_id: None,
         })
+    }
+
+    fn seed_unidentified(
+        ctx: &ServerContext,
+        entries: &[(std::net::IpAddr, chrono::DateTime<chrono::Utc>)],
+    ) {
+        let registry = ctx.clients.load();
+        for (ip, last_seen) in entries {
+            registry.update_routeros_leases(vec![sito_clients::RouterOsLease {
+                mac: "11:22:33:44:55:66".to_string(),
+                ip: Some(*ip),
+                hostname: Some(format!("host-{ip}")),
+                comment: None,
+            }]);
+            let mut client = sito_core::client::ClientContext::new(*ip);
+            let _ = registry.resolve(&mut client, registry.timezone().at_utc(*last_seen));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unidentified_clients_endpoint_newest_first_and_bounded() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_clients_unidentified_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let now = chrono::Utc::now();
+        let older: std::net::IpAddr = "10.20.0.1".parse().unwrap();
+        let newer: std::net::IpAddr = "10.20.0.2".parse().unwrap();
+        seed_unidentified(
+            &ctx,
+            &[
+                (older, now - chrono::TimeDelta::minutes(5)),
+                (newer, now - chrono::TimeDelta::minutes(1)),
+            ],
+        );
+
+        let response = get_unidentified_clients(
+            operator(),
+            State(ctx.clone()),
+            Query(UnidentifiedClientsQuery { limit: Some(1) }),
+        )
+        .await
+        .0;
+        assert_eq!(response.clients.len(), 1, "the limit must bound the page");
+        assert_eq!(response.clients[0].ip, newer.to_string());
+        let expected_host = format!("host-{newer}");
+        assert_eq!(
+            response.clients[0].hostname.as_deref(),
+            Some(expected_host.as_str())
+        );
+
+        // Newest-first when both are requested.
+        let response = get_unidentified_clients(
+            operator(),
+            State(ctx.clone()),
+            Query(UnidentifiedClientsQuery { limit: Some(10) }),
+        )
+        .await
+        .0;
+        assert_eq!(response.clients.len(), 2);
+        assert_eq!(response.clients[0].ip, newer.to_string());
+        assert_eq!(response.clients[1].ip, older.to_string());
+
+        // An oversized limit is clamped instead of allocating the request.
+        let response = get_unidentified_clients(
+            operator(),
+            State(ctx.clone()),
+            Query(UnidentifiedClientsQuery {
+                limit: Some(usize::MAX),
+            }),
+        )
+        .await
+        .0;
+        assert_eq!(response.clients.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_unidentified_clients_response_reports_limits() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_clients_limits_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let response = get_unidentified_clients(
+            operator(),
+            State(ctx.clone()),
+            Query(UnidentifiedClientsQuery::default()),
+        )
+        .await
+        .0;
+        assert_eq!(response.max_entries, sito_clients::MAX_UNIDENTIFIED_CLIENTS);
+        assert_eq!(
+            response.retention_hours,
+            sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_unidentified_clients_requires_operator() {
+        use axum::extract::FromRequestParts;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_clients_rbac_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+        let (_, token) = ctx
+            .auth_mgr
+            .create_token("viewer", Role::Viewer, None)
+            .await
+            .expect("token");
+
+        let request = axum::http::Request::builder()
+            .uri("/api/v1/clients/unidentified")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {}", token.token),
+            )
+            .body(())
+            .unwrap();
+        let (mut parts, ()) = request.into_parts();
+        let err = <RequireOperator as FromRequestParts<ServerContext>>::from_request_parts(
+            &mut parts, &ctx,
+        )
+        .await
+        .expect_err("a Viewer must not list discovered clients");
+        assert_eq!(err.status, 403);
+
+        // Operators pass the same extractor.
+        let (_, token) = ctx
+            .auth_mgr
+            .create_token("operator", Role::Operator, None)
+            .await
+            .expect("token");
+        let request = axum::http::Request::builder()
+            .uri("/api/v1/clients/unidentified")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {}", token.token),
+            )
+            .body(())
+            .unwrap();
+        let (mut parts, ()) = request.into_parts();
+        assert!(
+            <RequireOperator as FromRequestParts<ServerContext>>::from_request_parts(
+                &mut parts, &ctx,
+            )
+            .await
+            .is_ok()
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_client_reload_preserves_unidentified_clients() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_clients_reload_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let ip: std::net::IpAddr = "10.30.0.7".parse().unwrap();
+        seed_unidentified(&ctx, &[(ip, chrono::Utc::now())]);
+        assert_eq!(ctx.clients.load().unidentified_clients().len(), 1);
+
+        // Saving clients replaces the registry; discovery must survive.
+        let cfg = load_clients_config(&ctx);
+        save_clients_config(&ctx, &cfg).await.unwrap();
+
+        let list = ctx.clients.load().unidentified_clients();
+        assert_eq!(list.len(), 1, "a clients reload must keep discovery data");
+        assert_eq!(list[0].ip, ip);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]
@@ -833,7 +1077,11 @@ mod tests {
         assert_eq!(updated.ip, vec!["10.0.0.5"]);
         // DoH path is classified correctly (previously unreachable).
         assert_eq!(updated.doh_path, Some("/dns-query".to_string()));
-        assert!(updated.subnet.is_empty());
+        assert!(
+            updated.subnet.is_empty(),
+            "DoH client must not carry a subnet: {:?}",
+            updated.subnet
+        );
 
         // Renaming onto an existing name is rejected.
         let conflict = update_client(

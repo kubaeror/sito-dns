@@ -250,6 +250,9 @@ pub struct DnsRewriteRule {
     pub rcode: String,
     pub rtype: Option<String>,
     pub value: Option<String>,
+    /// True only for the bare `@@...$dnsrewrite` form, which cancels every
+    /// matching rewrite instead of being an explicit NODATA rewrite.
+    pub bare: bool,
 }
 
 impl fmt::Display for DnsRewriteRule {
@@ -349,7 +352,11 @@ pub fn compute_canonical(kind: RuleKind, pattern: &Pattern, modifiers: &RuleModi
         opts.push(format!("dnstype={dnstype}"));
     }
     if let Some(dnsrewrite) = &modifiers.dnsrewrite {
-        opts.push(format!("dnsrewrite={dnsrewrite}"));
+        if dnsrewrite.bare {
+            opts.push("dnsrewrite".to_string());
+        } else {
+            opts.push(format!("dnsrewrite={dnsrewrite}"));
+        }
     }
     if modifiers.important {
         opts.push("important".to_string());
@@ -673,6 +680,7 @@ fn validate_rewrite(
             rcode,
             rtype: None,
             value: None,
+            bare: false,
         }),
         (None, Some(v)) => {
             let (rtype, value) = infer_rewrite_type(&v)?;
@@ -680,6 +688,7 @@ fn validate_rewrite(
                 rcode,
                 rtype: Some(rtype),
                 value: Some(value),
+                bare: false,
             })
         }
         (Some(_), None) => None,
@@ -715,6 +724,7 @@ fn validate_rewrite(
                 rcode,
                 rtype: Some(rtype),
                 value: Some(value),
+                bare: false,
             })
         }
     }
@@ -761,6 +771,7 @@ fn parse_dnsrewrite(value: &str) -> Option<DnsRewriteRule> {
                 rcode: upper,
                 rtype: None,
                 value: None,
+                bare: false,
             })
         } else {
             let (rtype, value) = infer_rewrite_type(trimmed)?;
@@ -768,6 +779,7 @@ fn parse_dnsrewrite(value: &str) -> Option<DnsRewriteRule> {
                 rcode: "NOERROR".to_string(),
                 rtype: Some(rtype),
                 value: Some(value),
+                bare: false,
             })
         }
     }
@@ -837,6 +849,7 @@ fn parse_modifiers(options_str: &str, kind: RuleKind) -> Result<RuleModifiers, S
                         rcode: "NOERROR".to_string(),
                         rtype: None,
                         value: None,
+                        bare: true,
                     });
                 }
                 None => return Err("modifier 'dnsrewrite' requires a value".to_string()),
@@ -1222,6 +1235,7 @@ mod tests {
                 rcode: "NOERROR".to_string(),
                 rtype: Some("A".to_string()),
                 value: Some("1.2.3.4".to_string()),
+                bare: false,
             })
         );
 
@@ -1233,7 +1247,54 @@ mod tests {
                 rcode: "NXDOMAIN".to_string(),
                 rtype: None,
                 value: None,
+                bare: false,
             })
+        );
+    }
+
+    #[test]
+    fn test_bare_dnsrewrite_exception_sets_bare() {
+        let rule = parse_line("@@||example.com^$dnsrewrite", "test", 1).unwrap();
+        let rewrite = rule.modifiers.dnsrewrite.unwrap();
+        assert!(rewrite.bare, "the bare form must be marked as bare");
+        assert_eq!(rewrite.rcode, "NOERROR");
+        assert!(rewrite.rtype.is_none());
+        assert!(rewrite.value.is_none());
+    }
+
+    #[test]
+    fn test_explicit_noerror_dnsrewrite_is_not_bare() {
+        // `$dnsrewrite=NOERROR` is an explicit NODATA rewrite, not a
+        // cancel-everything bare exception.
+        let rule = parse_line("@@||example.com^$dnsrewrite=NOERROR", "test", 1).unwrap();
+        let rewrite = rule.modifiers.dnsrewrite.unwrap();
+        assert!(!rewrite.bare, "an explicit NOERROR must not be bare");
+        assert_eq!(rewrite.rcode, "NOERROR");
+        assert!(rewrite.rtype.is_none());
+        assert!(rewrite.value.is_none());
+
+        let semicolons = parse_line("@@||example.com^$dnsrewrite=NOERROR;;", "test", 2).unwrap();
+        assert!(
+            !semicolons.modifiers.dnsrewrite.unwrap().bare,
+            "the explicit rcode;rtype;value form must not be bare"
+        );
+    }
+
+    #[test]
+    fn test_canonical_representation_distinguishes_bare_dnsrewrite() {
+        let bare = parse_line("@@||example.com^$dnsrewrite", "test", 1).unwrap();
+        let explicit = parse_line("@@||example.com^$dnsrewrite=NOERROR", "test", 2).unwrap();
+        let valued = parse_line("@@||example.com^$dnsrewrite=1.2.3.4", "test", 3).unwrap();
+
+        assert_eq!(bare.canonical, "@@||example.com^$dnsrewrite");
+        assert_eq!(explicit.canonical, "@@||example.com^$dnsrewrite=NOERROR;;");
+        assert_eq!(
+            valued.canonical,
+            "@@||example.com^$dnsrewrite=NOERROR;A;1.2.3.4"
+        );
+        assert_ne!(
+            bare.canonical, explicit.canonical,
+            "bare and explicit NOERROR rewrites must not share a canonical form"
         );
     }
 
@@ -1343,6 +1404,7 @@ mod tests {
                 rcode: "NOERROR".to_string(),
                 rtype: None,
                 value: None,
+                bare: false,
             })
         );
 
@@ -1363,6 +1425,7 @@ mod tests {
                 rcode: "NOERROR".to_string(),
                 rtype: Some("AAAA".to_string()),
                 value: Some("::1".to_string()),
+                bare: false,
             })
         );
         let cname = parse_line("||e.com^$dnsrewrite=cname.example.net", "test", 9).unwrap();
@@ -1372,6 +1435,7 @@ mod tests {
                 rcode: "NOERROR".to_string(),
                 rtype: Some("CNAME".to_string()),
                 value: Some("cname.example.net".to_string()),
+                bare: false,
             })
         );
     }

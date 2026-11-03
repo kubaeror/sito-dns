@@ -291,7 +291,11 @@ mod tests {
         let resp = synthesize_blocked_response(&query, &BlockingMode::ZeroIp, 60);
         assert_eq!(resp.metadata.id, 9999);
         assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
-        assert!(resp.answers.is_empty()); // NODATA
+        assert!(
+            resp.answers.is_empty(),
+            "NODATA response must not carry answers: {:?}",
+            resp.answers
+        );
     }
 
     #[test]
@@ -302,7 +306,11 @@ mod tests {
 
         let resp = synthesize_blocked_response(&query, &BlockingMode::Nxdomain, 60);
         assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
-        assert!(resp.answers.is_empty());
+        assert!(
+            resp.answers.is_empty(),
+            "NXDOMAIN block must not carry answers: {:?}",
+            resp.answers
+        );
     }
 
     #[test]
@@ -323,7 +331,11 @@ mod tests {
 
         let resp = synthesize_blocked_response(&query, &BlockingMode::NullRdata, 60);
         assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
-        assert!(resp.answers.is_empty());
+        assert!(
+            resp.answers.is_empty(),
+            "0.0.0.0 block must not carry answers: {:?}",
+            resp.answers
+        );
     }
 
     #[test]

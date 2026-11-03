@@ -1,0 +1,116 @@
+name: Artifact E2E
+
+# Verifies an already-published release end to end: the unified checksum file,
+# the cosign keyless signature identity, and that the packaged binary accepts
+# the configuration shipped inside the archive.
+#
+# - `workflow_call`: invoked by release.yml after the tag-only release has been
+#   published. It is a job in that workflow rather than a `release: published`
+#   trigger because GitHub does not start workflows for releases created with
+#   the repository's GITHUB_TOKEN.
+# - `workflow_dispatch`: re-verify any existing release without publishing.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to verify (for example v1.9.0)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify (for example v1.9.0, or "latest")
+        required: true
+        type: string
+        default: latest
+
+# Least privilege: reading release assets and metadata only.
+permissions:
+  contents: read
+
+jobs:
+  artifact-e2e:
+    name: verify (${{ inputs.tag }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Resolve the release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${REQUESTED_TAG}" = "latest" ]; then
+            tag="$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName --jq .tagName)"
+          else
+            tag="${REQUESTED_TAG}"
+          fi
+          # The tag is interpolated into asset paths and a grep pattern below.
+          if ! printf '%s' "${tag}" | grep -Eq '^v[0-9][0-9A-Za-z.+-]*$'; then
+            echo "::error::unexpected release tag '${tag}'"
+            exit 1
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download the release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          gh release download "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir release-assets \
+            --pattern 'sito-*-x86_64-unknown-linux-gnu.tar.gz' \
+            --pattern 'sito-*-x86_64-unknown-linux-gnu.tar.gz.sha256' \
+            --pattern 'sito-*-x86_64-unknown-linux-gnu.tar.gz.sig' \
+            --pattern 'sito-*-x86_64-unknown-linux-gnu.tar.gz.pem' \
+            --pattern 'SHA256SUMS'
+          ls -l release-assets
+
+      - name: Verify checksums
+        working-directory: release-assets
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          archive="sito-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          sha256sum -c "${archive}.sha256"
+          # SHA256SUMS also covers the other architectures and the SBOM, which
+          # this job does not download; verify only the archive under test.
+          grep -F "  ${archive}" SHA256SUMS | sha256sum -c -
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          # Pinned to v2 like release.yml: the v3 CLI changed its flag surface.
+          cosign-release: 'v2.6.5'
+
+      - name: Verify the cosign keyless signature
+        working-directory: release-assets
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          archive="sito-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          cosign verify-blob \
+            --certificate "${archive}.pem" \
+            --signature "${archive}.sig" \
+            --certificate-identity-regexp \
+              '^https://github.com/kubaeror/sito-dns/\.github/workflows/release\.yml@refs/tags/.*$' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${archive}"
+
+      - name: Extract and validate the shipped configuration
+        working-directory: release-assets
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          archive="sito-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          dir="sito-${TAG}-x86_64-unknown-linux-gnu"
+          tar -xzf "${archive}"
+          "./${dir}/sito" --version
+          "./${dir}/sito" check-config --config "./${dir}/config.example.toml"

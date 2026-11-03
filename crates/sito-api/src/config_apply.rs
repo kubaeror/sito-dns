@@ -17,7 +17,7 @@
 //! and the runtime never diverge silently.
 
 use crate::config_validation::validate_typed_sections;
-use crate::config_writer::save_config_atomic;
+use crate::config_writer::save_config_document_atomic;
 use crate::error::ProblemDetails;
 use crate::state::ServerContext;
 use sito_core::config::Config;
@@ -212,7 +212,23 @@ fn validate_hostname(host: &str) -> Result<(), String> {
 }
 
 /// Applies `candidate` to the live server, rolling back on failure.
+///
+/// Every apply path acquires [`ServerContext::apply_lock`], so an older
+/// document that was already read from disk cannot overwrite the runtime after
+/// a newer push acquired the lock first.
 pub async fn apply_full_config(
+    ctx: &ServerContext,
+    candidate: &Config,
+    filter_apply: FilterApply,
+    hooks: Option<&dyn ConfigApplyHooks>,
+) -> Result<AppliedReport, ProblemDetails> {
+    let _apply_guard = ctx.apply_lock.lock().await;
+    apply_full_config_locked(ctx, candidate, filter_apply, hooks).await
+}
+
+/// Apply implementation that must be called with [`ServerContext::apply_lock`]
+/// already held.
+async fn apply_full_config_locked(
     ctx: &ServerContext,
     candidate: &Config,
     filter_apply: FilterApply,
@@ -249,11 +265,43 @@ pub async fn apply_and_persist_config(
     filter_apply: FilterApply,
     hooks: Option<&dyn ConfigApplyHooks>,
 ) -> Result<AppliedReport, ProblemDetails> {
-    let previous = (**ctx.config.load()).clone();
-    let report = apply_full_config(ctx, candidate, filter_apply, hooks).await?;
+    let document = toml::to_string_pretty(candidate)
+        .map_err(|e| ProblemDetails::internal_error(format!("Serialization failed: {e}")))?;
+    let _apply_guard = ctx.apply_lock.lock().await;
+    apply_and_persist_document_locked(ctx, candidate, &document, filter_apply, hooks).await
+}
 
-    if let Err(e) = save_config_atomic(&ctx.config_path, candidate).await {
-        if let Err(rollback_err) = apply_full_config(ctx, &previous, FilterApply::Sync, hooks).await
+/// Applies `candidate` and atomically persists `document` only after the apply
+/// succeeded.
+///
+/// The HA slave uses this variant to keep the exact document built from the
+/// pushed configuration plus node-local fields. A persist failure rolls the
+/// in-memory apply back so the file and the running server stay in sync.
+pub async fn apply_and_persist_document(
+    ctx: &ServerContext,
+    candidate: &Config,
+    document: &str,
+    filter_apply: FilterApply,
+    hooks: Option<&dyn ConfigApplyHooks>,
+) -> Result<AppliedReport, ProblemDetails> {
+    let _apply_guard = ctx.apply_lock.lock().await;
+    apply_and_persist_document_locked(ctx, candidate, document, filter_apply, hooks).await
+}
+
+/// Persist variant that must be called with [`ServerContext::apply_lock`] held.
+async fn apply_and_persist_document_locked(
+    ctx: &ServerContext,
+    candidate: &Config,
+    document: &str,
+    filter_apply: FilterApply,
+    hooks: Option<&dyn ConfigApplyHooks>,
+) -> Result<AppliedReport, ProblemDetails> {
+    let previous = (**ctx.config.load()).clone();
+    let report = apply_full_config_locked(ctx, candidate, filter_apply, hooks).await?;
+
+    if let Err(e) = save_config_document_atomic(&ctx.config_path, document, candidate).await {
+        if let Err(rollback_err) =
+            apply_full_config_locked(ctx, &previous, FilterApply::Sync, hooks).await
         {
             tracing::error!(
                 error = %rollback_err.detail,
@@ -264,6 +312,81 @@ pub async fn apply_and_persist_config(
     }
     ctx.publish_bundle().await;
     Ok(report)
+}
+
+/// Result of handling a configuration file change.
+#[derive(Debug)]
+pub enum ConfigFileApplyOutcome {
+    /// The file already matches the live runtime configuration (typically the
+    /// HA applier's own write or an identical save); nothing was re-applied.
+    SelfWriteIgnored,
+    /// The new configuration was applied and published to slaves.
+    Applied(AppliedReport),
+    /// The document was rejected; the running configuration is untouched.
+    Rejected(ProblemDetails),
+}
+
+/// Applies a configuration document read from disk (file-watcher path).
+///
+/// Every event is serialized with the other apply/persist paths and then
+/// re-reads the file. The document is suppressed only when it parses to the
+/// *current* runtime configuration (typically the HA applier's own write, a
+/// duplicate event, or an identical external save). An identical external save
+/// therefore does not force a full re-apply; use `POST /api/v1/config/reload`
+/// when an explicit reload is required. A file that differs from the runtime —
+/// including an external revert to an older document — is always applied.
+///
+/// If the on-disk document is rejected (parse or validation failure), the
+/// running configuration is left untouched by design. In that case the file
+/// and runtime can diverge until an operator fixes the file or restores a
+/// valid document; the runtime is not rolled forward to a rejected file.
+pub async fn apply_config_document_event(
+    ctx: &ServerContext,
+    document: &str,
+    filter_apply: FilterApply,
+    hooks: Option<&dyn ConfigApplyHooks>,
+) -> ConfigFileApplyOutcome {
+    // Serialize with every other apply/persist path, then re-read the file.
+    // An event for push A can be delivered after push B has already written
+    // and applied; applying the stale A document would regress the runtime to
+    // an older configuration even though B was ACKed.
+    let _apply_guard = ctx.apply_lock.lock().await;
+
+    let mut current = document.to_string();
+    match tokio::fs::read_to_string(&ctx.config_path).await {
+        Ok(on_disk) if on_disk != current => {
+            tracing::debug!(
+                path = %ctx.config_path.display(),
+                "Configuration watcher event was stale; applying the current file content"
+            );
+            current = on_disk;
+        }
+        _ => {}
+    }
+
+    let new_cfg = match Config::from_toml_str(&current) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return ConfigFileApplyOutcome::Rejected(ProblemDetails::bad_request(format!(
+                "Invalid hot-reloaded configuration: {e}"
+            )));
+        }
+    };
+
+    // Compare against the live runtime, not a time-limited record of writes: an
+    // external revert to an older (but recently self-written) document must be
+    // applied.
+    if new_cfg == **ctx.config.load() {
+        return ConfigFileApplyOutcome::SelfWriteIgnored;
+    }
+
+    match apply_full_config_locked(ctx, &new_cfg, filter_apply, hooks).await {
+        Ok(report) => {
+            ctx.publish_bundle().await;
+            ConfigFileApplyOutcome::Applied(report)
+        }
+        Err(e) => ConfigFileApplyOutcome::Rejected(e),
+    }
 }
 
 async fn apply_inner(
@@ -285,7 +408,6 @@ async fn apply_inner(
 
     // 2. Filter engine (unless the caller queues the list fetch).
     if filter_apply == FilterApply::Sync {
-        let filter_started = std::time::Instant::now();
         ctx.filter
             .reload_with_config(&cfg.filtering)
             .await
@@ -293,8 +415,6 @@ async fn apply_inner(
                 ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
             })?;
         ctx.metrics.set_filter_rules(ctx.filter.rule_count());
-        ctx.metrics
-            .observe_filter_compile(filter_started.elapsed().as_secs_f64());
         // Filter rules changed: drop cached answers that may now be blocked.
         ctx.cache.flush();
     }
@@ -312,12 +432,16 @@ async fn apply_inner(
     ctx.cache.update_config(cfg.dns.cache.clone()).await;
     ctx.querylog_sender
         .set_anonymize(cfg.privacy.anonymize_querylog);
+    let current_clients = ctx.clients.load();
+    let clients_registry = sito_clients::ClientRegistry::with_stores(
+        clients,
+        current_clients.routeros_leases_store(),
+        current_clients.unidentified_store(),
+    );
+    drop(current_clients);
     ctx.runtime.replace(sito_runtime::RuntimeSnapshot {
         config: Arc::new(cfg.clone()),
-        clients: Arc::new(sito_clients::ClientRegistry::with_routeros_leases(
-            clients,
-            ctx.clients.load().routeros_leases_store(),
-        )),
+        clients: Arc::new(clients_registry),
         rewrites: Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
     });
     Ok(())
@@ -353,11 +477,9 @@ pub fn queue_filter_refresh(
     let metrics = ctx.metrics.clone();
     let cache = ctx.cache.clone();
     tokio::spawn(async move {
-        let started = std::time::Instant::now();
         match engine.reload_with_config(&filtering).await {
             Ok(_) => {
                 metrics.set_filter_rules(engine.rule_count());
-                metrics.observe_filter_compile(started.elapsed().as_secs_f64());
                 cache.flush();
                 tracing::info!("Background blocklist refresh completed");
             }
@@ -479,6 +601,174 @@ mod tests {
         }
     }
 
+    /// B regression: two rapid pushes end at the newer document (a stale event
+    /// for A re-reads B), but an external revert to the older A document within
+    /// the old 120 s window must be applied, leaving runtime and file at A.
+    #[tokio::test]
+    async fn test_rapid_pushes_end_at_newest_and_external_revert_is_applied() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_rapid_pushes");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut first = (**ctx.config.load()).clone();
+        first.upstream.servers = vec!["1.1.1.1".to_string()];
+        let first_document = toml::to_string_pretty(&first).unwrap();
+        let mut second = first.clone();
+        second.upstream.servers = vec!["9.9.9.9".to_string()];
+        let second_document = toml::to_string_pretty(&second).unwrap();
+
+        // Push A then push B before A's watcher event is handled. The file
+        // already contains B when the stale A event arrives.
+        tokio::fs::write(&ctx.config_path, &first_document)
+            .await
+            .unwrap();
+        tokio::fs::write(&ctx.config_path, &second_document)
+            .await
+            .unwrap();
+
+        match apply_config_document_event(&ctx, &first_document, FilterApply::Sync, None).await {
+            ConfigFileApplyOutcome::Applied(_) => {}
+            other => panic!("the current file (B) must be applied, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.runtime.snapshot().config.upstream.servers,
+            vec!["9.9.9.9".to_string()],
+            "the stale A event must apply the current file B, not A"
+        );
+
+        // A pending stale-A event delivered after B is live re-reads B and is a
+        // no-op: the runtime stays at B.
+        match apply_config_document_event(&ctx, &first_document, FilterApply::Sync, None).await {
+            ConfigFileApplyOutcome::SelfWriteIgnored => {}
+            other => panic!("a stale event must re-read the live B file, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.runtime.snapshot().config.upstream.servers,
+            vec!["9.9.9.9".to_string()],
+            "two rapid pushes must end at the newer document"
+        );
+
+        // An external revert to A (which was a self-write moments ago) must be
+        // applied: the runtime must not stay ahead of the file.
+        tokio::fs::write(&ctx.config_path, &first_document)
+            .await
+            .unwrap();
+        match apply_config_document_event(&ctx, &first_document, FilterApply::Sync, None).await {
+            ConfigFileApplyOutcome::Applied(_) => {}
+            other => panic!("an external revert must be applied, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.runtime.snapshot().config.upstream.servers,
+            vec!["1.1.1.1".to_string()],
+            "the runtime and file must both end at the reverted document"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// The watcher suppresses only a document that already matches the live
+    /// runtime; changed documents are applied normally.
+    #[tokio::test]
+    async fn test_config_document_event_suppresses_only_current_runtime() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_watcher");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let equal_document = toml::to_string_pretty(&**ctx.config.load()).unwrap();
+        match apply_config_document_event(&ctx, &equal_document, FilterApply::Sync, None).await {
+            ConfigFileApplyOutcome::SelfWriteIgnored => {}
+            other => panic!("an equal document must be ignored, got {other:?}"),
+        }
+
+        let mut changed = (**ctx.config.load()).clone();
+        changed.upstream.servers = vec!["9.9.9.9".to_string()];
+        let changed_document = toml::to_string_pretty(&changed).unwrap();
+        match apply_config_document_event(&ctx, &changed_document, FilterApply::Sync, None).await {
+            ConfigFileApplyOutcome::Applied(_) => {}
+            other => panic!("a changed document must be applied, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.runtime.snapshot().config.upstream.servers,
+            vec!["9.9.9.9".to_string()]
+        );
+
+        match apply_config_document_event(&ctx, &changed_document, FilterApply::Sync, None).await {
+            ConfigFileApplyOutcome::SelfWriteIgnored => {}
+            other => panic!("the runtime-matching document must be suppressed, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// D-01: the HA path persists the exact document it built (preserving
+    /// `[ha]`, identity and credentials) while applying the same config.
+    #[tokio::test]
+    async fn test_apply_and_persist_document_preserves_document() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_document");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut candidate = (**ctx.config.load()).clone();
+        candidate.upstream.servers = vec!["9.9.9.9".to_string()];
+        candidate.dns.cache.min_ttl = 60;
+        // The document intentionally contains formatting/comments the typed
+        // serializer would drop; it must be written byte-for-byte.
+        let document = format!(
+            "{}\n# node-local section preserved by the HA applier\n",
+            toml::to_string_pretty(&candidate).unwrap()
+        );
+
+        apply_and_persist_document(&ctx, &candidate, &document, FilterApply::Sync, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            document,
+            "the persisted document must not be re-serialized"
+        );
+        assert_eq!(
+            ctx.runtime.snapshot().config.upstream.servers,
+            vec!["9.9.9.9".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// D-01: a persist failure rolls the applied components back, including
+    /// the live filter snapshot.
+    #[tokio::test]
+    async fn test_apply_and_persist_document_rolls_back_on_persist_failure() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_document_rollback");
+        let mut ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.config_path = std::path::PathBuf::from("/proc/forbidden_document_test/config.toml");
+
+        let original_ttl = ctx.config.load().dns.cache.min_ttl;
+        let mut candidate = (**ctx.config.load()).clone();
+        candidate.dns.cache.min_ttl = original_ttl.saturating_add(42);
+        candidate.filtering.custom_rules = vec!["||must-not-stick.test^".to_string()];
+        let document = toml::to_string_pretty(&candidate).unwrap();
+
+        let err = apply_and_persist_document(&ctx, &candidate, &document, FilterApply::Sync, None)
+            .await
+            .expect_err("persist must fail");
+        assert_eq!(err.status, 500);
+        assert_eq!(ctx.config.load().dns.cache.min_ttl, original_ttl);
+        assert!(
+            ctx.runtime
+                .snapshot()
+                .config
+                .filtering
+                .custom_rules
+                .is_empty(),
+            "the runtime snapshot must be rolled back"
+        );
+        assert_eq!(
+            ctx.filter.rule_count(),
+            0,
+            "the live filter snapshot must be rolled back"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[test]
     fn test_restart_required_matrix_is_truthful() {
         let old = Config::default();
@@ -527,6 +817,10 @@ mod tests {
         // must not be reported (WP-6.5 false positive).
         let mut new2 = old.clone();
         new2.dns.doh_dedicated_hostname = "dns.example.com".to_string();
-        assert!(restart_required_fields(&old, &new2).is_empty());
+        assert!(
+            restart_required_fields(&old, &new2).is_empty(),
+            "changing only the DoH hostname must not require a restart: {:?}",
+            restart_required_fields(&old, &new2)
+        );
     }
 }

@@ -42,4 +42,9 @@ pub enum FilterError {
 
     #[error("Filter rule set exceeds the configured limit of {limit} rules (parsed: {count})")]
     TooManyRules { count: usize, limit: usize },
+
+    #[error(
+        "Regex compilation exceeded the configured budget of {limit_ms} ms (elapsed: {elapsed_ms} ms); previous snapshot retained"
+    )]
+    CompileBudgetExceeded { elapsed_ms: u64, limit_ms: u64 },
 }
