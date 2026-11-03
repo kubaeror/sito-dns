@@ -136,6 +136,20 @@
     </table>
   </div>
 
+  {% if discovered_pages > 1 %}
+  <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px 0;">
+    <span style="color: var(--text-muted); font-size: 0.8rem;">Page {{ discovered_page }} of {{ discovered_pages }}</span>
+    <span style="display: flex; gap: 8px;">
+      {% if discovered_page > 1 %}
+      <a class="btn btn-secondary btn-sm" href="/clients?discovered_page={{ discovered_page - 1 }}">Previous</a>
+      {% endif %}
+      {% if discovered_page < discovered_pages %}
+      <a class="btn btn-secondary btn-sm" href="/clients?discovered_page={{ discovered_page + 1 }}">Next</a>
+      {% endif %}
+    </span>
+  </div>
+  {% endif %}
+
   {% if discovered.len() < discovered_total %}
   <div style="padding: 12px 18px 0; color: var(--text-muted); font-size: 0.8rem;">
     Showing {{ discovered.len() }} of {{ discovered_total }} discovered clients (newest first).

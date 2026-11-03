@@ -1071,7 +1071,18 @@ fn load_clients_config(ctx: &ServerContext) -> sito_clients::ClientsConfig {
         .unwrap_or_default()
 }
 
-pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
+/// Query parameters for the clients page.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClientsPageQuery {
+    /// 1-based page of the discovered-but-unidentified list.
+    pub discovered_page: Option<usize>,
+}
+
+pub async fn clients_page(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Query(query): Query<ClientsPageQuery>,
+) -> Response {
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
     };
@@ -1089,27 +1100,35 @@ pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
         .collect();
 
     // Discovered-client rows carry DHCP PII (IP/MAC/hostname), so they are
-    // loaded and rendered for Operators and above only. The UI shows at most
-    // the API's default page size; the registry itself keeps its hard cap.
+    // loaded and rendered for Operators and above only. The list is paginated
+    // at the API's default page size; the registry itself keeps its hard cap.
     let can_view_discovered = user.role >= Role::Operator;
-    let (discovered, discovered_total): (Vec<ClientDiscoveryViewItem>, usize) =
-        if can_view_discovered {
-            let all = ctx.clients.load().unidentified_clients();
-            let total = all.len();
-            let rows = all
-                .into_iter()
-                .take(crate::handlers::clients::DEFAULT_UNIDENTIFIED_LIMIT)
-                .map(|client| ClientDiscoveryViewItem {
-                    ip: client.ip.to_string(),
-                    mac: client.mac,
-                    hostname: client.hostname,
-                    last_seen: client.last_seen.format("%Y-%m-%d %H:%M UTC").to_string(),
-                })
-                .collect();
-            (rows, total)
-        } else {
-            (Vec::new(), 0)
-        };
+    let (discovered, discovered_total, discovered_page, discovered_pages): (
+        Vec<ClientDiscoveryViewItem>,
+        usize,
+        usize,
+        usize,
+    ) = if can_view_discovered {
+        let all = ctx.clients.load().unidentified_clients();
+        let total = all.len();
+        let page_size = crate::handlers::clients::DEFAULT_UNIDENTIFIED_LIMIT;
+        let pages = total.div_ceil(page_size).max(1);
+        let page = query.discovered_page.unwrap_or(1).clamp(1, pages);
+        let rows = all
+            .into_iter()
+            .skip((page - 1) * page_size)
+            .take(page_size)
+            .map(|client| ClientDiscoveryViewItem {
+                ip: client.ip.to_string(),
+                mac: client.mac,
+                hostname: client.hostname,
+                last_seen: client.last_seen.format("%Y-%m-%d %H:%M UTC").to_string(),
+            })
+            .collect();
+        (rows, total, page, pages)
+    } else {
+        (Vec::new(), 0, 1, 1)
+    };
 
     HtmlTemplate(ClientsTemplate {
         csrf_token: &csrf,
@@ -1122,6 +1141,8 @@ pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
         discovered,
         discovered_total,
         can_view_discovered,
+        discovered_page,
+        discovered_pages,
         max_entries: sito_clients::MAX_UNIDENTIFIED_CLIENTS,
         retention_hours: sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS,
     })
@@ -3780,6 +3801,20 @@ mod tests {
         }
     }
 
+    /// Seeds `count` discoveries under `10.44.0.x` (index 0 is newest).
+    /// `hostname_prefix` adds a hostname to each entry so PII-leak assertions
+    /// have something distinctive to look for.
+    fn seed_discovered_page(ctx: &ServerContext, count: i64, hostname_prefix: Option<&str>) {
+        let base = midday();
+        for index in 0..count {
+            let ip: std::net::IpAddr = format!("10.44.0.{}", index + 1).parse().unwrap();
+            let mac = format!("aa:bb:cc:dd:ef:{index:02x}");
+            let hostname = hostname_prefix.map(|prefix| format!("{prefix}-{index}"));
+            let seen = base - chrono::TimeDelta::minutes(index);
+            seed_discovered(ctx, &[(ip, Some(mac.as_str()), hostname.as_deref(), seen)]);
+        }
+    }
+
     /// A fixed midday UTC instant: deterministic formatting with no risk of
     /// crossing a day (or UTC midnight) while the test runs.
     fn midday() -> chrono::DateTime<chrono::Utc> {
@@ -3836,7 +3871,12 @@ mod tests {
         else {
             panic!("operator login failed");
         };
-        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        let resp = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery::default()),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = response_body(resp).await;
 
@@ -3934,7 +3974,12 @@ mod tests {
         else {
             panic!("operator login failed");
         };
-        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        let resp = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery::default()),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = response_body(resp).await;
 
@@ -4008,7 +4053,12 @@ mod tests {
         else {
             panic!("viewer login failed");
         };
-        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        let resp = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery::default()),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = response_body(resp).await;
 
@@ -4061,7 +4111,12 @@ mod tests {
         else {
             panic!("operator login failed");
         };
-        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        let resp = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery::default()),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = response_body(resp).await;
 
@@ -4076,6 +4131,236 @@ mod tests {
                 sito_clients::MAX_UNIDENTIFIED_CLIENTS
             )),
             "the bound must stay visible when the list is empty: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn discovered_row_count(body: &str) -> usize {
+        body.matches("<td class=\"td-strong mono\">10.44.0.")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn test_clients_page_paginates_discovered_clients() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_paginate_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+        seed_discovered_page(&ctx, 105, None);
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+
+        let page1 = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery {
+                discovered_page: Some(1),
+            }),
+        )
+        .await;
+        assert_eq!(page1.status(), StatusCode::OK);
+        let body1 = response_body(page1).await;
+        assert!(body1.contains("Page 1 of 2"), "{body1}");
+        assert_eq!(
+            discovered_row_count(&body1),
+            crate::handlers::clients::DEFAULT_UNIDENTIFIED_LIMIT,
+            "page 1 must render exactly one page of rows: {body1}"
+        );
+        assert!(
+            body1.contains("Showing 100 of 105 discovered clients"),
+            "the page count must stay accurate: {body1}"
+        );
+        assert!(body1.contains("10.44.0.1<"), "newest row must render");
+        assert!(body1.contains("10.44.0.100<"), "row 100 must render");
+        for index in 101..=105 {
+            assert!(
+                !body1.contains(&format!("10.44.0.{index}<")),
+                "row {index} belongs on page 2: {body1}"
+            );
+        }
+
+        let page2 = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery {
+                discovered_page: Some(2),
+            }),
+        )
+        .await;
+        assert_eq!(page2.status(), StatusCode::OK);
+        let body2 = response_body(page2).await;
+        assert!(body2.contains("Page 2 of 2"), "{body2}");
+        assert_eq!(discovered_row_count(&body2), 5, "{body2}");
+        assert!(
+            body2.contains("Showing 5 of 105 discovered clients"),
+            "the page count must stay accurate on the last page: {body2}"
+        );
+        for index in 101..=105 {
+            assert!(
+                body2.contains(&format!("10.44.0.{index}<")),
+                "row {index} must render on page 2: {body2}"
+            );
+        }
+        assert!(
+            !body2.contains("10.44.0.100<"),
+            "row 100 belongs on page 1: {body2}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_clients_page_clamps_out_of_range_page() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_clamp_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+        seed_discovered_page(&ctx, 105, None);
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+
+        // A page far past the end clamps to the last page.
+        let high = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery {
+                discovered_page: Some(99),
+            }),
+        )
+        .await;
+        assert_eq!(high.status(), StatusCode::OK);
+        let high_body = response_body(high).await;
+        assert!(
+            high_body.contains("Page 2 of 2"),
+            "an out-of-range page must clamp to the last page: {high_body}"
+        );
+        assert_eq!(discovered_row_count(&high_body), 5, "{high_body}");
+        assert!(high_body.contains("10.44.0.105<"), "{high_body}");
+
+        // Page zero clamps to the first page.
+        let zero = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery {
+                discovered_page: Some(0),
+            }),
+        )
+        .await;
+        assert_eq!(zero.status(), StatusCode::OK);
+        let zero_body = response_body(zero).await;
+        assert!(
+            zero_body.contains("Page 1 of 2"),
+            "page zero must clamp to the first page: {zero_body}"
+        );
+        assert_eq!(
+            discovered_row_count(&zero_body),
+            crate::handlers::clients::DEFAULT_UNIDENTIFIED_LIMIT,
+            "{zero_body}"
+        );
+        assert!(zero_body.contains("10.44.0.1<"), "{zero_body}");
+
+        // No query parameter at all defaults to the first page.
+        let default_page = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery::default()),
+        )
+        .await;
+        let default_body = response_body(default_page).await;
+        assert!(default_body.contains("Page 1 of 2"), "{default_body}");
+        assert_eq!(
+            discovered_row_count(&default_body),
+            crate::handlers::clients::DEFAULT_UNIDENTIFIED_LIMIT,
+            "{default_body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_viewer_pagination_never_exposes_pii() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_viewer_page_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("view_user", "ViewerPass1", Role::Viewer)
+            .await;
+        seed_discovered_page(&ctx, 105, Some("pii-host"));
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("view_user", "ViewerPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("viewer login failed");
+        };
+        let resp = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery {
+                discovered_page: Some(2),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+
+        assert!(
+            !body.contains("Discovered but unidentified"),
+            "the discovered section must stay operator-only: {body}"
+        );
+        assert!(
+            !body.contains("Page 1 of 2") && !body.contains("Page 2 of 2"),
+            "pagination controls must not leak the section: {body}"
+        );
+        assert!(
+            !body.contains("No unidentified clients discovered yet"),
+            "the empty state must not leak the section: {body}"
+        );
+        // Page 2 would contain rows 101-105; none of them (nor their PII) may
+        // appear for a Viewer.
+        for index in 1..=105 {
+            assert!(
+                !body.contains(&format!("10.44.0.{index}<")),
+                "discovered IP {index} leaked: {body}"
+            );
+        }
+        assert!(
+            !body.contains("pii-host-"),
+            "discovered hostname leaked: {body}"
+        );
+        assert!(
+            !body.contains("aa:bb:cc:dd:ef:"),
+            "discovered MAC leaked: {body}"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
