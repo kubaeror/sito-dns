@@ -22,6 +22,12 @@ use tracing::warn;
 /// safe; dropping the cache never changes a validation decision on its own.
 pub const CHAIN_CACHE_MAX_ENTRIES: usize = 8192;
 
+/// On-disk format version. Bumped whenever previously persisted evidence is no
+/// longer safe to trust. Version 1 (implicit: files without a version field)
+/// could contain `Signed` root/TLD entries recorded from fetched chain-helper
+/// RRSIGs, which made unrelated names look like stripped downgrades.
+const CHAIN_CACHE_FORMAT_VERSION: u32 = 2;
+
 /// Authenticated status of a zone/delegation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -103,6 +109,11 @@ pub struct ChainCache {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PersistedCache {
+    /// Format version. `0` (missing) marks files written before versioning was
+    /// introduced; their entries were produced by the buggy zone-evidence
+    /// rules and are migrated on load.
+    #[serde(default)]
+    format_version: u32,
     #[serde(default)]
     entries: Vec<PersistedEntry>,
     #[serde(default)]
@@ -125,6 +136,8 @@ struct PersistedCache {
 struct LoadStats {
     expired: usize,
     malformed: usize,
+    /// Unsafe legacy root/TLD `Signed` entries dropped by the format upgrade.
+    migrated: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -378,7 +391,8 @@ impl ChainCache {
     ///
     /// Missing files are normal. Corrupt or unreadable files are ignored with a
     /// path-only warning; expired entries and malformed individual entries are
-    /// dropped. This function never panics and never marks the cache dirty.
+    /// dropped. This function never panics. A legacy-format file may mark the
+    /// cache dirty so the migrated view is persisted by the next flush.
     pub fn load(&self, now: u32) {
         let _ = self.load_with_stats(now);
     }
@@ -410,11 +424,20 @@ impl ChainCache {
         };
 
         let PersistedCache {
+            format_version,
             entries,
             policy,
             policy_anchors,
             policy_ntas,
         } = persisted;
+        // Older formats recorded root/TLD `Signed` evidence from fetched
+        // chain-helper RRSIGs. Such an entry covers every descendant and would
+        // otherwise turn the first new signed zone after an upgrade into a
+        // false SERVFAIL, so prune it even when the policy fingerprint is
+        // unchanged. Deeper `Signed` entries came from a zone that actually
+        // signed data and remain valid; `Unsigned` entries only cause a
+        // re-probe and are safe to keep.
+        let legacy_format = format_version < CHAIN_CACHE_FORMAT_VERSION;
 
         if let Some(fingerprint) = policy {
             let metadata_known = policy_anchors.is_some() && policy_ntas.is_some();
@@ -443,6 +466,10 @@ impl ChainCache {
                 continue;
             };
             let lower = LowerName::from(&name);
+            if legacy_format && entry.status == ZoneStatus::Signed && lower.num_labels() <= 1 {
+                stats.migrated += 1;
+                continue;
+            }
             let loaded = ChainEntry {
                 status: entry.status,
                 expires_at: entry.expires_at,
@@ -469,6 +496,16 @@ impl ChainCache {
                 malformed = stats.malformed,
                 "Skipped malformed DNSSEC chain-cache entries"
             );
+        }
+        if stats.migrated > 0 {
+            warn!(
+                path = %path.display(),
+                dropped = stats.migrated,
+                "Dropped unsafe legacy root/TLD signed DNSSEC chain-cache entries"
+            );
+            // Persist the migrated view so the unsafe entries cannot come back
+            // if the process exits before the next policy change.
+            self.dirty.store(true, Ordering::Release);
         }
         self.enforce_bounds(now);
         stats
@@ -624,12 +661,14 @@ impl ChainCache {
                 .collect();
             match policy.as_ref() {
                 Some(record) => PersistedCache {
+                    format_version: CHAIN_CACHE_FORMAT_VERSION,
                     entries,
                     policy: Some(record.state.fingerprint.clone()),
                     policy_anchors: record.metadata_known.then(|| record.state.anchors.clone()),
                     policy_ntas: record.metadata_known.then(|| record.state.ntas.clone()),
                 },
                 None => PersistedCache {
+                    format_version: CHAIN_CACHE_FORMAT_VERSION,
                     entries,
                     policy: None,
                     policy_anchors: None,
@@ -1527,6 +1566,7 @@ mod tests {
         let now = system_now();
         let valid = name("valid.example.");
         let persisted = PersistedCache {
+            format_version: CHAIN_CACHE_FORMAT_VERSION,
             entries: vec![
                 PersistedEntry {
                     name: valid.to_string(),
@@ -1586,5 +1626,74 @@ mod tests {
             cache.closest_signed(&name("www.signed.example."), now),
             Some((name("signed.example."), now + 60))
         );
+    }
+
+    /// Format migration: files written before the helper-RRSIG fix can contain
+    /// `Signed` root/TLD entries recorded from fetched chain-helper signatures.
+    /// Those entries would suppress validation for every descendant after an
+    /// upgrade, so a legacy-format load must drop them while keeping genuine
+    /// delegation evidence.
+    #[test]
+    fn test_legacy_format_drops_root_and_tld_signed_entries() {
+        let path = temp_path("legacy_format");
+        let now = system_now();
+        std::fs::write(
+            &path,
+            format!(
+                "[[entries]]\n\
+                 name = \".\"\nstatus = \"signed\"\nexpires_at = {}\nvalidated_at = {}\n\
+                 \n[[entries]]\n\
+                 name = \"com.\"\nstatus = \"signed\"\nexpires_at = {}\nvalidated_at = {}\n\
+                 \n[[entries]]\n\
+                 name = \"signed.example.com.\"\nstatus = \"signed\"\nexpires_at = {}\nvalidated_at = {}\n\
+                 \n[[entries]]\n\
+                 name = \"corp.\"\nstatus = \"unsigned\"\nexpires_at = {}\nvalidated_at = {}\n",
+                now + 600,
+                now,
+                now + 600,
+                now,
+                now + 600,
+                now,
+                now + 600,
+                now,
+            ),
+        )
+        .expect("write legacy cache");
+
+        let cache = ChainCache::new(Some(path.clone()));
+        cache.load(now);
+
+        assert!(
+            cache.get(&name("."), now).is_none(),
+            "a legacy root Signed entry must not survive the format upgrade"
+        );
+        assert!(
+            cache.get(&name("com."), now).is_none(),
+            "a legacy TLD Signed entry must not survive the format upgrade"
+        );
+        assert!(
+            cache.get(&name("signed.example.com."), now).is_some(),
+            "genuine deeper signed evidence must survive"
+        );
+        assert!(
+            cache.get(&name("corp."), now).is_some(),
+            "legacy unsigned delegation evidence must survive (it only causes a re-probe)"
+        );
+
+        cache.flush().expect("flush migrated cache");
+        let content = std::fs::read_to_string(&path).expect("read migrated cache");
+        let persisted: PersistedCache = toml::from_str(&content).expect("valid migrated TOML");
+        assert_eq!(
+            persisted.format_version, CHAIN_CACHE_FORMAT_VERSION,
+            "the migrated file must carry the current format version"
+        );
+        assert!(
+            !persisted.entries.iter().any(|entry| {
+                entry.status == ZoneStatus::Signed && (entry.name == "." || entry.name == "com.")
+            }),
+            "root/TLD signed entries must not be re-persisted"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 }

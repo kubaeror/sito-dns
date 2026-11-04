@@ -5,6 +5,24 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **DNSSEC false SERVFAIL after the first signed zone (P0)**: with
+  `dns.dnssec.validate = true` and `mode = "validate"`, resolving one signed
+  domain and then a different signed domain (for example `cloudflare.com`
+  followed by `example.com`) returned SERVFAIL with EDE
+  `Missing RRSIG for zone previously proven signed`. DNSKEY/DS RRSIGs fetched
+  during the chain walk were appended to the response and treated as evidence
+  that the root/TLD had signed the query, and a response that carried a
+  relevant RRSIG but no key yet was rejected before the key chain could be
+  fetched. Chain-helper RRSIGs are now separated from the original response,
+  the root is never used as descendant signed-zone evidence, a relevant RRSIG
+  without key material returns `Indeterminate` so the chain fetch can run, and
+  a legacy chain-cache format drops unsafe root/TLD `Signed` entries on load.
+  Genuinely stripped responses under a proven-signed zone and genuinely bogus
+  zones still fail closed with SERVFAIL in `validate` mode.
+
 ## [1.9.1] - 2026-11-04
 
 Patch release fixing residual correctness, concurrency, and UI issues found
