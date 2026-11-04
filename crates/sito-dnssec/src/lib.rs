@@ -3026,6 +3026,32 @@ impl DnssecValidator {
         };
         let negative_lower = LowerName::from(&negative_name);
 
+        // Whether the original response carries an NSEC/NSEC3 RRSIG signed by
+        // a zone that contains the negative answer name. Its key may simply be
+        // missing (DNSKEY TTL shorter than the signed-zone evidence), so on
+        // the pre-fetch pass this defers the "missing denial proof" Bogus to
+        // the chain fetch instead of false-SERVFAILing.
+        let has_denial_rrsig = negative
+            && rrsigs
+                .iter()
+                .zip(helper_rrsigs.iter())
+                .any(|((owner, sig), is_helper)| {
+                    !is_helper
+                        && matches!(
+                            sig.input().type_covered,
+                            RecordType::NSEC | RecordType::NSEC3
+                        )
+                        && LowerName::from(&sig.input().signer_name).zone_of(&negative_lower)
+                        && response
+                            .answers
+                            .iter()
+                            .chain(response.authorities.iter())
+                            .any(|record| {
+                                record.name == *owner
+                                    && record.record_type() == sig.input().type_covered
+                            })
+                });
+
         if negative {
             let denial = if trusted_sigs.is_empty() {
                 DenialResult::Incomplete
@@ -3083,12 +3109,20 @@ impl DnssecValidator {
                         || all_present_signed
                         || self.signed_zone_contains(&qname_lower, now);
                     if would_be_secure {
-                        return self.handle_bogus(
-                            response,
-                            upstream,
-                            "Negative response lacks a valid NSEC/NSEC3 denial proof",
-                            EDE_DNSSEC_BOGUS,
-                        );
+                        // A denial RRSIG whose key is not available yet is
+                        // deferrable only on the pre-fetch pass; the strict
+                        // post-fetch pass keeps the fail-closed Bogus.
+                        if allow_unchecked_signatures && has_denial_rrsig {
+                            // Fall through to Indeterminate so the caller can
+                            // fetch the signer's DNSKEY.
+                        } else {
+                            return self.handle_bogus(
+                                response,
+                                upstream,
+                                "Negative response lacks a valid NSEC/NSEC3 denial proof",
+                                EDE_DNSSEC_BOGUS,
+                            );
+                        }
                     }
                 }
             }
@@ -3151,7 +3185,8 @@ impl DnssecValidator {
         let signed_zone_evidence = (self.signed_zone_contains(&qname_lower, now)
             && !self.insecure_zone_covers(&qname_lower, now))
             || trusted_signer_covers_qname;
-        if signed_zone_evidence && (!has_relevant_rrsig || !allow_unchecked_signatures) {
+        let unchecked_rrsig_present = has_relevant_rrsig || has_denial_rrsig;
+        if signed_zone_evidence && (!unchecked_rrsig_present || !allow_unchecked_signatures) {
             return self.handle_bogus(
                 response,
                 upstream,
@@ -5562,6 +5597,93 @@ mod tests {
             matches!(outcome, ValidationOutcome::Bogus { .. }),
             "a stripped answer under a zone proven signed by a denial must stay Bogus: {outcome:?}"
         );
+    }
+
+    /// Important regression: a negative response whose NSEC denial RRSIGs are
+    /// present but whose DNSKEY is missing must fetch the key instead of
+    /// SERVFAILing. This mirrors the positive-answer P0 after the key cache
+    /// expires while signed-zone evidence is still live.
+    #[tokio::test]
+    async fn test_negative_response_with_denial_rrsig_fetches_key() {
+        let (origin, dnskey, signer) = create_test_signer("negfetch.example.");
+        let qname = Name::from_str("missing.negfetch.example.").expect("qname");
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        // Signed-zone evidence survives (cache reload / long-lived denial)
+        // while the key cache is empty, as when the DNSKEY TTL expires first.
+        validator
+            .signed_zones
+            .insert(LowerName::from(&origin), now + 300);
+
+        let bitmap = vec![RecordType::A, RecordType::NSEC, RecordType::RRSIG];
+        let mut base = signed_nsec_response_records(
+            &origin,
+            &[
+                (
+                    origin.clone(),
+                    Name::from_str("a.negfetch.example.").expect("next"),
+                    bitmap.clone(),
+                ),
+                (
+                    Name::from_str("a.negfetch.example.").expect("owner"),
+                    nsec_next(&origin),
+                    bitmap,
+                ),
+            ],
+            &qname,
+            &dnskey,
+            &signer,
+            ResponseCode::NXDomain,
+        );
+        // Simulate an upstream response that omitted the DNSKEY.
+        base.additionals
+            .retain(|record| !matches!(record.data, RData::DNSSEC(DNSSECRData::DNSKEY(_))));
+
+        let fetcher = StaticFetcher::new().with(
+            &origin,
+            RecordType::DNSKEY,
+            signed_dnskey_message(&origin, &dnskey, &signer),
+        );
+
+        let mut msg = base.clone();
+        let outcome = validator
+            .validate_with_key_fetcher(&mut msg, Some("negfetch"), now, &fetcher)
+            .await;
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Secure,
+            "the missing DNSKEY must be fetched for a signed denial proof: {outcome:?}"
+        );
+        assert!(msg.metadata.authentic_data);
+        assert_eq!(msg.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(fetcher.calls(), 1, "one DNSKEY fetch must be attempted");
+
+        // Post-fetch/offline strictness: a fresh validator with the same
+        // signed-zone evidence but no cached key must fail closed when the
+        // denial RRSIG still cannot be checked.
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let offline_validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+        offline_validator
+            .signed_zones
+            .insert(LowerName::from(&origin), now + 300);
+        let offline = OfflineFetcher::new();
+        let mut msg = base;
+        let outcome = offline_validator
+            .validate_with_key_fetcher(&mut msg, Some("offline"), now, &offline)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "an unverifiable denial RRSIG must fail closed after the fetch: {outcome:?}"
+        );
+        assert_eq!(msg.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(msg.answers.len(), 0);
     }
 
     /// Regression: a response that carries a relevant RRSIG but no key yet
