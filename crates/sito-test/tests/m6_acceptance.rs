@@ -20,6 +20,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
+/// Non-default password used by router tests so the bootstrap-admin gate does
+/// not close the login path the tests are exercising.
+const TEST_ADMIN_PASSWORD: &str = "TestAdminPassword123!";
+
 async fn create_test_context() -> (ServerContext, PathBuf) {
     let temp_dir = std::env::temp_dir().join(format!("sito_m6_{}", rand::random::<u64>()));
     tokio::fs::create_dir_all(&temp_dir).await.unwrap();
@@ -67,6 +71,11 @@ async fn create_test_context() -> (ServerContext, PathBuf) {
         Default::default(),
     ))));
     let auth_mgr = Arc::new(AuthManager::new());
+    // Router tests run against a configured deployment, not the bootstrap
+    // state: use a non-default password so the setup gate stays out of the way.
+    auth_mgr
+        .update_user_password("admin", TEST_ADMIN_PASSWORD)
+        .await;
 
     let runtime = Arc::new(sito_runtime::RuntimeState::new(
         config_arc.clone(),
@@ -156,8 +165,11 @@ async fn test_embedded_ui_serves_root_and_index() {
 async fn test_embedded_ui_spa_routing_fallback() {
     let (ctx, temp_dir) = create_test_context().await;
 
-    // Login with default admin credentials to obtain real session cookie
-    let login_res = ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await;
+    // Login with the configured admin credentials to obtain a real session cookie
+    let login_res = ctx
+        .auth_mgr
+        .login("admin", TEST_ADMIN_PASSWORD, "127.0.0.1")
+        .await;
     let cookie_val = match login_res {
         sito_api::auth::LoginResult::Success(session) => session.to_cookie_header(),
         other => panic!("expected login success, got {other:?}"),
@@ -240,7 +252,10 @@ async fn test_embedded_ui_api_route_not_found_returns_problem_details() {
 #[cfg(feature = "embed-ui")]
 #[tokio::test]
 async fn test_wizard_gate_forbidden_after_setup() {
-    let (ctx, temp_dir) = create_test_context().await;
+    let (mut ctx, temp_dir) = create_test_context().await;
+    // Simulate the genuine first-run bootstrap regardless of the configured
+    // password used by the router test helper.
+    ctx.auth_mgr = Arc::new(AuthManager::new());
 
     // 1. In first-run, unauthenticated POST /ui/wizard/complete succeeds.
     //    `filtering_enabled=on` keeps the seeded local `file://` list instead
@@ -315,7 +330,9 @@ async fn test_wizard_gate_forbidden_after_setup() {
 #[cfg(feature = "embed-ui")]
 #[tokio::test]
 async fn test_setup_pending_route_gating_and_wizard_flow() {
-    let (ctx, temp_dir) = create_test_context().await;
+    let (mut ctx, temp_dir) = create_test_context().await;
+    // Missing config plus the bootstrap admin is the canonical first-run state.
+    ctx.auth_mgr = Arc::new(AuthManager::new());
     ctx.set_setup_pending(true);
 
     let app = create_router(ctx.clone());
@@ -456,7 +473,9 @@ async fn test_csrf_cookie_enforced_for_session_mutations() {
         .header(header::HOST, "localhost")
         .header(header::ORIGIN, "http://localhost")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"user":"admin","pass":"adminadmin"}"#))
+        .body(Body::from(
+            serde_json::json!({"user": "admin", "pass": TEST_ADMIN_PASSWORD}).to_string(),
+        ))
         .unwrap();
     let resp = app.clone().oneshot(login).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -573,6 +592,188 @@ async fn test_setup_pending_with_existing_users_requires_admin() {
 
     // DNS listeners stay gated while no configuration exists.
     assert!(ctx.is_setup_pending());
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// Regression (1.9.2): `config.toml` existing was treated as "setup done" even
+/// while `users.toml` still contained the bootstrap `admin/adminadmin`. The
+/// setup token was active, but `setup_pending` was false, so the middleware
+/// let the default password log in over the network.
+#[cfg(feature = "embed-ui")]
+#[tokio::test]
+async fn test_default_admin_with_existing_config_is_gated_by_setup_token() {
+    let (mut ctx, temp_dir) = create_test_context().await;
+    ctx.auth_mgr = Arc::new(AuthManager::with_storage(&temp_dir, 24, 5).unwrap());
+    ctx.set_setup_pending(false);
+
+    assert!(ctx.auth_mgr.setup_token_required());
+    assert!(ctx.auth_mgr.is_default_admin_active());
+    let token = ctx.auth_mgr.setup_token().expect("setup token provisioned");
+    let app = create_router(ctx.clone());
+
+    // 1. The bootstrap password must not authenticate while the token is active.
+    let login = |user: &'static str, pass: String| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"user": user, "pass": pass}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let resp = login("admin", "adminadmin".to_string()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "default admin login must be blocked while setup is pending"
+    );
+    assert!(
+        cookie_value(&resp, "sito_session").is_none(),
+        "no session may be issued for the bootstrap password"
+    );
+
+    // 2. Every non-wizard API is setup-gated.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // 3. The wizard itself still requires the token.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/wizard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/wizard?setup_token={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a valid setup token opens the wizard"
+    );
+
+    // 4. An authenticated Admin may always reach the wizard.
+    let sito_api::auth::LoginResult::Success(admin_session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("direct admin login failed");
+    };
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/wizard")
+                .header(header::COOKIE, admin_session.to_cookie_header())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 5. Completing the wizard with a strong password consumes the token and
+    // rotates the bootstrap credential.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/wizard/complete")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "setup_token={token}&admin_user=admin&admin_password=Recovered-Password-1!&confirm_password=Recovered-Password-1!"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(!ctx.auth_mgr.setup_token_required());
+    assert!(!ctx.auth_mgr.is_default_admin_active());
+
+    let resp = login("admin", "adminadmin".to_string()).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = login("admin", "Recovered-Password-1!".to_string()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// Regression (1.9.2): the documented recovery path must restore remote login
+/// with the new password and leave no active setup token behind.
+#[cfg(feature = "embed-ui")]
+#[tokio::test]
+async fn test_reset_admin_custom_password_restores_login() {
+    let (mut ctx, temp_dir) = create_test_context().await;
+    {
+        let _ = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+    }
+    AuthManager::reset_admin_credentials(&temp_dir, "RecoveredPassword123!").unwrap();
+
+    let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+    assert!(!mgr.setup_token_required());
+    assert!(!mgr.is_default_admin_active());
+    ctx.auth_mgr = Arc::new(mgr);
+    let app = create_router(ctx.clone());
+
+    let login = |pass: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"user": "admin", "pass": pass}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let resp = login("adminadmin").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = login("RecoveredPassword123!").await;
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

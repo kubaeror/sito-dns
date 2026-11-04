@@ -40,6 +40,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tower::ServiceExt;
 
+/// Router tests exercise a configured deployment; a non-default admin password
+/// keeps the first-boot gate from closing the API path under test.
+const TEST_ADMIN_PASSWORD: &str = "TestAdminPassword123!";
+
 /// Reserves a free loopback TCP port for HA replication listeners.
 fn reserve_tcp_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve tcp port");
@@ -162,6 +166,9 @@ async fn create_test_context(
         Default::default(),
     ))));
     let auth_mgr = Arc::new(AuthManager::new());
+    auth_mgr
+        .update_user_password("admin", TEST_ADMIN_PASSWORD)
+        .await;
     let (_meta, token_resp) = auth_mgr
         .create_token("admin", sito_api::auth::Role::Admin, None)
         .await

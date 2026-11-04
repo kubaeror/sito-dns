@@ -94,13 +94,20 @@ fn setup_token_from_request(request: &Request) -> Option<String> {
 
 /// Middleware that gates setup-only routes.
 ///
-/// While a first-boot setup token is active, `/wizard`, `/ui/wizard/*` and
+/// While a first-boot setup token is active (or the bootstrap
+/// `admin/adminadmin` account is still active), `/wizard`, `/ui/wizard/*` and
 /// `/ui/upstreams/test` require either an authenticated session with
-/// sufficient privileges or the one-time setup token. When `setup_pending` is
-/// true the remaining bootstrapping behavior is preserved:
-/// - Allows: `/static/*`, `/assets/*`, `/health`, `/status`.
-/// - Returns 503 for `/api/v1/*`.
-/// - Redirects all other UI routes to `/wizard`.
+/// sufficient privileges or the one-time setup token. During that window:
+/// - Allows: `/wizard`, `/ui/wizard/*`, `/static/*`, `/assets/*`, `/health`,
+///   `/status` and the setup-token-protected endpoints.
+/// - Returns 403 for `/api/v1/auth/*` (login and credential management).
+/// - Returns 503 for the remaining `/api/v1/*` routes.
+/// - Redirects all other UI routes to `/wizard` (or `/login` once user
+///   accounts exist and no setup token is required).
+///
+/// `setup_pending` alone only tracks a missing `config.toml`; the setup token
+/// and default-admin checks are what make this fail closed when a configuration
+/// file exists but the bootstrap credentials were never rotated.
 pub async fn setup_pending_middleware(
     State(ctx): State<ServerContext>,
     request: Request,
@@ -108,8 +115,9 @@ pub async fn setup_pending_middleware(
 ) -> Response {
     let setup_pending = ctx.is_setup_pending();
     let token_required = ctx.auth_mgr.setup_token_required();
+    let default_admin_active = ctx.auth_mgr.is_default_admin_active();
 
-    if !setup_pending && !token_required {
+    if !setup_pending && !token_required && !default_admin_active {
         return next.run(request).await;
     }
 
@@ -180,36 +188,46 @@ pub async fn setup_pending_middleware(
         }
     }
 
-    if setup_pending {
-        // When user accounts already exist (missing `config.toml` but a valid
-        // `users.toml`), the deployment is not in first-boot state: allow the
-        // operator to log in instead of forcing the wizard on every route.
-        let first_run = ctx.auth_mgr.is_first_run();
-        let login_allowed = !first_run && !token_required;
+    // The setup gate applies whenever the deployment is still bootstrapping:
+    // missing configuration, an unconsumed setup token, or the bootstrap
+    // default password. A missing `config.toml` is not the only signal.
+    // When user accounts already exist (missing `config.toml` but a valid
+    // `users.toml` with a rotated password), the deployment is not in
+    // first-boot state: allow the operator to log in instead of forcing the
+    // wizard on every route.
+    let first_run = ctx.auth_mgr.is_first_run();
+    let login_allowed = !first_run && !token_required;
 
-        let login_path = path == "/login" || path == "/ui/login";
-        let auth_api = path.starts_with("/api/v1/auth");
-        if path.starts_with("/wizard")
-            || path.starts_with("/ui/wizard")
-            || path.starts_with("/static/")
-            || path.starts_with("/assets/")
-            || path == "/ui/upstreams/test"
-            || path == "/health"
-            || path == "/status"
-            || (login_allowed && (login_path || auth_api))
-        {
-            return next.run(request).await;
-        }
-
-        if path.starts_with("/api/v1/") || path == "/api/v1" {
-            return (StatusCode::SERVICE_UNAVAILABLE, "Setup not completed").into_response();
-        }
-
-        let target = if login_allowed { "/login" } else { "/wizard" };
-        return (StatusCode::FOUND, [(axum::http::header::LOCATION, target)]).into_response();
+    let login_path = path == "/login" || path == "/ui/login";
+    let auth_api = path.starts_with("/api/v1/auth");
+    if path.starts_with("/wizard")
+        || path.starts_with("/ui/wizard")
+        || path.starts_with("/static/")
+        || path.starts_with("/assets/")
+        || path == "/ui/upstreams/test"
+        || path == "/health"
+        || path == "/status"
+        || (login_allowed && (login_path || auth_api))
+    {
+        return next.run(request).await;
     }
 
-    next.run(request).await
+    // Fail closed on authentication while bootstrap credentials are live: a
+    // remote client must not obtain a session with `admin/adminadmin` (or any
+    // other account) before setup completes.
+    if auth_api {
+        return ProblemDetails::forbidden(
+            "Authentication is disabled until first-boot setup is completed.",
+        )
+        .into_response();
+    }
+
+    if path.starts_with("/api/v1/") || path == "/api/v1" {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Setup not completed").into_response();
+    }
+
+    let target = if login_allowed { "/login" } else { "/wizard" };
+    (StatusCode::FOUND, [(axum::http::header::LOCATION, target)]).into_response()
 }
 
 /// Unauthenticated liveness probe that also reports whether the first-run
