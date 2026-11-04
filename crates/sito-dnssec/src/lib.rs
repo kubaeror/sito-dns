@@ -2332,7 +2332,7 @@ impl DnssecValidator {
         // where they begin so validation can tell them apart.
         let original_additionals = response.additionals.len();
         let baseline =
-            self.validate_response_inner(response, upstream, now, Some(original_additionals));
+            self.validate_response_inner(response, upstream, now, Some(original_additionals), true);
         if baseline != ValidationOutcome::Indeterminate || self.mode == DnssecMode::Disabled {
             return baseline;
         }
@@ -2344,7 +2344,6 @@ impl DnssecValidator {
 
         let anchors = self.trust_anchors.load();
         let mut visited = HashSet::new();
-        let mut fetched_any = false;
         for signer in signers.iter().take(4) {
             // Reaching the root costs one DNSKEY lookup per label plus one DS
             // lookup per non-root level; a fixed budget of 6 could not reach
@@ -2355,7 +2354,7 @@ impl DnssecValidator {
                 .saturating_mul(2)
                 .saturating_add(1)
                 .min(31);
-            if fetch_zone_chain(
+            let _ = fetch_zone_chain(
                 &anchors,
                 fetcher,
                 signer,
@@ -2363,20 +2362,21 @@ impl DnssecValidator {
                 &mut visited,
                 response,
             )
-            .await
-            .is_some()
-            {
-                fetched_any = true;
-            }
+            .await;
         }
 
-        if !fetched_any {
-            response.additionals.truncate(original_additionals);
-            return baseline;
-        }
-
-        let outcome =
-            self.validate_response_inner(response, upstream, now, Some(original_additionals));
+        // This is the post-fetch pass: the "relevant RRSIG is present but not
+        // checkable yet" escape no longer applies. If the chain walk produced
+        // no usable key, a response under proven signed evidence must fail
+        // closed rather than be served unvalidated. Running the strict pass
+        // even when no fetch succeeded also covers fully offline upstreams.
+        let outcome = self.validate_response_inner(
+            response,
+            upstream,
+            now,
+            Some(original_additionals),
+            false,
+        );
         response.additionals.truncate(original_additionals);
         outcome
     }
@@ -2632,7 +2632,10 @@ impl DnssecValidator {
         upstream: Option<&str>,
         now: u32,
     ) -> ValidationOutcome {
-        self.validate_response_inner(response, upstream, now, None)
+        // No fetcher is available here, so a present-but-unchecked relevant
+        // RRSIG stays Indeterminate: callers that can fetch the chain add
+        // their own strict post-fetch pass.
+        self.validate_response_inner(response, upstream, now, None, true)
     }
 
     /// Validate a response, treating additional-section records starting at
@@ -2643,12 +2646,19 @@ impl DnssecValidator {
     /// signatures authenticate helper RRsets, not the original answer: they
     /// must never count as signed-zone evidence or as a signature covering the
     /// query. `None` means every record belongs to the original response.
+    ///
+    /// `allow_unchecked_signatures` is true only on the pre-fetch pass. It
+    /// permits returning `Indeterminate` when a relevant signature cannot be
+    /// checked yet, because the caller may still fetch its key. The post-fetch
+    /// pass sets it to false so an unverifiable signature under proven
+    /// signed-zone evidence fails closed.
     fn validate_response_inner(
         &self,
         response: &mut Message,
         upstream: Option<&str>,
         now: u32,
         helper_additionals: Option<usize>,
+        allow_unchecked_signatures: bool,
     ) -> ValidationOutcome {
         if self.mode == DnssecMode::Disabled {
             response.metadata.authentic_data = false;
@@ -3134,15 +3144,14 @@ impl DnssecValidator {
             return outcome;
         }
         // A relevant RRSIG that could not be checked because no trusted key is
-        // available yet is not a downgrade: return Indeterminate so
-        // `validate_with_key_fetcher` can fetch the chain. Bogus is reserved
-        // for a genuinely missing relevant signature under authenticated
-        // signed-zone evidence.
-        if !has_relevant_rrsig
-            && ((self.signed_zone_contains(&qname_lower, now)
-                && !self.insecure_zone_covers(&qname_lower, now))
-                || trusted_signer_covers_qname)
-        {
+        // available yet is not a downgrade on the pre-fetch pass: return
+        // Indeterminate so `validate_with_key_fetcher` can fetch the chain.
+        // After the fetch (or when no fetcher is involved) an unverifiable
+        // signature under proven signed-zone evidence must fail closed.
+        let signed_zone_evidence = (self.signed_zone_contains(&qname_lower, now)
+            && !self.insecure_zone_covers(&qname_lower, now))
+            || trusted_signer_covers_qname;
+        if signed_zone_evidence && (!has_relevant_rrsig || !allow_unchecked_signatures) {
             return self.handle_bogus(
                 response,
                 upstream,
@@ -5591,6 +5600,79 @@ mod tests {
         assert!(!response.metadata.authentic_data);
     }
 
+    /// Critical regression: a forged answer with a present-but-unverifiable
+    /// relevant RRSIG under a proven-signed zone must stay Bogus. The
+    /// "Indeterminate so the chain can be fetched" escape is only valid on the
+    /// pre-fetch pass; after the fetch fails to produce a key, the response
+    /// must fail closed instead of being served unvalidated.
+    #[tokio::test]
+    async fn test_unverifiable_relevant_rrsig_under_proven_signed_zone_is_bogus() {
+        use hickory_proto::rr::RecordSet;
+
+        let (validator, origin, _key, _signer) = signed_zone_validator("victim.example.");
+        let qname = Name::from_str("www.victim.example.").expect("qname");
+        let (_fake_origin, _fake_key, fake_signer) = create_test_signer("nonexistent.");
+
+        let forged = Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(203, 0, 113, 66))),
+        );
+        let mut set = RecordSet::new(qname.clone(), RecordType::A, 0);
+        set.insert(forged.clone(), 0);
+        let fake_rrsig = sign_test_rrset(&set, &fake_signer);
+        assert_eq!(
+            fake_rrsig.record_type(),
+            RecordType::RRSIG,
+            "the forgery needs a relevant RRSIG owner/type"
+        );
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        assert!(
+            validator.signed_zone_contains(&LowerName::from(&origin), now),
+            "the victim zone must be proven signed"
+        );
+
+        let build_response = || {
+            let mut response = Message::new(83, MessageType::Response, OpCode::Query);
+            response
+                .queries
+                .push(Query::query(qname.clone(), RecordType::A));
+            response.answers.push(forged.clone());
+            response.answers.push(fake_rrsig.clone());
+            response
+        };
+
+        // NXDOMAIN responses from the chain walk (the fake signer does not
+        // exist) and a fully offline fetcher must both fail closed.
+        let nxdomain = NxdomainFetcher::new();
+        let mut response = build_response();
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("forged"), now, &nxdomain)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "an unverifiable relevant RRSIG under proven signed evidence must be Bogus: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(
+            response.answers.is_empty(),
+            "a Bogus response must not carry answers"
+        );
+
+        let offline = OfflineFetcher::new();
+        let mut response = build_response();
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("forged"), now, &offline)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a failed fetch must not downgrade an unverifiable relevant RRSIG: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(response.answers.len(), 0);
+    }
+
     /// Regression: RFC 4035 5.3.3 - a validated RRset may not be cached (or
     /// served with AD=1) beyond its signature's remaining validity.
     #[test]
@@ -7215,6 +7297,32 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    /// A fetcher whose upstream answers every chain lookup with NXDOMAIN.
+    struct NxdomainFetcher {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NxdomainFetcher {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DnssecKeyFetcher for NxdomainFetcher {
+        async fn query(&self, name: &Name, _rtype: RecordType) -> Result<Message, UpstreamError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+            message
+                .queries
+                .push(Query::query(name.clone(), RecordType::DNSKEY));
+            message.metadata.response_code = ResponseCode::NXDomain;
+            Ok(message)
+        }
     }
 
     struct OfflineFetcher {
