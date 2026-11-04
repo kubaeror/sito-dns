@@ -215,6 +215,10 @@ pub struct ClientsTemplate<'a> {
     pub discovered_total: usize,
     /// True when the signed-in role may see discovered-client PII.
     pub can_view_discovered: bool,
+    /// 1-based page of the discovered-client list currently rendered.
+    pub discovered_page: usize,
+    /// Total number of discovered-client pages (always at least one).
+    pub discovered_pages: usize,
     /// Maximum number of entries the registry retains.
     pub max_entries: usize,
     /// Age after which discovered entries are pruned.

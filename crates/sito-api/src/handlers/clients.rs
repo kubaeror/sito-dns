@@ -6,7 +6,9 @@
 
 use crate::auth::RequireOperator;
 use crate::auth::token::Role;
-use crate::config_writer::save_config_atomic;
+use crate::config_apply::{
+    ApplyHooks, ConfigApplyHooks, FilterApply, apply_and_persist_config_locked,
+};
 use crate::error::ProblemDetails;
 use crate::models::{
     ClientDto, ClientGroupDto, GenericMessageResponse, UnidentifiedClientDto,
@@ -14,7 +16,7 @@ use crate::models::{
 };
 use crate::state::ServerContext;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use serde::Deserialize;
 use sito_clients::{BlockedServiceConfig, ClientEntryConfig, ClientGroupConfig, ClientsConfig};
 
@@ -56,9 +58,13 @@ fn load_clients_config(ctx: &ServerContext) -> ClientsConfig {
         .unwrap_or_default()
 }
 
-async fn save_clients_config(
+/// Applies and persists a clients update. The caller **must** hold
+/// [`ServerContext::apply_lock`] (see [`ServerContext::lock_config_apply`]) and
+/// must have read the current config after acquiring it.
+async fn save_clients_config_locked(
     ctx: &ServerContext,
     clients_cfg: &ClientsConfig,
+    hooks: Option<&dyn ConfigApplyHooks>,
 ) -> Result<(), ProblemDetails> {
     let mut new_cfg = (**ctx.config.load()).clone();
     let val = toml::Value::try_from(clients_cfg).map_err(|e| {
@@ -66,21 +72,20 @@ async fn save_clients_config(
     })?;
     new_cfg.clients = Some(val);
 
-    save_config_atomic(&ctx.config_path, &new_cfg).await?;
-    ctx.set_config(new_cfg);
-
-    // Update active registry, keeping the RouterOS lease and discovered-client
-    // stores shared so a config save does not hide unidentified clients.
-    let current = ctx.clients.load();
-    let new_reg = sito_clients::ClientRegistry::with_stores(
-        clients_cfg.clone(),
-        current.routeros_leases_store(),
-        current.unidentified_store(),
-    );
-    drop(current);
-    ctx.set_clients(new_reg);
-    crate::publish_bundle(ctx).await;
+    // `apply_inner` rebuilds the registry with the shared RouterOS lease and
+    // discovered-client stores, so unidentified clients survive the save.
+    apply_and_persist_config_locked(ctx, &new_cfg, FilterApply::Deferred, hooks).await?;
     Ok(())
+}
+
+/// Test-only convenience wrapper that acquires the apply lock itself.
+#[cfg(test)]
+async fn save_clients_config(
+    ctx: &ServerContext,
+    clients_cfg: &ClientsConfig,
+) -> Result<(), ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
+    save_clients_config_locked(ctx, clients_cfg, None).await
 }
 
 /// Identifier buckets returned by [`classify_ids`]: ip, mac, subnet, DoH
@@ -307,8 +312,10 @@ pub async fn get_unidentified_clients(
 pub async fn create_client(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     Json(payload): Json<ClientDto>,
 ) -> Result<Json<ClientDto>, ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut cfg = load_clients_config(&ctx);
     if cfg.entries.iter().any(|c| c.name == payload.name) {
         return Err(ProblemDetails::conflict(format!(
@@ -338,7 +345,7 @@ pub async fn create_client(
     }
 
     cfg.entries.push(entry.clone());
-    save_clients_config(&ctx, &cfg).await?;
+    save_clients_config_locked(&ctx, &cfg, hooks.as_dyn()).await?;
     Ok(Json(client_to_dto(
         &entry,
         cfg.client_id_secrets.get(&entry.name),
@@ -411,9 +418,11 @@ pub async fn get_client_by_name(
 pub async fn update_client(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     Path(name): Path<String>,
     Json(payload): Json<UpdateClientRequest>,
 ) -> Result<Json<ClientDto>, ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut cfg = load_clients_config(&ctx);
     let Some(pos) = cfg.entries.iter().position(|e| e.name == name) else {
         return Err(ProblemDetails::not_found(format!(
@@ -479,7 +488,7 @@ pub async fn update_client(
     }
 
     cfg.entries[pos] = entry.clone();
-    save_clients_config(&ctx, &cfg).await?;
+    save_clients_config_locked(&ctx, &cfg, hooks.as_dyn()).await?;
     Ok(Json(client_to_dto(
         &entry,
         cfg.client_id_secrets.get(&entry.name),
@@ -502,8 +511,10 @@ pub async fn update_client(
 pub async fn delete_client(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     Path(name): Path<String>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut cfg = load_clients_config(&ctx);
     let Some(pos) = cfg.entries.iter().position(|e| e.name == name) else {
         return Err(ProblemDetails::not_found(format!(
@@ -513,7 +524,7 @@ pub async fn delete_client(
 
     cfg.entries.remove(pos);
     cfg.client_id_secrets.remove(&name);
-    save_clients_config(&ctx, &cfg).await?;
+    save_clients_config_locked(&ctx, &cfg, hooks.as_dyn()).await?;
     Ok(Json(GenericMessageResponse {
         message: format!("Client '{name}' deleted successfully"),
     }))
@@ -611,9 +622,11 @@ pub async fn get_client_group_by_name(
 pub async fn update_client_group(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     Path(name): Path<String>,
     Json(payload): Json<UpdateClientGroupRequest>,
 ) -> Result<Json<ClientGroupDto>, ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut cfg = load_clients_config(&ctx);
     let existing = cfg.groups.get(&name).cloned().unwrap_or_default();
 
@@ -660,7 +673,7 @@ pub async fn update_client_group(
     };
 
     cfg.groups.insert(name.clone(), group.clone());
-    save_clients_config(&ctx, &cfg).await?;
+    save_clients_config_locked(&ctx, &cfg, hooks.as_dyn()).await?;
     Ok(Json(group_to_dto(&name, &group)))
 }
 
@@ -679,8 +692,10 @@ pub async fn update_client_group(
 pub async fn add_client_group(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     Json(payload): Json<ClientGroupDto>,
 ) -> Result<Json<ClientGroupDto>, ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut cfg = load_clients_config(&ctx);
     if cfg.groups.contains_key(&payload.name) {
         return Err(ProblemDetails::bad_request(format!(
@@ -709,7 +724,7 @@ pub async fn add_client_group(
             .collect(),
     };
     cfg.groups.insert(payload.name.clone(), group.clone());
-    save_clients_config(&ctx, &cfg).await?;
+    save_clients_config_locked(&ctx, &cfg, hooks.as_dyn()).await?;
     Ok(Json(group_to_dto(&payload.name, &group)))
 }
 
@@ -728,6 +743,7 @@ pub async fn add_client_group(
 pub async fn delete_client_group(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     Path(name): Path<String>,
 ) -> Result<Json<crate::models::GenericMessageResponse>, ProblemDetails> {
     if name == "default" {
@@ -735,9 +751,10 @@ pub async fn delete_client_group(
             "Cannot delete the default group",
         ));
     }
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut cfg = load_clients_config(&ctx);
     if cfg.groups.remove(&name).is_some() {
-        save_clients_config(&ctx, &cfg).await?;
+        save_clients_config_locked(&ctx, &cfg, hooks.as_dyn()).await?;
         Ok(Json(crate::models::GenericMessageResponse {
             message: format!("Group '{name}' deleted successfully"),
         }))
@@ -1059,6 +1076,7 @@ mod tests {
         let updated = update_client(
             operator(),
             State(ctx.clone()),
+            Extension(ApplyHooks::default()),
             Path("alpha".to_string()),
             Json(UpdateClientRequest {
                 ignore_stats: Some(true),
@@ -1087,6 +1105,7 @@ mod tests {
         let conflict = update_client(
             operator(),
             State(ctx.clone()),
+            Extension(ApplyHooks::default()),
             Path("alpha".to_string()),
             Json(UpdateClientRequest {
                 name: Some("beta".to_string()),
@@ -1126,6 +1145,7 @@ mod tests {
         let created = create_client(
             operator(),
             State(ctx.clone()),
+            Extension(ApplyHooks::default()),
             Json(dto("phone", Some("  super-secret  "))),
         )
         .await
@@ -1174,6 +1194,7 @@ mod tests {
         let conflict = create_client(
             operator(),
             State(ctx.clone()),
+            Extension(ApplyHooks::default()),
             Json(dto("other", Some("super-secret"))),
         )
         .await
@@ -1184,6 +1205,7 @@ mod tests {
         let _ = update_client(
             operator(),
             State(ctx.clone()),
+            Extension(ApplyHooks::default()),
             Path("phone".to_string()),
             Json(UpdateClientRequest {
                 ip: vec!["10.0.0.10".to_string()],
@@ -1202,6 +1224,7 @@ mod tests {
         let _ = update_client(
             operator(),
             State(ctx.clone()),
+            Extension(ApplyHooks::default()),
             Path("phone".to_string()),
             Json(UpdateClientRequest {
                 doh_path: Some("second-secret".to_string()),
@@ -1220,6 +1243,7 @@ mod tests {
         let updated = update_client(
             operator(),
             State(ctx.clone()),
+            Extension(ApplyHooks::default()),
             Path("phone".to_string()),
             Json(UpdateClientRequest {
                 doh_path: Some("***cret".to_string()),
@@ -1241,9 +1265,14 @@ mod tests {
             "a masked value must never overwrite the stored secret"
         );
 
-        let _ = delete_client(operator(), State(ctx.clone()), Path("phone".to_string()))
-            .await
-            .unwrap();
+        let _ = delete_client(
+            operator(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Path("phone".to_string()),
+        )
+        .await
+        .unwrap();
         assert!(
             !load_clients_config(&ctx)
                 .client_id_secrets
@@ -1286,6 +1315,7 @@ mod tests {
         let _unused = update_client_group(
             operator(),
             State(ctx.clone()),
+            Extension(ApplyHooks::default()),
             Path("kids".to_string()),
             Json(UpdateClientGroupRequest {
                 filtering_enabled: Some(false),

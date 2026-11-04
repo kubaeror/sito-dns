@@ -1,7 +1,7 @@
 //! Filtering management and simulation endpoints per section 12.1.
 
 use crate::auth::{RequireOperator, RequireViewer};
-use crate::config_writer::save_config_atomic;
+use crate::config_apply::{FilterApply, apply_and_persist_config_locked};
 use crate::error::ProblemDetails;
 use crate::models::{
     AddFilterListRequest, CustomRulesDto, FilterCheckRequest, FilterCheckResponse, FilterListDto,
@@ -105,6 +105,7 @@ pub async fn add_filter_list(
     State(ctx): State<ServerContext>,
     Json(payload): Json<AddFilterListRequest>,
 ) -> Result<Json<FilterListDto>, ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     let name = payload.name.trim().to_string();
     if !valid_filter_list_name(&name) || payload.url.trim().is_empty() {
@@ -127,17 +128,9 @@ pub async fn add_filter_list(
     new_cfg.filtering.lists.push(new_list.clone());
 
     // Compile before persisting so a broken list does not get written as
-    // successfully applied.
-    ctx.filter
-        .reload_with_config(&new_cfg.filtering)
-        .await
-        .map_err(|e| {
-            ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
-        })?;
-    ctx.cache.flush();
-    save_config_atomic(&ctx.config_path, &new_cfg).await?;
-    ctx.set_config(new_cfg);
-    crate::publish_bundle(&ctx).await;
+    // successfully applied; a persist failure also rolls the filter snapshot
+    // and the rest of the live apply back.
+    apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await?;
 
     let mut dto = filter_list_dto(&ctx, &new_list).await;
     dto.id = name;
@@ -163,6 +156,7 @@ pub async fn update_filter_list(
     Path(id): Path<String>,
     Json(payload): Json<UpdateFilterListRequest>,
 ) -> Result<Json<FilterListDto>, ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     let idx = resolve_filter_list_index(&new_cfg, &id)
         .ok_or_else(|| ProblemDetails::not_found(format!("Filter list with ID {id} not found")))?;
@@ -200,17 +194,8 @@ pub async fn update_filter_list(
         list.refresh_hours = Some(u64::from(rh));
     }
 
-    ctx.filter
-        .reload_with_config(&new_cfg.filtering)
-        .await
-        .map_err(|e| {
-            ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
-        })?;
-    ctx.cache.flush();
-    save_config_atomic(&ctx.config_path, &new_cfg).await?;
     let updated = new_cfg.filtering.lists[idx].clone();
-    ctx.set_config(new_cfg);
-    crate::publish_bundle(&ctx).await;
+    apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await?;
 
     Ok(Json(filter_list_dto(&ctx, &updated).await))
 }
@@ -232,21 +217,13 @@ pub async fn delete_filter_list(
     State(ctx): State<ServerContext>,
     Path(id): Path<String>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     let idx = resolve_filter_list_index(&new_cfg, &id)
         .ok_or_else(|| ProblemDetails::not_found(format!("Filter list with ID {id} not found")))?;
 
     let removed = new_cfg.filtering.lists.remove(idx);
-    ctx.filter
-        .reload_with_config(&new_cfg.filtering)
-        .await
-        .map_err(|e| {
-            ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
-        })?;
-    ctx.cache.flush();
-    save_config_atomic(&ctx.config_path, &new_cfg).await?;
-    ctx.set_config(new_cfg);
-    crate::publish_bundle(&ctx).await;
+    apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await?;
 
     Ok(Json(GenericMessageResponse {
         message: format!("Filter list '{}' deleted successfully", removed.name),
@@ -315,19 +292,11 @@ pub async fn set_filtering_rules(
     State(ctx): State<ServerContext>,
     Json(payload): Json<CustomRulesDto>,
 ) -> Result<Json<CustomRulesDto>, ProblemDetails> {
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     new_cfg.filtering.custom_rules = payload.rules.clone();
 
-    ctx.filter
-        .reload_with_config(&new_cfg.filtering)
-        .await
-        .map_err(|e| {
-            ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
-        })?;
-    ctx.cache.flush();
-    save_config_atomic(&ctx.config_path, &new_cfg).await?;
-    ctx.set_config(new_cfg);
-    crate::publish_bundle(&ctx).await;
+    apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await?;
 
     Ok(Json(CustomRulesDto {
         rules: payload.rules,

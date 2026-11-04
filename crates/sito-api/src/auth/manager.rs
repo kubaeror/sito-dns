@@ -11,7 +11,7 @@ use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
@@ -481,6 +481,12 @@ pub struct AuthManager {
     tokens_path: Option<PathBuf>,
     tokens_dirty: Arc<AtomicBool>,
     sessions_dirty: Arc<AtomicBool>,
+    /// Monotonic revision of every token mutation. A save captures it before
+    /// snapshotting and only clears `tokens_dirty` when it is still unchanged,
+    /// so a sync reader's removal/last-used update is never silently dropped.
+    tokens_revision: Arc<AtomicU64>,
+    /// Same contract as [`Self::tokens_revision`] for sessions.
+    sessions_revision: Arc<AtomicU64>,
     token_default_ttl_days: u64,
     /// Global user-secret generation; sessions/tokens must match it to be valid.
     generation: u64,
@@ -624,6 +630,8 @@ impl AuthManager {
             tokens_path,
             tokens_dirty: Arc::new(AtomicBool::new(false)),
             sessions_dirty: Arc::new(AtomicBool::new(false)),
+            tokens_revision: Arc::new(AtomicU64::new(0)),
+            sessions_revision: Arc::new(AtomicU64::new(0)),
             token_default_ttl_days,
             generation,
             secret_store: None,
@@ -788,7 +796,7 @@ impl AuthManager {
                 }
             })?);
             mgr.create_user_internal("admin", "adminadmin", Role::Admin);
-            mgr.save_users();
+            mgr.save_users_initial();
         } else {
             // Memory-only fallback for tests
             mgr.create_user_internal("admin", "adminadmin", Role::Admin);
@@ -885,6 +893,8 @@ impl AuthManager {
             tokens_path: None,
             tokens_dirty: Arc::new(AtomicBool::new(false)),
             sessions_dirty: Arc::new(AtomicBool::new(false)),
+            tokens_revision: Arc::new(AtomicU64::new(0)),
+            sessions_revision: Arc::new(AtomicU64::new(0)),
             token_default_ttl_days: 0,
             generation,
             // A reset replaces the account store; reuse an existing key so
@@ -893,7 +903,7 @@ impl AuthManager {
             secret_store: Some(secret_store),
         };
         mgr.create_user_internal("admin", new_password, Role::Admin);
-        mgr.save_users();
+        mgr.save_users_initial();
         Ok(path)
     }
 
@@ -938,7 +948,10 @@ impl AuthManager {
         Ok(Some((path, toml_str)))
     }
 
-    fn save_users(&self) {
+    /// Writes the users file synchronously. Constructor-only: the manager is
+    /// not shared yet, so bypassing `persist_lock` cannot race a runtime save.
+    /// Every runtime path must use [`Self::save_users_async`] instead.
+    fn save_users_initial(&self) {
         match self.users_toml() {
             Ok(Some((path, toml_str))) => atomic_write_secret(&path, &toml_str),
             Ok(None) => {}
@@ -1009,22 +1022,37 @@ impl AuthManager {
     /// blocking file IO on the runtime worker.
     async fn save_sessions_async(&self) {
         let persist = self.persist_lock.clone().lock_owned().await;
+        // Capture the revision before snapshotting. A mutation that lands after
+        // the snapshot must keep the store dirty so the pruner retries.
+        let revision = self.sessions_revision.load(Ordering::SeqCst);
         let Some((path, toml_str)) = self.sessions_toml() else {
-            self.sessions_dirty.store(false, Ordering::SeqCst);
+            // Only a memory-only manager has nothing to retry; keep the flag
+            // set when serialization failed so the pruner tries again.
+            if self.sessions_path.is_none() {
+                self.sessions_dirty.store(false, Ordering::SeqCst);
+            }
             return;
         };
         // Mark dirty before writing so a failed write is retried by the pruner
         // instead of being lost until the next explicit session mutation.
         self.sessions_dirty.store(true, Ordering::SeqCst);
         let sessions_dirty = self.sessions_dirty.clone();
+        let sessions_revision = self.sessions_revision.clone();
+        let sessions = self.sessions.clone();
         match tokio::task::spawn_blocking(move || {
             let _persist = persist;
             let result = write_secret_file(&path, &toml_str);
             if result.is_ok() {
-                // Clear while the persist guard is still held: a newer save
-                // woken by its release must not be able to set the flag again
-                // and then have this older caller clear it after a failure.
-                sessions_dirty.store(false, Ordering::SeqCst);
+                // Take the sessions lock so the revision check and clear cannot
+                // interleave with a sync mutator such as `validate_session`,
+                // which bumps the revision and sets the dirty flag under this
+                // same lock. Clear while the persist guard is still held: a
+                // newer save woken by its release must not be able to set the
+                // flag again and then have this older caller clear it.
+                let _sessions = lock(&sessions);
+                if sessions_revision.load(Ordering::SeqCst) == revision {
+                    sessions_dirty.store(false, Ordering::SeqCst);
+                }
             }
             result
         })
@@ -1041,20 +1069,35 @@ impl AuthManager {
     /// by the pruner.
     async fn save_tokens_async(&self) {
         let persist = self.persist_lock.clone().lock_owned().await;
+        // Capture the revision before snapshotting. A mutation that lands after
+        // the snapshot must keep the store dirty so the pruner retries.
+        let revision = self.tokens_revision.load(Ordering::SeqCst);
         let Some((path, toml_str)) = self.tokens_toml() else {
-            self.tokens_dirty.store(false, Ordering::SeqCst);
+            // Only a memory-only manager has nothing to retry; keep the flag
+            // set when serialization failed so the pruner tries again.
+            if self.tokens_path.is_none() {
+                self.tokens_dirty.store(false, Ordering::SeqCst);
+            }
             return;
         };
         self.tokens_dirty.store(true, Ordering::SeqCst);
         let tokens_dirty = self.tokens_dirty.clone();
+        let tokens_revision = self.tokens_revision.clone();
+        let tokens = self.tokens.clone();
         match tokio::task::spawn_blocking(move || {
             let _persist = persist;
             let result = write_secret_file(&path, &toml_str);
             if result.is_ok() {
-                // Clear while the persist guard is still held: a newer save
-                // woken by its release must not be able to set the flag again
-                // and then have this older caller clear it after a failure.
-                tokens_dirty.store(false, Ordering::SeqCst);
+                // Take the tokens lock so the revision check and clear cannot
+                // interleave with a sync mutator such as `validate_token`,
+                // which bumps the revision and sets the dirty flag under this
+                // same lock. Clear while the persist guard is still held: a
+                // newer save woken by its release must not be able to set the
+                // flag again and then have this older caller clear it.
+                let _tokens = lock(&tokens);
+                if tokens_revision.load(Ordering::SeqCst) == revision {
+                    tokens_dirty.store(false, Ordering::SeqCst);
+                }
             }
             result
         })
@@ -1547,7 +1590,11 @@ impl AuthManager {
         let mut sessions = lock(&self.sessions);
         let before = sessions.len();
         sessions.retain(|_, session| session.username != username);
-        sessions.len() != before
+        let changed = sessions.len() != before;
+        if changed {
+            self.sessions_revision.fetch_add(1, Ordering::SeqCst);
+        }
+        changed
     }
 
     async fn insert_session(&self, session: Session) {
@@ -1570,6 +1617,7 @@ impl AuthManager {
                 }
             }
             sessions.insert(session.id.clone(), session);
+            self.sessions_revision.fetch_add(1, Ordering::SeqCst);
         }
         self.save_sessions_async().await;
     }
@@ -1869,8 +1917,11 @@ impl AuthManager {
             user.totp = Some(config);
         }
         self.save_users_async().await;
-        // Changing the second factor invalidates existing sessions.
+        // Changing the second factor invalidates existing sessions and every
+        // API token owned by the account, matching the disable lifecycle: a
+        // credential must not outlive the factor it was issued under.
         self.purge_user_sessions(username).await;
+        self.revoke_tokens_for_owner(username).await;
         true
     }
 
@@ -1945,16 +1996,17 @@ impl AuthManager {
     pub fn validate_session(&self, session_id: &str) -> Option<Session> {
         let mut sessions = lock(&self.sessions);
         if let Some(session) = sessions.get(session_id) {
-            if session.generation != self.generation {
+            let stale_generation = session.generation != self.generation;
+            let expired = session.is_expired();
+            if stale_generation || expired {
                 sessions.remove(session_id);
+                // Readers may prune as a side effect; the pruner persists this
+                // removal within 60 seconds (revision guards the retry).
+                self.sessions_revision.fetch_add(1, Ordering::SeqCst);
+                self.sessions_dirty.store(true, Ordering::SeqCst);
                 return None;
             }
-            if session.is_expired() {
-                sessions.remove(session_id);
-                None
-            } else {
-                Some(session.clone())
-            }
+            Some(session.clone())
         } else {
             None
         }
@@ -1962,7 +2014,14 @@ impl AuthManager {
 
     /// Logs out and destroys an active session.
     pub async fn logout(&self, session_id: &str) {
-        let removed = lock(&self.sessions).remove(session_id).is_some();
+        let removed = {
+            let mut sessions = lock(&self.sessions);
+            let removed = sessions.remove(session_id).is_some();
+            if removed {
+                self.sessions_revision.fetch_add(1, Ordering::SeqCst);
+            }
+            removed
+        };
         if removed {
             self.save_sessions_async().await;
         }
@@ -1984,7 +2043,11 @@ impl AuthManager {
         let mut tokens = lock(&self.tokens);
         let before = tokens.len();
         tokens.retain(|_, token| token.owner.as_deref() != Some(username));
-        tokens.len() != before
+        let changed = tokens.len() != before;
+        if changed {
+            self.tokens_revision.fetch_add(1, Ordering::SeqCst);
+        }
+        changed
     }
 
     /// Creates a new API token owned by `owner`.
@@ -2044,14 +2107,17 @@ impl AuthManager {
                     .filter(|(_, t)| t.owner.as_deref() == owner)
                     .min_by_key(|(_, t)| (t.created_at, t.id.clone()))
                     .map(|(k, _)| k.clone());
-                match oldest_same_owner {
-                    Some(key) => {
-                        tokens.remove(&key);
-                    }
-                    None => return Err(CreateTokenError::CapacityReached),
+                if let Some(key) = oldest_same_owner {
+                    tokens.remove(&key);
+                } else {
+                    // Expired/over-quota trims above may already have mutated
+                    // the store even though creation fails.
+                    self.tokens_revision.fetch_add(1, Ordering::SeqCst);
+                    return Err(CreateTokenError::CapacityReached);
                 }
             }
             tokens.insert(meta.hash.clone(), meta.clone());
+            self.tokens_revision.fetch_add(1, Ordering::SeqCst);
         }
         self.save_tokens_async().await;
         Ok((meta, resp))
@@ -2072,6 +2138,7 @@ impl AuthManager {
                 .map(|(k, _)| k.clone())
             {
                 tokens.remove(&key);
+                self.tokens_revision.fetch_add(1, Ordering::SeqCst);
                 true
             } else {
                 false
@@ -2112,6 +2179,7 @@ impl AuthManager {
                 .is_some_and(|meta| meta.generation != self.generation)
             {
                 tokens.remove(&key);
+                self.tokens_revision.fetch_add(1, Ordering::SeqCst);
                 self.tokens_dirty.store(true, Ordering::SeqCst);
                 return None;
             }
@@ -2121,11 +2189,13 @@ impl AuthManager {
                 .is_some_and(|expires_at| now >= expires_at)
             {
                 tokens.remove(&key);
+                self.tokens_revision.fetch_add(1, Ordering::SeqCst);
                 self.tokens_dirty.store(true, Ordering::SeqCst);
                 return None;
             }
             if let Some(meta) = tokens.get_mut(&key) {
                 meta.last_used = Some(chrono::Utc::now().timestamp_millis());
+                self.tokens_revision.fetch_add(1, Ordering::SeqCst);
                 self.tokens_dirty.store(true, Ordering::SeqCst);
                 return Some(meta.clone());
             }
@@ -2141,7 +2211,11 @@ impl AuthManager {
             let mut sessions = lock(&self.sessions);
             let before = sessions.len();
             sessions.retain(|_, s| !s.is_expired());
-            sessions.len() != before
+            let changed = sessions.len() != before;
+            if changed {
+                self.sessions_revision.fetch_add(1, Ordering::SeqCst);
+            }
+            changed
         };
         if sessions_changed || self.sessions_dirty.load(Ordering::SeqCst) {
             self.save_sessions_async().await;
@@ -2151,7 +2225,11 @@ impl AuthManager {
             let mut tokens = lock(&self.tokens);
             let before = tokens.len();
             tokens.retain(|_, t| t.expires_at.is_none_or(|exp| now < exp));
-            tokens.len() != before
+            let changed = tokens.len() != before;
+            if changed {
+                self.tokens_revision.fetch_add(1, Ordering::SeqCst);
+            }
+            changed
         };
         if tokens_changed || self.tokens_dirty.load(Ordering::SeqCst) {
             self.save_tokens_async().await;
@@ -3898,6 +3976,195 @@ mod tests {
             "a reload must not resurrect a deleted token"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sync reader (`validate_token`) that removes an expired token while a
+    /// save is in flight must leave the token store dirty: the old snapshot on
+    /// disk still contains the removal, and the next prune must rewrite it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_validate_token_expiry_retries_persist() {
+        let dir = auth_temp_dir("validate_token_retry");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        let (meta, resp) = mgr
+            .create_token("expiring-retry", Role::Viewer, None)
+            .await
+            .expect("token");
+        // Expire the token in memory only: the next snapshot will include it.
+        lock(&mgr.tokens)
+            .get_mut(&meta.hash)
+            .expect("token in memory")
+            .expires_at = Some(chrono::Utc::now().timestamp() - 10);
+
+        let tokens_path = dir.join("tokens.toml");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        SECRET_WRITE_START_SIGNALS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((tokens_path.clone(), started_tx));
+        SECRET_WRITE_DELAYS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((tokens_path.clone(), Duration::from_millis(400)));
+
+        let save_mgr = mgr.clone();
+        let save = tokio::spawn(async move { save_mgr.save_tokens_async().await });
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("timed out waiting for the delayed token write to start")
+            .expect("write-start signal was dropped");
+
+        // Remove the expired token while the snapshot write is in flight.
+        assert!(mgr.validate_token(&resp.token).is_none());
+        save.await.expect("token save task");
+
+        // Without the dirty flag the prune below would see no in-memory change
+        // and skip rewriting, leaving the removed token on disk.
+        mgr.prune().await;
+
+        let raw = std::fs::read_to_string(&tokens_path).unwrap();
+        assert!(
+            !raw.contains("expiring-retry"),
+            "prune must persist a removal made by validate_token: {raw}"
+        );
+
+        drop(mgr);
+        let reloaded = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            !reloaded
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == meta.id),
+            "a reload must not resurrect a token removed by validate_token"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same contract as [`test_validate_token_expiry_retries_persist`] for
+    /// sessions: a sync `validate_session` removal must mark the store dirty so
+    /// the pruner rewrites the stale snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_validate_session_expiry_retries_persist() {
+        let dir = auth_temp_dir("validate_session_retry");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("login failed");
+        };
+        mgr.expire_session_for_test(&session.id);
+
+        let sessions_path = dir.join("sessions.toml");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        SECRET_WRITE_START_SIGNALS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((sessions_path.clone(), started_tx));
+        SECRET_WRITE_DELAYS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((sessions_path.clone(), Duration::from_millis(400)));
+
+        let save_mgr = mgr.clone();
+        let save = tokio::spawn(async move { save_mgr.save_sessions_async().await });
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("timed out waiting for the delayed session write to start")
+            .expect("write-start signal was dropped");
+
+        assert!(mgr.validate_session(&session.id).is_none());
+        save.await.expect("session save task");
+
+        mgr.prune().await;
+
+        let raw = std::fs::read_to_string(&sessions_path).unwrap();
+        assert!(
+            !raw.contains(&session.id),
+            "prune must persist a removal made by validate_session: {raw}"
+        );
+
+        drop(mgr);
+        let reloaded = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(reloaded.validate_session(&session.id).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Enabling TOTP is a credential change exactly like disabling it: tokens
+    /// owned by the account must not outlive the new second factor.
+    #[tokio::test]
+    async fn test_totp_enable_revokes_owned_tokens() {
+        let dir = auth_temp_dir("totp_enable_revokes");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        let (admin_token, admin_resp) = mgr
+            .create_token("admin-before-totp", Role::Operator, Some("admin"))
+            .await
+            .expect("admin token");
+        let (alice_token, _) = mgr
+            .create_token("alice-unaffected", Role::Operator, Some("alice"))
+            .await
+            .expect("alice token");
+
+        enable_totp(&mgr, "admin").await;
+
+        assert!(
+            mgr.validate_token(&admin_resp.token).is_none(),
+            "enabling TOTP must revoke owned tokens in memory"
+        );
+        assert!(
+            !mgr.list_tokens()
+                .iter()
+                .any(|token| token.id == admin_token.id)
+        );
+        assert!(
+            mgr.list_tokens()
+                .iter()
+                .any(|token| token.id == alice_token.id),
+            "another account's tokens must survive"
+        );
+
+        let raw = std::fs::read_to_string(dir.join("tokens.toml")).unwrap();
+        assert!(
+            !raw.contains("admin-before-totp"),
+            "the revocation must be persisted: {raw}"
+        );
+        assert!(raw.contains("alice-unaffected"));
+
+        drop(mgr);
+        let reloaded = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            !reloaded
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == admin_token.id),
+            "a reload must not resurrect a token revoked by TOTP enable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `save_users_initial` bypasses `persist_lock` and is only safe from the
+    /// constructors. Runtime mutations must go through `save_users_async`.
+    #[test]
+    fn test_save_users_is_constructor_only() {
+        let source = include_str!("manager.rs");
+        // Build needles at runtime so this test's own source cannot match them.
+        let private_initial_fn = format!("{}{}", "fn save_users", "_initial(&self) {");
+        assert!(
+            source.lines().any(|line| line.trim() == private_initial_fn),
+            "the synchronous constructor-only writer must exist as a private fn"
+        );
+        let public_initial_fn = format!("pub {private_initial_fn}");
+        assert!(
+            !source
+                .lines()
+                .any(|line| line.trim_start().starts_with(&public_initial_fn)),
+            "save_users_initial must stay private"
+        );
+        let constructor_calls = format!("{}{}", "mgr.save_users", "_initial();");
+        assert_eq!(
+            source.matches(&constructor_calls).count(),
+            2,
+            "only the two constructors may call save_users_initial"
+        );
     }
 
     #[tokio::test]

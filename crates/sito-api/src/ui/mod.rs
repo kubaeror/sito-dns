@@ -275,6 +275,8 @@ mod tests {
             }],
             discovered_total: 1,
             can_view_discovered: true,
+            discovered_page: 1,
+            discovered_pages: 1,
             max_entries: sito_clients::MAX_UNIDENTIFIED_CLIENTS,
             retention_hours: sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS,
         };

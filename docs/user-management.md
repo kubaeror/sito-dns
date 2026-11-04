@@ -128,9 +128,10 @@ owns**. Tokens created before ownership tracking (ownerless/legacy tokens) are
 not linked to an account, so they survive account deletion and remain
 Admin-managed; revoke them explicitly if they were issued to the deleted user.
 
-Password changes, TOTP disable, role changes, and overwriting/recreating an
-account also revoke **all API tokens owned by that account**: a credential must
-not outlive the password, second factor, or privileges it was issued under.
+Password changes, TOTP enable/disable, role changes, and overwriting/recreating
+an account also revoke **all API tokens owned by that account**: a credential
+must not outlive the password, second factor, or privileges it was issued
+under.
 Legacy ownerless tokens are never matched by these revocations and remain
 Admin-managed until explicitly revoked.
 
@@ -236,7 +237,7 @@ Admin-managed.
 API tokens are revoked automatically by:
 
 * an account password change (self-service or Admin override);
-* disabling TOTP for the account;
+* enabling or disabling TOTP for the account;
 * any role change (promotion or demotion);
 * overwriting/recreating the account (for example via the setup wizard or CLI);
 * deleting the account.
@@ -314,9 +315,11 @@ an API workflow (Admin session required by the current API guards); the
      -d '{"password":"NewCorrectHorse2","code":"123456"}'
    ```
 
-Enabling or disabling TOTP revokes all sessions of the account. Disabling TOTP
-also revokes every API token owned by the account, because removing the second
-factor is a credential change.
+Enabling or disabling TOTP revokes all sessions of the account **and every API
+token it owns**, because either change to the second factor is a credential
+change. Scripts that authenticated with an owned token must create a new token
+after enabling 2FA. Legacy ownerless tokens are not matched and remain
+Admin-managed.
 
 TOTP secrets are encrypted at rest with AES-256-GCM using
 `<data_dir>/totp.key`. Back up `users.toml` and `totp.key` together: restoring

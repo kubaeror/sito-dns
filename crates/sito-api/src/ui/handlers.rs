@@ -16,8 +16,9 @@ use crate::auth::session::{
     build_clear_csrf_cookie, build_clear_session_cookie, build_csrf_cookie, extract_session_cookie,
 };
 use crate::auth::token::Role;
-use crate::config_apply::{ApplyHooks, FilterApply, apply_and_persist_config, apply_full_config};
-use crate::config_writer::save_config_atomic;
+use crate::config_apply::{
+    ApplyHooks, FilterApply, apply_and_persist_config_locked, apply_full_config,
+};
 use crate::error::ProblemDetails;
 use crate::handlers::auth_handlers::{
     user_mutation_problem, validate_password_policy, validate_username,
@@ -713,29 +714,19 @@ pub async fn filtering_toggle_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     let Some(idx) = find_filter_list_index(&new_cfg, &id) else {
         return error_response(StatusCode::NOT_FOUND, "Filter list not found");
     };
     new_cfg.filtering.lists[idx].enabled = !new_cfg.filtering.lists[idx].enabled;
-    if let Err(e) = ctx.filter.reload_with_config(&new_cfg.filtering).await {
-        tracing::error!("Failed to apply filter configuration: {e}");
+    if let Err(e) = apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await {
+        tracing::error!("Failed to apply filter configuration: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to apply filter configuration: {e}"),
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to apply filter configuration: {}", e.detail),
         );
     }
-    // Filter rules changed: drop cached answers that may now be blocked.
-    ctx.cache.flush();
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist configuration",
-        );
-    }
-    ctx.set_config(new_cfg.clone());
-    crate::publish_bundle(&ctx).await;
     Redirect::to("/filtering").into_response()
 }
 
@@ -768,6 +759,7 @@ pub async fn filtering_add_handler(
         );
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     if new_cfg.filtering.lists.iter().any(|list| list.name == name) {
         return error_response(StatusCode::CONFLICT, "A list with that name already exists");
@@ -778,24 +770,13 @@ pub async fn filtering_add_handler(
         enabled: true,
         refresh_hours: form.refresh_hours.map(u64::from),
     });
-    if let Err(e) = ctx.filter.reload_with_config(&new_cfg.filtering).await {
-        tracing::error!("Failed to apply filter configuration: {e}");
+    if let Err(e) = apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await {
+        tracing::error!("Failed to apply filter configuration: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to apply filter configuration: {e}"),
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to apply filter configuration: {}", e.detail),
         );
     }
-    // Filter rules changed: drop cached answers that may now be blocked.
-    ctx.cache.flush();
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist configuration",
-        );
-    }
-    ctx.set_config(new_cfg.clone());
-    crate::publish_bundle(&ctx).await;
 
     Redirect::to("/filtering").into_response()
 }
@@ -812,29 +793,19 @@ pub async fn filtering_delete_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     let Some(idx) = find_filter_list_index(&new_cfg, &id) else {
         return error_response(StatusCode::NOT_FOUND, "Filter list not found");
     };
     new_cfg.filtering.lists.remove(idx);
-    if let Err(e) = ctx.filter.reload_with_config(&new_cfg.filtering).await {
-        tracing::error!("Failed to apply filter configuration: {e}");
+    if let Err(e) = apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await {
+        tracing::error!("Failed to apply filter configuration: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to apply filter configuration: {e}"),
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to apply filter configuration: {}", e.detail),
         );
     }
-    // Filter rules changed: drop cached answers that may now be blocked.
-    ctx.cache.flush();
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist configuration",
-        );
-    }
-    ctx.set_config(new_cfg.clone());
-    crate::publish_bundle(&ctx).await;
     Redirect::to("/filtering").into_response()
 }
 
@@ -855,6 +826,7 @@ pub async fn filtering_custom_rules_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     new_cfg.filtering.custom_rules = form
         .rules
@@ -864,24 +836,13 @@ pub async fn filtering_custom_rules_handler(
         .map(String::from)
         .collect();
 
-    if let Err(e) = ctx.filter.reload_with_config(&new_cfg.filtering).await {
-        tracing::error!("Failed to apply filter configuration: {e}");
+    if let Err(e) = apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await {
+        tracing::error!("Failed to apply filter configuration: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to apply filter configuration: {e}"),
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to apply filter configuration: {}", e.detail),
         );
     }
-    // Filter rules changed: drop cached answers that may now be blocked.
-    ctx.cache.flush();
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist configuration",
-        );
-    }
-    ctx.set_config(new_cfg.clone());
-    crate::publish_bundle(&ctx).await;
 
     Redirect::to("/filtering").into_response()
 }
@@ -1024,6 +985,7 @@ pub async fn rewrites_add_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut store = crate::handlers::rewrites::load_rewrite_store(&ctx);
     store.cfg.entries.push(sito_rewrites::RewriteEntryConfig {
         domain: form.domain,
@@ -1033,7 +995,7 @@ pub async fn rewrites_add_handler(
     });
     store.ids.push(crate::handlers::rewrites::new_rewrite_id());
 
-    if let Err(e) = crate::handlers::rewrites::save_rewrite_store(&ctx, &store).await {
+    if let Err(e) = crate::handlers::rewrites::save_rewrite_store_locked(&ctx, &store).await {
         tracing::error!("Failed to persist rewrites: {e:?}");
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1068,6 +1030,7 @@ pub async fn rewrites_delete_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut store = crate::handlers::rewrites::load_rewrite_store(&ctx);
     let idx = if let Some(ref id) = form.id {
         crate::handlers::rewrites::resolve_rewrite_index(&store, id)
@@ -1084,10 +1047,10 @@ pub async fn rewrites_delete_handler(
     store.cfg.entries.remove(idx);
     store.ids.remove(idx);
 
-    if let Err(e) = crate::handlers::rewrites::save_rewrite_store(&ctx, &store).await {
+    if let Err(e) = crate::handlers::rewrites::save_rewrite_store_locked(&ctx, &store).await {
         tracing::error!("Failed to persist rewrites: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             &format!("Failed to persist rewrites: {}", e.detail),
         );
     }
@@ -1108,7 +1071,18 @@ fn load_clients_config(ctx: &ServerContext) -> sito_clients::ClientsConfig {
         .unwrap_or_default()
 }
 
-pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
+/// Query parameters for the clients page.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClientsPageQuery {
+    /// 1-based page of the discovered-but-unidentified list.
+    pub discovered_page: Option<usize>,
+}
+
+pub async fn clients_page(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Query(query): Query<ClientsPageQuery>,
+) -> Response {
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
     };
@@ -1126,27 +1100,35 @@ pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
         .collect();
 
     // Discovered-client rows carry DHCP PII (IP/MAC/hostname), so they are
-    // loaded and rendered for Operators and above only. The UI shows at most
-    // the API's default page size; the registry itself keeps its hard cap.
+    // loaded and rendered for Operators and above only. The list is paginated
+    // at the API's default page size; the registry itself keeps its hard cap.
     let can_view_discovered = user.role >= Role::Operator;
-    let (discovered, discovered_total): (Vec<ClientDiscoveryViewItem>, usize) =
-        if can_view_discovered {
-            let all = ctx.clients.load().unidentified_clients();
-            let total = all.len();
-            let rows = all
-                .into_iter()
-                .take(crate::handlers::clients::DEFAULT_UNIDENTIFIED_LIMIT)
-                .map(|client| ClientDiscoveryViewItem {
-                    ip: client.ip.to_string(),
-                    mac: client.mac,
-                    hostname: client.hostname,
-                    last_seen: client.last_seen.format("%Y-%m-%d %H:%M UTC").to_string(),
-                })
-                .collect();
-            (rows, total)
-        } else {
-            (Vec::new(), 0)
-        };
+    let (discovered, discovered_total, discovered_page, discovered_pages): (
+        Vec<ClientDiscoveryViewItem>,
+        usize,
+        usize,
+        usize,
+    ) = if can_view_discovered {
+        let all = ctx.clients.load().unidentified_clients();
+        let total = all.len();
+        let page_size = crate::handlers::clients::DEFAULT_UNIDENTIFIED_LIMIT;
+        let pages = total.div_ceil(page_size).max(1);
+        let page = query.discovered_page.unwrap_or(1).clamp(1, pages);
+        let rows = all
+            .into_iter()
+            .skip((page - 1) * page_size)
+            .take(page_size)
+            .map(|client| ClientDiscoveryViewItem {
+                ip: client.ip.to_string(),
+                mac: client.mac,
+                hostname: client.hostname,
+                last_seen: client.last_seen.format("%Y-%m-%d %H:%M UTC").to_string(),
+            })
+            .collect();
+        (rows, total, page, pages)
+    } else {
+        (Vec::new(), 0, 1, 1)
+    };
 
     HtmlTemplate(ClientsTemplate {
         csrf_token: &csrf,
@@ -1159,6 +1141,8 @@ pub async fn clients_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
         discovered,
         discovered_total,
         can_view_discovered,
+        discovered_page,
+        discovered_pages,
         max_entries: sito_clients::MAX_UNIDENTIFIED_CLIENTS,
         retention_hours: sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS,
     })
@@ -1174,6 +1158,7 @@ pub struct AddClientForm {
 
 pub async fn clients_add_handler(
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     headers: HeaderMap,
     Form(form): Form<AddClientForm>,
 ) -> Response {
@@ -1184,6 +1169,7 @@ pub async fn clients_add_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut clients_cfg = load_clients_config(&ctx);
     if clients_cfg.entries.iter().any(|c| c.name == form.name) {
         return error_response(
@@ -1225,23 +1211,15 @@ pub async fn clients_add_handler(
     };
     let mut new_cfg = (**ctx.config.load()).clone();
     new_cfg.clients = Some(val);
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
+    if let Err(e) =
+        apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Deferred, hooks.as_dyn()).await
+    {
+        tracing::error!("Failed to apply clients: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist clients",
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to persist clients: {}", e.detail),
         );
     }
-    ctx.set_config(new_cfg);
-    let current = ctx.clients.load();
-    let new_reg = sito_clients::ClientRegistry::with_stores(
-        clients_cfg,
-        current.routeros_leases_store(),
-        current.unidentified_store(),
-    );
-    drop(current);
-    ctx.set_clients(new_reg);
-    crate::publish_bundle(&ctx).await;
 
     Redirect::to("/clients").into_response()
 }
@@ -1253,6 +1231,7 @@ pub struct DeleteClientForm {
 
 pub async fn clients_delete_handler(
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     headers: HeaderMap,
     Form(form): Form<DeleteClientForm>,
 ) -> Response {
@@ -1263,6 +1242,7 @@ pub async fn clients_delete_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut clients_cfg = load_clients_config(&ctx);
     let before = clients_cfg.entries.len();
     clients_cfg.entries.retain(|c| c.name != form.name);
@@ -1283,23 +1263,15 @@ pub async fn clients_delete_handler(
     };
     let mut new_cfg = (**ctx.config.load()).clone();
     new_cfg.clients = Some(val);
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
+    if let Err(e) =
+        apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Deferred, hooks.as_dyn()).await
+    {
+        tracing::error!("Failed to apply clients: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist clients",
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to persist clients: {}", e.detail),
         );
     }
-    ctx.set_config(new_cfg);
-    let current = ctx.clients.load();
-    let new_reg = sito_clients::ClientRegistry::with_stores(
-        clients_cfg,
-        current.routeros_leases_store(),
-        current.unidentified_store(),
-    );
-    drop(current);
-    ctx.set_clients(new_reg);
-    crate::publish_bundle(&ctx).await;
 
     Redirect::to("/clients").into_response()
 }
@@ -1336,6 +1308,7 @@ pub struct AddUpstreamForm {
 
 pub async fn upstreams_add_handler(
     State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
     headers: HeaderMap,
     Form(form): Form<AddUpstreamForm>,
 ) -> Response {
@@ -1346,35 +1319,26 @@ pub async fn upstreams_add_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let mut new_cfg = (**ctx.config.load()).clone();
     let clean = form.address.trim().to_string();
     if clean.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "Upstream address is required");
     }
+
+    let _apply_guard = ctx.lock_config_apply().await;
+    let mut new_cfg = (**ctx.config.load()).clone();
     if new_cfg.upstream.servers.contains(&clean) {
         return error_response(StatusCode::CONFLICT, "Upstream is already configured");
     }
     new_cfg.upstream.servers.push(clean);
-    let bootstrap = sito_upstream::BootstrapResolver::new(
-        new_cfg.upstream.bootstrap.clone(),
-        std::time::Duration::from_millis(new_cfg.upstream.timeout_ms),
-    );
-    if let Err(e) = ctx.upstream.reload(&new_cfg.upstream, &bootstrap).await {
-        tracing::error!("Failed to reload upstream manager: {e:?}");
+    if let Err(e) =
+        apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Deferred, hooks.as_dyn()).await
+    {
+        tracing::error!("Failed to apply upstream configuration: {e:?}");
         return error_response(
-            StatusCode::BAD_REQUEST,
-            &format!("Invalid upstream configuration: {e}"),
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to apply upstream configuration: {}", e.detail),
         );
     }
-    if let Err(e) = save_config_atomic(&ctx.config_path, &new_cfg).await {
-        tracing::error!("Failed to persist configuration to disk: {e:?}");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to persist configuration",
-        );
-    }
-    ctx.set_config(new_cfg.clone());
-    crate::publish_bundle(&ctx).await;
 
     Redirect::to("/upstreams").into_response()
 }
@@ -1526,6 +1490,9 @@ pub async fn settings_save_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    // Read the current config only after taking the apply lock so a concurrent
+    // clients/filter write cannot be overwritten by a stale settings snapshot.
+    let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     new_cfg.dns.cache.size_mb = form.cache_size_mb;
     new_cfg.dns.cache.min_ttl = form.min_ttl;
@@ -1536,7 +1503,7 @@ pub async fn settings_save_handler(
     // effect (and are validated) before the file is written, and a failed
     // write rolls the in-memory apply back.
     if let Err(e) =
-        apply_and_persist_config(&ctx, &new_cfg, FilterApply::Sync, hooks.as_dyn()).await
+        apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, hooks.as_dyn()).await
     {
         tracing::error!("Failed to apply settings: {e:?}");
         return StatusCode::from_u16(e.status)
@@ -2256,25 +2223,36 @@ pub async fn wizard_complete_handler(
         admin_pass_input
     };
 
-    let base_cfg = (**ctx.config.load()).clone();
-    let new_cfg = match form.build_config(&base_cfg) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Invalid configuration: {e}"),
-            )
-                .into_response();
-        }
-    };
+    // Read the base config only after taking the apply lock so a concurrent
+    // writer cannot be overwritten by a stale wizard snapshot. The guard is
+    // scoped to the apply/persist section; credential changes below do not
+    // write the configuration file.
+    let (report, filtering) = {
+        let _apply_guard = ctx.lock_config_apply().await;
+        let base_cfg = (**ctx.config.load()).clone();
+        let new_cfg = match form.build_config(&base_cfg) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid configuration: {e}"),
+                )
+                    .into_response();
+            }
+        };
 
-    // Apply first, persist second (WP-4.2): a configuration that cannot be
-    // applied never reaches the file. The blocklist fetch is deferred to a
-    // background refresh so the wizard request does not download lists
-    // synchronously; the DNS listeners are only started after the refresh
-    // finished.
-    let report =
-        match apply_and_persist_config(&ctx, &new_cfg, FilterApply::Deferred, hooks.as_dyn()).await
+        // Apply first, persist second (WP-4.2): a configuration that cannot be
+        // applied never reaches the file. The blocklist fetch is deferred to a
+        // background refresh so the wizard request does not download lists
+        // synchronously; the DNS listeners are only started after the refresh
+        // finished.
+        let report = match apply_and_persist_config_locked(
+            &ctx,
+            &new_cfg,
+            FilterApply::Deferred,
+            hooks.as_dyn(),
+        )
+        .await
         {
             Ok(report) => report,
             Err(e) => {
@@ -2285,6 +2263,8 @@ pub async fn wizard_complete_handler(
                 );
             }
         };
+        (report, new_cfg.filtering.clone())
+    };
     if !report.restart_required.is_empty() {
         tracing::warn!(
             fields = ?report.restart_required,
@@ -2347,7 +2327,7 @@ pub async fn wizard_complete_handler(
     // Queue the blocklist fetch/compile off the request path. When the DNS
     // listeners are still gated (first boot), start them only after the
     // filter engine has the new rules.
-    let filter_handle = crate::config_apply::queue_filter_refresh(&ctx, new_cfg.filtering.clone());
+    let filter_handle = crate::config_apply::queue_filter_refresh(&ctx, filtering);
     match ctx.dns_starter.clone() {
         Some(starter) => {
             tokio::spawn(async move {
@@ -3677,6 +3657,7 @@ mod tests {
 
         let resp = clients_delete_handler(
             State(ctx.clone()),
+            Extension(ApplyHooks::default()),
             headers,
             Form(DeleteClientForm {
                 name: "phone".to_string(),
@@ -3820,6 +3801,20 @@ mod tests {
         }
     }
 
+    /// Seeds `count` discoveries under `10.44.0.x` (index 0 is newest).
+    /// `hostname_prefix` adds a hostname to each entry so PII-leak assertions
+    /// have something distinctive to look for.
+    fn seed_discovered_page(ctx: &ServerContext, count: i64, hostname_prefix: Option<&str>) {
+        let base = midday();
+        for index in 0..count {
+            let ip: std::net::IpAddr = format!("10.44.0.{}", index + 1).parse().unwrap();
+            let mac = format!("aa:bb:cc:dd:ef:{index:02x}");
+            let hostname = hostname_prefix.map(|prefix| format!("{prefix}-{index}"));
+            let seen = base - chrono::TimeDelta::minutes(index);
+            seed_discovered(ctx, &[(ip, Some(mac.as_str()), hostname.as_deref(), seen)]);
+        }
+    }
+
     /// A fixed midday UTC instant: deterministic formatting with no risk of
     /// crossing a day (or UTC midnight) while the test runs.
     fn midday() -> chrono::DateTime<chrono::Utc> {
@@ -3876,7 +3871,12 @@ mod tests {
         else {
             panic!("operator login failed");
         };
-        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        let resp = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery::default()),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = response_body(resp).await;
 
@@ -3974,7 +3974,12 @@ mod tests {
         else {
             panic!("operator login failed");
         };
-        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        let resp = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery::default()),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = response_body(resp).await;
 
@@ -4048,7 +4053,12 @@ mod tests {
         else {
             panic!("viewer login failed");
         };
-        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        let resp = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery::default()),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = response_body(resp).await;
 
@@ -4101,7 +4111,12 @@ mod tests {
         else {
             panic!("operator login failed");
         };
-        let resp = clients_page(State(ctx.clone()), session_headers(&session)).await;
+        let resp = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery::default()),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = response_body(resp).await;
 
@@ -4116,6 +4131,236 @@ mod tests {
                 sito_clients::MAX_UNIDENTIFIED_CLIENTS
             )),
             "the bound must stay visible when the list is empty: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn discovered_row_count(body: &str) -> usize {
+        body.matches("<td class=\"td-strong mono\">10.44.0.")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn test_clients_page_paginates_discovered_clients() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_paginate_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+        seed_discovered_page(&ctx, 105, None);
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+
+        let page1 = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery {
+                discovered_page: Some(1),
+            }),
+        )
+        .await;
+        assert_eq!(page1.status(), StatusCode::OK);
+        let body1 = response_body(page1).await;
+        assert!(body1.contains("Page 1 of 2"), "{body1}");
+        assert_eq!(
+            discovered_row_count(&body1),
+            crate::handlers::clients::DEFAULT_UNIDENTIFIED_LIMIT,
+            "page 1 must render exactly one page of rows: {body1}"
+        );
+        assert!(
+            body1.contains("Showing 100 of 105 discovered clients"),
+            "the page count must stay accurate: {body1}"
+        );
+        assert!(body1.contains("10.44.0.1<"), "newest row must render");
+        assert!(body1.contains("10.44.0.100<"), "row 100 must render");
+        for index in 101..=105 {
+            assert!(
+                !body1.contains(&format!("10.44.0.{index}<")),
+                "row {index} belongs on page 2: {body1}"
+            );
+        }
+
+        let page2 = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery {
+                discovered_page: Some(2),
+            }),
+        )
+        .await;
+        assert_eq!(page2.status(), StatusCode::OK);
+        let body2 = response_body(page2).await;
+        assert!(body2.contains("Page 2 of 2"), "{body2}");
+        assert_eq!(discovered_row_count(&body2), 5, "{body2}");
+        assert!(
+            body2.contains("Showing 5 of 105 discovered clients"),
+            "the page count must stay accurate on the last page: {body2}"
+        );
+        for index in 101..=105 {
+            assert!(
+                body2.contains(&format!("10.44.0.{index}<")),
+                "row {index} must render on page 2: {body2}"
+            );
+        }
+        assert!(
+            !body2.contains("10.44.0.100<"),
+            "row 100 belongs on page 1: {body2}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_clients_page_clamps_out_of_range_page() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_clamp_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("oper_user", "OperPass1", Role::Operator)
+            .await;
+        seed_discovered_page(&ctx, 105, None);
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("oper_user", "OperPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("operator login failed");
+        };
+
+        // A page far past the end clamps to the last page.
+        let high = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery {
+                discovered_page: Some(99),
+            }),
+        )
+        .await;
+        assert_eq!(high.status(), StatusCode::OK);
+        let high_body = response_body(high).await;
+        assert!(
+            high_body.contains("Page 2 of 2"),
+            "an out-of-range page must clamp to the last page: {high_body}"
+        );
+        assert_eq!(discovered_row_count(&high_body), 5, "{high_body}");
+        assert!(high_body.contains("10.44.0.105<"), "{high_body}");
+
+        // Page zero clamps to the first page.
+        let zero = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery {
+                discovered_page: Some(0),
+            }),
+        )
+        .await;
+        assert_eq!(zero.status(), StatusCode::OK);
+        let zero_body = response_body(zero).await;
+        assert!(
+            zero_body.contains("Page 1 of 2"),
+            "page zero must clamp to the first page: {zero_body}"
+        );
+        assert_eq!(
+            discovered_row_count(&zero_body),
+            crate::handlers::clients::DEFAULT_UNIDENTIFIED_LIMIT,
+            "{zero_body}"
+        );
+        assert!(zero_body.contains("10.44.0.1<"), "{zero_body}");
+
+        // No query parameter at all defaults to the first page.
+        let default_page = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery::default()),
+        )
+        .await;
+        let default_body = response_body(default_page).await;
+        assert!(default_body.contains("Page 1 of 2"), "{default_body}");
+        assert_eq!(
+            discovered_row_count(&default_body),
+            crate::handlers::clients::DEFAULT_UNIDENTIFIED_LIMIT,
+            "{default_body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_viewer_pagination_never_exposes_pii() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ui_clients_discovered_viewer_page_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        ctx.auth_mgr
+            .create_user("view_user", "ViewerPass1", Role::Viewer)
+            .await;
+        seed_discovered_page(&ctx, 105, Some("pii-host"));
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("view_user", "ViewerPass1", "127.0.0.1")
+            .await
+        else {
+            panic!("viewer login failed");
+        };
+        let resp = clients_page(
+            State(ctx.clone()),
+            session_headers(&session),
+            Query(ClientsPageQuery {
+                discovered_page: Some(2),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_body(resp).await;
+
+        assert!(
+            !body.contains("Discovered but unidentified"),
+            "the discovered section must stay operator-only: {body}"
+        );
+        assert!(
+            !body.contains("Page 1 of 2") && !body.contains("Page 2 of 2"),
+            "pagination controls must not leak the section: {body}"
+        );
+        assert!(
+            !body.contains("No unidentified clients discovered yet"),
+            "the empty state must not leak the section: {body}"
+        );
+        // Page 2 would contain rows 101-105; none of them (nor their PII) may
+        // appear for a Viewer.
+        for index in 1..=105 {
+            assert!(
+                !body.contains(&format!("10.44.0.{index}<")),
+                "discovered IP {index} leaked: {body}"
+            );
+        }
+        assert!(
+            !body.contains("pii-host-"),
+            "discovered hostname leaked: {body}"
+        );
+        assert!(
+            !body.contains("aa:bb:cc:dd:ef:"),
+            "discovered MAC leaked: {body}"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
