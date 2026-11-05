@@ -21,7 +21,10 @@ use sito_rewrites::RewritesConfig;
 use sito_stats::MetricsRegistry;
 use sito_stats::metrics::MetricsSnapshot;
 
-use crate::bundle::{ConfigBundle, substitute_secrets, verify_and_unpack_push};
+use crate::bundle::{
+    ConfigBundle, push_payload_hash, substitute_secrets, verify_and_unpack_push_with_watermark,
+    watermark_covers,
+};
 use crate::config::HaConfig;
 use crate::crypto::parse_public_key;
 use crate::error::HaError;
@@ -79,16 +82,35 @@ pub async fn apply_config_push(
     handles: &SlaveAppHandles,
     master_pubkey: &[u8],
 ) -> Result<u64, HaError> {
-    let have_version = tracker.get_version();
+    let watermark = tracker.get_watermark();
 
-    // 1. Verify cryptographic signature, checksum, and monotonicity
-    let bundle = match verify_and_unpack_push(push, have_version, master_pubkey) {
-        Ok(b) => b,
+    // 1. Verify cryptographic signature, checksum, term and monotonicity
+    //    against the persisted watermark (not only the in-memory counter, so a
+    //    process restart cannot lose the replay guard).
+    let bundle =
+        match verify_and_unpack_push_with_watermark(push, watermark.as_ref(), master_pubkey) {
+            Ok(b) => b,
+            Err(e) => {
+                tracker.mark_degraded(format!("Validation/Signature verification failed: {e}"));
+                return Err(e);
+            }
+        };
+    let payload_hash = match push_payload_hash(push) {
+        Ok(hash) => hash,
         Err(e) => {
             tracker.mark_degraded(format!("Validation/Signature verification failed: {e}"));
             return Err(e);
         }
     };
+
+    // An identical re-delivery of the already-applied bundle needs no work and
+    // must not rewrite local configuration; acknowledge it as synced.
+    if let Some(ref applied) = watermark
+        && watermark_covers(applied, bundle.version, &payload_hash)
+    {
+        tracker.mark_synced(bundle.version);
+        return Ok(bundle.version);
+    }
 
     // 2. Secret substitution. Placeholders resolve from the process
     // environment only (`DNSD_SECRET_<NAME>`, then `<NAME>`); there is no
@@ -242,6 +264,19 @@ pub async fn apply_config_push(
         error!(
             error = %e,
             "Failed to apply pushed configuration; refusing to acknowledge the push"
+        );
+        tracker.mark_degraded(reason.clone());
+        return Err(HaError::Rollback(reason));
+    }
+
+    // Persist the applied-version watermark before acknowledging: a crash
+    // between apply and ACK must still leave a restart able to reject replays.
+    if let Err(e) = tracker.persist_watermark(bundle.version, &payload_hash) {
+        let reason = format!("Failed to persist the applied-version watermark: {e}");
+        error!(
+            error = %e,
+            version = bundle.version,
+            "Configuration was applied but the watermark could not be persisted; refusing to acknowledge"
         );
         tracker.mark_degraded(reason.clone());
         return Err(HaError::Rollback(reason));
@@ -940,8 +975,64 @@ where
                 .await
                 .map_err(|e| HaError::Connection(format!("Failed to send Pong: {e}")))?;
         }
-        HaMessage::ConfigPush { ref version, .. } => {
+        HaMessage::ConfigPush {
+            ref version,
+            ref payload_hash_blake3,
+            ..
+        } => {
             let target_version = *version;
+
+            // A push at or below the persisted watermark is only acceptable
+            // when it is the identical signed payload that produced that
+            // watermark. An older version, or the same version with different
+            // content, is a replay/rollback attempt and must not be
+            // acknowledged as applied.
+            if let Some(watermark) = tracker.get_watermark() {
+                if target_version < watermark.version {
+                    let ack = HaMessage::Ack {
+                        version: watermark.version,
+                        applied: false,
+                        error: Some(format!(
+                            "Push version {target_version} is below the applied watermark {} (replay rejected)",
+                            watermark.version
+                        )),
+                    };
+                    ws_stream
+                        .send(WsMessage::Text(ack.to_json()?.into()))
+                        .await
+                        .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                    return Ok(());
+                }
+                if target_version == watermark.version {
+                    if !watermark_covers(&watermark, target_version, payload_hash_blake3) {
+                        let ack = HaMessage::Ack {
+                            version: watermark.version,
+                            applied: false,
+                            error: Some(format!(
+                                "Push version {target_version} does not match the applied payload hash (same-version replay rejected)"
+                            )),
+                        };
+                        ws_stream
+                            .send(WsMessage::Text(ack.to_json()?.into()))
+                            .await
+                            .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                        return Ok(());
+                    }
+                    let ack = HaMessage::Ack {
+                        version: watermark.version,
+                        applied: true,
+                        error: None,
+                    };
+                    ws_stream
+                        .send(WsMessage::Text(ack.to_json()?.into()))
+                        .await
+                        .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                    if tracker.get_state() != SlaveState::Degraded {
+                        tracker.mark_synced(watermark.version);
+                    }
+                    return Ok(());
+                }
+            }
 
             // Already at (or ahead of) this version: acknowledge without
             // re-applying. The master always pushes on connect.
@@ -1654,6 +1745,178 @@ ttl = 60
                 .custom_rules
                 .len(),
             1
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A restart restores the applied watermark and rejects both an older
+    /// signed bundle and a same-version bundle with different content.
+    #[tokio::test]
+    async fn test_restart_rejects_replay_and_same_version_content_swap() {
+        let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_watermark_worker_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let watermark_path = dir.join("ha_watermark.toml");
+        let config_toml = "config_version = 1\n[server]\nrole = \"slave\"\n";
+
+        let first = SlaveStatusTracker::new("slave-restart".to_string(), 0, None)
+            .with_watermark_path(watermark_path.clone())
+            .unwrap();
+        let handles = test_handles(None).await;
+        let push_v2 =
+            build_and_sign_push(&test_bundle(2, config_toml, None, None), &signing_key).unwrap();
+        assert_eq!(
+            apply_config_push(&push_v2, &first, &handles, &signing_key.public_key())
+                .await
+                .unwrap(),
+            2
+        );
+
+        // Simulate a process restart: only the on-disk watermark survives.
+        let restarted = SlaveStatusTracker::new("slave-restart".to_string(), 0, None)
+            .with_watermark_path(watermark_path.clone())
+            .unwrap();
+        assert_eq!(restarted.get_version(), 2);
+        let restarted_handles = test_handles(None).await;
+
+        let old_push =
+            build_and_sign_push(&test_bundle(1, config_toml, None, None), &signing_key).unwrap();
+        assert!(
+            apply_config_push(
+                &old_push,
+                &restarted,
+                &restarted_handles,
+                &signing_key.public_key()
+            )
+            .await
+            .is_err(),
+            "an older signed bundle must be rejected after restart"
+        );
+        assert_eq!(
+            restarted.get_version(),
+            2,
+            "a rejected replay must not advance the watermark"
+        );
+
+        let mut swapped = test_bundle(2, config_toml, None, None);
+        swapped.custom_rules = vec!["||content-swap.example^".to_string()];
+        let swapped_push = build_and_sign_push(&swapped, &signing_key).unwrap();
+        assert!(
+            apply_config_push(
+                &swapped_push,
+                &restarted,
+                &restarted_handles,
+                &signing_key.public_key()
+            )
+            .await
+            .is_err(),
+            "same-version content replay must be rejected"
+        );
+        assert!(
+            restarted_handles
+                .runtime
+                .snapshot()
+                .config
+                .filtering
+                .custom_rules
+                .is_empty(),
+            "rejected replays must not change the live configuration"
+        );
+
+        // Forward progress still works after the restart.
+        let push_v3 =
+            build_and_sign_push(&test_bundle(3, config_toml, None, None), &signing_key).unwrap();
+        assert_eq!(
+            apply_config_push(
+                &push_v3,
+                &restarted,
+                &restarted_handles,
+                &signing_key.public_key()
+            )
+            .await
+            .unwrap(),
+            3
+        );
+        let persisted = restarted.get_watermark().expect("watermark");
+        assert_eq!(persisted.version, 3);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// The watermark is durable before the push is acknowledged.
+    #[tokio::test]
+    async fn test_watermark_is_persisted_before_ack() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_watermark_ack_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let watermark_path = dir.join("ha_watermark.toml");
+        let tracker = SlaveStatusTracker::new("slave-ack".to_string(), 0, None)
+            .with_watermark_path(watermark_path.clone())
+            .unwrap();
+        let handles = test_handles(None).await;
+        let push = build_and_sign_push(
+            &test_bundle(
+                1,
+                "config_version = 1\n[server]\nrole = \"slave\"\n",
+                None,
+                None,
+            ),
+            &signing_key,
+        )
+        .unwrap();
+
+        let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            slave_socket,
+            Role::Client,
+            Some(ws_config()),
+        )
+        .await;
+        let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer_socket,
+            Role::Server,
+            Some(ws_config()),
+        )
+        .await;
+
+        tracker.set_state(SlaveState::HelloSent);
+        handle_master_message(
+            &push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            read_ack(&mut peer).await,
+            HaMessage::Ack {
+                version: 1,
+                applied: true,
+                ..
+            }
+        ));
+        let persisted: crate::bundle::AppliedWatermark =
+            serde_json::from_str(&tokio::fs::read_to_string(&watermark_path).await.unwrap())
+                .unwrap();
+        assert_eq!(persisted.version, 1);
+        assert_eq!(
+            persisted.payload_hash,
+            push_payload_hash(&push).unwrap(),
+            "the ACK must only be sent after the exact signed payload is on disk"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

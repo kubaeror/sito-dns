@@ -228,6 +228,45 @@ pub fn substitute_secrets<S: ::std::hash::BuildHasher>(
     Ok(result)
 }
 
+/// Persisted applied-version watermark for a slave node.
+///
+/// Written atomically (0600) after a push has been applied and its
+/// configuration persisted, before the slave acknowledges it. On startup the
+/// slave restores this record so a restart cannot replay an older signed
+/// bundle or overwrite the applied configuration with stale content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppliedWatermark {
+    /// Configuration version of the last successfully applied bundle.
+    pub version: u64,
+    /// BLAKE3 hash of the signed bundle payload that produced `version`.
+    pub payload_hash: String,
+    /// Unix milliseconds at which the bundle was applied.
+    pub timestamp: u64,
+}
+
+impl AppliedWatermark {
+    /// Returns the normalized (prefix-free) payload hash.
+    #[must_use]
+    pub fn normalized_hash(&self) -> &str {
+        self.payload_hash.trim_start_matches("blake3:")
+    }
+}
+
+/// Extracts the signed payload hash from a `ConfigPush` envelope.
+pub fn push_payload_hash(push: &HaMessage) -> Result<String, HaError> {
+    match push {
+        HaMessage::ConfigPush {
+            payload_hash_blake3,
+            ..
+        } => Ok(payload_hash_blake3
+            .trim_start_matches("blake3:")
+            .to_string()),
+        other => Err(HaError::Protocol(format!(
+            "Expected ConfigPush message, got: {other:?}"
+        ))),
+    }
+}
+
 /// Packages a `ConfigBundle` into a signed `HaMessage::ConfigPush`.
 ///
 /// The bundle is sanitized before serialization (structured
@@ -258,19 +297,12 @@ pub fn build_and_sign_push(
     })
 }
 
-/// Verifies and unpacks a received `HaMessage::ConfigPush`.
-///
-/// Performs:
-/// 1. Monotonicity check: `version > have_version`.
-/// 2. Base64 payload decoding.
-/// 3. BLAKE3 payload checksum verification.
-/// 4. Ed25519 cryptographic signature verification using `master_pubkey`.
-/// 5. Deserialization into `ConfigBundle`.
-pub fn verify_and_unpack_push(
+/// Verifies the envelope and returns the signed bundle plus the computed
+/// normalized payload hash.
+fn verify_and_unpack_push_inner(
     push: &HaMessage,
-    have_version: u64,
     master_pubkey: &[u8],
-) -> Result<ConfigBundle, HaError> {
+) -> Result<(ConfigBundle, String), HaError> {
     let (version, signature_ed25519, payload_b64, payload_hash_blake3, envelope_hash) = match push {
         HaMessage::ConfigPush {
             version,
@@ -292,22 +324,20 @@ pub fn verify_and_unpack_push(
         }
     };
 
-    // 1. Monotonicity guard: strictly greater than current version
-    if version <= have_version {
+    if version == u64::MAX {
         return Err(HaError::Validation {
             field: "version".to_string(),
-            reason: format!(
-                "Push version {version} is not greater than currently synced version {have_version} (monotonicity violation/replay rejected)"
-            ),
+            reason: "Push version u64::MAX is implausible; the sequence could never advance again"
+                .to_string(),
         });
     }
 
-    // 2. Base64 payload decoding
+    // 1. Base64 payload decoding
     let payload_bytes = BASE64_STANDARD
         .decode(payload_b64)
         .map_err(|e| HaError::Protocol(format!("Invalid base64 payload in config push: {e}")))?;
 
-    // 3. BLAKE3 payload checksum verification
+    // 2. BLAKE3 payload checksum verification
     let computed_hash = blake3::hash(&payload_bytes);
     let computed_hash_hex = computed_hash.to_hex().to_string();
 
@@ -325,7 +355,7 @@ pub fn verify_and_unpack_push(
         ));
     }
 
-    // 4. Ed25519 signature verification
+    // 3. Ed25519 signature verification
     let sig_bytes = hex::decode(signature_ed25519)
         .or_else(|_| BASE64_STANDARD.decode(signature_ed25519))
         .map_err(|e| HaError::Crypto(format!("Invalid signature encoding: {e}")))?;
@@ -333,13 +363,13 @@ pub fn verify_and_unpack_push(
     // Verify over hash bytes
     verify_ed25519_signature(master_pubkey, computed_hash.as_bytes(), &sig_bytes)?;
 
-    // 5. Deserialization
+    // 4. Deserialization
     let bundle_str = std::str::from_utf8(&payload_bytes)
         .map_err(|e| HaError::Serialization(format!("Bundle payload is not valid UTF-8: {e}")))?;
 
     let bundle = ConfigBundle::from_json(bundle_str)?;
 
-    // 6. Envelope/payload version binding: the version the monotonicity guard
+    // 5. Envelope/payload version binding: the version the monotonicity guard
     // checked must be the same one actually carried inside the signed payload,
     // otherwise an attacker can replay an old signed bundle with a bumped
     // envelope version and roll the slave's configuration backward.
@@ -353,7 +383,82 @@ pub fn verify_and_unpack_push(
         });
     }
 
+    Ok((bundle, computed_hash_hex))
+}
+
+/// Verifies and unpacks a received `HaMessage::ConfigPush`.
+///
+/// Performs:
+/// 1. Monotonicity check: `version > have_version`.
+/// 2. Base64 payload decoding.
+/// 3. BLAKE3 payload checksum verification.
+/// 4. Ed25519 cryptographic signature verification using `master_pubkey`.
+/// 5. Deserialization into `ConfigBundle`.
+pub fn verify_and_unpack_push(
+    push: &HaMessage,
+    have_version: u64,
+    master_pubkey: &[u8],
+) -> Result<ConfigBundle, HaError> {
+    let (bundle, _hash) = verify_and_unpack_push_inner(push, master_pubkey)?;
+
+    // Monotonicity guard: strictly greater than current version
+    if bundle.version <= have_version {
+        return Err(HaError::Validation {
+            field: "version".to_string(),
+            reason: format!(
+                "Push version {} is not greater than currently synced version {have_version} (monotonicity violation/replay rejected)",
+                bundle.version
+            ),
+        });
+    }
+
     Ok(bundle)
+}
+
+/// Verifies and unpacks a push against the persisted applied watermark.
+///
+/// Unlike [`verify_and_unpack_push`], an equal version is accepted only when it
+/// is the *same signed payload* that produced the watermark: that is an
+/// idempotent re-delivery, not a replay. A lower version, an equal version with
+/// a different payload hash, or an implausible `u64::MAX` version is rejected.
+pub fn verify_and_unpack_push_with_watermark(
+    push: &HaMessage,
+    watermark: Option<&AppliedWatermark>,
+    master_pubkey: &[u8],
+) -> Result<ConfigBundle, HaError> {
+    let (bundle, payload_hash) = verify_and_unpack_push_inner(push, master_pubkey)?;
+
+    if let Some(watermark) = watermark {
+        if bundle.version < watermark.version {
+            return Err(HaError::Validation {
+                field: "version".to_string(),
+                reason: format!(
+                    "Push version {} is below the persisted applied watermark {} (restart/replay rejected)",
+                    bundle.version, watermark.version
+                ),
+            });
+        }
+        if bundle.version == watermark.version && payload_hash != watermark.normalized_hash() {
+            return Err(HaError::Validation {
+                field: "version".to_string(),
+                reason: format!(
+                    "Push version {} has payload hash {payload_hash} but the applied watermark records {} (same-version content replay rejected)",
+                    bundle.version,
+                    watermark.normalized_hash()
+                ),
+            });
+        }
+    }
+
+    Ok(bundle)
+}
+
+/// Returns true when `watermark` already covers a push with `version` and
+/// `payload_hash` (same version, identical signed payload).
+#[must_use]
+pub fn watermark_covers(watermark: &AppliedWatermark, version: u64, payload_hash: &str) -> bool {
+    version == watermark.version
+        && payload_hash.trim_start_matches("blake3:") == watermark.normalized_hash()
 }
 
 #[cfg(test)]

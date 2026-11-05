@@ -343,7 +343,8 @@ fn init_ha(
             config.server.instance_name.clone(),
             0,
             ha_config.master_url.clone(),
-        );
+        )
+        .with_watermark_path(config.server.data_dir.join("ha_watermark.toml"))?;
         let (resync_tx, resync_rx) = tokio::sync::mpsc::channel(4);
         (None, Some(tracker), Some(resync_tx), Some(resync_rx))
     };

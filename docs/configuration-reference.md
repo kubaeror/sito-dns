@@ -417,6 +417,16 @@ replication_port = 8953
 | `allow_insecure_ws` | boolean | `false` | Allow plaintext `ws://` replication. Requires a non-empty `slave_token`; must be set explicitly on both ends. |
 | `stats_interval_secs` | integer | `30` | Interval between slave-to-master statistics reports. |
 
+Slaves persist the last successfully applied bundle identity to
+`<data_dir>/ha_watermark.toml` (JSON, mode `0600`, written atomically) after
+the configuration is applied and before the push is acknowledged. The file
+records the version, signed payload hash and application timestamp. It is
+restored at startup: pushes below the recorded version are rejected, and a
+push at the same version is only accepted when the signed payload hash
+matches. A corrupt or unreadable watermark fails startup rather than resetting
+to version 0; delete it only when you intend to force a full resync from the
+master. The watermark is node-local and must not be copied between slaves.
+
 ---
 
 ## 14. `[integrations.mikrotik]` — RouterOS Integration

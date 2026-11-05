@@ -8,7 +8,7 @@ This runbook provides step-by-step operational procedures for managing, maintain
 
 `sito` implements an active-passive master/slave replication architecture governed by [ADR-0002](adr/0002-ha-master-slave-push.md):
 - **Master Node**: Accepts administrative REST API mutations and Web UI configurations, generates monotonic configuration bundles, signs them using an Ed25519 private key (`data_dir/ha_signing.key`, permissions `0600`), and pushes updates to connected slaves in real-time over WebSocket with mutual TLS (mTLS) on port `8953`. The active bundle and its version are persisted to `data_dir/ha_state.toml` (mode `0600`) on every publish.
-- **Slave Nodes**: Connect to the master over WebSocket + mTLS, verify the master's Ed25519 signature and certificate fingerprint, enforce strict monotonic version ordering (`version > have_version`), and apply configuration snapshots atomically.
+- **Slave Nodes**: Connect to the master over WebSocket + mTLS, verify the master's Ed25519 signature and certificate fingerprint, enforce strict monotonic version ordering (`version > have_version`), and apply configuration snapshots atomically. The last applied version, signed payload hash and timestamp are persisted to `data_dir/ha_watermark.toml` (atomic, mode `0600`) before the push is acknowledged, so a restart cannot replay an older bundle or accept same-version content with a different hash. A corrupt watermark fails startup; delete the file only to force a full resync.
 - **Continuous Resolution**: Slaves serve DNS queries continuously without downtime. If an invalid or unparsable configuration bundle is received, the slave performs an automatic rollback to its last known good snapshot and enters a `Degraded` state.
 - **Read-Only Enforcement**: Slave REST API endpoints reject mutating operations (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP `409 Conflict` and return the `X-Dnsd-Master: <master_url>` header to redirect operators to the authoritative master.
 - **Statistics Aggregation**: Slaves report traffic and upstream metrics to the master every 30 seconds via `stats_report`. The master stores the latest report per slave and exposes it through `GET /api/v1/ha/slaves`; replica counters are **not** merged into the master's own Prometheus registry. Scrape each replica's `/metrics` endpoint separately (labels such as `sito_ha_config_version{instance="..."}` identify the node).
@@ -296,6 +296,12 @@ When a slave node fails or must be reprovisioned from bare metal:
    curl -s http://localhost:8080/api/v1/ha/status | jq .
    ```
    The slave will transition through `Connecting` -> `HelloSent` -> `Applying` -> `Synced` (or `HelloSent` -> `Synced` when it is already at the master's version) in under 2 seconds. Verify that custom rules, rewrites, and client lists match the master. `Degraded` is only cleared by a successful apply or an early ACK for the already-running version.
+
+   If `data_dir/ha_watermark.toml` is corrupt or restored from a different
+   node, the slave refuses to start rather than dropping its replay guard.
+   Restore the file from backup, or delete it only when you intentionally want
+   the node to accept the master's current bundle as a fresh sync. Never copy a
+   watermark between slaves: it identifies this node's last applied payload.
 
 ---
 

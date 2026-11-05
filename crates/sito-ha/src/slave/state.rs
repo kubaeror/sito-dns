@@ -2,8 +2,12 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+use crate::bundle::AppliedWatermark;
+use crate::error::HaError;
 
 /// Lifecycle states of a replica slave node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +46,10 @@ pub struct SlaveStatusTracker {
     pub degraded_reason: Arc<Mutex<Option<String>>>,
     pub last_synced_at: Arc<Mutex<Option<DateTime<Utc>>>>,
     pub master_url: Option<String>,
+    /// Last durably applied bundle watermark.
+    watermark: Arc<Mutex<Option<AppliedWatermark>>>,
+    /// Path of the on-disk watermark, when persistence is configured.
+    watermark_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl SlaveStatusTracker {
@@ -53,7 +61,130 @@ impl SlaveStatusTracker {
             degraded_reason: Arc::new(Mutex::new(None)),
             last_synced_at: Arc::new(Mutex::new(None)),
             master_url,
+            watermark: Arc::new(Mutex::new(None)),
+            watermark_path: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Restores the applied-version watermark from `path` and enables
+    /// persistence there.
+    ///
+    /// A missing file is a fresh node. A corrupt or implausible file is a hard
+    /// error: silently starting at version 0 would let a stale master replay an
+    /// older signed bundle after a restart.
+    pub fn with_watermark_path(self, path: PathBuf) -> Result<Self, HaError> {
+        let watermark = Self::load_watermark(&path)?;
+        if let Some(ref watermark) = watermark {
+            if watermark.version == u64::MAX {
+                return Err(HaError::Validation {
+                    field: "ha_watermark".to_string(),
+                    reason: format!(
+                        "Watermark {} records version u64::MAX and can never advance; delete it only after accepting a full resync",
+                        path.display()
+                    ),
+                });
+            }
+            self.current_version
+                .store(watermark.version, Ordering::SeqCst);
+        }
+        *self.watermark.lock().unwrap() = watermark;
+        *self.watermark_path.lock().unwrap() = Some(path);
+        Ok(self)
+    }
+
+    fn load_watermark(path: &std::path::Path) -> Result<Option<AppliedWatermark>, HaError> {
+        let data = match std::fs::read_to_string(path) {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(HaError::Validation {
+                    field: "ha_watermark".to_string(),
+                    reason: format!("Failed to read {}: {e}", path.display()),
+                });
+            }
+        };
+        serde_json::from_str(&data).map(Some).map_err(|e| HaError::Validation {
+            field: "ha_watermark".to_string(),
+            reason: format!(
+                "Corrupt applied-version watermark {}: {e}. Refusing to start at version 0 because that would re-enable replay; restore the file from backup or delete it to force a full resync",
+                path.display()
+            ),
+        })
+    }
+
+    /// Returns the last durably applied bundle watermark, if any.
+    pub fn get_watermark(&self) -> Option<AppliedWatermark> {
+        self.watermark.lock().unwrap().clone()
+    }
+
+    /// Atomically persists `{version, payload_hash, timestamp}` (0600) and
+    /// updates the in-memory watermark only after the write succeeds.
+    ///
+    /// Must be called after the pushed configuration has been applied and
+    /// persisted, before the ACK is sent.
+    pub fn persist_watermark(&self, version: u64, payload_hash: &str) -> Result<(), HaError> {
+        if version == u64::MAX {
+            return Err(HaError::Validation {
+                field: "ha_watermark".to_string(),
+                reason: "Refusing to persist an applied watermark at version u64::MAX".to_string(),
+            });
+        }
+        #[allow(clippy::cast_sign_loss)]
+        let timestamp = Utc::now().timestamp_millis() as u64;
+        let watermark = AppliedWatermark {
+            version,
+            payload_hash: payload_hash.trim_start_matches("blake3:").to_string(),
+            timestamp,
+        };
+
+        if let Some(path) = self.watermark_path.lock().unwrap().clone() {
+            let payload = serde_json::to_vec_pretty(&watermark).map_err(|e| {
+                HaError::Serialization(format!("Failed to serialize HA watermark: {e}"))
+            })?;
+            Self::write_private_atomic(&path, &payload).map_err(|e| HaError::Validation {
+                field: "ha_watermark".to_string(),
+                reason: format!(
+                    "Failed to persist applied watermark {}: {e}",
+                    path.display()
+                ),
+            })?;
+        }
+
+        *self.watermark.lock().unwrap() = Some(watermark);
+        Ok(())
+    }
+
+    /// Writes `payload` to `path` atomically (0600 temp file, fsync, rename).
+    fn write_private_atomic(path: &std::path::Path, payload: &[u8]) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(payload)?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            file.write_all(payload)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
     }
 
     pub fn get_state(&self) -> SlaveState {
@@ -80,5 +211,159 @@ impl SlaveStatusTracker {
     pub fn mark_degraded(&self, reason: String) {
         *self.state.lock().unwrap() = SlaveState::Degraded;
         *self.degraded_reason.lock().unwrap() = Some(reason);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bundle::{ConfigBundle, build_and_sign_push, verify_and_unpack_push_with_watermark};
+    use crate::crypto::Ed25519SigningKey;
+
+    fn temp_path(label: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "sito_ha_watermark_{label}_{}_{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ))
+            .join("ha_watermark.toml")
+    }
+
+    fn bundle(version: u64) -> ConfigBundle {
+        ConfigBundle {
+            version,
+            timestamp: 1,
+            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+            custom_rules: vec![],
+            rewrites: None,
+            clients: None,
+            lists: vec![],
+        }
+    }
+
+    #[test]
+    fn test_watermark_persists_0600_and_loads_on_restart() {
+        let path = temp_path("restart");
+        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+        tracker.persist_watermark(5, "abc123").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "watermark must be owner-only");
+        }
+        assert!(!path.with_extension("tmp").exists());
+
+        // A restart must resume at the persisted watermark, not version 0.
+        let restarted = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+        assert_eq!(restarted.get_version(), 5);
+        let watermark = restarted.get_watermark().expect("watermark restored");
+        assert_eq!(watermark.version, 5);
+        assert_eq!(watermark.payload_hash, "abc123");
+        assert!(watermark.timestamp > 0);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_restart_rejects_replayed_bundle_below_watermark() {
+        let path = temp_path("replay");
+        let signing_key = Ed25519SigningKey::generate().unwrap();
+        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+        let old_push = build_and_sign_push(&bundle(4), &signing_key).unwrap();
+        tracker.persist_watermark(5, "abc123").unwrap();
+
+        // Simulate a process restart: the in-memory counter is unknown, so the
+        // persisted watermark is the only replay guard.
+        let restarted = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+        let err = verify_and_unpack_push_with_watermark(
+            &old_push,
+            restarted.get_watermark().as_ref(),
+            &signing_key.public_key(),
+        )
+        .expect_err("an older signed bundle must be rejected after restart");
+        assert!(matches!(err, HaError::Validation { ref field, .. } if field == "version"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_same_version_with_different_hash_is_rejected() {
+        let path = temp_path("hash");
+        let signing_key = Ed25519SigningKey::generate().unwrap();
+        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+        let push = build_and_sign_push(&bundle(5), &signing_key).unwrap();
+        let hash = crate::bundle::push_payload_hash(&push).unwrap();
+        tracker.persist_watermark(5, &hash).unwrap();
+
+        // Same version and identical payload: an idempotent re-delivery.
+        verify_and_unpack_push_with_watermark(
+            &push,
+            tracker.get_watermark().as_ref(),
+            &signing_key.public_key(),
+        )
+        .expect("identical same-version delivery must be accepted as idempotent");
+
+        // Same version, different signed content: a content replay.
+        let other = build_and_sign_push(
+            &ConfigBundle {
+                custom_rules: vec!["||evil.example^".to_string()],
+                ..bundle(5)
+            },
+            &signing_key,
+        )
+        .unwrap();
+        let err = verify_and_unpack_push_with_watermark(
+            &other,
+            tracker.get_watermark().as_ref(),
+            &signing_key.public_key(),
+        )
+        .expect_err("same-version content replay must be rejected");
+        assert!(matches!(err, HaError::Validation { ref field, .. } if field == "version"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_corrupt_watermark_fails_closed() {
+        let path = temp_path("corrupt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not-json").unwrap();
+
+        let err = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .expect_err("a corrupt watermark must not silently reset to version 0");
+        assert!(matches!(err, HaError::Validation { ref field, .. } if field == "ha_watermark"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_watermark_refuses_u64_max() {
+        let path = temp_path("max");
+        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+        assert_eq!(tracker.get_version(), 0);
+        assert!(tracker.persist_watermark(u64::MAX, "hash").is_err());
+        assert_eq!(
+            tracker.get_version(),
+            0,
+            "a rejected watermark must not advance the counter"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

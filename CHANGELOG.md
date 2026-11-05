@@ -14,6 +14,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   1,000,000 above its own sequence without seeding or registering, ignores
   implausible ACK versions without rebasing, rejects publishing or restoring a
   sequence at `u64::MAX`, and uses `checked_add` for every sequence increment.
+- **HA applied-version watermark is durable**: slaves now persist
+  `{version, payload_hash, timestamp}` to `data_dir/ha_watermark.toml`
+  (atomic, mode `0600`) after applying and persisting a pushed bundle and
+  before acknowledging it. On startup the watermark is restored, so a restart
+  can no longer replay an older signed bundle or accept the same version with
+  different content. A corrupt watermark fails startup instead of silently
+  resetting to version 0.
 - **DNSSEC verification amplification (security)**: a crafted authoritative
   response can no longer force unbounded cryptographic work. Each response now
   has a hard budget of 256 RRSIG verification attempts (shared across the
