@@ -5,7 +5,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased]
+## [1.9.2] - 2026-11-05
+
+Security and correctness patch release for the 1.9 line. It fixes the DNSSEC
+false-SERVFAIL regression after the first signed zone, bounds DNSSEC verification
+work, revokes legacy credentials exactly once on upgrade, hardens HA replication
+against stale masters and same-version forks, makes broken HA nodes visible to
+healthchecks, and repairs first-boot setup, `reset-admin`, self-update, and the
+Web UI update form. See the
+[1.9.2 release notes](docs/release-notes-1.9.2.md) for the user-visible summary
+and upgrade actions; this changelog remains the exhaustive record.
 
 ### Added
 - **Startup network-exposure warnings**: the historical defaults still bind the

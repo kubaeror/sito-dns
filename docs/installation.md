@@ -251,7 +251,7 @@ sudo systemctl start sito
 
 # Option B: re-run the installer (SITO_VERSION pins a release)
 sudo systemctl stop sito
-sudo SITO_VERSION=1.9.1 bash contrib/install.sh
+sudo SITO_VERSION=1.9.2 bash contrib/install.sh
 ```
 
 Without `--config`, the CLI prefers an existing `/etc/sito/config.toml` and
@@ -495,12 +495,12 @@ sha256sum -c SHA256SUMS
 
 ```bash
 cosign verify-blob \
-  --certificate sito-v1.9.1-x86_64-unknown-linux-gnu.tar.gz.pem \
-  --signature   sito-v1.9.1-x86_64-unknown-linux-gnu.tar.gz.sig \
+  --certificate sito-v1.9.2-x86_64-unknown-linux-gnu.tar.gz.pem \
+  --signature   sito-v1.9.2-x86_64-unknown-linux-gnu.tar.gz.sig \
   --certificate-identity-regexp \
       '^https://github.com/kubaeror/sito-dns/\.github/workflows/release\.yml@refs/tags/.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  sito-v1.9.1-x86_64-unknown-linux-gnu.tar.gz
+  sito-v1.9.2-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 The identity pins the artifact to this repository's release workflow and the
