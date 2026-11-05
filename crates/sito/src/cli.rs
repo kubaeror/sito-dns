@@ -102,12 +102,20 @@ pub enum Commands {
         /// Also delete every non-admin account (full account-store replacement)
         #[arg(long = "reset-all", alias = "reset-users")]
         reset_all: bool,
+        /// Allow the reset while sito is running. The running server keeps its
+        /// in-memory credentials/sessions until it is restarted.
+        #[arg(long)]
+        force: bool,
     },
     /// Invalidate all persisted web sessions and API tokens (users are kept)
     ResetSessions {
         /// Optional path to configuration file (defaults to main --config)
         #[arg(short, long)]
         config: Option<PathBuf>,
+        /// Allow the reset while sito is running. Live sessions and API tokens
+        /// stay valid until the running server is restarted.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -727,6 +735,53 @@ pub async fn run_update(
     Ok(())
 }
 
+/// Formats the PID of the process currently holding the service lease.
+fn lease_holder(pid: Option<u32>) -> String {
+    pid.map_or_else(|| "a live process".to_string(), |pid| format!("pid {pid}"))
+}
+
+/// Refuses destructive resets while a server holds the data directory lease,
+/// unless the operator explicitly passed `--force`.
+///
+/// Returns the detected service status (with the live PID when known) when the
+/// reset is allowed.
+fn ensure_reset_allowed(
+    data_dir: &Path,
+    action: &str,
+    force: bool,
+) -> Result<crate::service_lock::ServiceStatus, anyhow::Error> {
+    let status = crate::service_lock::status(data_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "Refusing to {action}: cannot determine whether sito is running for '{}': {e}",
+            data_dir.display()
+        )
+    })?;
+
+    match status {
+        crate::service_lock::ServiceStatus::Stopped => Ok(status),
+        crate::service_lock::ServiceStatus::Running { .. } if force => Ok(status),
+        crate::service_lock::ServiceStatus::Running { pid } => Err(anyhow::anyhow!(
+            "Refusing to {action} while sito is running ({}).\n\
+             Stop the service first:\n  sudo systemctl stop sito\n\
+             Then run this command again and start it:\n  sudo systemctl start sito\n\
+             Use --force only if you understand that live sessions and API tokens remain \
+             valid until the service is restarted and that a new admin password will not \
+             take effect until then.",
+            lease_holder(pid)
+        )),
+    }
+}
+
+/// Warning printed by `--force` when the server is still running.
+fn running_service_warning(pid: Option<u32>, live_state: &str) -> String {
+    format!(
+        "WARNING: sito is still running ({}). This command changed persisted files only; \
+         the running server keeps its in-memory state. {live_state} until the service is \
+         restarted. Restart it now:\n  sudo systemctl stop sito\n  sudo systemctl start sito",
+        lease_holder(pid)
+    )
+}
+
 /// Outcome of `reset-admin`, including a generated password so callers can
 /// print it exactly once without persisting it anywhere else.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -760,7 +815,7 @@ pub fn run_reset_admin(
     config_path: &Path,
     password: Option<&str>,
 ) -> Result<ResetAdminOutcome, anyhow::Error> {
-    run_reset_admin_with_options(config_path, password, false)
+    run_reset_admin_with_options(config_path, password, false, false)
 }
 
 /// Executes the `reset-admin` subcommand.
@@ -768,6 +823,7 @@ pub fn run_reset_admin_with_options(
     config_path: &Path,
     password: Option<&str>,
     reset_all_users: bool,
+    force: bool,
 ) -> Result<ResetAdminOutcome, anyhow::Error> {
     let content = std::fs::read_to_string(config_path).map_err(|e| {
         anyhow::anyhow!(
@@ -785,6 +841,12 @@ pub fn run_reset_admin_with_options(
         )
     })?;
 
+    let service = ensure_reset_allowed(
+        &config.server.data_dir,
+        "reset administrative credentials",
+        force,
+    )?;
+
     let (pass, generated_password) = if let Some(password) = password {
         validate_reset_admin_password(password)?;
         (password.to_string(), None)
@@ -800,10 +862,24 @@ pub fn run_reset_admin_with_options(
     }
     .map_err(|e| anyhow::anyhow!("Failed to reset admin credentials: {e}"))?;
 
-    println!(
-        "Administrative credentials successfully reset in '{}'.\nUsername: admin",
-        users_path.display()
-    );
+    if let crate::service_lock::ServiceStatus::Running { pid } = service {
+        println!(
+            "Administrative credentials were written to '{}'.\nUsername: admin",
+            users_path.display()
+        );
+        println!(
+            "{}",
+            running_service_warning(
+                pid,
+                "The running server still accepts the old admin password and rejects the new one",
+            )
+        );
+    } else {
+        println!(
+            "Administrative credentials successfully reset in '{}'.\nUsername: admin",
+            users_path.display()
+        );
+    }
     if let Some(generated) = generated_password.as_deref() {
         println!("Password: {generated}");
         println!("Store this password now; it is not written anywhere else.");
@@ -825,6 +901,14 @@ pub fn run_reset_admin_with_options(
 
 /// Executes the `reset-sessions` subcommand: removes persisted sessions and API tokens.
 pub fn run_reset_sessions(config_path: &Path) -> Result<(), anyhow::Error> {
+    run_reset_sessions_with_options(config_path, false)
+}
+
+/// Executes `reset-sessions` with an explicit live-service override.
+pub fn run_reset_sessions_with_options(
+    config_path: &Path,
+    force: bool,
+) -> Result<(), anyhow::Error> {
     let content = std::fs::read_to_string(config_path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to read configuration file '{}': {}",
@@ -842,6 +926,8 @@ pub fn run_reset_sessions(config_path: &Path) -> Result<(), anyhow::Error> {
     })?;
 
     let data_dir = &config.server.data_dir;
+    let service = ensure_reset_allowed(data_dir, "reset sessions and API tokens", force)?;
+
     let mut removed = 0;
     for name in ["sessions.toml", "tokens.toml"] {
         let path = data_dir.join(name);
@@ -864,8 +950,17 @@ pub fn run_reset_sessions(config_path: &Path) -> Result<(), anyhow::Error> {
             "No persisted sessions or tokens found in '{}'.",
             data_dir.display()
         );
+    } else if matches!(service, crate::service_lock::ServiceStatus::Running { .. }) {
+        println!("Persisted web sessions and API tokens were removed.");
     } else {
         println!("All web sessions and API tokens have been invalidated.");
+    }
+
+    if let crate::service_lock::ServiceStatus::Running { pid } = service {
+        println!(
+            "{}",
+            running_service_warning(pid, "Existing web sessions and API tokens remain valid")
+        );
     }
     Ok(())
 }
@@ -1270,6 +1365,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_cli_reset_force_flags() {
+        let cli = Cli::try_parse_from(["sito", "reset-admin", "--force"]).expect("parse args");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::ResetAdmin { force: true, .. })
+        ));
+
+        let cli = Cli::try_parse_from(["sito", "reset-sessions", "--force"]).expect("parse args");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::ResetSessions { force: true, .. })
+        ));
+
+        let cli = Cli::try_parse_from(["sito", "reset-sessions"]).expect("parse args");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::ResetSessions { force: false, .. })
+        ));
+    }
+
     #[tokio::test]
     async fn test_reset_admin_rejects_weak_or_default_passwords() {
         let (dir, config_path) = reset_admin_fixture();
@@ -1345,7 +1461,8 @@ mod tests {
 
         // The explicit full reset is the only path that removes other accounts.
         let outcome =
-            run_reset_admin_with_options(&config_path, Some("NewAdminPassword2!"), true).unwrap();
+            run_reset_admin_with_options(&config_path, Some("NewAdminPassword2!"), true, false)
+                .unwrap();
         assert!(outcome.reset_all_users);
         let mgr = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
         assert!(!mgr.has_user("alice"));

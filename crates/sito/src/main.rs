@@ -104,21 +104,23 @@ async fn main() -> anyhow::Result<()> {
                 config,
                 password,
                 reset_all,
+                force,
             } => {
                 let config_path = config.unwrap_or(cli.config);
                 if let Err(e) = sito::cli::run_reset_admin_with_options(
                     &config_path,
                     password.as_deref(),
                     reset_all,
+                    force,
                 ) {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }
                 return Ok(());
             }
-            Commands::ResetSessions { config } => {
+            Commands::ResetSessions { config, force } => {
                 let config_path = config.unwrap_or(cli.config);
-                if let Err(e) = sito::cli::run_reset_sessions(&config_path) {
+                if let Err(e) = sito::cli::run_reset_sessions_with_options(&config_path, force) {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }

@@ -841,6 +841,25 @@ pub async fn run_server_full(
     setup_pending: bool,
 ) -> anyhow::Result<()> {
     validate_typed_sections(&config)?;
+
+    // Hold a single-instance lease for the whole server lifetime. The reset
+    // commands use the same lease to distinguish "stopped" from "running" and
+    // refuse to pretend that credentials/sessions were revoked live.
+    let _service_lease =
+        crate::service_lock::ServiceLease::acquire(&config.server.data_dir).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::anyhow!(
+                    "Another sito server is already running for data directory '{}'. Stop it before starting a second instance. ({e})",
+                    config.server.data_dir.display()
+                )
+            } else {
+                anyhow::anyhow!(
+                    "Failed to acquire the service lease in '{}': {e}",
+                    config.server.data_dir.display()
+                )
+            }
+        })?;
+
     // Canonicalize so the file watcher compares absolute event paths, and so
     // the default relative `config.toml` still yields a watchable directory.
     let config_path_buf = canonical_config_path(config_path.as_ref());
