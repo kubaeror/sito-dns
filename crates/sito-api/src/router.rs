@@ -238,6 +238,15 @@ async fn health_handler(State(ctx): State<ServerContext>) -> impl IntoResponse {
     let cfg = ctx.config.load();
     let ha_required = crate::state::ha_readiness_required(&cfg);
     let ha = ctx.ha_readiness(&cfg);
+    // This endpoint is unauthenticated and reachable wherever the web listener
+    // is bound. Expose only a generic reason; the detailed cause (certificate
+    // path, OS error, master URL, validation text) stays in the authenticated
+    // `/api/v1/ha/status` response and the server logs.
+    let ha_reason = if ha.ready {
+        None
+    } else {
+        Some("HA replication is not ready")
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -248,7 +257,7 @@ async fn health_handler(State(ctx): State<ServerContext>) -> impl IntoResponse {
             "ha": {
                 "required": ha_required,
                 "ready": ha.ready,
-                "reason": ha.reason,
+                "reason": ha_reason,
             },
         })),
     )

@@ -47,7 +47,10 @@ still answers. The same visibility applies to a failed listener bind, a slave
 that cannot complete the handshake, and a slave that has not reached `Synced`.
 Readiness is read from the admin web listener, so keep `[web] enabled = true`
 (the default) on HA nodes; the healthcheck fails closed when HA is configured
-but the web listener cannot report readiness.
+but the web listener cannot report readiness. The unauthenticated `/health`
+endpoint exposes only the generic ready flag; read `readiness_reason` on the
+authenticated `/api/v1/ha/status` endpoint (or the logs) for the detailed
+cause.
 
 ---
 

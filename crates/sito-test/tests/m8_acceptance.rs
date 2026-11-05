@@ -776,6 +776,22 @@ async fn test_m8_ha_readiness_is_visible_in_health_and_status() {
     let health = get_json(&master_app, "/health", None).await;
     assert_eq!(health["ha"]["required"], true);
     assert_eq!(health["ha"]["ready"], false);
+    // `/health` is unauthenticated: it must not leak the detailed reason
+    // (certificate path, OS error, internal master URL, TOML/validation text)
+    // that remains available on the authenticated `/api/v1/ha/status`.
+    let public_reason = health["ha"]["reason"].as_str().unwrap_or_default();
+    assert_eq!(
+        public_reason, "HA replication is not ready",
+        "public health must use a generic HA reason: {health}"
+    );
+    assert!(
+        !public_reason.contains('/'),
+        "no filesystem paths in /health"
+    );
+    assert!(
+        !public_reason.contains("Permission denied"),
+        "no OS error detail in /health"
+    );
 
     // Slave: readiness requires an actual sync, not just a configured URL.
     let tracker = SlaveStatusTracker::new(
@@ -799,6 +815,12 @@ async fn test_m8_ha_readiness_is_visible_in_health_and_status() {
             .unwrap_or_default()
             .contains("mTLS handshake failed"),
         "handshake failure must reach /ha/status: {status}"
+    );
+    let slave_health = get_json(&slave_app, "/health", None).await;
+    assert_eq!(slave_health["ha"]["ready"], false);
+    assert_eq!(
+        slave_health["ha"]["reason"], "HA replication is not ready",
+        "slave /health must not expose the handshake/master URL detail"
     );
 
     tracker.mark_synced_with_term(1, 0);
@@ -842,6 +864,10 @@ async fn test_m8_ha_disabled_reason_is_exposed_in_status() {
     let health = get_json(&master_app, "/health", None).await;
     assert_eq!(health["ha"]["required"], false);
     assert_eq!(health["ha"]["ready"], true);
+    assert!(
+        health["ha"]["reason"].is_null(),
+        "public /health must not expose the disabled explanation: {health}"
+    );
 
     let _ = std::fs::remove_dir_all(&master_dir);
 }

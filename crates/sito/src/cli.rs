@@ -356,12 +356,11 @@ async fn probe_ha_readiness(web_addr: SocketAddr, timeout_ms: u64) -> Result<(),
     if ready {
         return Ok(());
     }
-    let reason = ha
-        .get("reason")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("the server reported no reason");
+    // Deliberately ignore any server-provided detail: this message is printed
+    // into container logs from a public probe. Operators get the detailed
+    // cause from the authenticated `/api/v1/ha/status` endpoint or the logs.
     Err(anyhow::anyhow!(
-        "Healthcheck failed: HA replication is not ready: {reason}"
+        "Healthcheck failed: HA replication is not ready (see /api/v1/ha/status or the server logs for the reason)"
     ))
 }
 
@@ -1473,9 +1472,14 @@ mod tests {
             .expect_err("a healthy DNS probe must not mask an unready HA node");
         let message = err.to_string();
         assert!(
-            message.contains("HA replication is not ready")
-                && message.contains("Permission denied"),
-            "the readiness reason must reach the operator: {message}"
+            message.contains("HA replication is not ready"),
+            "the healthcheck must report the unready HA role: {message}"
+        );
+        // `/health` is public; the healthcheck must not echo internal paths or
+        // OS errors from the server's detailed readiness reason into logs.
+        assert!(
+            !message.contains("Permission denied") && !message.contains("mTLS initialization"),
+            "the public healthcheck failure must stay generic: {message}"
         );
     }
 

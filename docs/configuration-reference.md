@@ -422,9 +422,10 @@ Private keys referenced by `key` are read by the unprivileged service account
 with ownership transfer (`sito ha gen-certs --uid <UID> --gid <GID>`, both
 required together) or `chown` them after copying; a key owned by another user
 fails the mTLS listener even though DNS keeps answering. Replication readiness
-is exposed as `ready` and `readiness_reason` in `GET /api/v1/ha/status` (and
-`/health`), and the `healthcheck` subcommand fails when `[ha]` requires
-replication but the master listener or slave handshake is not ready. Because
+is exposed as `ready` and `readiness_reason` in `GET /api/v1/ha/status`; the
+unauthenticated `/health` endpoint reports only a generic ready flag, and the
+`healthcheck` subcommand fails when `[ha]` requires replication but the master
+listener or slave handshake is not ready. Because
 readiness is reported by the admin web listener, keep `[web] enabled = true`
 (the default) on HA nodes; with the web listener disabled the healthcheck
 fails closed rather than assuming replication is healthy.
