@@ -516,7 +516,7 @@ impl DnsCache {
             // capped the SOA TTL in `apply_authenticated_ttls`, so no proof
             // here means nothing further to cap (not a zero lifespan).
             let denial_ttl = if validation_status.is_secure() {
-                denial_proof_ttl(&response.authorities)
+                denial_proof_ttl(response)
             } else {
                 None
             };
@@ -683,24 +683,31 @@ fn negative_ttl_from_soa(authorities: &[Record], chain_names: &[Name]) -> Option
     None
 }
 
-/// Authenticated lifetime of the NSEC/NSEC3 denial proof in `authorities`.
+/// Authenticated lifetime of the NSEC/NSEC3 denial proof in `response`.
 ///
-/// Returns the minimum TTL among the denial records and their RRSIGs. The
-/// DNSSEC validator's `apply_authenticated_ttls` has already capped every TTL
-/// by the RRSIG original TTL and remaining validity, so this minimum is the
-/// time the proof remains trustworthy. `None` when no NSEC/NSEC3 is present.
-fn denial_proof_ttl(authorities: &[Record]) -> Option<u32> {
+/// Returns the minimum TTL among the denial records and their signatures.
+/// The DNSSEC validator's `apply_authenticated_ttls` has already capped every
+/// TTL by the RRSIG original TTL and remaining validity, so this minimum is the
+/// time the proof remains trustworthy. All three sections are scanned because
+/// the validator accepts denial records and signatures from the additional
+/// section as well. `None` when no NSEC/NSEC3 is present.
+fn denial_proof_ttl(response: &Message) -> Option<u32> {
     let mut saw_denial = false;
     let mut min_ttl = u32::MAX;
-    for record in authorities {
+    for record in response
+        .answers
+        .iter()
+        .chain(response.authorities.iter())
+        .chain(response.additionals.iter())
+    {
         match record.record_type() {
             RecordType::NSEC | RecordType::NSEC3 => {
                 saw_denial = true;
                 min_ttl = min_ttl.min(record.ttl);
             }
             // A signature can expire before the RR it covers. Including every
-            // RRSIG in the authority section can only shorten the lifespan.
-            RecordType::RRSIG => {
+            // signature RR can only shorten the lifespan.
+            RecordType::RRSIG | RecordType::SIG => {
                 min_ttl = min_ttl.min(record.ttl);
             }
             _ => {}

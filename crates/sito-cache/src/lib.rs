@@ -525,6 +525,59 @@ mod tests {
         );
     }
 
+    /// The validator accepts denial proofs from the additional section, so the
+    /// cache TTL cap must scan the same sections. A Secure negative whose
+    /// NSEC/RRSIG proof was relocated to additionals must still use the proof
+    /// TTL, not the SOA TTL.
+    #[tokio::test]
+    async fn test_secure_negative_proof_in_additionals_caps_lifespan() {
+        let config = make_test_config(60, 3600, 3600);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("missing-addl-ttl.example.").unwrap();
+        let query = query_for(84, &qname);
+        let mut response = Message::response(84, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.metadata.response_code = ResponseCode::NXDomain;
+        response.authorities.push(Record::from_rdata(
+            Name::from_str("example.").unwrap(),
+            3600,
+            RData::SOA(SOA::new(
+                Name::from_str("ns1.example.").unwrap(),
+                Name::from_str("hostmaster.example.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                3600,
+            )),
+        ));
+        // Denial proof carried in the additional section.
+        for code in [RecordType::NSEC, RecordType::RRSIG] {
+            response.additionals.push(Record::from_rdata(
+                qname.clone(),
+                10,
+                RData::Unknown {
+                    code,
+                    rdata: NULL::default(),
+                },
+            ));
+        }
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Secure)
+            .await;
+
+        let (cached, status) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("cache hit");
+        assert_eq!(status, ValidationStatus::Secure);
+        assert_eq!(
+            cached.authorities[0].ttl, 10,
+            "an additional-section denial proof must cap the negative lifespan"
+        );
+    }
+
     /// The stale fallback must expose the recorded validation status (so the
     /// pipeline can refuse Unchecked entries) and strip every DNSSEC RR type,
     /// not just RRSIG.

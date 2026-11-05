@@ -171,11 +171,19 @@ fn apply_authenticated_ttls(response: &mut Message, now: u32) {
         .answers
         .iter()
         .chain(response.authorities.iter())
+        .chain(response.additionals.iter())
         .filter_map(|record| match &record.data {
             RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some((
                 LowerName::from(&record.name),
                 rrsig.input().type_covered,
                 rrsig.clone(),
+            )),
+            // Legacy SIG is accepted by the validator too; treat it as the
+            // equivalent RRSIG for TTL accounting.
+            RData::DNSSEC(DNSSECRData::SIG(sig)) => Some((
+                LowerName::from(&record.name),
+                sig.input().type_covered,
+                RRSIG::from_sig(sig.input().clone(), sig.sig().to_vec()),
             )),
             _ => None,
         })
@@ -183,12 +191,24 @@ fn apply_authenticated_ttls(response: &mut Message, now: u32) {
     if signatures.is_empty() {
         return;
     }
-    for section in [&mut response.answers, &mut response.authorities] {
+    for section in [
+        &mut response.answers,
+        &mut response.authorities,
+        &mut response.additionals,
+    ] {
         for record in section.iter_mut() {
-            // RFC 4035 §5.3.3 also caps the RRSIG RR's own TTL.
-            if let RData::DNSSEC(DNSSECRData::RRSIG(own)) = &record.data {
-                record.ttl = record.ttl.min(own.authenticated_ttl(record, now));
-                continue;
+            // RFC 4035 §5.3.3 also caps the signature RR's own TTL.
+            match &record.data {
+                RData::DNSSEC(DNSSECRData::RRSIG(own)) => {
+                    record.ttl = record.ttl.min(own.authenticated_ttl(record, now));
+                    continue;
+                }
+                RData::DNSSEC(DNSSECRData::SIG(sig)) => {
+                    let own = RRSIG::from_sig(sig.input().clone(), sig.sig().to_vec());
+                    record.ttl = record.ttl.min(own.authenticated_ttl(record, now));
+                    continue;
+                }
+                _ => {}
             }
             let owner = LowerName::from(&record.name);
             let covered = record.record_type();
@@ -234,11 +254,20 @@ fn authenticated_denial_ttl(response: &Message) -> Option<u32> {
         .answers
         .iter()
         .chain(response.authorities.iter())
+        .chain(response.additionals.iter())
         .filter_map(|record| match &record.data {
             RData::DNSSEC(DNSSECRData::NSEC(_) | DNSSECRData::NSEC3(_)) => Some(record.ttl),
             RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
                 if matches!(
                     rrsig.input().type_covered,
+                    RecordType::NSEC | RecordType::NSEC3
+                ) =>
+            {
+                Some(record.ttl)
+            }
+            RData::DNSSEC(DNSSECRData::SIG(sig))
+                if matches!(
+                    sig.input().type_covered,
                     RecordType::NSEC | RecordType::NSEC3
                 ) =>
             {
@@ -3939,6 +3968,86 @@ mod tests {
         let outcome = validator.validate_response(&mut msg, Some("test"), now);
 
         assert_eq!(outcome, ValidationOutcome::Secure);
+    }
+
+    /// The validator accepts a denial proof carried in the additional section
+    /// (`evaluate_denial` and the RRSIG loop both scan it). The SOA TTL cap
+    /// must use the same sections, otherwise moving a genuine NSEC/RRSIG from
+    /// authority to additional would leave a Secure negative with the SOA's
+    /// long lifetime.
+    #[test]
+    fn test_negative_proof_in_additionals_caps_soa_ttl() {
+        use hickory_proto::dnssec::rdata::NSEC;
+        use hickory_proto::rr::RecordSet;
+        use hickory_proto::rr::rdata::SOA;
+
+        let (origin, dnskey, signer) = create_test_signer("addl.example.");
+        let qname = Name::from_str("empty.addl.example.").unwrap();
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let mut msg = Message::new(30, MessageType::Response, OpCode::Query);
+        msg.queries.push(Query::query(qname.clone(), RecordType::A));
+        msg.metadata.response_code = ResponseCode::NoError;
+
+        // A long-lived signed SOA in the authority section.
+        let soa = Record::from_rdata(
+            origin.clone(),
+            3600,
+            RData::SOA(SOA::new(
+                Name::from_str("ns1.addl.example.").unwrap(),
+                Name::from_str("hostmaster.addl.example.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                3600,
+            )),
+        );
+        let mut soa_set = RecordSet::new(origin.clone(), RecordType::SOA, 3600);
+        soa_set.insert(soa.clone(), 0);
+        let mut soa_sig = sign_test_rrset(&soa_set, &signer);
+        soa_sig.ttl = 3600;
+        msg.authorities.push(soa);
+        msg.authorities.push(soa_sig);
+
+        // The NSEC NODATA proof and its signature live in the additional
+        // section, with a short 10 s lifetime.
+        let nsec = NSEC::new(
+            Name::from_str("zzz.addl.example.").unwrap(),
+            [RecordType::SOA, RecordType::NSEC, RecordType::RRSIG],
+        );
+        let nsec_record =
+            Record::from_rdata(qname.clone(), 10, RData::DNSSEC(DNSSECRData::NSEC(nsec)));
+        let mut nsec_set = RecordSet::new(qname.clone(), RecordType::NSEC, 10);
+        nsec_set.insert(nsec_record.clone(), 0);
+        let mut nsec_sig = sign_test_rrset(&nsec_set, &signer);
+        nsec_sig.ttl = 10;
+        msg.additionals.push(nsec_record);
+        msg.additionals.push(nsec_sig);
+        msg.additionals.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+        ));
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("addl"), now);
+        assert_eq!(outcome, ValidationOutcome::Secure);
+
+        let soa_ttl = msg
+            .authorities
+            .iter()
+            .find(|record| record.record_type() == RecordType::SOA)
+            .expect("SOA")
+            .ttl;
+        assert_eq!(
+            soa_ttl, 10,
+            "the SOA TTL must be capped by an additional-section denial proof"
+        );
     }
 
     #[test]
