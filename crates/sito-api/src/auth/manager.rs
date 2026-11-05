@@ -306,28 +306,9 @@ pub(crate) static SECRET_WRITE_FAIL_AFTER: Mutex<Vec<(PathBuf, usize)>> = Mutex:
 fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
     #[cfg(test)]
     {
-        let should_fail = {
-            let mut rules = SECRET_WRITE_FAIL_AFTER
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if let Some(index) = rules.iter().position(|(rule_path, _)| rule_path == path) {
-                if rules[index].1 == 0 {
-                    rules.remove(index);
-                    true
-                } else {
-                    rules[index].1 -= 1;
-                    false
-                }
-            } else {
-                false
-            }
-        };
-        if should_fail {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "injected users-file write failure",
-            ));
-        }
+        // Notify and delay before deciding to fail so a test can observe the
+        // start of a write that is then rejected (and interleave another
+        // mutation while it is still in flight).
         let signal = {
             let mut signals = SECRET_WRITE_START_SIGNALS
                 .lock()
@@ -351,6 +332,28 @@ fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
         };
         if let Some(delay) = delay {
             std::thread::sleep(delay);
+        }
+        let should_fail = {
+            let mut rules = SECRET_WRITE_FAIL_AFTER
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(index) = rules.iter().position(|(rule_path, _)| rule_path == path) {
+                if rules[index].1 == 0 {
+                    rules.remove(index);
+                    true
+                } else {
+                    rules[index].1 -= 1;
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if should_fail {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected users-file write failure",
+            ));
         }
         SECRET_WRITE_THREADS
             .lock()
@@ -532,6 +535,15 @@ pub struct AuthManager {
     /// Serializes setup-wizard completion so token consumption, credential
     /// changes and `setup_complete` cannot race each other.
     setup_completion_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes every users-table mutation from the in-memory change through
+    /// its save/rollback. Without it, a mutation whose write fails can release
+    /// `persist_lock`, let a second mutation snapshot and commit the first
+    /// mutation's uncommitted state, and then roll the first mutation back over
+    /// the second one (or resurrect a concurrently deleted account).
+    ///
+    /// Lock order: `totp_verification_lock` (if taken) then this lock. Never
+    /// acquire the TOTP verification lock while holding this one.
+    user_mutation_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes snapshot + persist of the auth state files so a stale
     /// snapshot can never overwrite a newer revocation/creation on disk.
     /// Held only across the snapshot and its `spawn_blocking` write; callers
@@ -694,6 +706,7 @@ impl AuthManager {
             setup_pending_warned: Arc::new(AtomicBool::new(false)),
             totp_verification_lock: Arc::new(tokio::sync::Mutex::new(())),
             setup_completion_lock: Arc::new(tokio::sync::Mutex::new(())),
+            user_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             users_path,
             sessions_path,
@@ -1028,6 +1041,7 @@ impl AuthManager {
             setup_pending_warned: Arc::new(AtomicBool::new(false)),
             totp_verification_lock: Arc::new(tokio::sync::Mutex::new(())),
             setup_completion_lock: Arc::new(tokio::sync::Mutex::new(())),
+            user_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             users_path: Some(path.clone()),
             sessions_path: None,
@@ -1622,7 +1636,9 @@ impl AuthManager {
         role: Role,
         protect_last_admin: bool,
     ) -> Result<bool, UserMutationError> {
-        let (changed, previous_user) = {
+        // Serialize the whole mutation + save + rollback cycle.
+        let _mutation = self.user_mutation_lock.lock().await;
+        let (changed, previous_role, previous_epoch, mutated_epoch) = {
             let mut users = lock(&self.users);
             let admin_count = users.values().filter(|u| u.role == Role::Admin).count();
             let Some(user) = users.get_mut(username) else {
@@ -1637,18 +1653,35 @@ impl AuthManager {
             }
             let changed = user.role != role;
             if changed {
-                let previous = user.clone();
+                let previous_role = user.role;
+                let previous_epoch = user.credential_epoch;
+                let mutated_epoch = self.next_credential_epoch();
                 user.role = role;
-                user.credential_epoch = self.next_credential_epoch();
-                (true, Some(previous))
+                user.credential_epoch = mutated_epoch;
+                (
+                    true,
+                    Some(previous_role),
+                    Some(previous_epoch),
+                    Some(mutated_epoch),
+                )
             } else {
-                (false, None)
+                (false, None, None, None)
             }
         };
         if changed {
             if let Err(e) = self.try_save_users_async().await {
-                if let Some(previous) = previous_user {
-                    lock(&self.users).insert(previous.username.clone(), previous);
+                // Field-level, epoch-CAS rollback: only undo this mutation if
+                // no newer credential state has replaced it.
+                if let (Some(previous_role), Some(previous_epoch), Some(mutated_epoch)) =
+                    (previous_role, previous_epoch, mutated_epoch)
+                {
+                    let mut users = lock(&self.users);
+                    if let Some(current) = users.get_mut(username)
+                        && current.credential_epoch == mutated_epoch
+                    {
+                        current.role = previous_role;
+                        current.credential_epoch = previous_epoch;
+                    }
                 }
                 return Err(UserMutationError::Persistence(e.to_string()));
             }
@@ -1682,6 +1715,7 @@ impl AuthManager {
         username: &str,
         protect_last_admin: bool,
     ) -> Result<(), UserMutationError> {
+        let _mutation = self.user_mutation_lock.lock().await;
         let (removed, previous_default_admin_active) = {
             let mut users = lock(&self.users);
             let Some(role) = users.get(username).map(|user| user.role) else {
@@ -1702,8 +1736,13 @@ impl AuthManager {
         if let Err(e) = self.try_save_users_async().await {
             // The account is still on disk: restore it (and the bootstrap
             // flag) so a failed write cannot look like a successful deletion.
+            // Never overwrite an account that was recreated after this
+            // deletion attempt removed the old one.
             if let Some(removed) = removed {
-                lock(&self.users).insert(username.to_string(), removed);
+                let mut users = lock(&self.users);
+                if !users.contains_key(username) {
+                    users.insert(username.to_string(), removed);
+                }
             }
             self.default_admin_active
                 .store(previous_default_admin_active, Ordering::SeqCst);
@@ -1756,16 +1795,18 @@ impl AuthManager {
         password: &str,
         role: Role,
     ) -> Result<(), String> {
+        let _mutation = self.user_mutation_lock.lock().await;
         let (hash, is_default) = hash_password_blocking(password.to_string())
             .await
             .map_err(|e| format!("failed to hash password for '{username}': {e}"))?;
+        let mutated_epoch = self.next_credential_epoch();
         let user = UserAccount {
             username: username.to_string(),
             password_hash: hash,
             role,
             // Always a fresh epoch: overwriting or recreating an account must
             // invalidate every credential issued for the previous identity.
-            credential_epoch: self.next_credential_epoch(),
+            credential_epoch: mutated_epoch,
             totp: None,
         };
         let previous_user = {
@@ -1786,12 +1827,19 @@ impl AuthManager {
         };
         if let Err(e) = self.try_save_users_async().await {
             let mut users = lock(&self.users);
-            match previous_user.clone() {
-                Some(previous) => {
-                    users.insert(username.to_string(), previous);
-                }
-                None => {
-                    users.remove(username);
+            // Epoch-CAS: only undo this create/overwrite if the account still
+            // carries the epoch this call installed.
+            if users
+                .get(username)
+                .is_some_and(|current| current.credential_epoch == mutated_epoch)
+            {
+                match previous_user {
+                    Some(previous) => {
+                        users.insert(username.to_string(), previous);
+                    }
+                    None => {
+                        users.remove(username);
+                    }
                 }
             }
             return Err(format!("failed to persist users file: {e}"));
@@ -1825,22 +1873,33 @@ impl AuthManager {
         username: &str,
         password: &str,
     ) -> Result<Option<String>, UserMutationError> {
+        let _mutation = self.user_mutation_lock.lock().await;
         let (hash, is_default) = hash_password_blocking(password.to_string())
             .await
             .map_err(UserMutationError::Persistence)?;
 
-        let previous = {
+        let (previous_hash, previous_epoch, mutated_epoch) = {
             let mut users = lock(&self.users);
             let Some(user) = users.get_mut(username) else {
                 return Err(UserMutationError::NotFound);
             };
-            let previous = user.clone();
-            user.password_hash = hash;
-            user.credential_epoch = self.next_credential_epoch();
-            previous
+            let previous_hash = user.password_hash.clone();
+            let previous_epoch = user.credential_epoch;
+            let mutated_epoch = self.next_credential_epoch();
+            user.password_hash.clone_from(&hash);
+            user.credential_epoch = mutated_epoch;
+            (previous_hash, previous_epoch, mutated_epoch)
         };
         if let Err(e) = self.try_save_users_async().await {
-            lock(&self.users).insert(previous.username.clone(), previous);
+            // Field-level, epoch-CAS rollback: never clobber a newer password
+            // or another credential mutation.
+            let mut users = lock(&self.users);
+            if let Some(current) = users.get_mut(username)
+                && current.credential_epoch == mutated_epoch
+            {
+                current.password_hash.clone_from(&previous_hash);
+                current.credential_epoch = previous_epoch;
+            }
             return Err(UserMutationError::Persistence(e.to_string()));
         }
         if username == "admin" {
@@ -1851,7 +1910,7 @@ impl AuthManager {
         // A password change invalidates every credential derived from the old
         // password, including owned API tokens.
         self.revoke_tokens_for_owner(username).await;
-        Ok(Some(previous.password_hash))
+        Ok(Some(previous_hash))
     }
 
     /// Password update for request handlers that must distinguish a missing
@@ -1874,20 +1933,29 @@ impl AuthManager {
         username: &str,
         previous_hash: &str,
     ) -> Result<(), String> {
+        let _mutation = self.user_mutation_lock.lock().await;
         let is_default = username == "admin"
             && verify_password_blocking("adminadmin".to_string(), previous_hash.to_string()).await;
-        let previous = {
+        let (previous_current_hash, previous_epoch, mutated_epoch) = {
             let mut users = lock(&self.users);
             let Some(user) = users.get_mut(username) else {
                 return Err(format!("user '{username}' does not exist"));
             };
-            let previous = user.clone();
+            let previous_current_hash = user.password_hash.clone();
+            let previous_epoch = user.credential_epoch;
+            let mutated_epoch = self.next_credential_epoch();
             user.password_hash = previous_hash.to_string();
-            user.credential_epoch = self.next_credential_epoch();
-            previous
+            user.credential_epoch = mutated_epoch;
+            (previous_current_hash, previous_epoch, mutated_epoch)
         };
         if let Err(e) = self.try_save_users_async().await {
-            lock(&self.users).insert(previous.username.clone(), previous);
+            let mut users = lock(&self.users);
+            if let Some(current) = users.get_mut(username)
+                && current.credential_epoch == mutated_epoch
+            {
+                current.password_hash = previous_current_hash;
+                current.credential_epoch = previous_epoch;
+            }
             return Err(format!("failed to persist users file: {e}"));
         }
         if username == "admin" {
@@ -2193,6 +2261,9 @@ impl AuthManager {
             // Test-only: allow a credential mutation to interleave after the
             // code was verified but before the session is created.
             self.await_login_test_gate().await;
+            // Serialize the credential-state update with every other user
+            // mutation. Lock order: TOTP verification lock, then mutation lock.
+            let _mutation = self.user_mutation_lock.lock().await;
             // Success: consume the partial token first so it can never be
             // replayed, then re-check the credential epoch before writing the
             // TOTP state. A concurrent disable must win.
@@ -2303,6 +2374,8 @@ impl AuthManager {
         }
 
         let _totp_guard = self.totp_verification_lock.lock().await;
+        // Lock order: TOTP verification lock, then user-mutation lock.
+        let _mutation = self.user_mutation_lock.lock().await;
         let code_owned = code.to_string();
         let username_owned = username.to_string();
         let verified = tokio::task::spawn_blocking(move || {
@@ -2317,18 +2390,28 @@ impl AuthManager {
         }
 
         config.enabled = true;
-        let previous = {
+        let (previous_totp, previous_epoch, mutated_epoch) = {
             let mut users = lock(&self.users);
             let Some(user) = users.get_mut(username) else {
                 return Err(TotpMutationError::NotFound);
             };
-            let previous = user.clone();
+            let previous_totp = user.totp.clone();
+            let previous_epoch = user.credential_epoch;
+            let mutated_epoch = self.next_credential_epoch();
             user.totp = Some(config);
-            user.credential_epoch = self.next_credential_epoch();
-            previous
+            user.credential_epoch = mutated_epoch;
+            (previous_totp, previous_epoch, mutated_epoch)
         };
         if let Err(e) = self.try_save_users_async().await {
-            lock(&self.users).insert(previous.username.clone(), previous);
+            // Field-level, epoch-CAS rollback: never discard a newer TOTP
+            // enable/disable from another operation.
+            let mut users = lock(&self.users);
+            if let Some(current) = users.get_mut(username)
+                && current.credential_epoch == mutated_epoch
+            {
+                current.totp = previous_totp;
+                current.credential_epoch = previous_epoch;
+            }
             return Err(TotpMutationError::Persistence(e.to_string()));
         }
         // Changing the second factor invalidates existing sessions and every
@@ -2351,13 +2434,18 @@ impl AuthManager {
     /// consuming a backup code on success.
     pub async fn verify_second_factor(&self, username: &str, code: &str) -> bool {
         let _totp_guard = self.totp_verification_lock.lock().await;
-        let totp = lock(&self.users).get(username).and_then(|u| u.totp.clone());
-        let Some(totp) = totp else {
+        // Lock order: TOTP verification lock, then user-mutation lock.
+        let _mutation = self.user_mutation_lock.lock().await;
+        let snapshot = lock(&self.users)
+            .get(username)
+            .map(|user| (user.credential_epoch, user.totp.clone()));
+        let Some((credential_epoch, Some(previous_totp))) = snapshot else {
             return false;
         };
-        if !totp.enabled {
+        if !previous_totp.enabled {
             return false;
         }
+        let totp = previous_totp.clone();
 
         let code_owned = code.to_string();
         let username_owned = username.to_string();
@@ -2374,14 +2462,24 @@ impl AuthManager {
         if ok {
             {
                 let mut users = lock(&self.users);
-                if let Some(user) = users.get_mut(username) {
-                    user.totp = Some(updated);
+                let Some(user) = users.get_mut(username) else {
+                    return false;
+                };
+                if user.credential_epoch != credential_epoch {
+                    return false;
                 }
+                user.totp = Some(updated);
             }
             if let Err(e) = self.try_save_users_async().await {
                 // A consumed backup code or advanced replay counter that did
                 // not reach disk must not authorize a sensitive operation.
                 tracing::error!(error = %e, "Failed to persist TOTP verification state");
+                let mut users = lock(&self.users);
+                if let Some(user) = users.get_mut(username)
+                    && user.credential_epoch == credential_epoch
+                {
+                    user.totp = Some(previous_totp);
+                }
                 return false;
             }
         }
@@ -2399,21 +2497,29 @@ impl AuthManager {
 
     /// Disables TOTP, failing closed when the users file cannot be written.
     pub(crate) async fn try_disable_totp(&self, username: &str) -> Result<(), TotpMutationError> {
-        let previous = {
+        let _mutation = self.user_mutation_lock.lock().await;
+        let (previous_totp, previous_epoch, mutated_epoch) = {
             let mut users = lock(&self.users);
             let Some(user) = users.get_mut(username) else {
                 return Err(TotpMutationError::NotFound);
             };
-            if user.totp.is_none() {
+            let Some(previous_totp) = user.totp.clone() else {
                 return Ok(());
-            }
-            let previous = user.clone();
+            };
+            let previous_epoch = user.credential_epoch;
+            let mutated_epoch = self.next_credential_epoch();
             user.totp = None;
-            user.credential_epoch = self.next_credential_epoch();
-            previous
+            user.credential_epoch = mutated_epoch;
+            (previous_totp, previous_epoch, mutated_epoch)
         };
         if let Err(e) = self.try_save_users_async().await {
-            lock(&self.users).insert(previous.username.clone(), previous);
+            let mut users = lock(&self.users);
+            if let Some(current) = users.get_mut(username)
+                && current.credential_epoch == mutated_epoch
+            {
+                current.totp = Some(previous_totp);
+                current.credential_epoch = previous_epoch;
+            }
             return Err(TotpMutationError::Persistence(e.to_string()));
         }
         self.purge_user_sessions(username).await;
@@ -5367,6 +5473,133 @@ owner = "admin"
         assert!(
             mgr.validate_session(&session.id).is_some(),
             "a rolled-back role change must not revoke the account's session"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed mutation's rollback must not clobber a concurrent mutation
+    /// that committed while the first write was in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_failed_rollback_does_not_clobber_concurrent_role_change() {
+        let dir = auth_temp_dir("mutation_rollback_role");
+        let mgr = Arc::new(AuthManager::with_storage(&dir, 24, 5).unwrap());
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+
+        let users_path = dir.join("users.toml");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        SECRET_WRITE_START_SIGNALS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((users_path.clone(), started_tx));
+        SECRET_WRITE_DELAYS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((users_path.clone(), Duration::from_millis(500)));
+        SECRET_WRITE_FAIL_AFTER
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((users_path, 0));
+
+        // First mutation: role change whose users write fails.
+        let first_mgr = mgr.clone();
+        let first =
+            tokio::spawn(
+                async move { first_mgr.set_user_role_checked("alice", Role::Viewer).await },
+            );
+        started_rx.await.expect("first users write started");
+
+        // Second mutation: promote while the first write is still sleeping.
+        // Without a mutation lock it changes memory before the first rollback.
+        let second_mgr = mgr.clone();
+        let second =
+            tokio::spawn(
+                async move { second_mgr.set_user_role_checked("alice", Role::Admin).await },
+            );
+
+        let first_result = first.await.expect("first task");
+        assert!(
+            matches!(first_result, Err(UserMutationError::Persistence(_))),
+            "the first mutation must fail: {first_result:?}"
+        );
+        let second_result = second
+            .await
+            .expect("second task")
+            .expect("the second mutation must succeed");
+        assert!(second_result, "the promotion must report a change");
+        assert_eq!(
+            mgr.role_of("alice"),
+            Some(Role::Admin),
+            "the failed mutation's rollback must not clobber the committed promotion"
+        );
+
+        drop(mgr);
+        let reloaded = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert_eq!(
+            reloaded.role_of("alice"),
+            Some(Role::Admin),
+            "the committed promotion must be the persisted state"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed mutation's rollback must not resurrect an account that a
+    /// concurrent mutation deleted successfully.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_failed_rollback_does_not_resurrect_deleted_account() {
+        let dir = auth_temp_dir("mutation_rollback_delete");
+        let mgr = Arc::new(AuthManager::with_storage(&dir, 24, 5).unwrap());
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+
+        let users_path = dir.join("users.toml");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        SECRET_WRITE_START_SIGNALS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((users_path.clone(), started_tx));
+        SECRET_WRITE_DELAYS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((users_path.clone(), Duration::from_millis(500)));
+        SECRET_WRITE_FAIL_AFTER
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((users_path, 0));
+
+        // First mutation: role change whose users write fails.
+        let first_mgr = mgr.clone();
+        let first =
+            tokio::spawn(
+                async move { first_mgr.set_user_role_checked("alice", Role::Viewer).await },
+            );
+        started_rx.await.expect("first users write started");
+
+        // Second mutation: delete the account while the first write sleeps.
+        let second_mgr = mgr.clone();
+        let second = tokio::spawn(async move { second_mgr.delete_user_checked("alice").await });
+
+        let first_result = first.await.expect("first task");
+        assert!(
+            matches!(first_result, Err(UserMutationError::Persistence(_))),
+            "the first mutation must fail: {first_result:?}"
+        );
+        second
+            .await
+            .expect("second task")
+            .expect("the deletion must succeed");
+        assert!(
+            !mgr.has_user("alice"),
+            "the failed mutation's rollback must not resurrect the deleted account"
+        );
+
+        drop(mgr);
+        let reloaded = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            !reloaded.has_user("alice"),
+            "the deletion must be the persisted state"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
