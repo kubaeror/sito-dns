@@ -471,6 +471,9 @@ pub struct AuthManager {
     /// Serializes second-factor verification so a backup code cannot be
     /// consumed by two concurrent requests.
     totp_verification_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes setup-wizard completion so token consumption, credential
+    /// changes and `setup_complete` cannot race each other.
+    setup_completion_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes snapshot + persist of the auth state files so a stale
     /// snapshot can never overwrite a newer revocation/creation on disk.
     /// Held only across the snapshot and its `spawn_blocking` write; callers
@@ -624,6 +627,7 @@ impl AuthManager {
             setup_token_failures: Arc::new(Mutex::new(HashMap::new())),
             setup_pending_warned: Arc::new(AtomicBool::new(false)),
             totp_verification_lock: Arc::new(tokio::sync::Mutex::new(())),
+            setup_completion_lock: Arc::new(tokio::sync::Mutex::new(())),
             persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             users_path,
             sessions_path,
@@ -738,16 +742,23 @@ impl AuthManager {
                     }
                 }
 
-                let (has_admin, admin_default_active) = {
+                let (has_usable_admin, admin_default_active) = {
                     let mut map = lock(&mgr.users);
                     for u in users {
                         map.insert(u.username.clone(), u);
                     }
-                    if let Some(admin) = map.get("admin") {
-                        (true, verify_password("adminadmin", &admin.password_hash))
-                    } else {
-                        (false, false)
-                    }
+                    let admin_default_active = map
+                        .get("admin")
+                        .is_some_and(|admin| verify_password("adminadmin", &admin.password_hash));
+                    // Setup is complete when at least one Admin account has a
+                    // non-bootstrap credential, regardless of its username.
+                    // The bootstrap `admin` account only counts once its
+                    // password has been rotated.
+                    let has_usable_admin = map.values().any(|user| {
+                        user.role == Role::Admin
+                            && !(user.username == "admin" && admin_default_active)
+                    });
+                    (has_usable_admin, admin_default_active)
                 };
 
                 // Legacy plaintext secrets are encrypted on this startup with
@@ -772,7 +783,7 @@ impl AuthManager {
                 mgr.default_admin_active
                     .store(admin_default_active, Ordering::SeqCst);
                 mgr.setup_complete
-                    .store(has_admin && !admin_default_active, Ordering::SeqCst);
+                    .store(has_usable_admin && !admin_default_active, Ordering::SeqCst);
                 mgr.load_sessions();
                 mgr.load_tokens();
                 mgr.provision_setup_token_if_needed();
@@ -942,6 +953,7 @@ impl AuthManager {
             setup_token_failures: Arc::new(Mutex::new(HashMap::new())),
             setup_pending_warned: Arc::new(AtomicBool::new(false)),
             totp_verification_lock: Arc::new(tokio::sync::Mutex::new(())),
+            setup_completion_lock: Arc::new(tokio::sync::Mutex::new(())),
             persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             users_path: Some(path.clone()),
             sessions_path: None,
@@ -1550,6 +1562,18 @@ impl AuthManager {
     /// Returns true if the default bootstrapped admin user is still active with default password.
     pub fn is_default_admin_active(&self) -> bool {
         self.default_admin_active.load(Ordering::SeqCst)
+    }
+
+    /// Serializes setup-wizard completions. Hold this guard from before
+    /// reading the setup state until the token has been consumed and setup has
+    /// been marked complete.
+    pub async fn lock_setup_completion(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.setup_completion_lock.clone().lock_owned().await
+    }
+
+    /// Returns true once setup has been completed.
+    pub fn is_setup_complete(&self) -> bool {
+        self.setup_complete.load(Ordering::SeqCst)
     }
 
     /// Marks initial setup as completed.

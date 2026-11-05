@@ -196,7 +196,9 @@ pub async fn setup_pending_middleware(
     // first-boot state: allow the operator to log in instead of forcing the
     // wizard on every route.
     let first_run = ctx.auth_mgr.is_first_run();
-    let login_allowed = !first_run && !token_required;
+    // A custom Admin may exist while the literal bootstrap `admin` credential
+    // is still `adminadmin`; never reopen login in that state.
+    let login_allowed = !first_run && !token_required && !default_admin_active;
 
     let login_path = path == "/login" || path == "/ui/login";
     let auth_api = path.starts_with("/api/v1/auth");

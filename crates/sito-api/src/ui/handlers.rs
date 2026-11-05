@@ -1719,15 +1719,17 @@ pub async fn wizard_page(
 ) -> Response {
     let auth_user = get_session_user(&ctx, &headers);
     let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
+    let setup_required = ctx.auth_mgr.setup_token_required();
 
     // Once user accounts exist (even if `config.toml` is missing) the wizard
     // is an admin-only configuration surface, not an unauthenticated bootstrap.
-    if !ctx.auth_mgr.is_first_run() && !is_admin {
+    // A deployment with no usable Admin (for example only non-admin accounts)
+    // is still recoverable with the provisioned setup token.
+    if !ctx.auth_mgr.is_first_run() && !setup_required && !is_admin {
         return Redirect::to("/login").into_response();
     }
 
     let csrf = get_csrf_token(&ctx, &headers);
-    let setup_required = ctx.auth_mgr.setup_token_required();
     // Only echo a token the requester already supplied; never reveal the
     // stored setup token in the rendered page on its own.
     let setup_token = params.setup_token.unwrap_or_default();
@@ -2143,35 +2145,30 @@ pub async fn wizard_complete_handler(
     headers: HeaderMap,
     Form(form): Form<WizardCompleteForm>,
 ) -> Response {
-    let first_run = ctx.auth_mgr.is_first_run();
-    // Only a genuinely unconfigured deployment may complete the wizard
-    // without authentication. `setup_pending` also covers the
-    // missing-`config.toml` case, which must not become an unauthenticated
-    // admin-password reset when `users.toml` already exists.
-    let is_first_run = first_run;
+    // Serialize the whole completion. Capturing the token requirement once
+    // prevents a request that entered before a concurrent completion from
+    // re-reading it as `false` and skipping token validation.
+    let _setup_guard = ctx.auth_mgr.lock_setup_completion().await;
+    let is_first_run = ctx.auth_mgr.is_first_run();
+    let setup_token_required = ctx.auth_mgr.setup_token_required();
+    // Bootstrap mode covers both the default-admin first run and deployments
+    // with no usable Admin yet (for example only non-admin accounts), which
+    // are recoverable only with the setup token.
+    let bootstrapping = is_first_run || setup_token_required;
     let auth_user = get_session_user(&ctx, &headers);
     let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
 
-    if !is_first_run && !is_admin {
+    if !bootstrapping && !is_admin {
         return error_response(
             StatusCode::FORBIDDEN,
             "Setup wizard is disabled. Admin session required.",
         );
     }
 
-    // Setup-pending with an already-configured admin account but no setup
-    // token: an authenticated admin is required to change credentials.
-    if !first_run && !is_admin && !ctx.auth_mgr.setup_token_required() {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "Setup wizard is disabled. Admin session required.",
-        );
-    }
-
-    // First-boot completion requires the one-time setup token (authenticated
+    // Bootstrap completion requires the one-time setup token (authenticated
     // admins and in-memory test managers without a provisioned token are
-    // exempt).
-    if ctx.auth_mgr.setup_token_required() && !is_admin {
+    // exempt). The requirement was captured under the completion lock.
+    if setup_token_required && !is_admin {
         let config = ctx.config.load();
         let trusted_proxies = config.get_web_config().trusted_proxies.clone();
         drop(config);
@@ -2265,7 +2262,7 @@ pub async fn wizard_complete_handler(
             "The selected account exists but is not an administrator.",
         );
     }
-    if !is_first_run && !ctx.auth_mgr.has_user(admin_user) {
+    if !bootstrapping && !ctx.auth_mgr.has_user(admin_user) {
         return error_response(StatusCode::BAD_REQUEST, "Username does not exist.");
     }
 
@@ -2358,7 +2355,7 @@ pub async fn wizard_complete_handler(
         );
     }
 
-    if is_first_run {
+    if bootstrapping {
         // Never leave the bootstrap `admin` account active after setup
         // completes. Removing it only after the configuration persist means a
         // failure leaves setup pending instead of half-applied.

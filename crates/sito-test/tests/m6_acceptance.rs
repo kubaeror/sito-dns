@@ -733,6 +733,152 @@ async fn test_default_admin_with_existing_config_is_gated_by_setup_token() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// Regression (1.9.2 review): a restart with a custom-named Admin and no
+/// literal `admin` account must not re-enter setup-token mode or lock out
+/// login, the wizard (for Admins) or the API.
+#[cfg(feature = "embed-ui")]
+#[tokio::test]
+async fn test_custom_admin_restart_does_not_reengage_setup_gate() {
+    let (mut ctx, temp_dir) = create_test_context().await;
+    {
+        let seed = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        seed.create_user("owner", "OwnerPassword123!", sito_api::auth::Role::Admin)
+            .await;
+        seed.delete_user_checked("admin")
+            .await
+            .expect("delete bootstrap admin");
+    }
+
+    let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+    assert!(!mgr.has_user("admin"));
+    assert!(!mgr.setup_token_required());
+    assert!(!mgr.is_first_run());
+    ctx.auth_mgr = Arc::new(mgr);
+    let app = create_router(ctx.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"user": "owner", "pass": "OwnerPassword123!"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "custom Admin must log in after restart"
+    );
+    let session = cookie_value(&resp, "sito_session").expect("session cookie");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/wizard")
+                .header(header::COOKIE, format!("sito_session={session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/status")
+                .header(header::COOKIE, format!("sito_session={session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a configured custom-admin deployment must not stay API-gated"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// Regression (1.9.2 review): a users file with no usable Admin must keep the
+/// token-protected wizard reachable so the deployment can be recovered without
+/// shell access.
+#[cfg(feature = "embed-ui")]
+#[tokio::test]
+async fn test_setup_token_wizard_works_without_any_admin_account() {
+    let (mut ctx, temp_dir) = create_test_context().await;
+    {
+        let seed = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        seed.create_user("viewer", "ViewerPassword123!", sito_api::auth::Role::Viewer)
+            .await;
+        assert!(
+            seed.delete_user("admin").await,
+            "remove the bootstrap admin"
+        );
+    }
+
+    let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+    assert!(mgr.setup_token_required());
+    assert!(!mgr.is_first_run());
+    let token = mgr.setup_token().expect("setup token provisioned");
+    ctx.auth_mgr = Arc::new(mgr);
+    ctx.set_setup_pending(false);
+    let app = create_router(ctx.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/wizard?setup_token={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "token holder must reach the wizard even without an Admin account"
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/wizard/complete")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "setup_token={token}&admin_user=admin&admin_password=RecoveredPassword123!&confirm_password=RecoveredPassword123!"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(!ctx.auth_mgr.setup_token_required());
+    assert!(ctx.auth_mgr.has_user("admin"));
+    assert!(ctx.auth_mgr.has_user("viewer"));
+    assert!(matches!(
+        ctx.auth_mgr
+            .login("admin", "RecoveredPassword123!", "127.0.0.1")
+            .await,
+        sito_api::auth::LoginResult::Success(_)
+    ));
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 /// Regression (1.9.2): the documented recovery path must restore remote login
 /// with the new password and leave no active setup token behind.
 #[cfg(feature = "embed-ui")]
