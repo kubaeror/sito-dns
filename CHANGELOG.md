@@ -17,6 +17,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   failed transfer is reported instead of being silently skipped.
 
 ### Fixed
+- **Web UI update form sends the CSRF token**: the system page's
+  "Download & Install" button called native `form.submit()`, bypassing htmx
+  and omitting the session-bound CSRF value, so the middleware rejected the
+  POST. The form now includes the hidden `csrf_token` used by the other UI
+  forms and lets htmx perform the request.
 - **Self-update prerequisites are installed and checked up front**: a fresh
   systemd install could not use the documented `sito update` path because
   `server.update_require_signature` defaults to `true` while `install.sh` only

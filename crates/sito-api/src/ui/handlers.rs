@@ -1585,6 +1585,37 @@ pub async fn system_reload_handler(
     Redirect::to("/system").into_response()
 }
 
+/// Renders the update action row for the system page.
+///
+/// Session-authenticated HTMX posts must carry the session CSRF token. The
+/// form includes it as a hidden field (matching the Askama forms) and lets
+/// htmx perform the submission; calling `form.submit()` natively would bypass
+/// htmx and still lack the token.
+fn update_action_html(info: &crate::updater::UpdateInfo, csrf_token: &str) -> String {
+    if info.is_docker {
+        return r#"<div style="margin-top: 14px; padding: 12px; background: rgba(56, 189, 248, 0.1); border: 1px solid var(--accent); border-radius: 6px;">
+                <div style="font-weight: 600; color: var(--accent); margin-bottom: 4px;">Docker Environment Detected</div>
+                <div style="font-size: 0.85rem; color: var(--text-secondary);">
+                    In-app binary updates are disabled in containers. Upgrade by running:
+                    <pre style="margin-top: 6px; padding: 6px 10px; background: var(--bg-surface); border-radius: 4px;"><code>docker compose pull && docker compose up -d</code></pre>
+                </div>
+            </div>"#
+            .to_string();
+    }
+
+    format!(
+        r##"<form hx-post="/ui/system/update/apply" hx-target="#update-container" hx-swap="innerHTML" style="margin-top: 14px;">
+            <input type="hidden" name="csrf_token" value="{}">
+            <button type="submit" class="btn btn-primary" @click="this.disabled=true; this.innerText='Updating...';">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+                Download & Install v{}
+            </button>
+        </form>"##,
+        escape_html(csrf_token),
+        escape_html(&info.latest_version)
+    )
+}
+
 pub async fn system_update_check_handler(
     State(ctx): State<ServerContext>,
     headers: HeaderMap,
@@ -1592,29 +1623,12 @@ pub async fn system_update_check_handler(
     if get_session_user(&ctx, &headers).is_none() {
         return Redirect::to("/login").into_response();
     }
+    let csrf = get_csrf_token(&ctx, &headers);
 
     match crate::updater::check_for_update(None).await {
         Ok(info) => {
             if info.update_available {
-                let install_or_docker = if info.is_docker {
-                    r#"<div style="margin-top: 14px; padding: 12px; background: rgba(56, 189, 248, 0.1); border: 1px solid var(--accent); border-radius: 6px;">
-                            <div style="font-weight: 600; color: var(--accent); margin-bottom: 4px;">Docker Environment Detected</div>
-                            <div style="font-size: 0.85rem; color: var(--text-secondary);">
-                                In-app binary updates are disabled in containers. Upgrade by running:
-                                <pre style="margin-top: 6px; padding: 6px 10px; background: var(--bg-surface); border-radius: 4px;"><code>docker compose pull && docker compose up -d</code></pre>
-                            </div>
-                        </div>"#.to_string()
-                } else {
-                    format!(
-                        r##"<form hx-post="/ui/system/update/apply" hx-target="#update-container" hx-swap="innerHTML" style="margin-top: 14px;">
-                            <button type="submit" class="btn btn-primary" @click="this.disabled=true; this.innerText='Updating...'; this.form.submit();">
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
-                                Download & Install v{}
-                            </button>
-                        </form>"##,
-                        escape_html(&info.latest_version)
-                    )
-                };
+                let install_or_docker = update_action_html(&info, &csrf);
 
                 axum::response::Html(format!(
                     r#"<div>
@@ -3006,6 +3020,42 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::Instant;
+
+    #[test]
+    fn test_update_install_form_carries_csrf_token_and_uses_htmx() {
+        let info = crate::updater::UpdateInfo {
+            current_version: "1.9.1".to_string(),
+            latest_version: "1.9.2".to_string(),
+            update_available: true,
+            release_url: "https://github.com/kubaeror/sito-dns/releases/tag/v1.9.2".to_string(),
+            release_notes: "notes".to_string(),
+            published_at: None,
+            is_docker: false,
+            instructions: None,
+            version_comparison_unknown: false,
+        };
+        let html = update_action_html(&info, "csrf-token-123");
+        assert!(
+            html.contains(r#"name="csrf_token" value="csrf-token-123""#),
+            "update form must carry the session CSRF token: {html}"
+        );
+        assert!(
+            html.contains(r#"hx-post="/ui/system/update/apply""#),
+            "update form must remain an htmx post: {html}"
+        );
+        assert!(
+            !html.contains("this.form.submit()"),
+            "native form submission bypasses htmx and would omit the CSRF header: {html}"
+        );
+
+        let docker = crate::updater::UpdateInfo {
+            is_docker: true,
+            ..info
+        };
+        let docker_html = update_action_html(&docker, "csrf-token-123");
+        assert!(!docker_html.contains("<form"), "{docker_html}");
+        assert!(docker_html.contains("docker compose pull"), "{docker_html}");
+    }
 
     async fn mock_context(temp_dir: &std::path::Path) -> ServerContext {
         let db_path = temp_dir.join("test.db");

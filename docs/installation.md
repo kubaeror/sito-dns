@@ -184,6 +184,10 @@ the binary manually, install cosign first; only set
 `server.update_require_signature = false` when you intentionally accept
 SHA-256-only integrity.
 
+The web UI's update button uses the same updater and signature policy. Under
+the hardened systemd unit the unprivileged service still cannot replace the
+root-owned binary, so use the CLI path above for system installs.
+
 The installer backs up the previous binary to `/usr/local/bin/sito.bak` and
 restores it automatically if the post-install health check fails. If you manage
 the binary manually, stop the service, replace `/usr/local/bin/sito`, re-apply
