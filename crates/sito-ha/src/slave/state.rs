@@ -46,6 +46,9 @@ pub struct SlaveStatusTracker {
     pub current_term: Arc<AtomicU64>,
     pub state: Arc<Mutex<SlaveState>>,
     pub degraded_reason: Arc<Mutex<Option<String>>>,
+    /// Last connection/handshake error. Kept separate from `degraded_reason`
+    /// because a transport failure is not an apply failure.
+    connection_error: Arc<Mutex<Option<String>>>,
     pub last_synced_at: Arc<Mutex<Option<DateTime<Utc>>>>,
     pub master_url: Option<String>,
     /// Last durably applied bundle watermark.
@@ -62,6 +65,7 @@ impl SlaveStatusTracker {
             current_term: Arc::new(AtomicU64::new(0)),
             state: Arc::new(Mutex::new(SlaveState::Connecting)),
             degraded_reason: Arc::new(Mutex::new(None)),
+            connection_error: Arc::new(Mutex::new(None)),
             last_synced_at: Arc::new(Mutex::new(None)),
             master_url,
             watermark: Arc::new(Mutex::new(None)),
@@ -276,6 +280,44 @@ impl SlaveStatusTracker {
         self.current_version.load(Ordering::SeqCst)
     }
 
+    /// Records or clears the last connection/handshake failure.
+    pub fn set_connection_error(&self, reason: Option<String>) {
+        *self.connection_error.lock().unwrap() = reason;
+    }
+
+    /// Readiness of the slave's replication path.
+    ///
+    /// The node is ready only after a successful sync and while its last
+    /// connection attempt did not fail. DNS keeps serving either way, so this
+    /// signal is what the healthcheck and `/ha/status` use to avoid masking a
+    /// dead replication link.
+    #[must_use]
+    pub fn readiness(&self) -> crate::readiness::HaReadiness {
+        if let Some(error) = self.connection_error.lock().unwrap().clone() {
+            return crate::readiness::HaReadiness::not_ready(error);
+        }
+        let state = self.get_state();
+        if state == SlaveState::Synced {
+            return crate::readiness::HaReadiness::ready();
+        }
+        let reason = self
+            .degraded_reason
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| match state {
+                SlaveState::Degraded => "slave is degraded".to_string(),
+                SlaveState::HelloSent => {
+                    "connected to master; waiting for the initial sync".to_string()
+                }
+                SlaveState::Applying => "applying a pushed configuration".to_string(),
+                SlaveState::Connecting | SlaveState::Synced => {
+                    "connecting to the master replication endpoint".to_string()
+                }
+            });
+        crate::readiness::HaReadiness::not_ready(reason)
+    }
+
     pub fn get_term(&self) -> u64 {
         self.current_term.load(Ordering::SeqCst)
     }
@@ -292,12 +334,16 @@ impl SlaveStatusTracker {
         self.current_term.store(term, Ordering::SeqCst);
         *self.state.lock().unwrap() = SlaveState::Synced;
         *self.degraded_reason.lock().unwrap() = None;
+        *self.connection_error.lock().unwrap() = None;
         *self.last_synced_at.lock().unwrap() = Some(Utc::now());
     }
 
     pub fn mark_degraded(&self, reason: String) {
         *self.state.lock().unwrap() = SlaveState::Degraded;
         *self.degraded_reason.lock().unwrap() = Some(reason);
+        // A degraded node is connected (the failure is in the apply path), so
+        // do not let an earlier transport error mask the actual reason.
+        *self.connection_error.lock().unwrap() = None;
     }
 }
 
@@ -328,6 +374,51 @@ mod tests {
             clients: None,
             lists: vec![],
         }
+    }
+
+    #[test]
+    fn test_slave_readiness_requires_synced_state() {
+        let tracker = SlaveStatusTracker::new(
+            "slave-1".to_string(),
+            0,
+            Some("wss://127.0.0.1:8953".to_string()),
+        );
+        let readiness = tracker.readiness();
+        assert!(!readiness.ready, "a fresh slave is not ready before sync");
+        assert!(
+            readiness.reason.unwrap_or_default().contains("connect"),
+            "a connecting slave must explain its state"
+        );
+
+        tracker.set_connection_error(Some(
+            "mTLS handshake failed with master '127.0.0.1:8953'".to_string(),
+        ));
+        let readiness = tracker.readiness();
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .reason
+                .unwrap_or_default()
+                .contains("mTLS handshake failed"),
+            "the handshake failure must be visible, not just the generic state"
+        );
+
+        tracker.mark_degraded("apply failed".to_string());
+        let readiness = tracker.readiness();
+        assert!(!readiness.ready);
+        assert_eq!(readiness.reason.as_deref(), Some("apply failed"));
+
+        tracker.mark_synced_with_term(7, 1);
+        let readiness = tracker.readiness();
+        assert!(readiness.ready, "a synced slave is ready");
+        assert!(readiness.reason.is_none());
+
+        // A later connection error after sync must immediately make the node
+        // unready again instead of leaving a stale green signal.
+        tracker.set_connection_error(Some("TCP connect error".to_string()));
+        let readiness = tracker.readiness();
+        assert!(!readiness.ready);
+        assert_eq!(readiness.reason.as_deref(), Some("TCP connect error"));
     }
 
     #[test]

@@ -45,6 +45,9 @@ denied`, `GET /api/v1/ha/status` reports `ready: false` with a
 `readiness_reason`, and the `healthcheck` subcommand fails even though DNS
 still answers. The same visibility applies to a failed listener bind, a slave
 that cannot complete the handshake, and a slave that has not reached `Synced`.
+Readiness is read from the admin web listener, so keep `[web] enabled = true`
+(the default) on HA nodes; the healthcheck fails closed when HA is configured
+but the web listener cannot report readiness.
 
 ---
 

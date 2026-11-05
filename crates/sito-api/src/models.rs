@@ -470,6 +470,16 @@ pub struct HaStatusResponse {
     pub instance_name: String,
     pub version: u64,
     pub state: String,
+    /// Whether the node's HA role is actually operational. A master with a
+    /// failed mTLS listener or a slave that has not reached `synced` reports
+    /// `false` even though DNS keeps answering.
+    #[serde(default)]
+    pub ready: bool,
+    /// Why `ready` is false (unreadable key, bind failure, handshake failure,
+    /// not yet synced, ...), or an explanatory note for a deliberately
+    /// disabled replication listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_url: Option<String>,
     pub slaves_connected: usize,

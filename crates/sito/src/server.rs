@@ -289,6 +289,10 @@ fn init_ha(
         )
         .with_state_path(config.server.data_dir.join("ha_state.toml"));
 
+        if ha_config.replication_port == 0 {
+            coordinator.mark_replication_disabled();
+        }
+
         // Continue the version sequence across restarts; only a master with no
         // recoverable state starts a fresh v1 sequence.
         let restored_version = coordinator.restore_state()?;
@@ -723,6 +727,9 @@ fn spawn_slave_worker_after_listeners(
     };
     if ha_runtime.config.master_url.is_none() {
         metrics.inc_ha_startup_noop("slave", "missing_master_url");
+        tracker.set_connection_error(Some(
+            "master_url is not configured; replication cannot start".to_string(),
+        ));
         warn!("Slave role configured without master_url; replication worker idle");
         return;
     }

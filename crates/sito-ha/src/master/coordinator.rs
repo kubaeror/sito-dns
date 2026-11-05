@@ -24,6 +24,7 @@ use crate::crypto::Ed25519SigningKey;
 use crate::error::HaError;
 use crate::master::tracker::{ActiveSlave, SlaveStatsSummary, SlaveSummary};
 use crate::protocol::{AckConflict, HaMessage};
+use crate::readiness::{HaReadiness, HaReadinessState};
 use crate::transport::{build_server_tls_config, ws_config};
 
 /// Maximum amount by which an authenticated peer may report being ahead of the
@@ -113,6 +114,9 @@ pub struct MasterCoordinator {
     /// an explicit operator resync/promotion or disconnect removes them, never
     /// an unrelated version advance.
     diverged: Arc<Mutex<HashMap<String, Divergence>>>,
+    /// Whether the replication listener is actually serving. Updated by
+    /// `spawn_master_server` and surfaced by `/ha/status` and `/health`.
+    readiness: HaReadinessState,
 }
 
 impl MasterCoordinator {
@@ -150,7 +154,33 @@ impl MasterCoordinator {
             #[cfg(test)]
             state_write_hook: Arc::new(Mutex::new(None)),
             diverged: Arc::new(Mutex::new(HashMap::new())),
+            readiness: HaReadinessState::not_ready("master replication listener has not started"),
         }
+    }
+
+    /// Current readiness of the master replication listener.
+    #[must_use]
+    pub fn readiness(&self) -> HaReadiness {
+        self.readiness.snapshot()
+    }
+
+    /// Marks the replication listener as serving connections.
+    pub fn mark_replication_ready(&self) {
+        self.readiness.mark_ready();
+    }
+
+    /// Records a listener/TLS failure that prevents replication.
+    pub fn mark_replication_failed(&self, reason: impl Into<String>) {
+        self.readiness.mark_failed(reason);
+    }
+
+    /// Records an intentionally disabled listener (`replication_port = 0`).
+    ///
+    /// This is not a failure: the operator explicitly turned HA off. Keeping a
+    /// reason makes the disabled state visible in `/ha/status`.
+    pub fn mark_replication_disabled(&self) {
+        self.readiness
+            .mark_ready_with_reason("replication_port is 0 (replication disabled)");
     }
 
     /// Enables persistence of the active configuration version/bundle to `path`.
@@ -1426,6 +1456,7 @@ pub fn spawn_master_server(
             // The startup no-op metric is recorded by the production call site
             // (`init_ha`); incrementing it here would double count when both
             // paths run, and this function is not called for port 0 there.
+            coordinator.mark_replication_disabled();
             info!("Master HA replication is disabled (replication_port is 0)");
             return;
         }
@@ -1445,12 +1476,17 @@ pub fn spawn_master_server(
                     coordinator
                         .metrics
                         .inc_ha_startup_noop("master", "tls_init_failed");
+                    coordinator
+                        .mark_replication_failed(format!("master mTLS initialization failed: {e}"));
                     error!("Failed to initialize mTLS for master HA replication server: {e}");
                     return;
                 }
             }
         } else {
             if !ha_config.allow_insecure_ws {
+                coordinator.mark_replication_failed(
+                    "master replication refused to serve plaintext without allow_insecure_ws",
+                );
                 error!(
                     "Master HA replication requires TLS (cert and key configured) unless allow_insecure_ws is true. Refusing to serve plaintext replication."
                 );
@@ -1466,11 +1502,15 @@ pub fn spawn_master_server(
                 coordinator
                     .metrics
                     .inc_ha_startup_noop("master", "bind_failed");
+                coordinator.mark_replication_failed(format!(
+                    "Failed to bind master replication listener on '{listen_addr}': {e}"
+                ));
                 error!("Failed to bind master HA replication listener on '{listen_addr}': {e}");
                 return;
             }
         };
 
+        coordinator.mark_replication_ready();
         info!(addr = %listen_addr, "Master HA replication listener active");
 
         let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_SLAVE_CONNECTIONS));
@@ -2098,6 +2138,7 @@ mod tests {
     #[tokio::test]
     async fn test_master_tls_init_failure_records_startup_noop() {
         let coordinator = test_coordinator();
+        let observer = coordinator.clone();
         let metrics = coordinator.metrics.clone();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = spawn_master_server(
@@ -2120,6 +2161,105 @@ mod tests {
                 r#"sito_ha_startup_noop_total{role="master",reason="tls_init_failed"} 1"#
             ),
             "a TLS init failure must be observable: {rendered}"
+        );
+
+        // The operator-facing readiness signal must carry the same failure:
+        // DNS health alone used to hide a master that never started replication.
+        let readiness = observer.readiness();
+        assert!(!readiness.ready, "TLS failure must leave HA not ready");
+        let reason = readiness.reason.unwrap_or_default();
+        assert!(
+            reason.contains("mTLS"),
+            "readiness must name the TLS failure: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_master_listener_bind_marks_readiness_ready() {
+        let coordinator = test_coordinator();
+        let observer = coordinator.clone();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_master_server(
+            HaConfig {
+                replication_port: port,
+                listen_addr: "127.0.0.1".to_string(),
+                allow_insecure_ws: true,
+                slave_token: Some("tok".to_string()),
+                ..Default::default()
+            },
+            coordinator,
+            shutdown_rx,
+        );
+
+        let mut readiness = observer.readiness();
+        for _ in 0..50 {
+            if readiness.ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            readiness = observer.readiness();
+        }
+        assert!(
+            readiness.ready,
+            "a bound replication listener must be reported ready: {readiness:?}"
+        );
+        assert!(readiness.reason.is_none());
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_master_bind_failure_marks_readiness_failed() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        let coordinator = test_coordinator();
+        let observer = coordinator.clone();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_master_server(
+            HaConfig {
+                replication_port: port,
+                listen_addr: "127.0.0.1".to_string(),
+                allow_insecure_ws: true,
+                slave_token: Some("tok".to_string()),
+                ..Default::default()
+            },
+            coordinator,
+            shutdown_rx,
+        );
+        handle.await.unwrap();
+
+        let readiness = observer.readiness();
+        assert!(!readiness.ready, "a bind failure must leave HA not ready");
+        assert!(
+            readiness
+                .reason
+                .unwrap_or_default()
+                .contains("Failed to bind"),
+            "readiness must name the bind failure"
+        );
+        drop(probe);
+    }
+
+    #[tokio::test]
+    async fn test_master_replication_disabled_is_ready_and_explained() {
+        let coordinator = test_coordinator();
+        coordinator.mark_replication_disabled();
+        let readiness = coordinator.readiness();
+        assert!(
+            readiness.ready,
+            "an explicitly disabled replication listener is not a failure"
+        );
+        assert!(
+            readiness
+                .reason
+                .unwrap_or_default()
+                .contains("replication_port"),
+            "the disabled state must be explained"
         );
     }
 

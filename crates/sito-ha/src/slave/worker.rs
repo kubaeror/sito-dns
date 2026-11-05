@@ -706,6 +706,9 @@ pub fn spawn_slave_worker(
             handles
                 .metrics
                 .inc_ha_startup_noop("slave", "missing_master_url");
+            tracker.set_connection_error(Some(
+                "master_url is not configured; replication cannot start".to_string(),
+            ));
             warn!("Slave role configured without master_url; replication worker idle");
             return;
         };
@@ -748,6 +751,9 @@ pub fn spawn_slave_worker(
                 Ok(()) => {
                     info!("Replication connection finished cleanly");
                     backoff.reset();
+                    // The session is over: stop advertising readiness until
+                    // the next successful sync even though DNS keeps serving.
+                    tracker.set_state(SlaveState::Connecting);
                     // Avoid a tight reconnect loop when the master accepts and
                     // immediately closes the connection.
                     tokio::select! {
@@ -767,6 +773,7 @@ pub fn spawn_slave_worker(
                     }
                 }
                 Err(e) => {
+                    tracker.set_connection_error(Some(e.to_string()));
                     warn!("Replication connection error: {e}");
                     let delay = backoff.next_delay();
                     info!("Backing off for {:?} before reconnecting", delay);
@@ -888,6 +895,7 @@ async fn connect_and_run(
         })?
         .map_err(|e| HaError::Connection(format!("WebSocket client handshake failed: {e}")))?;
 
+        tracker.set_connection_error(None);
         run_ws_session(
             ws_stream,
             ha_config,
@@ -920,6 +928,7 @@ async fn connect_and_run(
             HaError::Connection(format!("Plain WebSocket client handshake failed: {e}"))
         })?;
 
+        tracker.set_connection_error(None);
         run_ws_session(
             ws_stream,
             ha_config,

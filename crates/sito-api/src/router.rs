@@ -235,11 +235,21 @@ pub async fn setup_pending_middleware(
 /// Unauthenticated liveness probe that also reports whether the first-run
 /// setup wizard is still pending (used by the container healthcheck).
 async fn health_handler(State(ctx): State<ServerContext>) -> impl IntoResponse {
+    let cfg = ctx.config.load();
+    let ha_required = crate::state::ha_readiness_required(&cfg);
+    let ha = ctx.ha_readiness(&cfg);
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "status": "ok",
             "setup_pending": ctx.is_setup_pending(),
+            // The container healthcheck (and any external probe) must be able
+            // to distinguish a healthy DNS listener from a broken HA role.
+            "ha": {
+                "required": ha_required,
+                "ready": ha.ready,
+                "reason": ha.reason,
+            },
         })),
     )
 }

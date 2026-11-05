@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod error;
 pub mod master;
 pub mod protocol;
+pub mod readiness;
 pub mod slave;
 pub mod transport;
 
@@ -29,6 +30,7 @@ pub use crypto::{
 pub use error::HaError;
 pub use master::{MasterCoordinator, ResyncOutcome, SlaveSummary, spawn_master_server};
 pub use protocol::{AckConflict, HaMessage, PROTOCOL_VERSION, UpstreamReport};
+pub use readiness::{HaReadiness, HaReadinessState};
 pub use slave::{
     SlaveAppHandles, SlaveConfigApplier, SlaveState, SlaveStatusTracker, apply_config_push,
     spawn_slave_worker,

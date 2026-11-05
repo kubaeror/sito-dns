@@ -249,6 +249,15 @@ pub async fn run_healthcheck(addr: SocketAddr, timeout_ms: u64) -> Result<(), an
     probe_dns(addr, timeout_ms).await
 }
 
+/// Whether the configuration makes HA replication part of this node's role.
+///
+/// Mirrors the server's readiness gate so the healthcheck fails closed only
+/// when `[ha]` is actually part of the deployment.
+#[must_use]
+pub fn ha_readiness_required(config: &Config) -> bool {
+    sito_api::state::ha_readiness_required(config)
+}
+
 /// Healthcheck that may accept the admin web interface while the server is
 /// still in first-boot setup-pending mode.
 ///
@@ -256,52 +265,104 @@ pub async fn run_healthcheck(addr: SocketAddr, timeout_ms: u64) -> Result<(), an
 /// the admin API explicitly reports that setup is pending. Once setup has
 /// completed (or when the API cannot confirm setup-pending), a failing DNS
 /// probe stays a healthcheck failure so a broken DNS listener is never masked.
+///
+/// When `ha_required` is set, a successful DNS probe is not sufficient: the
+/// `/health` endpoint must also report the HA role as ready. This keeps a
+/// failed mTLS listener or a slave that never completed its handshake from
+/// looking healthy just because DNS still answers.
 pub async fn run_healthcheck_or_web(
     dns_addr: Option<SocketAddr>,
     web_addr: SocketAddr,
     timeout_ms: u64,
     setup_fallback: bool,
+    ha_required: bool,
 ) -> Result<(), anyhow::Error> {
     let dns_error = if let Some(addr) = dns_addr {
-        match probe_dns(addr, timeout_ms).await {
-            Ok(()) => return Ok(()),
-            Err(e) => Some(e),
-        }
+        probe_dns(addr, timeout_ms).await.err()
     } else {
-        None
+        Some(anyhow::anyhow!(
+            "Healthcheck failed: no DNS target is configured and the setup web fallback is disabled"
+        ))
     };
 
-    if !setup_fallback {
-        return Err(dns_error.unwrap_or_else(|| {
-            anyhow::anyhow!(
-                "Healthcheck failed: no DNS target is configured and the setup web fallback is disabled"
-            )
-        }));
+    let mut setup_pending_note = None;
+    if let Some(dns_error) = dns_error {
+        if !setup_fallback {
+            return Err(dns_error);
+        }
+
+        match probe_setup_pending(web_addr, timeout_ms).await {
+            Ok(true) => {
+                setup_pending_note = Some(format!(
+                    "Healthcheck OK: DNS probe failed ({dns_error}), but admin web interface {web_addr} reports setup pending"
+                ));
+            }
+            Ok(false) => return Err(dns_error),
+            Err(status_error) => {
+                return Err(dns_error.context(format!(
+                    "setup status check against {web_addr} failed: {status_error}"
+                )));
+            }
+        }
     }
 
-    match probe_setup_pending(web_addr, timeout_ms).await {
-        Ok(true) => {
-            if let Some(e) = &dns_error {
-                println!(
-                    "Healthcheck OK: DNS probe failed ({e}), but admin web interface {web_addr} reports setup pending"
-                );
-            } else {
-                println!("Healthcheck OK: admin web interface {web_addr} reports setup pending");
-            }
-            Ok(())
-        }
-        Ok(false) => Err(dns_error.unwrap_or_else(|| {
-            anyhow::anyhow!(
-                "Healthcheck failed: admin web interface {web_addr} is not reporting setup pending"
-            )
-        })),
-        Err(status_error) => Err(match dns_error {
-            Some(dns_err) => dns_err.context(format!(
-                "setup status check against {web_addr} failed: {status_error}"
-            )),
-            None => status_error,
-        }),
+    if ha_required {
+        probe_ha_readiness(web_addr, timeout_ms).await?;
     }
+    if let Some(note) = setup_pending_note {
+        println!("{note}");
+    }
+    Ok(())
+}
+
+/// Verifies the HA readiness reported by the public `/health` endpoint.
+///
+/// Any inability to obtain a definitive answer fails closed: an unreachable
+/// web API or a payload without the `ha` object is an error, not a pass.
+async fn probe_ha_readiness(web_addr: SocketAddr, timeout_ms: u64) -> Result<(), anyhow::Error> {
+    let (status, body) = http_get(web_addr, "/health", timeout_ms)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot verify HA readiness from {web_addr}/health: {e}"))?;
+    if status != 200 {
+        return Err(anyhow::anyhow!(
+            "cannot verify HA readiness: {web_addr}/health returned HTTP {status}"
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+        anyhow::anyhow!("invalid HA readiness response from {web_addr}/health: {e}")
+    })?;
+    let ha = value.get("ha").ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot verify HA readiness: {web_addr}/health does not expose the HA readiness signal"
+        )
+    })?;
+    if !ha
+        .get("required")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(anyhow::anyhow!(
+            "cannot verify HA readiness: {web_addr}/health does not report the configured HA role as required"
+        ));
+    }
+    let ready = ha
+        .get("ready")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot verify HA readiness: {web_addr}/health has no boolean `ha.ready` field"
+            )
+        })?;
+    if ready {
+        return Ok(());
+    }
+    let reason = ha
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("the server reported no reason");
+    Err(anyhow::anyhow!(
+        "Healthcheck failed: HA replication is not ready: {reason}"
+    ))
 }
 
 /// Reports whether the admin API is in first-boot setup-pending mode.
@@ -1388,7 +1449,7 @@ mod tests {
         let (dns_addr, _silent) = spawn_silent_udp().await;
         let web_addr =
             spawn_http_router(vec![("/api/v1/status", 503, "Setup not completed")]).await;
-        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, false)
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, false, false)
             .await
             .expect_err("web reachability must not mask a broken DNS listener by default");
         assert!(
@@ -1398,10 +1459,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_healthcheck_fails_when_ha_is_not_ready() {
+        let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
+        let web_addr = spawn_http_router(vec![(
+            "/health",
+            200,
+            r#"{"status":"ok","setup_pending":false,"ha":{"required":true,"ready":false,"reason":"master mTLS initialization failed: Permission denied"}}"#,
+        )])
+        .await;
+
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, true)
+            .await
+            .expect_err("a healthy DNS probe must not mask an unready HA node");
+        let message = err.to_string();
+        assert!(
+            message.contains("HA replication is not ready")
+                && message.contains("Permission denied"),
+            "the readiness reason must reach the operator: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_healthcheck_passes_when_ha_is_ready() {
+        let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
+        let web_addr = spawn_http_router(vec![(
+            "/health",
+            200,
+            r#"{"status":"ok","setup_pending":false,"ha":{"required":true,"ready":true,"reason":null}}"#,
+        )])
+        .await;
+
+        run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, true)
+            .await
+            .expect("a ready HA node must satisfy the healthcheck");
+    }
+
+    #[tokio::test]
+    async fn test_healthcheck_ha_required_without_signal_fails_closed() {
+        let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
+        let web_addr = spawn_http_router(vec![(
+            "/health",
+            200,
+            r#"{"status":"ok","setup_pending":false}"#,
+        )])
+        .await;
+
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, true)
+            .await
+            .expect_err("a missing HA readiness signal must fail closed");
+        assert!(
+            err.to_string().contains("HA readiness"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_healthcheck_ignores_ha_when_not_configured() {
+        let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
+        // No web listener is required when HA is not part of the role.
+        let web_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, false, false)
+            .await
+            .expect("a DNS-only node must stay healthy without an HA check");
+    }
+
+    #[test]
+    fn test_ha_readiness_required_from_config() {
+        let mut cfg = Config::default();
+        cfg.server.role = "master".to_string();
+        assert!(
+            !ha_readiness_required(&cfg),
+            "no [ha] section means no HA readiness gate"
+        );
+
+        cfg.ha = Some(toml::from_str("replication_port = 8953").unwrap());
+        assert!(ha_readiness_required(&cfg));
+
+        cfg.ha = Some(toml::from_str("replication_port = 0").unwrap());
+        assert!(
+            !ha_readiness_required(&cfg),
+            "an explicitly disabled master replication is not a gate"
+        );
+
+        cfg.server.role = "slave".to_string();
+        cfg.ha = Some(toml::from_str("master_url = \"wss://10.0.0.1:8953\"").unwrap());
+        assert!(ha_readiness_required(&cfg));
+
+        cfg.ha = None;
+        assert!(!ha_readiness_required(&cfg));
+    }
+
+    #[tokio::test]
     async fn test_healthcheck_setup_fallback_accepts_pending_health_json() {
         let (dns_addr, _silent) = spawn_silent_udp().await;
         let web_addr = spawn_http_router(vec![("/health", 200, "{\"setup_pending\": true}")]).await;
-        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true)
+        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true, false)
             .await
             .expect("setup-pending web interface must satisfy the setup fallback");
     }
@@ -1411,7 +1563,7 @@ mod tests {
         let (dns_addr, _silent) = spawn_silent_udp().await;
         let web_addr =
             spawn_http_router(vec![("/api/v1/status", 503, "Setup not completed")]).await;
-        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true)
+        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true, false)
             .await
             .expect("503 setup-pending signal must satisfy the setup fallback");
     }
@@ -1420,7 +1572,7 @@ mod tests {
     async fn test_healthcheck_setup_fallback_rejects_completed_setup() {
         let (dns_addr, _silent) = spawn_silent_udp().await;
         let web_addr = spawn_http_router(vec![("/api/v1/status", 401, "Unauthorized")]).await;
-        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true)
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true, false)
             .await
             .expect_err("completed setup must not mask a broken DNS listener");
         assert!(

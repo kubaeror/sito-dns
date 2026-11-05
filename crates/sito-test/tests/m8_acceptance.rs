@@ -739,6 +739,96 @@ async fn test_m8_ha_rest_api_endpoints() {
 }
 
 // ----------------------------------------------------------------------------
+// Test 7b: HA readiness is visible in /health and /ha/status
+// ----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_m8_ha_readiness_is_visible_in_health_and_status() {
+    // Master: a listener/TLS failure must flip ready to false and expose a
+    // reason instead of leaving DNS as the only health signal.
+    let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+    let metrics = MetricsRegistry::new("0.1.0", "test");
+    let coordinator = MasterCoordinator::new("master-ready".to_string(), 1, signing_key, metrics);
+    coordinator.mark_replication_ready();
+    let (master_ctx, master_token, master_dir) =
+        create_test_context("master", Some(coordinator.clone()), None, None).await;
+    let mut master_cfg = (**master_ctx.config.load()).clone();
+    master_cfg.ha = Some(toml::from_str("replication_port = 8953").unwrap());
+    master_ctx.config.store(Arc::new(master_cfg));
+    let master_app = create_router(master_ctx);
+
+    let health = get_json(&master_app, "/health", None).await;
+    assert_eq!(health["ha"]["required"], true);
+    assert_eq!(health["ha"]["ready"], true);
+
+    coordinator.mark_replication_failed("master mTLS initialization failed: Permission denied");
+    let status = get_json(&master_app, "/api/v1/ha/status", Some(&master_token)).await;
+    assert_eq!(
+        status["ready"], false,
+        "failed listener must not look active"
+    );
+    assert!(
+        status["readiness_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Permission denied"),
+        "readiness reason must survive to /ha/status: {status}"
+    );
+    let health = get_json(&master_app, "/health", None).await;
+    assert_eq!(health["ha"]["required"], true);
+    assert_eq!(health["ha"]["ready"], false);
+
+    // Slave: readiness requires an actual sync, not just a configured URL.
+    let tracker = SlaveStatusTracker::new(
+        "slave-ready".to_string(),
+        0,
+        Some("wss://master.internal:8953".to_string()),
+    );
+    tracker.set_connection_error(Some("mTLS handshake failed with master".to_string()));
+    let (slave_ctx, slave_token, slave_dir) =
+        create_test_context("slave", None, Some(tracker.clone()), None).await;
+    let mut slave_cfg = (**slave_ctx.config.load()).clone();
+    slave_cfg.ha = Some(toml::from_str("master_url = \"wss://master.internal:8953\"").unwrap());
+    slave_ctx.config.store(Arc::new(slave_cfg));
+    let slave_app = create_router(slave_ctx);
+
+    let status = get_json(&slave_app, "/api/v1/ha/status", Some(&slave_token)).await;
+    assert_eq!(status["ready"], false);
+    assert!(
+        status["readiness_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("mTLS handshake failed"),
+        "handshake failure must reach /ha/status: {status}"
+    );
+
+    tracker.mark_synced_with_term(1, 0);
+    let status = get_json(&slave_app, "/api/v1/ha/status", Some(&slave_token)).await;
+    assert_eq!(status["ready"], true);
+    assert!(status["readiness_reason"].is_null());
+
+    let _ = std::fs::remove_dir_all(&master_dir);
+    let _ = std::fs::remove_dir_all(&slave_dir);
+}
+
+/// GETs `path` from the router and decodes a JSON body.
+async fn get_json(app: &axum::Router, path: &str, token: Option<&str>) -> serde_json::Value {
+    let mut request = Request::builder().uri(path);
+    if let Some(token) = token {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let resp = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+// ----------------------------------------------------------------------------
 // Test 8: List change on master applies to 2 slaves in < 2 seconds
 // ----------------------------------------------------------------------------
 #[tokio::test]

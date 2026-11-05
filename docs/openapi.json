@@ -3835,6 +3835,17 @@
               "null"
             ]
           },
+          "readiness_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why `ready` is false (unreadable key, bind failure, handshake failure,\nnot yet synced, ...), or an explanatory note for a deliberately\ndisabled replication listener."
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "Whether the node's HA role is actually operational. A master with a\nfailed mTLS listener or a slave that has not reached `synced` reports\n`false` even though DNS keeps answering."
+          },
           "role": {
             "type": "string"
           },

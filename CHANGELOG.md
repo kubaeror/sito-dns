@@ -17,6 +17,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   failed transfer is reported instead of being silently skipped.
 
 ### Fixed
+- **HA failures are visible in status and healthchecks**: a master whose
+  replication listener failed to initialize mTLS or bind, and a slave whose
+  handshake never completed or that has not reached `synced`, now report
+  `ready: false` with a `readiness_reason` in `GET /api/v1/ha/status`. The
+  public `/health` endpoint exposes the same signal, and `sito healthcheck`
+  fails when `[ha]` makes replication part of the role, so a successful DNS
+  probe can no longer mask a broken HA node. A master with
+  `replication_port = 0` remains ready and explains that replication is
+  intentionally disabled.
 - **HA compares effective `[auth]` policy, not raw TOML**: an `[auth]` table
   that spells out the default values (as `config.example.toml` does) is now
   equivalent to omitting the section, and inert legacy keys stripped during
