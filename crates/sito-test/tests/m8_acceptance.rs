@@ -872,6 +872,260 @@ async fn test_m8_ha_disabled_reason_is_exposed_in_status() {
     let _ = std::fs::remove_dir_all(&master_dir);
 }
 
+// ----------------------------------------------------------------------------
+// Test 7c-b: a real unreadable key blocks mTLS until permissions are fixed
+// ----------------------------------------------------------------------------
+//
+// Non-root-safe half of the ownership acceptance: mode 0000 on the key makes
+// `build_server_tls_config` fail with a real permission error, and restoring
+// mode 0600 makes the same call succeed. Root bypasses mode bits, so this test
+// skips when euid is 0 (the root-gated test below covers that case).
+#[cfg(unix)]
+#[tokio::test]
+async fn test_m8_unreadable_key_fails_tls_until_permissions_fixed() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_m8_unreadable_key_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let probe = dir.join("probe");
+    std::fs::write(&probe, b"x").unwrap();
+    if std::fs::metadata(&probe).unwrap().uid() == 0 {
+        eprintln!(
+            "skipping test_m8_unreadable_key_fails_tls_until_permissions_fixed: root ignores mode bits"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let certs = generate_ha_certs(&dir, true, true).unwrap();
+    let cert = certs.master_cert_path.clone().unwrap();
+    let key = certs.master_key_path.clone().unwrap();
+    let fingerprint = certs.slave_fingerprint.clone().unwrap();
+
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let err =
+        sito_ha::build_server_tls_config(&cert, &key, std::slice::from_ref(&fingerprint), None)
+            .expect_err("an unreadable private key must fail mTLS initialization");
+    assert!(
+        err.to_string().contains("Permission denied"),
+        "expected a real permission error, got: {err}"
+    );
+
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    sito_ha::build_server_tls_config(&cert, &key, &[fingerprint], None)
+        .expect("restoring key permissions must make mTLS initialization succeed");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ----------------------------------------------------------------------------
+// Test 7d: root-owned key is unreadable, and chown makes HA start (root only)
+// ----------------------------------------------------------------------------
+//
+// Root-only verification of the runbook's systemd/Docker path. The parent
+// process must be root so it can generate a root-owned 0600 key and run the
+// child probe under uid/gid 65532 (the container runtime identity):
+//
+//   sudo env CARGO_TARGET_DIR=/home/ubuntu/sito-dns/target \
+//     cargo test -p sito-test --test m8_acceptance \
+//     test_m8_root_owned_key_chown_activates_ha -- --nocapture
+//
+// Or use `sudo scripts/test-ha-ownership-root.sh`. The test skips (and passes)
+// when not run as root so ordinary unprivileged test runs stay green.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_m8_root_owned_key_chown_activates_ha() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::process::CommandExt as _;
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_m8_root_owner_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let probe_path = dir.join("probe");
+    std::fs::write(&probe_path, b"x").unwrap();
+    let euid = std::fs::metadata(&probe_path).unwrap().uid();
+    if euid != 0 {
+        eprintln!(
+            "skipping test_m8_root_owned_key_chown_activates_ha: requires root (euid {euid})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    // Root-generated keys: exactly the state `sudo sito ha gen-certs` produced
+    // before ownership transfer.
+    let certs = generate_ha_certs(&dir, true, true).unwrap();
+    let master_key = certs.master_key_path.clone().unwrap();
+    let master_cert = certs.master_cert_path.clone().unwrap();
+    let slave_fingerprint = certs.slave_fingerprint.clone().unwrap();
+    let key_meta = std::fs::metadata(&master_key).unwrap();
+    assert_eq!(key_meta.uid(), 0, "fixture key must be root-owned");
+    assert_eq!(key_meta.mode() & 0o777, 0o600);
+
+    // The test binary lives under the developer checkout (often mode 0750),
+    // which uid 65532 cannot traverse; copy it somewhere world-executable.
+    let child_exe = dir.join("m8_acceptance_child");
+    std::fs::copy(std::env::current_exe().unwrap(), &child_exe).unwrap();
+    std::fs::set_permissions(&child_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run_child = |mode: &str| {
+        let mut command = std::process::Command::new(&child_exe);
+        command
+            .arg("--exact")
+            .arg("test_m8_ha_runtime_child_probe")
+            .arg("--nocapture")
+            .env("SITO_HA_CHILD_MODE", mode)
+            .env("SITO_HA_CHILD_CERT", &master_cert)
+            .env("SITO_HA_CHILD_KEY", &master_key)
+            .env("SITO_HA_CHILD_FINGERPRINT", &slave_fingerprint)
+            .current_dir("/tmp");
+        command.uid(65532).gid(65532);
+        command.output().expect("spawn uid-65532 child probe")
+    };
+
+    // 1. Root-owned 0600 key is unreadable by the runtime user: real mTLS
+    //    initialization must fail with a permission error, not injected state.
+    let unreadable = run_child("unreadable");
+    assert!(
+        unreadable.status.success(),
+        "runtime user unexpectedly read a root-owned key\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&unreadable.stdout),
+        String::from_utf8_lossy(&unreadable.stderr)
+    );
+
+    // 2. Perform the documented chown, then let the same runtime user start
+    //    the listener and verify the public readiness signal flips to ready.
+    for path in [
+        certs.ca_cert_path.as_path(),
+        certs.ca_key_path.as_path(),
+        master_cert.as_path(),
+        master_key.as_path(),
+        certs.slave_cert_path.as_ref().unwrap().as_path(),
+        certs.slave_key_path.as_ref().unwrap().as_path(),
+    ] {
+        std::os::unix::fs::chown(path, Some(65532), Some(65532))
+            .unwrap_or_else(|e| panic!("chown {}: {e}", path.display()));
+    }
+
+    let ready = run_child("ready");
+    assert!(
+        ready.status.success(),
+        "runtime user could not start HA after chown\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ready.stdout),
+        String::from_utf8_lossy(&ready.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Child process for [`test_m8_root_owned_key_chown_activates_ha`].
+///
+/// Runs only when `SITO_HA_CHILD_MODE` is set and is invoked under uid/gid
+/// 65532. `unreadable` asserts TLS initialization fails against the
+/// root-owned key; `ready` starts the real listener, then checks the API's
+/// `/health` and `/ha/status` readiness.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_m8_ha_runtime_child_probe() {
+    let Ok(mode) = std::env::var("SITO_HA_CHILD_MODE") else {
+        return;
+    };
+    let cert = PathBuf::from(std::env::var("SITO_HA_CHILD_CERT").unwrap());
+    let key = PathBuf::from(std::env::var("SITO_HA_CHILD_KEY").unwrap());
+    let fingerprint = std::env::var("SITO_HA_CHILD_FINGERPRINT").unwrap();
+
+    // Running as uid 65532: probe the real file permissions, never the
+    // in-process readiness fields.
+    use std::os::unix::fs::MetadataExt as _;
+    let probe_uid = {
+        let probe =
+            std::env::temp_dir().join(format!("sito_m8_child_uid_{}", rand::random::<u64>()));
+        std::fs::write(&probe, b"x").unwrap();
+        let uid = std::fs::metadata(&probe).unwrap().uid();
+        let _ = std::fs::remove_file(&probe);
+        uid
+    };
+    assert_eq!(probe_uid, 65532, "child probe must run as uid 65532");
+
+    match mode.as_str() {
+        "unreadable" => {
+            let err = sito_ha::build_server_tls_config(
+                &cert,
+                &key,
+                std::slice::from_ref(&fingerprint),
+                None,
+            )
+            .expect_err("a root-owned 0600 key must be unreadable by uid 65532");
+            assert!(
+                err.to_string().contains("Permission denied"),
+                "expected a permission error, got: {err}"
+            );
+        }
+        "ready" => {
+            let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+            let metrics = MetricsRegistry::new("0.1.0", "child");
+            let coordinator =
+                MasterCoordinator::new("child-master".to_string(), 1, signing_key, metrics);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let replication_port = reserve_tcp_port();
+            let handle = spawn_master_server(
+                HaConfig {
+                    replication_port,
+                    listen_addr: "127.0.0.1".to_string(),
+                    cert: Some(cert),
+                    key: Some(key),
+                    pinned_slave_fingerprints: vec![fingerprint],
+                    ..Default::default()
+                },
+                coordinator.clone(),
+                shutdown_rx,
+            );
+
+            let mut readiness = coordinator.readiness();
+            for _ in 0..100 {
+                if readiness.ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                readiness = coordinator.readiness();
+            }
+            assert!(
+                readiness.ready,
+                "listener did not become ready after chown: {readiness:?}"
+            );
+
+            let (ctx, token, dir) =
+                create_test_context("master", Some(coordinator), None, None).await;
+            let mut cfg = (**ctx.config.load()).clone();
+            cfg.ha =
+                Some(toml::from_str(&format!("replication_port = {replication_port}")).unwrap());
+            ctx.config.store(Arc::new(cfg));
+            let app = create_router(ctx);
+
+            let health = get_json(&app, "/health", None).await;
+            assert_eq!(health["ha"]["required"], true);
+            assert_eq!(
+                health["ha"]["ready"], true,
+                "public /health must flip to ready after chown: {health}"
+            );
+            let status = get_json(&app, "/api/v1/ha/status", Some(&token)).await;
+            assert_eq!(status["ready"], true);
+
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        other => panic!("unknown SITO_HA_CHILD_MODE '{other}'"),
+    }
+}
+
 /// GETs `path` from the router and decodes a JSON body.
 async fn get_json(app: &axum::Router, path: &str, token: Option<&str>) -> serde_json::Value {
     let mut request = Request::builder().uri(path);

@@ -99,6 +99,11 @@ cargo clippy --workspace -- -D warnings
 # Unit and integration tests
 cargo test --workspace
 
+# HA certificate ownership (root-gated; skipped in unprivileged runs)
+# Generates root-owned keys, proves uid 65532 cannot read them, chowns, then
+# starts the real mTLS listener and checks /health + /api/v1/ha/status.
+sudo scripts/test-ha-ownership-root.sh
+
 # License and dependency check
 cargo deny check
 
