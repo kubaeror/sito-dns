@@ -389,10 +389,26 @@ mod tests {
         .expect_err("an older-term master must be rejected even with a higher version");
         assert!(matches!(err, HaError::Validation { ref field, .. } if field == "term"));
 
-        // A promoted master (new epoch) may restart the version sequence.
-        let promoted = ConfigBundle {
+        // A term bump alone is not permission to roll the version back: a
+        // promoted master with a stale state file is rejected.
+        let stale_promotion = ConfigBundle {
             term: 3,
             ..bundle(1)
+        };
+        let stale_promotion_push = build_and_sign_push(&stale_promotion, &signing_key).unwrap();
+        let err = verify_and_unpack_push_with_watermark(
+            &stale_promotion_push,
+            tracker.get_watermark().as_ref(),
+            &signing_key.public_key(),
+        )
+        .expect_err("a higher term with a lower version must not roll the cluster back");
+        assert!(matches!(err, HaError::Validation { ref field, .. } if field == "version"));
+
+        // An explicit promotion must raise both term and version above the
+        // applied high-water mark.
+        let promoted = ConfigBundle {
+            term: 3,
+            ..bundle(11)
         };
         let promoted_push = build_and_sign_push(&promoted, &signing_key).unwrap();
         let accepted = verify_and_unpack_push_with_watermark(
@@ -402,12 +418,12 @@ mod tests {
         )
         .expect("a newer explicitly promoted epoch must be accepted");
         assert_eq!(accepted.term, 3);
-        assert_eq!(accepted.version, 1);
+        assert_eq!(accepted.version, 11);
         // The promotion is only complete once the new epoch is applied; record
         // its watermark before checking that the old epoch cannot come back.
         tracker
             .persist_watermark(
-                1,
+                11,
                 3,
                 &crate::bundle::push_payload_hash(&promoted_push).unwrap(),
             )

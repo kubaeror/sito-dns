@@ -488,6 +488,20 @@ pub fn verify_and_unpack_push_with_watermark(
                 ),
             });
         }
+        if bundle.term > watermark.term {
+            // A term increase is an explicit promotion, but it is not
+            // permission to roll the version back: the promoted master must
+            // continue above the cluster's applied high-water mark.
+            if bundle.version <= watermark.version {
+                return Err(HaError::Validation {
+                    field: "version".to_string(),
+                    reason: format!(
+                        "Higher-term push (term {} version {}) must continue above the applied version {}; a term bump does not permit a version rollback (restore the promoted state or raise the version)",
+                        bundle.term, bundle.version, watermark.version
+                    ),
+                });
+            }
+        }
         if bundle.term == watermark.term {
             if bundle.version < watermark.version {
                 return Err(HaError::Validation {

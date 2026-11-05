@@ -1054,6 +1054,25 @@ where
                         .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
                     return Ok(());
                 }
+                if push_term > watermark.term && target_version <= watermark.version {
+                    let reason = format!(
+                        "Higher-term push (term {push_term} version {target_version}) must continue above the applied version {}; a term bump does not permit a version rollback",
+                        watermark.version
+                    );
+                    tracker.mark_degraded(reason.clone());
+                    let ack = HaMessage::Ack {
+                        version: watermark.version,
+                        term: watermark.term,
+                        applied: false,
+                        conflict: Some(AckConflict::StaleVersion),
+                        error: Some(reason),
+                    };
+                    ws_stream
+                        .send(WsMessage::Text(ack.to_json()?.into()))
+                        .await
+                        .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                    return Ok(());
+                }
                 if push_term == watermark.term {
                     if target_version < watermark.version {
                         let ack = HaMessage::Ack {

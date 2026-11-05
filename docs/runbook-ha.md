@@ -76,6 +76,11 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
        (a first promotion from a term-0 cluster uses `1`), and
      - `version` is greater than the highest version the remaining slaves have
        applied (the previous cluster version `N` becomes `N+1`).
+     A term increase alone is **not** accepted: slaves enforce version
+     continuity across a promotion and reject a higher-term bundle whose
+     version is not above their applied high-water mark. That prevents a
+     promoted node with a stale state file from silently rolling the cluster
+     back.
      ```json
      {
        "version": 12,

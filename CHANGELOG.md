@@ -28,9 +28,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   master that sees a replica ahead in the same term or in a newer term marks
   itself `diverged` and no longer seeds its counter or republishes its stale
   active bundle. Recovery is an explicit promotion that raises `term` and
-  `version` in `ha_state.toml`; existing state files without a term load as
-  term 0 and old signed bundles remain verifiable. Upgrade slaves before
-  promoting a master (see `docs/runbook-ha.md`).
+  `version` in `ha_state.toml`; a higher term does not bypass version
+  continuity, so the promoted version must also exceed the cluster high-water
+  mark. Existing state files without a term load as term 0 and old signed
+  bundles remain verifiable. Upgrade slaves before promoting a master (see
+  `docs/runbook-ha.md`).
 - **Same-term HA forks are latched**: when a slave receives the same version
   and term with a different signed payload hash, it now persists a fork marker
   in `ha_watermark.toml`, degrades immediately, and rejects every further push

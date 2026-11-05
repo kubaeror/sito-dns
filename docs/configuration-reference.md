@@ -430,10 +430,12 @@ is node-local and must not be copied between slaves.
 
 Cluster terms are node-persisted, not configuration keys: the master stores the
 current term inside `ha_state.toml` and only an explicit promotion (editing the
-state file and restarting, see `docs/runbook-ha.md`) raises it. Upgrade every
-slave before promoting a master so the new term is persisted; a stale master
-from an older term then cannot overwrite newer configuration even if its
-version counter is higher.
+state file and restarting, see `docs/runbook-ha.md`) raises it. A promotion must
+raise both the term and the version above the cluster high-water mark: a higher
+term alone does not bypass version continuity, so a promoted node with a stale
+state file cannot roll the cluster back. Upgrade every slave before promoting a
+master so the new term is persisted; a stale master from an older term then
+cannot overwrite newer configuration even if its version counter is higher.
 
 ---
 
