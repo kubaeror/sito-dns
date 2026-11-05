@@ -962,12 +962,12 @@ mod tests {
         let mut with_default_auth = without_auth.clone();
         with_default_auth.auth = Some(
             toml::from_str(
-                r#"
+                r"
                 session_ttl_hours = 24
                 login_rate_limit = 5
                 session_persist = true
                 token_default_ttl_days = 90
-                "#,
+                ",
             )
             .unwrap(),
         );

@@ -1235,7 +1235,7 @@ mod tests {
             .expect("parse update --config");
         match cli.command {
             Some(Commands::Update { config, .. }) => {
-                assert_eq!(config, Some(PathBuf::from("/etc/sito/config.toml")))
+                assert_eq!(config, Some(PathBuf::from("/etc/sito/config.toml")));
             }
             other => panic!("expected update command, got {other:?}"),
         }
