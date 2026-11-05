@@ -17,6 +17,10 @@ pub enum HaMessage {
     Hello {
         instance: String,
         have_version: u64,
+        /// Cluster epoch/term of the sender's last applied configuration.
+        /// Missing on older peers, which are treated as term 0.
+        #[serde(default)]
+        have_term: u64,
         #[serde(default)]
         capabilities: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,6 +37,10 @@ pub enum HaMessage {
     #[serde(rename = "config_push")]
     ConfigPush {
         version: u64,
+        /// Cluster epoch/term bound to the signed bundle. Missing on older
+        /// masters, which are treated as term 0.
+        #[serde(default)]
+        term: u64,
         hash_blake3: String,
         signature_ed25519: String,
         payload_b64: String,
@@ -43,6 +51,9 @@ pub enum HaMessage {
     #[serde(rename = "ack")]
     Ack {
         version: u64,
+        /// Cluster epoch/term of the acknowledged configuration.
+        #[serde(default)]
+        term: u64,
         applied: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
@@ -110,6 +121,7 @@ mod tests {
         let hello = HaMessage::Hello {
             instance: "slave-pi".to_string(),
             have_version: 41,
+            have_term: 3,
             capabilities: vec!["stats-v1".to_string()],
             token: None,
             role: Some("slave".to_string()),
@@ -119,12 +131,27 @@ mod tests {
         assert!(json.contains("\"type\":\"hello\""));
         assert!(json.contains("\"instance\":\"slave-pi\""));
         assert!(json.contains("\"have_version\":41"));
+        assert!(json.contains("\"have_term\":3"));
 
         let deserialized = HaMessage::from_json(&json).unwrap();
         assert_eq!(hello, deserialized);
 
+        // Older peers omit the new fields: they must deserialize as term 0.
+        let legacy_hello =
+            HaMessage::from_json(r#"{"type":"hello","instance":"legacy","have_version":7}"#)
+                .unwrap();
+        assert!(matches!(
+            legacy_hello,
+            HaMessage::Hello {
+                have_term: 0,
+                have_version: 7,
+                ..
+            }
+        ));
+
         let push = HaMessage::ConfigPush {
             version: 42,
+            term: 3,
             hash_blake3: "hash1".to_string(),
             signature_ed25519: "sig1".to_string(),
             payload_b64: "payload1".to_string(),
@@ -137,6 +164,7 @@ mod tests {
 
         let ack = HaMessage::Ack {
             version: 42,
+            term: 3,
             applied: true,
             error: None,
         };

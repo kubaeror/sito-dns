@@ -42,6 +42,8 @@ impl std::fmt::Display for SlaveState {
 pub struct SlaveStatusTracker {
     pub instance_name: String,
     pub current_version: Arc<AtomicU64>,
+    /// Cluster epoch/term of the last applied configuration.
+    pub current_term: Arc<AtomicU64>,
     pub state: Arc<Mutex<SlaveState>>,
     pub degraded_reason: Arc<Mutex<Option<String>>>,
     pub last_synced_at: Arc<Mutex<Option<DateTime<Utc>>>>,
@@ -57,6 +59,7 @@ impl SlaveStatusTracker {
         Self {
             instance_name,
             current_version: Arc::new(AtomicU64::new(initial_version)),
+            current_term: Arc::new(AtomicU64::new(0)),
             state: Arc::new(Mutex::new(SlaveState::Connecting)),
             degraded_reason: Arc::new(Mutex::new(None)),
             last_synced_at: Arc::new(Mutex::new(None)),
@@ -84,8 +87,18 @@ impl SlaveStatusTracker {
                     ),
                 });
             }
+            if watermark.term == u64::MAX {
+                return Err(HaError::Validation {
+                    field: "ha_watermark".to_string(),
+                    reason: format!(
+                        "Watermark {} records term u64::MAX and can never advance; delete it only after accepting a full resync",
+                        path.display()
+                    ),
+                });
+            }
             self.current_version
                 .store(watermark.version, Ordering::SeqCst);
+            self.current_term.store(watermark.term, Ordering::SeqCst);
         }
         *self.watermark.lock().unwrap() = watermark;
         *self.watermark_path.lock().unwrap() = Some(path);
@@ -117,22 +130,34 @@ impl SlaveStatusTracker {
         self.watermark.lock().unwrap().clone()
     }
 
-    /// Atomically persists `{version, payload_hash, timestamp}` (0600) and
-    /// updates the in-memory watermark only after the write succeeds.
+    /// Atomically persists `{version, term, payload_hash, timestamp}` (0600)
+    /// and updates the in-memory watermark only after the write succeeds.
     ///
     /// Must be called after the pushed configuration has been applied and
     /// persisted, before the ACK is sent.
-    pub fn persist_watermark(&self, version: u64, payload_hash: &str) -> Result<(), HaError> {
+    pub fn persist_watermark(
+        &self,
+        version: u64,
+        term: u64,
+        payload_hash: &str,
+    ) -> Result<(), HaError> {
         if version == u64::MAX {
             return Err(HaError::Validation {
                 field: "ha_watermark".to_string(),
                 reason: "Refusing to persist an applied watermark at version u64::MAX".to_string(),
             });
         }
+        if term == u64::MAX {
+            return Err(HaError::Validation {
+                field: "ha_watermark".to_string(),
+                reason: "Refusing to persist an applied watermark at term u64::MAX".to_string(),
+            });
+        }
         #[allow(clippy::cast_sign_loss)]
         let timestamp = Utc::now().timestamp_millis() as u64;
         let watermark = AppliedWatermark {
             version,
+            term,
             payload_hash: payload_hash.trim_start_matches("blake3:").to_string(),
             timestamp,
         };
@@ -199,10 +224,20 @@ impl SlaveStatusTracker {
         self.current_version.load(Ordering::SeqCst)
     }
 
+    pub fn get_term(&self) -> u64 {
+        self.current_term.load(Ordering::SeqCst)
+    }
+
     /// Records a successful apply (or an early ACK for the already-running
     /// version) and clears any previous degraded reason.
     pub fn mark_synced(&self, version: u64) {
+        self.mark_synced_with_term(version, self.get_term());
+    }
+
+    /// Records a successful apply together with the bundle's cluster term.
+    pub fn mark_synced_with_term(&self, version: u64, term: u64) {
         self.current_version.store(version, Ordering::SeqCst);
+        self.current_term.store(term, Ordering::SeqCst);
         *self.state.lock().unwrap() = SlaveState::Synced;
         *self.degraded_reason.lock().unwrap() = None;
         *self.last_synced_at.lock().unwrap() = Some(Utc::now());
@@ -233,6 +268,7 @@ mod tests {
     fn bundle(version: u64) -> ConfigBundle {
         ConfigBundle {
             version,
+            term: 0,
             timestamp: 1,
             config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec![],
@@ -248,7 +284,7 @@ mod tests {
         let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
             .with_watermark_path(path.clone())
             .unwrap();
-        tracker.persist_watermark(5, "abc123").unwrap();
+        tracker.persist_watermark(5, 0, "abc123").unwrap();
 
         #[cfg(unix)]
         {
@@ -263,10 +299,80 @@ mod tests {
             .with_watermark_path(path.clone())
             .unwrap();
         assert_eq!(restarted.get_version(), 5);
+        assert_eq!(restarted.get_term(), 0);
         let watermark = restarted.get_watermark().expect("watermark restored");
         assert_eq!(watermark.version, 5);
+        assert_eq!(watermark.term, 0);
         assert_eq!(watermark.payload_hash, "abc123");
         assert!(watermark.timestamp > 0);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_stale_master_term_is_rejected_and_new_term_wins() {
+        let path = temp_path("term");
+        let signing_key = Ed25519SigningKey::generate().unwrap();
+        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+
+        // The slave is at epoch 2, version 10.
+        let current = ConfigBundle {
+            term: 2,
+            ..bundle(10)
+        };
+        let current_push = build_and_sign_push(&current, &signing_key).unwrap();
+        let hash = crate::bundle::push_payload_hash(&current_push).unwrap();
+        tracker.persist_watermark(10, 2, &hash).unwrap();
+
+        // A stale master from epoch 1 with a higher version must not overwrite
+        // the newer configuration.
+        let stale = ConfigBundle {
+            term: 1,
+            ..bundle(11)
+        };
+        let stale_push = build_and_sign_push(&stale, &signing_key).unwrap();
+        let err = verify_and_unpack_push_with_watermark(
+            &stale_push,
+            tracker.get_watermark().as_ref(),
+            &signing_key.public_key(),
+        )
+        .expect_err("an older-term master must be rejected even with a higher version");
+        assert!(matches!(err, HaError::Validation { ref field, .. } if field == "term"));
+
+        // A promoted master (new epoch) may restart the version sequence.
+        let promoted = ConfigBundle {
+            term: 3,
+            ..bundle(1)
+        };
+        let promoted_push = build_and_sign_push(&promoted, &signing_key).unwrap();
+        let accepted = verify_and_unpack_push_with_watermark(
+            &promoted_push,
+            tracker.get_watermark().as_ref(),
+            &signing_key.public_key(),
+        )
+        .expect("a newer explicitly promoted epoch must be accepted");
+        assert_eq!(accepted.term, 3);
+        assert_eq!(accepted.version, 1);
+        // The promotion is only complete once the new epoch is applied; record
+        // its watermark before checking that the old epoch cannot come back.
+        tracker
+            .persist_watermark(
+                1,
+                3,
+                &crate::bundle::push_payload_hash(&promoted_push).unwrap(),
+            )
+            .unwrap();
+
+        // Old-epoch bundles can never be replayed after the promotion.
+        let err = verify_and_unpack_push_with_watermark(
+            &current_push,
+            tracker.get_watermark().as_ref(),
+            &signing_key.public_key(),
+        )
+        .expect_err("the previous epoch must be rejected after the watermark is at a newer term");
+        assert!(matches!(err, HaError::Validation { ref field, .. } if field == "term"));
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -279,7 +385,7 @@ mod tests {
             .with_watermark_path(path.clone())
             .unwrap();
         let old_push = build_and_sign_push(&bundle(4), &signing_key).unwrap();
-        tracker.persist_watermark(5, "abc123").unwrap();
+        tracker.persist_watermark(5, 0, "abc123").unwrap();
 
         // Simulate a process restart: the in-memory counter is unknown, so the
         // persisted watermark is the only replay guard.
@@ -306,7 +412,7 @@ mod tests {
             .unwrap();
         let push = build_and_sign_push(&bundle(5), &signing_key).unwrap();
         let hash = crate::bundle::push_payload_hash(&push).unwrap();
-        tracker.persist_watermark(5, &hash).unwrap();
+        tracker.persist_watermark(5, 0, &hash).unwrap();
 
         // Same version and identical payload: an idempotent re-delivery.
         verify_and_unpack_push_with_watermark(
@@ -337,6 +443,26 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_watermark_without_term_loads_as_term_zero() {
+        let path = temp_path("legacy");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"version":5,"payload_hash":"abc123","timestamp":1}"#,
+        )
+        .unwrap();
+
+        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .expect("a pre-term watermark must remain loadable");
+        assert_eq!(tracker.get_version(), 5);
+        assert_eq!(tracker.get_term(), 0);
+        assert_eq!(tracker.get_watermark().unwrap().term, 0);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn test_corrupt_watermark_fails_closed() {
         let path = temp_path("corrupt");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -357,7 +483,7 @@ mod tests {
             .with_watermark_path(path.clone())
             .unwrap();
         assert_eq!(tracker.get_version(), 0);
-        assert!(tracker.persist_watermark(u64::MAX, "hash").is_err());
+        assert!(tracker.persist_watermark(u64::MAX, 0, "hash").is_err());
         assert_eq!(
             tracker.get_version(),
             0,

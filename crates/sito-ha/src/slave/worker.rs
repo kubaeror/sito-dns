@@ -103,12 +103,33 @@ pub async fn apply_config_push(
         }
     };
 
+    // Before the first watermark exists (fresh node or a test harness), fall
+    // back to the in-memory applied version so the monotonicity guard is not
+    // weakened by the watermark refactor.
+    if watermark.is_none() && bundle.version <= tracker.get_version() {
+        let err = HaError::Validation {
+            field: "version".to_string(),
+            reason: format!(
+                "Push version {} is not greater than the current applied version {} (monotonicity violation/replay rejected)",
+                bundle.version,
+                tracker.get_version()
+            ),
+        };
+        tracker.mark_degraded(format!("Validation/Signature verification failed: {err}"));
+        return Err(err);
+    }
+
     // An identical re-delivery of the already-applied bundle needs no work and
-    // must not rewrite local configuration; acknowledge it as synced.
+    // must not rewrite local configuration; acknowledge it as synced. A newer
+    // term with the same payload only records the promoted epoch.
     if let Some(ref applied) = watermark
-        && watermark_covers(applied, bundle.version, &payload_hash)
+        && bundle.version == applied.version
+        && payload_hash == applied.normalized_hash()
     {
-        tracker.mark_synced(bundle.version);
+        if bundle.term > applied.term {
+            tracker.persist_watermark(bundle.version, bundle.term, &payload_hash)?;
+        }
+        tracker.mark_synced_with_term(bundle.version, bundle.term);
         return Ok(bundle.version);
     }
 
@@ -271,7 +292,7 @@ pub async fn apply_config_push(
 
     // Persist the applied-version watermark before acknowledging: a crash
     // between apply and ACK must still leave a restart able to reject replays.
-    if let Err(e) = tracker.persist_watermark(bundle.version, &payload_hash) {
+    if let Err(e) = tracker.persist_watermark(bundle.version, bundle.term, &payload_hash) {
         let reason = format!("Failed to persist the applied-version watermark: {e}");
         error!(
             error = %e,
@@ -284,7 +305,7 @@ pub async fn apply_config_push(
 
     // Mark tracker as synced (a successful apply is the only path that clears
     // a `Degraded` state).
-    tracker.mark_synced(bundle.version);
+    tracker.mark_synced_with_term(bundle.version, bundle.term);
     #[allow(clippy::cast_precision_loss)]
     handles
         .metrics
@@ -810,6 +831,7 @@ where
     let hello = HaMessage::Hello {
         instance: tracker.instance_name.clone(),
         have_version,
+        have_term: tracker.get_term(),
         capabilities: vec!["stats-v1".to_string()],
         token: ha_config.slave_token.clone(),
         role: Some("slave".to_string()),
@@ -862,6 +884,7 @@ where
                 let hello = HaMessage::Hello {
                     instance: tracker.instance_name.clone(),
                     have_version: cur_v,
+                    have_term: tracker.get_term(),
                     capabilities: vec!["stats-v1".to_string()],
                     token: ha_config.slave_token.clone(),
                     role: Some("slave".to_string()),
@@ -977,24 +1000,27 @@ where
         }
         HaMessage::ConfigPush {
             ref version,
+            ref term,
             ref payload_hash_blake3,
             ..
         } => {
             let target_version = *version;
+            let push_term = *term;
 
-            // A push at or below the persisted watermark is only acceptable
-            // when it is the identical signed payload that produced that
-            // watermark. An older version, or the same version with different
-            // content, is a replay/rollback attempt and must not be
-            // acknowledged as applied.
+            // A push from an older epoch is a stale master and must never
+            // overwrite newer configuration, even when its version counter is
+            // higher. Within the same epoch the version must advance, and a
+            // same-version push is only acceptable when it is the identical
+            // signed payload.
             if let Some(watermark) = tracker.get_watermark() {
-                if target_version < watermark.version {
+                if push_term < watermark.term {
                     let ack = HaMessage::Ack {
                         version: watermark.version,
+                        term: watermark.term,
                         applied: false,
                         error: Some(format!(
-                            "Push version {target_version} is below the applied watermark {} (replay rejected)",
-                            watermark.version
+                            "Push term {push_term} is below the applied term {} (stale master/epoch rejected)",
+                            watermark.term
                         )),
                     };
                     ws_stream
@@ -1003,13 +1029,15 @@ where
                         .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
                     return Ok(());
                 }
-                if target_version == watermark.version {
-                    if !watermark_covers(&watermark, target_version, payload_hash_blake3) {
+                if push_term == watermark.term {
+                    if target_version < watermark.version {
                         let ack = HaMessage::Ack {
                             version: watermark.version,
+                            term: watermark.term,
                             applied: false,
                             error: Some(format!(
-                                "Push version {target_version} does not match the applied payload hash (same-version replay rejected)"
+                                "Push version {target_version} is below the applied watermark {} (replay rejected)",
+                                watermark.version
                             )),
                         };
                         ws_stream
@@ -1018,27 +1046,71 @@ where
                             .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
                         return Ok(());
                     }
-                    let ack = HaMessage::Ack {
-                        version: watermark.version,
-                        applied: true,
-                        error: None,
-                    };
-                    ws_stream
-                        .send(WsMessage::Text(ack.to_json()?.into()))
-                        .await
-                        .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
-                    if tracker.get_state() != SlaveState::Degraded {
-                        tracker.mark_synced(watermark.version);
+                    if target_version == watermark.version {
+                        if !watermark_covers(
+                            &watermark,
+                            push_term,
+                            target_version,
+                            payload_hash_blake3,
+                        ) {
+                            let ack = HaMessage::Ack {
+                                version: watermark.version,
+                                term: watermark.term,
+                                applied: false,
+                                error: Some(format!(
+                                    "Push version {target_version} does not match the applied payload hash (same-version replay rejected)"
+                                )),
+                            };
+                            ws_stream
+                                .send(WsMessage::Text(ack.to_json()?.into()))
+                                .await
+                                .map_err(|e| {
+                                    HaError::Connection(format!("Failed to send Ack: {e}"))
+                                })?;
+                            return Ok(());
+                        }
+                        let ack = HaMessage::Ack {
+                            version: watermark.version,
+                            term: watermark.term,
+                            applied: true,
+                            error: None,
+                        };
+                        ws_stream
+                            .send(WsMessage::Text(ack.to_json()?.into()))
+                            .await
+                            .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                        if tracker.get_state() != SlaveState::Degraded {
+                            tracker.mark_synced_with_term(watermark.version, watermark.term);
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
                 }
             }
 
-            // Already at (or ahead of) this version: acknowledge without
-            // re-applying. The master always pushes on connect.
-            if target_version <= tracker.get_version() {
+            if push_term < tracker.get_term() {
                 let ack = HaMessage::Ack {
                     version: tracker.get_version(),
+                    term: tracker.get_term(),
+                    applied: false,
+                    error: Some(format!(
+                        "Push term {push_term} is below the current term {} (stale master/epoch rejected)",
+                        tracker.get_term()
+                    )),
+                };
+                ws_stream
+                    .send(WsMessage::Text(ack.to_json()?.into()))
+                    .await
+                    .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                return Ok(());
+            }
+
+            // Already at (or ahead of) this version in the same term:
+            // acknowledge without re-applying. The master always pushes on
+            // connect.
+            if push_term == tracker.get_term() && target_version <= tracker.get_version() {
+                let ack = HaMessage::Ack {
+                    version: tracker.get_version(),
+                    term: tracker.get_term(),
                     applied: true,
                     error: None,
                 };
@@ -1073,6 +1145,7 @@ where
                 Ok(v) => {
                     let ack = HaMessage::Ack {
                         version: v,
+                        term: tracker.get_term(),
                         applied: true,
                         error: None,
                     };
@@ -1084,6 +1157,7 @@ where
                 Err(e) => {
                     let ack = HaMessage::Ack {
                         version: target_version,
+                        term: push_term,
                         applied: false,
                         error: Some(e.to_string()),
                     };
@@ -1179,6 +1253,7 @@ mod tests {
     ) -> ConfigBundle {
         ConfigBundle {
             version,
+            term: 0,
             timestamp: 1,
             config_toml: config_toml.to_string(),
             custom_rules: vec!["||pushed-rule.example^".to_string()],
@@ -1328,6 +1403,7 @@ nta = ["internal.example"]
             read_ack(&mut peer).await,
             HaMessage::Ack {
                 version: 5,
+                term: 0,
                 applied: true,
                 ..
             }
@@ -1399,6 +1475,7 @@ nta = ["internal.example"]
                 version,
                 applied,
                 error,
+                ..
             } => {
                 assert_eq!(version, 5);
                 assert!(!applied);
@@ -1905,6 +1982,7 @@ ttl = 60
             read_ack(&mut peer).await,
             HaMessage::Ack {
                 version: 1,
+                term: 0,
                 applied: true,
                 ..
             }
@@ -1917,6 +1995,108 @@ ttl = 60
             persisted.payload_hash,
             push_payload_hash(&push).unwrap(),
             "the ACK must only be sent after the exact signed payload is on disk"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A stale master from an older term must not overwrite a newer slave,
+    /// even when its version counter is higher.
+    #[tokio::test]
+    async fn test_stale_master_push_is_rejected_without_overwriting() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_stale_master_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tracker = SlaveStatusTracker::new("slave-epoch".to_string(), 0, None)
+            .with_watermark_path(dir.join("ha_watermark.toml"))
+            .unwrap();
+        let handles = test_handles(None).await;
+
+        // The slave has applied an epoch-1, version-5 bundle.
+        let current = ConfigBundle {
+            term: 1,
+            ..test_bundle(
+                5,
+                "config_version = 1\n[server]\nrole = \"slave\"\n",
+                None,
+                None,
+            )
+        };
+        let current_push = build_and_sign_push(&current, &signing_key).unwrap();
+        assert_eq!(
+            apply_config_push(&current_push, &tracker, &handles, &signing_key.public_key())
+                .await
+                .unwrap(),
+            5
+        );
+        assert_eq!(tracker.get_term(), 1);
+
+        // A stale epoch-0 master offers a higher version.
+        let stale = ConfigBundle {
+            term: 0,
+            ..test_bundle(
+                6,
+                "config_version = 1\n[server]\nrole = \"slave\"\n",
+                None,
+                None,
+            )
+        };
+        let stale_push = build_and_sign_push(&stale, &signing_key).unwrap();
+
+        let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            slave_socket,
+            Role::Client,
+            Some(ws_config()),
+        )
+        .await;
+        let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer_socket,
+            Role::Server,
+            Some(ws_config()),
+        )
+        .await;
+
+        tracker.set_state(SlaveState::Synced);
+        handle_master_message(
+            &stale_push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+
+        match read_ack(&mut peer).await {
+            HaMessage::Ack {
+                version,
+                term,
+                applied,
+                error,
+            } => {
+                assert_eq!(version, 5);
+                assert_eq!(term, 1);
+                assert!(!applied);
+                assert!(
+                    error.unwrap_or_default().contains("stale master/epoch"),
+                    "the ACK must explain the rejected epoch"
+                );
+            }
+            other => panic!("expected an ACK, got {other:?}"),
+        }
+        assert_eq!(tracker.get_version(), 5);
+        assert_eq!(tracker.get_term(), 1);
+        assert_eq!(
+            tracker.get_watermark().unwrap().version,
+            5,
+            "the stale push must not advance the watermark"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -1947,6 +2127,7 @@ ttl = 60
         let handles = test_handles(None).await;
         let push = HaMessage::ConfigPush {
             version: 5,
+            term: 0,
             hash_blake3: "hash".to_string(),
             signature_ed25519: "sig".to_string(),
             payload_b64: "payload".to_string(),
@@ -1966,6 +2147,7 @@ ttl = 60
             ack,
             HaMessage::Ack {
                 version: 5,
+                term: 0,
                 applied: true,
                 ..
             }
@@ -2077,6 +2259,7 @@ ttl = 60
             let _ = ws.next().await;
             let big = HaMessage::ConfigPush {
                 version: 99,
+                term: 0,
                 hash_blake3: "h".to_string(),
                 signature_ed25519: "s".to_string(),
                 payload_b64: "x".repeat(2 * 1024 * 1024),

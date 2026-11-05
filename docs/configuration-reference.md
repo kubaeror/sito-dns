@@ -420,12 +420,20 @@ replication_port = 8953
 Slaves persist the last successfully applied bundle identity to
 `<data_dir>/ha_watermark.toml` (JSON, mode `0600`, written atomically) after
 the configuration is applied and before the push is acknowledged. The file
-records the version, signed payload hash and application timestamp. It is
-restored at startup: pushes below the recorded version are rejected, and a
-push at the same version is only accepted when the signed payload hash
-matches. A corrupt or unreadable watermark fails startup rather than resetting
-to version 0; delete it only when you intend to force a full resync from the
-master. The watermark is node-local and must not be copied between slaves.
+records the term, version, signed payload hash and application timestamp. It is
+restored at startup: pushes from an older term are rejected, pushes below the
+recorded version within the same term are rejected, and a push at the same
+version is only accepted when the signed payload hash matches. A corrupt or
+unreadable watermark fails startup rather than resetting to version 0; delete
+it only when you intend to force a full resync from the master. The watermark
+is node-local and must not be copied between slaves.
+
+Cluster terms are node-persisted, not configuration keys: the master stores the
+current term inside `ha_state.toml` and only an explicit promotion (editing the
+state file and restarting, see `docs/runbook-ha.md`) raises it. Upgrade every
+slave before promoting a master so the new term is persisted; a stale master
+from an older term then cannot overwrite newer configuration even if its
+version counter is higher.
 
 ---
 

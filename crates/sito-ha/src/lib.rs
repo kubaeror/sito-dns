@@ -132,6 +132,7 @@ mod tests {
         // Update bundle on master
         let bundle = ConfigBundle {
             version: 2,
+            term: 0,
             timestamp: 12345,
             config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec!["||ha-test-domain.internal^".to_string()],
@@ -445,6 +446,7 @@ mod tests {
         coordinator
             .update_bundle(ConfigBundle {
                 version: 2,
+                term: 0,
                 timestamp: 1,
                 config_toml: "config_version = 1\n".to_string(),
                 custom_rules: vec![],
@@ -523,6 +525,7 @@ mod tests {
         coordinator
             .update_bundle(ConfigBundle {
                 version: 2,
+                term: 0,
                 timestamp: 1,
                 config_toml: "config_version = 1\n".to_string(),
                 custom_rules: vec![],
@@ -601,6 +604,7 @@ mod tests {
         coordinator
             .update_bundle(ConfigBundle {
                 version: 2,
+                term: 0,
                 timestamp: 1,
                 config_toml: "config_version = 1\n".to_string(),
                 custom_rules: vec![],
@@ -674,6 +678,7 @@ mod tests {
         coordinator
             .update_bundle(ConfigBundle {
                 version: 2,
+                term: 0,
                 timestamp: 1,
                 config_toml: "config_version = 1\n".to_string(),
                 custom_rules: vec![],

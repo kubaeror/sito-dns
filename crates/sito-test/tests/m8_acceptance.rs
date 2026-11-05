@@ -395,6 +395,7 @@ key = "/etc/sito/certs/master.key"
 
     let clean_bundle = ConfigBundle {
         version: 1,
+        term: 0,
         timestamp: 1000,
         config_toml: sanitized,
         custom_rules: vec!["||example.com^".to_string()],
@@ -437,6 +438,7 @@ fn test_m8_monotonicity_guard_rejects_replay() {
 
     let bundle = ConfigBundle {
         version: 5,
+        term: 0,
         timestamp: 2000,
         config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec!["||replay-test.com^".to_string()],
@@ -471,6 +473,7 @@ fn test_m8_monotonicity_guard_rejects_replay() {
     {
         let fake_push = HaMessage::ConfigPush {
             version: *version,
+            term: 0,
             hash_blake3: hash_blake3.clone(),
             signature_ed25519: "deadbeef".repeat(8),
             payload_b64: payload_b64.clone(),
@@ -534,6 +537,7 @@ async fn test_m8_slave_rollback_on_invalid_bundle() {
     // Construct a corrupted bundle with invalid TOML syntax
     let corrupted_bundle = ConfigBundle {
         version: 2,
+        term: 0,
         timestamp: 12345,
         config_toml: "corrupted_toml = [[ broken syntax {{{".to_string(),
         custom_rules: vec!["||should-not-apply.com^".to_string()],
@@ -866,6 +870,7 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
     // Now update bundle on master: add a new custom rule
     let bundle = ConfigBundle {
         version: 2,
+        term: 0,
         timestamp: 12345,
         config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec!["||blocked-fast.test^".to_string()],
@@ -1003,6 +1008,7 @@ nta = ["pushed.internal"]
     let push = build_and_sign_push(
         &ConfigBundle {
             version: 2,
+            term: 0,
             timestamp: 1,
             config_toml: config_toml.to_string(),
             custom_rules: vec!["||pushed-d01.test^".to_string()],
@@ -1141,6 +1147,7 @@ async fn test_m8_push_before_listeners_fails_and_retries_after_ready() {
     let push = build_and_sign_push(
         &ConfigBundle {
             version: 2,
+            term: 0,
             timestamp: 1,
             config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n\n[upstream]\nservers = [\"9.9.9.9\"]\n".to_string(),
             custom_rules: vec![],
@@ -1281,6 +1288,7 @@ async fn test_m8_chaos_master_mid_push_kill() {
     // Publish a bundle and kill the master while the push is in flight.
     let bundle = ConfigBundle {
         version: 2,
+        term: 0,
         timestamp: 424_242,
         config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec!["||mid-push.test^".to_string()],
@@ -1331,19 +1339,23 @@ async fn test_m8_slave_to_master_promotion_procedure() {
         assert_eq!(perms.mode() & 0o777, 0o600);
     }
 
-    // c. Initialize MasterCoordinator on promoted node
+    // c. Initialize MasterCoordinator on promoted node. The operator raised the
+    //    cluster term explicitly (section 2 of the runbook).
     let metrics = MetricsRegistry::new("0.1.0", "promoted");
     let promoted_coordinator = MasterCoordinator::new(
         "sito-master-promoted".to_string(),
         2,
         signing_key,
         metrics.clone(),
-    );
+    )
+    .with_term(1);
     assert_eq!(promoted_coordinator.get_current_version(), 2);
+    assert_eq!(promoted_coordinator.get_current_term(), 1);
 
-    // d. Promoted master creates and signs new bundle (version 3)
+    // d. Promoted master creates and signs new bundle (version 3, term 1)
     let new_bundle = ConfigBundle {
         version: 3,
+        term: 1,
         timestamp: 99999,
         config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec!["||promoted-master-rule.net^".to_string()],
@@ -1357,6 +1369,7 @@ async fn test_m8_slave_to_master_promotion_procedure() {
     // A promoted master must never publish a stale/equal version again.
     let stale_bundle = ConfigBundle {
         version: 3,
+        term: 1,
         timestamp: 100_000,
         config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec![],
@@ -1367,6 +1380,26 @@ async fn test_m8_slave_to_master_promotion_procedure() {
     assert!(
         promoted_coordinator.update_bundle(stale_bundle).is_err(),
         "non-monotonic bundle must be rejected after promotion"
+    );
+
+    // A stale term-0 master cannot publish a higher version over the promoted
+    // epoch.
+    let stale_epoch_bundle = ConfigBundle {
+        version: 4,
+        term: 0,
+        timestamp: 100_001,
+        config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+        custom_rules: vec![],
+        rewrites: None,
+        clients: None,
+        lists: vec![],
+    };
+    let err = promoted_coordinator
+        .update_bundle(stale_epoch_bundle)
+        .expect_err("an older-term bundle must not publish over the promoted epoch");
+    assert!(
+        matches!(err, sito_ha::HaError::Validation { ref field, .. } if field == "term"),
+        "unexpected error: {err:?}"
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);

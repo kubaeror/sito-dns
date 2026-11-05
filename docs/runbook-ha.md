@@ -8,7 +8,7 @@ This runbook provides step-by-step operational procedures for managing, maintain
 
 `sito` implements an active-passive master/slave replication architecture governed by [ADR-0002](adr/0002-ha-master-slave-push.md):
 - **Master Node**: Accepts administrative REST API mutations and Web UI configurations, generates monotonic configuration bundles, signs them using an Ed25519 private key (`data_dir/ha_signing.key`, permissions `0600`), and pushes updates to connected slaves in real-time over WebSocket with mutual TLS (mTLS) on port `8953`. The active bundle and its version are persisted to `data_dir/ha_state.toml` (mode `0600`) on every publish.
-- **Slave Nodes**: Connect to the master over WebSocket + mTLS, verify the master's Ed25519 signature and certificate fingerprint, enforce strict monotonic version ordering (`version > have_version`), and apply configuration snapshots atomically. The last applied version, signed payload hash and timestamp are persisted to `data_dir/ha_watermark.toml` (atomic, mode `0600`) before the push is acknowledged, so a restart cannot replay an older bundle or accept same-version content with a different hash. A corrupt watermark fails startup; delete the file only to force a full resync.
+- **Slave Nodes**: Connect to the master over WebSocket + mTLS, verify the master's Ed25519 signature and certificate fingerprint, enforce the cluster epoch (a bundle from an older term is rejected even when its version is higher) and strict monotonic version ordering within a term, and apply configuration snapshots atomically. The last applied term, version, signed payload hash and timestamp are persisted to `data_dir/ha_watermark.toml` (atomic, mode `0600`) before the push is acknowledged, so a restart cannot replay an older bundle or accept same-version content with a different hash. A corrupt watermark fails startup; delete the file only to force a full resync.
 - **Continuous Resolution**: Slaves serve DNS queries continuously without downtime. If an invalid or unparsable configuration bundle is received, the slave performs an automatic rollback to its last known good snapshot and enters a `Degraded` state.
 - **Read-Only Enforcement**: Slave REST API endpoints reject mutating operations (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP `409 Conflict` and return the `X-Dnsd-Master: <master_url>` header to redirect operators to the authoritative master.
 - **Statistics Aggregation**: Slaves report traffic and upstream metrics to the master every 30 seconds via `stats_report`. The master stores the latest report per slave and exposes it through `GET /api/v1/ha/slaves`; replica counters are **not** merged into the master's own Prometheus registry. Scrape each replica's `/metrics` endpoint separately (labels such as `sito_ha_config_version{instance="..."}` identify the node).
@@ -62,14 +62,40 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
      `master_pubkey` without changes. A key is generated automatically when
      the file does not exist, but every slave must then be given the new
      public key.
-   - **State file** (`data_dir/ha_state.toml`): the persisted active bundle and
-     version. Restoring the old master's file keeps the sequence monotonic.
-     If it is missing or corrupt, the master starts a new sequence but **seeds
-     it from the highest `have_version` reported by an authenticated slave**
-     before publishing, then republishes the active bundle above that version.
-     You can also override the sequence explicitly: stop the service, edit the
-     `version` field in a copy of `ha_state.toml` (JSON, mode `0600`) to a
-     value above the cluster's highest, and start the service.
+   - **State file** (`data_dir/ha_state.toml`): the persisted active bundle,
+     version and cluster term. Restoring the old master's file keeps the
+     sequence monotonic and the term unchanged. If it is missing or corrupt,
+     the promoted master **must not** adopt a counter from its peers: it starts
+     a fresh sequence and detects any replica that is ahead (same term) or in a
+     newer term, marks itself `diverged`, and refuses to overwrite the cluster.
+     Promote it explicitly (see below) before pointing anything at it.
+
+     To promote a node explicitly, stop the service and create or edit
+     `ha_state.toml` (JSON, mode `0600`) so that:
+     - `term` is **one greater** than the highest term any replica has applied
+       (a first promotion from a term-0 cluster uses `1`), and
+     - `version` is greater than the highest version the remaining slaves have
+       applied (the previous cluster version `N` becomes `N+1`).
+     ```json
+     {
+       "version": 12,
+       "term": 1,
+       "timestamp": 1730000000000,
+       "config_toml": "...",
+       "custom_rules": [],
+       "lists": []
+     }
+     ```
+     Keep the rest of a copy of the old master's state (or the last pushed
+     bundle) intact; only `version` and `term` need to change. Starting the
+     service then restores this state and publishes subsequent mutations with
+     the promoted term.
+
+     **Upgrade order:** upgrade every slave to a build that understands terms
+     and persists the term in `ha_watermark.toml` *before* promoting. A slave
+     that does not know about terms can still be overwritten by a stale
+     term-less master (it only compares versions), although its persisted
+     watermark still prevents rollback below what it has already applied.
 
    To obtain the master public key for the slave configs:
    ```bash
@@ -78,11 +104,11 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
 
    # Without it: the promoted master prints the same value in its status once running.
    ```
-   Never let a promoted master start at a version below what its former peers
-   already applied: they silently ignore every lower push. When that happens
-   the master marks itself in `GET /api/v1/ha/status` with
-   `"diverged": true` plus a `diverged_reason`, and recovers by republishing
-   above the divergent version.
+   Never let an unpromoted master start below or beside a newer term: it marks
+   itself in `GET /api/v1/ha/status` with `"diverged": true` plus a
+   `diverged_reason` and stops replicating, rather than republishing its stale
+   bundle over newer configuration. Recovery is always the explicit promotion
+   above, not waiting for an automatic rebase.
 
 4. **Verify or generate master certificates**:
    `sito` uses the certificates configured in `[ha] cert`/`key` for mTLS and
@@ -314,8 +340,8 @@ When a slave node fails or must be reprovisioned from bare metal:
 | Slave state is `Degraded` | Configuration apply failed, corrupted bundle, or an unresolvable `${SECRET:...}` placeholder | Check the service journal (`journalctl -u sito`) for `apply_config_push` errors. The slave keeps its last good snapshot and reports `Degraded`; fix the configuration on the master and re-push. The reason is exposed as `degraded_reason` in `GET /api/v1/ha/status`. |
 | Slave state is `Connecting` in loop | Network unreachable, firewall blocking 8953, or mTLS handshake failed/timed out | Check `nc -zv 192.168.1.10 8953`. Check TLS certificate expiration or fingerprint mismatch in logs. |
 | `Signature verification failed` | Bundle signature does not match master public key | Verify that the master didn't regenerate `ha_signing.key` without updating slaves. Compare `master_pubkey` from the master's `/api/v1/ha/status` with the slave config. |
-| `Incoming version <= have_version` | Out of order or replayed bundle | Normal during network blips; master will send latest monotonic version. |
-| Master reports `"diverged": true` | A slave acknowledged a version above the master's current version (promoted slave, lost/corrupt `ha_state.toml`, or forked master) | Read `diverged_reason`. The master automatically republishes above the divergent version; if it persists, restore/promote with a version above the cluster's highest as described in section 2. |
+| `Incoming version <= have_version` | Out of order or replayed bundle | Normal during network blips; the master will send the latest monotonic version. After a promotion, an older-term master is rejected even with a higher version; promote the master explicitly (section 2). |
+| Master reports `"diverged": true` | A slave is ahead in the same term, or reports a newer term (stale/partitioned master, lost/corrupt `ha_state.toml`, or forked master) | Read `diverged_reason`. The master intentionally does **not** republish: doing so would overwrite newer configuration. Isolate the stale master, restore its state file or perform the explicit promotion in section 2 (raise both `term` and `version`), then restart it. |
 | API returns `409 Conflict` | Mutation attempted directly on a slave node | Perform configuration edits on the master node indicated in the `X-Dnsd-Master` header. |
 | `POST /api/v1/ha/resync` returns `503` | No HA coordinator/tracker on the node, the replication worker stopped, or the push could not be queued | Check the node's role and `GET /api/v1/ha/status`. A `429` means a resync is already queued; retry shortly. |
 

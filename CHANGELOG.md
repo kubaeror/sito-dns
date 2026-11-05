@@ -21,6 +21,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   can no longer replay an older signed bundle or accept the same version with
   different content. A corrupt watermark fails startup instead of silently
   resetting to version 0.
+- **HA term/epoch stops stale-master overwrites (security)**: bundles and the
+  master/slave state now carry a cluster term. A slave rejects a push from an
+  older term even when its version counter is higher; within a term the version
+  must advance and a same-version push must match the applied payload hash. A
+  master that sees a replica ahead in the same term or in a newer term marks
+  itself `diverged` and no longer seeds its counter or republishes its stale
+  active bundle. Recovery is an explicit promotion that raises `term` and
+  `version` in `ha_state.toml`; existing state files without a term load as
+  term 0 and old signed bundles remain verifiable. Upgrade slaves before
+  promoting a master (see `docs/runbook-ha.md`).
 - **DNSSEC verification amplification (security)**: a crafted authoritative
   response can no longer force unbounded cryptographic work. Each response now
   has a hard budget of 256 RRSIG verification attempts (shared across the

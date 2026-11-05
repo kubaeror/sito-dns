@@ -307,6 +307,7 @@ fn init_ha(
             #[allow(clippy::cast_sign_loss)]
             let initial_bundle = sito_ha::ConfigBundle {
                 version: 1,
+                term: coordinator.get_current_term(),
                 timestamp: chrono::Utc::now().timestamp_millis() as u64,
                 config_toml: sanitized_toml,
                 custom_rules: config.filtering.custom_rules.clone(),
