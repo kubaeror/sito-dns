@@ -8,6 +8,21 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **Credential revocation races (security)**: sessions and API tokens now store
+  the account's persisted `credential_epoch` and are revalidated against
+  `users.toml` on every request: the account must still exist, the role must
+  still match, and the epoch must be current. Password changes, role changes,
+  TOTP enable/disable, account deletion/recreation and `reset-admin` advance
+  the epoch; a login that raced a credential mutation is refused instead of
+  inserting a session with the old role or for a deleted account. Persisted
+  sessions and API tokens written before this release have no epoch and are
+  rejected once after upgrade: users must sign in again and API tokens must be
+  re-issued. User-credential writes (create, password, role, TOTP
+  enable/disable, delete and `reset-admin`) now fail closed: a failed
+  `users.toml` write returns an error and rolls the in-memory change back
+  instead of reporting success. Interrupted revocations are also revalidated on
+  restart, so a crash between the users write and the session/token write
+  cannot resurrect a revoked credential.
 - **Reset commands no longer claim live revocation**: the server now holds an
   exclusive lease on `<data_dir>/sito.pid`. `sito reset-sessions` and
   `sito reset-admin` refuse to run while that lease is held, because the running

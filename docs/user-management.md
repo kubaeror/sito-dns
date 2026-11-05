@@ -184,6 +184,28 @@ token from surviving a demotion. The last-admin check and the role update are
 atomic, so two concurrent demotions cannot both succeed and leave the
 deployment without an Admin.
 
+### Credential epochs and upgrade re-login
+
+Every account carries a persisted `credential_epoch` in `users.toml`. Sessions
+and API tokens record the account and role they were issued under together with
+that epoch, and every request re-checks the user table: the account must still
+exist, its role must be unchanged, and the epoch must be current. Password
+changes, role changes, TOTP enable/disable, deletion/recreation and
+`reset-admin` advance the epoch. A login or TOTP verification that raced one of
+those mutations is refused instead of creating a session with the old role or
+for a deleted account; an interrupted revocation is re-checked after a restart.
+
+Sessions and tokens persisted by an older release have no epoch. They are
+rejected once after upgrading, so every user must sign in again and every API
+token must be re-issued. Plan the upgrade accordingly; no data is lost, but old
+credentials stop working immediately.
+
+Credential writes are fail-closed. If `users.toml` cannot be written, creating
+an account, changing a password or role, enabling/disabling TOTP, deleting an
+account or running `reset-admin` returns an error (`500 Internal Server Error`
+through the API) and rolls the in-memory change back. The operation is never
+reported as successful before it is durable.
+
 ## 5. Change a Password
 
 Requires an authenticated **user session**. API tokens are rejected with
