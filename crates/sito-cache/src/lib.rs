@@ -409,6 +409,232 @@ mod tests {
         assert_eq!(status, ValidationStatus::Secure);
     }
 
+    /// `min_ttl` is a cache policy floor for unvalidated data only. Raising a
+    /// `Secure` TTL above the RRSIG-authenticated TTL would serve AD=1 data
+    /// after its signature/TTL expired.
+    #[tokio::test]
+    async fn test_secure_ttl_is_not_raised_to_min_ttl() {
+        let config = make_test_config(60, 3600, 3600);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("secure-ttl.example.").unwrap();
+        let query = query_for(80, &qname);
+        let mut response = answer_response(80, &qname, [192, 0, 2, 80]);
+        response.answers[0].ttl = 10;
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Secure)
+            .await;
+
+        let (cached, status) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("cache hit");
+        assert_eq!(status, ValidationStatus::Secure);
+        assert_eq!(
+            cached.answers[0].ttl, 10,
+            "a Secure TTL must never be raised above its authenticated value"
+        );
+
+        // Unvalidated entries keep the existing min_ttl floor.
+        let other = Name::from_str("unchecked-ttl.example.").unwrap();
+        let other_query = query_for(81, &other);
+        let mut other_response = answer_response(81, &other, [192, 0, 2, 81]);
+        other_response.answers[0].ttl = 10;
+        cache
+            .insert_with_status(&other_query, &other_response, ValidationStatus::Unchecked)
+            .await;
+        let (cached, _) = cache
+            .get_for_query_with_status(&other_query)
+            .await
+            .expect("cache hit");
+        assert_eq!(
+            cached.answers[0].ttl, 60,
+            "unvalidated entries must still be clamped up to min_ttl"
+        );
+    }
+
+    /// A Secure negative answer is only as trustworthy as its NSEC/NSEC3
+    /// denial proof. The SOA-derived negative TTL must not outlive the denial
+    /// record or its RRSIG (RFC 4035 §5.3.3).
+    #[tokio::test]
+    async fn test_secure_negative_ttl_is_capped_by_denial_proof() {
+        let config = make_test_config(60, 3600, 3600);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("missing-ttl.example.").unwrap();
+        let query = query_for(83, &qname);
+        let mut response = Message::response(83, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.metadata.response_code = ResponseCode::NXDomain;
+        // The SOA is signed with a long TTL, while the actual denial proof
+        // (NSEC + RRSIG) expires after 10 seconds.
+        response.authorities.push(Record::from_rdata(
+            Name::from_str("example.").unwrap(),
+            3600,
+            RData::SOA(SOA::new(
+                Name::from_str("ns1.example.").unwrap(),
+                Name::from_str("hostmaster.example.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                3600,
+            )),
+        ));
+        for code in [RecordType::NSEC, RecordType::RRSIG] {
+            response.authorities.push(Record::from_rdata(
+                qname.clone(),
+                10,
+                RData::Unknown {
+                    code,
+                    rdata: NULL::default(),
+                },
+            ));
+        }
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Secure)
+            .await;
+
+        let (cached, status) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("cache hit");
+        assert_eq!(status, ValidationStatus::Secure);
+        assert_eq!(cached.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(
+            cached.authorities[0].ttl, 10,
+            "the SOA-derived negative TTL must be capped by the denial proof"
+        );
+        assert!(
+            cached.authorities.iter().all(|record| record.ttl <= 10),
+            "no authority record may outlive the denial proof: {:?}",
+            cached.authorities
+        );
+
+        // The entry must decrement from the denial TTL (10 s), not from the
+        // 3600 s SOA TTL.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let (later, _) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("still within the denial lifespan");
+        assert!(
+            later.authorities[0].ttl < 10,
+            "the negative lifespan must be the denial TTL (got {})",
+            later.authorities[0].ttl
+        );
+    }
+
+    /// The validator accepts denial proofs from the additional section, so the
+    /// cache TTL cap must scan the same sections. A Secure negative whose
+    /// NSEC/RRSIG proof was relocated to additionals must still use the proof
+    /// TTL, not the SOA TTL.
+    #[tokio::test]
+    async fn test_secure_negative_proof_in_additionals_caps_lifespan() {
+        let config = make_test_config(60, 3600, 3600);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("missing-addl-ttl.example.").unwrap();
+        let query = query_for(84, &qname);
+        let mut response = Message::response(84, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.metadata.response_code = ResponseCode::NXDomain;
+        response.authorities.push(Record::from_rdata(
+            Name::from_str("example.").unwrap(),
+            3600,
+            RData::SOA(SOA::new(
+                Name::from_str("ns1.example.").unwrap(),
+                Name::from_str("hostmaster.example.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                3600,
+            )),
+        ));
+        // Denial proof carried in the additional section.
+        for code in [RecordType::NSEC, RecordType::RRSIG] {
+            response.additionals.push(Record::from_rdata(
+                qname.clone(),
+                10,
+                RData::Unknown {
+                    code,
+                    rdata: NULL::default(),
+                },
+            ));
+        }
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Secure)
+            .await;
+
+        let (cached, status) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("cache hit");
+        assert_eq!(status, ValidationStatus::Secure);
+        assert_eq!(
+            cached.authorities[0].ttl, 10,
+            "an additional-section denial proof must cap the negative lifespan"
+        );
+    }
+
+    /// The stale fallback must expose the recorded validation status (so the
+    /// pipeline can refuse Unchecked entries) and strip every DNSSEC RR type,
+    /// not just RRSIG.
+    #[tokio::test]
+    async fn test_stale_lookup_reports_status_and_strips_all_dnssec_records() {
+        let mut config = make_test_config(1, 1, 300);
+        config.serve_stale_hours = 1;
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("stale-status.example.").unwrap();
+        let query = query_for(82, &qname);
+        let mut response = answer_response(82, &qname, [192, 0, 2, 82]);
+        response.metadata.authentic_data = true;
+        for code in [
+            RecordType::RRSIG,
+            RecordType::DNSKEY,
+            RecordType::DS,
+            RecordType::NSEC3,
+        ] {
+            response.answers.push(Record::from_rdata(
+                qname.clone(),
+                1,
+                RData::Unknown {
+                    code,
+                    rdata: NULL::default(),
+                },
+            ));
+        }
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Unchecked)
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        let (stale, status) = cache
+            .get_stale_for_query_with_status(&query)
+            .await
+            .expect("stale hit");
+        assert_eq!(
+            status,
+            ValidationStatus::Unchecked,
+            "the stale path must expose the recorded validation status"
+        );
+        assert!(
+            !stale.metadata.authentic_data,
+            "stale data must never be served as authenticated"
+        );
+        assert!(
+            stale
+                .answers
+                .iter()
+                .all(|record| !record.record_type().is_dnssec()),
+            "stale sanitization must remove every DNSSEC RR type: {:?}",
+            stale.answers
+        );
+    }
+
     #[tokio::test]
     async fn test_serve_stale_fallback() {
         let mut config = make_test_config(1, 1, 300);

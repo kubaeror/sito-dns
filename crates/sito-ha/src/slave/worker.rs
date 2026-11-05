@@ -21,11 +21,14 @@ use sito_rewrites::RewritesConfig;
 use sito_stats::MetricsRegistry;
 use sito_stats::metrics::MetricsSnapshot;
 
-use crate::bundle::{ConfigBundle, substitute_secrets, verify_and_unpack_push};
+use crate::bundle::{
+    ConfigBundle, push_payload_hash, substitute_secrets, verify_and_unpack_push_with_watermark,
+    watermark_covers,
+};
 use crate::config::HaConfig;
 use crate::crypto::parse_public_key;
 use crate::error::HaError;
-use crate::protocol::{HaMessage, UpstreamReport};
+use crate::protocol::{AckConflict, HaMessage, UpstreamReport};
 use crate::slave::state::{SlaveState, SlaveStatusTracker};
 use crate::transport::{
     ExponentialBackoff, SLAVE_HANDSHAKE_TIMEOUT, build_client_tls_config, ws_config,
@@ -79,16 +82,56 @@ pub async fn apply_config_push(
     handles: &SlaveAppHandles,
     master_pubkey: &[u8],
 ) -> Result<u64, HaError> {
-    let have_version = tracker.get_version();
+    let watermark = tracker.get_watermark();
 
-    // 1. Verify cryptographic signature, checksum, and monotonicity
-    let bundle = match verify_and_unpack_push(push, have_version, master_pubkey) {
-        Ok(b) => b,
+    // 1. Verify cryptographic signature, checksum, term and monotonicity
+    //    against the persisted watermark (not only the in-memory counter, so a
+    //    process restart cannot lose the replay guard).
+    let bundle =
+        match verify_and_unpack_push_with_watermark(push, watermark.as_ref(), master_pubkey) {
+            Ok(b) => b,
+            Err(e) => {
+                tracker.mark_degraded(format!("Validation/Signature verification failed: {e}"));
+                return Err(e);
+            }
+        };
+    let payload_hash = match push_payload_hash(push) {
+        Ok(hash) => hash,
         Err(e) => {
             tracker.mark_degraded(format!("Validation/Signature verification failed: {e}"));
             return Err(e);
         }
     };
+
+    // Before the first watermark exists (fresh node or a test harness), fall
+    // back to the in-memory applied version so the monotonicity guard is not
+    // weakened by the watermark refactor.
+    if watermark.is_none() && bundle.version <= tracker.get_version() {
+        let err = HaError::Validation {
+            field: "version".to_string(),
+            reason: format!(
+                "Push version {} is not greater than the current applied version {} (monotonicity violation/replay rejected)",
+                bundle.version,
+                tracker.get_version()
+            ),
+        };
+        tracker.mark_degraded(format!("Validation/Signature verification failed: {err}"));
+        return Err(err);
+    }
+
+    // An identical re-delivery of the already-applied bundle needs no work and
+    // must not rewrite local configuration; acknowledge it as synced. A newer
+    // term with the same payload only records the promoted epoch.
+    if let Some(ref applied) = watermark
+        && bundle.version == applied.version
+        && payload_hash == applied.normalized_hash()
+    {
+        if bundle.term > applied.term {
+            tracker.persist_watermark(bundle.version, bundle.term, &payload_hash)?;
+        }
+        tracker.mark_synced_with_term(bundle.version, bundle.term);
+        return Ok(bundle.version);
+    }
 
     // 2. Secret substitution. Placeholders resolve from the process
     // environment only (`DNSD_SECRET_<NAME>`, then `<NAME>`); there is no
@@ -247,9 +290,22 @@ pub async fn apply_config_push(
         return Err(HaError::Rollback(reason));
     }
 
+    // Persist the applied-version watermark before acknowledging: a crash
+    // between apply and ACK must still leave a restart able to reject replays.
+    if let Err(e) = tracker.persist_watermark(bundle.version, bundle.term, &payload_hash) {
+        let reason = format!("Failed to persist the applied-version watermark: {e}");
+        error!(
+            error = %e,
+            version = bundle.version,
+            "Configuration was applied but the watermark could not be persisted; refusing to acknowledge"
+        );
+        tracker.mark_degraded(reason.clone());
+        return Err(HaError::Rollback(reason));
+    }
+
     // Mark tracker as synced (a successful apply is the only path that clears
     // a `Degraded` state).
-    tracker.mark_synced(bundle.version);
+    tracker.mark_synced_with_term(bundle.version, bundle.term);
     #[allow(clippy::cast_precision_loss)]
     handles
         .metrics
@@ -341,23 +397,15 @@ async fn build_persisted_config(
         toml::Value::String(live.server.data_dir.to_string_lossy().into_owned()),
     );
 
-    if let Some(local_credentials) = live
-        .integrations
-        .as_ref()
-        .and_then(|i| i.get("mikrotik"))
-        .and_then(toml::Value::as_table)
-        && let Some(pushed_mikrotik) = pushed
-            .get_mut("integrations")
-            .and_then(|i| i.as_table_mut())
-            .and_then(|i| i.get_mut("mikrotik"))
-            .and_then(toml::Value::as_table_mut)
-    {
-        for key in ["token", "password"] {
-            if let Some(value) = local_credentials.get(key) {
-                pushed_mikrotik.insert(key.to_string(), value.clone());
-            }
-        }
-    }
+    // Node-local listener, TLS and ACME identity. The master's bind addresses
+    // may not exist on this node (or may already be in use) and its
+    // certificate paths are local to the master, so the live node-local values
+    // are authoritative for the persisted document.
+    preserve_node_local_listener_config(&mut pushed, live)?;
+
+    // `[integrations.mikrotik]` describes the router on this node's LAN and
+    // carries per-node credentials. None of it is shared cluster state.
+    preserve_node_local_mikrotik(&mut pushed, live)?;
 
     // Authoritative removal: the bundle's structured fields decide whether the
     // section exists at all. `clients_value` already includes the node-local
@@ -408,6 +456,158 @@ async fn build_persisted_config(
     }
 
     toml::to_string_pretty(&pushed).map_err(|e| HaError::Serialization(e.to_string()))
+}
+
+/// Encodes a serializable configuration section as a TOML value.
+fn section_value<T: serde::Serialize>(value: &T) -> Result<toml::Value, HaError> {
+    toml::Value::try_from(value).map_err(|e| HaError::Serialization(e.to_string()))
+}
+
+/// Returns `table[key]` as a mutable table, creating it when absent.
+fn ensure_section<'a>(
+    table: &'a mut toml::Table,
+    key: &str,
+) -> Result<&'a mut toml::Table, HaError> {
+    table
+        .entry(key.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| HaError::Validation {
+            field: key.to_string(),
+            reason: format!("Pushed [{key}] section is not a table"),
+        })
+}
+
+/// `[web]` keys whose values describe this node. The master's copies must
+/// never replace them: the admin listener is bound per host, and the proxy,
+/// metrics-auth and public-URL settings describe how this node is reached.
+const NODE_LOCAL_WEB_KEYS: [&str; 7] = [
+    "enabled",
+    "bind",
+    "port",
+    "trusted_proxies",
+    "metrics_auth",
+    "public_url",
+    "tls_terminated_by_proxy",
+];
+
+/// Restores the node-local listener, TLS and ACME identity into `pushed`.
+///
+/// The master's `dns.bind` addresses, the complete `[web]` identity,
+/// certificate paths and ACME account/cache settings are local to the master
+/// node. A slave with different addresses would fail to bind (or expose the
+/// admin UI on the wrong interface) and its TLS material lives at different
+/// paths.
+fn preserve_node_local_listener_config(
+    pushed: &mut toml::Table,
+    live: &Config,
+) -> Result<(), HaError> {
+    {
+        let dns = ensure_section(pushed, "dns")?;
+        dns.insert(
+            "bind".to_string(),
+            toml::Value::Array(
+                live.dns
+                    .bind
+                    .iter()
+                    .map(|addr| toml::Value::String(addr.to_string()))
+                    .collect(),
+            ),
+        );
+        match live.dns.tls.as_ref() {
+            Some(tls) => {
+                dns.insert("tls".to_string(), section_value(tls)?);
+            }
+            None => {
+                dns.remove("tls");
+            }
+        }
+    }
+
+    match live.tls.as_ref() {
+        Some(tls) => {
+            pushed.insert("tls".to_string(), section_value(tls)?);
+        }
+        None => {
+            pushed.remove("tls");
+        }
+    }
+
+    match live.acme.as_ref() {
+        Some(acme) => {
+            pushed.insert("acme".to_string(), section_value(acme)?);
+        }
+        None => {
+            pushed.remove("acme");
+        }
+    }
+
+    // Only materialize `[web]` when either side declares it; a node that never
+    // configured it keeps using the built-in defaults. Read the raw local
+    // table so keys that only exist in raw form (`public_url`,
+    // `tls_terminated_by_proxy`) survive as well. A key absent locally is
+    // removed instead of inherited so the slave's effective default applies;
+    // cluster-shared `[web]` keys (legacy `acme_*`) still come from the push.
+    if pushed.contains_key("web") || live.web.is_some() {
+        let local_web = live
+            .web
+            .as_ref()
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        let web = ensure_section(pushed, "web")?;
+        for key in NODE_LOCAL_WEB_KEYS {
+            match local_web.get(key) {
+                Some(value) => {
+                    web.insert(key.to_string(), value.clone());
+                }
+                None => {
+                    web.remove(key);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Restores the node-local `[integrations.mikrotik]` section into `pushed`.
+///
+/// The router lives on this node's LAN and carries per-node credentials, so
+/// the whole section is node-local rather than only `token`/`password`.
+fn preserve_node_local_mikrotik(pushed: &mut toml::Table, live: &Config) -> Result<(), HaError> {
+    let local = live
+        .integrations
+        .as_ref()
+        .and_then(|integrations| integrations.get("mikrotik"))
+        .cloned();
+    match local {
+        Some(value) => {
+            let integrations = ensure_section(pushed, "integrations")?;
+            integrations.insert("mikrotik".to_string(), value);
+        }
+        None => {
+            if let Some(integrations) = pushed
+                .get_mut("integrations")
+                .and_then(toml::Value::as_table_mut)
+            {
+                integrations.remove("mikrotik");
+            }
+        }
+    }
+
+    // An empty `[integrations]` left over from removing the master's MikroTik
+    // section would look like a restart-only `integrations` change on the next
+    // apply, so drop it entirely.
+    if pushed
+        .get("integrations")
+        .and_then(toml::Value::as_table)
+        .is_some_and(toml::Table::is_empty)
+    {
+        pushed.remove("integrations");
+    }
+
+    Ok(())
 }
 
 /// Reads the node-local `[clients] client_id_secrets` table (name -> secret)
@@ -531,6 +731,9 @@ pub fn spawn_slave_worker(
             handles
                 .metrics
                 .inc_ha_startup_noop("slave", "missing_master_url");
+            tracker.set_connection_error(Some(
+                "master_url is not configured; replication cannot start".to_string(),
+            ));
             warn!("Slave role configured without master_url; replication worker idle");
             return;
         };
@@ -573,6 +776,9 @@ pub fn spawn_slave_worker(
                 Ok(()) => {
                     info!("Replication connection finished cleanly");
                     backoff.reset();
+                    // The session is over: stop advertising readiness until
+                    // the next successful sync even though DNS keeps serving.
+                    tracker.set_state(SlaveState::Connecting);
                     // Avoid a tight reconnect loop when the master accepts and
                     // immediately closes the connection.
                     tokio::select! {
@@ -592,6 +798,7 @@ pub fn spawn_slave_worker(
                     }
                 }
                 Err(e) => {
+                    tracker.set_connection_error(Some(e.to_string()));
                     warn!("Replication connection error: {e}");
                     let delay = backoff.next_delay();
                     info!("Backing off for {:?} before reconnecting", delay);
@@ -713,6 +920,7 @@ async fn connect_and_run(
         })?
         .map_err(|e| HaError::Connection(format!("WebSocket client handshake failed: {e}")))?;
 
+        tracker.set_connection_error(None);
         run_ws_session(
             ws_stream,
             ha_config,
@@ -745,6 +953,7 @@ async fn connect_and_run(
             HaError::Connection(format!("Plain WebSocket client handshake failed: {e}"))
         })?;
 
+        tracker.set_connection_error(None);
         run_ws_session(
             ws_stream,
             ha_config,
@@ -775,6 +984,7 @@ where
     let hello = HaMessage::Hello {
         instance: tracker.instance_name.clone(),
         have_version,
+        have_term: tracker.get_term(),
         capabilities: vec!["stats-v1".to_string()],
         token: ha_config.slave_token.clone(),
         role: Some("slave".to_string()),
@@ -827,6 +1037,7 @@ where
                 let hello = HaMessage::Hello {
                     instance: tracker.instance_name.clone(),
                     have_version: cur_v,
+                    have_term: tracker.get_term(),
                     capabilities: vec!["stats-v1".to_string()],
                     token: ha_config.slave_token.clone(),
                     role: Some("slave".to_string()),
@@ -940,15 +1151,200 @@ where
                 .await
                 .map_err(|e| HaError::Connection(format!("Failed to send Pong: {e}")))?;
         }
-        HaMessage::ConfigPush { ref version, .. } => {
+        HaMessage::ConfigPush {
+            ref version,
+            ref term,
+            ref payload_hash_blake3,
+            ..
+        } => {
             let target_version = *version;
+            let push_term = *term;
 
-            // Already at (or ahead of) this version: acknowledge without
-            // re-applying. The master always pushes on connect.
-            if target_version <= tracker.get_version() {
+            // A push from an older epoch is a stale master and must never
+            // overwrite newer configuration, even when its version counter is
+            // higher. Within the same epoch the version must advance, and a
+            // same-version push is only acceptable when it is the identical
+            // signed payload.
+            if let Some(watermark) = tracker.get_watermark() {
+                if watermark.forked && push_term <= watermark.term {
+                    // A fork was already latched: only a strictly higher-term
+                    // promotion may resume replication.
+                    if let Err(e) = tracker.latch_fork(watermark.version, watermark.term) {
+                        warn!(
+                            error = %e,
+                            "Failed to re-persist the HA fork latch; the in-memory latch still applies"
+                        );
+                    }
+                    tracker.mark_degraded(format!(
+                        "HA fork latched at term {} version {}: refusing term {push_term} until explicit higher-term promotion",
+                        watermark.term, watermark.forked_at_version
+                    ));
+                    let ack = HaMessage::Ack {
+                        version: watermark.version,
+                        term: watermark.term,
+                        applied: false,
+                        conflict: Some(AckConflict::SameVersionFork),
+                        error: Some(format!(
+                            "Term {push_term} is blocked by the latched same-version fork at term {} version {}",
+                            watermark.term, watermark.forked_at_version
+                        )),
+                    };
+                    ws_stream
+                        .send(WsMessage::Text(ack.to_json()?.into()))
+                        .await
+                        .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                    return Ok(());
+                }
+                if push_term < watermark.term {
+                    let ack = HaMessage::Ack {
+                        version: watermark.version,
+                        term: watermark.term,
+                        applied: false,
+                        conflict: Some(AckConflict::StaleTerm),
+                        error: Some(format!(
+                            "Push term {push_term} is below the applied term {} (stale master/epoch rejected)",
+                            watermark.term
+                        )),
+                    };
+                    ws_stream
+                        .send(WsMessage::Text(ack.to_json()?.into()))
+                        .await
+                        .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                    return Ok(());
+                }
+                if push_term > watermark.term && target_version <= watermark.version {
+                    let reason = format!(
+                        "Higher-term push (term {push_term} version {target_version}) must continue above the applied version {}; a term bump does not permit a version rollback",
+                        watermark.version
+                    );
+                    tracker.mark_degraded(reason.clone());
+                    let ack = HaMessage::Ack {
+                        version: watermark.version,
+                        term: watermark.term,
+                        applied: false,
+                        conflict: Some(AckConflict::StaleVersion),
+                        error: Some(reason),
+                    };
+                    ws_stream
+                        .send(WsMessage::Text(ack.to_json()?.into()))
+                        .await
+                        .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                    return Ok(());
+                }
+                if push_term == watermark.term {
+                    if target_version < watermark.version {
+                        let ack = HaMessage::Ack {
+                            version: watermark.version,
+                            term: watermark.term,
+                            applied: false,
+                            conflict: Some(AckConflict::StaleVersion),
+                            error: Some(format!(
+                                "Push version {target_version} is below the applied watermark {} (replay rejected)",
+                                watermark.version
+                            )),
+                        };
+                        ws_stream
+                            .send(WsMessage::Text(ack.to_json()?.into()))
+                            .await
+                            .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                        return Ok(());
+                    }
+                    if target_version == watermark.version {
+                        if !watermark_covers(
+                            &watermark,
+                            push_term,
+                            target_version,
+                            payload_hash_blake3,
+                        ) {
+                            // Same term and version but different content: this
+                            // is a fork. Latch it (in memory and durably) so
+                            // the next same-term version from the forked master
+                            // cannot overwrite the applied configuration. A
+                            // failed durable write still leaves the in-memory
+                            // latch, but is reported in the ACK.
+                            let latch_error = match tracker
+                                .latch_fork(watermark.version, watermark.term)
+                            {
+                                Ok(()) => None,
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        "Failed to persist the HA fork latch; keeping the in-memory latch"
+                                    );
+                                    Some(e.to_string())
+                                }
+                            };
+                            let reason = format!(
+                                "Same-version payload fork at term {} version {}: master content differs from the applied bundle",
+                                watermark.term, watermark.version
+                            );
+                            tracker.mark_degraded(reason.clone());
+                            let ack = HaMessage::Ack {
+                                version: watermark.version,
+                                term: watermark.term,
+                                applied: false,
+                                conflict: Some(AckConflict::SameVersionFork),
+                                error: Some(match latch_error {
+                                    Some(e) => {
+                                        format!("{reason} (fork latch could not be persisted: {e})")
+                                    }
+                                    None => reason,
+                                }),
+                            };
+                            ws_stream
+                                .send(WsMessage::Text(ack.to_json()?.into()))
+                                .await
+                                .map_err(|e| {
+                                    HaError::Connection(format!("Failed to send Ack: {e}"))
+                                })?;
+                            return Ok(());
+                        }
+                        let ack = HaMessage::Ack {
+                            version: watermark.version,
+                            term: watermark.term,
+                            applied: true,
+                            conflict: None,
+                            error: None,
+                        };
+                        ws_stream
+                            .send(WsMessage::Text(ack.to_json()?.into()))
+                            .await
+                            .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                        if tracker.get_state() != SlaveState::Degraded {
+                            tracker.mark_synced_with_term(watermark.version, watermark.term);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+
+            if push_term < tracker.get_term() {
                 let ack = HaMessage::Ack {
                     version: tracker.get_version(),
+                    term: tracker.get_term(),
+                    applied: false,
+                    conflict: Some(AckConflict::StaleTerm),
+                    error: Some(format!(
+                        "Push term {push_term} is below the current term {} (stale master/epoch rejected)",
+                        tracker.get_term()
+                    )),
+                };
+                ws_stream
+                    .send(WsMessage::Text(ack.to_json()?.into()))
+                    .await
+                    .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                return Ok(());
+            }
+
+            // Already at (or ahead of) this version in the same term:
+            // acknowledge without re-applying. The master always pushes on
+            // connect.
+            if push_term == tracker.get_term() && target_version <= tracker.get_version() {
+                let ack = HaMessage::Ack {
+                    version: tracker.get_version(),
+                    term: tracker.get_term(),
                     applied: true,
+                    conflict: None,
                     error: None,
                 };
                 ws_stream
@@ -982,7 +1378,9 @@ where
                 Ok(v) => {
                     let ack = HaMessage::Ack {
                         version: v,
+                        term: tracker.get_term(),
                         applied: true,
+                        conflict: None,
                         error: None,
                     };
                     ws_stream
@@ -993,7 +1391,9 @@ where
                 Err(e) => {
                     let ack = HaMessage::Ack {
                         version: target_version,
+                        term: push_term,
                         applied: false,
+                        conflict: None,
                         error: Some(e.to_string()),
                     };
                     let _ = ws_stream.send(WsMessage::Text(ack.to_json()?.into())).await;
@@ -1088,6 +1488,7 @@ mod tests {
     ) -> ConfigBundle {
         ConfigBundle {
             version,
+            term: 0,
             timestamp: 1,
             config_toml: config_toml.to_string(),
             custom_rules: vec!["||pushed-rule.example^".to_string()],
@@ -1237,6 +1638,8 @@ nta = ["internal.example"]
             read_ack(&mut peer).await,
             HaMessage::Ack {
                 version: 5,
+                term: 0,
+                conflict: None,
                 applied: true,
                 ..
             }
@@ -1308,6 +1711,7 @@ nta = ["internal.example"]
                 version,
                 applied,
                 error,
+                ..
             } => {
                 assert_eq!(version, 5);
                 assert!(!applied);
@@ -1473,6 +1877,342 @@ url = "https://192.168.1.1"
                 .and_then(toml::Value::as_str),
             Some(expected_data_dir.as_ref()),
             "the node data directory must come from the live configuration"
+        );
+    }
+
+    /// Node-local listener, TLS, ACME and RouterOS identity must never be
+    /// replaced by the master's values: a master bound to `192.168.1.10` must
+    /// not make a slave at `.11` fail to bind, and certificate paths that only
+    /// exist on the master must not reach the slave's persisted file.
+    #[tokio::test]
+    async fn test_persisted_config_preserves_node_local_listener_tls_and_web() {
+        let local = r#"
+config_version = 1
+
+[server]
+role = "slave"
+instance_name = "slave-1"
+data_dir = "/var/lib/sito-slave"
+
+[dns]
+bind = ["192.168.1.11"]
+
+[dns.tls]
+cert = "/etc/sito/slave-dns.crt"
+key = "/etc/sito/slave-dns.key"
+
+[tls]
+cert = "/etc/sito/slave.crt"
+key = "/etc/sito/slave.key"
+
+[acme]
+enabled = true
+email = "slave@example.com"
+domains = ["slave.example"]
+cache_dir = "/var/lib/sito/acme"
+
+[web]
+bind = "127.0.0.1"
+port = 8081
+
+[integrations.mikrotik]
+url = "https://192.168.1.7"
+token = "local-token"
+password = "local-routeros-password"
+"#;
+        let pushed = r#"
+config_version = 1
+
+[server]
+role = "slave"
+data_dir = "/var/lib/sito-master"
+
+[dns]
+bind = ["192.168.1.10", "::"]
+
+[dns.tls]
+cert = "/etc/sito/master-dns.crt"
+key = "/etc/sito/master-dns.key"
+
+[tls]
+cert = "/etc/sito/master.crt"
+key = "/etc/sito/master.key"
+
+[acme]
+enabled = true
+email = "master@example.com"
+domains = ["master.example"]
+cache_dir = "/var/lib/sito-master/acme"
+
+[web]
+bind = "192.168.1.10"
+port = 80
+
+[integrations.mikrotik]
+url = "https://192.168.9.9"
+"#;
+
+        let live = Config::from_toml_str(local).expect("node-local config");
+        let bundle = test_bundle(2, pushed, None, None);
+        let merged = build_persisted_config(pushed, &bundle, None, &live, None)
+            .await
+            .expect("build persisted config");
+        let table: toml::Table = merged.parse().unwrap();
+
+        assert_eq!(
+            table
+                .get("dns")
+                .and_then(|dns| dns.get("bind"))
+                .and_then(toml::Value::as_array)
+                .map(|bind| bind
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<Vec<_>>()),
+            Some(vec!["192.168.1.11"]),
+            "the slave must keep its own bind list, not the master's: {merged}"
+        );
+        assert_eq!(
+            table
+                .get("dns")
+                .and_then(|dns| dns.get("tls"))
+                .and_then(|tls| tls.get("cert"))
+                .and_then(toml::Value::as_str),
+            Some("/etc/sito/slave-dns.crt"),
+            "the slave must keep its own [dns.tls] certificate path"
+        );
+        assert_eq!(
+            table
+                .get("tls")
+                .and_then(|tls| tls.get("cert"))
+                .and_then(toml::Value::as_str),
+            Some("/etc/sito/slave.crt"),
+            "the slave must keep its own [tls] certificate path"
+        );
+        assert_eq!(
+            table
+                .get("tls")
+                .and_then(|tls| tls.get("key"))
+                .and_then(toml::Value::as_str),
+            Some("/etc/sito/slave.key"),
+            "the slave must keep its own [tls] key path"
+        );
+        assert_eq!(
+            table
+                .get("acme")
+                .and_then(|acme| acme.get("email"))
+                .and_then(toml::Value::as_str),
+            Some("slave@example.com"),
+            "the slave must keep its own [acme] identity"
+        );
+        assert_eq!(
+            table
+                .get("acme")
+                .and_then(|acme| acme.get("cache_dir"))
+                .and_then(toml::Value::as_str),
+            Some("/var/lib/sito/acme"),
+            "the slave must keep its own [acme] cache directory"
+        );
+        assert_eq!(
+            table
+                .get("web")
+                .and_then(|web| web.get("bind"))
+                .and_then(toml::Value::as_str),
+            Some("127.0.0.1"),
+            "the slave must keep its own web bind address"
+        );
+        assert_eq!(
+            table
+                .get("web")
+                .and_then(|web| web.get("port"))
+                .and_then(toml::Value::as_integer),
+            Some(8081),
+            "the slave must keep its own web port"
+        );
+        assert_eq!(
+            table
+                .get("integrations")
+                .and_then(|integrations| integrations.get("mikrotik"))
+                .and_then(|mikrotik| mikrotik.get("url"))
+                .and_then(toml::Value::as_str),
+            Some("https://192.168.1.7"),
+            "the RouterOS URL is node-local and must come from the slave"
+        );
+        assert_eq!(
+            table
+                .get("integrations")
+                .and_then(|integrations| integrations.get("mikrotik"))
+                .and_then(|mikrotik| mikrotik.get("password"))
+                .and_then(toml::Value::as_str),
+            Some("local-routeros-password"),
+            "the RouterOS password must survive a push"
+        );
+    }
+
+    /// Regression: a slave that disables the admin listener must not receive
+    /// the master's `web.enabled = true`. That false difference made the push
+    /// fail with `restart_required: web`, so the slave stayed `Degraded` and
+    /// replication never converged. The complete node-local web identity must
+    /// survive; only cluster-shared `[web]` keys (legacy ACME) follow the
+    /// master.
+    #[tokio::test]
+    async fn test_persisted_config_preserves_node_local_web_identity() {
+        let local = r#"
+config_version = 1
+
+[server]
+role = "slave"
+
+[web]
+enabled = false
+bind = "127.0.0.1"
+port = 8081
+trusted_proxies = ["10.0.0.2"]
+metrics_auth = false
+public_url = "https://slave.example"
+tls_terminated_by_proxy = true
+acme_enabled = true
+acme_email = "slave@example.com"
+acme_domains = ["slave.example"]
+"#;
+        let pushed = r#"
+config_version = 1
+
+[server]
+role = "slave"
+
+[web]
+enabled = true
+bind = "192.168.1.10"
+port = 80
+trusted_proxies = ["10.0.0.1"]
+metrics_auth = true
+public_url = "https://master.example"
+tls_terminated_by_proxy = false
+acme_enabled = false
+"#;
+
+        let live = Config::from_toml_str(local).expect("node-local config");
+        let bundle = test_bundle(2, pushed, None, None);
+        let merged = build_persisted_config(pushed, &bundle, None, &live, None)
+            .await
+            .expect("build persisted config");
+        let table: toml::Table = merged.parse().unwrap();
+        let web = table
+            .get("web")
+            .and_then(toml::Value::as_table)
+            .expect("[web] must be persisted");
+
+        assert_eq!(
+            web.get("enabled").and_then(toml::Value::as_bool),
+            Some(false),
+            "the slave must keep its own web.enabled: {merged}"
+        );
+        assert_eq!(
+            web.get("bind").and_then(toml::Value::as_str),
+            Some("127.0.0.1"),
+            "the slave must keep its own web.bind"
+        );
+        assert_eq!(
+            web.get("port").and_then(toml::Value::as_integer),
+            Some(8081),
+            "the slave must keep its own web.port"
+        );
+        assert_eq!(
+            web.get("trusted_proxies")
+                .and_then(toml::Value::as_array)
+                .map(|proxies| proxies
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<Vec<_>>()),
+            Some(vec!["10.0.0.2"]),
+            "the slave must keep its own web.trusted_proxies"
+        );
+        assert_eq!(
+            web.get("metrics_auth").and_then(toml::Value::as_bool),
+            Some(false),
+            "the slave must keep its own web.metrics_auth"
+        );
+        assert_eq!(
+            web.get("public_url").and_then(toml::Value::as_str),
+            Some("https://slave.example"),
+            "the slave must keep its own web.public_url"
+        );
+        assert_eq!(
+            web.get("tls_terminated_by_proxy")
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "the slave must keep its own web.tls_terminated_by_proxy"
+        );
+        assert_eq!(
+            web.get("acme_enabled").and_then(toml::Value::as_bool),
+            Some(false),
+            "cluster-shared [web] keys must still come from the master"
+        );
+
+        // The restart-only check compares the effective typed listener
+        // fields. `config_apply`'s regression test asserts the same pair does
+        // not report `web`.
+        let applied = Config::from_toml_str(&merged).expect("merged config");
+        assert_eq!(applied.get_web_config(), live.get_web_config());
+    }
+
+    /// A slave without certificate material must not inherit the master's TLS
+    /// and ACME paths: they are local to the master and a restart on the slave
+    /// would fail to load them.
+    #[tokio::test]
+    async fn test_pushed_tls_and_acme_are_removed_when_slave_has_none() {
+        let pushed = r#"
+config_version = 1
+
+[server]
+role = "slave"
+
+[dns]
+bind = ["192.168.1.10"]
+[dns.tls]
+cert = "/etc/sito/master-dns.crt"
+key = "/etc/sito/master-dns.key"
+
+[tls]
+cert = "/etc/sito/master.crt"
+key = "/etc/sito/master.key"
+
+[acme]
+enabled = true
+email = "master@example.com"
+domains = ["master.example"]
+"#;
+        let live = Config::default();
+        let bundle = test_bundle(2, pushed, None, None);
+        let merged = build_persisted_config(pushed, &bundle, None, &live, None)
+            .await
+            .expect("build persisted config");
+        let table: toml::Table = merged.parse().unwrap();
+
+        assert!(
+            table.get("tls").is_none(),
+            "the master's [tls] section must not be persisted on a slave without one: {merged}"
+        );
+        assert!(
+            table.get("acme").is_none(),
+            "the master's [acme] section must not be persisted on a slave without one: {merged}"
+        );
+        assert!(
+            table.get("dns").and_then(|dns| dns.get("tls")).is_none(),
+            "the master's [dns.tls] section must not be persisted on a slave: {merged}"
+        );
+        let expected_bind: Vec<String> = live.dns.bind.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            table
+                .get("dns")
+                .and_then(|dns| dns.get("bind"))
+                .and_then(toml::Value::as_array)
+                .map(|bind| bind
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<Vec<_>>()),
+            Some(expected_bind.iter().map(String::as_str).collect()),
+            "the slave's default bind list must be preserved"
         );
     }
 
@@ -1659,6 +2399,580 @@ ttl = 60
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
+    /// A restart restores the applied watermark and rejects both an older
+    /// signed bundle and a same-version bundle with different content.
+    #[tokio::test]
+    async fn test_restart_rejects_replay_and_same_version_content_swap() {
+        let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_watermark_worker_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let watermark_path = dir.join("ha_watermark.toml");
+        let config_toml = "config_version = 1\n[server]\nrole = \"slave\"\n";
+
+        let first = SlaveStatusTracker::new("slave-restart".to_string(), 0, None)
+            .with_watermark_path(watermark_path.clone())
+            .unwrap();
+        let handles = test_handles(None).await;
+        let push_v2 =
+            build_and_sign_push(&test_bundle(2, config_toml, None, None), &signing_key).unwrap();
+        assert_eq!(
+            apply_config_push(&push_v2, &first, &handles, &signing_key.public_key())
+                .await
+                .unwrap(),
+            2
+        );
+
+        // Simulate a process restart: only the on-disk watermark survives.
+        let restarted = SlaveStatusTracker::new("slave-restart".to_string(), 0, None)
+            .with_watermark_path(watermark_path.clone())
+            .unwrap();
+        assert_eq!(restarted.get_version(), 2);
+        let restarted_handles = test_handles(None).await;
+
+        let old_push =
+            build_and_sign_push(&test_bundle(1, config_toml, None, None), &signing_key).unwrap();
+        assert!(
+            apply_config_push(
+                &old_push,
+                &restarted,
+                &restarted_handles,
+                &signing_key.public_key()
+            )
+            .await
+            .is_err(),
+            "an older signed bundle must be rejected after restart"
+        );
+        assert_eq!(
+            restarted.get_version(),
+            2,
+            "a rejected replay must not advance the watermark"
+        );
+
+        let mut swapped = test_bundle(2, config_toml, None, None);
+        swapped.custom_rules = vec!["||content-swap.example^".to_string()];
+        let swapped_push = build_and_sign_push(&swapped, &signing_key).unwrap();
+        assert!(
+            apply_config_push(
+                &swapped_push,
+                &restarted,
+                &restarted_handles,
+                &signing_key.public_key()
+            )
+            .await
+            .is_err(),
+            "same-version content replay must be rejected"
+        );
+        assert!(
+            restarted_handles
+                .runtime
+                .snapshot()
+                .config
+                .filtering
+                .custom_rules
+                .is_empty(),
+            "rejected replays must not change the live configuration"
+        );
+
+        // Forward progress still works after the restart.
+        let push_v3 =
+            build_and_sign_push(&test_bundle(3, config_toml, None, None), &signing_key).unwrap();
+        assert_eq!(
+            apply_config_push(
+                &push_v3,
+                &restarted,
+                &restarted_handles,
+                &signing_key.public_key()
+            )
+            .await
+            .unwrap(),
+            3
+        );
+        let persisted = restarted.get_watermark().expect("watermark");
+        assert_eq!(persisted.version, 3);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// The watermark is durable before the push is acknowledged.
+    #[tokio::test]
+    async fn test_watermark_is_persisted_before_ack() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_watermark_ack_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let watermark_path = dir.join("ha_watermark.toml");
+        let tracker = SlaveStatusTracker::new("slave-ack".to_string(), 0, None)
+            .with_watermark_path(watermark_path.clone())
+            .unwrap();
+        let handles = test_handles(None).await;
+        let push = build_and_sign_push(
+            &test_bundle(
+                1,
+                "config_version = 1\n[server]\nrole = \"slave\"\n",
+                None,
+                None,
+            ),
+            &signing_key,
+        )
+        .unwrap();
+
+        let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            slave_socket,
+            Role::Client,
+            Some(ws_config()),
+        )
+        .await;
+        let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer_socket,
+            Role::Server,
+            Some(ws_config()),
+        )
+        .await;
+
+        tracker.set_state(SlaveState::HelloSent);
+        handle_master_message(
+            &push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            read_ack(&mut peer).await,
+            HaMessage::Ack {
+                version: 1,
+                term: 0,
+                conflict: None,
+                applied: true,
+                ..
+            }
+        ));
+        let persisted: crate::bundle::AppliedWatermark =
+            serde_json::from_str(&tokio::fs::read_to_string(&watermark_path).await.unwrap())
+                .unwrap();
+        assert_eq!(persisted.version, 1);
+        assert_eq!(
+            persisted.payload_hash,
+            push_payload_hash(&push).unwrap(),
+            "the ACK must only be sent after the exact signed payload is on disk"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A same-version payload fork latches the slave: every further push in the
+    /// same term is rejected until an explicit higher-term promotion arrives.
+    #[tokio::test]
+    async fn test_same_version_fork_latches_and_blocks_same_term_versions() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_fork_latch_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let watermark_path = dir.join("ha_watermark.toml");
+        let tracker = SlaveStatusTracker::new("slave-fork".to_string(), 0, None)
+            .with_watermark_path(watermark_path.clone())
+            .unwrap();
+        let handles = test_handles(None).await;
+        let config_toml = "config_version = 1\n[server]\nrole = \"slave\"\n";
+
+        // Applied state: term 0, version 50, payload B.
+        let applied = ConfigBundle {
+            term: 0,
+            ..test_bundle(50, config_toml, None, None)
+        };
+        let applied_push = build_and_sign_push(&applied, &signing_key).unwrap();
+        assert_eq!(
+            apply_config_push(&applied_push, &tracker, &handles, &signing_key.public_key())
+                .await
+                .unwrap(),
+            50
+        );
+        assert!(!tracker.is_forked());
+
+        let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            slave_socket,
+            Role::Client,
+            Some(ws_config()),
+        )
+        .await;
+        let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer_socket,
+            Role::Server,
+            Some(ws_config()),
+        )
+        .await;
+
+        // Same term and version, different content: fork signal.
+        let mut forked = test_bundle(50, config_toml, None, None);
+        forked.term = 0;
+        forked.custom_rules = vec!["||fork-a.example^".to_string()];
+        let forked_push = build_and_sign_push(&forked, &signing_key).unwrap();
+        tracker.set_state(SlaveState::Synced);
+        handle_master_message(
+            &forked_push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+
+        match read_ack(&mut peer).await {
+            HaMessage::Ack {
+                version,
+                term,
+                applied,
+                conflict,
+                ..
+            } => {
+                assert_eq!(version, 50);
+                assert_eq!(term, 0);
+                assert!(!applied);
+                assert_eq!(conflict, Some(AckConflict::SameVersionFork));
+            }
+            other => panic!("expected an ACK, got {other:?}"),
+        }
+        assert!(tracker.is_forked(), "the fork must be latched");
+        assert_eq!(
+            tracker.get_state(),
+            SlaveState::Degraded,
+            "a fork must degrade the slave immediately"
+        );
+        let persisted: crate::bundle::AppliedWatermark =
+            serde_json::from_str(&tokio::fs::read_to_string(&watermark_path).await.unwrap())
+                .unwrap();
+        assert!(persisted.forked, "the latch must be durable");
+        assert_eq!(persisted.version, 50);
+
+        // The forked master's next version in the same term is refused.
+        let forked_next = ConfigBundle {
+            term: 0,
+            ..test_bundle(51, config_toml, None, None)
+        };
+        let forked_next_push = build_and_sign_push(&forked_next, &signing_key).unwrap();
+        handle_master_message(
+            &forked_next_push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+        match read_ack(&mut peer).await {
+            HaMessage::Ack {
+                version,
+                applied,
+                conflict,
+                ..
+            } => {
+                assert_eq!(version, 50);
+                assert!(!applied);
+                assert_eq!(conflict, Some(AckConflict::SameVersionFork));
+            }
+            other => panic!("expected an ACK, got {other:?}"),
+        }
+        assert_eq!(tracker.get_version(), 50);
+        let live_rules = &handles.runtime.snapshot().config.filtering.custom_rules;
+        assert!(
+            !live_rules
+                .iter()
+                .any(|rule| rule.contains("fork-a.example")),
+            "the forked configuration must never become live: {live_rules:?}"
+        );
+
+        // An explicit higher-term promotion (with a higher version) resumes
+        // replication and clears the latch.
+        let promoted = ConfigBundle {
+            term: 1,
+            ..test_bundle(51, config_toml, None, None)
+        };
+        let promoted_push = build_and_sign_push(&promoted, &signing_key).unwrap();
+        handle_master_message(
+            &promoted_push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+        match read_ack(&mut peer).await {
+            HaMessage::Ack {
+                version,
+                term,
+                applied,
+                conflict,
+                ..
+            } => {
+                assert_eq!(version, 51);
+                assert_eq!(term, 1);
+                assert!(applied);
+                assert_eq!(conflict, None);
+            }
+            other => panic!("expected an ACK, got {other:?}"),
+        }
+        assert_eq!(tracker.get_version(), 51);
+        assert_eq!(tracker.get_term(), 1);
+        assert!(!tracker.is_forked(), "a higher term clears the latch");
+        assert!(!tracker.get_watermark().unwrap().forked);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A failed durable fork-latch write must still keep the in-memory latch and
+    /// refuse the next same-term version; it must not proceed as if unlatched.
+    #[tokio::test]
+    async fn test_fork_latch_write_failure_still_refuses_same_term_push() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_fork_latch_fail_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tracker = SlaveStatusTracker::new("slave-fork-fail".to_string(), 0, None)
+            .with_watermark_path(dir.join("ha_watermark.toml"))
+            .unwrap();
+        let handles = test_handles(None).await;
+        let config_toml = "config_version = 1\n[server]\nrole = \"slave\"\n";
+
+        let applied = ConfigBundle {
+            term: 0,
+            ..test_bundle(50, config_toml, None, None)
+        };
+        let applied_push = build_and_sign_push(&applied, &signing_key).unwrap();
+        assert_eq!(
+            apply_config_push(&applied_push, &tracker, &handles, &signing_key.public_key())
+                .await
+                .unwrap(),
+            50
+        );
+
+        // Sabotage the watermark path: its parent becomes a regular file, so
+        // the next atomic latch write fails.
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+        tokio::fs::write(&dir, b"not-a-directory").await.unwrap();
+
+        let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            slave_socket,
+            Role::Client,
+            Some(ws_config()),
+        )
+        .await;
+        let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer_socket,
+            Role::Server,
+            Some(ws_config()),
+        )
+        .await;
+
+        let mut forked = test_bundle(50, config_toml, None, None);
+        forked.term = 0;
+        forked.custom_rules = vec!["||fork-write-fail.example^".to_string()];
+        let forked_push = build_and_sign_push(&forked, &signing_key).unwrap();
+        tracker.set_state(SlaveState::Synced);
+        handle_master_message(
+            &forked_push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+
+        match read_ack(&mut peer).await {
+            HaMessage::Ack {
+                applied,
+                conflict,
+                error,
+                ..
+            } => {
+                assert!(!applied);
+                assert_eq!(conflict, Some(AckConflict::SameVersionFork));
+                assert!(
+                    error.unwrap_or_default().contains("could not be persisted"),
+                    "the ACK must surface the latch write failure"
+                );
+            }
+            other => panic!("expected an ACK, got {other:?}"),
+        }
+        assert!(
+            tracker.is_forked(),
+            "the in-memory latch must survive a failed durable write"
+        );
+        assert_eq!(tracker.get_state(), SlaveState::Degraded);
+
+        let forked_next = ConfigBundle {
+            term: 0,
+            ..test_bundle(51, config_toml, None, None)
+        };
+        let forked_next_push = build_and_sign_push(&forked_next, &signing_key).unwrap();
+        handle_master_message(
+            &forked_next_push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+        match read_ack(&mut peer).await {
+            HaMessage::Ack {
+                version,
+                applied,
+                conflict,
+                ..
+            } => {
+                assert_eq!(version, 50);
+                assert!(!applied);
+                assert_eq!(conflict, Some(AckConflict::SameVersionFork));
+            }
+            other => panic!("expected an ACK, got {other:?}"),
+        }
+        assert_eq!(tracker.get_version(), 50);
+        assert!(
+            !handles
+                .runtime
+                .snapshot()
+                .config
+                .filtering
+                .custom_rules
+                .iter()
+                .any(|rule| rule.contains("fork-write-fail")),
+            "the forked configuration must not become live"
+        );
+
+        let _ = tokio::fs::remove_file(&dir).await;
+    }
+
+    /// A stale master from an older term must not overwrite a newer slave,
+    /// even when its version counter is higher.
+    #[tokio::test]
+    async fn test_stale_master_push_is_rejected_without_overwriting() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_stale_master_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tracker = SlaveStatusTracker::new("slave-epoch".to_string(), 0, None)
+            .with_watermark_path(dir.join("ha_watermark.toml"))
+            .unwrap();
+        let handles = test_handles(None).await;
+
+        // The slave has applied an epoch-1, version-5 bundle.
+        let current = ConfigBundle {
+            term: 1,
+            ..test_bundle(
+                5,
+                "config_version = 1\n[server]\nrole = \"slave\"\n",
+                None,
+                None,
+            )
+        };
+        let current_push = build_and_sign_push(&current, &signing_key).unwrap();
+        assert_eq!(
+            apply_config_push(&current_push, &tracker, &handles, &signing_key.public_key())
+                .await
+                .unwrap(),
+            5
+        );
+        assert_eq!(tracker.get_term(), 1);
+
+        // A stale epoch-0 master offers a higher version.
+        let stale = ConfigBundle {
+            term: 0,
+            ..test_bundle(
+                6,
+                "config_version = 1\n[server]\nrole = \"slave\"\n",
+                None,
+                None,
+            )
+        };
+        let stale_push = build_and_sign_push(&stale, &signing_key).unwrap();
+
+        let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            slave_socket,
+            Role::Client,
+            Some(ws_config()),
+        )
+        .await;
+        let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer_socket,
+            Role::Server,
+            Some(ws_config()),
+        )
+        .await;
+
+        tracker.set_state(SlaveState::Synced);
+        handle_master_message(
+            &stale_push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+
+        match read_ack(&mut peer).await {
+            HaMessage::Ack {
+                version,
+                term,
+                applied,
+                error,
+                ..
+            } => {
+                assert_eq!(version, 5);
+                assert_eq!(term, 1);
+                assert!(!applied);
+                assert!(
+                    error.unwrap_or_default().contains("stale master/epoch"),
+                    "the ACK must explain the rejected epoch"
+                );
+            }
+            other => panic!("expected an ACK, got {other:?}"),
+        }
+        assert_eq!(tracker.get_version(), 5);
+        assert_eq!(tracker.get_term(), 1);
+        assert_eq!(
+            tracker.get_watermark().unwrap().version,
+            5,
+            "the stale push must not advance the watermark"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
     /// The early-ACK path must reach `Synced`, but it must never clear a
     /// `Degraded` state without a successful apply.
     #[tokio::test]
@@ -1684,6 +2998,7 @@ ttl = 60
         let handles = test_handles(None).await;
         let push = HaMessage::ConfigPush {
             version: 5,
+            term: 0,
             hash_blake3: "hash".to_string(),
             signature_ed25519: "sig".to_string(),
             payload_b64: "payload".to_string(),
@@ -1703,6 +3018,8 @@ ttl = 60
             ack,
             HaMessage::Ack {
                 version: 5,
+                term: 0,
+                conflict: None,
                 applied: true,
                 ..
             }
@@ -1814,6 +3131,7 @@ ttl = 60
             let _ = ws.next().await;
             let big = HaMessage::ConfigPush {
                 version: 99,
+                term: 0,
                 hash_blake3: "h".to_string(),
                 signature_ed25519: "s".to_string(),
                 payload_b64: "x".repeat(2 * 1024 * 1024),
@@ -1857,8 +3175,9 @@ ttl = 60
 
     /// The WP-5.1 end-to-end scenario: a realistic master config with a
     /// `[tls] key` path and structured `client_id_secrets` must replicate
-    /// successfully (no unresolvable `${SECRET:tls_key}` placeholder) and the
-    /// wire bundle must not carry the client secret.
+    /// successfully (no unresolvable `${SECRET:tls_key}` placeholder).
+    /// Certificate paths are node-local: the slave keeps its own `[tls]`
+    /// paths and the wire bundle must not carry the client secret.
     #[tokio::test]
     async fn test_push_with_tls_path_and_client_secrets_applies() {
         use crate::bundle::sanitize_config_for_bundle;
@@ -1905,10 +3224,10 @@ client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
         let dir = std::env::temp_dir().join(format!("sito_ha_tls_{}", rand::random::<u64>()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let path = dir.join("config.toml");
-        // The slave keeps its node-local secret.
+        // The slave keeps its node-local secret and TLS paths.
         tokio::fs::write(
             &path,
-            "[server]\nrole = \"slave\"\ninstance_name = \"slave-tls\"\n\n[clients]\nclient_id_secrets = { \"kids-tablet\" = \"client_shared_secret_9876\" }\n",
+            "[server]\nrole = \"slave\"\ninstance_name = \"slave-tls\"\n\n[tls]\ncert = \"/etc/sito/slave.crt\"\nkey = \"/etc/sito/slave.key\"\n\n[clients]\nclient_id_secrets = { \"kids-tablet\" = \"client_shared_secret_9876\" }\n",
         )
         .await
         .unwrap();
@@ -1920,8 +3239,8 @@ client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
             .expect("a config with a TLS key path and client secrets must replicate");
         assert_eq!(tracker.get_state(), SlaveState::Synced);
 
-        // The persisted configuration keeps the node-local secret and the TLS
-        // path, and a restart can parse it.
+        // The persisted configuration keeps the node-local secret and the
+        // slave's own TLS paths, and a restart can parse it.
         let persisted: toml::Table = tokio::fs::read_to_string(&path)
             .await
             .unwrap()
@@ -1932,7 +3251,8 @@ client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
                 .get("tls")
                 .and_then(|t| t.get("key"))
                 .and_then(toml::Value::as_str),
-            Some("/etc/sito/tls.key")
+            Some("/etc/sito/slave.key"),
+            "the master's certificate path must not replace the slave's"
         );
         assert_eq!(
             persisted

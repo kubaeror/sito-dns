@@ -9,10 +9,20 @@ Type=simple
 User=sito
 Group=sito
 ExecStart=/usr/local/bin/sito --config /etc/sito/config.toml
+# HA mTLS certificates must be readable by User=sito. Generate them as root
+# with ownership transfer, or chown the files before starting the service:
+#   sudo sito ha gen-certs --dir /etc/sito/certs --master --slave \
+#     --uid "$(id -u sito)" --gid "$(id -g sito)"
+#   sudo chown -R sito:sito /etc/sito/certs
+#   sudo chmod 0600 /etc/sito/certs/*.key
+# Keys owned by root make the replication listener fail at startup while DNS
+# health still passes; GET /api/v1/ha/status then reports ready = false.
 # The service runs unprivileged with ProtectSystem=strict, so in-app updates
 # cannot replace the binary in /usr/local/bin. Updates must be applied as root
 # while the service is stopped: sudo systemctl stop sito && sudo sito update
-# (or re-run this installer). See docs/installation.md "Updating sito".
+# (or re-run this installer). The installer also installs cosign because
+# server.update_require_signature defaults to true. See docs/installation.md
+# "Updating sito".
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true

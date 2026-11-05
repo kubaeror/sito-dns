@@ -557,3 +557,82 @@ fn test_m9_release_configuration_and_systemd() {
         "install.sh must gate the unverified local-binary install behind an explicit opt-in"
     );
 }
+
+/// 1.9.2 keeps the wildcard defaults but must not teach operators to expose
+/// the admin UI or an open resolver to the internet. The installer and the
+/// primary docs must recommend LAN-only access and show the safe options.
+#[test]
+fn test_m9_network_exposure_guidance_is_lan_only() {
+    let root = if Path::new("../../contrib/install.sh").exists() {
+        Path::new("../..").to_path_buf()
+    } else {
+        Path::new(".").to_path_buf()
+    };
+    let read = |relative: &str| {
+        let path = root.join(relative);
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    };
+
+    let install = read("contrib/install.sh");
+    for forbidden in [
+        "ufw allow 8080",
+        "ufw allow 53/tcp",
+        "ufw allow 53/udp",
+        "add-port={53/tcp,53/udp,853/tcp,443/tcp,8080/tcp}",
+    ] {
+        assert!(
+            !install.contains(forbidden),
+            "install.sh must not recommend opening '{forbidden}' to every source"
+        );
+    }
+    for expected in [
+        "Firewall guidance (LAN-only by default)",
+        "Do not expose port 8080 to the internet",
+        "ufw allow OpenSSH",
+        "do not open 8080",
+        "ufw allow from 192.168.0.0/24 to any port 8080 proto tcp",
+        "ssh -L 8080:127.0.0.1:8080",
+        "ufw allow from 192.168.0.0/24 to any port 53 proto udp",
+        "reverse proxy",
+    ] {
+        assert!(
+            install.contains(expected),
+            "install.sh is missing LAN-only exposure guidance: '{expected}'"
+        );
+    }
+
+    let installation = read("docs/installation.md");
+    assert!(
+        installation.contains("## Network Exposure and Firewall"),
+        "docs/installation.md must have a network-exposure/firewall section"
+    );
+    for expected in [
+        "sudo ufw allow OpenSSH",
+        "do not open 8080",
+        "ssh -L 8080:127.0.0.1:8080",
+        "1.10.0",
+        "web.bind",
+        "dns.bind",
+    ] {
+        assert!(
+            installation.contains(expected),
+            "docs/installation.md is missing exposure guidance: '{expected}'"
+        );
+    }
+
+    let reference = read("docs/configuration-reference.md");
+    for expected in ["no DNS client allow-list", "startup warning"] {
+        assert!(
+            reference.contains(expected),
+            "docs/configuration-reference.md is missing exposure guidance: '{expected}'"
+        );
+    }
+
+    let readme = read("README.md");
+    for expected in ["Network exposure", "Do not expose port 8080"] {
+        assert!(
+            readme.contains(expected),
+            "README.md is missing exposure guidance: '{expected}'"
+        );
+    }
+}

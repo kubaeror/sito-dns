@@ -50,7 +50,12 @@ export TOKEN='sito_...'   # an Admin API token, or use a session cookie instead
 1. **Bootstrap.** On a fresh installation the first administrator is created by
    the setup wizard at `/wizard` (or, for headless installs, by
    `sito --no-setup`, which generates a random password and binds the panel to
-   loopback). The bootstrap account is named `admin`.
+   loopback). The bootstrap account is named `admin`. While the first-boot setup
+   token is active, or `admin/adminadmin` is still the stored bootstrap
+   credential, login, `/api/v1/auth/*`, API tokens and every non-wizard route are
+   disabled. Only `/wizard`, `/ui/wizard/*`, static assets, `/health` and
+   `/status` are reachable; the wizard requires the one-time token printed in
+   the server logs (or an authenticated Admin session).
 2. **Create** additional accounts with `POST /api/v1/auth/users` or the Admin
    **Users** page at `/users`.
 3. **Operate.** Users sign in at `/login` (session cookie) or authenticate with
@@ -59,10 +64,34 @@ export TOKEN='sito_...'   # an Admin API token, or use a session cookie instead
    **Users** page. Sessions and every API token owned by that account are
    revoked immediately. Legacy ownerless tokens are not tied to an account and
    remain Admin-managed until explicitly revoked.
-5. **Recover.** If credentials are lost, an operator with shell access can run
-   `sito reset-admin --config /etc/sito/config.toml --password '<new-password>'`.
-   This recreates the `admin` account and invalidates **all** sessions and
-   tokens by rotating the auth generation.
+5. **Recover.** If credentials are lost, an operator with shell access must
+   stop the service first, then reset the admin account and start it again:
+
+   ```bash
+   sudo systemctl stop sito
+   sudo sito reset-admin --config /etc/sito/config.toml --password '<new-password>'
+   sudo systemctl start sito
+   ```
+
+   Supplied passwords must meet the same policy as the API and wizard (at least
+   8 characters, no whitespace or control characters, and not `adminadmin`). If
+   `--password` is omitted, a 192-bit random password is generated and printed
+   exactly once. The reset preserves every non-admin account and invalidates
+   **all** persisted sessions and tokens by rotating the auth generation. Add
+   `--reset-all` (alias `--reset-users`) only when a full account-store
+   replacement is intended; a corrupt `users.toml` requires that explicit
+   option.
+
+   `reset-admin` and `reset-sessions` detect the running server through the
+   service lease at `<data_dir>/sito.pid` and **refuse to run while it is
+   active**, because the process keeps users, sessions, tokens and the auth
+   generation in memory. Stopping the service is therefore part of the recovery
+   procedure, not an optional step. `--force` overrides the refusal but only
+   changes the files on disk: existing sessions/API tokens remain valid and the
+   new admin password is not accepted until the service is restarted. Use
+   `--force` only when you deliberately want the on-disk state prepared for a
+   restart that will happen immediately afterwards. In a container, stop the
+   container instead of using `systemctl`.
 
 Account data never leaves the node: `users.toml` is not replicated by HA and
 must be backed up together with `<data_dir>/totp.key` (see
@@ -154,6 +183,28 @@ create fresh tokens after a role change. This prevents an old Admin-scoped
 token from surviving a demotion. The last-admin check and the role update are
 atomic, so two concurrent demotions cannot both succeed and leave the
 deployment without an Admin.
+
+### Credential epochs and upgrade re-login
+
+Every account carries a persisted `credential_epoch` in `users.toml`. Sessions
+and API tokens record the account and role they were issued under together with
+that epoch, and every request re-checks the user table: the account must still
+exist, its role must be unchanged, and the epoch must be current. Password
+changes, role changes, TOTP enable/disable, deletion/recreation and
+`reset-admin` advance the epoch. A login or TOTP verification that raced one of
+those mutations is refused instead of creating a session with the old role or
+for a deleted account; an interrupted revocation is re-checked after a restart.
+
+Sessions and tokens persisted by an older release have no epoch. They are
+rejected once after upgrading, so every user must sign in again and every API
+token must be re-issued. Plan the upgrade accordingly; no data is lost, but old
+credentials stop working immediately.
+
+Credential writes are fail-closed. If `users.toml` cannot be written, creating
+an account, changing a password or role, enabling/disabling TOTP, deleting an
+account or running `reset-admin` returns an error (`500 Internal Server Error`
+through the API) and rolls the in-memory change back. The operation is never
+reported as successful before it is durable.
 
 ## 5. Change a Password
 
@@ -263,10 +314,14 @@ The REST revoke endpoint is Admin-only. On `/account`, a user may revoke only
 their own tokens (Admins may also revoke legacy ownerless tokens); another
 user's token ID returns `404`, indistinguishable from a missing token.
 
-Revocation takes effect immediately. To invalidate every session and token at
-once, run `sito reset-sessions --config /etc/sito/config.toml` (or
-`sito reset-admin`), which also rotates the auth generation so copies of the
-deleted stores cannot be replayed.
+Revocation takes effect immediately. To invalidate every persisted session and
+token at once, stop the service, run
+`sito reset-sessions --config /etc/sito/config.toml` (or `sito reset-admin`),
+then start it again. The reset rotates the auth generation so copies of the
+deleted stores cannot be replayed. It refuses to run while the server is
+running: an in-memory session or token would stay valid until restart, so
+claiming otherwise would be false. `--force` performs the on-disk reset anyway
+and prints a warning that the restart is required to revoke live credentials.
 
 Tokens authenticate API requests and count as their configured scope. They
 cannot change passwords or manage TOTP; those operations require a real user
@@ -324,8 +379,9 @@ Admin-managed.
 TOTP secrets are encrypted at rest with AES-256-GCM using
 `<data_dir>/totp.key`. Back up `users.toml` and `totp.key` together: restoring
 only one is a lockout, and the server refuses to start when the key is missing
-or does not match the stored secrets. `sito reset-admin` is the documented
-recovery path.
+or does not match the stored secrets. Stop the service before running the
+documented `sito reset-admin` recovery path so the new credentials are loaded
+on the next start (see section 1).
 
 ## 8. Sessions and Lockout
 

@@ -88,6 +88,17 @@ Client Query ──▶ [sito-transport] (UDP / TCP / DoT / DoH / DoQ / DoH3)
 curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/main/contrib/install.sh | sudo bash
 ```
 
+### Network exposure (read before exposing the host)
+
+The 1.9.2 defaults are intended for a trusted LAN: the admin UI listens on
+`0.0.0.0:8080` over plain HTTP, and DNS listens on `0.0.0.0`/`::` with no
+client allow-list. **Do not expose port 8080 to the internet.** Restrict DNS to
+your LAN with a host firewall, or bind `dns.bind` to your LAN address. For
+remote admin access, bind `web.bind = "127.0.0.1"` and use an SSH tunnel or a
+TLS reverse proxy. The server logs a startup warning for each exposed listener.
+The loopback-by-default change and a DNS client ACL are planned for 1.10.0;
+existing configurations keep working in 1.9.2.
+
 ### Option 2: Docker / Docker Compose
 ```yaml
 services:
@@ -139,13 +150,30 @@ cargo build --release --locked --features "embed-ui,mimalloc"
 ### 🧙 First-Time Setup Wizard
 On a fresh installation without a configuration file, **sito** starts in **setup-pending mode** on port `8080` (DNS listener ports 53/853/443 remain closed until initial setup is confirmed).
 
-Open **`http://<server-ip>:8080`** in any browser to launch the 6-section configuration wizard:
-* **Administrator Account:** Set a custom admin username and a password. The wizard rejects the bootstrap password `adminadmin`, passwords shorter than 8 characters, and passwords containing whitespace or control characters; there are no default credentials to fall back on.
+Open **`http://<server-ip>:8080`** from a trusted LAN host (or through an SSH tunnel; the LAN-only firewall in the installation guide does not open 8080) to launch the 6-section configuration wizard:
+* **Administrator Account:** Set a custom admin username and a password. The wizard rejects the bootstrap password `adminadmin`, passwords shorter than 8 characters, and passwords containing whitespace or control characters. The bootstrap account cannot log in while setup is pending.
 * **DNS Listeners:** Configure IPv4/IPv6 bindings, UDP/TCP, DoT, and DoH ports.
 * **Upstream Resolvers:** Select presets (Cloudflare, Quad9, Google) with live latency testing.
 * **Cache & DNSSEC:** Tune in-memory cache and cryptographic DNSSEC validation.
 * **Filtering:** Choose blocking modes, enable CNAME cloaking defense, and subscribe to popular blocklists (OISD, StevenBlack, HaGeZi).
 * **Web Panel & Statistics:** Configure web bind and retention policies.
+
+While setup is pending, the server prints a one-time setup token to the console. Open `/wizard?setup_token=<token>` (or send the `X-Setup-Token` header). Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` credential.
+
+If credentials are lost, stop the service, reset the admin account, then start it
+again:
+
+```bash
+sudo systemctl stop sito
+sudo sito reset-admin --config /etc/sito/config.toml   # prints a generated password once
+sudo systemctl start sito
+```
+
+`reset-admin` preserves non-admin accounts unless `--reset-all` is passed. The
+reset commands refuse to run while a server holds the data directory. `--force`
+writes the change to disk anyway, but the running server keeps its in-memory
+state: existing sessions/tokens stay valid and the new admin password does not
+take effect until the service is restarted.
 
 Once setup is submitted, DNS listeners are bound in-process without needing a server restart.
 
@@ -163,8 +191,8 @@ Swagger UI / OpenAPI documentation is available at `http://localhost:8080/api/do
 * **[User Management & Authentication](docs/user-management.md):** Accounts, roles/RBAC, password changes, API tokens, TOTP 2FA, last-admin protection, and recovery — including the Admin **Users** page (`/users`), the per-user **Account** page (`/account`), and the Operator-only unidentified-clients table in the web panel.
 * **[Migrating from AdGuard Home](docs/migration-adguard.md):** Migration instructions and automated converter script (`contrib/adguard_to_sito.py`).
 * **[High-Availability Runbook](docs/runbook-ha.md):** Deployment architectures, mTLS certificates, failover, and slave promotion.
-* **[1.9.1 Release Notes](docs/release-notes-1.9.1.md):** User-visible behavior changes, upgrade notes, and known issues for 1.9.1.
-* **[Changelog](CHANGELOG.md):** Release notes for v1.9.1 and complete history of phases M0 through M9.
+* **[1.9.2 Release Notes](docs/release-notes-1.9.2.md):** User-visible behavior changes, upgrade notes, and known issues for 1.9.2.
+* **[Changelog](CHANGELOG.md):** Release notes for v1.9.2 and complete history of phases M0 through M9.
 
 ---
 

@@ -40,6 +40,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tower::ServiceExt;
 
+/// Router tests exercise a configured deployment; a non-default admin password
+/// keeps the first-boot gate from closing the API path under test.
+const TEST_ADMIN_PASSWORD: &str = "TestAdminPassword123!";
+
 /// Reserves a free loopback TCP port for HA replication listeners.
 fn reserve_tcp_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve tcp port");
@@ -162,6 +166,9 @@ async fn create_test_context(
         Default::default(),
     ))));
     let auth_mgr = Arc::new(AuthManager::new());
+    auth_mgr
+        .update_user_password("admin", TEST_ADMIN_PASSWORD)
+        .await;
     let (_meta, token_resp) = auth_mgr
         .create_token("admin", sito_api::auth::Role::Admin, None)
         .await
@@ -388,6 +395,7 @@ key = "/etc/sito/certs/master.key"
 
     let clean_bundle = ConfigBundle {
         version: 1,
+        term: 0,
         timestamp: 1000,
         config_toml: sanitized,
         custom_rules: vec!["||example.com^".to_string()],
@@ -430,6 +438,7 @@ fn test_m8_monotonicity_guard_rejects_replay() {
 
     let bundle = ConfigBundle {
         version: 5,
+        term: 0,
         timestamp: 2000,
         config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec!["||replay-test.com^".to_string()],
@@ -464,6 +473,7 @@ fn test_m8_monotonicity_guard_rejects_replay() {
     {
         let fake_push = HaMessage::ConfigPush {
             version: *version,
+            term: 0,
             hash_blake3: hash_blake3.clone(),
             signature_ed25519: "deadbeef".repeat(8),
             payload_b64: payload_b64.clone(),
@@ -527,6 +537,7 @@ async fn test_m8_slave_rollback_on_invalid_bundle() {
     // Construct a corrupted bundle with invalid TOML syntax
     let corrupted_bundle = ConfigBundle {
         version: 2,
+        term: 0,
         timestamp: 12345,
         config_toml: "corrupted_toml = [[ broken syntax {{{".to_string(),
         custom_rules: vec!["||should-not-apply.com^".to_string()],
@@ -728,6 +739,412 @@ async fn test_m8_ha_rest_api_endpoints() {
 }
 
 // ----------------------------------------------------------------------------
+// Test 7b: HA readiness is visible in /health and /ha/status
+// ----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_m8_ha_readiness_is_visible_in_health_and_status() {
+    // Master: a listener/TLS failure must flip ready to false and expose a
+    // reason instead of leaving DNS as the only health signal.
+    let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+    let metrics = MetricsRegistry::new("0.1.0", "test");
+    let coordinator = MasterCoordinator::new("master-ready".to_string(), 1, signing_key, metrics);
+    coordinator.mark_replication_ready();
+    let (master_ctx, master_token, master_dir) =
+        create_test_context("master", Some(coordinator.clone()), None, None).await;
+    let mut master_cfg = (**master_ctx.config.load()).clone();
+    master_cfg.ha = Some(toml::from_str("replication_port = 8953").unwrap());
+    master_ctx.config.store(Arc::new(master_cfg));
+    let master_app = create_router(master_ctx);
+
+    let health = get_json(&master_app, "/health", None).await;
+    assert_eq!(health["ha"]["required"], true);
+    assert_eq!(health["ha"]["ready"], true);
+
+    coordinator.mark_replication_failed("master mTLS initialization failed: Permission denied");
+    let status = get_json(&master_app, "/api/v1/ha/status", Some(&master_token)).await;
+    assert_eq!(
+        status["ready"], false,
+        "failed listener must not look active"
+    );
+    assert!(
+        status["readiness_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Permission denied"),
+        "readiness reason must survive to /ha/status: {status}"
+    );
+    let health = get_json(&master_app, "/health", None).await;
+    assert_eq!(health["ha"]["required"], true);
+    assert_eq!(health["ha"]["ready"], false);
+    // `/health` is unauthenticated: it must not leak the detailed reason
+    // (certificate path, OS error, internal master URL, TOML/validation text)
+    // that remains available on the authenticated `/api/v1/ha/status`.
+    let public_reason = health["ha"]["reason"].as_str().unwrap_or_default();
+    assert_eq!(
+        public_reason, "HA replication is not ready",
+        "public health must use a generic HA reason: {health}"
+    );
+    assert!(
+        !public_reason.contains('/'),
+        "no filesystem paths in /health"
+    );
+    assert!(
+        !public_reason.contains("Permission denied"),
+        "no OS error detail in /health"
+    );
+
+    // Slave: readiness requires an actual sync, not just a configured URL.
+    let tracker = SlaveStatusTracker::new(
+        "slave-ready".to_string(),
+        0,
+        Some("wss://master.internal:8953".to_string()),
+    );
+    tracker.set_connection_error(Some("mTLS handshake failed with master".to_string()));
+    let (slave_ctx, slave_token, slave_dir) =
+        create_test_context("slave", None, Some(tracker.clone()), None).await;
+    let mut slave_cfg = (**slave_ctx.config.load()).clone();
+    slave_cfg.ha = Some(toml::from_str("master_url = \"wss://master.internal:8953\"").unwrap());
+    slave_ctx.config.store(Arc::new(slave_cfg));
+    let slave_app = create_router(slave_ctx);
+
+    let status = get_json(&slave_app, "/api/v1/ha/status", Some(&slave_token)).await;
+    assert_eq!(status["ready"], false);
+    assert!(
+        status["readiness_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("mTLS handshake failed"),
+        "handshake failure must reach /ha/status: {status}"
+    );
+    let slave_health = get_json(&slave_app, "/health", None).await;
+    assert_eq!(slave_health["ha"]["ready"], false);
+    assert_eq!(
+        slave_health["ha"]["reason"], "HA replication is not ready",
+        "slave /health must not expose the handshake/master URL detail"
+    );
+
+    tracker.mark_synced_with_term(1, 0);
+    let status = get_json(&slave_app, "/api/v1/ha/status", Some(&slave_token)).await;
+    assert_eq!(status["ready"], true);
+    assert!(status["readiness_reason"].is_null());
+
+    let _ = std::fs::remove_dir_all(&master_dir);
+    let _ = std::fs::remove_dir_all(&slave_dir);
+}
+
+// ----------------------------------------------------------------------------
+// Test 7c: An explicitly disabled master replication keeps its explanation
+// ----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_m8_ha_disabled_reason_is_exposed_in_status() {
+    let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+    let metrics = MetricsRegistry::new("0.1.0", "test");
+    let coordinator =
+        MasterCoordinator::new("master-disabled".to_string(), 1, signing_key, metrics);
+    coordinator.mark_replication_disabled();
+    let (master_ctx, master_token, master_dir) =
+        create_test_context("master", Some(coordinator), None, None).await;
+    let mut master_cfg = (**master_ctx.config.load()).clone();
+    master_cfg.ha = Some(toml::from_str("replication_port = 0").unwrap());
+    master_ctx.config.store(Arc::new(master_cfg));
+    let master_app = create_router(master_ctx);
+
+    // Replication is deliberately off, so the node is ready, but the reason
+    // must not be lost: operators need to see why there is no listener.
+    let status = get_json(&master_app, "/api/v1/ha/status", Some(&master_token)).await;
+    assert_eq!(status["ready"], true);
+    assert!(
+        status["readiness_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replication_port"),
+        "disabled replication must stay explained in /ha/status: {status}"
+    );
+
+    let health = get_json(&master_app, "/health", None).await;
+    assert_eq!(health["ha"]["required"], false);
+    assert_eq!(health["ha"]["ready"], true);
+    assert!(
+        health["ha"]["reason"].is_null(),
+        "public /health must not expose the disabled explanation: {health}"
+    );
+
+    let _ = std::fs::remove_dir_all(&master_dir);
+}
+
+// ----------------------------------------------------------------------------
+// Test 7c-b: a real unreadable key blocks mTLS until permissions are fixed
+// ----------------------------------------------------------------------------
+//
+// Non-root-safe half of the ownership acceptance: mode 0000 on the key makes
+// `build_server_tls_config` fail with a real permission error, and restoring
+// mode 0600 makes the same call succeed. Root bypasses mode bits, so this test
+// skips when euid is 0 (the root-gated test below covers that case).
+#[cfg(unix)]
+#[tokio::test]
+async fn test_m8_unreadable_key_fails_tls_until_permissions_fixed() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_m8_unreadable_key_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let probe = dir.join("probe");
+    std::fs::write(&probe, b"x").unwrap();
+    if std::fs::metadata(&probe).unwrap().uid() == 0 {
+        eprintln!(
+            "skipping test_m8_unreadable_key_fails_tls_until_permissions_fixed: root ignores mode bits"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let certs = generate_ha_certs(&dir, true, true).unwrap();
+    let cert = certs.master_cert_path.clone().unwrap();
+    let key = certs.master_key_path.clone().unwrap();
+    let fingerprint = certs.slave_fingerprint.clone().unwrap();
+
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let err =
+        sito_ha::build_server_tls_config(&cert, &key, std::slice::from_ref(&fingerprint), None)
+            .expect_err("an unreadable private key must fail mTLS initialization");
+    assert!(
+        err.to_string().contains("Permission denied"),
+        "expected a real permission error, got: {err}"
+    );
+
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    sito_ha::build_server_tls_config(&cert, &key, &[fingerprint], None)
+        .expect("restoring key permissions must make mTLS initialization succeed");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ----------------------------------------------------------------------------
+// Test 7d: root-owned key is unreadable, and chown makes HA start (root only)
+// ----------------------------------------------------------------------------
+//
+// Root-only verification of the runbook's systemd/Docker path. The parent
+// process must be root so it can generate a root-owned 0600 key and run the
+// child probe under uid/gid 65532 (the container runtime identity):
+//
+//   sudo env CARGO_TARGET_DIR=/home/ubuntu/sito-dns/target \
+//     cargo test -p sito-test --test m8_acceptance \
+//     test_m8_root_owned_key_chown_activates_ha -- --nocapture
+//
+// Or use `sudo scripts/test-ha-ownership-root.sh`. The test skips (and passes)
+// when not run as root so ordinary unprivileged test runs stay green.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_m8_root_owned_key_chown_activates_ha() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::process::CommandExt as _;
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_m8_root_owner_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let probe_path = dir.join("probe");
+    std::fs::write(&probe_path, b"x").unwrap();
+    let euid = std::fs::metadata(&probe_path).unwrap().uid();
+    if euid != 0 {
+        eprintln!(
+            "skipping test_m8_root_owned_key_chown_activates_ha: requires root (euid {euid})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    // Root-generated keys: exactly the state `sudo sito ha gen-certs` produced
+    // before ownership transfer.
+    let certs = generate_ha_certs(&dir, true, true).unwrap();
+    let master_key = certs.master_key_path.clone().unwrap();
+    let master_cert = certs.master_cert_path.clone().unwrap();
+    let slave_fingerprint = certs.slave_fingerprint.clone().unwrap();
+    let key_meta = std::fs::metadata(&master_key).unwrap();
+    assert_eq!(key_meta.uid(), 0, "fixture key must be root-owned");
+    assert_eq!(key_meta.mode() & 0o777, 0o600);
+
+    // The test binary lives under the developer checkout (often mode 0750),
+    // which uid 65532 cannot traverse; copy it somewhere world-executable.
+    let child_exe = dir.join("m8_acceptance_child");
+    std::fs::copy(std::env::current_exe().unwrap(), &child_exe).unwrap();
+    std::fs::set_permissions(&child_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run_child = |mode: &str| {
+        let mut command = std::process::Command::new(&child_exe);
+        command
+            .arg("--exact")
+            .arg("test_m8_ha_runtime_child_probe")
+            .arg("--nocapture")
+            .env("SITO_HA_CHILD_MODE", mode)
+            .env("SITO_HA_CHILD_CERT", &master_cert)
+            .env("SITO_HA_CHILD_KEY", &master_key)
+            .env("SITO_HA_CHILD_FINGERPRINT", &slave_fingerprint)
+            .current_dir("/tmp");
+        command.uid(65532).gid(65532);
+        command.output().expect("spawn uid-65532 child probe")
+    };
+
+    // 1. Root-owned 0600 key is unreadable by the runtime user: real mTLS
+    //    initialization must fail with a permission error, not injected state.
+    let unreadable = run_child("unreadable");
+    assert!(
+        unreadable.status.success(),
+        "runtime user unexpectedly read a root-owned key\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&unreadable.stdout),
+        String::from_utf8_lossy(&unreadable.stderr)
+    );
+
+    // 2. Perform the documented chown, then let the same runtime user start
+    //    the listener and verify the public readiness signal flips to ready.
+    for path in [
+        certs.ca_cert_path.as_path(),
+        certs.ca_key_path.as_path(),
+        master_cert.as_path(),
+        master_key.as_path(),
+        certs.slave_cert_path.as_ref().unwrap().as_path(),
+        certs.slave_key_path.as_ref().unwrap().as_path(),
+    ] {
+        std::os::unix::fs::chown(path, Some(65532), Some(65532))
+            .unwrap_or_else(|e| panic!("chown {}: {e}", path.display()));
+    }
+
+    let ready = run_child("ready");
+    assert!(
+        ready.status.success(),
+        "runtime user could not start HA after chown\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ready.stdout),
+        String::from_utf8_lossy(&ready.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Child process for [`test_m8_root_owned_key_chown_activates_ha`].
+///
+/// Runs only when `SITO_HA_CHILD_MODE` is set and is invoked under uid/gid
+/// 65532. `unreadable` asserts TLS initialization fails against the
+/// root-owned key; `ready` starts the real listener, then checks the API's
+/// `/health` and `/ha/status` readiness.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_m8_ha_runtime_child_probe() {
+    let Ok(mode) = std::env::var("SITO_HA_CHILD_MODE") else {
+        return;
+    };
+    let cert = PathBuf::from(std::env::var("SITO_HA_CHILD_CERT").unwrap());
+    let key = PathBuf::from(std::env::var("SITO_HA_CHILD_KEY").unwrap());
+    let fingerprint = std::env::var("SITO_HA_CHILD_FINGERPRINT").unwrap();
+
+    // Running as uid 65532: probe the real file permissions, never the
+    // in-process readiness fields.
+    use std::os::unix::fs::MetadataExt as _;
+    let probe_uid = {
+        let probe =
+            std::env::temp_dir().join(format!("sito_m8_child_uid_{}", rand::random::<u64>()));
+        std::fs::write(&probe, b"x").unwrap();
+        let uid = std::fs::metadata(&probe).unwrap().uid();
+        let _ = std::fs::remove_file(&probe);
+        uid
+    };
+    assert_eq!(probe_uid, 65532, "child probe must run as uid 65532");
+
+    match mode.as_str() {
+        "unreadable" => {
+            let err = sito_ha::build_server_tls_config(
+                &cert,
+                &key,
+                std::slice::from_ref(&fingerprint),
+                None,
+            )
+            .expect_err("a root-owned 0600 key must be unreadable by uid 65532");
+            assert!(
+                err.to_string().contains("Permission denied"),
+                "expected a permission error, got: {err}"
+            );
+        }
+        "ready" => {
+            let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+            let metrics = MetricsRegistry::new("0.1.0", "child");
+            let coordinator =
+                MasterCoordinator::new("child-master".to_string(), 1, signing_key, metrics);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let replication_port = reserve_tcp_port();
+            let handle = spawn_master_server(
+                HaConfig {
+                    replication_port,
+                    listen_addr: "127.0.0.1".to_string(),
+                    cert: Some(cert),
+                    key: Some(key),
+                    pinned_slave_fingerprints: vec![fingerprint],
+                    ..Default::default()
+                },
+                coordinator.clone(),
+                shutdown_rx,
+            );
+
+            let mut readiness = coordinator.readiness();
+            for _ in 0..100 {
+                if readiness.ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                readiness = coordinator.readiness();
+            }
+            assert!(
+                readiness.ready,
+                "listener did not become ready after chown: {readiness:?}"
+            );
+
+            let (ctx, token, dir) =
+                create_test_context("master", Some(coordinator), None, None).await;
+            let mut cfg = (**ctx.config.load()).clone();
+            cfg.ha =
+                Some(toml::from_str(&format!("replication_port = {replication_port}")).unwrap());
+            ctx.config.store(Arc::new(cfg));
+            let app = create_router(ctx);
+
+            let health = get_json(&app, "/health", None).await;
+            assert_eq!(health["ha"]["required"], true);
+            assert_eq!(
+                health["ha"]["ready"], true,
+                "public /health must flip to ready after chown: {health}"
+            );
+            let status = get_json(&app, "/api/v1/ha/status", Some(&token)).await;
+            assert_eq!(status["ready"], true);
+
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        other => panic!("unknown SITO_HA_CHILD_MODE '{other}'"),
+    }
+}
+
+/// GETs `path` from the router and decodes a JSON body.
+async fn get_json(app: &axum::Router, path: &str, token: Option<&str>) -> serde_json::Value {
+    let mut request = Request::builder().uri(path);
+    if let Some(token) = token {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let resp = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+// ----------------------------------------------------------------------------
 // Test 8: List change on master applies to 2 slaves in < 2 seconds
 // ----------------------------------------------------------------------------
 #[tokio::test]
@@ -859,6 +1276,7 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
     // Now update bundle on master: add a new custom rule
     let bundle = ConfigBundle {
         version: 2,
+        term: 0,
         timestamp: 12345,
         config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec!["||blocked-fast.test^".to_string()],
@@ -996,6 +1414,7 @@ nta = ["pushed.internal"]
     let push = build_and_sign_push(
         &ConfigBundle {
             version: 2,
+            term: 0,
             timestamp: 1,
             config_toml: config_toml.to_string(),
             custom_rules: vec!["||pushed-d01.test^".to_string()],
@@ -1103,6 +1522,224 @@ nta = ["pushed.internal"]
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+/// A push that changes a restart-only field must not be acknowledged as fully
+/// applied: the live process keeps its previous behavior, so `applied: true`
+/// would lie to the master. The push is rejected, the previous live state and
+/// the persisted file are kept, and the failure names `restart_required`.
+#[tokio::test]
+async fn test_m8_push_restart_only_field_is_not_acked_as_applied() {
+    let signing_key = Ed25519SigningKey::generate().unwrap();
+    let (ctx, _token, temp_dir) = create_test_context("slave", None, None, None).await;
+
+    let hooks = Arc::new(RecordingDnssecHooks {
+        validator: Arc::new(ArcSwap::from_pointee(
+            sito_dnssec::DnssecValidator::from_config(&Config::default().dns.dnssec),
+        )),
+        observed_nta: Arc::new(Mutex::new(Vec::new())),
+    });
+    let applier = Arc::new(sito::server::HaConfigApplier::new(
+        ctx.clone(),
+        hooks.clone(),
+    ));
+    applier.mark_listeners_ready();
+
+    let tracker = SlaveStatusTracker::new("slave-restart-only".to_string(), 0, None);
+    let handles = SlaveAppHandles {
+        runtime: ctx.runtime.clone(),
+        filter: ctx.filter.clone(),
+        metrics: ctx.metrics.clone(),
+        config_path: Some(ctx.config_path.clone()),
+        applier,
+    };
+
+    let config_before = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
+    let upstream_before = ctx.runtime.snapshot().config.upstream.servers.clone();
+
+    // `server.log_format` is restart-only; the same push also carries a
+    // hot-appliable upstream change that must not be applied either, because
+    // the push as a whole cannot take effect without a restart.
+    let config_toml = r#"
+config_version = 1
+
+[server]
+role = "slave"
+log_format = "pretty"
+
+[upstream]
+servers = ["9.9.9.9"]
+"#;
+    let push = build_and_sign_push(
+        &ConfigBundle {
+            version: 2,
+            term: 0,
+            timestamp: 1,
+            config_toml: config_toml.to_string(),
+            custom_rules: vec![],
+            rewrites: None,
+            clients: None,
+            lists: vec![],
+        },
+        &signing_key,
+    )
+    .unwrap();
+
+    let err =
+        sito_ha::apply_config_push(&push, &tracker, &handles, signing_key.public_key().as_ref())
+            .await
+            .expect_err("a restart-only change must not be acknowledged as applied");
+    let message = err.to_string();
+    assert!(
+        message.contains("restart_required"),
+        "the rejection must identify the restart-only change: {message}"
+    );
+    assert!(
+        message.contains("server.log_format"),
+        "the rejection must name the restart-only field: {message}"
+    );
+    assert_eq!(tracker.get_state(), SlaveState::Degraded);
+    assert_eq!(
+        tracker.get_version(),
+        0,
+        "the watermark must not advance for a push that was not applied"
+    );
+    assert_eq!(
+        ctx.runtime.snapshot().config.upstream.servers,
+        upstream_before,
+        "hot-appliable fields from a rejected push must not be applied"
+    );
+    assert_eq!(
+        ctx.runtime.snapshot().config.server.log_format,
+        "json",
+        "the live restart-only setting must be kept"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+        config_before,
+        "the persisted file must be kept"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// Regression: an explicit `[auth]` table with the default policy must be
+/// equivalent to omitting it. The shipped master example spells the defaults
+/// out while the runbook's minimal slave has no `[auth]`; before the fix every
+/// such push was rejected with `restart_required: auth`. A genuine policy
+/// change must still be rejected.
+#[tokio::test]
+async fn test_m8_push_default_auth_policy_is_not_rejected() {
+    let signing_key = Ed25519SigningKey::generate().unwrap();
+    let (ctx, _token, temp_dir) = create_test_context("slave", None, None, None).await;
+
+    let hooks = Arc::new(RecordingDnssecHooks {
+        validator: Arc::new(ArcSwap::from_pointee(
+            sito_dnssec::DnssecValidator::from_config(&Config::default().dns.dnssec),
+        )),
+        observed_nta: Arc::new(Mutex::new(Vec::new())),
+    });
+    let applier = Arc::new(sito::server::HaConfigApplier::new(
+        ctx.clone(),
+        hooks.clone(),
+    ));
+    applier.mark_listeners_ready();
+
+    let tracker = SlaveStatusTracker::new("slave-default-auth".to_string(), 0, None);
+    let handles = SlaveAppHandles {
+        runtime: ctx.runtime.clone(),
+        filter: ctx.filter.clone(),
+        metrics: ctx.metrics.clone(),
+        config_path: Some(ctx.config_path.clone()),
+        applier,
+    };
+
+    // Master example: explicit `[auth]` with exactly the default values.
+    // Slave: no `[auth]` section at all.
+    let default_auth_toml = r#"
+config_version = 1
+
+[server]
+role = "slave"
+
+[auth]
+session_ttl_hours = 24
+login_rate_limit = 5
+session_persist = true
+token_default_ttl_days = 90
+
+[upstream]
+servers = ["9.9.9.9"]
+"#;
+    let push = build_and_sign_push(
+        &ConfigBundle {
+            version: 2,
+            term: 0,
+            timestamp: 1,
+            config_toml: default_auth_toml.to_string(),
+            custom_rules: vec![],
+            rewrites: None,
+            clients: None,
+            lists: vec![],
+        },
+        &signing_key,
+    )
+    .unwrap();
+
+    let applied =
+        sito_ha::apply_config_push(&push, &tracker, &handles, signing_key.public_key().as_ref())
+            .await
+            .expect("an explicit-default [auth] must not be treated as restart-only");
+    assert_eq!(applied, 2);
+    assert_eq!(tracker.get_state(), SlaveState::Synced);
+    assert_eq!(tracker.get_version(), 2);
+
+    // A real policy change is still a restart-only difference and must not be
+    // acknowledged as applied.
+    let config_before = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
+    let changed_policy_toml =
+        default_auth_toml.replace("session_ttl_hours = 24", "session_ttl_hours = 1");
+    let push = build_and_sign_push(
+        &ConfigBundle {
+            version: 3,
+            term: 0,
+            timestamp: 2,
+            config_toml: changed_policy_toml,
+            custom_rules: vec![],
+            rewrites: None,
+            clients: None,
+            lists: vec![],
+        },
+        &signing_key,
+    )
+    .unwrap();
+
+    let err =
+        sito_ha::apply_config_push(&push, &tracker, &handles, signing_key.public_key().as_ref())
+            .await
+            .expect_err("a real [auth] policy change must still require a restart");
+    let message = err.to_string();
+    assert!(
+        message.contains("restart_required"),
+        "the rejection must identify the restart-only change: {message}"
+    );
+    assert!(
+        message.contains("auth"),
+        "the rejection must name the [auth] section: {message}"
+    );
+    assert_eq!(tracker.get_state(), SlaveState::Degraded);
+    assert_eq!(
+        tracker.get_version(),
+        2,
+        "the watermark must not advance for the rejected policy change"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+        config_before,
+        "the persisted file must keep the previously applied policy"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 /// D-01 startup-order regression: a push that arrives before the DNS listener
 /// generation and rate limiters exist is refused (so the worker ACKs
 /// `applied:false` and retries) instead of being applied and persisted with
@@ -1134,6 +1771,7 @@ async fn test_m8_push_before_listeners_fails_and_retries_after_ready() {
     let push = build_and_sign_push(
         &ConfigBundle {
             version: 2,
+            term: 0,
             timestamp: 1,
             config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n\n[upstream]\nservers = [\"9.9.9.9\"]\n".to_string(),
             custom_rules: vec![],
@@ -1274,6 +1912,7 @@ async fn test_m8_chaos_master_mid_push_kill() {
     // Publish a bundle and kill the master while the push is in flight.
     let bundle = ConfigBundle {
         version: 2,
+        term: 0,
         timestamp: 424_242,
         config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec!["||mid-push.test^".to_string()],
@@ -1324,19 +1963,23 @@ async fn test_m8_slave_to_master_promotion_procedure() {
         assert_eq!(perms.mode() & 0o777, 0o600);
     }
 
-    // c. Initialize MasterCoordinator on promoted node
+    // c. Initialize MasterCoordinator on promoted node. The operator raised the
+    //    cluster term explicitly (section 2 of the runbook).
     let metrics = MetricsRegistry::new("0.1.0", "promoted");
     let promoted_coordinator = MasterCoordinator::new(
         "sito-master-promoted".to_string(),
         2,
         signing_key,
         metrics.clone(),
-    );
+    )
+    .with_term(1);
     assert_eq!(promoted_coordinator.get_current_version(), 2);
+    assert_eq!(promoted_coordinator.get_current_term(), 1);
 
-    // d. Promoted master creates and signs new bundle (version 3)
+    // d. Promoted master creates and signs new bundle (version 3, term 1)
     let new_bundle = ConfigBundle {
         version: 3,
+        term: 1,
         timestamp: 99999,
         config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec!["||promoted-master-rule.net^".to_string()],
@@ -1350,6 +1993,7 @@ async fn test_m8_slave_to_master_promotion_procedure() {
     // A promoted master must never publish a stale/equal version again.
     let stale_bundle = ConfigBundle {
         version: 3,
+        term: 1,
         timestamp: 100_000,
         config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec![],
@@ -1360,6 +2004,26 @@ async fn test_m8_slave_to_master_promotion_procedure() {
     assert!(
         promoted_coordinator.update_bundle(stale_bundle).is_err(),
         "non-monotonic bundle must be rejected after promotion"
+    );
+
+    // A stale term-0 master cannot publish a higher version over the promoted
+    // epoch.
+    let stale_epoch_bundle = ConfigBundle {
+        version: 4,
+        term: 0,
+        timestamp: 100_001,
+        config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+        custom_rules: vec![],
+        rewrites: None,
+        clients: None,
+        lists: vec![],
+    };
+    let err = promoted_coordinator
+        .update_bundle(stale_epoch_bundle)
+        .expect_err("an older-term bundle must not publish over the promoted epoch");
+    assert!(
+        matches!(err, sito_ha::HaError::Validation { ref field, .. } if field == "term"),
+        "unexpected error: {err:?}"
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);

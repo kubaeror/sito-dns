@@ -11,7 +11,7 @@ use tracing::{debug, trace, warn};
 use sito_core::config::CacheConfig;
 use sito_proto::rdata::SOA;
 use sito_proto::{
-    DNSClass, Message, MessageType, Name, RData, RecordType, ResponseCode, encode_message,
+    DNSClass, Message, MessageType, Name, RData, Record, RecordType, ResponseCode, encode_message,
 };
 
 use crate::entry::{CacheEntry, ValidationStatus};
@@ -253,8 +253,9 @@ impl DnsCache {
     /// Retrieve a stale cached response according to RFC 8767 when upstreams fail.
     ///
     /// DNSSEC material is removed before serving: a stale entry is not
-    /// revalidated, so it must never claim `AD` and must not carry RRSIGs that
-    /// would let a client treat it as authentic.
+    /// revalidated, so it must never claim `AD` and must not carry RRSIGs,
+    /// DNSKEYs or denial records that would let a client treat it as
+    /// authentic.
     /// TTLs are clamped to 30 seconds as recommended by RFC 8767 section 5.
     pub async fn get_stale(
         &self,
@@ -264,14 +265,31 @@ impl DnsCache {
     ) -> Option<Message> {
         self.get_stale_by_key(&CacheKey::new(name, qtype, qclass))
             .await
+            .map(|(message, _)| message)
     }
 
     /// Retrieve a stale response for `query`, honouring its DO/CD/ECS cache key.
     pub async fn get_stale_for_query(&self, query: &Message) -> Option<Message> {
+        self.get_stale_for_query_with_status(query)
+            .await
+            .map(|(message, _)| message)
+    }
+
+    /// Retrieve a stale response together with the validation status recorded
+    /// when it was cached.
+    ///
+    /// The pipeline uses the status to apply the same
+    /// [`ValidationStatus::Unchecked`] gate as fresh cache hits: stale data is
+    /// not revalidated, so an entry cached without local validation must not
+    /// be served while validation is active.
+    pub async fn get_stale_for_query_with_status(
+        &self,
+        query: &Message,
+    ) -> Option<(Message, ValidationStatus)> {
         self.get_stale_by_key(&CacheKey::from_query(query)?).await
     }
 
-    async fn get_stale_by_key(&self, key: &CacheKey) -> Option<Message> {
+    async fn get_stale_by_key(&self, key: &CacheKey) -> Option<(Message, ValidationStatus)> {
         let config = self.config.load();
         if !config.enabled || config.serve_stale_hours == 0 {
             return None;
@@ -310,7 +328,7 @@ impl DnsCache {
             "Cache serving stale entry for {} (elapsed: {}s, original lifespan: {}s)",
             key.qname, elapsed_secs, entry.max_lifespan_secs
         );
-        Some(response)
+        Some((response, entry.validation_status))
     }
 
     /// Check whether a cached entry is eligible for background prefetch
@@ -459,6 +477,15 @@ impl DnsCache {
         let mut authority_ttls = Vec::new();
         let mut additional_ttls = Vec::new();
 
+        // `min_ttl` is a floor for *unvalidated* data. Raising a Secure entry
+        // would let an AD=1 answer outlive the TTL/RRSIG validity that
+        // authenticated it (RFC 4035 §5.3.3).
+        let ttl_floor = if validation_status.is_secure() {
+            0
+        } else {
+            config.min_ttl
+        };
+
         let max_lifespan_secs = if is_negative {
             // RFC 2308 requires a SOA record owned by an ancestor of the query
             // name (or of a CNAME target on the chain) to derive the negative
@@ -472,12 +499,30 @@ impl DnsCache {
                 );
                 return;
             };
-            let clamped_ttl =
-                soa_ttl.clamp(config.min_ttl, config.negative_ttl_max.max(config.min_ttl));
+            let clamped_ttl = soa_ttl.clamp(ttl_floor, config.negative_ttl_max.max(config.min_ttl));
             // RFC 2308: the negative answer must never outlive the CNAME chain
             // that led to it. Otherwise the cached NODATA/NXDOMAIN would keep
             // being served after the alias TTL expired.
-            let max_lifespan = clamped_ttl.min(cname_chain_ttl.unwrap_or(u32::MAX));
+            //
+            // A Secure negative answer is proven by its NSEC/NSEC3 denial
+            // records (and their RRSIGs), whose TTLs the validator has already
+            // capped by the authenticated TTL/signature expiry. The SOA can be
+            // signed with a longer lifetime, so the entry must not outlive the
+            // denial proof.
+            //
+            // When the proof is still present (DO=1 responses) apply the same
+            // cap here as defense in depth. DO=0 responses are stripped of
+            // DNSSEC records before caching; for those, the validator already
+            // capped the SOA TTL in `apply_authenticated_ttls`, so no proof
+            // here means nothing further to cap (not a zero lifespan).
+            let denial_ttl = if validation_status.is_secure() {
+                denial_proof_ttl(response)
+            } else {
+                None
+            };
+            let max_lifespan = clamped_ttl
+                .min(cname_chain_ttl.unwrap_or(u32::MAX))
+                .min(denial_ttl.unwrap_or(u32::MAX));
 
             for answer in &response.answers {
                 answer_ttls.push(answer.ttl.min(max_lifespan));
@@ -494,19 +539,19 @@ impl DnsCache {
             let effective_max_ttl = config.max_ttl.max(config.min_ttl);
 
             for ans in &response.answers {
-                let clamped = ans.ttl.clamp(config.min_ttl, effective_max_ttl);
+                let clamped = ans.ttl.clamp(ttl_floor, effective_max_ttl);
                 answer_ttls.push(clamped);
                 min_record_ttl = min_record_ttl.min(clamped);
             }
 
             for auth in &response.authorities {
-                let clamped = auth.ttl.clamp(config.min_ttl, effective_max_ttl);
+                let clamped = auth.ttl.clamp(ttl_floor, effective_max_ttl);
                 authority_ttls.push(clamped);
                 min_record_ttl = min_record_ttl.min(clamped);
             }
 
             for add in &response.additionals {
-                let clamped = add.ttl.clamp(config.min_ttl, effective_max_ttl);
+                let clamped = add.ttl.clamp(ttl_floor, effective_max_ttl);
                 additional_ttls.push(clamped);
                 min_record_ttl = min_record_ttl.min(clamped);
             }
@@ -583,13 +628,13 @@ fn clear_dnssec_material(response: &mut Message) {
     response.metadata.authentic_data = false;
     response
         .answers
-        .retain(|record| record.record_type() != RecordType::RRSIG);
+        .retain(|record| !record.record_type().is_dnssec());
     response
         .authorities
-        .retain(|record| record.record_type() != RecordType::RRSIG);
+        .retain(|record| !record.record_type().is_dnssec());
     response
         .additionals
-        .retain(|record| record.record_type() != RecordType::RRSIG);
+        .retain(|record| !record.record_type().is_dnssec());
 }
 
 /// Returns true when every answer record's owner is the query name or a CNAME
@@ -627,7 +672,7 @@ fn answer_owners_are_relevant(qname: &Name, response: &Message) -> bool {
 /// `authorities` (`min(SOA TTL, SOA MINIMUM)`) whose owner is one of
 /// `chain_names` or an ancestor of one. A SOA for an unrelated zone is out of
 /// bailiwick and is ignored.
-fn negative_ttl_from_soa(authorities: &[sito_proto::Record], chain_names: &[Name]) -> Option<u32> {
+fn negative_ttl_from_soa(authorities: &[Record], chain_names: &[Name]) -> Option<u32> {
     for auth in authorities {
         if let RData::SOA(SOA { minimum, .. }) = &auth.data
             && chain_names.iter().any(|name| auth.name.zone_of(name))
@@ -636,6 +681,39 @@ fn negative_ttl_from_soa(authorities: &[sito_proto::Record], chain_names: &[Name
         }
     }
     None
+}
+
+/// Authenticated lifetime of the NSEC/NSEC3 denial proof in `response`.
+///
+/// Returns the minimum TTL among the denial records and their signatures.
+/// The DNSSEC validator's `apply_authenticated_ttls` has already capped every
+/// TTL by the RRSIG original TTL and remaining validity, so this minimum is the
+/// time the proof remains trustworthy. All three sections are scanned because
+/// the validator accepts denial records and signatures from the additional
+/// section as well. `None` when no NSEC/NSEC3 is present.
+fn denial_proof_ttl(response: &Message) -> Option<u32> {
+    let mut saw_denial = false;
+    let mut min_ttl = u32::MAX;
+    for record in response
+        .answers
+        .iter()
+        .chain(response.authorities.iter())
+        .chain(response.additionals.iter())
+    {
+        match record.record_type() {
+            RecordType::NSEC | RecordType::NSEC3 => {
+                saw_denial = true;
+                min_ttl = min_ttl.min(record.ttl);
+            }
+            // A signature can expire before the RR it covers. Including every
+            // signature RR can only shorten the lifespan.
+            RecordType::RRSIG | RecordType::SIG => {
+                min_ttl = min_ttl.min(record.ttl);
+            }
+            _ => {}
+        }
+    }
+    saw_denial.then_some(min_ttl)
 }
 
 /// Names on the CNAME chain starting at `qname` (including `qname` itself) and

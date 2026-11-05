@@ -6,7 +6,7 @@
     "license": {
       "name": "GPL-3.0-only"
     },
-    "version": "1.9.1"
+    "version": "1.9.2"
   },
   "paths": {
     "/api/v1/auth/change-password": {
@@ -3834,6 +3834,17 @@
               "string",
               "null"
             ]
+          },
+          "readiness_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why `ready` is false (unreadable key, bind failure, handshake failure,\nnot yet synced, ...), or an explanatory note for a deliberately\ndisabled replication listener."
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "Whether the node's HA role is actually operational. A master with a\nfailed mTLS listener or a slave that has not reached `synced` reports\n`false` even though DNS keeps answering."
           },
           "role": {
             "type": "string"

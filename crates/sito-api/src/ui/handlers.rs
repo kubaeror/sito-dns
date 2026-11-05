@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use crate::auth::manager::LoginResult;
+use crate::auth::manager::{LoginResult, TotpMutationError, UserMutationError};
 use crate::auth::rbac::AuthUser;
 use crate::auth::resolve_client_ip;
 use crate::auth::session::{
@@ -267,16 +267,18 @@ pub async fn login_submit(
             csrf_token: "",
         })
         .into_response(),
-        LoginResult::InvalidCredentials { .. } => HtmlTemplate(LoginTemplate {
-            is_authenticated: false,
-            username: &form.username,
-            user_role: "",
-            active_tab: "login",
-            version: env!("CARGO_PKG_VERSION"),
-            error_message: "Invalid username or password.",
-            csrf_token: "",
-        })
-        .into_response(),
+        LoginResult::InvalidCredentials { .. } | LoginResult::StaleCredentials => {
+            HtmlTemplate(LoginTemplate {
+                is_authenticated: false,
+                username: &form.username,
+                user_role: "",
+                active_tab: "login",
+                version: env!("CARGO_PKG_VERSION"),
+                error_message: "Invalid username or password.",
+                csrf_token: "",
+            })
+            .into_response()
+        }
     }
 }
 
@@ -1583,6 +1585,37 @@ pub async fn system_reload_handler(
     Redirect::to("/system").into_response()
 }
 
+/// Renders the update action row for the system page.
+///
+/// Session-authenticated HTMX posts must carry the session CSRF token. The
+/// form includes it as a hidden field (matching the Askama forms) and lets
+/// htmx perform the submission; calling `form.submit()` natively would bypass
+/// htmx and still lack the token.
+fn update_action_html(info: &crate::updater::UpdateInfo, csrf_token: &str) -> String {
+    if info.is_docker {
+        return r#"<div style="margin-top: 14px; padding: 12px; background: rgba(56, 189, 248, 0.1); border: 1px solid var(--accent); border-radius: 6px;">
+                <div style="font-weight: 600; color: var(--accent); margin-bottom: 4px;">Docker Environment Detected</div>
+                <div style="font-size: 0.85rem; color: var(--text-secondary);">
+                    In-app binary updates are disabled in containers. Upgrade by running:
+                    <pre style="margin-top: 6px; padding: 6px 10px; background: var(--bg-surface); border-radius: 4px;"><code>docker compose pull && docker compose up -d</code></pre>
+                </div>
+            </div>"#
+            .to_string();
+    }
+
+    format!(
+        r##"<form hx-post="/ui/system/update/apply" hx-target="#update-container" hx-swap="innerHTML" hx-disabled-elt="button" style="margin-top: 14px;">
+            <input type="hidden" name="csrf_token" value="{}">
+            <button type="submit" class="btn btn-primary" @click="this.innerText='Updating...';">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+                Download & Install v{}
+            </button>
+        </form>"##,
+        escape_html(csrf_token),
+        escape_html(&info.latest_version)
+    )
+}
+
 pub async fn system_update_check_handler(
     State(ctx): State<ServerContext>,
     headers: HeaderMap,
@@ -1590,29 +1623,12 @@ pub async fn system_update_check_handler(
     if get_session_user(&ctx, &headers).is_none() {
         return Redirect::to("/login").into_response();
     }
+    let csrf = get_csrf_token(&ctx, &headers);
 
     match crate::updater::check_for_update(None).await {
         Ok(info) => {
             if info.update_available {
-                let install_or_docker = if info.is_docker {
-                    r#"<div style="margin-top: 14px; padding: 12px; background: rgba(56, 189, 248, 0.1); border: 1px solid var(--accent); border-radius: 6px;">
-                            <div style="font-weight: 600; color: var(--accent); margin-bottom: 4px;">Docker Environment Detected</div>
-                            <div style="font-size: 0.85rem; color: var(--text-secondary);">
-                                In-app binary updates are disabled in containers. Upgrade by running:
-                                <pre style="margin-top: 6px; padding: 6px 10px; background: var(--bg-surface); border-radius: 4px;"><code>docker compose pull && docker compose up -d</code></pre>
-                            </div>
-                        </div>"#.to_string()
-                } else {
-                    format!(
-                        r##"<form hx-post="/ui/system/update/apply" hx-target="#update-container" hx-swap="innerHTML" style="margin-top: 14px;">
-                            <button type="submit" class="btn btn-primary" @click="this.disabled=true; this.innerText='Updating...'; this.form.submit();">
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
-                                Download & Install v{}
-                            </button>
-                        </form>"##,
-                        escape_html(&info.latest_version)
-                    )
-                };
+                let install_or_docker = update_action_html(&info, &csrf);
 
                 axum::response::Html(format!(
                     r#"<div>
@@ -1719,15 +1735,17 @@ pub async fn wizard_page(
 ) -> Response {
     let auth_user = get_session_user(&ctx, &headers);
     let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
+    let setup_required = ctx.auth_mgr.setup_token_required();
 
     // Once user accounts exist (even if `config.toml` is missing) the wizard
     // is an admin-only configuration surface, not an unauthenticated bootstrap.
-    if !ctx.auth_mgr.is_first_run() && !is_admin {
+    // A deployment with no usable Admin (for example only non-admin accounts)
+    // is still recoverable with the provisioned setup token.
+    if !ctx.auth_mgr.is_first_run() && !setup_required && !is_admin {
         return Redirect::to("/login").into_response();
     }
 
     let csrf = get_csrf_token(&ctx, &headers);
-    let setup_required = ctx.auth_mgr.setup_token_required();
     // Only echo a token the requester already supplied; never reveal the
     // stored setup token in the rendered page on its own.
     let setup_token = params.setup_token.unwrap_or_default();
@@ -2103,6 +2121,39 @@ impl WizardCompleteForm {
     }
 }
 
+/// Credential mutations made by the wizard, kept so a later configuration
+/// persistence failure can restore the previous account state.
+#[derive(Default)]
+struct WizardCredentialUndo {
+    restore_password: Option<(String, String)>,
+    remove_created_user: Option<String>,
+}
+
+impl WizardCredentialUndo {
+    async fn rollback(self, ctx: &ServerContext) {
+        if let Some((username, previous_hash)) = self.restore_password
+            && let Err(e) = ctx
+                .auth_mgr
+                .restore_user_password_hash(&username, &previous_hash)
+                .await
+        {
+            tracing::error!(
+                user = %username,
+                error = %e,
+                "Failed to roll back the administrator password after a wizard persistence failure"
+            );
+        }
+        if let Some(username) = self.remove_created_user
+            && !ctx.auth_mgr.delete_user(&username).await
+        {
+            tracing::error!(
+                user = %username,
+                "Failed to remove the wizard-created administrator during rollback"
+            );
+        }
+    }
+}
+
 pub async fn wizard_complete_handler(
     State(ctx): State<ServerContext>,
     Extension(hooks): Extension<ApplyHooks>,
@@ -2110,35 +2161,30 @@ pub async fn wizard_complete_handler(
     headers: HeaderMap,
     Form(form): Form<WizardCompleteForm>,
 ) -> Response {
-    let first_run = ctx.auth_mgr.is_first_run();
-    // Only a genuinely unconfigured deployment may complete the wizard
-    // without authentication. `setup_pending` also covers the
-    // missing-`config.toml` case, which must not become an unauthenticated
-    // admin-password reset when `users.toml` already exists.
-    let is_first_run = first_run;
+    // Serialize the whole completion. Capturing the token requirement once
+    // prevents a request that entered before a concurrent completion from
+    // re-reading it as `false` and skipping token validation.
+    let _setup_guard = ctx.auth_mgr.lock_setup_completion().await;
+    let is_first_run = ctx.auth_mgr.is_first_run();
+    let setup_token_required = ctx.auth_mgr.setup_token_required();
+    // Bootstrap mode covers both the default-admin first run and deployments
+    // with no usable Admin yet (for example only non-admin accounts), which
+    // are recoverable only with the setup token.
+    let bootstrapping = is_first_run || setup_token_required;
     let auth_user = get_session_user(&ctx, &headers);
     let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
 
-    if !is_first_run && !is_admin {
+    if !bootstrapping && !is_admin {
         return error_response(
             StatusCode::FORBIDDEN,
             "Setup wizard is disabled. Admin session required.",
         );
     }
 
-    // Setup-pending with an already-configured admin account but no setup
-    // token: an authenticated admin is required to change credentials.
-    if !first_run && !is_admin && !ctx.auth_mgr.setup_token_required() {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "Setup wizard is disabled. Admin session required.",
-        );
-    }
-
-    // First-boot completion requires the one-time setup token (authenticated
+    // Bootstrap completion requires the one-time setup token (authenticated
     // admins and in-memory test managers without a provisioned token are
-    // exempt).
-    if ctx.auth_mgr.setup_token_required() && !is_admin {
+    // exempt). The requirement was captured under the completion lock.
+    if setup_token_required && !is_admin {
         let config = ctx.config.load();
         let trusted_proxies = config.get_web_config().trusted_proxies.clone();
         drop(config);
@@ -2223,10 +2269,23 @@ pub async fn wizard_complete_handler(
         admin_pass_input
     };
 
+    // A wizard completion may only target an Admin account. Updating the
+    // password of an existing non-Admin would let setup finish with a
+    // non-privileged account (and could leave `adminadmin` active).
+    if ctx.auth_mgr.has_user(admin_user) && ctx.auth_mgr.role_of(admin_user) != Some(Role::Admin) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "The selected account exists but is not an administrator.",
+        );
+    }
+    if !bootstrapping && !ctx.auth_mgr.has_user(admin_user) {
+        return error_response(StatusCode::BAD_REQUEST, "Username does not exist.");
+    }
+
     // Read the base config only after taking the apply lock so a concurrent
     // writer cannot be overwritten by a stale wizard snapshot. The guard is
-    // scoped to the apply/persist section; credential changes below do not
-    // write the configuration file.
+    // scoped to the apply/persist section.
+    let mut credential_undo = WizardCredentialUndo::default();
     let (report, filtering) = {
         let _apply_guard = ctx.lock_config_apply().await;
         let base_cfg = (**ctx.config.load()).clone();
@@ -2240,6 +2299,50 @@ pub async fn wizard_complete_handler(
                     .into_response();
             }
         };
+
+        // Defense in depth: if another writer completed setup while this
+        // request waited, do not mutate credentials with a stale bootstrap
+        // snapshot. The completion lock should already have prevented this.
+        if bootstrapping && ctx.auth_mgr.is_setup_complete() && !ctx.auth_mgr.setup_token_required()
+        {
+            return error_response(StatusCode::CONFLICT, "Setup has already been completed.");
+        }
+
+        // Change and persist the administrator credential before the
+        // configuration file. Setup must never be persisted with the bootstrap
+        // password still active.
+        if bootstrapping && !ctx.auth_mgr.has_user(admin_user) {
+            if let Err(e) = ctx
+                .auth_mgr
+                .create_user_persisted(admin_user, effective_password, Role::Admin)
+                .await
+            {
+                tracing::error!(user = %admin_user, error = %e, "Wizard failed to create the administrator");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to persist the administrator password. Setup was not completed.",
+                );
+            }
+            credential_undo.remove_created_user = Some(admin_user.to_string());
+        } else {
+            match ctx
+                .auth_mgr
+                .update_user_password_tracked(admin_user, effective_password)
+                .await
+            {
+                Ok(previous_hash) => {
+                    credential_undo.restore_password =
+                        previous_hash.map(|hash| (admin_user.to_string(), hash));
+                }
+                Err(e) => {
+                    tracing::error!(user = %admin_user, error = %e, "Wizard failed to update the administrator password");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to persist the administrator password. Setup was not completed.",
+                    );
+                }
+            }
+        }
 
         // Apply first, persist second (WP-4.2): a configuration that cannot be
         // applied never reaches the file. The blocklist fetch is deferred to a
@@ -2257,9 +2360,13 @@ pub async fn wizard_complete_handler(
             Ok(report) => report,
             Err(e) => {
                 tracing::error!("Failed to apply wizard configuration: {e:?}");
+                credential_undo.rollback(&ctx).await;
                 return error_response(
                     StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &format!("Failed to apply configuration: {}", e.detail),
+                    &format!(
+                        "Failed to apply configuration: {}. Setup was not completed.",
+                        e.detail
+                    ),
                 );
             }
         };
@@ -2272,55 +2379,29 @@ pub async fn wizard_complete_handler(
         );
     }
 
-    if is_first_run {
-        if ctx.auth_mgr.has_user(admin_user) {
-            if !ctx
-                .auth_mgr
-                .update_user_password(admin_user, effective_password)
-                .await
-            {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "Failed to update administrator password.",
-                );
-            }
-        } else {
-            // Nonexistent user: create as admin
-            ctx.auth_mgr
-                .create_user(admin_user, effective_password, Role::Admin)
-                .await;
-            // If custom admin username chosen, remove default 'admin' account if still on bootstrap password.
-            // Use the last-admin-protected path: if creating the custom admin
-            // failed, the bootstrap account is the sole Admin and must remain.
-            if admin_user != "admin"
-                && ctx.auth_mgr.is_default_admin_active()
-                && let Err(err) = ctx.auth_mgr.delete_user_checked("admin").await
-            {
-                tracing::warn!(
-                    error = %err,
-                    "Wizard could not remove the bootstrap admin account; leaving it in place"
-                );
-            }
-        }
-        ctx.auth_mgr.mark_setup_complete();
-    } else {
-        // Not first run: must be authenticated admin updating existing admin credentials
-        if !ctx.auth_mgr.has_user(admin_user) {
-            return error_response(StatusCode::BAD_REQUEST, "Username does not exist.");
-        }
-        if !ctx
-            .auth_mgr
-            .update_user_password(admin_user, effective_password)
-            .await
+    if bootstrapping {
+        // Never leave the bootstrap `admin` account active after setup
+        // completes. Removing it only after the configuration persist means a
+        // failure leaves setup pending instead of half-applied.
+        if admin_user != "admin"
+            && ctx.auth_mgr.is_default_admin_active()
+            && let Err(err) = ctx.auth_mgr.delete_user_checked("admin").await
         {
+            tracing::error!(
+                error = %err,
+                "Wizard could not remove the bootstrap admin account; setup remains pending"
+            );
+            credential_undo.rollback(&ctx).await;
             return error_response(
-                StatusCode::BAD_REQUEST,
-                "Failed to update administrator password.",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to remove the bootstrap administrator. Setup was not completed.",
             );
         }
+        ctx.auth_mgr.mark_setup_complete();
     }
 
-    // Apply → persist → consume token, in that order.
+    // All credential and configuration writes succeeded: only now retire the
+    // setup token and let the server leave setup mode.
     ctx.auth_mgr.consume_setup_token();
     ctx.set_setup_pending(false);
 
@@ -2572,9 +2653,18 @@ pub async fn users_create_handler(
         );
     }
 
-    ctx.auth_mgr
-        .create_user(username, &form.password, role)
-        .await;
+    if let Err(e) = ctx
+        .auth_mgr
+        .create_user_persisted(username, &form.password, role)
+        .await
+    {
+        return users_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::internal_error(format!("Failed to persist the user store: {e}")),
+        );
+    }
     tracing::info!(
         actor = %user.username,
         target = %username,
@@ -2693,17 +2783,21 @@ pub async fn account_password_handler(
             ProblemDetails::bad_request("Current password is incorrect"),
         );
     }
-    if !ctx
+    if let Err(err) = ctx
         .auth_mgr
-        .update_user_password(&user.username, &form.new_password)
+        .update_user_password_checked(&user.username, &form.new_password)
         .await
     {
-        return account_problem_page(
-            &ctx,
-            &user,
-            &csrf,
-            ProblemDetails::not_found("User account not found"),
-        );
+        let problem = match err {
+            UserMutationError::NotFound => ProblemDetails::not_found("User account not found"),
+            UserMutationError::LastAdmin => {
+                ProblemDetails::bad_request("Cannot remove the last remaining admin account")
+            }
+            UserMutationError::Persistence(detail) => ProblemDetails::internal_error(format!(
+                "Failed to persist the user store while changing the password: {detail}"
+            )),
+        };
+        return account_problem_page(&ctx, &user, &csrf, problem);
     }
     tracing::info!(user = %user.username, "User changed their password from the web UI");
     // Password changes revoke every session for the account, including this
@@ -2897,13 +2991,17 @@ pub async fn account_totp_disable_handler(
         }
     }
 
-    if !ctx.auth_mgr.disable_totp(&user.username).await {
-        return account_problem_page(
-            &ctx,
-            &user,
-            &csrf,
-            ProblemDetails::not_found("User account not found"),
-        );
+    if let Err(err) = ctx.auth_mgr.try_disable_totp(&user.username).await {
+        let problem = match err {
+            TotpMutationError::NotFound => ProblemDetails::not_found("User account not found"),
+            TotpMutationError::InvalidCode => {
+                ProblemDetails::bad_request("Invalid TOTP verification code")
+            }
+            TotpMutationError::Persistence(detail) => ProblemDetails::internal_error(format!(
+                "Failed to persist the user store while disabling TOTP: {detail}"
+            )),
+        };
+        return account_problem_page(&ctx, &user, &csrf, problem);
     }
     tracing::info!(user = %user.username, "User disabled TOTP 2FA from the web UI");
     // Disabling 2FA revokes every session for the account by design.
@@ -2922,6 +3020,53 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::Instant;
+
+    #[test]
+    fn test_update_install_form_carries_csrf_token_and_uses_htmx() {
+        let info = crate::updater::UpdateInfo {
+            current_version: "1.9.1".to_string(),
+            latest_version: "1.9.2".to_string(),
+            update_available: true,
+            release_url: "https://github.com/kubaeror/sito-dns/releases/tag/v1.9.2".to_string(),
+            release_notes: "notes".to_string(),
+            published_at: None,
+            is_docker: false,
+            instructions: None,
+            version_comparison_unknown: false,
+        };
+        let html = update_action_html(&info, "csrf-token-123");
+        assert!(
+            html.contains(r#"name="csrf_token" value="csrf-token-123""#),
+            "update form must carry the session CSRF token: {html}"
+        );
+        assert!(
+            html.contains(r#"hx-post="/ui/system/update/apply""#),
+            "update form must remain an htmx post: {html}"
+        );
+        assert!(
+            !html.contains("this.form.submit()"),
+            "native form submission bypasses htmx and would omit the CSRF header: {html}"
+        );
+        // A submit button disabled during its click handler returns from the
+        // activation behavior without firing the form's submit event, so htmx
+        // must own the disabled state after the event has started.
+        assert!(
+            html.contains(r#"hx-disabled-elt="button""#),
+            "htmx must disable the button after submit: {html}"
+        );
+        assert!(
+            !html.contains("this.disabled"),
+            "the click handler must not disable the submit button before htmx sees submit: {html}"
+        );
+
+        let docker = crate::updater::UpdateInfo {
+            is_docker: true,
+            ..info
+        };
+        let docker_html = update_action_html(&docker, "csrf-token-123");
+        assert!(!docker_html.contains("<form"), "{docker_html}");
+        assert!(docker_html.contains("docker compose pull"), "{docker_html}");
+    }
 
     async fn mock_context(temp_dir: &std::path::Path) -> ServerContext {
         let db_path = temp_dir.join("test.db");
@@ -3299,6 +3444,262 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_wizard_rejects_existing_non_admin_target() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_nonadmin_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("bob", "BobPassword123!", Role::Viewer)
+            .await;
+        assert!(ctx.auth_mgr.is_default_admin_active());
+
+        let form = WizardCompleteForm {
+            admin_user: Some("bob".to_string()),
+            admin_password: Some("NewBobPassword123!".to_string()),
+            upstream: Some("1.1.1.1:53".to_string()),
+            ..Default::default()
+        };
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(form),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(ctx.auth_mgr.role_of("bob"), Some(Role::Viewer));
+        assert!(ctx.auth_mgr.is_default_admin_active());
+        assert!(ctx.auth_mgr.is_first_run());
+        // The rejected target's password must not have changed either.
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("bob", "BobPassword123!")
+                .await
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Ordering regression: the configuration file must not be written when
+    /// the administrator password cannot be persisted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_wizard_password_persist_failure_does_not_persist_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_pwfail_{}", rand::random::<u64>()));
+        let auth_dir = temp_dir.join("auth");
+        let _ = std::fs::create_dir_all(&auth_dir);
+        let mut ctx = mock_context(&temp_dir).await;
+        ctx.auth_mgr = Arc::new(crate::auth::AuthManager::with_storage(&auth_dir, 24, 5).unwrap());
+        ctx.set_setup_pending(true);
+        let token = ctx.auth_mgr.setup_token().expect("setup token provisioned");
+        let config_path = ctx.config_path.clone();
+        assert!(!config_path.exists());
+
+        // Make the account store unwritable while the configuration directory
+        // stays writable: a pre-fix wizard would persist config first.
+        std::fs::set_permissions(&auth_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let form = WizardCompleteForm {
+            setup_token: Some(token),
+            admin_user: Some("admin".to_string()),
+            admin_password: Some("StrongPassword123!".to_string()),
+            upstream: Some("1.1.1.1:53".to_string()),
+            ..Default::default()
+        };
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(form),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(
+            !config_path.exists(),
+            "config must not be persisted before the admin password is persisted"
+        );
+        assert!(ctx.is_setup_pending());
+        assert!(ctx.auth_mgr.setup_token_required());
+        assert!(ctx.auth_mgr.is_first_run());
+
+        std::fs::set_permissions(&auth_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Regression (1.9.2 review): concurrent completions are serialized, so a
+    /// request that re-reads the token state after another completion cannot
+    /// skip token validation and overwrite the new password.
+    #[tokio::test]
+    async fn test_concurrent_wizard_completion_only_one_succeeds() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_race_{}", rand::random::<u64>()));
+        let auth_dir = temp_dir.join("auth");
+        let _ = std::fs::create_dir_all(&auth_dir);
+        let mut ctx = mock_context(&temp_dir).await;
+        ctx.auth_mgr = Arc::new(crate::auth::AuthManager::with_storage(&auth_dir, 24, 5).unwrap());
+        let token = ctx.auth_mgr.setup_token().expect("setup token provisioned");
+        let form = || WizardCompleteForm {
+            setup_token: Some(token.clone()),
+            admin_user: Some("admin".to_string()),
+            admin_password: Some("RacedPassword123!".to_string()),
+            confirm_password: Some("RacedPassword123!".to_string()),
+            upstream: Some("1.1.1.1:53".to_string()),
+            ..Default::default()
+        };
+
+        let first = wizard_complete_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(form()),
+        );
+        let second = wizard_complete_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(form()),
+        );
+        let (first, second) = tokio::join!(first, second);
+        let statuses = [first.status(), second.status()];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::SEE_OTHER)
+                .count(),
+            1,
+            "exactly one completion may win: {statuses:?}"
+        );
+        assert!(
+            statuses.iter().all(|status| !status.is_success()),
+            "no completion may report a body success: {statuses:?}"
+        );
+        assert!(!ctx.auth_mgr.setup_token_required());
+        assert!(ctx.auth_mgr.has_user("admin"));
+        assert!(matches!(
+            ctx.auth_mgr
+                .login("admin", "RacedPassword123!", "127.0.0.1")
+                .await,
+            crate::auth::LoginResult::Success(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Regression (1.9.2 review): a failed write while deleting the bootstrap
+    /// `admin` must not be reported as a successful setup.
+    #[tokio::test]
+    async fn test_wizard_bootstrap_delete_persist_failure_keeps_setup_pending() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_delfail_{}", rand::random::<u64>()));
+        let auth_dir = temp_dir.join("auth");
+        let _ = std::fs::create_dir_all(&auth_dir);
+        let mut ctx = mock_context(&temp_dir).await;
+        ctx.auth_mgr = Arc::new(crate::auth::AuthManager::with_storage(&auth_dir, 24, 5).unwrap());
+        ctx.set_setup_pending(true);
+        let token = ctx.auth_mgr.setup_token().expect("setup token provisioned");
+        ctx.auth_mgr
+            .create_user("owner", "OwnerPassword123!", Role::Admin)
+            .await;
+
+        // The credential update write succeeds; the following delete write
+        // fails.
+        crate::auth::manager::SECRET_WRITE_FAIL_AFTER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((auth_dir.join("users.toml"), 1));
+
+        let form = WizardCompleteForm {
+            setup_token: Some(token),
+            admin_user: Some("owner".to_string()),
+            admin_password: Some("NewOwnerPassword123!".to_string()),
+            confirm_password: Some("NewOwnerPassword123!".to_string()),
+            upstream: Some("1.1.1.1:53".to_string()),
+            ..Default::default()
+        };
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(form),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(ctx.is_setup_pending());
+        assert!(ctx.auth_mgr.setup_token_required());
+        assert!(ctx.auth_mgr.has_user("admin"));
+        assert!(ctx.auth_mgr.has_user("owner"));
+        assert!(ctx.auth_mgr.is_default_admin_active());
+        assert!(ctx.auth_mgr.is_first_run());
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("owner", "OwnerPassword123!")
+                .await,
+            "the credential change must be rolled back"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// A configuration persistence failure must restore the previous admin
+    /// password so setup stays pending with the bootstrap credential.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_wizard_config_persist_failure_rolls_back_admin_password() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_cfgfail_{}", rand::random::<u64>()));
+        let readonly = temp_dir.join("readonly");
+        let _ = std::fs::create_dir_all(&readonly);
+        let mut ctx = mock_context(&temp_dir).await;
+        ctx.set_setup_pending(true);
+        ctx.config_path = readonly.join("config.toml");
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let form = WizardCompleteForm {
+            admin_user: Some("admin".to_string()),
+            admin_password: Some("StrongPassword123!".to_string()),
+            upstream: Some("1.1.1.1:53".to_string()),
+            ..Default::default()
+        };
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(form),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(ctx.is_setup_pending());
+        assert!(ctx.auth_mgr.is_first_run());
+        assert!(ctx.auth_mgr.is_default_admin_active());
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("admin", "adminadmin")
+                .await,
+            "the bootstrap password must be restored after the config persist failure"
+        );
+        assert!(
+            !ctx.auth_mgr
+                .verify_user_password("admin", "StrongPassword123!")
+                .await
+        );
+
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 

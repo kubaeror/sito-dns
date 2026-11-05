@@ -92,6 +92,7 @@ pub async fn get_ha_status(
     let cfg = ctx.config.load();
     let role = cfg.server.role.clone();
     let instance_name = cfg.server.instance_name.clone();
+    let readiness = ctx.ha_readiness(&cfg);
 
     if role == "master" {
         let (version, slaves_connected, diverged, diverged_reason, master_pubkey) =
@@ -112,6 +113,8 @@ pub async fn get_ha_status(
             instance_name,
             version,
             state: "active".to_string(),
+            ready: readiness.ready,
+            readiness_reason: readiness.reason,
             master_url: None,
             slaves_connected,
             last_synced_at: None,
@@ -149,6 +152,8 @@ pub async fn get_ha_status(
             instance_name,
             version,
             state,
+            ready: readiness.ready,
+            readiness_reason: readiness.reason,
             master_url,
             slaves_connected: 0,
             last_synced_at,
@@ -241,6 +246,7 @@ mod tests {
     fn test_bundle(version: u64) -> sito_ha::ConfigBundle {
         sito_ha::ConfigBundle {
             version,
+            term: 0,
             timestamp: 1,
             config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec![],
@@ -277,6 +283,8 @@ mod tests {
             instance_name: "master-1".to_string(),
             version: 11,
             state: "active".to_string(),
+            ready: false,
+            readiness_reason: Some("mTLS initialization failed".to_string()),
             master_url: None,
             slaves_connected: 1,
             last_synced_at: None,

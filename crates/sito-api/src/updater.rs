@@ -404,6 +404,18 @@ impl CosignVerifier {
     }
 }
 
+/// Returns true when the `cosign` binary is available to the updater.
+///
+/// Callers use this for an actionable preflight before downloading a release.
+pub fn cosign_available() -> bool {
+    CosignVerifier::binary().is_some()
+}
+
+/// Actionable guidance for a host that requires signatures but has no cosign.
+pub const COSIGN_MISSING_GUIDANCE: &str = "install cosign (the installer does this by default; \
+     otherwise re-run contrib/install.sh or see docs/installation.md \"Updating sito\") or set \
+     server.update_require_signature = false only if you accept SHA-256-only integrity";
+
 #[async_trait::async_trait]
 impl SignatureVerifier for CosignVerifier {
     fn is_available(&self) -> bool {
@@ -417,9 +429,9 @@ impl SignatureVerifier for CosignVerifier {
         certificate: &Path,
     ) -> Result<(), UpdateError> {
         let binary = Self::binary().ok_or_else(|| {
-            UpdateError::SignatureVerifierUnavailable(
-                "cosign binary not found in /usr/bin, /usr/local/bin or PATH".to_string(),
-            )
+            UpdateError::SignatureVerifierUnavailable(format!(
+                "cosign binary not found in /usr/bin, /usr/local/bin or PATH; {COSIGN_MISSING_GUIDANCE}"
+            ))
         })?;
 
         let output = tokio::process::Command::new(binary)
@@ -473,9 +485,9 @@ pub async fn verify_release_signature(
     if let (Some(sig), Some(cert)) = (signature, certificate) {
         if !verifier.is_available() {
             if required {
-                return Err(UpdateError::SignatureVerifierUnavailable(
-                    "release ships a signature but no verifier is installed".to_string(),
-                ));
+                return Err(UpdateError::SignatureVerifierUnavailable(format!(
+                    "release ships a signature but no verifier is installed; {COSIGN_MISSING_GUIDANCE}"
+                )));
             }
             tracing::warn!(
                 "Release ships a signature but no verifier is available; relying on SHA-256 checksum only"
@@ -1175,6 +1187,15 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
         .await
         .unwrap_err();
         assert!(matches!(err, UpdateError::SignatureVerifierUnavailable(_)));
+        // The error must tell the operator how to fix the host, not just
+        // report that verification failed.
+        let msg = err.to_string();
+        assert!(msg.contains("cosign"), "unexpected error: {msg}");
+        assert!(msg.contains("install cosign"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("update_require_signature"),
+            "unexpected error: {msg}"
+        );
     }
 
     fn test_scratch_dir(label: &str) -> std::path::PathBuf {

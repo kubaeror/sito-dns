@@ -6,6 +6,7 @@ pub mod cli;
 pub mod logging;
 pub mod pipeline;
 pub mod server;
+pub mod service_lock;
 
 pub use cli::{Cli, Commands, run_check_config, run_healthcheck};
 pub use pipeline::DnsPipeline;

@@ -23,8 +23,39 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  verify-tag:
+    name: Verify tag matches workspace version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Every publishing job depends on this job, so a mismatched tag stops the
+      # workflow before any binary, release asset or image is produced.
+      - name: Verify release tag matches the workspace version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ -z "${VERSION}" ]; then
+            echo "::error::could not read the workspace version from Cargo.toml"
+            exit 1
+          fi
+          # Stable tag: v1.9.2. Prerelease tag: v1.9.2-rc.1 (any valid suffix
+          # after the workspace version). Anything else is a mismatch.
+          pattern="^v${VERSION//./\\.}(-[0-9A-Za-z][0-9A-Za-z.-]*)?$"
+          if ! printf '%s\n' "${RELEASE_TAG}" | grep -Eq "${pattern}"; then
+            echo "::error::Release tag '${RELEASE_TAG}' does not match workspace version 'v${VERSION}'"
+            echo "::error::expected 'v${VERSION}' or a prerelease such as 'v${VERSION}-rc.1'"
+            exit 1
+          fi
+
   build-binaries:
     name: build (${{ matrix.target }})
+    needs: [verify-tag]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -96,7 +127,7 @@ jobs:
 
   sbom-and-release:
     name: Generate SBOM & Publish Release
-    needs: [build-binaries]
+    needs: [verify-tag, build-binaries]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -122,15 +153,8 @@ jobs:
           sha256sum *.tar.gz > SHA256SUMS
           cd ..
 
-      - name: Verify release tag matches the workspace version
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          if [ "${RELEASE_TAG}" != "v${VERSION}" ]; then
-            echo "::error::Release tag '${RELEASE_TAG}' does not match workspace version 'v${VERSION}'"
-            exit 1
-          fi
+      # The tag/version gate runs in the verify-tag job that all publishing
+      # jobs depend on, so no release asset is published for a mismatched tag.
 
       - name: Install cargo-sbom
         uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
@@ -171,7 +195,29 @@ jobs:
             release-assets/*
           generate_release_notes: true
           draft: false
-          prerelease: false
+          # Tags containing '-' are prereleases and must never be published as
+          # a stable release or move the repository's "latest" release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ contains(github.ref_name, '-') && 'false' || 'true' }}
+          body: |
+            ## Container image
+
+            The image is published only after the tag/version check, the signed
+            release assets, the SBOM, and the artifact E2E verification pass.
+            Stable tags also update `latest`; prerelease tags (the tag contains
+            `-`) never do.
+
+            Verify the image (Docker tags omit the leading `v`):
+
+            ```bash
+            release_tag=${{ github.ref_name }}
+            image="ghcr.io/${{ github.repository }}:${release_tag#v}"
+            docker buildx imagetools inspect "$image" --format '{{json .Provenance}}'
+            docker buildx imagetools inspect "$image" --format '{{json .SBOM}}'
+            ```
+
+            See `docs/release-verification.md` for the full post-push checklist
+            and expected results.
 
   artifact-e2e:
     name: Verify release artifacts
@@ -184,6 +230,10 @@ jobs:
 
   docker-build-push:
     name: Build and Push Multi-Arch Container Image
+    # Publishing is the last step of the release gate: the image is only built
+    # after the tag/version check, the binaries, the signed release/SBOM job and
+    # the artifact E2E verification have all succeeded.
+    needs: [verify-tag, build-binaries, sbom-and-release, artifact-e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -210,12 +260,16 @@ jobs:
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # `latest` and the moving `<major>.<minor>` tag are stable-only. A
+          # prerelease (tag containing '-') keeps its full version tag but must
+          # not move a stable tag.
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
 
       - name: Build and push multi-arch Docker image
+        id: build
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
@@ -225,10 +279,91 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Supply-chain attestations: BuildKit provenance and an SPDX SBOM
-          # attestation are attached to the pushed image index. Verify with:
-          #   docker buildx imagetools inspect <image>@<digest> --format '{{json .Provenance}}'
-          #   cosign verify-attestation --type spdxjson <image>@<digest> ...
+          # attestation are attached to the pushed image index. The step below
+          # verifies that both are present before the job can succeed.
           provenance: true
           sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify the pushed image digest, platforms and attestations
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REF_NAME: ${{ github.ref_name }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+
+          if ! printf '%s' "${DIGEST}" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::build-push-action returned an unexpected digest '${DIGEST}'"
+            exit 1
+          fi
+
+          # Every tag generated by the metadata step must resolve to the digest
+          # the build reported; a mismatch means another publish raced us.
+          while IFS= read -r tag; do
+            [ -n "${tag}" ] || continue
+            resolved="$(docker buildx imagetools inspect "${tag}" --format '{{.Manifest.Digest}}')"
+            if [ "${resolved}" != "${DIGEST}" ]; then
+              echo "::error::${tag} resolves to ${resolved}, expected ${DIGEST}"
+              exit 1
+            fi
+          done <<< "${TAGS}"
+
+          # A stable tag must move latest to this build; a prerelease must not
+          # publish or move latest at all.
+          if printf '%s' "${REF_NAME}" | grep -q -- '-'; then
+            if printf '%s\n' "${TAGS}" | grep -Fxq "${IMAGE}:latest"; then
+              echo "::error::prerelease tag ${REF_NAME} would publish ${IMAGE}:latest"
+              exit 1
+            fi
+            if latest="$(docker buildx imagetools inspect "${IMAGE}:latest" \
+              --format '{{.Manifest.Digest}}' 2>/dev/null)"; then
+              if [ "${latest}" = "${DIGEST}" ]; then
+                echo "::error::${IMAGE}:latest points at prerelease digest ${DIGEST}"
+                exit 1
+              fi
+            fi
+          else
+            if ! printf '%s\n' "${TAGS}" | grep -Fxq "${IMAGE}:latest"; then
+              echo "::error::stable tag ${REF_NAME} did not publish ${IMAGE}:latest"
+              exit 1
+            fi
+            latest="$(docker buildx imagetools inspect "${IMAGE}:latest" --format '{{.Manifest.Digest}}')"
+            if [ "${latest}" != "${DIGEST}" ]; then
+              echo "::error::${IMAGE}:latest resolves to ${latest}, expected ${DIGEST}"
+              exit 1
+            fi
+          fi
+
+          # The index must contain every platform the release promises. The
+          # attestation manifests appear as unknown/unknown and are ignored by
+          # the explicit allowlist.
+          platforms="$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" \
+            --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}}{{with .Platform.Variant}}/{{.}}{{end}} {{end}}')"
+          # BuildKit reports 64-bit ARM as linux/arm64/v8 while some builders
+          # omit the implicit variant. The helper accepts both spellings and
+          # still enforces linux/amd64, linux/arm64 and linux/arm/v7.
+          if ! printf '%s\n' "${platforms}" | scripts/check-release-platforms.sh; then
+            echo "::error::image ${IMAGE}@${DIGEST} is missing a required platform"
+            exit 1
+          fi
+
+          # `provenance: true` and `sbom: true` must have attached attestations
+          # to the pushed index; fail closed if either is missing.
+          provenance="$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .Provenance}}')"
+          if ! printf '%s' "${provenance}" | grep -q '"SLSA"'; then
+            echo "::error::no SLSA provenance attestation on ${IMAGE}@${DIGEST}"
+            exit 1
+          fi
+          sbom="$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .SBOM}}')"
+          if ! printf '%s' "${sbom}" | grep -q '"SPDX"'; then
+            echo "::error::no SPDX SBOM attestation on ${IMAGE}@${DIGEST}"
+            exit 1
+          fi
+
+          echo "Verified ${IMAGE}@${DIGEST}"
+          echo "platforms: ${platforms}"
+          echo "tags:"
+          printf '%s\n' "${TAGS}"

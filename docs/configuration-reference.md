@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v1.9.1**.
+This document is the exhaustive configuration reference for **sito v1.9.2**.
 
 `sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the `DNSD_SECRET_<name>` environment variable, then a bare `<name>` environment variable; there is no on-disk local secret store, and a placeholder that cannot be resolved rejects the whole pushed configuration.
 
@@ -75,6 +75,14 @@ allow_plaintext_doh = false
 | `max_tcp_connections` | integer | `256` | Maximum concurrent TCP, DoT, and DoH client connections. |
 | `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
+> [!WARNING]
+> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 1.9.2 has **no DNS client allow-list**.
+> `rate_limit_per_ip` only limits rate; it does not authorize clients. A wildcard bind therefore accepts recursive queries from any source
+> that can reach the host. Restrict the DNS ports to your LAN with a host
+> firewall, or bind specific LAN addresses. The server emits a startup warning
+> when a wildcard DNS bind is combined with an enabled DNS port. A
+> default-deny DNS client ACL is planned for 1.10.0.
+
 ---
 
 ## 4. `[dns.cache]` — Caching Layer
@@ -94,11 +102,11 @@ serve_stale_hours = 12
 |---|---|---|---|
 | `enabled` | boolean | `true` | Enables or disables in-memory caching. |
 | `size_mb` | integer | `64` | Memory allocation ceiling for the cache in megabytes. |
-| `min_ttl` | integer | `60` | Minimum TTL (seconds) to assign to cached answers (overrides smaller upstream TTLs). |
+| `min_ttl` | integer | `60` | Minimum TTL (seconds) for unvalidated cached answers (overrides smaller upstream TTLs). DNSSEC-validated (`Secure`) answers keep the smaller authenticated TTL/RRSIG validity, so this floor can never extend their lifetime; Secure negative answers are also capped by the NSEC/NSEC3 denial proof TTL. |
 | `max_ttl` | integer | `86400` | Maximum TTL (seconds) to assign to cached answers (caps excessively high upstream TTLs). |
 | `negative_ttl_max` | integer | `3600` | Maximum TTL (seconds) for negative caching (NXDOMAIN / NODATA). |
 | `prefetch` | boolean | `true` | When `true`, automatically re-resolves frequently requested domains before TTL expires. |
-| `serve_stale_hours` | integer | `12` | Hours to serve expired cache records as fallback when upstreams are unreachable. |
+| `serve_stale_hours` | integer | `12` | Hours to serve expired cache records as fallback when upstreams are unreachable. Stale answers are served with all DNSSEC records removed and AD=0; while DNSSEC validation is active, entries cached without validation (`Unchecked`) or with an inconclusive result (`Indeterminate`) are not served. |
 
 ---
 
@@ -114,7 +122,7 @@ ntp = ["local.internal"]
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `mode` | string | `"validate"` | Validation mode. Accepted: `"validate"`/`"strict"` (bogus = SERVFAIL), `"log_only"`/`"log-only"`/`"permissive"` (log and clear AD), `"off"`/`"disabled"`. |
-| `validate` | boolean | `true` | Enable DNSSEC processing. Validation walks DS/DNSKEY links present in the response and, when the chain is incomplete, resolves the missing DNSKEY/DS records through the configured upstreams (bounded per-query fetch budget). NSEC/NSEC3 denial proofs are enumerated; opt-out NXDOMAIN answers are treated as insecure. |
+| `validate` | boolean | `true` | Enable DNSSEC processing. Validation walks DS/DNSKEY links present in the response and, when the chain is incomplete, resolves the missing DNSKEY/DS records through the configured upstreams (bounded per-query fetch budget). Cryptographic verification is bounded per response (256 RRSIG checks, at most 8 candidate keys per signature). NSEC/NSEC3 denial proofs are enumerated; NSEC3 records above 150 iterations are ignored (RFC 9276) and opt-out NXDOMAIN answers are treated as insecure. |
 | `ntp` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). Alias retained for compatibility; `nta` is the preferred key. |
 | `nta` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). |
 | `trust_anchors` | array of strings | `[]` | Trust anchors used as the top of the DS/DNSKEY chain (DS or DNSKEY records in zone-file/hex form). Empty uses validation of RRSIGs against configured anchors only. |
@@ -313,13 +321,34 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 |---|---|---|---|
 | `web.enabled` | boolean | `true` | Enable the web dashboard and REST API. |
 | `web.port` | integer | `8080` | Port for the Web Dashboard and REST API (`/api/v1/`; must be ≥ 1). |
-| `web.bind` | string (IP address) | `"0.0.0.0"` | Bind address for the web server. |
+| `web.bind` | string (IP address) | `"0.0.0.0"` | Bind address for the web server. The admin UI is served over plain HTTP; see the exposure warning below. |
 | `web.metrics_auth` | boolean | `true` | Require authentication (token or session) for `/metrics`. |
 | `web.trusted_proxies`| array of IP addresses | `[]` | Individual proxy IPs trusted to supply `X-Forwarded-For`/`X-Forwarded-Proto` (CIDR is **not** supported here). |
 | `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required (must be ≥ 1). |
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
-| `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL; corrupt stores are backed up and start empty. Use `sito reset-sessions` to invalidate everything. |
+| `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL, but are revalidated against `users.toml` on load and on every request (account exists, role and credential epoch match); entries written before credential epochs existed are rejected once, so users re-login and API tokens are re-issued after upgrading. Corrupt stores are backed up and start empty. Stop the service before `sito reset-sessions`; the reset refuses to run against a live server unless `--force` is given. |
 | `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
+
+> [!WARNING]
+> `web.bind` defaults to `0.0.0.0` and the admin UI is served over plain HTTP
+> by axum (the DNS `[tls]` certificate never protects the admin scheme). Do not
+> expose port `8080` to the internet. The server emits a startup warning when
+> the UI is reachable beyond loopback unless an `https://` `web.public_url` (or
+> `web.tls_terminated_by_proxy = true` with no public URL) declares a TLS
+> reverse proxy. For remote access, bind `web.bind = "127.0.0.1"` and use an SSH
+> tunnel or reverse proxy. The loopback default is planned for 1.10.0; 1.9.2
+> keeps the historical default so existing configurations keep working.
+
+
+The running server holds an exclusive advisory lease on `<data_dir>/sito.pid`
+and keeps users, sessions, API tokens and the auth generation in memory.
+`sito reset-sessions` and `sito reset-admin` inspect that lease and refuse to
+run while it is held, because a file-only reset would not revoke live
+credentials. Stop the service (`sudo systemctl stop sito`), run the reset, then
+start it (`sudo systemctl start sito`). `--force` performs the on-disk reset
+while the server runs and warns that live sessions/tokens and any new admin
+password take effect only after a restart. A leftover `sito.pid` from a crash is
+harmless: only the lock, not the file's existence, marks the service as running.
 
 Accounts are stored in `<data_dir>/users.toml` (0600). TOTP secrets are
 encrypted at rest with AES-256-GCM using `<data_dir>/totp.key` (0600, created
@@ -329,6 +358,17 @@ store; restoring only one is a lockout. If the key is missing or does not match
 the stored secrets, the server refuses to start rather than silently disabling
 2FA (`sito reset-admin` is the recovery path). An HA slave keeps its own
 `totp.key`; `users.toml` is never replicated or included in HA bundles.
+
+While a first-boot setup token is active, or `users.toml` still contains the
+bootstrap `admin` / `adminadmin` credential, the HTTP middleware disables login,
+token authentication and every non-wizard API/UI route. Only `/wizard`,
+`/ui/wizard/*`, static assets, `/health` and `/status` remain reachable. On an
+already-configured deployment this state is recovered by stopping the service
+and running `sito reset-admin` (then starting it again): without `--password` it
+generates a new random password and prints it once, supplied passwords must pass
+the shared policy, and non-admin accounts are preserved unless `--reset-all` is
+given. The command refuses to run while the service lease is held unless
+`--force` is passed.
 
 Two additional `[web]` keys are read from the raw table:
 
@@ -396,6 +436,64 @@ replication_port = 8953
 | `allow_insecure_ws` | boolean | `false` | Allow plaintext `ws://` replication. Requires a non-empty `slave_token`; must be set explicitly on both ends. |
 | `stats_interval_secs` | integer | `30` | Interval between slave-to-master statistics reports. |
 
+Private keys referenced by `key` are read by the unprivileged service account
+(`sito` under systemd, uid/gid `65532` in the container image). Generate them
+with ownership transfer (`sito ha gen-certs --uid <UID> --gid <GID>`, both
+required together) or `chown` them after copying; a key owned by another user
+fails the mTLS listener even though DNS keeps answering. Replication readiness
+is exposed as `ready` and `readiness_reason` in `GET /api/v1/ha/status`; the
+unauthenticated `/health` endpoint reports only a generic ready flag, and the
+`healthcheck` subcommand fails when `[ha]` requires replication but the master
+listener or slave handshake is not ready. Because
+readiness is reported by the admin web listener, keep `[web] enabled = true`
+(the default) on HA nodes; with the web listener disabled the healthcheck
+fails closed rather than assuming replication is healthy.
+
+Slaves persist the last successfully applied bundle identity to
+`<data_dir>/ha_watermark.toml` (JSON, mode `0600`, written atomically) after
+the configuration is applied and before the push is acknowledged. The file
+records the term, version, signed payload hash and application timestamp. It is
+restored at startup: pushes from an older term are rejected, pushes below the
+recorded version within the same term are rejected, and a push at the same
+version is only accepted when the signed payload hash matches. A corrupt or
+unreadable watermark fails startup rather than resetting to version 0; delete
+it only when you intend to force a full resync from the master. The watermark
+is node-local and must not be copied between slaves.
+
+Replication preserves node-local identity. The master does not overwrite a
+slave's `dns.bind`, `[dns.tls]`/`[tls]` certificate paths, `[acme]` account and
+cache settings, the `[web]` admin identity (`enabled`, `bind`, `port`,
+`trusted_proxies`, `metrics_auth`, `public_url`, `tls_terminated_by_proxy`),
+`[ha]`, `server.instance_name`, `server.data_dir`,
+`[integrations.mikrotik]` or `clients.client_id_secrets`. Web identity is
+node-local: a slave may disable the admin listener or reach it through a
+different bind/proxy/URL than the master, and those differences do not make a
+push fail. `dns.port` and the other listener ports are shared configuration;
+the runbook's master `bind = ["0.0.0.0", "::"]` and slave
+`bind = ["0.0.0.0"]` therefore coexist, including on hosts without IPv6.
+
+If a push changes a restart-only field that is **not** preserved as node-local
+(for example `server.log_format` or `[auth]`), the slave rejects the push before
+applying or persisting anything: it keeps its previous live configuration and
+file, enters `Degraded`, and ACKs `applied: false` with a `restart_required`
+reason naming the fields. Restart the slave with the intended configuration (or
+change those fields locally) before expecting the master to report it synced.
+
+`[auth]` is compared as effective policy: an explicit table containing the
+default values is equivalent to omitting `[auth]`, and legacy keys already
+stripped from replicated bundles (`admin_password_hash`, `tokens`) do not count
+as changes. Non-default `session_ttl_hours`, `login_rate_limit`,
+`session_persist` or `token_default_ttl_days` still require a restart.
+
+Cluster terms are node-persisted, not configuration keys: the master stores the
+current term inside `ha_state.toml` and only an explicit promotion (editing the
+state file and restarting, see `docs/runbook-ha.md`) raises it. A promotion must
+raise both the term and the version above the cluster high-water mark: a higher
+term alone does not bypass version continuity, so a promoted node with a stale
+state file cannot roll the cluster back. Upgrade every slave before promoting a
+master so the new term is persisted; a stale master from an older term then
+cannot overwrite newer configuration even if its version counter is higher.
+
 ---
 
 ## 14. `[integrations.mikrotik]` — RouterOS Integration
@@ -451,9 +549,10 @@ url = "https://lists.example.com/services.json"
 
 ## 16. Hot Reload Matrix
 
-The running server watches the file passed to `--config` (the CLI default is
-the relative `config.toml`; the systemd unit and container image pass
-`/etc/sito/config.toml`) and re-applies the settings below in-process. A
+The running server watches the file passed to `--config`. Without an explicit
+flag an existing `./config.toml` is preferred, then `/etc/sito/config.toml`
+(the systemd unit and container image pass `/etc/sito/config.toml` explicitly)
+and re-applies the settings below in-process. A
 configuration that cannot be parsed or validated is rejected as a whole: the
 previous settings stay active and the error is logged. The REST API reports
 restart-only changes in the `restart_required` field of `PUT /api/v1/config`
@@ -476,7 +575,7 @@ and `POST /api/v1/config/reload`.
 | `dns.bind`, `dns.port`, `dns.dot_port`, `dns.doh_port`, `dns.doq_port`, `dns.doh3_port`, `dns.doh_dedicated_hostname`, `dns.dot_padding`, `dns.edns_udp_size`, `dns.max_tcp_connections`, `dns.allow_plaintext_doh` | DNS listeners are stopped and rebound in-process when the listener plan changes; a failed rebind restores the previous bindings. TLS listeners need the acceptors created at startup. |
 | `dns.rate_limit_per_ip` | Live rate limiters updated. |
 | `dns.cache.enabled`, `dns.cache.size_mb`, `dns.cache.min_ttl`, `dns.cache.max_ttl`, `dns.cache.negative_ttl_max`, `dns.cache.prefetch`, `dns.cache.serve_stale_hours` | Cache configuration updated. |
-| `dns.dnssec.mode`, `dns.dnssec.validate`, `dns.dnssec.ntp`, `dns.dnssec.nta`, `dns.dnssec.trust_anchors` | DNSSEC validator swapped for the new configuration. |
+| `dns.dnssec.mode`, `dns.dnssec.validate`, `dns.dnssec.ntp`, `dns.dnssec.nta`, `dns.dnssec.trust_anchors` | DNSSEC validator swapped for the new configuration; the response cache is flushed because cached validation decisions belong to the old policy. |
 | `upstream.servers`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.ecs`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt. |
 | `filtering.enabled`, `filtering.refresh_interval_hours`, `filtering.blocking_mode`, `filtering.blocking_ttl`, `filtering.cname_cloaking`, `filtering.fail_closed`, `filtering.anti_doh_bypass`, `filtering.max_rules`, `filtering.max_list_bytes`, `filtering.regex_compile_budget_ms`, `filtering.lists`, `filtering.custom_rules` | Filter engine reloaded with the new lists/rules; cached answers are flushed. List downloads continue asynchronously after the reload. |
 | `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
@@ -502,6 +601,15 @@ and `POST /api/v1/config/reload`.
 > (`enabled`/`bind`/`port`), `[tls]`, `[acme]`, `[ha]` and `[integrations]`.
 > Everything else applies live. Editing a config file also logs a warning for
 > restart-only changes (the watcher applies the rest).
+>
+> On HA slaves the master's `[web]` values are replaced with the node-local
+> ones before this check, so an intentional difference in web identity does
+> not produce `restart_required: web`. Changing a slave's own listener shape
+> still requires restarting that slave.
+>
+> The HA readiness healthcheck still requires the admin web listener. A slave
+> with `web.enabled = false` can replicate and become `Synced`, but it reports
+> not ready; this policy is unchanged.
 >
 > Same-transport port collisions are rejected at validation: `dns.dot_port`
 > with `dns.doh_port` (both TCP) and `dns.doq_port` with `dns.doh3_port` (both

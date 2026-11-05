@@ -12,21 +12,25 @@ pub mod crypto;
 pub mod error;
 pub mod master;
 pub mod protocol;
+pub mod readiness;
 pub mod slave;
 pub mod transport;
 
 pub use bundle::{
-    ConfigBundle, FilterListMetadata, build_and_sign_push, sanitize_config_for_bundle,
-    scan_for_secrets, substitute_secrets, verify_and_unpack_push,
+    AppliedWatermark, ConfigBundle, FilterListMetadata, build_and_sign_push, push_payload_hash,
+    sanitize_config_for_bundle, scan_for_secrets, substitute_secrets, verify_and_unpack_push,
+    verify_and_unpack_push_with_watermark, watermark_covers,
 };
 pub use config::HaConfig;
 pub use crypto::{
-    Ed25519SigningKey, GeneratedCerts, compute_blake3_fingerprint, generate_ha_certs,
-    generate_ha_certs_with_sans, parse_public_key, verify_ed25519_signature,
+    CertOwnership, Ed25519SigningKey, GeneratedCerts, compute_blake3_fingerprint,
+    generate_ha_certs, generate_ha_certs_with_options, generate_ha_certs_with_sans,
+    parse_public_key, verify_ed25519_signature,
 };
 pub use error::HaError;
 pub use master::{MasterCoordinator, ResyncOutcome, SlaveSummary, spawn_master_server};
-pub use protocol::{HaMessage, PROTOCOL_VERSION, UpstreamReport};
+pub use protocol::{AckConflict, HaMessage, PROTOCOL_VERSION, UpstreamReport};
+pub use readiness::{HaReadiness, HaReadinessState};
 pub use slave::{
     SlaveAppHandles, SlaveConfigApplier, SlaveState, SlaveStatusTracker, apply_config_push,
     spawn_slave_worker,
@@ -131,6 +135,7 @@ mod tests {
         // Update bundle on master
         let bundle = ConfigBundle {
             version: 2,
+            term: 0,
             timestamp: 12345,
             config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec!["||ha-test-domain.internal^".to_string()],
@@ -444,6 +449,7 @@ mod tests {
         coordinator
             .update_bundle(ConfigBundle {
                 version: 2,
+                term: 0,
                 timestamp: 1,
                 config_toml: "config_version = 1\n".to_string(),
                 custom_rules: vec![],
@@ -522,6 +528,7 @@ mod tests {
         coordinator
             .update_bundle(ConfigBundle {
                 version: 2,
+                term: 0,
                 timestamp: 1,
                 config_toml: "config_version = 1\n".to_string(),
                 custom_rules: vec![],
@@ -600,6 +607,7 @@ mod tests {
         coordinator
             .update_bundle(ConfigBundle {
                 version: 2,
+                term: 0,
                 timestamp: 1,
                 config_toml: "config_version = 1\n".to_string(),
                 custom_rules: vec![],
@@ -673,6 +681,7 @@ mod tests {
         coordinator
             .update_bundle(ConfigBundle {
                 version: 2,
+                term: 0,
                 timestamp: 1,
                 config_toml: "config_version = 1\n".to_string(),
                 custom_rules: vec![],

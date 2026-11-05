@@ -130,6 +130,16 @@ fn canonical_config_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Compares two sanitized bundle documents semantically, falling back to byte
+/// comparison when either side is not valid TOML. Used at master startup to
+/// decide whether `config.toml` still matches the persisted bundle.
+fn sanitized_configs_equal(a: &str, b: &str) -> bool {
+    match (a.parse::<toml::Table>(), b.parse::<toml::Table>()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// Builds one protocol's hot-reloadable TLS acceptor and starts its certificate
 /// watcher. Returns `None` (with a warning) when the certificate material cannot
 /// be loaded, matching the previous per-protocol behaviour.
@@ -279,19 +289,28 @@ fn init_ha(
         )
         .with_state_path(config.server.data_dir.join("ha_state.toml"));
 
+        if ha_config.replication_port == 0 {
+            coordinator.mark_replication_disabled();
+        }
+
         // Continue the version sequence across restarts; only a master with no
         // recoverable state starts a fresh v1 sequence.
         let restored_version = coordinator.restore_state()?;
 
         let initial_toml = std::fs::read_to_string(config_path)
             .unwrap_or_else(|_| toml::to_string_pretty(config).unwrap_or_default());
-        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&initial_toml).unwrap_or_default();
+        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&initial_toml).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to sanitize '{}' for the HA bundle: {e}",
+                config_path.display()
+            )
+        })?;
         if let Some(ref token) = ha_config.slave_token
             && let Err(e) = sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])
         {
             anyhow::bail!("Refusing to publish HA bundle with a leaked secret: {e}");
         }
-        let list_metadata = config
+        let list_metadata: Vec<sito_ha::FilterListMetadata> = config
             .filtering
             .lists
             .iter()
@@ -303,24 +322,59 @@ fn init_ha(
             })
             .collect();
 
-        if restored_version.is_none() {
+        // Runs on every startup and on an explicit reconciliation: the bundle
+        // is always built from the configuration currently on disk.
+        let build_bundle = |version: u64| -> sito_ha::ConfigBundle {
             #[allow(clippy::cast_sign_loss)]
-            let initial_bundle = sito_ha::ConfigBundle {
-                version: 1,
+            sito_ha::ConfigBundle {
+                version,
+                term: coordinator.get_current_term(),
                 timestamp: chrono::Utc::now().timestamp_millis() as u64,
-                config_toml: sanitized_toml,
+                config_toml: sanitized_toml.clone(),
                 custom_rules: config.filtering.custom_rules.clone(),
                 rewrites: config.rewrites.clone(),
                 clients: config.clients.clone(),
-                lists: list_metadata,
-            };
-            coordinator.update_bundle(initial_bundle)?;
-            info!("Published initial HA configuration bundle version 1");
+                lists: list_metadata.clone(),
+            }
+        };
+
+        if let Some(restored_version) = restored_version {
+            // A restart must never resume a bundle that no longer matches the
+            // current `config.toml`: slaves would stay on the old shared
+            // configuration indefinitely. Republish a fresh `N + 1` bundle
+            // whenever the sanitized document differs (semantically, so a
+            // formatting-only rewrite does not churn the sequence).
+            let restored_bundle = coordinator
+                .active_bundle
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|bundle| bundle.config_toml.clone());
+            let config_changed = restored_bundle
+                .as_deref()
+                .is_none_or(|restored| !sanitized_configs_equal(restored, &sanitized_toml));
+
+            if config_changed {
+                let next_version = restored_version.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Cannot reconcile the HA bundle: persisted version {restored_version} cannot advance"
+                    )
+                })?;
+                coordinator.update_bundle(build_bundle(next_version))?;
+                info!(
+                    version = next_version,
+                    previous_version = restored_version,
+                    "Republished HA configuration bundle because config.toml changed since the persisted bundle"
+                );
+            } else {
+                info!(
+                    version = restored_version,
+                    "Resumed HA configuration sequence from persisted state"
+                );
+            }
         } else {
-            info!(
-                version = restored_version.unwrap_or_default(),
-                "Resumed HA configuration sequence from persisted state"
-            );
+            coordinator.update_bundle(build_bundle(1))?;
+            info!("Published initial HA configuration bundle version 1");
         }
 
         // Spawn master replication listener if replication_port > 0
@@ -343,7 +397,8 @@ fn init_ha(
             config.server.instance_name.clone(),
             0,
             ha_config.master_url.clone(),
-        );
+        )
+        .with_watermark_path(config.server.data_dir.join("ha_watermark.toml"))?;
         let (resync_tx, resync_rx) = tokio::sync::mpsc::channel(4);
         (None, Some(tracker), Some(resync_tx), Some(resync_rx))
     };
@@ -616,7 +671,12 @@ impl sito_ha::SlaveConfigApplier for HaConfigApplier {
         }
 
         Box::pin(async move {
-            match sito_api::config_apply::apply_and_persist_document(
+            // A restart-only field cannot take effect in this process. The HA
+            // persist path rejects such a push *before* applying or persisting
+            // anything: the worker then ACKs `applied: false`, and the live
+            // configuration and the persisted file both keep the previous
+            // state instead of claiming a change only a restart could honor.
+            match sito_api::config_apply::apply_and_persist_document_rejecting_restart(
                 &self.ctx,
                 cfg,
                 document,
@@ -627,13 +687,11 @@ impl sito_ha::SlaveConfigApplier for HaConfigApplier {
             {
                 Ok(report) => {
                     if !report.restart_required.is_empty() {
-                        // The push is ACKed as applied because the document is
-                        // persisted and every hot-appliable component is live.
-                        // Restart-only sections are not silently claimed as
-                        // live: surface exactly which ones need a restart.
+                        // The lock-held pre-check uses the same matrix, so this
+                        // is a defensive backstop rather than a normal path.
                         warn!(
                             fields = ?report.restart_required,
-                            "HA push applied; these fields are persisted but require a restart to take effect"
+                            "HA push applied but reported restart-only fields; the acknowledgement may be incomplete"
                         );
                     }
                     Ok(())
@@ -669,6 +727,9 @@ fn spawn_slave_worker_after_listeners(
     };
     if ha_runtime.config.master_url.is_none() {
         metrics.inc_ha_startup_noop("slave", "missing_master_url");
+        tracker.set_connection_error(Some(
+            "master_url is not configured; replication cannot start".to_string(),
+        ));
         warn!("Slave role configured without master_url; replication worker idle");
         return;
     }
@@ -833,6 +894,24 @@ pub async fn run_server_with_shutdown(
     run_server_full(config, config_path, custom_shutdown, false).await
 }
 
+/// Startup phases that expose different listeners. The admin UI starts even in
+/// setup-pending mode; DNS listeners start only after setup (or immediately in
+/// a normal boot), so their warning is emitted at that transition.
+#[derive(Clone, Copy)]
+enum ExposurePhase {
+    Startup,
+    DnsListeners,
+}
+
+/// Returns the exposure warnings relevant to a startup phase.
+fn exposure_warnings_for_phase(config: &Config, phase: ExposurePhase) -> Vec<String> {
+    let warning = match phase {
+        ExposurePhase::Startup => config.web_exposure_warning(),
+        ExposurePhase::DnsListeners => config.dns_exposure_warning(),
+    };
+    warning.into_iter().collect()
+}
+
 /// Runs the DNS server with custom config path, shutdown receiver, and setup-pending mode.
 pub async fn run_server_full(
     config: Config,
@@ -841,6 +920,32 @@ pub async fn run_server_full(
     setup_pending: bool,
 ) -> anyhow::Result<()> {
     validate_typed_sections(&config)?;
+
+    // Make the historical wildcard defaults visible at startup. This is a
+    // warning, not a refusal: existing Docker/quickstart configurations must
+    // keep starting. 1.10.0 changes the defaults and is documented separately.
+    for warning in exposure_warnings_for_phase(&config, ExposurePhase::Startup) {
+        warn!("NETWORK EXPOSURE: {warning}");
+    }
+
+    // Hold a single-instance lease for the whole server lifetime. The reset
+    // commands use the same lease to distinguish "stopped" from "running" and
+    // refuse to pretend that credentials/sessions were revoked live.
+    let _service_lease =
+        crate::service_lock::ServiceLease::acquire(&config.server.data_dir).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::anyhow!(
+                    "Another sito server is already running for data directory '{}'. Stop it before starting a second instance. ({e})",
+                    config.server.data_dir.display()
+                )
+            } else {
+                anyhow::anyhow!(
+                    "Failed to acquire the service lease in '{}': {e}",
+                    config.server.data_dir.display()
+                )
+            }
+        })?;
+
     // Canonicalize so the file watcher compares absolute event paths, and so
     // the default relative `config.toml` still yields a watchable directory.
     let config_path_buf = canonical_config_path(config_path.as_ref());
@@ -1042,13 +1147,6 @@ pub async fn run_server_full(
     let web_cfg = config_arc.load().get_web_config();
     if web_cfg.enabled {
         let web_addr = SocketAddr::new(web_cfg.bind, web_cfg.port);
-        // DNS TLS does not terminate the admin UI: axum serves plain HTTP here
-        // regardless, so warn whenever the UI is reachable beyond loopback.
-        if !web_cfg.bind.is_loopback() {
-            warn!(
-                "Admin web UI listening on {web_addr} over plain HTTP; credentials and the setup token are transmitted in plaintext. Terminate TLS in front of it (reverse proxy) or bind to loopback."
-            );
-        }
         let listener = tokio::net::TcpListener::bind(web_addr).await.map_err(|e| {
             anyhow::anyhow!("Failed to bind web admin interface to {web_addr}: {e}")
         })?;
@@ -1162,6 +1260,11 @@ pub async fn run_server_full(
                         doq: None,
                         doh3: None,
                     });
+                for warning in
+                    exposure_warnings_for_phase(&current_cfg, ExposurePhase::DnsListeners)
+                {
+                    warn!("NETWORK EXPOSURE: {warning}");
+                }
                 let manager = DnsListenerManager::start(
                     &current_cfg,
                     pipeline.clone(),
@@ -1204,6 +1307,9 @@ pub async fn run_server_full(
         // Start from the current configuration (the watcher may already have
         // applied a file change during startup), not the stale startup copy.
         let listener_config = config_arc.load();
+        for warning in exposure_warnings_for_phase(&listener_config, ExposurePhase::DnsListeners) {
+            warn!("NETWORK EXPOSURE: {warning}");
+        }
         let manager = DnsListenerManager::start(
             &listener_config,
             pipeline.clone(),
@@ -1965,6 +2071,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression: a master restart with a persisted `ha_state.toml` used to
+    /// resume the old bundle and never compare it with `config.toml`, leaving
+    /// every slave on stale configuration. A changed config must republish at
+    /// `N + 1`; an unchanged config must resume the existing sequence.
+    #[tokio::test]
+    async fn test_master_restart_republishes_changed_config() {
+        let dir =
+            std::env::temp_dir().join(format!("sito_init_ha_reconcile_{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+
+        let mut config = Config::default();
+        config.server.role = "master".to_string();
+        config.server.instance_name = "master-reconcile".to_string();
+        config.server.data_dir = dir.clone();
+        config.ha = None;
+        config.upstream.servers = vec!["1.1.1.1".to_string()];
+        std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+        let metrics = sito_stats::MetricsRegistry::new("1.9.0", "test");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let first = init_ha(&config, &config_path, &metrics, &shutdown_rx)
+            .expect("first master startup must publish v1");
+        let first_coordinator = first.coordinator.expect("master coordinator");
+        assert_eq!(
+            first_coordinator.current_version.load(Ordering::SeqCst),
+            1,
+            "a fresh master must start at version 1"
+        );
+        drop(first_coordinator);
+
+        // Restarting with an unchanged config must not churn the sequence.
+        let unchanged = init_ha(&config, &config_path, &metrics, &shutdown_rx)
+            .expect("unchanged restart must succeed");
+        let unchanged_coordinator = unchanged.coordinator.expect("master coordinator");
+        assert_eq!(
+            unchanged_coordinator.current_version.load(Ordering::SeqCst),
+            1,
+            "an unchanged config must resume the persisted version"
+        );
+        let unchanged_bundle = unchanged_coordinator
+            .active_bundle
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("restored bundle");
+        assert!(
+            unchanged_bundle.config_toml.contains("1.1.1.1"),
+            "an unchanged restart must keep the persisted bundle"
+        );
+        drop(unchanged_coordinator);
+
+        // Editing the master config and restarting must publish N + 1 so
+        // connected slaves pick up the new shared configuration.
+        config.upstream.servers = vec!["9.9.9.9".to_string()];
+        std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        let changed = init_ha(&config, &config_path, &metrics, &shutdown_rx)
+            .expect("changed restart must republish the bundle");
+        let changed_coordinator = changed.coordinator.expect("master coordinator");
+        assert_eq!(
+            changed_coordinator.current_version.load(Ordering::SeqCst),
+            2,
+            "a changed config must republish at N + 1"
+        );
+        let changed_bundle = changed_coordinator
+            .active_bundle
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("republished bundle");
+        assert!(
+            changed_bundle.config_toml.contains("9.9.9.9"),
+            "the republished bundle must carry the current config: {}",
+            changed_bundle.config_toml
+        );
+        assert!(
+            !changed_bundle.config_toml.contains("1.1.1.1"),
+            "the republished bundle must not carry the stale config: {}",
+            changed_bundle.config_toml
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_bundled_registries_load_without_panicking() {
         // Startup must use the fallible loaders: corrupt embedded data has to
@@ -2020,5 +2211,41 @@ mod tests {
 
         drop(watchers);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: the DNS warning must not claim listeners exist during
+    /// setup-pending mode, and the post-wizard transition must use the
+    /// configuration the wizard actually wrote.
+    #[test]
+    fn test_exposure_warning_phases_suppress_dns_while_setup_pending() {
+        let default = Config::default();
+        let startup = exposure_warnings_for_phase(&default, ExposurePhase::Startup);
+        assert_eq!(
+            startup.len(),
+            1,
+            "setup-pending startup must warn only for the admin UI: {startup:?}"
+        );
+        assert!(startup[0].contains("admin web UI"));
+        assert!(
+            !startup.iter().any(|w| w.contains("DNS listeners")),
+            "DNS is not bound during setup-pending mode: {startup:?}"
+        );
+
+        let dns_starting = exposure_warnings_for_phase(&default, ExposurePhase::DnsListeners);
+        assert_eq!(
+            dns_starting.len(),
+            1,
+            "the DNS transition must emit exactly the DNS warning: {dns_starting:?}"
+        );
+        assert!(dns_starting[0].contains("DNS listeners"));
+
+        // The wizard may change dns.bind to loopback; the transition warning
+        // must use the then-current configuration, not the startup defaults.
+        let mut completed = Config::default();
+        completed.dns.bind = vec!["127.0.0.1".parse().expect("valid loopback")];
+        assert!(
+            exposure_warnings_for_phase(&completed, ExposurePhase::DnsListeners).is_empty(),
+            "a loopback DNS bind must not warn after setup completes"
+        );
     }
 }

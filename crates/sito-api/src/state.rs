@@ -48,7 +48,59 @@ pub struct ServerContext {
     pub apply_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Whether the configuration makes HA replication part of the node's role.
+///
+/// `/health` and the healthcheck use this to avoid gating non-HA deployments
+/// while still failing closed for a master with a listener or a slave enrolled
+/// in a cluster.
+#[must_use]
+pub fn ha_readiness_required(config: &Config) -> bool {
+    sito_ha::HaConfig::readiness_required(&config.server.role, config.ha.as_ref())
+}
+
 impl ServerContext {
+    /// Current HA readiness for the configured role.
+    ///
+    /// Returns ready when replication is not part of the deployment. When it
+    /// is, a missing runtime or an unready listener/worker is reported with a
+    /// reason instead of silently treating the node as healthy.
+    #[must_use]
+    pub fn ha_readiness(&self, config: &Config) -> sito_ha::HaReadiness {
+        // A role with no `[ha]` section is simply not an HA deployment. A
+        // master that *did* configure `[ha]` but explicitly disabled the
+        // listener (`replication_port = 0`) still has a meaningful state: the
+        // coordinator carries the "replication disabled" explanation and must
+        // be surfaced instead of being discarded as a generic ready.
+        if !ha_readiness_required(config) {
+            if config.ha.is_some()
+                && config.server.role == "master"
+                && let Some(coordinator) = self.master_coordinator.as_ref()
+            {
+                return coordinator.readiness();
+            }
+            return sito_ha::HaReadiness::ready();
+        }
+        match config.server.role.as_str() {
+            "master" => self.master_coordinator.as_ref().map_or_else(
+                || {
+                    sito_ha::HaReadiness::not_ready(
+                        "master coordinator is not initialized; replication cannot run",
+                    )
+                },
+                sito_ha::MasterCoordinator::readiness,
+            ),
+            "slave" => self.slave_tracker.as_ref().map_or_else(
+                || {
+                    sito_ha::HaReadiness::not_ready(
+                        "slave tracker is not initialized; replication cannot run",
+                    )
+                },
+                sito_ha::SlaveStatusTracker::readiness,
+            ),
+            _ => sito_ha::HaReadiness::ready(),
+        }
+    }
+
     /// Acquires the configuration apply/persist lock.
     ///
     /// Every writer must hold this guard from *before* it reads
@@ -143,10 +195,16 @@ impl ServerContext {
             return;
         }
 
-        let new_version = coordinator.get_current_version().saturating_add(1);
+        let Some(new_version) = coordinator.get_current_version().checked_add(1) else {
+            tracing::error!(
+                "Refusing to publish HA bundle: the configuration version sequence is exhausted"
+            );
+            return;
+        };
         #[allow(clippy::cast_sign_loss)]
         let bundle = sito_ha::ConfigBundle {
             version: new_version,
+            term: coordinator.get_current_term(),
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
             config_toml: sanitized_toml,
             custom_rules: config.filtering.custom_rules.clone(),

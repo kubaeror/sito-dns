@@ -26,6 +26,14 @@ pub struct FilterListMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigBundle {
     pub version: u64,
+    /// Cluster epoch/term that produced this bundle.
+    ///
+    /// Missing in bundles signed before terms existed, which are interpreted as
+    /// term 0 for backwards compatibility. A term increase is an explicit
+    /// operator promotion; a stale master from an older term can never
+    /// overwrite a newer slave, regardless of its version counter.
+    #[serde(default)]
+    pub term: u64,
     pub timestamp: u64,
     pub config_toml: String,
     #[serde(default)]
@@ -228,6 +236,57 @@ pub fn substitute_secrets<S: ::std::hash::BuildHasher>(
     Ok(result)
 }
 
+/// Persisted applied-version watermark for a slave node.
+///
+/// Written atomically (0600) after a push has been applied and its
+/// configuration persisted, before the slave acknowledges it. On startup the
+/// slave restores this record so a restart cannot replay an older signed
+/// bundle or overwrite the applied configuration with stale content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppliedWatermark {
+    /// Configuration version of the last successfully applied bundle.
+    pub version: u64,
+    /// Cluster epoch/term of that bundle. Missing in watermark files written
+    /// before terms existed, which are interpreted as term 0.
+    #[serde(default)]
+    pub term: u64,
+    /// BLAKE3 hash of the signed bundle payload that produced `version`.
+    pub payload_hash: String,
+    /// Unix milliseconds at which the bundle was applied.
+    pub timestamp: u64,
+    /// Set when a same-version payload-hash mismatch proved that this node and
+    /// its master are on different forks. All same-term pushes are rejected
+    /// until an explicit higher-term promotion arrives.
+    #[serde(default)]
+    pub forked: bool,
+    /// Version at which the fork was detected.
+    #[serde(default)]
+    pub forked_at_version: u64,
+}
+
+impl AppliedWatermark {
+    /// Returns the normalized (prefix-free) payload hash.
+    #[must_use]
+    pub fn normalized_hash(&self) -> &str {
+        self.payload_hash.trim_start_matches("blake3:")
+    }
+}
+
+/// Extracts the signed payload hash from a `ConfigPush` envelope.
+pub fn push_payload_hash(push: &HaMessage) -> Result<String, HaError> {
+    match push {
+        HaMessage::ConfigPush {
+            payload_hash_blake3,
+            ..
+        } => Ok(payload_hash_blake3
+            .trim_start_matches("blake3:")
+            .to_string()),
+        other => Err(HaError::Protocol(format!(
+            "Expected ConfigPush message, got: {other:?}"
+        ))),
+    }
+}
+
 /// Packages a `ConfigBundle` into a signed `HaMessage::ConfigPush`.
 ///
 /// The bundle is sanitized before serialization (structured
@@ -251,6 +310,7 @@ pub fn build_and_sign_push(
 
     Ok(HaMessage::ConfigPush {
         version: bundle.version,
+        term: bundle.term,
         hash_blake3: hash_hex.clone(),
         signature_ed25519: sig_hex,
         payload_b64,
@@ -258,56 +318,57 @@ pub fn build_and_sign_push(
     })
 }
 
-/// Verifies and unpacks a received `HaMessage::ConfigPush`.
-///
-/// Performs:
-/// 1. Monotonicity check: `version > have_version`.
-/// 2. Base64 payload decoding.
-/// 3. BLAKE3 payload checksum verification.
-/// 4. Ed25519 cryptographic signature verification using `master_pubkey`.
-/// 5. Deserialization into `ConfigBundle`.
-pub fn verify_and_unpack_push(
+/// Verifies the envelope and returns the signed bundle plus the computed
+/// normalized payload hash.
+fn verify_and_unpack_push_inner(
     push: &HaMessage,
-    have_version: u64,
     master_pubkey: &[u8],
-) -> Result<ConfigBundle, HaError> {
-    let (version, signature_ed25519, payload_b64, payload_hash_blake3, envelope_hash) = match push {
-        HaMessage::ConfigPush {
-            version,
-            signature_ed25519,
-            payload_b64,
-            payload_hash_blake3,
-            hash_blake3,
-        } => (
-            *version,
-            signature_ed25519,
-            payload_b64,
-            payload_hash_blake3,
-            hash_blake3,
-        ),
-        other => {
-            return Err(HaError::Protocol(format!(
-                "Expected ConfigPush message, got: {other:?}"
-            )));
-        }
-    };
+) -> Result<(ConfigBundle, String), HaError> {
+    let (version, term, signature_ed25519, payload_b64, payload_hash_blake3, envelope_hash) =
+        match push {
+            HaMessage::ConfigPush {
+                version,
+                term,
+                signature_ed25519,
+                payload_b64,
+                payload_hash_blake3,
+                hash_blake3,
+            } => (
+                *version,
+                *term,
+                signature_ed25519,
+                payload_b64,
+                payload_hash_blake3,
+                hash_blake3,
+            ),
+            other => {
+                return Err(HaError::Protocol(format!(
+                    "Expected ConfigPush message, got: {other:?}"
+                )));
+            }
+        };
 
-    // 1. Monotonicity guard: strictly greater than current version
-    if version <= have_version {
+    if version == u64::MAX {
         return Err(HaError::Validation {
             field: "version".to_string(),
-            reason: format!(
-                "Push version {version} is not greater than currently synced version {have_version} (monotonicity violation/replay rejected)"
-            ),
+            reason: "Push version u64::MAX is implausible; the sequence could never advance again"
+                .to_string(),
+        });
+    }
+    if term == u64::MAX {
+        return Err(HaError::Validation {
+            field: "term".to_string(),
+            reason: "Push term u64::MAX is implausible; the epoch could never advance again"
+                .to_string(),
         });
     }
 
-    // 2. Base64 payload decoding
+    // 1. Base64 payload decoding
     let payload_bytes = BASE64_STANDARD
         .decode(payload_b64)
         .map_err(|e| HaError::Protocol(format!("Invalid base64 payload in config push: {e}")))?;
 
-    // 3. BLAKE3 payload checksum verification
+    // 2. BLAKE3 payload checksum verification
     let computed_hash = blake3::hash(&payload_bytes);
     let computed_hash_hex = computed_hash.to_hex().to_string();
 
@@ -325,7 +386,7 @@ pub fn verify_and_unpack_push(
         ));
     }
 
-    // 4. Ed25519 signature verification
+    // 3. Ed25519 signature verification
     let sig_bytes = hex::decode(signature_ed25519)
         .or_else(|_| BASE64_STANDARD.decode(signature_ed25519))
         .map_err(|e| HaError::Crypto(format!("Invalid signature encoding: {e}")))?;
@@ -333,13 +394,13 @@ pub fn verify_and_unpack_push(
     // Verify over hash bytes
     verify_ed25519_signature(master_pubkey, computed_hash.as_bytes(), &sig_bytes)?;
 
-    // 5. Deserialization
+    // 4. Deserialization
     let bundle_str = std::str::from_utf8(&payload_bytes)
         .map_err(|e| HaError::Serialization(format!("Bundle payload is not valid UTF-8: {e}")))?;
 
     let bundle = ConfigBundle::from_json(bundle_str)?;
 
-    // 6. Envelope/payload version binding: the version the monotonicity guard
+    // 5. Envelope/payload version binding: the version the monotonicity guard
     // checked must be the same one actually carried inside the signed payload,
     // otherwise an attacker can replay an old signed bundle with a bumped
     // envelope version and roll the slave's configuration backward.
@@ -352,13 +413,166 @@ pub fn verify_and_unpack_push(
             ),
         });
     }
+    if bundle.term != term {
+        return Err(HaError::Validation {
+            field: "term".to_string(),
+            reason: format!(
+                "Envelope term {term} does not match signed bundle term {} (epoch tampering rejected)",
+                bundle.term
+            ),
+        });
+    }
+
+    Ok((bundle, computed_hash_hex))
+}
+
+/// Verifies and unpacks a received `HaMessage::ConfigPush`.
+///
+/// Performs:
+/// 1. Monotonicity check: `version > have_version`.
+/// 2. Base64 payload decoding.
+/// 3. BLAKE3 payload checksum verification.
+/// 4. Ed25519 cryptographic signature verification using `master_pubkey`.
+/// 5. Deserialization into `ConfigBundle`.
+pub fn verify_and_unpack_push(
+    push: &HaMessage,
+    have_version: u64,
+    master_pubkey: &[u8],
+) -> Result<ConfigBundle, HaError> {
+    let (bundle, _hash) = verify_and_unpack_push_inner(push, master_pubkey)?;
+
+    // Monotonicity guard: strictly greater than current version
+    if bundle.version <= have_version {
+        return Err(HaError::Validation {
+            field: "version".to_string(),
+            reason: format!(
+                "Push version {} is not greater than currently synced version {have_version} (monotonicity violation/replay rejected)",
+                bundle.version
+            ),
+        });
+    }
 
     Ok(bundle)
+}
+
+/// Verifies and unpacks a push against the persisted applied watermark.
+///
+/// A stale master from an older term is rejected even when its version counter
+/// is higher, because a term increase is the explicit promotion signal. Within
+/// the same term the version must advance; an equal version is accepted only
+/// when it is the same signed payload (idempotent re-delivery). A higher term
+/// is a new epoch, but it does **not** reset the sequence: the promoted version
+/// must also be above the applied watermark, so an explicit promotion raises
+/// both term and version.
+pub fn verify_and_unpack_push_with_watermark(
+    push: &HaMessage,
+    watermark: Option<&AppliedWatermark>,
+    master_pubkey: &[u8],
+) -> Result<ConfigBundle, HaError> {
+    let (bundle, payload_hash) = verify_and_unpack_push_inner(push, master_pubkey)?;
+
+    if let Some(watermark) = watermark {
+        if watermark.forked && bundle.term <= watermark.term {
+            return Err(HaError::Validation {
+                field: "term".to_string(),
+                reason: format!(
+                    "A same-version payload fork was latched at term {} version {}; refusing term {} version {} until a strictly higher-term promotion arrives",
+                    watermark.term, watermark.forked_at_version, bundle.term, bundle.version
+                ),
+            });
+        }
+        if bundle.term < watermark.term {
+            return Err(HaError::Validation {
+                field: "term".to_string(),
+                reason: format!(
+                    "Push term {} is below the persisted applied term {} (stale master/epoch rejected)",
+                    bundle.term, watermark.term
+                ),
+            });
+        }
+        if bundle.term > watermark.term {
+            // A term increase is an explicit promotion, but it is not
+            // permission to roll the version back: the promoted master must
+            // continue above the cluster's applied high-water mark.
+            if bundle.version <= watermark.version {
+                return Err(HaError::Validation {
+                    field: "version".to_string(),
+                    reason: format!(
+                        "Higher-term push (term {} version {}) must continue above the applied version {}; a term bump does not permit a version rollback (restore the promoted state or raise the version)",
+                        bundle.term, bundle.version, watermark.version
+                    ),
+                });
+            }
+        }
+        if bundle.term == watermark.term {
+            if bundle.version < watermark.version {
+                return Err(HaError::Validation {
+                    field: "version".to_string(),
+                    reason: format!(
+                        "Push version {} is below the persisted applied watermark {} (restart/replay rejected)",
+                        bundle.version, watermark.version
+                    ),
+                });
+            }
+            if bundle.version == watermark.version && payload_hash != watermark.normalized_hash() {
+                return Err(HaError::Validation {
+                    field: "version".to_string(),
+                    reason: format!(
+                        "Push version {} has payload hash {payload_hash} but the applied watermark records {} (same-version content replay rejected)",
+                        bundle.version,
+                        watermark.normalized_hash()
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(bundle)
+}
+
+/// Returns true when `watermark` already covers a push with `term`, `version`
+/// and `payload_hash` (same epoch, same version, identical signed payload).
+#[must_use]
+pub fn watermark_covers(
+    watermark: &AppliedWatermark,
+    term: u64,
+    version: u64,
+    payload_hash: &str,
+) -> bool {
+    term == watermark.term
+        && version == watermark.version
+        && payload_hash.trim_start_matches("blake3:") == watermark.normalized_hash()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_legacy_bundle_without_term_verifies_as_term_zero() {
+        let signing_key = Ed25519SigningKey::generate().unwrap();
+        // A payload produced by a pre-term master: no `term` field.
+        let payload = r#"{"version":7,"timestamp":1,"config_toml":"config_version = 1\n[server]\nrole = \"slave\"\n","custom_rules":[],"lists":[]}"#;
+        let hash = blake3::hash(payload.as_bytes());
+        let hash_hex = hash.to_hex().to_string();
+        let sig = signing_key.sign(hash.as_bytes());
+        let push = HaMessage::ConfigPush {
+            version: 7,
+            term: 0,
+            hash_blake3: hash_hex.clone(),
+            signature_ed25519: hex::encode(sig),
+            payload_b64: BASE64_STANDARD.encode(payload.as_bytes()),
+            payload_hash_blake3: hash_hex,
+        };
+
+        let bundle = verify_and_unpack_push(&push, 6, &signing_key.public_key())
+            .expect("a legacy term-less bundle must remain verifiable");
+        assert_eq!(bundle.term, 0, "missing term must default to epoch 0");
+
+        let bundle =
+            verify_and_unpack_push_with_watermark(&push, None, &signing_key.public_key()).unwrap();
+        assert_eq!(bundle.term, 0);
+    }
 
     #[test]
     fn test_bundle_sanitization_and_secret_redaction() {
@@ -449,6 +663,7 @@ password = "mikrotik_secret_password"
 
         let bundle = ConfigBundle {
             version: 7,
+            term: 0,
             timestamp: 123,
             config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec![],
@@ -487,6 +702,7 @@ password = "mikrotik_secret_password"
 
         let bundle = ConfigBundle {
             version: 10,
+            term: 0,
             timestamp: 123_456_789,
             config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec!["||example.org^".to_string()],
@@ -522,6 +738,7 @@ password = "mikrotik_secret_password"
 
         let bundle = ConfigBundle {
             version: 10,
+            term: 0,
             timestamp: 123_456_789,
             config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec![],
@@ -543,6 +760,7 @@ password = "mikrotik_secret_password"
                 ..
             } => HaMessage::ConfigPush {
                 version: 11,
+                term: 0,
                 hash_blake3,
                 signature_ed25519,
                 payload_b64,

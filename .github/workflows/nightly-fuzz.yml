@@ -1,5 +1,18 @@
 name: Nightly Fuzzing
 
+# This workflow was disabled manually after a long streak of `no such command:
+# fuzz` failures. Editing this file does NOT clear that state. After this
+# change lands on main, re-enable and smoke it on the current default branch:
+#
+#   gh workflow enable nightly-fuzz.yml
+#   gh workflow run nightly-fuzz.yml --ref main -f duration_seconds=10
+#   gh run view --json headSha,event,conclusion \
+#     "$(gh run list --workflow nightly-fuzz.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+#
+# The scheduled run itself always checks out the default branch HEAD; confirm
+# the reported headSha equals `git ls-remote origin refs/heads/main` before
+# trusting a nightly result.
+
 on:
   schedule:
     - cron: '0 2 * * *' # Daily at 02:00 UTC
@@ -92,10 +105,22 @@ jobs:
         with:
           key: fuzz-${{ matrix.target }}
 
+      # Pin a released install-action commit, not the `cargo-fuzz` branch head:
+      # SHA pins do not include the `default: cargo-fuzz` input that the
+      # published `@cargo-fuzz` tag injects, so the tool must be named
+      # explicitly. cargo-fuzz is not (or no longer) in install-action's
+      # manifest, so use the source-install fallback for a deterministic
+      # `cargo-fuzz@0.13.2` instead of an unverified prebuilt.
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@82fc405565b9cf90abfe700ba43b4751ce2fe422 # cargo-fuzz
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-fuzz@0.13.2
+          fallback: cargo-install
+
+      # Fail before the fuzz run if the install action silently did nothing
+      # (the previous 57 failures were `error: no such command: fuzz`).
+      - name: Verify cargo-fuzz is available
+        run: cargo fuzz --version
 
       # Persist the per-target corpus across nightly runs: coverage-guided
       # fuzzing only converges when it can build on the inputs found by

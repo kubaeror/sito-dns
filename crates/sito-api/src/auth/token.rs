@@ -62,6 +62,12 @@ pub struct ApiTokenMeta {
     /// invalidates tokens even if their persisted file survives.
     #[serde(default)]
     pub generation: u64,
+    /// Per-user credential epoch the token was issued under. `None` marks a
+    /// token persisted before epochs existed; those are rejected on load so an
+    /// upgrade forces tokens to be re-issued. Ownerless tokens store `Some(0)`
+    /// as a post-upgrade marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_epoch: Option<u64>,
     /// Account that created the token. `None` covers legacy tokens written
     /// before ownership was tracked; those are managed by Admins only.
     /// Deliberately not exposed through `ApiTokenDto`/OpenAPI.
@@ -102,6 +108,7 @@ pub fn generate_token(name: &str, scope: Role) -> (ApiTokenMeta, CreateTokenResp
         last_used: None,
         expires_at: None,
         generation: 0,
+        credential_epoch: None,
         owner: None,
     };
 

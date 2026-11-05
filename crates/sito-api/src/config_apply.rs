@@ -306,6 +306,33 @@ pub async fn apply_and_persist_document(
     apply_and_persist_document_locked(ctx, candidate, document, filter_apply, hooks).await
 }
 
+/// HA push variant of [`apply_and_persist_document`].
+///
+/// A restart-only change cannot take effect in the running process, so the
+/// candidate is rejected **before** anything is applied or persisted. The HA
+/// slave worker then ACKs `applied: false` and both the live configuration and
+/// the persisted file keep their previous state. The check runs under
+/// [`ServerContext::apply_lock`] together with the apply, so a concurrent
+/// watcher write cannot invalidate it between check and persist.
+pub async fn apply_and_persist_document_rejecting_restart(
+    ctx: &ServerContext,
+    candidate: &Config,
+    document: &str,
+    filter_apply: FilterApply,
+    hooks: Option<&dyn ConfigApplyHooks>,
+) -> Result<AppliedReport, ProblemDetails> {
+    let _apply_guard = ctx.apply_lock.lock().await;
+    let previous = (**ctx.config.load()).clone();
+    let restart_required = restart_required_fields(&previous, candidate);
+    if !restart_required.is_empty() {
+        return Err(ProblemDetails::bad_request(format!(
+            "restart_required: this push changes restart-only fields ({}); restart the slave with the new configuration or update them locally",
+            restart_required.join(", ")
+        )));
+    }
+    apply_and_persist_document_locked(ctx, candidate, document, filter_apply, hooks).await
+}
+
 /// Persist variant that must be called with [`ServerContext::apply_lock`] held.
 async fn apply_and_persist_document_locked(
     ctx: &ServerContext,
@@ -446,6 +473,14 @@ async fn apply_inner(
         hooks.apply(cfg, &clients).await?;
     }
 
+    // A DNSSEC mode/validate/anchor/NTA change invalidates every cached
+    // validation decision. Without this, an entry validated under the old
+    // policy would keep being served (Secure with AD=1 after an anchor was
+    // removed, or Unchecked after validation was enabled).
+    if ctx.config.load().dns.dnssec != cfg.dns.dnssec {
+        ctx.cache.flush();
+    }
+
     // 4. Cache policy, query-log privacy and the coherent runtime snapshot.
     ctx.cache.update_config(cfg.dns.cache.clone()).await;
     ctx.querylog_sender
@@ -550,8 +585,16 @@ pub fn restart_required_fields(old: &Config, new: &Config) -> Vec<String> {
         "server.log_format",
         &mut fields,
     );
-    // [auth] sessions/token policy is read once at startup.
-    mark(old.auth != new.auth, "auth", &mut fields);
+    // [auth] sessions/token policy is read once at startup. Compare the
+    // effective typed policy, not the raw TOML: an explicitly configured
+    // default (`[auth]` with the default values) is equivalent to omitting the
+    // section, and HA sanitization strips inert legacy keys such as
+    // `admin_password_hash`/`tokens` from the replicated table.
+    mark(
+        old.get_auth_config() != new.get_auth_config(),
+        "auth",
+        &mut fields,
+    );
     // Only the admin listener's enabled/bind/port are bound at startup;
     // `web.trusted_proxies`, `web.metrics_auth`, `web.public_url` and
     // `web.tls_terminated_by_proxy` are read per request and hot-applied.
@@ -617,6 +660,71 @@ mod tests {
                 "target '{target}' must be accepted"
             );
         }
+    }
+
+    /// A DNSSEC policy change invalidates every cached validation decision:
+    /// an old Insecure/Unchecked entry must not outlive the policy that
+    /// produced it.
+    #[tokio::test]
+    async fn test_dnssec_policy_change_flushes_response_cache() {
+        use sito_proto::{
+            DNSClass, Message, MessageType, OpCode, Query, RData, Record, RecordType,
+        };
+
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_dnssec_flush");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        for (index, change) in ["mode", "trust_anchors", "nta"].into_iter().enumerate() {
+            let name = sito_proto::Name::from_ascii(format!("policy-{index}.example.")).unwrap();
+            let mut query = Message::new(
+                u16::try_from(index).unwrap() + 1,
+                MessageType::Query,
+                OpCode::Query,
+            );
+            query
+                .queries
+                .push(Query::query(name.clone(), RecordType::A));
+            let mut response = Message::response(query.metadata.id, OpCode::Query);
+            response.queries = query.queries.clone();
+            response.answers.push(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::A(sito_proto::rdata::A("192.0.2.200".parse().unwrap())),
+            ));
+            ctx.cache.insert(&query, &response).await;
+            assert!(
+                ctx.cache
+                    .get(&name, RecordType::A, DNSClass::IN)
+                    .await
+                    .is_some(),
+                "cache seed for {change} must succeed"
+            );
+
+            let mut candidate = (**ctx.config.load()).clone();
+            match change {
+                "mode" => candidate.dns.dnssec.mode = "disabled".to_string(),
+                "trust_anchors" => candidate
+                    .dns
+                    .dnssec
+                    .trust_anchors
+                    .push("example.:13:AQID".to_string()),
+                "nta" => candidate.dns.dnssec.nta.push("nta.example".to_string()),
+                other => panic!("unhandled policy change {other}"),
+            }
+            apply_full_config(&ctx, &candidate, FilterApply::Deferred, None)
+                .await
+                .unwrap();
+
+            assert!(
+                ctx.cache
+                    .get(&name, RecordType::A, DNSClass::IN)
+                    .await
+                    .is_none(),
+                "changing dnssec {change} must flush cached validation decisions"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// B regression: two rapid pushes end at the newer document (a stale event
@@ -839,6 +947,127 @@ mod tests {
             restart_required_fields(&old, &new2).is_empty(),
             "changing only the DoH hostname must not require a restart: {:?}",
             restart_required_fields(&old, &new2)
+        );
+    }
+
+    /// Regression: HA restores the slave's node-local `[web]` identity before
+    /// the restart check runs. A master with `web.enabled = true` (and its own
+    /// proxy/public-URL settings) must therefore not make a slave that
+    /// disabled the listener report `restart_required: web`. A genuine
+    /// listener-shape change on the slave still requires a restart.
+    #[test]
+    fn test_restart_web_ignores_preserved_node_local_identity() {
+        let live = Config::from_toml_str(
+            r#"
+config_version = 1
+
+[web]
+enabled = false
+bind = "127.0.0.1"
+port = 8081
+trusted_proxies = ["10.0.0.2"]
+metrics_auth = false
+public_url = "https://slave.example"
+tls_terminated_by_proxy = true
+"#,
+        )
+        .expect("live slave config");
+
+        // Document as produced by `build_persisted_config`: the live web
+        // identity is restored while the master's cluster-shared `[web]`
+        // keys survive.
+        let preserved = Config::from_toml_str(
+            r#"
+config_version = 1
+
+[web]
+enabled = false
+bind = "127.0.0.1"
+port = 8081
+trusted_proxies = ["10.0.0.2"]
+metrics_auth = false
+public_url = "https://slave.example"
+tls_terminated_by_proxy = true
+acme_enabled = false
+"#,
+        )
+        .expect("merged persisted config");
+
+        assert!(
+            restart_required_fields(&live, &preserved).is_empty(),
+            "preserved node-local web identity must not require a restart: {:?}",
+            restart_required_fields(&live, &preserved)
+        );
+
+        // Changing the actual listener shape locally still requires a restart.
+        let mut enabled = preserved.clone();
+        let mut web = enabled.get_web_config();
+        web.enabled = true;
+        enabled.set_web_config(web);
+        let fields = restart_required_fields(&live, &enabled);
+        assert!(
+            fields.iter().any(|field| field == "web"),
+            "a genuine web listener change must still be reported: {fields:?}"
+        );
+    }
+
+    /// Regression: `[auth]` was compared as raw TOML, so a master that spells
+    /// out the default policy (or carries inert legacy keys) was treated as a
+    /// restart-only change against a slave that omits `[auth]`. That made
+    /// every push fail with `restart_required: auth`. Only a real effective
+    /// policy difference may require a restart.
+    #[test]
+    fn test_restart_auth_compares_effective_policy_not_raw_toml() {
+        let without_auth = Config::default();
+
+        let mut with_default_auth = without_auth.clone();
+        with_default_auth.auth = Some(
+            toml::from_str(
+                r"
+                session_ttl_hours = 24
+                login_rate_limit = 5
+                session_persist = true
+                token_default_ttl_days = 90
+                ",
+            )
+            .unwrap(),
+        );
+        assert!(
+            restart_required_fields(&without_auth, &with_default_auth).is_empty(),
+            "explicit defaults must be equivalent to omitting [auth]: {:?}",
+            restart_required_fields(&without_auth, &with_default_auth)
+        );
+        assert!(
+            restart_required_fields(&with_default_auth, &without_auth).is_empty(),
+            "removing an explicit-default [auth] must not require a restart: {:?}",
+            restart_required_fields(&with_default_auth, &without_auth)
+        );
+
+        // Sanitization strips these inert legacy keys from replicated bundles;
+        // their presence must not look like a policy change either.
+        let mut legacy_auth = without_auth.clone();
+        legacy_auth.auth = Some(
+            toml::from_str(
+                r#"
+                admin_password_hash = "$argon2id$legacy"
+                tokens = ["legacy-token"]
+                "#,
+            )
+            .unwrap(),
+        );
+        assert!(
+            restart_required_fields(&without_auth, &legacy_auth).is_empty(),
+            "inert legacy [auth] keys must not require a restart: {:?}",
+            restart_required_fields(&without_auth, &legacy_auth)
+        );
+
+        // A genuine policy change still needs a restart.
+        let mut changed_policy = without_auth.clone();
+        changed_policy.auth = Some(toml::from_str("session_ttl_hours = 1").unwrap());
+        let fields = restart_required_fields(&without_auth, &changed_policy);
+        assert!(
+            fields.iter().any(|field| field == "auth"),
+            "a real [auth] policy change must be reported: {fields:?}"
         );
     }
 

@@ -39,6 +39,11 @@ pub struct Session {
     /// every persisted session even if its file survives.
     #[serde(default)]
     pub generation: u64,
+    /// Per-user credential epoch the session was issued under. `None` marks a
+    /// session persisted before epochs existed; those are rejected on load so
+    /// an upgrade forces a fresh login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_epoch: Option<u64>,
 }
 
 fn random_token_hex() -> String {
@@ -60,6 +65,7 @@ impl Session {
             expires_at: now + ttl_secs,
             csrf_token: random_token_hex(),
             generation: 0,
+            credential_epoch: None,
         }
     }
 
@@ -67,6 +73,15 @@ impl Session {
     #[must_use]
     pub fn with_generation(mut self, generation: u64) -> Self {
         self.generation = generation;
+        self
+    }
+
+    /// Stamps the session with the account's credential epoch and role
+    /// snapshot.
+    #[must_use]
+    pub fn with_credential(mut self, role: Role, credential_epoch: u64) -> Self {
+        self.role = role;
+        self.credential_epoch = Some(credential_epoch);
         self
     }
 
@@ -281,6 +296,7 @@ mod tests {
             expires_at: i64::MAX,
             csrf_token: String::new(),
             generation: 0,
+            credential_epoch: None,
         };
         session.ensure_csrf_token();
         assert_eq!(session.csrf_token.len(), 64);

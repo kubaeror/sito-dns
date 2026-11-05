@@ -23,8 +23,18 @@ use crate::config::HaConfig;
 use crate::crypto::Ed25519SigningKey;
 use crate::error::HaError;
 use crate::master::tracker::{ActiveSlave, SlaveStatsSummary, SlaveSummary};
-use crate::protocol::HaMessage;
+use crate::protocol::{AckConflict, HaMessage};
+use crate::readiness::{HaReadiness, HaReadinessState};
 use crate::transport::{build_server_tls_config, ws_config};
+
+/// Maximum amount by which an authenticated peer may report being ahead of the
+/// master's sequence before the report is treated as implausible (and therefore
+/// hostile or corrupt) instead of as promotion evidence.
+///
+/// A single replica must never be able to freeze publishing by reporting a
+/// gigantic version: values above this bound are rejected without touching the
+/// master's counter or persisted state.
+pub const MAX_PEER_VERSION_LEAD: u64 = 1_000_000;
 
 /// Outcome of a manual resynchronization request, surfaced honestly by the
 /// `/ha/resync` API.
@@ -45,10 +55,25 @@ pub struct ResyncOutcome {
 #[cfg(test)]
 type StateWriteHook = Arc<dyn Fn(u64) + Send + Sync>;
 
-/// A version-continuity violation observed on a slave acknowledgement.
+/// Severity of a recorded divergence. Ordered so a fork outranks a term
+/// mismatch, which outranks a same-term version gap; `mark_diverged` never
+/// downgrades an existing higher-severity record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DivergenceKind {
+    /// Same term, peer reports a version above the master.
+    Ahead,
+    /// Peer reports a newer term (this master is stale).
+    Term,
+    /// Same term and version but a different signed payload (fork).
+    Fork,
+}
+
+/// A divergence observed for one connected slave.
 #[derive(Debug, Clone)]
 struct Divergence {
+    kind: DivergenceKind,
     acked_version: u64,
+    acked_term: u64,
     reason: String,
 }
 
@@ -58,6 +83,9 @@ pub struct MasterCoordinator {
     pub instance_name: String,
     pub signing_key: Arc<Ed25519SigningKey>,
     pub current_version: Arc<AtomicU64>,
+    /// Cluster epoch/term. Bumped only by an explicit operator promotion
+    /// (`with_term` or a restored `ha_state.toml`), never by peer input.
+    pub current_term: Arc<AtomicU64>,
     pub active_bundle: Arc<Mutex<Option<ConfigBundle>>>,
     pub active_push: Arc<Mutex<Option<HaMessage>>>,
     pub slaves: Arc<Mutex<HashMap<String, ActiveSlave>>>,
@@ -82,10 +110,13 @@ pub struct MasterCoordinator {
     /// Test-only hook called by the asynchronous state writer.
     #[cfg(test)]
     state_write_hook: Arc<Mutex<Option<StateWriteHook>>>,
-    /// Version-continuity violations per currently connected slave; an entry is
-    /// removed when a push above its version is applied or the slave
-    /// disconnects, so the metric series cannot outlive the record.
+    /// Divergence records per currently connected slave. They are sticky: only
+    /// an explicit operator resync/promotion or disconnect removes them, never
+    /// an unrelated version advance.
     diverged: Arc<Mutex<HashMap<String, Divergence>>>,
+    /// Whether the replication listener is actually serving. Updated by
+    /// `spawn_master_server` and surfaced by `/ha/status` and `/health`.
+    readiness: HaReadinessState,
 }
 
 impl MasterCoordinator {
@@ -107,6 +138,7 @@ impl MasterCoordinator {
             instance_name,
             signing_key,
             current_version: Arc::new(AtomicU64::new(initial_version)),
+            current_term: Arc::new(AtomicU64::new(0)),
             active_bundle: Arc::new(Mutex::new(None)),
             active_push: Arc::new(Mutex::new(None)),
             slaves: Arc::new(Mutex::new(HashMap::new())),
@@ -122,13 +154,51 @@ impl MasterCoordinator {
             #[cfg(test)]
             state_write_hook: Arc::new(Mutex::new(None)),
             diverged: Arc::new(Mutex::new(HashMap::new())),
+            readiness: HaReadinessState::not_ready("master replication listener has not started"),
         }
+    }
+
+    /// Current readiness of the master replication listener.
+    #[must_use]
+    pub fn readiness(&self) -> HaReadiness {
+        self.readiness.snapshot()
+    }
+
+    /// Marks the replication listener as serving connections.
+    pub fn mark_replication_ready(&self) {
+        self.readiness.mark_ready();
+    }
+
+    /// Records a listener/TLS failure that prevents replication.
+    pub fn mark_replication_failed(&self, reason: impl Into<String>) {
+        self.readiness.mark_failed(reason);
+    }
+
+    /// Records an intentionally disabled listener (`replication_port = 0`).
+    ///
+    /// This is not a failure: the operator explicitly turned HA off. Keeping a
+    /// reason makes the disabled state visible in `/ha/status`.
+    pub fn mark_replication_disabled(&self) {
+        self.readiness
+            .mark_ready_with_reason("replication_port is 0 (replication disabled)");
     }
 
     /// Enables persistence of the active configuration version/bundle to `path`.
     #[must_use]
     pub fn with_state_path(mut self, path: PathBuf) -> Self {
         self.state_path = Arc::new(Mutex::new(Some(path)));
+        self
+    }
+
+    /// Sets the cluster epoch/term for an explicit promotion.
+    ///
+    /// Normal nodes restore the term from `ha_state.toml`. This builder exists
+    /// for an embedded/operator promotion path (and tests): every bundle
+    /// published afterwards must carry this term. A stale master that has not
+    /// been promoted this way can never overwrite a newer slave.
+    #[must_use]
+    pub fn with_term(self, term: u64) -> Self {
+        self.current_term.store(term, Ordering::SeqCst);
         self
     }
 
@@ -258,12 +328,34 @@ impl MasterCoordinator {
         if bundle.version == 0 {
             return Ok(None);
         }
+        if bundle.version == u64::MAX {
+            // A state file at the ceiling can never advance again. Treat it as
+            // a hard error instead of silently resuming a frozen master; the
+            // operator must restore a backup or re-seed the sequence.
+            return Err(HaError::Validation {
+                field: "version".to_string(),
+                reason: format!(
+                    "Persisted HA state at {} has version u64::MAX and can never advance; restore the state file from backup or re-seed an explicit version",
+                    path.display()
+                ),
+            });
+        }
+        if bundle.term == u64::MAX {
+            return Err(HaError::Validation {
+                field: "term".to_string(),
+                reason: format!(
+                    "Persisted HA state at {} has term u64::MAX and can never advance; restore the state file from backup or re-seed an explicit term",
+                    path.display()
+                ),
+            });
+        }
         // State files written by older versions may still embed structured
         // client secrets; strip them before signing/broadcasting.
         let mut bundle = bundle;
         bundle.strip_structured_secrets();
         let push = build_and_sign_push(&bundle, &self.signing_key)?;
         self.current_version.store(bundle.version, Ordering::SeqCst);
+        self.current_term.store(bundle.term, Ordering::SeqCst);
         *self.active_bundle.lock().unwrap() = Some(bundle.clone());
         *self.active_push.lock().unwrap() = Some(push);
         #[allow(clippy::cast_precision_loss)]
@@ -299,8 +391,13 @@ impl MasterCoordinator {
         self.current_version.load(Ordering::SeqCst)
     }
 
-    /// Returns true when a version-continuity violation (a slave acknowledging
-    /// a version above the master's) is currently recorded.
+    /// Returns the current cluster epoch/term.
+    pub fn get_current_term(&self) -> u64 {
+        self.current_term.load(Ordering::SeqCst)
+    }
+
+    /// Returns true when any divergence (version gap, stale term, or fork) is
+    /// currently latched.
     pub fn is_diverged(&self) -> bool {
         !self.diverged.lock().unwrap().is_empty()
     }
@@ -311,22 +408,35 @@ impl MasterCoordinator {
             .lock()
             .unwrap()
             .values()
-            .max_by_key(|d| d.acked_version)
+            .max_by_key(|d| (d.kind, d.acked_version, d.acked_term))
             .map(|d| d.reason.clone())
     }
 
-    /// Records a version-continuity violation for one instance, keeping the
-    /// most severe version that instance reported.
-    fn mark_diverged(&self, instance: &str, acked_version: u64, reason: String) {
+    /// Records a divergence for one instance, keeping the most severe kind and
+    /// version that instance reported.
+    ///
+    /// Records are deliberately sticky: nothing here is cleared by an
+    /// unrelated version advance. Only [`Self::trigger_resync`] (an explicit
+    /// operator action) or disconnecting the slave removes them.
+    fn mark_diverged(
+        &self,
+        kind: DivergenceKind,
+        instance: &str,
+        acked_version: u64,
+        acked_term: u64,
+        reason: String,
+    ) {
         let mut diverged = self.diverged.lock().unwrap();
         if diverged
             .get(instance)
-            .is_none_or(|d| acked_version >= d.acked_version)
+            .is_none_or(|d| (kind, acked_version) >= (d.kind, d.acked_version))
         {
             diverged.insert(
                 instance.to_string(),
                 Divergence {
+                    kind,
                     acked_version,
+                    acked_term,
                     reason,
                 },
             );
@@ -334,19 +444,19 @@ impl MasterCoordinator {
         }
     }
 
-    /// Clears each divergence record once a version above its divergent one was
-    /// successfully applied by the master's slaves (or the operator published
-    /// past it).
+    /// Clears the advisory (non-fork) divergence records after an explicit
+    /// operator resync.
     ///
-    /// The slaves lock is held across the connectivity check and gauge update
-    /// so a concurrent disconnect cannot remove the record/metric and have this
-    /// path recreate a stale `0` series.
-    fn clear_divergence_above(&self, version: u64) {
+    /// A real same-version fork is not cleared here: re-pushing a stale active
+    /// bundle cannot resolve it. The fork record clears only when that slave
+    /// disconnects or successfully applies the current bundle after a
+    /// promotion/reconciliation.
+    fn clear_advisory_divergence(&self) {
         let slaves = self.slaves.lock().unwrap();
         let mut diverged = self.diverged.lock().unwrap();
         let cleared: Vec<String> = diverged
             .iter()
-            .filter(|(_, d)| version > d.acked_version)
+            .filter(|(_, d)| d.kind != DivergenceKind::Fork)
             .map(|(instance, _)| instance.clone())
             .collect();
         for instance in cleared {
@@ -357,48 +467,21 @@ impl MasterCoordinator {
         }
     }
 
-    /// Raises the local sequence to `have_version` when an authenticated slave
-    /// reports a higher version.
+    /// Clears one instance's *fork* divergence after it successfully applied
+    /// the master's current bundle/term.
     ///
-    /// This is the promotion/state-loss guard: a promoted slave (or a master
-    /// whose `ha_state.toml` was lost or corrupt) must continue *above* the
-    /// highest version in the cluster instead of restarting at v1, otherwise
-    /// every push is silently ignored by the remaining slaves. An operator can
-    /// override the sequence by seeding a higher `ha_state.toml` or by
-    /// publishing a higher bundle version explicitly.
-    ///
-    /// Returns true when the local sequence was raised.
-    fn seed_version_from_hello(&self, instance: &str, have_version: u64) -> bool {
-        let mut current = self.current_version.load(Ordering::SeqCst);
-        loop {
-            if have_version <= current {
-                return false;
-            }
-            match self.current_version.compare_exchange_weak(
-                current,
-                have_version,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
+    /// Advisory ahead/newer-term records stay sticky until an explicit resync
+    /// or disconnect: a same-term version advance by the same slave is not
+    /// proof that the earlier continuity condition is gone.
+    fn clear_divergence_for(&self, instance: &str) {
+        let slaves = self.slaves.lock().unwrap();
+        let mut diverged = self.diverged.lock().unwrap();
+        let is_fork = diverged
+            .get(instance)
+            .is_some_and(|d| d.kind == DivergenceKind::Fork);
+        if is_fork && diverged.remove(instance).is_some() && slaves.contains_key(instance) {
+            self.metrics.set_ha_diverged(instance, false);
         }
-
-        warn!(
-            instance = %instance,
-            have_version,
-            previous = current,
-            "Slave reports a version above the master's sequence; seeding the master version to preserve monotonic continuity"
-        );
-        #[allow(clippy::cast_precision_loss)]
-        {
-            self.metrics
-                .set_ha_config_version("local", have_version as f64);
-            self.metrics
-                .set_ha_config_version(&self.instance_name, have_version as f64);
-        }
-        true
     }
 
     /// Validates monotonicity, sanitizes and signs `bundle` without publishing
@@ -422,6 +505,30 @@ impl MasterCoordinator {
                 reason: format!(
                     "Refusing to publish non-monotonic configuration version {version} (current {current})"
                 ),
+            });
+        }
+        if version == u64::MAX {
+            return Err(HaError::Validation {
+                field: "version".to_string(),
+                reason: "Refusing to publish configuration version u64::MAX: the sequence could never advance again"
+                    .to_string(),
+            });
+        }
+        let current_term = self.get_current_term();
+        if bundle.term != current_term {
+            return Err(HaError::Validation {
+                field: "term".to_string(),
+                reason: format!(
+                    "Refusing to publish bundle term {} while the master is at term {current_term}; term changes are an explicit promotion",
+                    bundle.term
+                ),
+            });
+        }
+        if bundle.term == u64::MAX {
+            return Err(HaError::Validation {
+                field: "term".to_string(),
+                reason: "Refusing to publish term u64::MAX: the epoch could never advance again"
+                    .to_string(),
             });
         }
 
@@ -646,12 +753,21 @@ impl MasterCoordinator {
     }
 
     /// Triggers a re-push of the current active configuration bundle to all slaves.
+    /// Triggers a re-push of the current active configuration bundle to all slaves.
+    ///
+    /// This is the explicit operator recovery action. It clears advisory
+    /// (ahead/newer-term) records only when a push was actually queued; a real
+    /// same-version fork is left latched until the slave accepts the current
+    /// bundle (after promotion/reconciliation) or disconnects.
     pub fn trigger_resync(&self) -> ResyncOutcome {
         let push_opt = self.active_push.lock().unwrap().clone();
         let slaves_notified = match push_opt {
             Some(ref push) => self.broadcast(push),
             None => 0,
         };
+        if push_opt.is_some() && slaves_notified > 0 {
+            self.clear_advisory_divergence();
+        }
         ResyncOutcome {
             version: self.get_current_version(),
             active_bundle: push_opt.is_some(),
@@ -663,7 +779,11 @@ impl MasterCoordinator {
     pub fn list_slaves(&self) -> Vec<SlaveSummary> {
         let cur_v = self.get_current_version();
         let slaves = self.slaves.lock().unwrap();
-        slaves.values().map(|s| s.to_summary(cur_v)).collect()
+        let diverged = self.diverged.lock().unwrap();
+        slaves
+            .values()
+            .map(|s| s.to_summary(cur_v, diverged.contains_key(&s.instance)))
+            .collect()
     }
 
     /// Returns the count of currently connected slaves.
@@ -688,6 +808,7 @@ impl MasterCoordinator {
                 Ok(HaMessage::Hello {
                     instance,
                     have_version,
+                    have_term,
                     capabilities,
                     token,
                     role,
@@ -695,6 +816,7 @@ impl MasterCoordinator {
                 }) => (
                     instance,
                     have_version,
+                    have_term,
                     capabilities,
                     token,
                     role,
@@ -715,6 +837,7 @@ impl MasterCoordinator {
                         Ok(HaMessage::Hello {
                             instance,
                             have_version,
+                            have_term,
                             capabilities,
                             token,
                             role,
@@ -722,6 +845,7 @@ impl MasterCoordinator {
                         }) => (
                             instance,
                             have_version,
+                            have_term,
                             capabilities,
                             token,
                             role,
@@ -739,7 +863,8 @@ impl MasterCoordinator {
             }
         };
 
-        let (slave_instance, have_version, capabilities, token, role, protocol_version) = hello_msg;
+        let (slave_instance, have_version, have_term, capabilities, token, role, protocol_version) =
+            hello_msg;
 
         // Protocol version negotiation
         if let Some(version) = protocol_version
@@ -798,28 +923,74 @@ impl MasterCoordinator {
             "Received authenticated Hello from replica slave"
         );
 
+        // Reject implausible peer versions before they can influence the local
+        // sequence. An authenticated replica reporting `u64::MAX` (or any
+        // value far beyond the master's counter) would otherwise seed the
+        // version and make every subsequent publish non-monotonic, freezing
+        // replication.
+        let current = self.get_current_version();
+        if have_version > current.saturating_add(MAX_PEER_VERSION_LEAD) {
+            error!(
+                instance = %slave_instance,
+                peer = %peer_addr,
+                have_version,
+                current,
+                max_lead = MAX_PEER_VERSION_LEAD,
+                "Rejecting Hello with an implausible have_version"
+            );
+            return;
+        }
+
+        // Term/version continuity is checked, never repaired automatically from
+        // peer input. A replica that is ahead in the same term (lost/corrupt
+        // `ha_state.toml`, forked master) or in a newer term (this master is
+        // stale) must not cause the master to adopt its counter and republish
+        // its own possibly-stale bundle. Instead surface the divergence and
+        // require an explicit promotion/resync.
+        let current = self.get_current_version();
+        let current_term = self.get_current_term();
+        if have_term > current_term {
+            let reason = format!(
+                "slave '{slave_instance}' reports term {have_term} above the master's term {current_term}: this master is stale and must not overwrite the cluster"
+            );
+            error!(
+                instance = %slave_instance,
+                peer = %peer_addr,
+                have_term,
+                current_term,
+                "{reason}"
+            );
+            self.mark_diverged(
+                DivergenceKind::Term,
+                &slave_instance,
+                have_version,
+                have_term,
+                reason,
+            );
+        }
+        if have_term == current_term && have_version > current {
+            let reason = format!(
+                "slave '{slave_instance}' reports version {have_version} above the master's version {current} in term {current_term}: version continuity is broken (promoted slave or lost/corrupt ha_state.toml); explicit promotion is required"
+            );
+            error!(
+                instance = %slave_instance,
+                peer = %peer_addr,
+                have_version,
+                current,
+                current_term,
+                "{reason}"
+            );
+            self.mark_diverged(
+                DivergenceKind::Ahead,
+                &slave_instance,
+                have_version,
+                current_term,
+                reason,
+            );
+        }
+
         let (tx, mut rx) = mpsc::channel::<HaMessage>(32);
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
-
-        // Version continuity: a promoted slave (or a master whose
-        // `ha_state.toml` was lost) reports a version above the local
-        // sequence. Seed the sequence from it *before* publishing anything,
-        // then re-publish the active bundle under a version above it so the
-        // remaining slaves actually apply it instead of ignoring every push.
-        let seeded = self.seed_version_from_hello(&slave_instance, have_version);
-        let active_bundle = self.active_bundle.lock().unwrap().clone();
-        if seeded && let Some(bundle) = active_bundle {
-            let next_version = self.get_current_version().saturating_add(1);
-            let mut rebased = bundle;
-            rebased.version = next_version;
-            if let Err(e) = self.update_bundle_async(rebased).await {
-                warn!(
-                    instance = %slave_instance,
-                    version = next_version,
-                    "Failed to republish the active bundle after seeding the version: {e}"
-                );
-            }
-        }
 
         // Register slave in tracking map. A reconnecting instance replaces the
         // previous entry; `connection_id` lets the superseded session detect
@@ -831,7 +1002,9 @@ impl MasterCoordinator {
                 ActiveSlave {
                     instance: slave_instance.clone(),
                     remote_addr: peer_addr,
-                    synced_version: have_version,
+                    // Never trust the peer's Hello claim for the *reported*
+                    // synced version: only an applied ACK proves it.
+                    synced_version: 0,
                     last_ping: Instant::now(),
                     connected_at: Utc::now(),
                     last_stats: None,
@@ -842,9 +1015,7 @@ impl MasterCoordinator {
             );
             #[allow(clippy::cast_possible_wrap)]
             self.metrics.set_ha_slaves_connected(slaves.len() as i64);
-            #[allow(clippy::cast_precision_loss)]
-            self.metrics
-                .set_ha_config_version(&slave_instance, have_version as f64);
+            self.metrics.set_ha_config_version(&slave_instance, 0.0);
         }
 
         // Always enqueue the current push on connect; a slave that is already
@@ -922,13 +1093,13 @@ impl MasterCoordinator {
                 msg_opt = ws_stream.next() => {
                     match msg_opt {
                         Some(Ok(WsMessage::Text(txt))) => {
-                            if !self.process_slave_msg(&slave_instance, connection_id, &txt).await {
+                            if !self.process_slave_msg(&slave_instance, connection_id, &txt) {
                                 break;
                             }
                         }
                         Some(Ok(WsMessage::Binary(bin))) => {
                             if let Ok(txt) = std::str::from_utf8(&bin)
-                                && !self.process_slave_msg(&slave_instance, connection_id, txt).await {
+                                && !self.process_slave_msg(&slave_instance, connection_id, txt) {
                                     break;
                                 }
                         }
@@ -992,12 +1163,30 @@ impl MasterCoordinator {
         owned
     }
 
-    async fn process_slave_msg(
-        &self,
-        slave_instance: &str,
-        connection_id: u64,
-        text: &str,
-    ) -> bool {
+    /// Returns true when the master's currently active push has exactly this
+    /// term and version.
+    ///
+    /// Used to bind a structured fork rejection to a push the master actually
+    /// sent: an authenticated peer cannot invent a fork for an arbitrary
+    /// (possibly huge) version.
+    fn active_push_matches(&self, term: u64, version: u64) -> bool {
+        self.active_push
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|push| {
+                matches!(
+                    push,
+                    HaMessage::ConfigPush {
+                        version: pushed_version,
+                        term: pushed_term,
+                        ..
+                    } if *pushed_version == version && *pushed_term == term
+                )
+            })
+    }
+
+    fn process_slave_msg(&self, slave_instance: &str, connection_id: u64, text: &str) -> bool {
         let msg = match HaMessage::from_json(text) {
             Ok(m) => m,
             Err(e) => {
@@ -1009,7 +1198,9 @@ impl MasterCoordinator {
         match msg {
             HaMessage::Ack {
                 version,
+                term,
                 applied,
+                conflict,
                 error,
             } => {
                 // Ignore acknowledgements from a superseded connection: the
@@ -1025,10 +1216,116 @@ impl MasterCoordinator {
                 }
 
                 let current = self.get_current_version();
-                if applied && version == current {
+                let current_term = self.get_current_term();
+                if version > current.saturating_add(MAX_PEER_VERSION_LEAD) {
+                    // Never use an implausible peer-driven version as a seed,
+                    // a rebase input, or a persisted value. A single replica
+                    // must not be able to freeze publishing with `u64::MAX`.
+                    // This applies to `applied:false` ACKs too: a forged
+                    // rejection must not carry an unbounded version.
+                    error!(
+                        instance = %slave_instance,
+                        acked_version = version,
+                        current,
+                        max_lead = MAX_PEER_VERSION_LEAD,
+                        applied,
+                        "Ignoring ACK with an implausible version"
+                    );
+                    return true;
+                }
+
+                if term > current_term {
+                    // The replica knows a newer epoch: this master is stale.
+                    // Adopting the peer's counter would let a partitioned old
+                    // master overwrite newer configuration, so only surface the
+                    // divergence and require an explicit promotion.
+                    let reason = format!(
+                        "slave '{slave_instance}' acknowledged term {term} above the master's term {current_term}: this master is stale and must not overwrite the cluster"
+                    );
+                    error!(
+                        instance = %slave_instance,
+                        acked_version = version,
+                        acked_term = term,
+                        current,
+                        current_term,
+                        "{reason}"
+                    );
+                    self.mark_diverged(DivergenceKind::Term, slave_instance, version, term, reason);
+                    return true;
+                }
+
+                if !applied {
+                    if conflict == Some(AckConflict::SameVersionFork) {
+                        // Only a push the master actually sent can prove a
+                        // fork. Without this binding an authenticated replica
+                        // could latch a fabricated fork for any version and
+                        // (before publishing was decoupled) block the cluster.
+                        if !self.active_push_matches(term, version) {
+                            warn!(
+                                instance = %slave_instance,
+                                acked_version = version,
+                                acked_term = term,
+                                current,
+                                current_term,
+                                "Ignoring same-version fork ACK without a matching active push"
+                            );
+                            return true;
+                        }
+                        // Same term and version but different content: this is
+                        // the fork signal. Record it so the slave is reported
+                        // unsynced and can never silently "win" the fork; this
+                        // does not stop publishing to other replicas.
+                        let reason = format!(
+                            "slave '{slave_instance}' rejected term {term} version {version} with a same-version payload-hash fork: resolve the fork or promote the slave"
+                        );
+                        error!(
+                            instance = %slave_instance,
+                            acked_version = version,
+                            acked_term = term,
+                            current_term,
+                            "{reason}"
+                        );
+                        self.mark_diverged(
+                            DivergenceKind::Fork,
+                            slave_instance,
+                            version,
+                            term,
+                            reason,
+                        );
+                        if let Some(slave) = self.slaves.lock().unwrap().get_mut(slave_instance)
+                            && slave.connection_id == connection_id
+                        {
+                            slave.synced_version = 0;
+                        }
+                    }
+                    warn!(
+                        instance = %slave_instance,
+                        version,
+                        term,
+                        conflict = ?conflict,
+                        error = ?error,
+                        "Slave failed to apply configuration bundle"
+                    );
+                    return true;
+                }
+
+                if term < current_term {
+                    // Our epoch is newer; the replica is stale even if its
+                    // old-epoch version counter is higher. Re-push the active
+                    // bundle of the current term so it adopts the promotion.
+                    warn!(
+                        instance = %slave_instance,
+                        acked_version = version,
+                        acked_term = term,
+                        current_term,
+                        "Slave acknowledged an older term; re-pushing the current-term active bundle"
+                    );
+                    self.maybe_repush(slave_instance, version);
+                } else if version == current {
                     info!(
                         instance = %slave_instance,
                         version,
+                        term,
                         "Slave successfully applied configuration bundle"
                     );
                     let mut slaves = self.slaves.lock().unwrap();
@@ -1046,10 +1343,11 @@ impl MasterCoordinator {
                     self.metrics
                         .set_ha_config_version(slave_instance, version as f64);
                     self.stale_repushes.lock().unwrap().remove(slave_instance);
-                    // Applying a version above the last divergence restores
-                    // continuity.
-                    self.clear_divergence_above(version);
-                } else if applied && version < current {
+                    // This slave has accepted the current term/version, so a
+                    // real fork record for it is now resolved. Advisory
+                    // ahead/newer-term records stay sticky until resync.
+                    self.clear_divergence_for(slave_instance);
+                } else if version < current {
                     warn!(
                         instance = %slave_instance,
                         acked_version = version,
@@ -1057,48 +1355,27 @@ impl MasterCoordinator {
                         "Slave acknowledged a stale configuration version; re-pushing the active bundle"
                     );
                     self.maybe_repush(slave_instance, version);
-                } else if applied {
-                    // A slave ahead of the master means version continuity is
-                    // broken (promoted slave, restored from an older state
-                    // file, or forked master). Every push below its version is
-                    // silently ignored, so surface it loudly and recover by
-                    // republishing above the reported version.
+                } else {
+                    // Same term but a version above the master's means version
+                    // continuity is broken (promoted slave, restored from an
+                    // older state file, or forked master). Do not auto-rebase:
+                    // that would let this stale master overwrite newer slaves.
                     let reason = format!(
-                        "slave '{slave_instance}' acknowledged version {version} above the master's current version {current}: version continuity is broken (promoted slave or lost/corrupt ha_state.toml)"
+                        "slave '{slave_instance}' acknowledged version {version} above the master's current version {current} in term {current_term}: version continuity is broken (promoted slave or lost/corrupt ha_state.toml); explicit promotion is required"
                     );
                     error!(
                         instance = %slave_instance,
                         acked_version = version,
                         current,
+                        current_term,
                         "{reason}"
                     );
-                    self.mark_diverged(slave_instance, version, reason);
-                    let active_bundle = self.active_bundle.lock().unwrap().clone();
-                    if let Some(bundle) = active_bundle
-                        && bundle.version <= version
-                    {
-                        let next_version = version.saturating_add(1);
-                        let mut rebased = bundle;
-                        rebased.version = next_version;
-                        warn!(
-                            instance = %slave_instance,
-                            version = next_version,
-                            "Republishing the active bundle above the divergent version"
-                        );
-                        if let Err(e) = self.update_bundle_async(rebased).await {
-                            error!(
-                                instance = %slave_instance,
-                                version = next_version,
-                                "Failed to republish above the divergent version: {e}"
-                            );
-                        }
-                    }
-                } else {
-                    warn!(
-                        instance = %slave_instance,
+                    self.mark_diverged(
+                        DivergenceKind::Ahead,
+                        slave_instance,
                         version,
-                        error = ?error,
-                        "Slave failed to apply configuration bundle"
+                        current_term,
+                        reason,
                     );
                 }
             }
@@ -1179,6 +1456,7 @@ pub fn spawn_master_server(
             // The startup no-op metric is recorded by the production call site
             // (`init_ha`); incrementing it here would double count when both
             // paths run, and this function is not called for port 0 there.
+            coordinator.mark_replication_disabled();
             info!("Master HA replication is disabled (replication_port is 0)");
             return;
         }
@@ -1198,12 +1476,17 @@ pub fn spawn_master_server(
                     coordinator
                         .metrics
                         .inc_ha_startup_noop("master", "tls_init_failed");
+                    coordinator
+                        .mark_replication_failed(format!("master mTLS initialization failed: {e}"));
                     error!("Failed to initialize mTLS for master HA replication server: {e}");
                     return;
                 }
             }
         } else {
             if !ha_config.allow_insecure_ws {
+                coordinator.mark_replication_failed(
+                    "master replication refused to serve plaintext without allow_insecure_ws",
+                );
                 error!(
                     "Master HA replication requires TLS (cert and key configured) unless allow_insecure_ws is true. Refusing to serve plaintext replication."
                 );
@@ -1219,11 +1502,15 @@ pub fn spawn_master_server(
                 coordinator
                     .metrics
                     .inc_ha_startup_noop("master", "bind_failed");
+                coordinator.mark_replication_failed(format!(
+                    "Failed to bind master replication listener on '{listen_addr}': {e}"
+                ));
                 error!("Failed to bind master HA replication listener on '{listen_addr}': {e}");
                 return;
             }
         };
 
+        coordinator.mark_replication_ready();
         info!(addr = %listen_addr, "Master HA replication listener active");
 
         let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_SLAVE_CONNECTIONS));
@@ -1320,6 +1607,7 @@ mod tests {
     fn test_bundle(version: u64) -> ConfigBundle {
         ConfigBundle {
             version,
+            term: 0,
             timestamp: 1,
             config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec![],
@@ -1442,6 +1730,47 @@ mod tests {
             "corrupt state must be moved aside instead of deleted"
         );
         assert_eq!(third.update_bundle(test_bundle(1)).unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_restore_preserves_term_and_legacy_state_defaults_to_zero() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_term_state_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("ha_state.toml");
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+
+        let mut promoted = test_bundle(5);
+        promoted.term = 2;
+        std::fs::write(&state_path, serde_json::to_vec(&promoted).unwrap()).unwrap();
+        let restored = MasterCoordinator::new(
+            "test-master".to_string(),
+            0,
+            key.clone(),
+            sito_stats::MetricsRegistry::new("test", "test"),
+        )
+        .with_state_path(state_path.clone());
+        assert_eq!(restored.restore_state().unwrap(), Some(5));
+        assert_eq!(restored.get_current_term(), 2);
+
+        // State written before terms existed has no `term` field and must load
+        // as epoch 0.
+        let legacy = r#"{"version":6,"timestamp":1,"config_toml":"config_version = 1\n[server]\nrole = \"slave\"\n","custom_rules":[],"lists":[]}"#;
+        std::fs::write(&state_path, legacy).unwrap();
+        let legacy_restored = MasterCoordinator::new(
+            "test-master".to_string(),
+            0,
+            key,
+            sito_stats::MetricsRegistry::new("test", "test"),
+        )
+        .with_state_path(state_path.clone());
+        assert_eq!(legacy_restored.restore_state().unwrap(), Some(6));
+        assert_eq!(legacy_restored.get_current_term(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1809,6 +2138,7 @@ mod tests {
     #[tokio::test]
     async fn test_master_tls_init_failure_records_startup_noop() {
         let coordinator = test_coordinator();
+        let observer = coordinator.clone();
         let metrics = coordinator.metrics.clone();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = spawn_master_server(
@@ -1831,6 +2161,105 @@ mod tests {
                 r#"sito_ha_startup_noop_total{role="master",reason="tls_init_failed"} 1"#
             ),
             "a TLS init failure must be observable: {rendered}"
+        );
+
+        // The operator-facing readiness signal must carry the same failure:
+        // DNS health alone used to hide a master that never started replication.
+        let readiness = observer.readiness();
+        assert!(!readiness.ready, "TLS failure must leave HA not ready");
+        let reason = readiness.reason.unwrap_or_default();
+        assert!(
+            reason.contains("mTLS"),
+            "readiness must name the TLS failure: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_master_listener_bind_marks_readiness_ready() {
+        let coordinator = test_coordinator();
+        let observer = coordinator.clone();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_master_server(
+            HaConfig {
+                replication_port: port,
+                listen_addr: "127.0.0.1".to_string(),
+                allow_insecure_ws: true,
+                slave_token: Some("tok".to_string()),
+                ..Default::default()
+            },
+            coordinator,
+            shutdown_rx,
+        );
+
+        let mut readiness = observer.readiness();
+        for _ in 0..50 {
+            if readiness.ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            readiness = observer.readiness();
+        }
+        assert!(
+            readiness.ready,
+            "a bound replication listener must be reported ready: {readiness:?}"
+        );
+        assert!(readiness.reason.is_none());
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_master_bind_failure_marks_readiness_failed() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        let coordinator = test_coordinator();
+        let observer = coordinator.clone();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_master_server(
+            HaConfig {
+                replication_port: port,
+                listen_addr: "127.0.0.1".to_string(),
+                allow_insecure_ws: true,
+                slave_token: Some("tok".to_string()),
+                ..Default::default()
+            },
+            coordinator,
+            shutdown_rx,
+        );
+        handle.await.unwrap();
+
+        let readiness = observer.readiness();
+        assert!(!readiness.ready, "a bind failure must leave HA not ready");
+        assert!(
+            readiness
+                .reason
+                .unwrap_or_default()
+                .contains("Failed to bind"),
+            "readiness must name the bind failure"
+        );
+        drop(probe);
+    }
+
+    #[tokio::test]
+    async fn test_master_replication_disabled_is_ready_and_explained() {
+        let coordinator = test_coordinator();
+        coordinator.mark_replication_disabled();
+        let readiness = coordinator.readiness();
+        assert!(
+            readiness.ready,
+            "an explicitly disabled replication listener is not a failure"
+        );
+        assert!(
+            readiness
+                .reason
+                .unwrap_or_default()
+                .contains("replication_port"),
+            "the disabled state must be explained"
         );
     }
 
@@ -1939,12 +2368,14 @@ mod tests {
         // A stale ACK records one catch-up attempt for the session.
         let ack = HaMessage::Ack {
             version: 1,
+            term: 0,
+            conflict: None,
             applied: true,
             error: None,
         }
         .to_json()
         .unwrap();
-        assert!(coordinator.process_slave_msg("slave-1", 7, &ack).await);
+        assert!(coordinator.process_slave_msg("slave-1", 7, &ack));
         assert_eq!(
             coordinator.stale_repushes.lock().unwrap().get("slave-1"),
             Some(&1),
@@ -1993,7 +2424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ahead_slave_seeds_version_and_receives_republished_bundle() {
+    async fn test_ahead_slave_same_term_does_not_seed_or_rebase() {
         use tokio_tungstenite::tungstenite::protocol::Role;
         use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
@@ -2025,6 +2456,7 @@ mod tests {
         let hello = HaMessage::Hello {
             instance: "promoted-slave".to_string(),
             have_version: 10,
+            have_term: 0,
             capabilities: vec![],
             token: None,
             role: Some("slave".to_string()),
@@ -2035,26 +2467,47 @@ mod tests {
             .await
             .unwrap();
 
-        // The master seeds from Hello and republishes the active bundle above
-        // v10 so the slave actually applies it.
-        let pushed = tokio::time::timeout(Duration::from_secs(5), client_ws.next())
-            .await
-            .expect("timed out waiting for the catch-up push")
-            .expect("connection closed")
-            .expect("websocket error");
-        let push_version = match HaMessage::from_json(&pushed.into_text().unwrap()).unwrap() {
-            HaMessage::ConfigPush { version, .. } => version,
+        // A slave ahead in the *same* term is divergence evidence, not
+        // authority. The master must not adopt its version or re-publish its
+        // own bundle above it.
+        let pushed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match client_ws.next().await {
+                    Some(Ok(WsMessage::Text(txt))) => {
+                        if let Ok(msg @ HaMessage::ConfigPush { .. }) = HaMessage::from_json(&txt) {
+                            break msg;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    _ => panic!("connection closed before a ConfigPush"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the current push");
+        let (push_version, push_term) = match pushed {
+            HaMessage::ConfigPush { version, term, .. } => (version, term),
             other => panic!("expected ConfigPush, got {other:?}"),
         };
+        assert_eq!(push_version, 2, "the master must keep its own version");
+        assert_eq!(push_term, 0, "the master must keep its own term");
+        assert_eq!(coordinator.get_current_version(), 2);
+        assert_eq!(coordinator.get_current_term(), 0);
         assert!(
-            push_version >= 11,
-            "a slave at v10 must be pushed a version above 10, got {push_version}"
+            coordinator.is_diverged(),
+            "a same-term version gap must be surfaced as divergence"
         );
-        assert!(coordinator.get_current_version() >= 11);
+        let reason = coordinator.diverged_reason().unwrap();
+        assert!(
+            reason.contains("continuity") && reason.contains("explicit promotion"),
+            "reason: {reason}"
+        );
 
-        // Acking the new version restores continuity.
+        // No automatic rebase on the ahead ACK either.
         let ack = HaMessage::Ack {
-            version: push_version,
+            version: 10,
+            term: 0,
+            conflict: None,
             applied: true,
             error: None,
         };
@@ -2062,27 +2515,32 @@ mod tests {
             .send(WsMessage::Text(ack.to_json().unwrap().into()))
             .await
             .unwrap();
-        let synced = tokio::time::timeout(Duration::from_secs(5), async {
+        let extra = tokio::time::timeout(Duration::from_millis(300), async {
             loop {
-                if coordinator
-                    .list_slaves()
-                    .first()
-                    .is_some_and(|s| s.synced_version == push_version)
-                {
-                    break;
+                match client_ws.next().await {
+                    Some(Ok(WsMessage::Text(txt))) => {
+                        if matches!(HaMessage::from_json(&txt), Ok(HaMessage::ConfigPush { .. })) {
+                            break true;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    _ => break false,
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await;
-        assert!(synced.is_ok(), "slave must be reported synced after ACK");
-        assert!(!coordinator.is_diverged());
+        assert!(
+            !matches!(extra, Ok(true)),
+            "an ahead ACK must not trigger an automatic rebase push"
+        );
+        assert_eq!(coordinator.get_current_version(), 2);
+        assert_eq!(coordinator.get_current_term(), 0);
 
         session.abort();
     }
 
     #[tokio::test]
-    async fn test_slave_ahead_ack_marks_diverged_and_republishes() {
+    async fn test_slave_ahead_ack_marks_diverged_without_republishing() {
         let coordinator = test_coordinator();
         coordinator.update_bundle(test_bundle(2)).unwrap();
 
@@ -2103,15 +2561,18 @@ mod tests {
         );
 
         // A slave acknowledging a version above the master's is a continuity
-        // error, not something to ignore.
+        // error, not something to auto-repair: doing so would publish this
+        // master's possibly-stale bundle over newer configuration.
         let ack = HaMessage::Ack {
             version: 50,
+            term: 0,
+            conflict: None,
             applied: true,
             error: None,
         }
         .to_json()
         .unwrap();
-        assert!(coordinator.process_slave_msg("slave-1", 1, &ack).await);
+        assert!(coordinator.process_slave_msg("slave-1", 1, &ack));
         assert!(coordinator.is_diverged(), "divergence must be surfaced");
         let rendered = coordinator.metrics.render_prometheus();
         assert!(
@@ -2119,32 +2580,512 @@ mod tests {
             "the per-slave divergence gauge must be raised: {rendered}"
         );
         let reason = coordinator.diverged_reason().unwrap();
-        assert!(reason.contains("continuity"), "reason: {reason}");
-        let remediated = coordinator.get_current_version();
         assert!(
-            remediated > 50,
-            "the master must republish above the divergent version, got {remediated}"
+            reason.contains("continuity") && reason.contains("explicit promotion"),
+            "reason: {reason}"
+        );
+        assert_eq!(
+            coordinator.get_current_version(),
+            2,
+            "the master must not rebase to the divergent version"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no recovery push may be queued automatically"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_same_version_fork_ack_marks_divergence_and_unsyncs_slave() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx, _rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "forked-slave".to_string(),
+            ActiveSlave {
+                instance: "forked-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 2,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
         );
 
-        // The recovery push is queued for the divergent slave.
-        let push = rx.try_recv().expect("catch-up push must be queued");
-        assert!(matches!(push, HaMessage::ConfigPush { version, .. } if version == remediated));
-
-        // Applying a version above the divergent one clears the flag.
         let ack = HaMessage::Ack {
-            version: remediated,
+            version: 2,
+            term: 0,
+            applied: false,
+            conflict: Some(AckConflict::SameVersionFork),
+            error: Some("same-version payload fork".to_string()),
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("forked-slave", 1, &ack));
+        assert!(
+            coordinator.is_diverged(),
+            "a fork ACK must latch divergence"
+        );
+        let reason = coordinator.diverged_reason().unwrap();
+        assert!(reason.contains("fork"), "reason: {reason}");
+        assert_eq!(
+            coordinator.slaves.lock().unwrap()["forked-slave"].synced_version,
+            0,
+            "a rejected fork push must not leave the slave reported as synced"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_term_divergence_survives_another_slave_version_advance() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx_a, _rx_a) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "newer-term-slave".to_string(),
+            ActiveSlave {
+                instance: "newer-term-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx_a,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+        let (tx_b, _rx_b) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "synced-slave".to_string(),
+            ActiveSlave {
+                instance: "synced-slave".to_string(),
+                remote_addr: "127.0.0.1:1001".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx_b,
+                capabilities: vec![],
+                connection_id: 2,
+            },
+        );
+
+        // Slave A knows a newer term: sticky term divergence.
+        let newer_term = HaMessage::Ack {
+            version: 3,
+            term: 1,
+            applied: true,
+            conflict: None,
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("newer-term-slave", 1, &newer_term));
+        assert!(coordinator.is_diverged());
+        assert!(coordinator.diverged_reason().unwrap().contains("term"));
+
+        // Slave B applying the master's current version must not clear the
+        // unrelated term divergence.
+        let synced = HaMessage::Ack {
+            version: 2,
+            term: 0,
+            applied: true,
+            conflict: None,
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("synced-slave", 2, &synced));
+        assert!(
+            coordinator.is_diverged(),
+            "a different slave's success must not clear a term divergence"
+        );
+        assert!(coordinator.diverged_reason().unwrap().contains("term"));
+        let summaries = coordinator.list_slaves();
+        let newer = summaries
+            .iter()
+            .find(|s| s.instance == "newer-term-slave")
+            .unwrap();
+        assert!(
+            newer.diverged,
+            "latched divergence must be visible in the API summary"
+        );
+        let rendered = coordinator.metrics.render_prometheus();
+        assert!(
+            rendered.contains(r#"sito_ha_diverged{instance="newer-term-slave"} 1"#),
+            "the sticky gauge must stay raised: {rendered}"
+        );
+
+        // Only an explicit resync clears it.
+        coordinator.trigger_resync();
+        assert!(!coordinator.is_diverged());
+        assert!(
+            coordinator
+                .metrics
+                .render_prometheus()
+                .contains(r#"sito_ha_diverged{instance="newer-term-slave"} 0"#),
+            "resync must zero the divergence gauge"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fork_divergence_does_not_block_publishing_and_clears_on_accept() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx, _rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "forked-slave".to_string(),
+            ActiveSlave {
+                instance: "forked-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+        let (other_tx, mut other_rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "other-slave".to_string(),
+            ActiveSlave {
+                instance: "other-slave".to_string(),
+                remote_addr: "127.0.0.1:1001".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: other_tx,
+                capabilities: vec![],
+                connection_id: 2,
+            },
+        );
+
+        let fork = HaMessage::Ack {
+            version: 2,
+            term: 0,
+            applied: false,
+            conflict: Some(AckConflict::SameVersionFork),
+            error: Some("same-version payload fork".to_string()),
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("forked-slave", 1, &fork));
+        assert!(coordinator.diverged_reason().unwrap().contains("fork"));
+
+        // One forked replica must not stop the master's sequence or the push
+        // to healthy replicas.
+        assert_eq!(coordinator.update_bundle(test_bundle(3)).unwrap(), 3);
+        match other_rx.try_recv().expect("healthy slave must receive v3") {
+            HaMessage::ConfigPush { version, term, .. } => {
+                assert_eq!(version, 3);
+                assert_eq!(term, 0);
+            }
+            other => panic!("expected ConfigPush, got {other:?}"),
+        }
+        assert!(coordinator.is_diverged(), "the fork stays visible");
+        let forked = coordinator
+            .list_slaves()
+            .into_iter()
+            .find(|s| s.instance == "forked-slave")
+            .unwrap();
+        assert!(forked.diverged, "the forked slave must stay unsynced");
+
+        // A resync does not fabricate recovery: it re-pushes the current
+        // bundle and keeps the real fork latch until the slave accepts it.
+        let outcome = coordinator.trigger_resync();
+        assert!(outcome.active_bundle);
+        assert!(
+            coordinator.is_diverged(),
+            "a resync must not clear a real fork latch"
+        );
+
+        // Once the slave accepts the current bundle (after promotion or local
+        // reconciliation), its own latch clears.
+        let accepted = HaMessage::Ack {
+            version: 3,
+            term: 0,
+            applied: true,
+            conflict: None,
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("forked-slave", 1, &accepted));
+        assert!(!coordinator.is_diverged());
+    }
+
+    #[tokio::test]
+    async fn test_fabricated_fork_ack_without_matching_push_is_ignored() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx, _rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "liar-slave".to_string(),
+            ActiveSlave {
+                instance: "liar-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+
+        // No push was ever sent at version 999, so this cannot prove a fork.
+        let fabricated = HaMessage::Ack {
+            version: 999,
+            term: 0,
+            applied: false,
+            conflict: Some(AckConflict::SameVersionFork),
+            error: Some("fabricated".to_string()),
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("liar-slave", 1, &fabricated));
+        assert!(
+            !coordinator.is_diverged(),
+            "a fork ACK must be bound to a push the master sent"
+        );
+
+        // Even `u64::MAX` in an applied:false ACK is rejected before it can
+        // influence state, and publishing continues.
+        let huge = HaMessage::Ack {
+            version: u64::MAX,
+            term: 0,
+            applied: false,
+            conflict: Some(AckConflict::SameVersionFork),
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("liar-slave", 1, &huge));
+        assert!(!coordinator.is_diverged());
+        assert_eq!(coordinator.update_bundle(test_bundle(3)).unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_same_term_ahead_divergence_is_sticky_until_resync() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx, _rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "ahead-slave".to_string(),
+            ActiveSlave {
+                instance: "ahead-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+
+        let ahead = HaMessage::Ack {
+            version: 50,
+            term: 0,
+            applied: true,
+            conflict: None,
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("ahead-slave", 1, &ahead));
+        assert!(coordinator.is_diverged());
+
+        // An ACK for the master's own version does not auto-clear the latch.
+        let current = HaMessage::Ack {
+            version: 2,
+            term: 0,
+            applied: true,
+            conflict: None,
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("ahead-slave", 1, &current));
+        assert!(
+            coordinator.is_diverged(),
+            "same-term divergence must stay latched until explicit resync"
+        );
+
+        coordinator.trigger_resync();
+        assert!(!coordinator.is_diverged());
+    }
+
+    #[tokio::test]
+    async fn test_ack_from_newer_term_marks_master_stale() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+        coordinator.current_term.store(1, Ordering::SeqCst);
+
+        let (tx, mut rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "newer-slave".to_string(),
+            ActiveSlave {
+                instance: "newer-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 3,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+
+        let ack = HaMessage::Ack {
+            version: 3,
+            term: 2,
+            conflict: None,
             applied: true,
             error: None,
         }
         .to_json()
         .unwrap();
-        assert!(coordinator.process_slave_msg("slave-1", 1, &ack).await);
-        assert!(!coordinator.is_diverged());
-        let rendered = coordinator.metrics.render_prometheus();
-        assert!(
-            rendered.contains(r#"sito_ha_diverged{instance="slave-1"} 0"#),
-            "recovering continuity must zero the gauge: {rendered}"
+        assert!(coordinator.process_slave_msg("newer-slave", 1, &ack));
+        assert!(coordinator.is_diverged());
+        let reason = coordinator.diverged_reason().unwrap();
+        assert!(reason.contains("term"), "reason: {reason}");
+        assert_eq!(
+            coordinator.get_current_version(),
+            2,
+            "a stale master must not adopt a newer term's version"
         );
+        assert_eq!(
+            coordinator.get_current_term(),
+            1,
+            "the master must not raise its term from peer input"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a stale master must not republish over a newer epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hello_from_newer_term_rejects_stale_master() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (server_socket, client_socket) = tokio::io::duplex(64 * 1024);
+        let server_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            server_socket,
+            Role::Server,
+            Some(WebSocketConfig::default()),
+        )
+        .await;
+        let mut client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            client_socket,
+            Role::Client,
+            Some(WebSocketConfig::default()),
+        )
+        .await;
+
+        let coord = coordinator.clone();
+        let session = tokio::spawn(async move {
+            coord
+                .handle_connection(server_ws, "127.0.0.1:1000".parse().unwrap())
+                .await;
+        });
+
+        let hello = HaMessage::Hello {
+            instance: "newer-slave".to_string(),
+            have_version: 3,
+            have_term: 1,
+            capabilities: vec![],
+            token: None,
+            role: Some("slave".to_string()),
+            protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        };
+        client_ws
+            .send(WsMessage::Text(hello.to_json().unwrap().into()))
+            .await
+            .unwrap();
+
+        // The stale master registers the replica and sends its own bundle; the
+        // replica rejects it on term, and the master surfaces the divergence.
+        let pushed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match client_ws.next().await {
+                    Some(Ok(WsMessage::Text(txt))) => {
+                        if let Ok(msg @ HaMessage::ConfigPush { .. }) = HaMessage::from_json(&txt) {
+                            break msg;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    _ => panic!("connection closed before a ConfigPush"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the master push");
+        match pushed {
+            HaMessage::ConfigPush { version, term, .. } => {
+                assert_eq!(version, 2, "the stale master must not rebase its version");
+                assert_eq!(term, 0, "the stale master must not adopt the newer term");
+            }
+            other => panic!("expected a ConfigPush, got {other:?}"),
+        }
+        assert_eq!(coordinator.get_current_version(), 2);
+        assert_eq!(coordinator.get_current_term(), 0);
+        assert!(
+            coordinator.is_diverged(),
+            "the newer-term replica must surface the divergence"
+        );
+        let reason = coordinator.diverged_reason().unwrap();
+        assert!(reason.contains("term"), "reason: {reason}");
+
+        session.abort();
+    }
+
+    #[test]
+    fn test_promoted_master_keeps_version_continuity_in_new_term() {
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        let coordinator = MasterCoordinator::new(
+            "promoted-master".to_string(),
+            10,
+            key,
+            sito_stats::MetricsRegistry::new("test", "test"),
+        )
+        .with_term(1);
+
+        // The explicit promotion continues above the previous sequence.
+        let mut promoted = test_bundle(11);
+        promoted.term = 1;
+        assert_eq!(coordinator.update_bundle(promoted).unwrap(), 11);
+        assert_eq!(coordinator.get_current_term(), 1);
+
+        // A stale term-0 coordinator cannot publish a higher version into the
+        // promoted cluster.
+        let mut stale = test_bundle(12);
+        stale.term = 0;
+        let err = coordinator
+            .update_bundle(stale)
+            .expect_err("a stale term must not publish over the promoted epoch");
+        assert!(matches!(err, HaError::Validation { ref field, .. } if field == "term"));
+        assert_eq!(coordinator.get_current_version(), 11);
+        assert_eq!(coordinator.get_current_term(), 1);
     }
 
     #[test]
@@ -2165,7 +3106,13 @@ mod tests {
                 connection_id: 1,
             },
         );
-        coordinator.mark_diverged("slave-1", 50, "continuity broken".to_string());
+        coordinator.mark_diverged(
+            DivergenceKind::Term,
+            "slave-1",
+            50,
+            0,
+            "continuity broken".to_string(),
+        );
         assert!(
             coordinator
                 .metrics
@@ -2206,7 +3153,13 @@ mod tests {
                 connection_id: 1,
             },
         );
-        coordinator.mark_diverged("slave-a", 50, "a is ahead".to_string());
+        coordinator.mark_diverged(
+            DivergenceKind::Ahead,
+            "slave-a",
+            50,
+            0,
+            "a is ahead".to_string(),
+        );
         assert!(coordinator.unregister_session("slave-a", 1));
 
         // A more severe divergence on a different, connected instance.
@@ -2225,7 +3178,13 @@ mod tests {
                 connection_id: 2,
             },
         );
-        coordinator.mark_diverged("slave-b", 60, "b is ahead".to_string());
+        coordinator.mark_diverged(
+            DivergenceKind::Ahead,
+            "slave-b",
+            60,
+            0,
+            "b is ahead".to_string(),
+        );
 
         let rendered = coordinator.metrics.render_prometheus();
         assert!(
@@ -2252,17 +3211,23 @@ mod tests {
             capabilities: vec![],
             connection_id: 1,
         };
-        let diverged = entry.to_summary(5);
+        let diverged = entry.to_summary(5, false);
         assert!(diverged.diverged);
         assert_eq!(diverged.lag, 0, "diverged lag must not look in sync");
 
-        let synced = entry.to_summary(9);
+        let synced = entry.to_summary(9, false);
         assert!(!synced.diverged);
         assert_eq!(synced.lag, 0);
 
-        let behind = entry.to_summary(12);
+        let behind = entry.to_summary(12, false);
         assert!(!behind.diverged);
         assert_eq!(behind.lag, 3);
+
+        // A latched divergence (fork/term/ahead) must be visible even when the
+        // version counter alone would look in sync.
+        let latched = entry.to_summary(9, true);
+        assert!(latched.diverged);
+        assert_eq!(latched.lag, 0);
     }
 
     #[tokio::test]
@@ -2292,6 +3257,7 @@ mod tests {
         let hello = HaMessage::Hello {
             instance: "x".repeat(2 * 1024 * 1024),
             have_version: 0,
+            have_term: 0,
             capabilities: vec![],
             token: Some("tok".to_string()),
             role: Some("slave".to_string()),
@@ -2321,5 +3287,164 @@ mod tests {
         );
 
         let _ = shutdown_tx.send(true);
+    }
+
+    #[test]
+    fn test_update_bundle_rejects_u64_max_version() {
+        let coordinator = test_coordinator();
+        let err = coordinator
+            .update_bundle(test_bundle(u64::MAX))
+            .expect_err("u64::MAX must never be persisted as the active version");
+        assert!(
+            matches!(err, HaError::Validation { ref field, .. } if field == "version"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            coordinator.get_current_version(),
+            1,
+            "a rejected publish must not advance the sequence"
+        );
+        assert!(
+            coordinator.active_bundle.lock().unwrap().is_none(),
+            "a rejected publish must not store an active bundle"
+        );
+    }
+
+    #[test]
+    fn test_restore_rejects_u64_max_state_instead_of_freezing() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_max_state_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("ha_state.toml");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&test_bundle(u64::MAX)).unwrap(),
+        )
+        .unwrap();
+
+        let coordinator = test_coordinator().with_state_path(state_path);
+        let err = coordinator
+            .restore_state()
+            .expect_err("a persisted u64::MAX sequence must fail closed");
+        assert!(matches!(err, HaError::Validation { ref field, .. } if field == "version"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_hello_u64_max_does_not_seed_or_register() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (server_socket, client_socket) = tokio::io::duplex(64 * 1024);
+        let server_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            server_socket,
+            Role::Server,
+            Some(WebSocketConfig::default()),
+        )
+        .await;
+        let mut client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            client_socket,
+            Role::Client,
+            Some(WebSocketConfig::default()),
+        )
+        .await;
+
+        let coord = coordinator.clone();
+        let session = tokio::spawn(async move {
+            coord
+                .handle_connection(server_ws, "127.0.0.1:1000".parse().unwrap())
+                .await;
+        });
+
+        let hello = HaMessage::Hello {
+            instance: "hostile-slave".to_string(),
+            have_version: u64::MAX,
+            have_term: 0,
+            capabilities: vec![],
+            token: None,
+            role: Some("slave".to_string()),
+            protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        };
+        client_ws
+            .send(WsMessage::Text(hello.to_json().unwrap().into()))
+            .await
+            .unwrap();
+
+        // The master closes the session without pushing or adopting the value.
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match client_ws.next().await {
+                    Some(Ok(WsMessage::Close(_)) | Err(_)) | None => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "an implausible Hello must close the session"
+        );
+        session.await.unwrap();
+        assert_eq!(
+            coordinator.get_current_version(),
+            2,
+            "u64::MAX must never seed the master sequence"
+        );
+        assert_eq!(coordinator.connected_slave_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ack_u64_max_does_not_freeze_publishing() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "hostile-slave".to_string(),
+            ActiveSlave {
+                instance: "hostile-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 2,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+
+        let ack = HaMessage::Ack {
+            version: u64::MAX,
+            term: 0,
+            conflict: None,
+            applied: true,
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("hostile-slave", 1, &ack));
+
+        assert_eq!(
+            coordinator.get_current_version(),
+            2,
+            "an implausible ACK must not change the master sequence"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an implausible ACK must not trigger a rebase push"
+        );
+        assert_eq!(
+            coordinator.update_bundle(test_bundle(3)).unwrap(),
+            3,
+            "publishing must keep working after an implausible ACK"
+        );
     }
 }

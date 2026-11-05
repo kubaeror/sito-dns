@@ -38,6 +38,43 @@ const MAX_DNSKEYS: usize = 64;
 const MAX_DS_RECORDS: usize = 64;
 /// Maximum number of RRSIG records evaluated from a single response.
 const MAX_RRSIGS: usize = 128;
+/// Hard upper bound on cryptographic RRSIG verification attempts for one
+/// client response. Upstream data is untrusted: without this bound a crafted
+/// message with 64 DNSKEYs and 128 RRSIGs could force thousands of RSA/ECDSA
+/// verifications per query.
+const MAX_VERIFICATIONS_PER_RESPONSE: u32 = 256;
+/// Maximum candidate keys tried for a single RRSIG. Trusted/validated keys are
+/// tried first, so this only drops unvalidated response keys.
+const MAX_CANDIDATE_KEYS_PER_RRSIG: usize = 8;
+
+/// Per-response budget for cryptographic RRSIG verification attempts.
+///
+/// Every `verify_rrsig` call in the response-validation path must consume one
+/// unit first. A crafted authoritative response cannot make the resolver
+/// perform more than `MAX_VERIFICATIONS_PER_RESPONSE` signature checks.
+#[derive(Debug)]
+struct VerifyBudget {
+    remaining: u32,
+}
+
+impl VerifyBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_VERIFICATIONS_PER_RESPONSE,
+        }
+    }
+
+    /// Consumes one verification slot, returning false when the budget is
+    /// exhausted. Callers must fail closed (stop verifying) on false.
+    fn try_consume(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
 /// Hard bound on the validated-key cache; DNSKEYs are re-discoverable.
 const KEY_CACHE_MAX_ENTRIES: usize = 4096;
 /// Hard bound on the known-signed-zone cache; zones are re-discoverable.
@@ -134,11 +171,19 @@ fn apply_authenticated_ttls(response: &mut Message, now: u32) {
         .answers
         .iter()
         .chain(response.authorities.iter())
+        .chain(response.additionals.iter())
         .filter_map(|record| match &record.data {
             RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some((
                 LowerName::from(&record.name),
                 rrsig.input().type_covered,
                 rrsig.clone(),
+            )),
+            // Legacy SIG is accepted by the validator too; treat it as the
+            // equivalent RRSIG for TTL accounting.
+            RData::DNSSEC(DNSSECRData::SIG(sig)) => Some((
+                LowerName::from(&record.name),
+                sig.input().type_covered,
+                RRSIG::from_sig(sig.input().clone(), sig.sig().to_vec()),
             )),
             _ => None,
         })
@@ -146,12 +191,24 @@ fn apply_authenticated_ttls(response: &mut Message, now: u32) {
     if signatures.is_empty() {
         return;
     }
-    for section in [&mut response.answers, &mut response.authorities] {
+    for section in [
+        &mut response.answers,
+        &mut response.authorities,
+        &mut response.additionals,
+    ] {
         for record in section.iter_mut() {
-            // RFC 4035 §5.3.3 also caps the RRSIG RR's own TTL.
-            if let RData::DNSSEC(DNSSECRData::RRSIG(own)) = &record.data {
-                record.ttl = record.ttl.min(own.authenticated_ttl(record, now));
-                continue;
+            // RFC 4035 §5.3.3 also caps the signature RR's own TTL.
+            match &record.data {
+                RData::DNSSEC(DNSSECRData::RRSIG(own)) => {
+                    record.ttl = record.ttl.min(own.authenticated_ttl(record, now));
+                    continue;
+                }
+                RData::DNSSEC(DNSSECRData::SIG(sig)) => {
+                    let own = RRSIG::from_sig(sig.input().clone(), sig.sig().to_vec());
+                    record.ttl = record.ttl.min(own.authenticated_ttl(record, now));
+                    continue;
+                }
+                _ => {}
             }
             let owner = LowerName::from(&record.name);
             let covered = record.record_type();
@@ -163,6 +220,62 @@ fn apply_authenticated_ttls(response: &mut Message, now: u32) {
             }
         }
     }
+
+    // A negative answer is authenticated by its NSEC/NSEC3 denial proof, not
+    // by the SOA. A zone can sign the SOA with a longer TTL/expiry than the
+    // proof, so cap the SOA-derived negative TTL here, while the DNSSEC
+    // records are still present. The pipeline strips them for DO=0 clients
+    // before caching, and the cache must not use the stripped records to
+    // decide how long a Secure negative may live.
+    let Some(query) = response.queries.first() else {
+        return;
+    };
+    let qname = query.name().clone();
+    let qtype = query.query_type();
+    if !is_negative_response(response, &qname, qtype) {
+        return;
+    }
+    let Some(denial_ttl) = authenticated_denial_ttl(response) else {
+        return;
+    };
+    for section in [&mut response.answers, &mut response.authorities] {
+        for record in section.iter_mut() {
+            if matches!(record.data, RData::SOA(_)) {
+                record.ttl = record.ttl.min(denial_ttl);
+            }
+        }
+    }
+}
+
+/// Minimum authenticated TTL of the NSEC/NSEC3 denial records and the RRSIGs
+/// covering them. Returns `None` when the response carries no denial proof.
+fn authenticated_denial_ttl(response: &Message) -> Option<u32> {
+    response
+        .answers
+        .iter()
+        .chain(response.authorities.iter())
+        .chain(response.additionals.iter())
+        .filter_map(|record| match &record.data {
+            RData::DNSSEC(DNSSECRData::NSEC(_) | DNSSECRData::NSEC3(_)) => Some(record.ttl),
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
+                if matches!(
+                    rrsig.input().type_covered,
+                    RecordType::NSEC | RecordType::NSEC3
+                ) =>
+            {
+                Some(record.ttl)
+            }
+            RData::DNSSEC(DNSSECRData::SIG(sig))
+                if matches!(
+                    sig.input().type_covered,
+                    RecordType::NSEC | RecordType::NSEC3
+                ) =>
+            {
+                Some(record.ttl)
+            }
+            _ => None,
+        })
+        .min()
 }
 
 /// DNSSEC validation mode.
@@ -249,6 +362,9 @@ pub struct DnssecMetrics {
     pub key_cache_hits: AtomicU64,
     /// DNSKEY lookups that had to be resolved from the response or upstream.
     pub key_cache_misses: AtomicU64,
+    /// Cryptographic RRSIG verification attempts made while validating
+    /// responses (bounded per response; see `MAX_VERIFICATIONS_PER_RESPONSE`).
+    pub signature_verifications: AtomicU64,
     pub bogus_by_upstream_reason: DashMap<(String, String), AtomicU64>,
 }
 
@@ -296,6 +412,17 @@ impl DnssecMetrics {
     #[must_use]
     pub fn key_cache_misses(&self) -> u64 {
         self.key_cache_misses.load(Ordering::Relaxed)
+    }
+
+    /// Records one cryptographic RRSIG verification attempt.
+    pub fn record_signature_verification(&self) {
+        self.signature_verifications.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative cryptographic RRSIG verification attempts.
+    #[must_use]
+    pub fn signature_verifications(&self) -> u64 {
+        self.signature_verifications.load(Ordering::Relaxed)
     }
 
     pub fn record_bogus(&self, upstream: Option<&str>, reason: &str) {
@@ -981,6 +1108,7 @@ fn has_valid_rrsig_for(
     signer_zone: &LowerName,
     keys: &[DNSKEY],
     now: u32,
+    budget: &mut VerifyBudget,
 ) -> bool {
     for record in response
         .answers
@@ -1005,6 +1133,9 @@ fn has_valid_rrsig_for(
                 || key.calculate_key_tag().ok() != Some(rrsig.input().key_tag)
             {
                 continue;
+            }
+            if !budget.try_consume() {
+                return false;
             }
             if verify_rrsig_covered(response, owner, rrsig, key) {
                 return true;
@@ -1040,6 +1171,8 @@ fn ds_response_status(
     if !parent_zone.zone_of(&LowerName::from(cut)) {
         return DsStatus::Unknown;
     }
+    // Bound the work one fetched DS/denial response can cause.
+    let mut budget = VerifyBudget::new();
 
     // A DS RRset at the cut: only meaningful when signed by the parent.
     let has_ds = response
@@ -1050,7 +1183,15 @@ fn ds_response_status(
             record.name == *cut && matches!(record.data, RData::DNSSEC(DNSSECRData::DS(_)))
         });
     if has_ds {
-        if !has_valid_rrsig_for(response, cut, RecordType::DS, parent_zone, parent_keys, now) {
+        if !has_valid_rrsig_for(
+            response,
+            cut,
+            RecordType::DS,
+            parent_zone,
+            parent_keys,
+            now,
+            &mut budget,
+        ) {
             return DsStatus::Unknown;
         }
         let ttl = response
@@ -1083,6 +1224,7 @@ fn ds_response_status(
             parent_zone,
             parent_keys,
             now,
+            &mut budget,
         ) {
             return DsStatus::Unknown;
         }
@@ -1128,6 +1270,7 @@ fn ds_response_status(
                 parent_zone,
                 parent_keys,
                 now,
+                &mut budget,
             )
         {
             return DsStatus::InZone;
@@ -1165,6 +1308,7 @@ fn ds_response_status(
                 parent_zone,
                 parent_keys,
                 now,
+                &mut budget,
             ) {
                 return DsStatus::Unknown;
             }
@@ -1211,6 +1355,7 @@ fn ds_response_status(
                         parent_zone,
                         parent_keys,
                         now,
+                        &mut budget,
                     )
                 {
                     return DsStatus::Unsigned(record.ttl.max(1));
@@ -1238,6 +1383,7 @@ fn ds_response_status(
                     parent_zone,
                     parent_keys,
                     now,
+                    &mut budget,
                 )
             })
             .collect();
@@ -1618,6 +1764,15 @@ impl DnssecValidator {
     /// Records that `zone` was proven signed, valid until `expiry`.
     fn mark_signed_zone(&self, zone: &LowerName, expiry: u32, now: u32) {
         self.insecure_zones.remove(zone);
+        // The root is signed by definition, but it is not evidence that a
+        // *descendant* name is signed: unsigned TLDs and delegations live
+        // directly below it. Recording the root would make every descendant
+        // without RRSIGs look like a stripped-signature downgrade (the P0
+        // false SERVFAIL after the first signed zone). It is also never useful
+        // for probe starts, because the anchor path already covers it.
+        if zone.is_root() {
+            return;
+        }
         self.signed_zones.insert(zone.clone(), expiry);
         // Only authenticated evidence reaches this method: either a signer of
         // validated response data or an authenticated DS RRset. Persist it so
@@ -1635,9 +1790,13 @@ impl DnssecValidator {
                 self.signed_zones.clear();
             }
         }
-        self.signed_zones
-            .iter()
-            .any(|entry| *entry.value() >= now && entry.key().zone_of(name))
+        self.signed_zones.iter().any(|entry| {
+            *entry.value() >= now
+                && entry.key().zone_of(name)
+                // Defensive: entries restored from an old cache may still
+                // contain the root. It only covers the root name itself.
+                && (!entry.key().is_root() || name.is_root())
+        })
     }
 
     /// Whether any name in the response's CNAME chain (starting at `qname`) is
@@ -1942,6 +2101,7 @@ impl DnssecValidator {
                 zone,
                 &anchored,
                 now,
+                &mut VerifyBudget::new(),
             )
         {
             return None;
@@ -2092,7 +2252,15 @@ impl DnssecValidator {
             .cloned()
             .collect();
         if matched.is_empty()
-            || !has_valid_rrsig_for(&message, &cut_name, RecordType::DNSKEY, cut, &matched, now)
+            || !has_valid_rrsig_for(
+                &message,
+                &cut_name,
+                RecordType::DNSKEY,
+                cut,
+                &matched,
+                now,
+                &mut VerifyBudget::new(),
+            )
         {
             return None;
         }
@@ -2314,7 +2482,22 @@ impl DnssecValidator {
             }
         }
 
-        let baseline = self.validate_response(response, upstream, now);
+        // Records appended by `fetch_zone_chain` below are helpers for chain
+        // building, never evidence about the original response. Remember
+        // where they begin so validation can tell them apart.
+        let original_additionals = response.additionals.len();
+        // One verification budget covers both passes (pre-fetch and strict)
+        // for this response, so a crafted message cannot double its work by
+        // forcing the chain walk.
+        let mut verify_budget = VerifyBudget::new();
+        let baseline = self.validate_response_inner(
+            response,
+            upstream,
+            now,
+            Some(original_additionals),
+            true,
+            &mut verify_budget,
+        );
         if baseline != ValidationOutcome::Indeterminate || self.mode == DnssecMode::Disabled {
             return baseline;
         }
@@ -2324,10 +2507,8 @@ impl DnssecValidator {
             return baseline;
         }
 
-        let original_additionals = response.additionals.len();
         let anchors = self.trust_anchors.load();
         let mut visited = HashSet::new();
-        let mut fetched_any = false;
         for signer in signers.iter().take(4) {
             // Reaching the root costs one DNSKEY lookup per label plus one DS
             // lookup per non-root level; a fixed budget of 6 could not reach
@@ -2338,7 +2519,7 @@ impl DnssecValidator {
                 .saturating_mul(2)
                 .saturating_add(1)
                 .min(31);
-            if fetch_zone_chain(
+            let _ = fetch_zone_chain(
                 &anchors,
                 fetcher,
                 signer,
@@ -2346,19 +2527,22 @@ impl DnssecValidator {
                 &mut visited,
                 response,
             )
-            .await
-            .is_some()
-            {
-                fetched_any = true;
-            }
+            .await;
         }
 
-        if !fetched_any {
-            response.additionals.truncate(original_additionals);
-            return baseline;
-        }
-
-        let outcome = self.validate_response(response, upstream, now);
+        // This is the post-fetch pass: the "relevant RRSIG is present but not
+        // checkable yet" escape no longer applies. If the chain walk produced
+        // no usable key, a response under proven signed evidence must fail
+        // closed rather than be served unvalidated. Running the strict pass
+        // even when no fetch succeeded also covers fully offline upstreams.
+        let outcome = self.validate_response_inner(
+            response,
+            upstream,
+            now,
+            Some(original_additionals),
+            false,
+            &mut verify_budget,
+        );
         response.additionals.truncate(original_additionals);
         outcome
     }
@@ -2383,6 +2567,7 @@ impl DnssecValidator {
         dnskeys: &[(Name, DNSKEY)],
         rrsigs: &[(Name, SIG)],
         now: u32,
+        budget: &mut VerifyBudget,
     ) -> KeySetBuild {
         let mut result = KeySetBuild::default();
         let anchors = self.trust_anchors.load();
@@ -2425,7 +2610,7 @@ impl DnssecValidator {
 
         let mut changed = true;
         let mut rounds = 0u8;
-        while changed && rounds < 16 {
+        'walk: while changed && rounds < 16 {
             changed = false;
             rounds += 1;
 
@@ -2454,6 +2639,11 @@ impl DnssecValidator {
                         {
                             continue;
                         }
+                        if !budget.try_consume() {
+                            // Bounded work: stop walking the forged chain.
+                            break 'walk;
+                        }
+                        self.metrics.record_signature_verification();
                         if !verify_rrsig_covered(response, ds_owner, sig, parent_key) {
                             continue;
                         }
@@ -2533,6 +2723,11 @@ impl DnssecValidator {
                     {
                         continue;
                     }
+                    if !budget.try_consume() {
+                        // Bounded work: stop walking the forged chain.
+                        break 'walk;
+                    }
+                    self.metrics.record_signature_verification();
                     if !verify_rrsig_covered(response, owner, sig, signer_key) {
                         continue;
                     }
@@ -2614,6 +2809,36 @@ impl DnssecValidator {
         upstream: Option<&str>,
         now: u32,
     ) -> ValidationOutcome {
+        // No fetcher is available here, so a present-but-unchecked relevant
+        // RRSIG stays Indeterminate: callers that can fetch the chain add
+        // their own strict post-fetch pass.
+        let mut verify_budget = VerifyBudget::new();
+        self.validate_response_inner(response, upstream, now, None, true, &mut verify_budget)
+    }
+
+    /// Validate a response, treating additional-section records starting at
+    /// `helper_additionals` as chain-fetch helpers.
+    ///
+    /// [`fetch_zone_chain`] appends DNSKEY/DS records (and their RRSIGs) to
+    /// the response so the chain can be built in one place. Those helper
+    /// signatures authenticate helper RRsets, not the original answer: they
+    /// must never count as signed-zone evidence or as a signature covering the
+    /// query. `None` means every record belongs to the original response.
+    ///
+    /// `allow_unchecked_signatures` is true only on the pre-fetch pass. It
+    /// permits returning `Indeterminate` when a relevant signature cannot be
+    /// checked yet, because the caller may still fetch its key. The post-fetch
+    /// pass sets it to false so an unverifiable signature under proven
+    /// signed-zone evidence fails closed.
+    fn validate_response_inner(
+        &self,
+        response: &mut Message,
+        upstream: Option<&str>,
+        now: u32,
+        helper_additionals: Option<usize>,
+        allow_unchecked_signatures: bool,
+        budget: &mut VerifyBudget,
+    ) -> ValidationOutcome {
         if self.mode == DnssecMode::Disabled {
             response.metadata.authentic_data = false;
             let outcome = ValidationOutcome::Insecure;
@@ -2660,23 +2885,41 @@ impl DnssecValidator {
             }
         }
 
-        // Collect RRSIG/SIG records (bounded).
+        // Collect RRSIG/SIG records (bounded). Signatures appended by the
+        // chain walk are flagged as helpers: they are usable for building the
+        // key chain, but they do not authenticate the original response.
+        let helper_start = helper_additionals.unwrap_or(usize::MAX);
         let mut rrsigs = Vec::new();
-        for record in response
-            .answers
-            .iter()
-            .chain(response.authorities.iter())
-            .chain(response.additionals.iter())
-        {
+        let mut helper_rrsigs = Vec::new();
+        for record in response.answers.iter().chain(response.authorities.iter()) {
             if rrsigs.len() >= MAX_RRSIGS {
                 break;
             }
             match &record.data {
                 RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
                     rrsigs.push((record.name.clone(), (**rrsig).clone()));
+                    helper_rrsigs.push(false);
                 }
                 RData::DNSSEC(DNSSECRData::SIG(sig)) => {
                     rrsigs.push((record.name.clone(), sig.clone()));
+                    helper_rrsigs.push(false);
+                }
+                _ => {}
+            }
+        }
+        for (index, record) in response.additionals.iter().enumerate() {
+            if rrsigs.len() >= MAX_RRSIGS {
+                break;
+            }
+            let is_helper = index >= helper_start;
+            match &record.data {
+                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
+                    rrsigs.push((record.name.clone(), (**rrsig).clone()));
+                    helper_rrsigs.push(is_helper);
+                }
+                RData::DNSSEC(DNSSECRData::SIG(sig)) => {
+                    rrsigs.push((record.name.clone(), sig.clone()));
+                    helper_rrsigs.push(is_helper);
                 }
                 _ => {}
             }
@@ -2702,13 +2945,27 @@ impl DnssecValidator {
         }
 
         // Extend trust from anchors to derived keys (DS delegation, KSK->ZSK).
-        let key_set = self.build_validated_key_set(response, &response_dnskeys, &rrsigs, now);
+        let key_set =
+            self.build_validated_key_set(response, &response_dnskeys, &rrsigs, now, budget);
 
         // Validate each RRSIG. Secure/AD is granted only when the answer RRset
         // relevant to the question (or a complete denial proof) is covered by a
         // signature that verified with a chain-validated key.
         let anchors = self.trust_anchors.load();
         let relevant_keys = relevant_answer_keys(response, &qname, qtype);
+        // Whether the original response carries an RRSIG that covers an RRset
+        // relevant to the question. If it does but the key chain is not yet
+        // available, this must stay Indeterminate so the caller can fetch the
+        // chain; only a genuinely missing relevant signature is a downgrade.
+        let has_relevant_rrsig =
+            rrsigs
+                .iter()
+                .zip(helper_rrsigs.iter())
+                .any(|((owner, sig), is_helper)| {
+                    !is_helper
+                        && relevant_keys
+                            .contains(&(LowerName::from(owner), sig.input().type_covered))
+                });
         let mut first_failure: Option<(&'static str, u16)> = key_set.time_failure;
         let mut policy_violation = false;
         let mut has_trusted_sig = false;
@@ -2716,7 +2973,7 @@ impl DnssecValidator {
         let mut trusted_sigs: Vec<TrustedSignature> = Vec::new();
         let mut trusted_signer_covers_qname = false;
 
-        for (rrsig_owner, rrsig) in &rrsigs {
+        for ((rrsig_owner, rrsig), is_helper) in rrsigs.iter().zip(helper_rrsigs.iter()) {
             let inception = rrsig.input().sig_inception.get();
             let expiration = rrsig.input().sig_expiration.get();
             let type_covered = rrsig.input().type_covered;
@@ -2724,8 +2981,9 @@ impl DnssecValidator {
             // Failures on signatures for RRsets that are not relevant to the
             // question (e.g. stale RRSIGs in the authority section of an
             // otherwise valid answer) must not turn the response Bogus.
+            // Chain-helper signatures are never relevant to the query.
             let rrsig_relevant =
-                relevant_keys.contains(&(LowerName::from(rrsig_owner), type_covered));
+                !is_helper && relevant_keys.contains(&(LowerName::from(rrsig_owner), type_covered));
 
             // RFC 4035 5.3.1 with a bounded clock skew: a signature is usable
             // within +/- 300 s of its validity window.
@@ -2746,11 +3004,15 @@ impl DnssecValidator {
             let key_tag = rrsig.input().key_tag;
 
             // Candidate keys for this RRSIG: the validated-key cache plus every
-            // response DNSKEY with the same owner, tag and algorithm. All
-            // candidates are tried because a key tag is not a unique key
+            // response DNSKEY with the same owner, tag and algorithm. Multiple
+            // candidates are considered because a key tag is not a unique key
             // identity (RFC 4035 5.3.1): an anchored key and a same-tag forgery
             // can both match, and stopping at the first match would let the
             // forgery shadow -- or inherit -- the real key's trust.
+            //
+            // Trusted keys are tried first and the list is capped, so a flood
+            // of same-tag response keys cannot starve the real signer or
+            // multiply the cryptographic work per signature.
             let lower_signer = LowerName::from(signer_name);
             let cached_key = self
                 .key_cache
@@ -2769,6 +3031,18 @@ impl DnssecValidator {
                     candidates.push(dnskey.clone());
                 }
             }
+            candidates.sort_by_key(|dnskey| {
+                let trusted = anchors.contains(dnskey.public_key())
+                    || anchors.contains_with_name(dnskey.public_key(), &lower_signer)
+                    || key_set
+                        .validated
+                        .contains(&(lower_signer.clone(), dnskey_fingerprint(dnskey)))
+                    || self
+                        .key_cache
+                        .is_validated(&lower_signer, key_tag, dnskey, now);
+                !trusted
+            });
+            candidates.truncate(MAX_CANDIDATE_KEYS_PER_RRSIG);
             if candidates.is_empty() {
                 // No usable key material: the chain fetch path may resolve it.
                 continue;
@@ -2807,6 +3081,12 @@ impl DnssecValidator {
                     continue;
                 }
 
+                if !budget.try_consume() {
+                    // Hard per-response cap; the remaining signatures stay
+                    // unverified (never secure).
+                    break;
+                }
+                self.metrics.record_signature_verification();
                 if dnskey
                     .verify_rrsig(
                         rrsig_owner,
@@ -2870,7 +3150,26 @@ impl DnssecValidator {
             if lower_signer.zone_of(&qname_lower) {
                 trusted_signer_covers_qname = true;
             }
-            self.mark_signed_zone(&lower_signer, expiration, now);
+            // Zone evidence must come from a signature over the original
+            // response data that is relevant to the query. A helper DNSKEY/DS
+            // RRSIG proves the helper RRset, not that this query's zone signed
+            // anything. A validated NSEC/NSEC3 in the original authority
+            // section is the query's denial proof and is relevant too: it
+            // proves the zone signs data, so later stripped answers under it
+            // must stay fail-closed.
+            let denial_evidence = !is_helper
+                && matches!(type_covered, RecordType::NSEC | RecordType::NSEC3)
+                && lower_signer.zone_of(&qname_lower)
+                && response
+                    .answers
+                    .iter()
+                    .chain(response.authorities.iter())
+                    .any(|record| {
+                        record.name == *rrsig_owner && record.record_type() == type_covered
+                    });
+            if rrsig_relevant || denial_evidence {
+                self.mark_signed_zone(&lower_signer, expiration, now);
+            }
             trusted_sigs.push(TrustedSignature {
                 owner: LowerName::from(rrsig_owner),
                 covered: type_covered,
@@ -2929,6 +3228,32 @@ impl DnssecValidator {
         };
         let negative_lower = LowerName::from(&negative_name);
 
+        // Whether the original response carries an NSEC/NSEC3 RRSIG signed by
+        // a zone that contains the negative answer name. Its key may simply be
+        // missing (DNSKEY TTL shorter than the signed-zone evidence), so on
+        // the pre-fetch pass this defers the "missing denial proof" Bogus to
+        // the chain fetch instead of false-SERVFAILing.
+        let has_denial_rrsig = negative
+            && rrsigs
+                .iter()
+                .zip(helper_rrsigs.iter())
+                .any(|((owner, sig), is_helper)| {
+                    !is_helper
+                        && matches!(
+                            sig.input().type_covered,
+                            RecordType::NSEC | RecordType::NSEC3
+                        )
+                        && LowerName::from(&sig.input().signer_name).zone_of(&negative_lower)
+                        && response
+                            .answers
+                            .iter()
+                            .chain(response.authorities.iter())
+                            .any(|record| {
+                                record.name == *owner
+                                    && record.record_type() == sig.input().type_covered
+                            })
+                });
+
         if negative {
             let denial = if trusted_sigs.is_empty() {
                 DenialResult::Incomplete
@@ -2986,12 +3311,20 @@ impl DnssecValidator {
                         || all_present_signed
                         || self.signed_zone_contains(&qname_lower, now);
                     if would_be_secure {
-                        return self.handle_bogus(
-                            response,
-                            upstream,
-                            "Negative response lacks a valid NSEC/NSEC3 denial proof",
-                            EDE_DNSSEC_BOGUS,
-                        );
+                        // A denial RRSIG whose key is not available yet is
+                        // deferrable only on the pre-fetch pass; the strict
+                        // post-fetch pass keeps the fail-closed Bogus.
+                        if allow_unchecked_signatures && has_denial_rrsig {
+                            // Fall through to Indeterminate so the caller can
+                            // fetch the signer's DNSKEY.
+                        } else {
+                            return self.handle_bogus(
+                                response,
+                                upstream,
+                                "Negative response lacks a valid NSEC/NSEC3 denial proof",
+                                EDE_DNSSEC_BOGUS,
+                            );
+                        }
                     }
                 }
             }
@@ -3046,10 +3379,16 @@ impl DnssecValidator {
             self.metrics.record_validation(&outcome);
             return outcome;
         }
-        if (self.signed_zone_contains(&qname_lower, now)
+        // A relevant RRSIG that could not be checked because no trusted key is
+        // available yet is not a downgrade on the pre-fetch pass: return
+        // Indeterminate so `validate_with_key_fetcher` can fetch the chain.
+        // After the fetch (or when no fetcher is involved) an unverifiable
+        // signature under proven signed-zone evidence must fail closed.
+        let signed_zone_evidence = (self.signed_zone_contains(&qname_lower, now)
             && !self.insecure_zone_covers(&qname_lower, now))
-            || trusted_signer_covers_qname
-        {
+            || trusted_signer_covers_qname;
+        let unchecked_rrsig_present = has_relevant_rrsig || has_denial_rrsig;
+        if signed_zone_evidence && (!unchecked_rrsig_present || !allow_unchecked_signatures) {
             return self.handle_bogus(
                 response,
                 upstream,
@@ -3057,7 +3396,11 @@ impl DnssecValidator {
                 EDE_DNSSEC_BOGUS,
             );
         }
-        if has_trusted_sig {
+        // A trusted signature over some unrelated RRset proves a signed zone
+        // signed *something*, not that the answer is unsigned. If a relevant
+        // RRSIG exists but could not be checked yet, let the caller fetch the
+        // chain instead of rejecting it here.
+        if has_trusted_sig && !has_relevant_rrsig {
             return self.handle_bogus(
                 response,
                 upstream,
@@ -3409,6 +3752,49 @@ mod tests {
         message
     }
 
+    /// A fetched DNSKEY response with a self-signature, as a validating
+    /// resolver's chain walk receives from a signed zone.
+    fn signed_dnskey_message(
+        owner: &Name,
+        key: &DNSKEY,
+        signer: &hickory_proto::dnssec::DnssecSigner,
+    ) -> Message {
+        use hickory_proto::rr::RecordSet;
+
+        let record = Record::from_rdata(
+            owner.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(key.clone())),
+        );
+        let mut set = RecordSet::new(owner.clone(), RecordType::DNSKEY, 0);
+        set.insert(record.clone(), 0);
+        let signature = sign_test_rrset(&set, signer);
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+        message.additionals.push(record);
+        message.additionals.push(signature);
+        message
+    }
+
+    /// A fetched DS response for `child`, signed by the parent zone.
+    fn signed_ds_fetch_message(
+        child: &Name,
+        child_key: &DNSKEY,
+        parent_signer: &hickory_proto::dnssec::DnssecSigner,
+    ) -> Message {
+        use hickory_proto::dnssec::DigestType;
+        use hickory_proto::rr::RecordSet;
+
+        let ds = DS::from_key(child_key.public_key(), child, DigestType::SHA256).expect("ds");
+        let record = Record::from_rdata(child.clone(), 300, RData::DNSSEC(DNSSECRData::DS(ds)));
+        let mut set = RecordSet::new(child.clone(), RecordType::DS, 0);
+        set.insert(record.clone(), 0);
+        let signature = sign_test_rrset(&set, parent_signer);
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+        message.authorities.push(record);
+        message.authorities.push(signature);
+        message
+    }
+
     fn signed_a_response(
         origin: &Name,
         signer: &hickory_proto::dnssec::DnssecSigner,
@@ -3582,6 +3968,86 @@ mod tests {
         let outcome = validator.validate_response(&mut msg, Some("test"), now);
 
         assert_eq!(outcome, ValidationOutcome::Secure);
+    }
+
+    /// The validator accepts a denial proof carried in the additional section
+    /// (`evaluate_denial` and the RRSIG loop both scan it). The SOA TTL cap
+    /// must use the same sections, otherwise moving a genuine NSEC/RRSIG from
+    /// authority to additional would leave a Secure negative with the SOA's
+    /// long lifetime.
+    #[test]
+    fn test_negative_proof_in_additionals_caps_soa_ttl() {
+        use hickory_proto::dnssec::rdata::NSEC;
+        use hickory_proto::rr::RecordSet;
+        use hickory_proto::rr::rdata::SOA;
+
+        let (origin, dnskey, signer) = create_test_signer("addl.example.");
+        let qname = Name::from_str("empty.addl.example.").unwrap();
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let mut msg = Message::new(30, MessageType::Response, OpCode::Query);
+        msg.queries.push(Query::query(qname.clone(), RecordType::A));
+        msg.metadata.response_code = ResponseCode::NoError;
+
+        // A long-lived signed SOA in the authority section.
+        let soa = Record::from_rdata(
+            origin.clone(),
+            3600,
+            RData::SOA(SOA::new(
+                Name::from_str("ns1.addl.example.").unwrap(),
+                Name::from_str("hostmaster.addl.example.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                3600,
+            )),
+        );
+        let mut soa_set = RecordSet::new(origin.clone(), RecordType::SOA, 3600);
+        soa_set.insert(soa.clone(), 0);
+        let mut soa_sig = sign_test_rrset(&soa_set, &signer);
+        soa_sig.ttl = 3600;
+        msg.authorities.push(soa);
+        msg.authorities.push(soa_sig);
+
+        // The NSEC NODATA proof and its signature live in the additional
+        // section, with a short 10 s lifetime.
+        let nsec = NSEC::new(
+            Name::from_str("zzz.addl.example.").unwrap(),
+            [RecordType::SOA, RecordType::NSEC, RecordType::RRSIG],
+        );
+        let nsec_record =
+            Record::from_rdata(qname.clone(), 10, RData::DNSSEC(DNSSECRData::NSEC(nsec)));
+        let mut nsec_set = RecordSet::new(qname.clone(), RecordType::NSEC, 10);
+        nsec_set.insert(nsec_record.clone(), 0);
+        let mut nsec_sig = sign_test_rrset(&nsec_set, &signer);
+        nsec_sig.ttl = 10;
+        msg.additionals.push(nsec_record);
+        msg.additionals.push(nsec_sig);
+        msg.additionals.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+        ));
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("addl"), now);
+        assert_eq!(outcome, ValidationOutcome::Secure);
+
+        let soa_ttl = msg
+            .authorities
+            .iter()
+            .find(|record| record.record_type() == RecordType::SOA)
+            .expect("SOA")
+            .ttl;
+        assert_eq!(
+            soa_ttl, 10,
+            "the SOA TTL must be capped by an additional-section denial proof"
+        );
     }
 
     #[test]
@@ -4718,7 +5184,13 @@ mod tests {
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
         let fingerprint = dnskey_fingerprint(&root_key);
         let dnskeys = vec![(root.clone(), root_key)];
-        let result = validator.build_validated_key_set(&response, &dnskeys, &[], now);
+        let result = validator.build_validated_key_set(
+            &response,
+            &dnskeys,
+            &[],
+            now,
+            &mut VerifyBudget::new(),
+        );
 
         assert!(result.validated.contains(&(lower.clone(), fingerprint)));
         assert!(
@@ -5017,8 +5489,13 @@ mod tests {
             RData::DNSSEC(DNSSECRData::DNSKEY(root_key.clone())),
         ));
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
-        let result =
-            validator.build_validated_key_set(&response, &[(root.clone(), root_key)], &[], now);
+        let result = validator.build_validated_key_set(
+            &response,
+            &[(root.clone(), root_key)],
+            &[],
+            now,
+            &mut VerifyBudget::new(),
+        );
         assert!(
             !result.validated.is_empty(),
             "expected validated keys, got none"
@@ -5221,6 +5698,396 @@ mod tests {
         assert_eq!(fetcher.calls(), 7);
     }
 
+    /// Regression: RRSIGs appended by the chain walk are helper records for
+    /// DNSKEY/DS RRsets, not evidence that the root (or any other helper
+    /// zone) signed the response. Marking the root from a fetched root DNSKEY
+    /// RRSIG made every later response look like a stripped downgrade.
+    #[tokio::test]
+    async fn test_chain_helper_rrsigs_do_not_mark_root_as_signed() {
+        let (root, root_key, root_signer) = create_test_signer(".");
+        let (one, one_key, one_signer) = create_test_signer("one.");
+
+        let qname = Name::from_str("www.one.").expect("qname");
+        let (answer, answer_sig) = signed_a_response(&qname, &one_signer);
+
+        let fetcher = StaticFetcher::new()
+            .with(
+                &one,
+                RecordType::DNSKEY,
+                signed_dnskey_message(&one, &one_key, &one_signer),
+            )
+            .with(
+                &one,
+                RecordType::DS,
+                signed_ds_fetch_message(&one, &one_key, &root_signer),
+            )
+            .with(
+                &Name::root(),
+                RecordType::DNSKEY,
+                signed_dnskey_message(&Name::root(), &root_key, &root_signer),
+            );
+
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+        validator.add_trust_anchor(&root_key, LowerName::from(&root));
+
+        let mut response = Message::new(77, MessageType::Response, OpCode::Query);
+        response.queries.push(Query::query(qname, RecordType::A));
+        response.answers.push(answer);
+        response.answers.push(answer_sig);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("helper"), now, &fetcher)
+            .await;
+        assert_eq!(outcome, ValidationOutcome::Secure, "{outcome:?}");
+
+        let root_lower = LowerName::from(&root);
+        assert!(
+            !validator.signed_zones.contains_key(&root_lower),
+            "the root must never be recorded as signed-zone evidence"
+        );
+        for name in ["com.", "other.test.", "www.example."] {
+            let lower = LowerName::from(&Name::from_str(name).expect("name"));
+            assert!(
+                !validator.signed_zone_contains(&lower, now),
+                "helper chain RRSIGs must not make {name} look signed"
+            );
+        }
+        assert!(
+            validator.signed_zone_contains(&LowerName::from(&one), now),
+            "the zone that actually signed the answer must still be recorded"
+        );
+    }
+
+    /// Regression: two different signed zones queried in sequence on a cold
+    /// cache must both validate. A helper DS/DNSKEY RRSIG for the shared
+    /// parent/TLD used to mark that ancestor as signed and SERVFAIL the second
+    /// zone before its chain could be fetched.
+    #[tokio::test]
+    async fn test_two_signed_zones_cold_cache_both_secure() {
+        let (tld, tld_key, tld_signer) = create_test_signer("example.");
+        let (one, one_key, one_signer) = create_test_signer("one.example.");
+        let (two, two_key, two_signer) = create_test_signer("two.example.");
+
+        let fetcher = StaticFetcher::new()
+            .with(
+                &one,
+                RecordType::DNSKEY,
+                signed_dnskey_message(&one, &one_key, &one_signer),
+            )
+            .with(
+                &one,
+                RecordType::DS,
+                signed_ds_fetch_message(&one, &one_key, &tld_signer),
+            )
+            .with(
+                &tld,
+                RecordType::DNSKEY,
+                signed_dnskey_message(&tld, &tld_key, &tld_signer),
+            )
+            .with(
+                &two,
+                RecordType::DNSKEY,
+                signed_dnskey_message(&two, &two_key, &two_signer),
+            )
+            .with(
+                &two,
+                RecordType::DS,
+                signed_ds_fetch_message(&two, &two_key, &tld_signer),
+            );
+
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+        validator.add_trust_anchor(&tld_key, LowerName::from(&tld));
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+        let qname_one = Name::from_str("a.one.example.").expect("qname");
+        let (answer_one, sig_one) = signed_a_response(&qname_one, &one_signer);
+        let mut first = Message::new(80, MessageType::Response, OpCode::Query);
+        first.queries.push(Query::query(qname_one, RecordType::A));
+        first.answers.push(answer_one);
+        first.answers.push(sig_one);
+        let outcome = validator
+            .validate_with_key_fetcher(&mut first, Some("first"), now, &fetcher)
+            .await;
+        assert_eq!(outcome, ValidationOutcome::Secure, "{outcome:?}");
+        assert!(first.metadata.authentic_data);
+
+        let qname_two = Name::from_str("b.two.example.").expect("qname");
+        let (answer_two, sig_two) = signed_a_response(&qname_two, &two_signer);
+        let mut second = Message::new(81, MessageType::Response, OpCode::Query);
+        second.queries.push(Query::query(qname_two, RecordType::A));
+        second.answers.push(answer_two);
+        second.answers.push(sig_two);
+        let outcome = validator
+            .validate_with_key_fetcher(&mut second, Some("second"), now, &fetcher)
+            .await;
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Secure,
+            "a second signed zone must not inherit the first zone's helper evidence: {outcome:?}"
+        );
+        assert!(second.metadata.authentic_data);
+        assert_eq!(second.metadata.response_code, ResponseCode::NoError);
+    }
+
+    /// A validated NSEC denial in the authority section is relevant evidence
+    /// that the signer zone is signed. A later stripped answer under it must
+    /// still fail closed rather than downgrade to Insecure.
+    #[test]
+    fn test_validated_negative_response_marks_zone_signed() {
+        let (origin, dnskey, signer) = create_test_signer("denial.example.");
+        let qname = Name::from_str("missing.denial.example.").expect("qname");
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let bitmap = vec![RecordType::A, RecordType::NSEC, RecordType::RRSIG];
+        let mut msg = signed_nsec_response_records(
+            &origin,
+            &[
+                (
+                    origin.clone(),
+                    Name::from_str("a.denial.example.").expect("next"),
+                    bitmap.clone(),
+                ),
+                (
+                    Name::from_str("a.denial.example.").expect("owner"),
+                    nsec_next(&origin),
+                    bitmap,
+                ),
+            ],
+            &qname,
+            &dnskey,
+            &signer,
+            ResponseCode::NXDomain,
+        );
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        assert_eq!(
+            validator.validate_response(&mut msg, Some("neg"), now),
+            ValidationOutcome::Secure
+        );
+        assert!(
+            validator.signed_zone_contains(&LowerName::from(&origin), now),
+            "a validated denial must record the signer zone as signed"
+        );
+
+        let other = Name::from_str("other.denial.example.").expect("other");
+        let mut stripped = Message::new(90, MessageType::Response, OpCode::Query);
+        stripped
+            .queries
+            .push(Query::query(other.clone(), RecordType::A));
+        stripped.answers.push(Record::from_rdata(
+            other,
+            300,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 99))),
+        ));
+        let outcome = validator.validate_response(&mut stripped, Some("neg"), now);
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a stripped answer under a zone proven signed by a denial must stay Bogus: {outcome:?}"
+        );
+    }
+
+    /// Important regression: a negative response whose NSEC denial RRSIGs are
+    /// present but whose DNSKEY is missing must fetch the key instead of
+    /// SERVFAILing. This mirrors the positive-answer P0 after the key cache
+    /// expires while signed-zone evidence is still live.
+    #[tokio::test]
+    async fn test_negative_response_with_denial_rrsig_fetches_key() {
+        let (origin, dnskey, signer) = create_test_signer("negfetch.example.");
+        let qname = Name::from_str("missing.negfetch.example.").expect("qname");
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        // Signed-zone evidence survives (cache reload / long-lived denial)
+        // while the key cache is empty, as when the DNSKEY TTL expires first.
+        validator
+            .signed_zones
+            .insert(LowerName::from(&origin), now + 300);
+
+        let bitmap = vec![RecordType::A, RecordType::NSEC, RecordType::RRSIG];
+        let mut base = signed_nsec_response_records(
+            &origin,
+            &[
+                (
+                    origin.clone(),
+                    Name::from_str("a.negfetch.example.").expect("next"),
+                    bitmap.clone(),
+                ),
+                (
+                    Name::from_str("a.negfetch.example.").expect("owner"),
+                    nsec_next(&origin),
+                    bitmap,
+                ),
+            ],
+            &qname,
+            &dnskey,
+            &signer,
+            ResponseCode::NXDomain,
+        );
+        // Simulate an upstream response that omitted the DNSKEY.
+        base.additionals
+            .retain(|record| !matches!(record.data, RData::DNSSEC(DNSSECRData::DNSKEY(_))));
+
+        let fetcher = StaticFetcher::new().with(
+            &origin,
+            RecordType::DNSKEY,
+            signed_dnskey_message(&origin, &dnskey, &signer),
+        );
+
+        let mut msg = base.clone();
+        let outcome = validator
+            .validate_with_key_fetcher(&mut msg, Some("negfetch"), now, &fetcher)
+            .await;
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Secure,
+            "the missing DNSKEY must be fetched for a signed denial proof: {outcome:?}"
+        );
+        assert!(msg.metadata.authentic_data);
+        assert_eq!(msg.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(fetcher.calls(), 1, "one DNSKEY fetch must be attempted");
+
+        // Post-fetch/offline strictness: a fresh validator with the same
+        // signed-zone evidence but no cached key must fail closed when the
+        // denial RRSIG still cannot be checked.
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let offline_validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+        offline_validator
+            .signed_zones
+            .insert(LowerName::from(&origin), now + 300);
+        let offline = OfflineFetcher::new();
+        let mut msg = base;
+        let outcome = offline_validator
+            .validate_with_key_fetcher(&mut msg, Some("offline"), now, &offline)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "an unverifiable denial RRSIG must fail closed after the fetch: {outcome:?}"
+        );
+        assert_eq!(msg.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(msg.answers.len(), 0);
+    }
+
+    /// Regression: a response that carries a relevant RRSIG but no key yet
+    /// must be Indeterminate (so the chain fetch can run), not Bogus just
+    /// because a cache reload restored signed-zone evidence for the name.
+    #[test]
+    fn test_relevant_rrsig_without_key_is_indeterminate_not_bogus() {
+        let (origin, dnskey, a_record, rrsig_record, _) =
+            create_test_signed_domain("reload.example.");
+
+        let mut trust_anchors = TrustAnchors::empty();
+        trust_anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new())
+            .with_trust_anchors(trust_anchors);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+        // Simulate signed-zone evidence restored from the persistent chain
+        // cache after a restart while the key cache is still empty.
+        validator
+            .signed_zones
+            .insert(LowerName::from(&origin), now + 300);
+
+        let mut response = Message::new(82, MessageType::Response, OpCode::Query);
+        response.queries.push(Query::query(origin, RecordType::A));
+        response.answers.push(a_record);
+        response.answers.push(rrsig_record);
+
+        let outcome = validator.validate_response(&mut response, Some("reload"), now);
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Indeterminate,
+            "a relevant RRSIG without key material must reach the chain fetcher: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(!response.metadata.authentic_data);
+    }
+
+    /// Critical regression: a forged answer with a present-but-unverifiable
+    /// relevant RRSIG under a proven-signed zone must stay Bogus. The
+    /// "Indeterminate so the chain can be fetched" escape is only valid on the
+    /// pre-fetch pass; after the fetch fails to produce a key, the response
+    /// must fail closed instead of being served unvalidated.
+    #[tokio::test]
+    async fn test_unverifiable_relevant_rrsig_under_proven_signed_zone_is_bogus() {
+        use hickory_proto::rr::RecordSet;
+
+        let (validator, origin, _key, _signer) = signed_zone_validator("victim.example.");
+        let qname = Name::from_str("www.victim.example.").expect("qname");
+        let (_fake_origin, _fake_key, fake_signer) = create_test_signer("nonexistent.");
+
+        let forged = Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(203, 0, 113, 66))),
+        );
+        let mut set = RecordSet::new(qname.clone(), RecordType::A, 0);
+        set.insert(forged.clone(), 0);
+        let fake_rrsig = sign_test_rrset(&set, &fake_signer);
+        assert_eq!(
+            fake_rrsig.record_type(),
+            RecordType::RRSIG,
+            "the forgery needs a relevant RRSIG owner/type"
+        );
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        assert!(
+            validator.signed_zone_contains(&LowerName::from(&origin), now),
+            "the victim zone must be proven signed"
+        );
+
+        let build_response = || {
+            let mut response = Message::new(83, MessageType::Response, OpCode::Query);
+            response
+                .queries
+                .push(Query::query(qname.clone(), RecordType::A));
+            response.answers.push(forged.clone());
+            response.answers.push(fake_rrsig.clone());
+            response
+        };
+
+        // NXDOMAIN responses from the chain walk (the fake signer does not
+        // exist) and a fully offline fetcher must both fail closed.
+        let nxdomain = NxdomainFetcher::new();
+        let mut response = build_response();
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("forged"), now, &nxdomain)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "an unverifiable relevant RRSIG under proven signed evidence must be Bogus: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(
+            response.answers.is_empty(),
+            "a Bogus response must not carry answers"
+        );
+
+        let offline = OfflineFetcher::new();
+        let mut response = build_response();
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("forged"), now, &offline)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a failed fetch must not downgrade an unverifiable relevant RRSIG: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(response.answers.len(), 0);
+    }
+
     /// Regression: RFC 4035 5.3.3 - a validated RRset may not be cached (or
     /// served with AD=1) beyond its signature's remaining validity.
     #[test]
@@ -5290,6 +6157,56 @@ mod tests {
         assert!(
             sig_ttl <= 30,
             "the RRSIG TTL must be capped as well, got {sig_ttl}"
+        );
+    }
+
+    /// A crafted response must not be able to force unbounded cryptographic
+    /// work: 128 RRSIGs (bounded by `MAX_RRSIGS`) each offering 64 candidate
+    /// DNSKEYs (bounded by `MAX_DNSKEYS`) used to mean thousands of ECDSA/RSA
+    /// verifications per client query.
+    #[test]
+    fn test_crafted_dnskey_rrsig_counts_stay_within_verification_budget() {
+        let (origin, dnskey, _a_record, rrsig_record, _) =
+            create_test_signed_domain("bounded.example.");
+
+        let mut trust_anchors = TrustAnchors::empty();
+        trust_anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new())
+            .with_trust_anchors(trust_anchors);
+
+        let mut msg = Message::new(4, MessageType::Response, OpCode::Query);
+        msg.queries
+            .push(Query::query(origin.clone(), RecordType::A));
+        // The signed RRset is replaced with a different address: every
+        // candidate key fails verification, which is the attacker's
+        // maximum-work case.
+        msg.answers.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(198, 51, 100, 9))),
+        ));
+        for _ in 0..MAX_RRSIGS {
+            msg.answers.push(rrsig_record.clone());
+        }
+        for _ in 0..MAX_DNSKEYS {
+            msg.additionals.push(Record::from_rdata(
+                origin.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+            ));
+        }
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("crafted"), now);
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "forged data must stay Bogus, got {outcome:?}"
+        );
+        let attempts = validator.metrics.signature_verifications();
+        assert!(
+            attempts <= u64::from(MAX_VERIFICATIONS_PER_RESPONSE),
+            "crafted response exceeded the verification budget: {attempts} attempts"
         );
     }
 
@@ -6845,6 +7762,32 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    /// A fetcher whose upstream answers every chain lookup with NXDOMAIN.
+    struct NxdomainFetcher {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NxdomainFetcher {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DnssecKeyFetcher for NxdomainFetcher {
+        async fn query(&self, name: &Name, _rtype: RecordType) -> Result<Message, UpstreamError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+            message
+                .queries
+                .push(Query::query(name.clone(), RecordType::DNSKEY));
+            message.metadata.response_code = ResponseCode::NXDomain;
+            Ok(message)
+        }
     }
 
     struct OfflineFetcher {

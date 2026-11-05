@@ -594,6 +594,167 @@ mod tests {
         server.shutdown().await.unwrap();
     }
 
+    /// 10a. Regression (P0): two different signed zones queried in sequence on
+    /// a cold cache must both resolve with AD=1. Fetched chain-helper RRSIGs
+    /// for the shared TLD used to mark it signed and SERVFAIL the second zone
+    /// before its own DNSKEY/DS chain could be fetched.
+    #[tokio::test]
+    async fn test_acceptance_dnssec_two_signed_zones_cold_cache() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use hickory_proto::dnssec::PublicKey;
+        use hickory_proto::dnssec::rdata::DNSSECRData;
+        use hickory_proto::dnssec::rdata::DS;
+        use hickory_proto::dnssec::{DigestType, DnssecSigner};
+        use hickory_proto::rr::{RData, Record, RecordSet};
+        use sito_dnssec::test_util::{
+            create_test_signed_domain, create_test_signer, sign_test_rrset,
+        };
+
+        fn dnskey_answers(
+            origin: &Name,
+            dnskey: &hickory_proto::dnssec::rdata::DNSKEY,
+            signer: &DnssecSigner,
+        ) -> (Vec<Record>, Vec<Record>) {
+            let record = Record::from_rdata(
+                origin.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+            );
+            let mut set = RecordSet::new(origin.clone(), RecordType::DNSKEY, 0);
+            set.insert(record.clone(), 0);
+            (vec![record, sign_test_rrset(&set, signer)], Vec::new())
+        }
+
+        fn ds_answers(
+            child: &Name,
+            child_key: &hickory_proto::dnssec::rdata::DNSKEY,
+            parent_signer: &DnssecSigner,
+        ) -> (Vec<Record>, Vec<Record>) {
+            let ds =
+                DS::from_key(child_key.public_key(), child, DigestType::SHA256).expect("build DS");
+            let record = Record::from_rdata(child.clone(), 300, RData::DNSSEC(DNSSECRData::DS(ds)));
+            let mut set = RecordSet::new(child.clone(), RecordType::DS, 0);
+            set.insert(record.clone(), 0);
+            (
+                vec![record, sign_test_rrset(&set, parent_signer)],
+                Vec::new(),
+            )
+        }
+
+        let mock_upstream = MockDnsServer::spawn().await.unwrap();
+
+        // Fake signed TLD anchor plus two independently signed child zones.
+        let (tld, tld_key, tld_signer) = create_test_signer("com.");
+        let (cloudflare, cloudflare_key, cloudflare_a, cloudflare_sig, cloudflare_signer) =
+            create_test_signed_domain("cloudflare.com.");
+        let (example, example_key, example_a, example_sig, example_signer) =
+            create_test_signed_domain("example.com.");
+
+        mock_upstream.add_custom_response(
+            "cloudflare.com",
+            RecordType::A,
+            vec![cloudflare_a, cloudflare_sig],
+            Vec::new(),
+        );
+        mock_upstream.add_custom_response(
+            "example.com",
+            RecordType::A,
+            vec![example_a, example_sig],
+            Vec::new(),
+        );
+
+        let (answers, additionals) = dnskey_answers(&tld, &tld_key, &tld_signer);
+        mock_upstream.add_custom_response("com", RecordType::DNSKEY, answers, additionals);
+        let (answers, additionals) =
+            dnskey_answers(&cloudflare, &cloudflare_key, &cloudflare_signer);
+        mock_upstream.add_custom_response(
+            "cloudflare.com",
+            RecordType::DNSKEY,
+            answers,
+            additionals,
+        );
+        let (answers, additionals) = dnskey_answers(&example, &example_key, &example_signer);
+        mock_upstream.add_custom_response("example.com", RecordType::DNSKEY, answers, additionals);
+
+        let (answers, additionals) = ds_answers(&cloudflare, &cloudflare_key, &tld_signer);
+        mock_upstream.add_custom_response("cloudflare.com", RecordType::DS, answers, additionals);
+        let (answers, additionals) = ds_answers(&example, &example_key, &tld_signer);
+        mock_upstream.add_custom_response("example.com", RecordType::DS, answers, additionals);
+
+        let trust_anchor = format!(
+            "com.:13:{}",
+            BASE64_STANDARD.encode(tld_key.public_key().public_bytes())
+        );
+
+        // Scenario 1: cache enabled, DO=1. Query two signed zones in sequence
+        // from a cold cache: both must be validated and AD=1.
+        let mut config = Config::default();
+        config.upstream.servers = vec![mock_upstream.addr().to_string()];
+        config.dns.dnssec.validate = true;
+        config.dns.dnssec.mode = "validate".to_string();
+        config.dns.dnssec.trust_anchors = vec![trust_anchor.clone()];
+
+        let server = TestServerInstance::spawn(config.clone()).await.unwrap();
+        let client = server.client();
+        for name in ["cloudflare.com", "example.com"] {
+            let resp = client.query_udp_dnssec(name, RecordType::A).await.unwrap();
+            assert_eq!(
+                resp.metadata.response_code,
+                hickory_proto::op::ResponseCode::NoError,
+                "{name} must not SERVFAIL on a cold cache: {resp:?}"
+            );
+            assert!(
+                resp.metadata.authentic_data,
+                "{name} must be validated (AD=1)"
+            );
+            assert!(!resp.answers.is_empty(), "{name} must carry an answer");
+        }
+        server.shutdown().await.unwrap();
+
+        // Scenario 2: cache disabled, DO=1. Same cold-start sequence without
+        // any positive/negative cache involvement.
+        let mut no_cache = config.clone();
+        no_cache.dns.cache.enabled = false;
+        let server = TestServerInstance::spawn(no_cache.clone()).await.unwrap();
+        let client = server.client();
+        for name in ["cloudflare.com", "example.com"] {
+            let resp = client.query_udp_dnssec(name, RecordType::A).await.unwrap();
+            assert_eq!(
+                resp.metadata.response_code,
+                hickory_proto::op::ResponseCode::NoError,
+                "{name} must resolve with the cache disabled: {resp:?}"
+            );
+            assert!(
+                resp.metadata.authentic_data,
+                "{name} must be validated (AD=1) with the cache disabled"
+            );
+        }
+        server.shutdown().await.unwrap();
+
+        // Scenario 3: DO=0. Validation still runs, but the client never sees
+        // AD or DNSSEC records; the second zone must not SERVFAIL.
+        let server = TestServerInstance::spawn(no_cache).await.unwrap();
+        let client = server.client();
+        for name in ["cloudflare.com", "example.com"] {
+            let resp = client.query_udp(name, RecordType::A).await.unwrap();
+            assert_eq!(
+                resp.metadata.response_code,
+                hickory_proto::op::ResponseCode::NoError,
+                "{name} must resolve for a DO=0 client: {resp:?}"
+            );
+            assert!(
+                !resp.answers.is_empty(),
+                "{name} must carry an answer for a DO=0 client"
+            );
+            assert!(
+                !resp.metadata.authentic_data,
+                "AD must not be asserted to a DO=0 client"
+            );
+        }
+        server.shutdown().await.unwrap();
+    }
+
     /// 10b. Acceptance test: CD=1 bypasses validation, AD requires DO/AD opt-in
     #[tokio::test]
     async fn test_acceptance_dnssec_cd_and_ad_flags() {

@@ -2,7 +2,7 @@
 
 use crate::error::ConfigError;
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -213,6 +213,101 @@ impl Config {
             }
         }
         WebConfig::default()
+    }
+
+    /// Returns operator-facing warnings for listeners reachable beyond
+    /// loopback without an explicit transport-security declaration.
+    ///
+    /// The messages contain only bind addresses, ports and configuration key
+    /// names; they never include credentials, tokens or URL userinfo.
+    #[must_use]
+    pub fn network_exposure_warnings(&self) -> Vec<String> {
+        self.web_exposure_warning()
+            .into_iter()
+            .chain(self.dns_exposure_warning())
+            .collect()
+    }
+
+    /// Returns the admin-UI exposure warning, if the UI is reachable beyond
+    /// loopback over plain HTTP without a declared TLS reverse proxy.
+    ///
+    /// The caller emits this while the web listener is starting, regardless of
+    /// setup-pending state: the admin UI binds in both modes.
+    #[must_use]
+    pub fn web_exposure_warning(&self) -> Option<String> {
+        // The admin UI is plain HTTP in-process. A declared TLS reverse proxy
+        // is the operator's explicit acknowledgement that a proxy fronts it;
+        // otherwise a non-loopback bind exposes credentials directly.
+        let web = self.get_web_config();
+        if !web.enabled || web.bind.is_loopback() || self.web_tls_declared() {
+            return None;
+        }
+        Some(format!(
+            "admin web UI is reachable at {} over plain HTTP; credentials, session cookies and the first-boot setup token cross the network in cleartext. Set web.bind = \"127.0.0.1\" and use an SSH tunnel or a TLS reverse proxy, or restrict TCP {} to trusted clients with a host firewall",
+            SocketAddr::new(web.bind, web.port),
+            web.port
+        ))
+    }
+
+    /// Returns the DNS exposure warning, if listeners are about to bind a
+    /// wildcard address without a client allow-list.
+    ///
+    /// Call this only when DNS listeners are actually starting: during
+    /// setup-pending mode no DNS port is bound, so emitting it there would be
+    /// false.
+    #[must_use]
+    pub fn dns_exposure_warning(&self) -> Option<String> {
+        // sito has no DNS client allow-list: a wildcard bind accepts recursion
+        // from every source. Rate limiting attenuates abuse, it does not
+        // authorize clients.
+        if !self.dns_listeners_exposed() {
+            return None;
+        }
+        let binds = self
+            .dns
+            .bind
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "DNS listeners bind to {binds} and accept queries from any source; sito has no DNS client allow-list and rate limiting is not an access control. Restrict the DNS ports to your LAN with a host firewall or set dns.bind to specific LAN addresses"
+        ))
+    }
+
+    /// True when the configuration explicitly declares that the admin scheme
+    /// is HTTPS (an `https://` `web.public_url`, or `tls_terminated_by_proxy`
+    /// when no public URL is set). An explicit `http://` public URL wins and
+    /// keeps the plaintext warning.
+    fn web_tls_declared(&self) -> bool {
+        let Some(table) = self.web.as_ref().and_then(toml::Value::as_table) else {
+            return false;
+        };
+        if let Some(url) = table.get("public_url").and_then(toml::Value::as_str) {
+            return url.split_once("://").is_some_and(|(scheme, rest)| {
+                !rest.is_empty() && scheme.eq_ignore_ascii_case("https")
+            });
+        }
+        table
+            .get("tls_terminated_by_proxy")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// True when any listener bind is a wildcard and at least one DNS port is
+    /// enabled. `dns.port` is validated to be nonzero, but the encrypted
+    /// listeners are checked too so a future plain-DNS-off mode still warns.
+    fn dns_listeners_exposed(&self) -> bool {
+        self.dns.bind.iter().any(IpAddr::is_unspecified)
+            && [
+                self.dns.port,
+                self.dns.dot_port,
+                self.dns.doh_port,
+                self.dns.doq_port,
+                self.dns.doh3_port,
+            ]
+            .into_iter()
+            .any(|port| port != 0)
     }
 
     /// Sets or overrides the web configuration.
@@ -1995,5 +2090,111 @@ key = "/path/to/key.pem"
             "{TEST_BASE}[[upstream.per_domain]]\ndomains = [\"lan\"]\nservers = [\"192.168.1.1\"]\n"
         ))
         .expect("a complete per-domain rule must be accepted");
+    }
+
+    /// 1.9.2 keeps the historical wildcard defaults, so startup must tell the
+    /// operator that both the plain-HTTP admin UI and the DNS listeners are
+    /// reachable beyond loopback (fail-closed visibility, truthful default).
+    #[test]
+    fn test_default_config_reports_web_and_dns_exposure() {
+        let warnings = Config::default().network_exposure_warnings();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "defaults must warn for both exposed services: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("admin web UI")
+                && w.contains("0.0.0.0:8080")
+                && w.contains("plain HTTP")),
+            "missing admin UI exposure warning: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("DNS listeners")
+                && w.contains("0.0.0.0")
+                && w.contains("any source")),
+            "missing DNS exposure warning: {warnings:?}"
+        );
+    }
+
+    /// Loopback listeners are not exposed, and a disabled web UI must never
+    /// produce an admin warning.
+    #[test]
+    fn test_loopback_and_disabled_web_do_not_warn() {
+        let mut config = Config::default();
+        config.dns.bind = vec![IpAddr::from_str("127.0.0.1").expect("valid loopback")];
+        let mut web = config.get_web_config();
+        web.bind = IpAddr::from_str("127.0.0.1").expect("valid loopback");
+        config.set_web_config(web);
+        assert_eq!(
+            config.network_exposure_warnings(),
+            Vec::<String>::new(),
+            "loopback-only listeners must not warn"
+        );
+
+        let mut disabled = Config::default();
+        disabled.dns.bind = vec![IpAddr::from_str("127.0.0.1").expect("valid loopback")];
+        let mut web = disabled.get_web_config();
+        web.enabled = false;
+        web.bind = IpAddr::from_str("0.0.0.0").expect("valid wildcard");
+        disabled.set_web_config(web);
+        assert!(
+            disabled.network_exposure_warnings().is_empty(),
+            "a disabled web UI must not warn about admin exposure"
+        );
+    }
+
+    /// An explicit TLS declaration makes a non-loopback admin bind an
+    /// intentional reverse-proxy deployment. An explicit `http://` public URL
+    /// overrides the proxy flag; only `https://` (or the proxy flag when no
+    /// public URL is set) suppresses the plaintext warning.
+    #[test]
+    fn test_tls_reverse_proxy_declaration_suppresses_web_warning() {
+        let https_proxy = format!(
+            "{TEST_BASE}[dns]\nbind = [\"127.0.0.1\"]\n[web]\nbind = \"0.0.0.0\"\npublic_url = \"https://dns.example.com\"\ntls_terminated_by_proxy = true\n"
+        );
+        let config = Config::from_toml_str(&https_proxy).expect("valid config");
+        assert!(
+            config.network_exposure_warnings().is_empty(),
+            "HTTPS reverse proxy declaration must suppress the plaintext warning"
+        );
+
+        let proxy_flag_only = format!(
+            "{TEST_BASE}[dns]\nbind = [\"127.0.0.1\"]\n[web]\nbind = \"0.0.0.0\"\ntls_terminated_by_proxy = true\n"
+        );
+        let config = Config::from_toml_str(&proxy_flag_only).expect("valid config");
+        assert!(
+            config.network_exposure_warnings().is_empty(),
+            "tls_terminated_by_proxy without public_url must suppress the warning"
+        );
+
+        let http_public_url = format!(
+            "{TEST_BASE}[dns]\nbind = [\"127.0.0.1\"]\n[web]\nbind = \"0.0.0.0\"\npublic_url = \"http://dns.example.com:8080\"\ntls_terminated_by_proxy = true\n"
+        );
+        let config = Config::from_toml_str(&http_public_url).expect("valid config");
+        assert!(
+            config
+                .network_exposure_warnings()
+                .iter()
+                .any(|w| w.contains("admin web UI")),
+            "an explicit http:// public URL must still warn even with the proxy flag"
+        );
+    }
+
+    /// Warnings are written to logs; they must never echo credentials or
+    /// tokens from unrelated configuration sections.
+    #[test]
+    fn test_exposure_warnings_do_not_leak_secrets() {
+        let config = Config::from_toml_str(&format!(
+            "{TEST_BASE}[dns]\nbind = [\"0.0.0.0\"]\n[web]\nbind = \"0.0.0.0\"\npublic_url = \"http://secret-user:secret-pass@example.test:8080\"\n[ha]\nslave_token = \"top-secret-token\"\n"
+        ))
+        .expect("valid config");
+        let rendered = config.network_exposure_warnings().join("\n");
+        for secret in ["secret-user", "secret-pass", "top-secret-token"] {
+            assert!(
+                !rendered.contains(secret),
+                "warning leaked '{secret}': {rendered}"
+            );
+        }
     }
 }

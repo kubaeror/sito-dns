@@ -5,6 +5,249 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.9.2] - 2026-11-05
+
+Security and correctness patch release for the 1.9 line. It fixes the DNSSEC
+false-SERVFAIL regression after the first signed zone, bounds DNSSEC verification
+work, revokes legacy credentials exactly once on upgrade, hardens HA replication
+against stale masters and same-version forks, makes broken HA nodes visible to
+healthchecks, and repairs first-boot setup, `reset-admin`, self-update, and the
+Web UI update form. See the
+[1.9.2 release notes](docs/release-notes-1.9.2.md) for the user-visible summary
+and upgrade actions; this changelog remains the exhaustive record.
+
+### Added
+- **Startup network-exposure warnings**: the historical defaults still bind the
+  admin UI to `0.0.0.0:8080` over plain HTTP and DNS to `0.0.0.0`/`::` with no
+  client allow-list, so startup now logs an actionable warning for each exposed
+  listener. A declared `https://` `web.public_url` (or
+  `web.tls_terminated_by_proxy = true` when no public URL is set) marks a
+  deliberate TLS reverse-proxy deployment; loopback binds and
+  `web.enabled = false` do not warn. The DNS warning is emitted only when DNS
+  listeners actually start: it is suppressed during setup-pending mode and
+  re-evaluated against the configuration written by the wizard when the
+  listeners start. The warnings contain only bind addresses
+  and ports, never credentials or tokens. Changing the default bind remains
+  planned for 1.10.0; 1.9.2 keeps existing configurations working.
+- **`sito ha gen-certs --uid/--gid`**: the generator can transfer the generated
+  certificates and private keys to the unprivileged HA runtime user. Container
+  deployments run as uid/gid `65532` and systemd runs as `sito`; keys generated
+  by root were previously unreadable by the runtime, so the mTLS replication
+  listener failed to start while DNS health stayed green. Both flags are
+  required together, the chown is applied after every file is written, and a
+  failed transfer is reported instead of being silently skipped.
+
+### Fixed
+- **Installer and docs recommend LAN-only exposure**: `install.sh` no longer
+  tells operators to open 53, 853, 443 and 8080 to everyone. It now allows SSH
+  before enabling UFW's default-deny policy, prints LAN-scoped DNS firewall
+  rules, an SSH tunnel for the admin UI, a temporary LAN-scoped 8080 rule for
+  first-time setup, and reverse-proxy guidance. The primary docs/compose
+  comments explain the `127.0.0.1:8080`/TLS-proxy options without changing the
+  shipped mappings. Existing 1.9.2 configurations keep working; the
+  default-bind change and a DNS client ACL remain planned for 1.10.0.
+- **Web UI update form sends the CSRF token**: the system page's
+  "Download & Install" button called native `form.submit()`, bypassing htmx
+  and omitting the session-bound CSRF value, so the middleware rejected the
+  POST. The form now includes the hidden `csrf_token` used by the other UI
+  forms and lets htmx perform the request.
+- **Self-update prerequisites are installed and checked up front**: a fresh
+  systemd install could not use the documented `sito update` path because
+  `server.update_require_signature` defaults to `true` while `install.sh` only
+  checked for cosign instead of installing it. The installer now installs a
+  checksum-verified cosign binary (`v2.6.5` by default, architecture-matched,
+  `SITO_INSTALL_COSIGN=0` to opt out) to `/usr/local/bin`, and `sito update`
+  refuses before downloading when signatures are required but cosign is
+  unavailable, naming the verifier, the install path and the configuration key.
+- **`sito update` finds the system configuration**: without `--config`, the CLI
+  prefers an existing `/etc/sito/config.toml` and otherwise uses
+  `./config.toml`. The documented
+  `sudo systemctl stop sito && sudo sito update` path therefore works from
+  `/root` instead of failing to read `./config.toml`. If neither file exists,
+  updates refuse with an actionable error naming `--config`; the signature
+  policy is never silently skipped.
+- **HA failures are visible in status and healthchecks**: a master whose
+  replication listener failed to initialize mTLS or bind, and a slave whose
+  handshake never completed or that has not reached `synced`, now report
+  `ready: false` with a `readiness_reason` in `GET /api/v1/ha/status`. The
+  public `/health` endpoint exposes only a generic ready flag (detailed
+  reasons stay in the authenticated status endpoint and logs), and
+  `sito healthcheck` fails when `[ha]` makes replication part of the role, so
+  a successful DNS probe can no longer mask a broken HA node. A master with
+  `replication_port = 0` remains ready and explains that replication is
+  intentionally disabled.
+- **HA compares effective `[auth]` policy, not raw TOML**: an `[auth]` table
+  that spells out the default values (as `config.example.toml` does) is now
+  equivalent to omitting the section, and inert legacy keys stripped during
+  bundle sanitization no longer look like a restart-only change. Previously
+  the documented master example plus the minimal slave template produced
+  `restart_required: auth` on every push and left the slave permanently
+  `Degraded`. A genuine policy change such as `session_ttl_hours` is still
+  rejected until a coordinated restart.
+- **HA restart-only changes are rejected, not ACKed as applied**: a push that
+  changes a restart-only field which is not node-local (for example
+  `server.log_format` or `[auth]`) now fails before anything is applied or
+  persisted. The slave keeps its previous live configuration and file, enters
+  `Degraded`, and ACKs `applied: false` with a `restart_required` reason naming
+  the fields. Previously it persisted the change, reported `applied: true`, and
+  silently kept the old live behavior until the next restart.
+- **HA pushes preserve node-local listeners and certificates**: a slave's
+  persisted configuration now keeps its own `dns.bind`, `[dns.tls]`/`[tls]`
+  paths, `[acme]`, `web.bind`/`web.port` and the complete
+  `[integrations.mikrotik]` section instead of inheriting the master's. A
+  master bound to one address can no longer make a slave fail to bind (or use
+  certificate paths that do not exist on that node), and the runbook's IPv6-vs-
+  IPv4 bind difference between master and slave is safe on the first push.
+- **HA master restarts reconcile `config.toml`**: a master that restarts with a
+  persisted `ha_state.toml` now compares the sanitized current configuration
+  with the stored bundle (semantically) and republishes at `N + 1` when they
+  differ. Previously it resumed the old bundle and never pushed the edited
+  configuration, leaving every slave on stale settings indefinitely. An
+  unchanged configuration still resumes the existing sequence without churn.
+- **HA peer version bounds (security)**: an authenticated replica can no longer
+  freeze publishing by reporting `u64::MAX` (or any implausibly high
+  `have_version`/ACK version). The master rejects Hello values more than
+  1,000,000 above its own sequence without seeding or registering, ignores
+  implausible ACK versions without rebasing, rejects publishing or restoring a
+  sequence at `u64::MAX`, and uses `checked_add` for every sequence increment.
+- **HA applied-version watermark is durable**: slaves now persist
+  `{version, payload_hash, timestamp}` to `data_dir/ha_watermark.toml`
+  (atomic, mode `0600`) after applying and persisting a pushed bundle and
+  before acknowledging it. On startup the watermark is restored, so a restart
+  can no longer replay an older signed bundle or accept the same version with
+  different content. A corrupt watermark fails startup instead of silently
+  resetting to version 0.
+- **HA term/epoch stops stale-master overwrites (security)**: bundles and the
+  master/slave state now carry a cluster term. A slave rejects a push from an
+  older term even when its version counter is higher; within a term the version
+  must advance and a same-version push must match the applied payload hash. A
+  master that sees a replica ahead in the same term or in a newer term marks
+  itself `diverged` and no longer seeds its counter or republishes its stale
+  active bundle. Recovery is an explicit promotion that raises `term` and
+  `version` in `ha_state.toml`; a higher term does not bypass version
+  continuity, so the promoted version must also exceed the cluster high-water
+  mark. Existing state files without a term load as term 0 and old signed
+  bundles remain verifiable. Upgrade slaves before promoting a master (see
+  `docs/runbook-ha.md`).
+- **Same-term HA forks are latched**: when a slave receives the same version
+  and term with a different signed payload hash, it persists a fork marker in
+  `ha_watermark.toml`, degrades immediately, and rejects every further push in
+  that term until an explicit higher-term promotion (with a higher version)
+  arrives. If the durable write fails, the in-memory latch is kept and the ACK
+  reports the failure instead of proceeding unlatched. The ACK carries a
+  structured `same_version_fork` reason; the master records divergence and
+  stops reporting the slave as synced instead of letting the next version
+  silently win the fork.
+- **HA divergence is sticky**: divergence records now retain their kind
+  (same-term version gap, newer term, or same-version fork) and are no longer
+  cleared by an unrelated slave applying the current version. A same-version
+  fork marks that slave unsynced and keeps it visible, but does **not** stop
+  publishing to healthy replicas; it clears when the slave accepts the current
+  bundle after promotion/reconciliation or disconnects. A resync clears only
+  advisory ahead/newer-term records, never a real fork. The slave list reports
+  a latched divergence even when its version counter would otherwise look in
+  sync.
+- **DNSSEC verification amplification (security)**: a crafted authoritative
+  response can no longer force unbounded cryptographic work. Each response now
+  has a hard budget of 256 RRSIG verification attempts (shared across the
+  pre-fetch and strict passes), candidate keys per RRSIG are capped at 8, and
+  trusted/validated keys are tried before unvalidated response keys. The
+  bounded work covers the DS/DNSKEY trust walk and the DS-status probes as
+  well.
+- **NSEC3 iteration cap bypass (security)**: `matches()`/`covers()` now reject
+  records whose iteration count exceeds 150 (RFC 9276) before hashing a name.
+  The DS-status exact-match/opt-out paths therefore no longer hash a name
+  65535 times or accept an over-cap denial.
+- **Secure answers no longer outlive their signature**: `dns.cache.min_ttl` is
+  a floor for unvalidated data only. Raising a `Secure` entry above its
+  authenticated TTL could serve AD=1 data after the RRSIG original TTL or
+  validity expired; validated records now keep the smaller TTL. Secure
+  NXDOMAIN/NODATA lifespans are additionally capped by the NSEC/NSEC3 denial
+  records and their RRSIGs, so a long-lived SOA can no longer extend a
+  validated negative answer past its proof.
+- **Stale cache entries follow the validation policy**: the RFC 8767 stale
+  fallback now refuses both `Unchecked` and `Indeterminate` entries while local
+  validation is active (an `Indeterminate` entry may be an inconclusive answer
+  or, in log-only mode, a Bogus result). Only authenticated `Secure`/`Insecure`
+  decisions are served from the stale window, always with AD=0. Stale
+  sanitization removes every DNSSEC RR type (RRSIG, DNSKEY, DS, NSEC/NSEC3),
+  not just RRSIGs.
+- **DNSSEC policy changes flush cached answers**: changing `dns.dnssec.mode`,
+  `validate`, `trust_anchors`, `nta` or `ntp` invalidates the response cache,
+  so a decision made under the old policy (Secure after an anchor removal, or
+  Unchecked after validation was enabled) cannot be served afterwards.
+- **Credential revocation races (security)**: sessions and API tokens now store
+  the account's persisted `credential_epoch` and are revalidated against
+  `users.toml` on every request: the account must still exist, the role must
+  still match, and the epoch must be current. Password changes, role changes,
+  TOTP enable/disable, account deletion/recreation and `reset-admin` advance
+  the epoch; a login that raced a credential mutation is refused instead of
+  inserting a session with the old role or for a deleted account. Persisted
+  sessions and API tokens written before this release have no epoch and are
+  rejected once after upgrade: users must sign in again and API tokens must be
+  re-issued. User-credential writes (create, password, role, TOTP
+  enable/disable, delete and `reset-admin`) now fail closed: a failed
+  `users.toml` write returns an error and rolls the in-memory change back
+  instead of reporting success. Interrupted revocations are also revalidated on
+  restart, so a crash between the users write and the session/token write
+  cannot resurrect a revoked credential.
+- **Reset commands no longer claim live revocation**: the server now holds an
+  exclusive lease on `<data_dir>/sito.pid`. `sito reset-sessions` and
+  `sito reset-admin` refuse to run while that lease is held, because the running
+  process keeps users, sessions, API tokens and the auth generation in memory.
+  The documented recovery sequence is `systemctl stop sito` → reset →
+  `systemctl start sito`. `--force` performs the on-disk reset anyway and prints
+  a warning that existing sessions/tokens remain valid and a new admin password
+  is not accepted until the service is restarted. A stale `sito.pid` from a
+  crash does not block resets; only the live lock does.
+- **First-boot login gating (P0)**: with `config.toml` present but
+  `users.toml` still holding the bootstrap `admin/adminadmin`, the setup token
+  was active while `setup_pending` was false. The default password could log in
+  remotely and the rest of the API stayed reachable. The middleware now gates on
+  the setup token and an active bootstrap admin as well: `/api/v1/auth/*`
+  returns 403, other `/api/v1/*` routes return 503, and only `/wizard`,
+  `/ui/wizard/*`, static assets, `/health`, `/status` and the
+  setup-token-protected paths remain reachable. An authenticated Admin may
+  always open the wizard.
+- **`reset-admin` no longer installs `adminadmin` or deletes accounts**: when
+  `--password` is omitted the command generates a 192-bit random password and
+  prints it exactly once. Supplied passwords must meet the API/wizard policy
+  (at least 8 characters, no whitespace/control characters, not `adminadmin`).
+  Non-admin accounts are preserved by default; use `--reset-all` /
+  `--reset-users` for an explicit full account-store replacement. Recovery from
+  a corrupt `users.toml` requires that explicit full reset.
+- **Setup wizard persists credentials before configuration**: the administrator
+  password is written and verified before `config.toml` is persisted. A later
+  configuration failure rolls the password back and leaves setup pending, a
+  non-Admin target account is rejected with 400, and the bootstrap `admin`
+  account is removed before setup is marked complete. A failed user-store write
+  is reported as an error instead of a successful setup redirect.
+- **DNSSEC false SERVFAIL after the first signed zone (P0)**: with
+  `dns.dnssec.validate = true` and `mode = "validate"`, resolving one signed
+  domain and then a different signed domain (for example `cloudflare.com`
+  followed by `example.com`) returned SERVFAIL with EDE
+  `Missing RRSIG for zone previously proven signed`. DNSKEY/DS RRSIGs fetched
+  during the chain walk were appended to the response and treated as evidence
+  that the root/TLD had signed the query, and a response that carried a
+  relevant RRSIG but no key yet was rejected before the key chain could be
+  fetched. Chain-helper RRSIGs are now separated from the original response,
+  the root is never used as descendant signed-zone evidence, a relevant RRSIG
+  without key material returns `Indeterminate` so the chain fetch can run, and
+  a legacy chain-cache format drops unsafe root/TLD `Signed` entries on load.
+  Genuinely stripped responses under a proven-signed zone and genuinely bogus
+  zones still fail closed with SERVFAIL in `validate` mode.
+- **Container image publication is gated on the verified release**: the
+  `docker-build-push` job now waits for the tag/version check, the binary
+  builds, the signed release/SBOM publication and the artifact E2E
+  verification. A tag that does not match the workspace version stops the
+  workflow before anything is published. Prerelease tags (containing `-`)
+  publish only their full version tag, never `latest`, the moving
+  `<major>.<minor>` tag, or a stable GitHub release. After the push, the
+  workflow verifies that every generated tag resolves to the reported digest,
+  that the index contains `linux/amd64`, `linux/arm64` and `linux/arm/v7`, and
+  that the SLSA provenance and SPDX SBOM attestations are present; any mismatch
+  fails the job. See `docs/release-verification.md`.
+
 ## [1.9.1] - 2026-11-04
 
 Patch release fixing residual correctness, concurrency, and UI issues found

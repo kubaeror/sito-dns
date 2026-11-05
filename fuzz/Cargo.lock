@@ -1912,7 +1912,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sito-clients"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1930,7 +1930,7 @@ dependencies = [
 
 [[package]]
 name = "sito-core"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "sito-dnssec"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "sito-filter"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "sito-ha"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "sito-proto"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "hickory-proto",
  "idna",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "sito-rewrites"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "hickory-proto",
  "serde",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "sito-runtime"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "arc-swap",
  "sito-clients",
@@ -2060,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "sito-stats"
-version = "1.9.1"
+version = "1.9.2"
 dependencies = [
  "chrono",
  "serde",

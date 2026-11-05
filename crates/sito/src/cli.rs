@@ -10,6 +10,75 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
+/// Conventional system-wide configuration path used by packages and the
+/// systemd unit.
+pub const SYSTEM_CONFIG_PATH: &str = "/etc/sito/config.toml";
+
+/// Resolves the configuration path for server-side commands.
+///
+/// `--config` always wins. Otherwise an existing `./config.toml` (development
+/// and manual installs) is preferred, then the system path. When neither
+/// exists the relative default is returned so first-boot setup can create it;
+/// commands that must fail closed use [`resolve_update_config_path`] instead.
+pub fn resolve_config_path(explicit: Option<&Path>) -> PathBuf {
+    resolve_config_path_from(
+        explicit,
+        Path::new("config.toml"),
+        Path::new(SYSTEM_CONFIG_PATH),
+    )
+}
+
+fn resolve_config_path_from(explicit: Option<&Path>, local: &Path, system: &Path) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    if local.is_file() {
+        return local.to_path_buf();
+    }
+    if system.is_file() {
+        return system.to_path_buf();
+    }
+    local.to_path_buf()
+}
+
+/// Resolves the configuration path for `sito update`, which cannot run without
+/// knowing the persisted signature policy.
+///
+/// An existing `/etc/sito/config.toml` is preferred over `./config.toml`
+/// because updates are usually run as root from an arbitrary cwd.
+pub fn resolve_update_config_path(explicit: Option<&Path>) -> Result<PathBuf, anyhow::Error> {
+    resolve_update_config_path_from(
+        explicit,
+        Path::new("config.toml"),
+        Path::new(SYSTEM_CONFIG_PATH),
+    )
+}
+
+fn resolve_update_config_path_from(
+    explicit: Option<&Path>,
+    local: &Path,
+    system: &Path,
+) -> Result<PathBuf, anyhow::Error> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    // A system configuration wins over a relative file for updates: the
+    // operator may run the command from any cwd after stopping the service,
+    // and a stray ./config.toml must not silently change the signature policy.
+    if system.is_file() {
+        return Ok(system.to_path_buf());
+    }
+    if local.is_file() {
+        return Ok(local.to_path_buf());
+    }
+    Err(anyhow::anyhow!(
+        "Refusing to update: no configuration file found at '{}' or '{}'. Pass 'sito update --config <path>' (or place --config before the subcommand) to choose the configuration explicitly (system installs use {}).",
+        system.display(),
+        local.display(),
+        SYSTEM_CONFIG_PATH
+    ))
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "sito",
@@ -18,9 +87,10 @@ use std::time::Duration;
     about = "High-performance, self-hosted, filtering DNS server"
 )]
 pub struct Cli {
-    /// Path to configuration file
-    #[arg(short, long, default_value = "config.toml")]
-    pub config: PathBuf,
+    /// Path to configuration file (default: ./config.toml when present, then
+    /// /etc/sito/config.toml)
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
 
     /// Skip web-based setup wizard gating and start with defaults immediately
     #[arg(long)]
@@ -28,6 +98,14 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Commands>,
+}
+
+impl Cli {
+    /// Configuration path after applying an explicit `--config` or
+    /// auto-detection (see [`resolve_config_path`]).
+    pub fn config_path(&self) -> PathBuf {
+        resolve_config_path(self.config.as_deref())
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -81,6 +159,10 @@ pub enum Commands {
     },
     /// Check for and install software updates
     Update {
+        /// Optional path to configuration file (defaults to main --config; the
+        /// long form is required because -c selects --check)
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Only check for available updates without installing
         #[arg(short, long)]
         check: bool,
@@ -96,15 +178,26 @@ pub enum Commands {
         /// Optional path to configuration file (defaults to main --config)
         #[arg(short, long)]
         config: Option<PathBuf>,
-        /// Optional new admin password (defaults to adminadmin)
+        /// New admin password (a random one is generated and printed once when omitted)
         #[arg(short, long)]
         password: Option<String>,
+        /// Also delete every non-admin account (full account-store replacement)
+        #[arg(long = "reset-all", alias = "reset-users")]
+        reset_all: bool,
+        /// Allow the reset while sito is running. The running server keeps its
+        /// in-memory credentials/sessions until it is restarted.
+        #[arg(long)]
+        force: bool,
     },
     /// Invalidate all persisted web sessions and API tokens (users are kept)
     ResetSessions {
         /// Optional path to configuration file (defaults to main --config)
         #[arg(short, long)]
         config: Option<PathBuf>,
+        /// Allow the reset while sito is running. Live sessions and API tokens
+        /// stay valid until the running server is restarted.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -125,6 +218,15 @@ pub enum HaCommands {
         /// (hostname or IP address). Repeatable.
         #[arg(long = "san", value_name = "HOST_OR_IP", action = clap::ArgAction::Append)]
         san: Vec<String>,
+        /// Transfer the generated certificates and private keys to this uid.
+        /// Requires --gid. Use the runtime user (for example 65532 in the
+        /// container image) so an unprivileged daemon can read its key.
+        #[arg(long, requires = "gid", value_name = "UID")]
+        uid: Option<u32>,
+        /// Transfer the generated certificates and private keys to this gid.
+        /// Requires --uid.
+        #[arg(long, requires = "uid", value_name = "GID")]
+        gid: Option<u32>,
     },
 }
 
@@ -229,6 +331,15 @@ pub async fn run_healthcheck(addr: SocketAddr, timeout_ms: u64) -> Result<(), an
     probe_dns(addr, timeout_ms).await
 }
 
+/// Whether the configuration makes HA replication part of this node's role.
+///
+/// Mirrors the server's readiness gate so the healthcheck fails closed only
+/// when `[ha]` is actually part of the deployment.
+#[must_use]
+pub fn ha_readiness_required(config: &Config) -> bool {
+    sito_api::state::ha_readiness_required(config)
+}
+
 /// Healthcheck that may accept the admin web interface while the server is
 /// still in first-boot setup-pending mode.
 ///
@@ -236,52 +347,103 @@ pub async fn run_healthcheck(addr: SocketAddr, timeout_ms: u64) -> Result<(), an
 /// the admin API explicitly reports that setup is pending. Once setup has
 /// completed (or when the API cannot confirm setup-pending), a failing DNS
 /// probe stays a healthcheck failure so a broken DNS listener is never masked.
+///
+/// When `ha_required` is set, a successful DNS probe is not sufficient: the
+/// `/health` endpoint must also report the HA role as ready. This keeps a
+/// failed mTLS listener or a slave that never completed its handshake from
+/// looking healthy just because DNS still answers.
 pub async fn run_healthcheck_or_web(
     dns_addr: Option<SocketAddr>,
     web_addr: SocketAddr,
     timeout_ms: u64,
     setup_fallback: bool,
+    ha_required: bool,
 ) -> Result<(), anyhow::Error> {
     let dns_error = if let Some(addr) = dns_addr {
-        match probe_dns(addr, timeout_ms).await {
-            Ok(()) => return Ok(()),
-            Err(e) => Some(e),
-        }
+        probe_dns(addr, timeout_ms).await.err()
     } else {
-        None
+        Some(anyhow::anyhow!(
+            "Healthcheck failed: no DNS target is configured and the setup web fallback is disabled"
+        ))
     };
 
-    if !setup_fallback {
-        return Err(dns_error.unwrap_or_else(|| {
-            anyhow::anyhow!(
-                "Healthcheck failed: no DNS target is configured and the setup web fallback is disabled"
-            )
-        }));
+    let mut setup_pending_note = None;
+    if let Some(dns_error) = dns_error {
+        if !setup_fallback {
+            return Err(dns_error);
+        }
+
+        match probe_setup_pending(web_addr, timeout_ms).await {
+            Ok(true) => {
+                setup_pending_note = Some(format!(
+                    "Healthcheck OK: DNS probe failed ({dns_error}), but admin web interface {web_addr} reports setup pending"
+                ));
+            }
+            Ok(false) => return Err(dns_error),
+            Err(status_error) => {
+                return Err(dns_error.context(format!(
+                    "setup status check against {web_addr} failed: {status_error}"
+                )));
+            }
+        }
     }
 
-    match probe_setup_pending(web_addr, timeout_ms).await {
-        Ok(true) => {
-            if let Some(e) = &dns_error {
-                println!(
-                    "Healthcheck OK: DNS probe failed ({e}), but admin web interface {web_addr} reports setup pending"
-                );
-            } else {
-                println!("Healthcheck OK: admin web interface {web_addr} reports setup pending");
-            }
-            Ok(())
-        }
-        Ok(false) => Err(dns_error.unwrap_or_else(|| {
-            anyhow::anyhow!(
-                "Healthcheck failed: admin web interface {web_addr} is not reporting setup pending"
-            )
-        })),
-        Err(status_error) => Err(match dns_error {
-            Some(dns_err) => dns_err.context(format!(
-                "setup status check against {web_addr} failed: {status_error}"
-            )),
-            None => status_error,
-        }),
+    if ha_required {
+        probe_ha_readiness(web_addr, timeout_ms).await?;
     }
+    if let Some(note) = setup_pending_note {
+        println!("{note}");
+    }
+    Ok(())
+}
+
+/// Verifies the HA readiness reported by the public `/health` endpoint.
+///
+/// Any inability to obtain a definitive answer fails closed: an unreachable
+/// web API or a payload without the `ha` object is an error, not a pass.
+async fn probe_ha_readiness(web_addr: SocketAddr, timeout_ms: u64) -> Result<(), anyhow::Error> {
+    let (status, body) = http_get(web_addr, "/health", timeout_ms)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot verify HA readiness from {web_addr}/health: {e}"))?;
+    if status != 200 {
+        return Err(anyhow::anyhow!(
+            "cannot verify HA readiness: {web_addr}/health returned HTTP {status}"
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+        anyhow::anyhow!("invalid HA readiness response from {web_addr}/health: {e}")
+    })?;
+    let ha = value.get("ha").ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot verify HA readiness: {web_addr}/health does not expose the HA readiness signal"
+        )
+    })?;
+    if !ha
+        .get("required")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(anyhow::anyhow!(
+            "cannot verify HA readiness: {web_addr}/health does not report the configured HA role as required"
+        ));
+    }
+    let ready = ha
+        .get("ready")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot verify HA readiness: {web_addr}/health has no boolean `ha.ready` field"
+            )
+        })?;
+    if ready {
+        return Ok(());
+    }
+    // Deliberately ignore any server-provided detail: this message is printed
+    // into container logs from a public probe. Operators get the detailed
+    // cause from the authenticated `/api/v1/ha/status` endpoint or the logs.
+    Err(anyhow::anyhow!(
+        "Healthcheck failed: HA replication is not ready (see /api/v1/ha/status or the server logs for the reason)"
+    ))
 }
 
 /// Reports whether the admin API is in first-boot setup-pending mode.
@@ -638,15 +800,37 @@ pub fn prepare_no_setup_bootstrap(
 }
 
 /// Executes the `ha gen-certs` subcommand.
+///
+/// `uid`/`gid` transfer every generated certificate and private key to the
+/// unprivileged HA runtime user. They must be provided together; clap enforces
+/// this for the CLI and the check below covers programmatic callers.
 pub fn run_ha_gen_certs(
     dir: &Path,
     master: bool,
     slave: bool,
     san: &[String],
+    uid: Option<u32>,
+    gid: Option<u32>,
 ) -> Result<(), anyhow::Error> {
-    let certs = sito_ha::generate_ha_certs_with_sans(dir, master, slave, san)
+    let ownership = match (uid, gid) {
+        (Some(uid), Some(gid)) => Some(sito_ha::CertOwnership { uid, gid }),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "--uid and --gid must be provided together so the generated keys are usable by exactly one runtime identity"
+            ));
+        }
+    };
+
+    let certs = sito_ha::generate_ha_certs_with_options(dir, master, slave, san, ownership)
         .map_err(|e| anyhow::anyhow!("Failed to generate HA certificates: {e}"))?;
     print!("{}", certs.summary());
+    if let Some(owner) = ownership {
+        println!(
+            "Certificate files are owned by {}:{}; private keys remain mode 0600.",
+            owner.uid, owner.gid
+        );
+    }
     Ok(())
 }
 
@@ -671,12 +855,32 @@ fn update_signature_policy(config_path: &Path) -> Result<bool, anyhow::Error> {
     Ok(cfg.server.update_require_signature)
 }
 
+/// Refuses to start an update when the persisted policy requires signatures
+/// but no verifier can enforce it.
+///
+/// The check runs before the release is downloaded so a missing `cosign`
+/// binary is reported as an actionable configuration problem instead of a
+/// verification failure halfway through an update.
+fn update_preflight(config_path: &Path, cosign_available: bool) -> Result<bool, anyhow::Error> {
+    let require_signature = update_signature_policy(config_path)?;
+    if require_signature && !cosign_available {
+        return Err(anyhow::anyhow!(
+            "Refusing to update: configuration '{}' sets server.update_require_signature = true, \
+             but the 'cosign' binary was not found in /usr/bin, /usr/local/bin or PATH. Install \
+             cosign (re-run contrib/install.sh or see docs/installation.md \"Updating sito\") or \
+             set server.update_require_signature = false only if you accept SHA-256-only integrity.",
+            config_path.display()
+        ));
+    }
+    Ok(require_signature)
+}
+
 /// Executes the `update` subcommand.
 pub async fn run_update(
     check: bool,
     force: bool,
     repo: Option<&str>,
-    config_path: &Path,
+    config_path: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     println!("Checking for updates...");
     let info = sito_api::updater::check_for_update(repo)
@@ -694,6 +898,13 @@ pub async fn run_update(
         return Ok(());
     }
 
+    // Fail closed: if the configuration cannot be found/read or parsed we
+    // cannot know whether signatures are required, so refuse instead of
+    // silently downgrading to checksum-only verification. Resolving here also
+    // means `sudo sito update` works from any cwd after the service is stopped.
+    let config_path = resolve_update_config_path(config_path)?;
+    let require_signature = update_preflight(&config_path, sito_api::updater::cosign_available())?;
+
     if !info.update_available && !force {
         println!("\nsito is up to date.");
         return Ok(());
@@ -709,10 +920,6 @@ pub async fn run_update(
     }
 
     println!("\nApplying update to v{}...", info.latest_version);
-    // Fail closed: if the configuration cannot be read or parsed we cannot
-    // know whether signatures are required, so refuse instead of silently
-    // downgrading to checksum-only verification.
-    let require_signature = update_signature_policy(config_path)?;
     if require_signature {
         println!("Signature verification is required by configuration.");
     }
@@ -724,8 +931,138 @@ pub async fn run_update(
     Ok(())
 }
 
+/// Formats the PID of the process currently holding the service lease.
+fn lease_holder(pid: Option<u32>) -> String {
+    pid.map_or_else(|| "a live process".to_string(), |pid| format!("pid {pid}"))
+}
+
+/// Data-directory access held for the whole duration of a reset.
+///
+/// When the service is stopped the CLI owns the service lease until this value
+/// is dropped. That closes the check-then-write race: a server started by a
+/// supervisor or by `systemctl start` cannot acquire the lease and start serving
+/// stale in-memory state between the run check and the disk writes. When the
+/// operator forced a reset on a live server, no exclusive lease is possible and
+/// callers must print the persisted-only warning.
+#[derive(Debug)]
+enum ResetAccess {
+    Stopped {
+        _lease: crate::service_lock::ServiceLease,
+    },
+    Running {
+        pid: Option<u32>,
+    },
+}
+
+impl ResetAccess {
+    fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+}
+
+/// Acquires reset access, refusing a live service unless `--force` was given.
+///
+/// Acquisition *is* the run check. If the lease was free we hold it through the
+/// reset; if it was held we know a server is live. `force_hint` is the
+/// command-specific consequence of using `--force`, so the refusals do not
+/// mention unrelated credentials.
+fn begin_reset(
+    data_dir: &Path,
+    action: &str,
+    force: bool,
+    force_hint: &str,
+) -> Result<ResetAccess, anyhow::Error> {
+    match crate::service_lock::ServiceLease::acquire(data_dir) {
+        Ok(lease) => Ok(ResetAccess::Stopped { _lease: lease }),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // The lease is held, so a server was live. Read the PID only to
+            // make the message useful; it cannot change the verdict.
+            let pid = match crate::service_lock::status(data_dir) {
+                Ok(crate::service_lock::ServiceStatus::Running { pid }) => pid,
+                _ => None,
+            };
+            if force {
+                Ok(ResetAccess::Running { pid })
+            } else {
+                Err(anyhow::anyhow!(
+                    "Refusing to {action} while sito is running ({}).\n\
+                     Stop the service first:\n  sudo systemctl stop sito\n\
+                     Then run this command again and start it:\n  sudo systemctl start sito\n\
+                     {force_hint}",
+                    lease_holder(pid)
+                ))
+            }
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "Refusing to {action}: cannot acquire the service lease in '{}': {e}",
+            data_dir.display()
+        )),
+    }
+}
+
+const ADMIN_FORCE_HINT: &str = "Use --force only if you understand that existing web sessions and API \
+     tokens remain valid until the service is restarted and that the new admin password is not \
+     accepted until then.";
+const SESSIONS_FORCE_HINT: &str = "Use --force only if you understand that existing web sessions and \
+     API tokens remain valid until the service is restarted.";
+
+const ADMIN_LIVE_STATE: &str = "Existing web sessions and API tokens remain valid, and the running \
+     server still accepts the old admin password and rejects the new one";
+const SESSIONS_LIVE_STATE: &str = "Existing web sessions and API tokens remain valid";
+
+/// Warning printed by `--force` when the server is still running.
+fn running_service_warning(pid: Option<u32>, live_state: &str) -> String {
+    format!(
+        "WARNING: sito is still running ({}). This command changed persisted files only; \
+         the running server keeps its in-memory state. {live_state} until the service is \
+         restarted. Restart it now:\n  sudo systemctl stop sito\n  sudo systemctl start sito",
+        lease_holder(pid)
+    )
+}
+
+/// Outcome of `reset-admin`, including a generated password so callers can
+/// print it exactly once without persisting it anywhere else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetAdminOutcome {
+    pub users_path: PathBuf,
+    /// `Some` when the password was generated because none was supplied.
+    pub generated_password: Option<String>,
+    pub reset_all_users: bool,
+}
+
+/// Generates a 192-bit random hex password for `reset-admin`.
+fn generate_reset_admin_password() -> String {
+    let mut bytes = [0u8; 24];
+    rand::rng().fill(&mut bytes);
+    let mut password = String::with_capacity(48);
+    for byte in &bytes {
+        let _ = std::fmt::Write::write_fmt(&mut password, format_args!("{byte:02x}"));
+    }
+    password
+}
+
+/// Applies the shared API/wizard password policy to an operator-supplied
+/// `reset-admin` password.
+fn validate_reset_admin_password(password: &str) -> Result<(), anyhow::Error> {
+    sito_api::handlers::auth_handlers::validate_password_policy(password)
+        .map_err(|problem| anyhow::anyhow!("Invalid admin password: {}", problem.detail))
+}
+
+/// Executes the `reset-admin` subcommand, preserving non-admin accounts.
+pub fn run_reset_admin(
+    config_path: &Path,
+    password: Option<&str>,
+) -> Result<ResetAdminOutcome, anyhow::Error> {
+    run_reset_admin_with_options(config_path, password, false, false)
+}
+
 /// Executes the `reset-admin` subcommand.
-pub fn run_reset_admin(config_path: &Path, password: Option<&str>) -> Result<(), anyhow::Error> {
+pub fn run_reset_admin_with_options(
+    config_path: &Path,
+    password: Option<&str>,
+    reset_all_users: bool,
+    force: bool,
+) -> Result<ResetAdminOutcome, anyhow::Error> {
     let content = std::fs::read_to_string(config_path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to read configuration file '{}': {}",
@@ -742,27 +1079,70 @@ pub fn run_reset_admin(config_path: &Path, password: Option<&str>) -> Result<(),
         )
     })?;
 
-    let pass = password.unwrap_or("adminadmin");
-    let users_path = sito_api::AuthManager::reset_admin_credentials(&config.server.data_dir, pass)
-        .map_err(|e| anyhow::anyhow!("Failed to reset admin credentials: {e}"))?;
+    // Keep the returned guard alive through the writes below.
+    let access = begin_reset(
+        &config.server.data_dir,
+        "reset administrative credentials",
+        force,
+        ADMIN_FORCE_HINT,
+    )?;
 
-    println!(
-        "Administrative credentials successfully reset in '{}'.\nUsername: admin",
-        users_path.display()
-    );
-    if password.is_none() {
+    let (pass, generated_password) = if let Some(password) = password {
+        validate_reset_admin_password(password)?;
+        (password.to_string(), None)
+    } else {
+        let generated = generate_reset_admin_password();
+        (generated.clone(), Some(generated))
+    };
+
+    let users_path = if reset_all_users {
+        sito_api::AuthManager::reset_admin_credentials_full(&config.server.data_dir, &pass)
+    } else {
+        sito_api::AuthManager::reset_admin_credentials(&config.server.data_dir, &pass)
+    }
+    .map_err(|e| anyhow::anyhow!("Failed to reset admin credentials: {e}"))?;
+
+    if let ResetAccess::Running { pid } = &access {
         println!(
-            "Password: adminadmin (Warning: Please change this default password upon logging in!)"
+            "Administrative credentials were written to '{}'.\nUsername: admin",
+            users_path.display()
         );
+        println!("{}", running_service_warning(*pid, ADMIN_LIVE_STATE));
+    } else {
+        println!(
+            "Administrative credentials successfully reset in '{}'.\nUsername: admin",
+            users_path.display()
+        );
+    }
+    if let Some(generated) = generated_password.as_deref() {
+        println!("Password: {generated}");
+        println!("Store this password now; it is not written anywhere else.");
     } else {
         println!("Password: (custom password set)");
     }
+    if reset_all_users {
+        println!("All non-admin accounts were removed (--reset-all).");
+    } else {
+        println!("Other user accounts were preserved.");
+    }
 
-    Ok(())
+    Ok(ResetAdminOutcome {
+        users_path,
+        generated_password,
+        reset_all_users,
+    })
 }
 
 /// Executes the `reset-sessions` subcommand: removes persisted sessions and API tokens.
 pub fn run_reset_sessions(config_path: &Path) -> Result<(), anyhow::Error> {
+    run_reset_sessions_with_options(config_path, false)
+}
+
+/// Executes `reset-sessions` with an explicit live-service override.
+pub fn run_reset_sessions_with_options(
+    config_path: &Path,
+    force: bool,
+) -> Result<(), anyhow::Error> {
     let content = std::fs::read_to_string(config_path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to read configuration file '{}': {}",
@@ -780,6 +1160,14 @@ pub fn run_reset_sessions(config_path: &Path) -> Result<(), anyhow::Error> {
     })?;
 
     let data_dir = &config.server.data_dir;
+    // Keep the returned guard alive through the writes below.
+    let access = begin_reset(
+        data_dir,
+        "reset sessions and API tokens",
+        force,
+        SESSIONS_FORCE_HINT,
+    )?;
+
     let mut removed = 0;
     for name in ["sessions.toml", "tokens.toml"] {
         let path = data_dir.join(name);
@@ -802,8 +1190,14 @@ pub fn run_reset_sessions(config_path: &Path) -> Result<(), anyhow::Error> {
             "No persisted sessions or tokens found in '{}'.",
             data_dir.display()
         );
+    } else if access.is_running() {
+        println!("Persisted web sessions and API tokens were removed.");
     } else {
         println!("All web sessions and API tokens have been invalidated.");
+    }
+
+    if let ResetAccess::Running { pid } = &access {
+        println!("{}", running_service_warning(*pid, SESSIONS_LIVE_STATE));
     }
     Ok(())
 }
@@ -818,7 +1212,7 @@ mod tests {
         let args_no_setup = vec!["sito", "--no-setup"];
         let cli = Cli::try_parse_from(args_no_setup).expect("parse args");
         assert!(cli.no_setup);
-        assert_eq!(cli.config, PathBuf::from("config.toml"));
+        assert_eq!(cli.config, None);
 
         let args_default = vec!["sito"];
         let cli_default = Cli::try_parse_from(args_default).expect("parse args");
@@ -827,7 +1221,149 @@ mod tests {
         let args_custom = vec!["sito", "--config", "/etc/sito/custom.toml", "--no-setup"];
         let cli_custom = Cli::try_parse_from(args_custom).expect("parse args");
         assert!(cli_custom.no_setup);
-        assert_eq!(cli_custom.config, PathBuf::from("/etc/sito/custom.toml"));
+        assert_eq!(
+            cli_custom.config,
+            Some(PathBuf::from("/etc/sito/custom.toml"))
+        );
+    }
+
+    #[test]
+    fn test_cli_update_accepts_config_before_and_after_subcommand() {
+        // The documented/error text says `--config <path>`; it must work after
+        // the subcommand as well as in the historical global position.
+        let cli = Cli::try_parse_from(["sito", "update", "--config", "/etc/sito/config.toml"])
+            .expect("parse update --config");
+        match cli.command {
+            Some(Commands::Update { config, .. }) => {
+                assert_eq!(config, Some(PathBuf::from("/etc/sito/config.toml")));
+            }
+            other => panic!("expected update command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["sito", "--config", "/etc/sito/config.toml", "update"])
+            .expect("parse global --config update");
+        assert_eq!(cli.config, Some(PathBuf::from("/etc/sito/config.toml")));
+        match cli.command {
+            Some(Commands::Update { config, .. }) => assert_eq!(config, None),
+            other => panic!("expected update command, got {other:?}"),
+        }
+    }
+
+    fn temp_config_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_config_path_{label}_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_server_config_path_resolution() {
+        let dir = temp_config_dir("server");
+        let local = dir.join("config.toml");
+        let system = dir.join("etc/sito/config.toml");
+        std::fs::create_dir_all(system.parent().unwrap()).unwrap();
+        let explicit = dir.join("explicit.toml");
+
+        // An explicit --config always wins, even when the file does not exist
+        // yet (the setup wizard may create it).
+        assert_eq!(
+            resolve_config_path_from(Some(&explicit), &local, &system),
+            explicit
+        );
+
+        // Neither location exists: keep the historical relative default so
+        // first-boot setup can create ./config.toml.
+        assert_eq!(resolve_config_path_from(None, &local, &system), local);
+
+        // A local config takes precedence over the system path.
+        std::fs::write(&local, "config_version = 1\n").unwrap();
+        assert_eq!(resolve_config_path_from(None, &local, &system), local);
+
+        // Without a local config, the system path is used.
+        std::fs::remove_file(&local).unwrap();
+        std::fs::write(&system, "config_version = 1\n").unwrap();
+        assert_eq!(resolve_config_path_from(None, &local, &system), system);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_config_path_resolution_fails_closed() {
+        let dir = temp_config_dir("update");
+        let local = dir.join("config.toml");
+        let system = dir.join("etc/sito/config.toml");
+        std::fs::create_dir_all(system.parent().unwrap()).unwrap();
+        let explicit = dir.join("explicit.toml");
+
+        // Explicit path wins even if missing; the read error is reported when
+        // the signature policy is loaded.
+        assert_eq!(
+            resolve_update_config_path_from(Some(&explicit), &local, &system).unwrap(),
+            explicit
+        );
+
+        // Missing local and system config: refuse with actionable guidance.
+        let err = resolve_update_config_path_from(None, &local, &system)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no configuration file found"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("--config"), "unexpected error: {err}");
+
+        // A local config is used when the system path does not exist.
+        std::fs::write(&local, "config_version = 1\n").unwrap();
+        assert_eq!(
+            resolve_update_config_path_from(None, &local, &system).unwrap(),
+            local
+        );
+
+        // The system config wins when both exist, so a stray ./config.toml
+        // cannot change the signature policy of a system install.
+        std::fs::write(&system, "config_version = 1\n").unwrap();
+        assert_eq!(
+            resolve_update_config_path_from(None, &local, &system).unwrap(),
+            system
+        );
+
+        // --config still overrides the system config.
+        assert_eq!(
+            resolve_update_config_path_from(Some(&explicit), &local, &system).unwrap(),
+            explicit
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_preflight_requires_cosign_when_signatures_required() {
+        let dir = temp_config_dir("preflight");
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, "config_version = 1\n").unwrap();
+
+        // Default policy requires signatures; without cosign the update must
+        // be refused before downloading anything.
+        let err = update_preflight(&cfg, false).unwrap_err().to_string();
+        assert!(err.contains("cosign"), "unexpected error: {err}");
+        assert!(
+            err.contains("update_require_signature"),
+            "unexpected error: {err}"
+        );
+        assert!(update_preflight(&cfg, true).unwrap());
+
+        // Explicit opt-out allows checksum-only verification without cosign.
+        std::fs::write(
+            &cfg,
+            "config_version = 1\n[server]\nupdate_require_signature = false\n",
+        )
+        .unwrap();
+        assert!(!update_preflight(&cfg, false).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -875,6 +1411,73 @@ mod tests {
             Some(Commands::Healthcheck { setup_fallback, .. }) => assert!(setup_fallback),
             other => panic!("expected healthcheck command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_cli_ha_gen_certs_uid_gid() {
+        let cli = Cli::try_parse_from([
+            "sito",
+            "ha",
+            "gen-certs",
+            "--dir",
+            "/tmp/certs",
+            "--uid",
+            "65532",
+            "--gid",
+            "65532",
+        ])
+        .expect("parse args");
+        match cli.command {
+            Some(Commands::Ha {
+                command: HaCommands::GenCerts { uid, gid, .. },
+            }) => {
+                assert_eq!(uid, Some(65532));
+                assert_eq!(gid, Some(65532));
+            }
+            other => panic!("expected ha gen-certs command, got {other:?}"),
+        }
+
+        // --uid and --gid are a pair: half an ownership request must fail
+        // instead of silently producing runtime-unreadable keys.
+        let err = Cli::try_parse_from([
+            "sito",
+            "ha",
+            "gen-certs",
+            "--dir",
+            "/tmp/certs",
+            "--uid",
+            "65532",
+        ])
+        .expect_err("--uid without --gid must be rejected");
+        assert!(err.to_string().contains("--gid"), "unexpected error: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_ha_gen_certs_applies_uid_gid() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_gen_certs_owner_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe");
+        std::fs::write(&probe, b"x").unwrap();
+        let meta = std::fs::metadata(&probe).unwrap();
+        let (uid, gid) = (meta.uid(), meta.gid());
+
+        run_ha_gen_certs(&dir, true, true, &[], Some(uid), Some(gid))
+            .expect("gen-certs with the invoking uid/gid must succeed");
+        for name in ["ca.key", "master.key", "slave.key"] {
+            let meta = std::fs::metadata(dir.join(name)).unwrap();
+            assert_eq!(meta.uid(), uid, "{name} uid");
+            assert_eq!(meta.gid(), gid, "{name} gid");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{name} mode");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression: the healthcheck used to prefer `::1` whenever any bind was
@@ -1092,7 +1695,7 @@ mod tests {
         let (dns_addr, _silent) = spawn_silent_udp().await;
         let web_addr =
             spawn_http_router(vec![("/api/v1/status", 503, "Setup not completed")]).await;
-        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, false)
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, false, false)
             .await
             .expect_err("web reachability must not mask a broken DNS listener by default");
         assert!(
@@ -1102,10 +1705,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_healthcheck_fails_when_ha_is_not_ready() {
+        let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
+        let web_addr = spawn_http_router(vec![(
+            "/health",
+            200,
+            r#"{"status":"ok","setup_pending":false,"ha":{"required":true,"ready":false,"reason":"master mTLS initialization failed: Permission denied"}}"#,
+        )])
+        .await;
+
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, true)
+            .await
+            .expect_err("a healthy DNS probe must not mask an unready HA node");
+        let message = err.to_string();
+        assert!(
+            message.contains("HA replication is not ready"),
+            "the healthcheck must report the unready HA role: {message}"
+        );
+        // `/health` is public; the healthcheck must not echo internal paths or
+        // OS errors from the server's detailed readiness reason into logs.
+        assert!(
+            !message.contains("Permission denied") && !message.contains("mTLS initialization"),
+            "the public healthcheck failure must stay generic: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_healthcheck_passes_when_ha_is_ready() {
+        let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
+        let web_addr = spawn_http_router(vec![(
+            "/health",
+            200,
+            r#"{"status":"ok","setup_pending":false,"ha":{"required":true,"ready":true,"reason":null}}"#,
+        )])
+        .await;
+
+        run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, true)
+            .await
+            .expect("a ready HA node must satisfy the healthcheck");
+    }
+
+    #[tokio::test]
+    async fn test_healthcheck_ha_required_without_signal_fails_closed() {
+        let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
+        let web_addr = spawn_http_router(vec![(
+            "/health",
+            200,
+            r#"{"status":"ok","setup_pending":false}"#,
+        )])
+        .await;
+
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, true)
+            .await
+            .expect_err("a missing HA readiness signal must fail closed");
+        assert!(
+            err.to_string().contains("HA readiness"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_healthcheck_ignores_ha_when_not_configured() {
+        let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
+        // No web listener is required when HA is not part of the role.
+        let web_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, false, false)
+            .await
+            .expect("a DNS-only node must stay healthy without an HA check");
+    }
+
+    #[test]
+    fn test_ha_readiness_required_from_config() {
+        let mut cfg = Config::default();
+        cfg.server.role = "master".to_string();
+        assert!(
+            !ha_readiness_required(&cfg),
+            "no [ha] section means no HA readiness gate"
+        );
+
+        cfg.ha = Some(toml::from_str("replication_port = 8953").unwrap());
+        assert!(ha_readiness_required(&cfg));
+
+        cfg.ha = Some(toml::from_str("replication_port = 0").unwrap());
+        assert!(
+            !ha_readiness_required(&cfg),
+            "an explicitly disabled master replication is not a gate"
+        );
+
+        cfg.server.role = "slave".to_string();
+        cfg.ha = Some(toml::from_str("master_url = \"wss://10.0.0.1:8953\"").unwrap());
+        assert!(ha_readiness_required(&cfg));
+
+        cfg.ha = None;
+        assert!(!ha_readiness_required(&cfg));
+    }
+
+    #[tokio::test]
     async fn test_healthcheck_setup_fallback_accepts_pending_health_json() {
         let (dns_addr, _silent) = spawn_silent_udp().await;
         let web_addr = spawn_http_router(vec![("/health", 200, "{\"setup_pending\": true}")]).await;
-        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true)
+        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true, false)
             .await
             .expect("setup-pending web interface must satisfy the setup fallback");
     }
@@ -1115,7 +1814,7 @@ mod tests {
         let (dns_addr, _silent) = spawn_silent_udp().await;
         let web_addr =
             spawn_http_router(vec![("/api/v1/status", 503, "Setup not completed")]).await;
-        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true)
+        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true, false)
             .await
             .expect("503 setup-pending signal must satisfy the setup fallback");
     }
@@ -1124,7 +1823,7 @@ mod tests {
     async fn test_healthcheck_setup_fallback_rejects_completed_setup() {
         let (dns_addr, _silent) = spawn_silent_udp().await;
         let web_addr = spawn_http_router(vec![("/api/v1/status", 401, "Unauthorized")]).await;
-        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true)
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true, false)
             .await
             .expect_err("completed setup must not mask a broken DNS listener");
         assert!(
@@ -1175,6 +1874,183 @@ mod tests {
             let mode = std::fs::metadata(&restored).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "restore must repair loose permissions");
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn reset_admin_fixture() -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("sito_reset_admin_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "config_version = 1\n[server]\ndata_dir = \"{}\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        (dir, config_path)
+    }
+
+    #[test]
+    fn test_cli_reset_admin_reset_all_flag() {
+        for flag in ["--reset-all", "--reset-users"] {
+            let cli = Cli::try_parse_from(["sito", "reset-admin", flag]).expect("parse args");
+            assert!(matches!(
+                cli.command,
+                Some(Commands::ResetAdmin {
+                    reset_all: true,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_cli_reset_force_flags() {
+        let cli = Cli::try_parse_from(["sito", "reset-admin", "--force"]).expect("parse args");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::ResetAdmin { force: true, .. })
+        ));
+
+        let cli = Cli::try_parse_from(["sito", "reset-sessions", "--force"]).expect("parse args");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::ResetSessions { force: true, .. })
+        ));
+
+        let cli = Cli::try_parse_from(["sito", "reset-sessions"]).expect("parse args");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::ResetSessions { force: false, .. })
+        ));
+    }
+
+    /// The reset must own the service lease for its whole duration, so a
+    /// supervisor or `systemctl start` cannot slip a live server between the
+    /// run check and the disk writes.
+    #[test]
+    fn test_reset_holds_service_lease_until_access_is_dropped() {
+        let (dir, _config_path) = reset_admin_fixture();
+        let access = begin_reset(&dir, "test reset", false, SESSIONS_FORCE_HINT)
+            .expect("stopped service must be allowed");
+        assert!(matches!(access, ResetAccess::Stopped { .. }));
+
+        let err = crate::service_lock::ServiceLease::acquire(&dir)
+            .expect_err("a server must not start while a reset holds the lease");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        drop(access);
+        drop(
+            crate::service_lock::ServiceLease::acquire(&dir)
+                .expect("lease must be released when the reset ends"),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_begin_reset_refuses_or_forces_live_service() {
+        let (dir, _config_path) = reset_admin_fixture();
+        let lease = crate::service_lock::ServiceLease::acquire(&dir).unwrap();
+
+        let err = begin_reset(&dir, "test reset", false, SESSIONS_FORCE_HINT)
+            .expect_err("a live service must be refused without --force");
+        let message = err.to_string();
+        assert!(message.contains("web sessions and API tokens remain valid"));
+        assert!(!message.contains("admin password"));
+
+        let access = begin_reset(&dir, "test reset", true, ADMIN_FORCE_HINT)
+            .expect("--force must allow a live service");
+        assert!(access.is_running());
+
+        drop(access);
+        drop(lease);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reset_admin_rejects_weak_or_default_passwords() {
+        let (dir, config_path) = reset_admin_fixture();
+        let _ = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+
+        for weak in ["adminadmin", "short", "has space 123"] {
+            let err = run_reset_admin(&config_path, Some(weak))
+                .expect_err("weak password must be rejected");
+            assert!(
+                !err.to_string().is_empty(),
+                "rejection must explain the password policy"
+            );
+        }
+
+        // The users file was not rotated by the rejected attempts.
+        let mgr = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(matches!(
+            mgr.login("admin", "adminadmin", "127.0.0.1").await,
+            sito_api::auth::LoginResult::Success(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reset_admin_without_password_never_writes_default() {
+        let (dir, config_path) = reset_admin_fixture();
+        let _ = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+
+        let outcome = run_reset_admin(&config_path, None).expect("generated-password reset");
+        let generated = outcome
+            .generated_password
+            .expect("missing --password must generate one");
+        assert_ne!(generated, "adminadmin");
+        validate_reset_admin_password(&generated).expect("generated password meets policy");
+
+        let mgr = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(matches!(
+            mgr.login("admin", "adminadmin", "127.0.0.1").await,
+            sito_api::auth::LoginResult::InvalidCredentials { .. }
+        ));
+        assert!(matches!(
+            mgr.login("admin", &generated, "127.0.0.1").await,
+            sito_api::auth::LoginResult::Success(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reset_admin_preserves_non_admin_users_by_default() {
+        let (dir, config_path) = reset_admin_fixture();
+        {
+            let mgr = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+            mgr.update_user_password("admin", "OldAdminPassword1!")
+                .await;
+            mgr.create_user("alice", "AlicePassword1!", sito_api::auth::Role::Operator)
+                .await;
+        }
+
+        run_reset_admin(&config_path, Some("NewAdminPassword1!")).expect("reset admin password");
+
+        let mgr = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            mgr.has_user("alice"),
+            "non-admin accounts must be preserved"
+        );
+        assert_eq!(mgr.role_of("alice"), Some(sito_api::auth::Role::Operator));
+        assert!(matches!(
+            mgr.login("admin", "NewAdminPassword1!", "127.0.0.1").await,
+            sito_api::auth::LoginResult::Success(_)
+        ));
+
+        // The explicit full reset is the only path that removes other accounts.
+        let outcome =
+            run_reset_admin_with_options(&config_path, Some("NewAdminPassword2!"), true, false)
+                .unwrap();
+        assert!(outcome.reset_all_users);
+        let mgr = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(!mgr.has_user("alice"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

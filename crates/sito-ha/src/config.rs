@@ -104,6 +104,29 @@ impl Default for HaConfig {
 }
 
 impl HaConfig {
+    /// Whether the node's role depends on a working HA replication path.
+    ///
+    /// Used by the healthcheck to fail closed only when replication is
+    /// actually part of the deployment:
+    /// - a master with `replication_port = 0` has explicitly disabled HA;
+    /// - a slave with no `[ha]` section is not enrolled in a cluster;
+    /// - any slave with an `[ha]` section is expected to replicate (a missing
+    ///   `master_url` is then a misconfiguration, not a healthy idle node).
+    #[must_use]
+    pub fn readiness_required(role: &str, ha: Option<&toml::Value>) -> bool {
+        let Some(ha) = ha else {
+            return false;
+        };
+        match role {
+            "master" => ha
+                .get("replication_port")
+                .and_then(toml::Value::as_integer)
+                .is_none_or(|port| port > 0),
+            "slave" => true,
+            _ => false,
+        }
+    }
+
     /// Deserializes `HaConfig` from a `toml::Value`.
     pub fn from_toml_value(val: &toml::Value) -> Result<Self, HaError> {
         val.clone().try_into().map_err(|e| HaError::Validation {
@@ -211,6 +234,23 @@ impl HaConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_readiness_required_only_when_replication_is_expected() {
+        assert!(!HaConfig::readiness_required("master", None));
+        let enabled: toml::Value = toml::from_str("replication_port = 8953").unwrap();
+        assert!(HaConfig::readiness_required("master", Some(&enabled)));
+        let disabled: toml::Value = toml::from_str("replication_port = 0").unwrap();
+        assert!(!HaConfig::readiness_required("master", Some(&disabled)));
+
+        assert!(!HaConfig::readiness_required("slave", None));
+        let slave: toml::Value = toml::from_str("master_url = \"wss://127.0.0.1:8953\"").unwrap();
+        assert!(HaConfig::readiness_required("slave", Some(&slave)));
+        // An [ha] section on a slave without master_url is a misconfiguration
+        // and must still gate health instead of looking idle.
+        let incomplete: toml::Value = toml::from_str("replication_port = 8953").unwrap();
+        assert!(HaConfig::readiness_required("slave", Some(&incomplete)));
+    }
 
     #[test]
     fn test_ha_config_defaults_and_parsing() {

@@ -17,6 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
+/// Router tests exercise a configured deployment; a non-default admin password
+/// keeps the first-boot gate from closing the login path under test.
+const TEST_ADMIN_PASSWORD: &str = "TestAdminPassword123!";
+
 async fn create_test_context(temp_dir: &Path, setup_pending: bool) -> ServerContext {
     let db_path = temp_dir.join("test_stats.db");
     let stats_db = StatsDb::open(&db_path).await.unwrap();
@@ -51,6 +55,9 @@ async fn create_test_context(temp_dir: &Path, setup_pending: bool) -> ServerCont
     ))));
 
     let auth_mgr = Arc::new(AuthManager::new());
+    auth_mgr
+        .update_user_password("admin", TEST_ADMIN_PASSWORD)
+        .await;
 
     let runtime = Arc::new(sito_runtime::RuntimeState::new(
         config_arc.clone(),
@@ -126,7 +133,7 @@ async fn test_acceptance_m10_csrf_and_origin_enforcement() {
         .uri("/api/v1/auth/login")
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::json!({"user": "admin", "pass": "adminadmin"}).to_string(),
+            serde_json::json!({"user": "admin", "pass": TEST_ADMIN_PASSWORD}).to_string(),
         ))
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
@@ -232,7 +239,7 @@ async fn test_acceptance_m10_security_headers_and_cookies() {
         .uri("/api/v1/auth/login")
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
-            serde_json::json!({"user": "admin", "pass": "adminadmin"}).to_string(),
+            serde_json::json!({"user": "admin", "pass": TEST_ADMIN_PASSWORD}).to_string(),
         ))
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
@@ -604,7 +611,7 @@ async fn test_acceptance_m10_ui_users_csrf_and_rbac() {
         }
     };
 
-    let (admin_session, admin_csrf) = login("admin", "adminadmin").await;
+    let (admin_session, admin_csrf) = login("admin", TEST_ADMIN_PASSWORD).await;
     let admin_cookies = format!("sito_session={admin_session}; sito_csrf={admin_csrf}");
 
     // 1. Missing CSRF token -> 403.

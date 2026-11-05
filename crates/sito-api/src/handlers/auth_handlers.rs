@@ -6,7 +6,7 @@ use axum::http::header::{HeaderMap, SET_COOKIE};
 use axum::response::{IntoResponse, Response};
 use std::str::FromStr;
 
-use crate::auth::manager::{LoginResult, TotpVerifyResult, UserMutationError};
+use crate::auth::manager::{LoginResult, TotpMutationError, TotpVerifyResult, UserMutationError};
 use crate::auth::rbac::RequireAdmin;
 use crate::auth::session::{
     Session, build_clear_csrf_cookie, build_clear_partial_cookie, build_clear_session_cookie,
@@ -133,6 +133,9 @@ pub async fn login(
                 "Invalid credentials. Remaining attempts before lockout: {remaining_attempts}"
             )))
         }
+        LoginResult::StaleCredentials => Err(ProblemDetails::unauthorized(
+            "Invalid credentials. Please try again.",
+        )),
     }
 }
 
@@ -292,15 +295,21 @@ pub async fn enable_totp(
     Json(req): Json<TotpConfirmRequest>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
     let username = session_username(&admin)?;
-    if ctx.auth_mgr.confirm_totp_setup(username, &req.code).await {
-        Ok(Json(GenericMessageResponse {
-            message: "TOTP 2FA enabled successfully".to_string(),
-        }))
-    } else {
-        Err(ProblemDetails::bad_request(
-            "Invalid TOTP verification code",
-        ))
-    }
+    ctx.auth_mgr
+        .try_confirm_totp_setup(username, &req.code)
+        .await
+        .map_err(|err| match err {
+            TotpMutationError::InvalidCode => {
+                ProblemDetails::bad_request("Invalid TOTP verification code")
+            }
+            TotpMutationError::NotFound => ProblemDetails::not_found("User account not found"),
+            TotpMutationError::Persistence(detail) => ProblemDetails::internal_error(format!(
+                "Failed to persist the user store while enabling TOTP: {detail}"
+            )),
+        })?;
+    Ok(Json(GenericMessageResponse {
+        message: "TOTP 2FA enabled successfully".to_string(),
+    }))
 }
 
 /// Disable TOTP 2FA. Requires the account password and, when TOTP is enabled,
@@ -350,9 +359,18 @@ pub async fn disable_totp(
         }
     }
 
-    if !ctx.auth_mgr.disable_totp(&username).await {
-        return Err(ProblemDetails::not_found("User account not found"));
-    }
+    ctx.auth_mgr
+        .try_disable_totp(&username)
+        .await
+        .map_err(|err| match err {
+            TotpMutationError::NotFound => ProblemDetails::not_found("User account not found"),
+            TotpMutationError::InvalidCode => {
+                ProblemDetails::bad_request("Invalid TOTP verification code")
+            }
+            TotpMutationError::Persistence(detail) => ProblemDetails::internal_error(format!(
+                "Failed to persist the user store while disabling TOTP: {detail}"
+            )),
+        })?;
     Ok(Json(GenericMessageResponse {
         message: "TOTP 2FA disabled successfully".to_string(),
     }))
@@ -543,6 +561,9 @@ pub(crate) fn user_mutation_problem(
         UserMutationError::LastAdmin => {
             ProblemDetails::bad_request(format!("Cannot {action} the last remaining admin account"))
         }
+        UserMutationError::Persistence(detail) => ProblemDetails::internal_error(format!(
+            "Failed to persist the user store while attempting to {action}: {detail}"
+        )),
     }
 }
 
@@ -597,8 +618,11 @@ pub async fn create_user(
         )));
     }
     ctx.auth_mgr
-        .create_user(username, &req.password, role)
-        .await;
+        .create_user_persisted(username, &req.password, role)
+        .await
+        .map_err(|e| {
+            ProblemDetails::internal_error(format!("Failed to persist the user store: {e}"))
+        })?;
     Ok(Json(UserDto {
         username: username.to_string(),
         role: role.to_string(),
@@ -746,15 +770,10 @@ pub async fn change_password(
         }
     }
 
-    if !ctx
-        .auth_mgr
-        .update_user_password(&target, &req.new_password)
+    ctx.auth_mgr
+        .update_user_password_checked(&target, &req.new_password)
         .await
-    {
-        return Err(ProblemDetails::not_found(format!(
-            "User '{target}' not found"
-        )));
-    }
+        .map_err(|err| user_mutation_problem(&target, "change the password", err))?;
     Ok(Json(GenericMessageResponse {
         message: format!("Password updated for user '{target}'"),
     }))
@@ -1300,6 +1319,73 @@ mod tests {
                 .iter()
                 .any(|token| token.name == "escaped"),
             "no ownerless token may be created under a revoke race"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// A users-file write failure must surface as 500, not a created user.
+    #[tokio::test]
+    async fn test_create_user_reports_users_write_failure() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_create_persist");
+        let mut ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr =
+            std::sync::Arc::new(crate::auth::AuthManager::with_storage(&temp_dir, 24, 5).unwrap());
+        crate::auth::manager::SECRET_WRITE_FAIL_AFTER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((temp_dir.join("users.toml"), 0));
+
+        let err = create_user(
+            admin(),
+            State(ctx.clone()),
+            Json(CreateUserRequest {
+                username: "alice".to_string(),
+                password: "AlicePassword1".to_string(),
+                role: "viewer".to_string(),
+            }),
+        )
+        .await
+        .expect_err("a failed users write must not report success");
+        assert_eq!(err.status, 500);
+        assert!(!ctx.auth_mgr.has_user("alice"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// A users-file write failure during a password change must surface as 500
+    /// and leave the old password valid.
+    #[tokio::test]
+    async fn test_change_password_reports_users_write_failure() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_password_persist");
+        let mut ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr =
+            std::sync::Arc::new(crate::auth::AuthManager::with_storage(&temp_dir, 24, 5).unwrap());
+        ctx.auth_mgr
+            .create_user("alice", "AlicePassword1", Role::Viewer)
+            .await;
+        crate::auth::manager::SECRET_WRITE_FAIL_AFTER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((temp_dir.join("users.toml"), 0));
+
+        let err = change_password(
+            admin(),
+            State(ctx.clone()),
+            Json(ChangePasswordRequest {
+                username: Some("alice".to_string()),
+                current_password: None,
+                new_password: "AlicePassword2".to_string(),
+            }),
+        )
+        .await
+        .expect_err("a failed users write must not report success");
+        assert_eq!(err.status, 500);
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("alice", "AlicePassword1")
+                .await,
+            "the old password must remain valid after a rolled-back change"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

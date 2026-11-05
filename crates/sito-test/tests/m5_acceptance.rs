@@ -25,6 +25,10 @@ use tokio_tungstenite::connect_async;
 use tower::ServiceExt;
 use utoipa::OpenApi;
 
+/// Router tests exercise a configured deployment; a non-default admin password
+/// keeps the first-boot gate from closing the API path under test.
+const TEST_ADMIN_PASSWORD: &str = "TestAdminPassword123!";
+
 async fn create_test_context(temp_dir: &Path) -> (ServerContext, PathBuf, QueryLogWriter) {
     let db_path = temp_dir.join("test_stats.db");
     let stats_db = StatsDb::open(&db_path).await.unwrap();
@@ -59,6 +63,9 @@ async fn create_test_context(temp_dir: &Path) -> (ServerContext, PathBuf, QueryL
     ))));
 
     let auth_mgr = Arc::new(AuthManager::new());
+    auth_mgr
+        .update_user_password("admin", TEST_ADMIN_PASSWORD)
+        .await;
 
     let runtime = Arc::new(sito_runtime::RuntimeState::new(
         config_arc.clone(),

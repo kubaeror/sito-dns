@@ -4,6 +4,90 @@ This guide covers deploying **sito** on Linux hosts using the automated one-line
 
 ---
 
+## Network Exposure and Firewall
+
+**Read this before the host is reachable from an untrusted network.** The
+1.9.2 defaults are deliberately unchanged for compatibility, so they are
+LAN defaults, not internet-safe defaults:
+
+* `web.bind` defaults to `0.0.0.0`, the admin UI is served over plain HTTP, and
+  port `8080` accepts setup and login requests from every reachable source.
+  There is no TLS in the admin listener itself.
+* `dns.bind` defaults to `["0.0.0.0", "::"]` and 1.9.2 has no DNS client
+  allow-list. `dns.rate_limit_per_ip` limits request rate; it is **not** an
+  access control. Any host that can reach the DNS ports can recurse through
+  this server.
+
+Sito logs a startup warning for each exposed listener. Reach the panel through
+an SSH tunnel or a TLS reverse proxy. The firewall examples below allow SSH
+before enabling the default-deny policy and **do not open 8080**, so the direct
+`http://<server-ip>:8080` URL stops working after `ufw enable`; use the tunnel
+or add the temporary LAN-scoped rule shown under "Safe admin access".
+
+### Recommended LAN-only firewall
+
+Replace `192.168.0.0/24` with your LAN subnet. The examples intentionally do
+**not** open the admin port:
+
+```bash
+# UFW: allow SSH first so a remote session survives enabling the firewall
+sudo ufw allow OpenSSH
+sudo ufw default deny incoming
+sudo ufw allow from 192.168.0.0/24 to any port 53 proto udp comment 'sito DNS (UDP, LAN)'
+sudo ufw allow from 192.168.0.0/24 to any port 53 proto tcp comment 'sito DNS (TCP, LAN)'
+sudo ufw enable
+
+# firewalld (equivalent)
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.0.0/24" port port="53" protocol="udp" accept'
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.0.0/24" port port="53" protocol="tcp" accept'
+sudo firewall-cmd --reload
+```
+
+> [!CAUTION]
+> On a remote host, enable the SSH rule **before** `ufw enable`. Enabling a
+> default-deny policy without it drops the SSH session.
+
+If you enable DoT/DoH/DoH3, restrict `853`/`443` to the clients that actually
+need them instead of opening them to everyone.
+
+### Safe admin access
+
+Do not publish port `8080` to the internet. Use an SSH tunnel from your
+workstation:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 user@server
+# then browse http://127.0.0.1:8080
+```
+
+If you need direct browser access from the LAN only during first-time setup,
+add a temporary LAN-scoped rule and remove it when setup is complete:
+
+```bash
+sudo ufw allow from 192.168.0.0/24 to any port 8080 proto tcp
+# after setup:
+sudo ufw delete allow from 192.168.0.0/24 to any port 8080 proto tcp
+```
+
+For browser access without a tunnel, keep `web.bind = "127.0.0.1"` and put a
+TLS reverse proxy on the same host in front of it (set `web.trusted_proxies`
+and, for external URLs, `web.public_url = "https://..."`
+or `web.tls_terminated_by_proxy = true`). For DNS clients outside the LAN,
+restrict the DNS ports to those client addresses at the firewall.
+
+Docker users: `-p 8080:8080` publishes the panel on every host interface.
+Prefer `-p 127.0.0.1:8080:8080` plus an SSH tunnel or reverse proxy, and publish
+DNS only to the interface your clients use. The compose file documents this
+choice without changing the historical mapping.
+
+> [!NOTE]
+> Changing the default to loopback (`web.bind = "127.0.0.1"`) and adding a
+> default-deny DNS client ACL is planned for **1.10.0**. 1.9.2 keeps existing
+> configurations working; the startup warning and this firewall guidance are
+> the patch-release mitigation.
+
+---
+
 ## 1. Quick Install (Automated Shell Script)
 
 For systemd-based distributions (Debian/Ubuntu, Arch, RHEL/Fedora). Alpine
@@ -22,7 +106,10 @@ The installer automatically:
 4. Grants `CAP_NET_BIND_SERVICE` capability to bind ports 53 and 443 without root.
 5. Deploys the hardened systemd unit, enables, and starts the service.
 6. Runs post-install health verification (`systemctl is-active` and HTTP check).
-7. Prompts you to complete setup via the web wizard at `http://<server-ip>:8080`.
+7. Prompts you to complete setup via the web wizard at `http://<server-ip>:8080`
+   and prints LAN-only firewall guidance. The advice allows SSH first, does not
+   open 8080, and points at the SSH tunnel or a temporary LAN-scoped rule for
+   first-time setup.
 
 ---
 
@@ -63,7 +150,7 @@ sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito
 
 ### 2.4 Configuration Skeleton (Optional)
 > [!NOTE]
-> On a clean boot without an existing `config.toml`, **sito** starts in **setup-pending mode** serving only the web panel on port 8080. You can simply open `http://<server-ip>:8080` to generate your configuration via the web wizard, or pass `--no-setup` to boot immediately with built-in defaults.
+> On a clean boot without an existing `config.toml`, **sito** starts in **setup-pending mode** serving only the web panel on port 8080. You can open `http://<server-ip>:8080` from the LAN to generate your configuration via the web wizard, or pass `--no-setup` to boot immediately with a generated administrator password (printed once) and the panel bound to loopback. If the LAN-only firewall from this guide is enabled, it does not open 8080: use the SSH tunnel (`ssh -L 8080:127.0.0.1:8080 user@server`) or the temporary LAN-scoped rule instead.
 >
 > If you prefer to supply configuration up-front, create `/etc/sito/config.toml`:
 
@@ -119,7 +206,9 @@ ExecStart=/usr/local/bin/sito --config /etc/sito/config.toml
 # The service runs unprivileged with ProtectSystem=strict, so in-app updates
 # cannot replace the binary in /usr/local/bin. Updates must be applied as root
 # while the service is stopped: sudo systemctl stop sito && sudo sito update
-# (or re-run this installer). See docs/installation.md "Updating sito".
+# (or re-run this installer). The installer also installs cosign because
+# server.update_require_signature defaults to true. See docs/installation.md
+# "Updating sito".
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -162,8 +251,30 @@ sudo systemctl start sito
 
 # Option B: re-run the installer (SITO_VERSION pins a release)
 sudo systemctl stop sito
-sudo SITO_VERSION=1.9.1 bash contrib/install.sh
+sudo SITO_VERSION=1.9.2 bash contrib/install.sh
 ```
+
+Without `--config`, the CLI prefers an existing `/etc/sito/config.toml` and
+otherwise uses `./config.toml`, so the commands above work from `/root`
+after the service is stopped. Pass `sito update --config <path>` (or
+`sito --config <path> update`) when the configuration lives somewhere else. If
+neither location exists, `sito update` refuses to run instead of guessing the
+signature policy.
+
+`sito update` verifies the release with cosign because
+`server.update_require_signature` defaults to `true`. The installer installs a
+checksum-verified `cosign` (v2.6.5, matching the release workflow) to
+`/usr/local/bin` when it is missing; `SITO_INSTALL_COSIGN=0` skips this, and
+`COSIGN_VERSION` pins a different cosign release. `sito update` refuses before
+downloading anything when signatures are required but cosign is unavailable,
+and names both the missing verifier and the configuration key. If you installed
+the binary manually, install cosign first; only set
+`server.update_require_signature = false` when you intentionally accept
+SHA-256-only integrity.
+
+The web UI's update button uses the same updater and signature policy. Under
+the hardened systemd unit the unprivileged service still cannot replace the
+root-owned binary, so use the CLI path above for system installs.
 
 The installer backs up the previous binary to `/usr/local/bin/sito.bak` and
 restores it automatically if the post-install health check fails. If you manage
@@ -338,7 +449,33 @@ sito --config /etc/sito/config.toml healthcheck
 sito --config /etc/sito/config.toml healthcheck --setup-fallback
 ```
 
-Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard. If the wizard is skipped with `--no-setup`, the bootstrap credentials are `admin` / `adminadmin` and **must be changed immediately** (Settings -> Administrator).
+When the configuration contains a `[ha]` section with HA enabled for the node's
+role, the probe also requires replication to be ready: the master listener must
+have bound with its mTLS key, and a slave must have reached `Synced`. A healthy
+DNS response alone no longer masks an HA failure. See `docs/runbook-ha.md`
+(certificate ownership) if the probe reports an unreadable key.
+
+Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard (or use the SSH tunnel above when the LAN-only firewall is enabled). While setup is pending the server prints a one-time setup token to the console; open `http://<host-ip>:8080/wizard?setup_token=<token>` or send the `X-Setup-Token` header. Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` already exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` account.
+
+If the wizard is skipped with `--no-setup`, a random administrator password is generated and printed once, and the panel binds to loopback. If credentials are lost later, stop the service so the running process cannot keep serving the old credentials, reset the account, then start it again:
+
+```bash
+sudo systemctl stop sito
+
+# Generate a new random password and print it once:
+sudo sito --config /etc/sito/config.toml reset-admin
+
+# Or supply your own strong password (same policy as the wizard/API):
+sudo sito --config /etc/sito/config.toml reset-admin --password '<new-password>'
+
+sudo systemctl start sito
+```
+
+`reset-admin` preserves other accounts. Add `--reset-all` (alias
+`--reset-users`) only when you explicitly want to remove every non-admin
+account. The reset commands refuse to run while the service holds
+`<data_dir>/sito.pid`; `--force` only updates the on-disk state and requires a
+restart before the new password or session revocation takes effect.
 
 ---
 
@@ -358,17 +495,20 @@ sha256sum -c SHA256SUMS
 
 ```bash
 cosign verify-blob \
-  --certificate sito-v1.9.1-x86_64-unknown-linux-gnu.tar.gz.pem \
-  --signature   sito-v1.9.1-x86_64-unknown-linux-gnu.tar.gz.sig \
+  --certificate sito-v1.9.2-x86_64-unknown-linux-gnu.tar.gz.pem \
+  --signature   sito-v1.9.2-x86_64-unknown-linux-gnu.tar.gz.sig \
   --certificate-identity-regexp \
       '^https://github.com/kubaeror/sito-dns/\.github/workflows/release\.yml@refs/tags/.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  sito-v1.9.1-x86_64-unknown-linux-gnu.tar.gz
+  sito-v1.9.2-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 The identity pins the artifact to this repository's release workflow and the
 OIDC issuer pins it to GitHub Actions. `SITO_REQUIRE_SIGNATURE=1|0` controls
-whether `install.sh` enforces signature verification.
+whether `install.sh` enforces signature verification. The installer also
+installs cosign itself (checksum-verified, `COSIGN_VERSION` defaults to
+`v2.6.5`) so the default `sito update` signature policy works after a fresh
+install; set `SITO_INSTALL_COSIGN=0` to manage cosign externally.
 
 ### 6.3 SBOM
 
