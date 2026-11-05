@@ -804,13 +804,14 @@ fn begin_reset(
     }
 }
 
-const ADMIN_FORCE_HINT: &str = "Use --force only if you understand that live sessions and API tokens \
-     remain valid until the service is restarted and that a new admin password will not take effect \
-     until then.";
-const SESSIONS_FORCE_HINT: &str = ADMIN_FORCE_HINT;
+const ADMIN_FORCE_HINT: &str = "Use --force only if you understand that existing web sessions and API \
+     tokens remain valid until the service is restarted and that the new admin password is not \
+     accepted until then.";
+const SESSIONS_FORCE_HINT: &str = "Use --force only if you understand that existing web sessions and \
+     API tokens remain valid until the service is restarted.";
 
-const ADMIN_LIVE_STATE: &str =
-    "The running server still accepts the old admin password and rejects the new one";
+const ADMIN_LIVE_STATE: &str = "Existing web sessions and API tokens remain valid, and the running \
+     server still accepts the old admin password and rejects the new one";
 const SESSIONS_LIVE_STATE: &str = "Existing web sessions and API tokens remain valid";
 
 /// Warning printed by `--force` when the server is still running.
@@ -1457,7 +1458,8 @@ mod tests {
         let err = begin_reset(&dir, "test reset", false, SESSIONS_FORCE_HINT)
             .expect_err("a live service must be refused without --force");
         let message = err.to_string();
-        assert!(message.contains("live sessions and API tokens remain valid"));
+        assert!(message.contains("web sessions and API tokens remain valid"));
+        assert!(!message.contains("admin password"));
 
         let access = begin_reset(&dir, "test reset", true, ADMIN_FORCE_HINT)
             .expect("--force must allow a live service");

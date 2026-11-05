@@ -90,6 +90,14 @@ fn reset_sessions_refuses_while_service_running() {
         "error must mention the explicit override: {stderr}"
     );
     assert!(
+        stderr.contains("web sessions and API tokens remain valid"),
+        "reset-sessions must explain that live sessions/tokens stay valid: {stderr}"
+    );
+    assert!(
+        !stderr.contains("admin password"),
+        "reset-sessions must not mention admin-password semantics: {stderr}"
+    );
+    assert!(
         dir.join("sessions.toml").exists() && dir.join("tokens.toml").exists(),
         "a refused reset must not delete the persisted stores"
     );
@@ -176,6 +184,14 @@ async fn reset_admin_refuses_while_service_running() {
         stderr.contains("--force"),
         "error must mention the explicit override: {stderr}"
     );
+    assert!(
+        stderr.contains("web sessions and API tokens remain valid"),
+        "reset-admin must explain that live sessions/tokens stay valid: {stderr}"
+    );
+    assert!(
+        stderr.contains("new admin password"),
+        "reset-admin must explain that the new password needs a restart: {stderr}"
+    );
     assert_eq!(
         std::fs::read(dir.join("users.toml")).unwrap(),
         users_before,
@@ -226,6 +242,14 @@ async fn reset_admin_force_warns_and_applies_only_after_restart() {
     assert!(
         stdout.contains("restart"),
         "--force must warn that the new password needs a restart: {stdout}"
+    );
+    assert!(
+        stdout.contains("web sessions and API tokens remain valid"),
+        "--force must warn that live sessions/tokens stay valid: {stdout}"
+    );
+    assert!(
+        stdout.contains("old admin password"),
+        "--force must warn that the old password still works: {stdout}"
     );
     assert!(
         !stdout.contains("will take effect immediately"),
