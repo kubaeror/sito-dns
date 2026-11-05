@@ -903,22 +903,24 @@ impl AuthManager {
                 )
             })?;
             file.users.retain(|user| user.username != "admin");
-            // A newly generated/rotated key cannot decrypt existing TOTP
-            // secrets. Preserve the accounts but drop the unusable second
-            // factor instead of failing to start later.
-            if key_was_missing || key_was_rotated {
-                for user in &mut file.users {
-                    if user
-                        .totp
-                        .as_ref()
-                        .is_some_and(|totp| TotpSecretStore::is_encrypted(&totp.secret))
-                    {
-                        tracing::warn!(
-                            user = %user.username,
-                            "Dropping an existing TOTP secret because the encryption key was regenerated during admin reset"
-                        );
-                        user.totp = None;
-                    }
+            // A newly generated/rotated key, or a valid file holding the
+            // wrong 32-byte key, cannot decrypt existing TOTP secrets.
+            // Preserve the accounts but drop the unusable second factor
+            // instead of leaving the server unable to start later.
+            let key_usable = !(key_was_missing || key_was_rotated);
+            for user in &mut file.users {
+                let Some(totp) = user.totp.as_ref() else {
+                    continue;
+                };
+                if !TotpSecretStore::is_encrypted(&totp.secret) {
+                    continue;
+                }
+                if !key_usable || secret_store.open(&user.username, &totp.secret).is_err() {
+                    tracing::warn!(
+                        user = %user.username,
+                        "Dropping an existing TOTP secret that the current encryption key cannot decrypt during admin reset"
+                    );
+                    user.totp = None;
                 }
             }
             file.users
