@@ -1708,58 +1708,66 @@ impl QueryHandler for DnsPipeline {
 
                     if cache_enabled
                         && config.dns.cache.serve_stale_hours > 0
-                        && let Some(mut stale_resp) =
-                            self.cache.get_stale_for_query(&cache_query).await
+                        && let Some((mut stale_resp, stale_status)) = self
+                            .cache
+                            .get_stale_for_query_with_status(&cache_query)
+                            .await
                     {
-                        if bypass_check_needed
-                            && let Some(outcome) = self.anti_doh_blocked_by_answers(
-                                &query,
-                                config,
-                                &stale_resp.answers,
-                                query_id,
-                                &domain_str,
-                                qtype,
-                                "stale_cache",
-                            )
-                        {
-                            return outcome;
-                        }
-                        if cname_uncloaking_active
-                            && self.cname_target_blocked(&stale_resp, qtype, &client, &policy)
-                        {
-                            info!(
+                        if cache_entry_servable(stale_status, validation_active) {
+                            if bypass_check_needed
+                                && let Some(outcome) = self.anti_doh_blocked_by_answers(
+                                    &query,
+                                    config,
+                                    &stale_resp.answers,
+                                    query_id,
+                                    &domain_str,
+                                    qtype,
+                                    "stale_cache",
+                                )
+                            {
+                                return outcome;
+                            }
+                            if cname_uncloaking_active
+                                && self.cname_target_blocked(&stale_resp, qtype, &client, &policy)
+                            {
+                                info!(
+                                    qname = %qname,
+                                    "Stale cached response blocked via CNAME uncloaking"
+                                );
+                                return Self::blocked_outcome(
+                                    &query,
+                                    config,
+                                    query_id,
+                                    &domain_str,
+                                    qtype,
+                                    Some(std::borrow::Cow::Borrowed("cname_uncloaking")),
+                                    None,
+                                );
+                            }
+                            debug!(
                                 qname = %qname,
-                                "Stale cached response blocked via CNAME uncloaking"
+                                "Upstream failed, serving stale cached response (RFC 8767)"
                             );
-                            return Self::blocked_outcome(
-                                &query,
-                                config,
-                                query_id,
-                                &domain_str,
+                            if let Some(ref m) = self.metrics {
+                                m.inc_cache_stale_served();
+                            }
+                            stale_resp.metadata.id = query_id;
+                            return QueryOutcome {
+                                response: Some(stale_resp),
+                                verdict: "allowed",
+                                rule: Some(std::borrow::Cow::Borrowed("stale_cache")),
+                                source: None,
+                                upstream: None,
+                                from_cache: true,
+                                domain_str,
                                 qtype,
-                                Some(std::borrow::Cow::Borrowed("cname_uncloaking")),
-                                None,
-                            );
+                                dnssec: None,
+                            };
                         }
                         debug!(
                             qname = %qname,
-                            "Upstream failed, serving stale cached response (RFC 8767)"
+                            "Ignoring unchecked stale cache entry while DNSSEC validation is active"
                         );
-                        if let Some(ref m) = self.metrics {
-                            m.inc_cache_stale_served();
-                        }
-                        stale_resp.metadata.id = query_id;
-                        return QueryOutcome {
-                            response: Some(stale_resp),
-                            verdict: "allowed",
-                            rule: Some(std::borrow::Cow::Borrowed("stale_cache")),
-                            source: None,
-                            upstream: None,
-                            from_cache: true,
-                            domain_str,
-                            qtype,
-                            dnssec: None,
-                        };
                     }
 
                     QueryOutcome::servfail(&query, domain_str, qtype)
@@ -2716,6 +2724,56 @@ mod tests {
             !resp.metadata.authentic_data,
             "the upstream AD bit must be replaced by local validation"
         );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// RFC 8767 stale answers are not revalidated. An entry cached without
+    /// local validation (`Unchecked`) must never be served to a client while
+    /// validation is active, even when the upstream is down.
+    #[tokio::test]
+    async fn test_stale_unchecked_entry_is_not_served_under_validation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut config = Config::default();
+        config.dns.cache.serve_stale_hours = 1;
+        config.dns.cache.min_ttl = 1;
+        config.dns.cache.max_ttl = 1;
+        config.dns.cache.negative_ttl_max = 1;
+        let fail = std::sync::Arc::new(AtomicBool::new(true));
+        let (pipeline, _server, calls, temp_dir) =
+            test_pipeline_with_failure_toggle(config, fail).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("stale-unchecked.example.").unwrap();
+        let query = do_query(15, &name);
+
+        let mut cached = Message::response(15, OpCode::Query);
+        cached.queries = query.queries.clone();
+        cached.answers.push(Record::from_rdata(
+            name.clone(),
+            1,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 15))),
+        ));
+        pipeline
+            .cache
+            .insert_with_status(&query, &cached, ValidationStatus::Unchecked)
+            .await;
+
+        // Let the entry leave the fresh window so only the stale path can
+        // answer it.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let resp = pipeline.handle(query, client).await.unwrap();
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::ServFail,
+            "a stale Unchecked entry must not bypass active validation"
+        );
+        assert!(
+            resp.answers.is_empty(),
+            "the rejected stale answer must not leak records"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

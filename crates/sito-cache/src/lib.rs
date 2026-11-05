@@ -453,6 +453,63 @@ mod tests {
         );
     }
 
+    /// The stale fallback must expose the recorded validation status (so the
+    /// pipeline can refuse Unchecked entries) and strip every DNSSEC RR type,
+    /// not just RRSIG.
+    #[tokio::test]
+    async fn test_stale_lookup_reports_status_and_strips_all_dnssec_records() {
+        let mut config = make_test_config(1, 1, 300);
+        config.serve_stale_hours = 1;
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("stale-status.example.").unwrap();
+        let query = query_for(82, &qname);
+        let mut response = answer_response(82, &qname, [192, 0, 2, 82]);
+        response.metadata.authentic_data = true;
+        for code in [
+            RecordType::RRSIG,
+            RecordType::DNSKEY,
+            RecordType::DS,
+            RecordType::NSEC3,
+        ] {
+            response.answers.push(Record::from_rdata(
+                qname.clone(),
+                1,
+                RData::Unknown {
+                    code,
+                    rdata: NULL::default(),
+                },
+            ));
+        }
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Unchecked)
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        let (stale, status) = cache
+            .get_stale_for_query_with_status(&query)
+            .await
+            .expect("stale hit");
+        assert_eq!(
+            status,
+            ValidationStatus::Unchecked,
+            "the stale path must expose the recorded validation status"
+        );
+        assert!(
+            !stale.metadata.authentic_data,
+            "stale data must never be served as authenticated"
+        );
+        assert!(
+            stale
+                .answers
+                .iter()
+                .all(|record| !record.record_type().is_dnssec()),
+            "stale sanitization must remove every DNSSEC RR type: {:?}",
+            stale.answers
+        );
+    }
+
     #[tokio::test]
     async fn test_serve_stale_fallback() {
         let mut config = make_test_config(1, 1, 300);

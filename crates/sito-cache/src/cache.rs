@@ -253,8 +253,9 @@ impl DnsCache {
     /// Retrieve a stale cached response according to RFC 8767 when upstreams fail.
     ///
     /// DNSSEC material is removed before serving: a stale entry is not
-    /// revalidated, so it must never claim `AD` and must not carry RRSIGs that
-    /// would let a client treat it as authentic.
+    /// revalidated, so it must never claim `AD` and must not carry RRSIGs,
+    /// DNSKEYs or denial records that would let a client treat it as
+    /// authentic.
     /// TTLs are clamped to 30 seconds as recommended by RFC 8767 section 5.
     pub async fn get_stale(
         &self,
@@ -264,14 +265,31 @@ impl DnsCache {
     ) -> Option<Message> {
         self.get_stale_by_key(&CacheKey::new(name, qtype, qclass))
             .await
+            .map(|(message, _)| message)
     }
 
     /// Retrieve a stale response for `query`, honouring its DO/CD/ECS cache key.
     pub async fn get_stale_for_query(&self, query: &Message) -> Option<Message> {
+        self.get_stale_for_query_with_status(query)
+            .await
+            .map(|(message, _)| message)
+    }
+
+    /// Retrieve a stale response together with the validation status recorded
+    /// when it was cached.
+    ///
+    /// The pipeline uses the status to apply the same
+    /// [`ValidationStatus::Unchecked`] gate as fresh cache hits: stale data is
+    /// not revalidated, so an entry cached without local validation must not
+    /// be served while validation is active.
+    pub async fn get_stale_for_query_with_status(
+        &self,
+        query: &Message,
+    ) -> Option<(Message, ValidationStatus)> {
         self.get_stale_by_key(&CacheKey::from_query(query)?).await
     }
 
-    async fn get_stale_by_key(&self, key: &CacheKey) -> Option<Message> {
+    async fn get_stale_by_key(&self, key: &CacheKey) -> Option<(Message, ValidationStatus)> {
         let config = self.config.load();
         if !config.enabled || config.serve_stale_hours == 0 {
             return None;
@@ -310,7 +328,7 @@ impl DnsCache {
             "Cache serving stale entry for {} (elapsed: {}s, original lifespan: {}s)",
             key.qname, elapsed_secs, entry.max_lifespan_secs
         );
-        Some(response)
+        Some((response, entry.validation_status))
     }
 
     /// Check whether a cached entry is eligible for background prefetch
@@ -591,13 +609,13 @@ fn clear_dnssec_material(response: &mut Message) {
     response.metadata.authentic_data = false;
     response
         .answers
-        .retain(|record| record.record_type() != RecordType::RRSIG);
+        .retain(|record| !record.record_type().is_dnssec());
     response
         .authorities
-        .retain(|record| record.record_type() != RecordType::RRSIG);
+        .retain(|record| !record.record_type().is_dnssec());
     response
         .additionals
-        .retain(|record| record.record_type() != RecordType::RRSIG);
+        .retain(|record| !record.record_type().is_dnssec());
 }
 
 /// Returns true when every answer record's owner is the query name or a CNAME
