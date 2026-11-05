@@ -8,6 +8,28 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **First-boot login gating (P0)**: with `config.toml` present but
+  `users.toml` still holding the bootstrap `admin/adminadmin`, the setup token
+  was active while `setup_pending` was false. The default password could log in
+  remotely and the rest of the API stayed reachable. The middleware now gates on
+  the setup token and an active bootstrap admin as well: `/api/v1/auth/*`
+  returns 403, other `/api/v1/*` routes return 503, and only `/wizard`,
+  `/ui/wizard/*`, static assets, `/health`, `/status` and the
+  setup-token-protected paths remain reachable. An authenticated Admin may
+  always open the wizard.
+- **`reset-admin` no longer installs `adminadmin` or deletes accounts**: when
+  `--password` is omitted the command generates a 192-bit random password and
+  prints it exactly once. Supplied passwords must meet the API/wizard policy
+  (at least 8 characters, no whitespace/control characters, not `adminadmin`).
+  Non-admin accounts are preserved by default; use `--reset-all` /
+  `--reset-users` for an explicit full account-store replacement. Recovery from
+  a corrupt `users.toml` requires that explicit full reset.
+- **Setup wizard persists credentials before configuration**: the administrator
+  password is written and verified before `config.toml` is persisted. A later
+  configuration failure rolls the password back and leaves setup pending, a
+  non-Admin target account is rejected with 400, and the bootstrap `admin`
+  account is removed before setup is marked complete. A failed user-store write
+  is reported as an error instead of a successful setup redirect.
 - **DNSSEC false SERVFAIL after the first signed zone (P0)**: with
   `dns.dnssec.validate = true` and `mode = "validate"`, resolving one signed
   domain and then a different signed domain (for example `cloudflare.com`

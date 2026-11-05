@@ -50,7 +50,12 @@ export TOKEN='sito_...'   # an Admin API token, or use a session cookie instead
 1. **Bootstrap.** On a fresh installation the first administrator is created by
    the setup wizard at `/wizard` (or, for headless installs, by
    `sito --no-setup`, which generates a random password and binds the panel to
-   loopback). The bootstrap account is named `admin`.
+   loopback). The bootstrap account is named `admin`. While the first-boot setup
+   token is active, or `admin/adminadmin` is still the stored bootstrap
+   credential, login, `/api/v1/auth/*`, API tokens and every non-wizard route are
+   disabled. Only `/wizard`, `/ui/wizard/*`, static assets, `/health` and
+   `/status` are reachable; the wizard requires the one-time token printed in
+   the server logs (or an authenticated Admin session).
 2. **Create** additional accounts with `POST /api/v1/auth/users` or the Admin
    **Users** page at `/users`.
 3. **Operate.** Users sign in at `/login` (session cookie) or authenticate with
@@ -61,8 +66,14 @@ export TOKEN='sito_...'   # an Admin API token, or use a session cookie instead
    remain Admin-managed until explicitly revoked.
 5. **Recover.** If credentials are lost, an operator with shell access can run
    `sito reset-admin --config /etc/sito/config.toml --password '<new-password>'`.
-   This recreates the `admin` account and invalidates **all** sessions and
-   tokens by rotating the auth generation.
+   Supplied passwords must meet the same policy as the API and wizard (at least
+   8 characters, no whitespace or control characters, and not `adminadmin`). If
+   `--password` is omitted, a 192-bit random password is generated and printed
+   exactly once. The reset preserves every non-admin account and invalidates
+   **all** sessions and tokens by rotating the auth generation. Add
+   `--reset-all` (alias `--reset-users`) only when a full account-store
+   replacement is intended; a corrupt `users.toml` requires that explicit
+   option.
 
 Account data never leaves the node: `users.toml` is not replicated by HA and
 must be backed up together with `<data_dir>/totp.key` (see

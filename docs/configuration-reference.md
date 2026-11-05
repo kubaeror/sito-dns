@@ -330,6 +330,15 @@ the stored secrets, the server refuses to start rather than silently disabling
 2FA (`sito reset-admin` is the recovery path). An HA slave keeps its own
 `totp.key`; `users.toml` is never replicated or included in HA bundles.
 
+While a first-boot setup token is active, or `users.toml` still contains the
+bootstrap `admin` / `adminadmin` credential, the HTTP middleware disables login,
+token authentication and every non-wizard API/UI route. Only `/wizard`,
+`/ui/wizard/*`, static assets, `/health` and `/status` remain reachable. On an
+already-configured deployment this state is recovered with `sito reset-admin`:
+without `--password` it generates a new random password and prints it once,
+supplied passwords must pass the shared policy, and non-admin accounts are
+preserved unless `--reset-all` is given.
+
 Two additional `[web]` keys are read from the raw table:
 
 * `web.public_url` (string, unset) — external URL of the admin UI. Its scheme

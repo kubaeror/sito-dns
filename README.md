@@ -140,12 +140,14 @@ cargo build --release --locked --features "embed-ui,mimalloc"
 On a fresh installation without a configuration file, **sito** starts in **setup-pending mode** on port `8080` (DNS listener ports 53/853/443 remain closed until initial setup is confirmed).
 
 Open **`http://<server-ip>:8080`** in any browser to launch the 6-section configuration wizard:
-* **Administrator Account:** Set a custom admin username and a password. The wizard rejects the bootstrap password `adminadmin`, passwords shorter than 8 characters, and passwords containing whitespace or control characters; there are no default credentials to fall back on.
+* **Administrator Account:** Set a custom admin username and a password. The wizard rejects the bootstrap password `adminadmin`, passwords shorter than 8 characters, and passwords containing whitespace or control characters. The bootstrap account cannot log in while setup is pending.
 * **DNS Listeners:** Configure IPv4/IPv6 bindings, UDP/TCP, DoT, and DoH ports.
 * **Upstream Resolvers:** Select presets (Cloudflare, Quad9, Google) with live latency testing.
 * **Cache & DNSSEC:** Tune in-memory cache and cryptographic DNSSEC validation.
 * **Filtering:** Choose blocking modes, enable CNAME cloaking defense, and subscribe to popular blocklists (OISD, StevenBlack, HaGeZi).
 * **Web Panel & Statistics:** Configure web bind and retention policies.
+
+While setup is pending, the server prints a one-time setup token to the console. Open `/wizard?setup_token=<token>` (or send the `X-Setup-Token` header). Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` credential. If credentials are lost, `sito reset-admin` generates a new random password and prints it once; it preserves non-admin accounts unless `--reset-all` is passed.
 
 Once setup is submitted, DNS listeners are bound in-process without needing a server restart.
 

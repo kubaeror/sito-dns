@@ -63,7 +63,7 @@ sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito
 
 ### 2.4 Configuration Skeleton (Optional)
 > [!NOTE]
-> On a clean boot without an existing `config.toml`, **sito** starts in **setup-pending mode** serving only the web panel on port 8080. You can simply open `http://<server-ip>:8080` to generate your configuration via the web wizard, or pass `--no-setup` to boot immediately with built-in defaults.
+> On a clean boot without an existing `config.toml`, **sito** starts in **setup-pending mode** serving only the web panel on port 8080. You can simply open `http://<server-ip>:8080` to generate your configuration via the web wizard, or pass `--no-setup` to boot immediately with a generated administrator password (printed once) and the panel bound to loopback.
 >
 > If you prefer to supply configuration up-front, create `/etc/sito/config.toml`:
 
@@ -338,7 +338,21 @@ sito --config /etc/sito/config.toml healthcheck
 sito --config /etc/sito/config.toml healthcheck --setup-fallback
 ```
 
-Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard. If the wizard is skipped with `--no-setup`, the bootstrap credentials are `admin` / `adminadmin` and **must be changed immediately** (Settings -> Administrator).
+Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard. While setup is pending the server prints a one-time setup token to the console; open `http://<host-ip>:8080/wizard?setup_token=<token>` or send the `X-Setup-Token` header. Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` already exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` account.
+
+If the wizard is skipped with `--no-setup`, a random administrator password is generated and printed once, and the panel binds to loopback. If credentials are lost later, run:
+
+```bash
+# Generate a new random password and print it once:
+sudo sito --config /etc/sito/config.toml reset-admin
+
+# Or supply your own strong password (same policy as the wizard/API):
+sudo sito --config /etc/sito/config.toml reset-admin --password '<new-password>'
+```
+
+`reset-admin` preserves other accounts. Add `--reset-all` (alias
+`--reset-users`) only when you explicitly want to remove every non-admin
+account.
 
 ---
 
