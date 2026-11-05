@@ -8,6 +8,29 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **DNSSEC verification amplification (security)**: a crafted authoritative
+  response can no longer force unbounded cryptographic work. Each response now
+  has a hard budget of 256 RRSIG verification attempts (shared across the
+  pre-fetch and strict passes), candidate keys per RRSIG are capped at 8, and
+  trusted/validated keys are tried before unvalidated response keys. The
+  bounded work covers the DS/DNSKEY trust walk and the DS-status probes as
+  well.
+- **NSEC3 iteration cap bypass (security)**: `matches()`/`covers()` now reject
+  records whose iteration count exceeds 150 (RFC 9276) before hashing a name.
+  The DS-status exact-match/opt-out paths therefore no longer hash a name
+  65535 times or accept an over-cap denial.
+- **Secure answers no longer outlive their signature**: `dns.cache.min_ttl` is
+  a floor for unvalidated data only. Raising a `Secure` entry above its
+  authenticated TTL could serve AD=1 data after the RRSIG original TTL or
+  validity expired; validated records now keep the smaller TTL.
+- **Stale cache entries follow the validation policy**: the RFC 8767 stale
+  fallback now uses the same status gate as fresh hits, so an `Unchecked` entry
+  is never served while local validation is active. Stale sanitization removes
+  every DNSSEC RR type (RRSIG, DNSKEY, DS, NSEC/NSEC3), not just RRSIGs.
+- **DNSSEC policy changes flush cached answers**: changing `dns.dnssec.mode`,
+  `validate`, `trust_anchors`, `nta` or `ntp` invalidates the response cache,
+  so a decision made under the old policy (Secure after an anchor removal, or
+  Unchecked after validation was enabled) cannot be served afterwards.
 - **Credential revocation races (security)**: sessions and API tokens now store
   the account's persisted `credential_epoch` and are revalidated against
   `users.toml` on every request: the account must still exist, the role must

@@ -94,11 +94,11 @@ serve_stale_hours = 12
 |---|---|---|---|
 | `enabled` | boolean | `true` | Enables or disables in-memory caching. |
 | `size_mb` | integer | `64` | Memory allocation ceiling for the cache in megabytes. |
-| `min_ttl` | integer | `60` | Minimum TTL (seconds) to assign to cached answers (overrides smaller upstream TTLs). |
+| `min_ttl` | integer | `60` | Minimum TTL (seconds) for unvalidated cached answers (overrides smaller upstream TTLs). DNSSEC-validated (`Secure`) answers keep the smaller authenticated TTL/RRSIG validity, so this floor can never extend their lifetime. |
 | `max_ttl` | integer | `86400` | Maximum TTL (seconds) to assign to cached answers (caps excessively high upstream TTLs). |
 | `negative_ttl_max` | integer | `3600` | Maximum TTL (seconds) for negative caching (NXDOMAIN / NODATA). |
 | `prefetch` | boolean | `true` | When `true`, automatically re-resolves frequently requested domains before TTL expires. |
-| `serve_stale_hours` | integer | `12` | Hours to serve expired cache records as fallback when upstreams are unreachable. |
+| `serve_stale_hours` | integer | `12` | Hours to serve expired cache records as fallback when upstreams are unreachable. Stale answers are served with all DNSSEC records removed and AD=0; entries cached without local validation (`Unchecked`) are not served while DNSSEC validation is active. |
 
 ---
 
@@ -114,7 +114,7 @@ ntp = ["local.internal"]
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `mode` | string | `"validate"` | Validation mode. Accepted: `"validate"`/`"strict"` (bogus = SERVFAIL), `"log_only"`/`"log-only"`/`"permissive"` (log and clear AD), `"off"`/`"disabled"`. |
-| `validate` | boolean | `true` | Enable DNSSEC processing. Validation walks DS/DNSKEY links present in the response and, when the chain is incomplete, resolves the missing DNSKEY/DS records through the configured upstreams (bounded per-query fetch budget). NSEC/NSEC3 denial proofs are enumerated; opt-out NXDOMAIN answers are treated as insecure. |
+| `validate` | boolean | `true` | Enable DNSSEC processing. Validation walks DS/DNSKEY links present in the response and, when the chain is incomplete, resolves the missing DNSKEY/DS records through the configured upstreams (bounded per-query fetch budget). Cryptographic verification is bounded per response (256 RRSIG checks, at most 8 candidate keys per signature). NSEC/NSEC3 denial proofs are enumerated; NSEC3 records above 150 iterations are ignored (RFC 9276) and opt-out NXDOMAIN answers are treated as insecure. |
 | `ntp` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). Alias retained for compatibility; `nta` is the preferred key. |
 | `nta` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). |
 | `trust_anchors` | array of strings | `[]` | Trust anchors used as the top of the DS/DNSKEY chain (DS or DNSKEY records in zone-file/hex form). Empty uses validation of RRSIGs against configured anchors only. |
@@ -497,7 +497,7 @@ and `POST /api/v1/config/reload`.
 | `dns.bind`, `dns.port`, `dns.dot_port`, `dns.doh_port`, `dns.doq_port`, `dns.doh3_port`, `dns.doh_dedicated_hostname`, `dns.dot_padding`, `dns.edns_udp_size`, `dns.max_tcp_connections`, `dns.allow_plaintext_doh` | DNS listeners are stopped and rebound in-process when the listener plan changes; a failed rebind restores the previous bindings. TLS listeners need the acceptors created at startup. |
 | `dns.rate_limit_per_ip` | Live rate limiters updated. |
 | `dns.cache.enabled`, `dns.cache.size_mb`, `dns.cache.min_ttl`, `dns.cache.max_ttl`, `dns.cache.negative_ttl_max`, `dns.cache.prefetch`, `dns.cache.serve_stale_hours` | Cache configuration updated. |
-| `dns.dnssec.mode`, `dns.dnssec.validate`, `dns.dnssec.ntp`, `dns.dnssec.nta`, `dns.dnssec.trust_anchors` | DNSSEC validator swapped for the new configuration. |
+| `dns.dnssec.mode`, `dns.dnssec.validate`, `dns.dnssec.ntp`, `dns.dnssec.nta`, `dns.dnssec.trust_anchors` | DNSSEC validator swapped for the new configuration; the response cache is flushed because cached validation decisions belong to the old policy. |
 | `upstream.servers`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.ecs`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt. |
 | `filtering.enabled`, `filtering.refresh_interval_hours`, `filtering.blocking_mode`, `filtering.blocking_ttl`, `filtering.cname_cloaking`, `filtering.fail_closed`, `filtering.anti_doh_bypass`, `filtering.max_rules`, `filtering.max_list_bytes`, `filtering.regex_compile_budget_ms`, `filtering.lists`, `filtering.custom_rules` | Filter engine reloaded with the new lists/rules; cached answers are flushed. List downloads continue asynchronously after the reload. |
 | `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
