@@ -8,6 +8,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **HA restart-only changes are rejected, not ACKed as applied**: a push that
+  changes a restart-only field which is not node-local (for example
+  `server.log_format` or `[auth]`) now fails before anything is applied or
+  persisted. The slave keeps its previous live configuration and file, enters
+  `Degraded`, and ACKs `applied: false` with a `restart_required` reason naming
+  the fields. Previously it persisted the change, reported `applied: true`, and
+  silently kept the old live behavior until the next restart.
 - **HA pushes preserve node-local listeners and certificates**: a slave's
   persisted configuration now keeps its own `dns.bind`, `[dns.tls]`/`[tls]`
   paths, `[acme]`, `web.bind`/`web.port` and the complete

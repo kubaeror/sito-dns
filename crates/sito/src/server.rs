@@ -667,7 +667,12 @@ impl sito_ha::SlaveConfigApplier for HaConfigApplier {
         }
 
         Box::pin(async move {
-            match sito_api::config_apply::apply_and_persist_document(
+            // A restart-only field cannot take effect in this process. The HA
+            // persist path rejects such a push *before* applying or persisting
+            // anything: the worker then ACKs `applied: false`, and the live
+            // configuration and the persisted file both keep the previous
+            // state instead of claiming a change only a restart could honor.
+            match sito_api::config_apply::apply_and_persist_document_rejecting_restart(
                 &self.ctx,
                 cfg,
                 document,
@@ -678,13 +683,11 @@ impl sito_ha::SlaveConfigApplier for HaConfigApplier {
             {
                 Ok(report) => {
                     if !report.restart_required.is_empty() {
-                        // The push is ACKed as applied because the document is
-                        // persisted and every hot-appliable component is live.
-                        // Restart-only sections are not silently claimed as
-                        // live: surface exactly which ones need a restart.
+                        // The lock-held pre-check uses the same matrix, so this
+                        // is a defensive backstop rather than a normal path.
                         warn!(
                             fields = ?report.restart_required,
-                            "HA push applied; these fields are persisted but require a restart to take effect"
+                            "HA push applied but reported restart-only fields; the acknowledgement may be incomplete"
                         );
                     }
                     Ok(())

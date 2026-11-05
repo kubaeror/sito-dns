@@ -436,6 +436,13 @@ cache settings, `web.bind`/`web.port`, `[ha]`, `server.instance_name`,
 master `bind = ["0.0.0.0", "::"]` and slave `bind = ["0.0.0.0"]` therefore
 coexist, including on hosts without IPv6.
 
+If a push changes a restart-only field that is **not** preserved as node-local
+(for example `server.log_format` or `[auth]`), the slave rejects the push before
+applying or persisting anything: it keeps its previous live configuration and
+file, enters `Degraded`, and ACKs `applied: false` with a `restart_required`
+reason naming the fields. Restart the slave with the intended configuration (or
+change those fields locally) before expecting the master to report it synced.
+
 Cluster terms are node-persisted, not configuration keys: the master stores the
 current term inside `ha_state.toml` and only an explicit promotion (editing the
 state file and restarting, see `docs/runbook-ha.md`) raises it. A promotion must

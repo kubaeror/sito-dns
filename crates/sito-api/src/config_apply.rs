@@ -306,6 +306,33 @@ pub async fn apply_and_persist_document(
     apply_and_persist_document_locked(ctx, candidate, document, filter_apply, hooks).await
 }
 
+/// HA push variant of [`apply_and_persist_document`].
+///
+/// A restart-only change cannot take effect in the running process, so the
+/// candidate is rejected **before** anything is applied or persisted. The HA
+/// slave worker then ACKs `applied: false` and both the live configuration and
+/// the persisted file keep their previous state. The check runs under
+/// [`ServerContext::apply_lock`] together with the apply, so a concurrent
+/// watcher write cannot invalidate it between check and persist.
+pub async fn apply_and_persist_document_rejecting_restart(
+    ctx: &ServerContext,
+    candidate: &Config,
+    document: &str,
+    filter_apply: FilterApply,
+    hooks: Option<&dyn ConfigApplyHooks>,
+) -> Result<AppliedReport, ProblemDetails> {
+    let _apply_guard = ctx.apply_lock.lock().await;
+    let previous = (**ctx.config.load()).clone();
+    let restart_required = restart_required_fields(&previous, candidate);
+    if !restart_required.is_empty() {
+        return Err(ProblemDetails::bad_request(format!(
+            "restart_required: this push changes restart-only fields ({}); restart the slave with the new configuration or update them locally",
+            restart_required.join(", ")
+        )));
+    }
+    apply_and_persist_document_locked(ctx, candidate, document, filter_apply, hooks).await
+}
+
 /// Persist variant that must be called with [`ServerContext::apply_lock`] held.
 async fn apply_and_persist_document_locked(
     ctx: &ServerContext,

@@ -1116,6 +1116,105 @@ nta = ["pushed.internal"]
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+/// A push that changes a restart-only field must not be acknowledged as fully
+/// applied: the live process keeps its previous behavior, so `applied: true`
+/// would lie to the master. The push is rejected, the previous live state and
+/// the persisted file are kept, and the failure names `restart_required`.
+#[tokio::test]
+async fn test_m8_push_restart_only_field_is_not_acked_as_applied() {
+    let signing_key = Ed25519SigningKey::generate().unwrap();
+    let (ctx, _token, temp_dir) = create_test_context("slave", None, None, None).await;
+
+    let hooks = Arc::new(RecordingDnssecHooks {
+        validator: Arc::new(ArcSwap::from_pointee(
+            sito_dnssec::DnssecValidator::from_config(&Config::default().dns.dnssec),
+        )),
+        observed_nta: Arc::new(Mutex::new(Vec::new())),
+    });
+    let applier = Arc::new(sito::server::HaConfigApplier::new(
+        ctx.clone(),
+        hooks.clone(),
+    ));
+    applier.mark_listeners_ready();
+
+    let tracker = SlaveStatusTracker::new("slave-restart-only".to_string(), 0, None);
+    let handles = SlaveAppHandles {
+        runtime: ctx.runtime.clone(),
+        filter: ctx.filter.clone(),
+        metrics: ctx.metrics.clone(),
+        config_path: Some(ctx.config_path.clone()),
+        applier,
+    };
+
+    let config_before = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
+    let upstream_before = ctx.runtime.snapshot().config.upstream.servers.clone();
+
+    // `server.log_format` is restart-only; the same push also carries a
+    // hot-appliable upstream change that must not be applied either, because
+    // the push as a whole cannot take effect without a restart.
+    let config_toml = r#"
+config_version = 1
+
+[server]
+role = "slave"
+log_format = "pretty"
+
+[upstream]
+servers = ["9.9.9.9"]
+"#;
+    let push = build_and_sign_push(
+        &ConfigBundle {
+            version: 2,
+            term: 0,
+            timestamp: 1,
+            config_toml: config_toml.to_string(),
+            custom_rules: vec![],
+            rewrites: None,
+            clients: None,
+            lists: vec![],
+        },
+        &signing_key,
+    )
+    .unwrap();
+
+    let err =
+        sito_ha::apply_config_push(&push, &tracker, &handles, signing_key.public_key().as_ref())
+            .await
+            .expect_err("a restart-only change must not be acknowledged as applied");
+    let message = err.to_string();
+    assert!(
+        message.contains("restart_required"),
+        "the rejection must identify the restart-only change: {message}"
+    );
+    assert!(
+        message.contains("server.log_format"),
+        "the rejection must name the restart-only field: {message}"
+    );
+    assert_eq!(tracker.get_state(), SlaveState::Degraded);
+    assert_eq!(
+        tracker.get_version(),
+        0,
+        "the watermark must not advance for a push that was not applied"
+    );
+    assert_eq!(
+        ctx.runtime.snapshot().config.upstream.servers,
+        upstream_before,
+        "hot-appliable fields from a rejected push must not be applied"
+    );
+    assert_eq!(
+        ctx.runtime.snapshot().config.server.log_format,
+        "json",
+        "the live restart-only setting must be kept"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+        config_before,
+        "the persisted file must be kept"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 /// D-01 startup-order regression: a push that arrives before the DNS listener
 /// generation and rate limiters exist is refused (so the worker ACKs
 /// `applied:false` and retries) instead of being applied and persisted with
