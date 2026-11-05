@@ -200,6 +200,23 @@ fn cache_entry_servable(status: ValidationStatus, validation_active: bool) -> bo
     !validation_active || status != ValidationStatus::Unchecked
 }
 
+/// Whether a *stale* (RFC 8767) entry may be served while local validation is
+/// active.
+///
+/// Stale answers are not revalidated, so only authenticated cache decisions
+/// (`Secure`/`Insecure`) may be served. An `Indeterminate` entry is
+/// inconclusive by definition — in log-only mode even Bogus data is recorded
+/// that way — and `Unchecked` means no local validation ran at all. Neither
+/// may be handed to a CD=0 client that relies on the resolver. Stale answers
+/// are always sanitized to AD=0 before they leave the cache.
+fn stale_cache_entry_servable(status: ValidationStatus, validation_active: bool) -> bool {
+    !validation_active
+        || matches!(
+            status,
+            ValidationStatus::Secure | ValidationStatus::Insecure
+        )
+}
+
 /// Outcome of executing a query through the DNS pipeline.
 struct QueryOutcome {
     response: Option<Message>,
@@ -1713,7 +1730,7 @@ impl QueryHandler for DnsPipeline {
                             .get_stale_for_query_with_status(&cache_query)
                             .await
                     {
-                        if cache_entry_servable(stale_status, validation_active) {
+                        if stale_cache_entry_servable(stale_status, validation_active) {
                             if bypass_check_needed
                                 && let Some(outcome) = self.anti_doh_blocked_by_answers(
                                     &query,
@@ -1766,7 +1783,7 @@ impl QueryHandler for DnsPipeline {
                         }
                         debug!(
                             qname = %qname,
-                            "Ignoring unchecked stale cache entry while DNSSEC validation is active"
+                            "Ignoring stale Indeterminate/Unchecked cache entry while DNSSEC validation is active"
                         );
                     }
 
@@ -2772,6 +2789,103 @@ mod tests {
         assert!(
             resp.answers.is_empty(),
             "the rejected stale answer must not leak records"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// A stale `Indeterminate` entry is not an authenticated decision: it may
+    /// be an inconclusive answer (or, in log-only mode, a Bogus result cached
+    /// as Indeterminate). It must not be served to a validating client while
+    /// the upstream is down.
+    #[tokio::test]
+    async fn test_stale_indeterminate_entry_is_not_served_under_validation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut config = Config::default();
+        config.dns.cache.serve_stale_hours = 1;
+        config.dns.cache.min_ttl = 1;
+        config.dns.cache.max_ttl = 1;
+        config.dns.cache.negative_ttl_max = 1;
+        let fail = std::sync::Arc::new(AtomicBool::new(true));
+        let (pipeline, _server, calls, temp_dir) =
+            test_pipeline_with_failure_toggle(config, fail).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("stale-indeterminate.example.").unwrap();
+        let query = do_query(16, &name);
+
+        let mut cached = Message::response(16, OpCode::Query);
+        cached.queries = query.queries.clone();
+        cached.answers.push(Record::from_rdata(
+            name.clone(),
+            1,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 16))),
+        ));
+        pipeline
+            .cache
+            .insert_with_status(&query, &cached, ValidationStatus::Indeterminate)
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let resp = pipeline.handle(query, client).await.unwrap();
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::ServFail,
+            "a stale Indeterminate entry must not be served to a validating client"
+        );
+        assert!(
+            resp.answers.is_empty(),
+            "the rejected stale answer must not leak records"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Stale `Insecure` data is an authenticated unsigned decision and remains
+    /// RFC 8767-servable, with AD cleared.
+    #[tokio::test]
+    async fn test_stale_insecure_entry_is_served_with_ad_zero() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut config = Config::default();
+        config.dns.cache.serve_stale_hours = 1;
+        config.dns.cache.min_ttl = 1;
+        config.dns.cache.max_ttl = 1;
+        config.dns.cache.negative_ttl_max = 1;
+        let fail = std::sync::Arc::new(AtomicBool::new(true));
+        let (pipeline, _server, calls, temp_dir) =
+            test_pipeline_with_failure_toggle(config, fail).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("stale-insecure.example.").unwrap();
+        let query = do_query(17, &name);
+
+        let mut cached = Message::response(17, OpCode::Query);
+        cached.queries = query.queries.clone();
+        cached.answers.push(Record::from_rdata(
+            name.clone(),
+            1,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 17))),
+        ));
+        pipeline
+            .cache
+            .insert_with_status(&query, &cached, ValidationStatus::Insecure)
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let resp = pipeline.handle(query, client).await.unwrap();
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NoError,
+            "a stale Insecure entry remains servable as unauthenticated data"
+        );
+        assert_eq!(resp.answers.len(), 1);
+        assert!(
+            !resp.metadata.authentic_data,
+            "a stale entry must never be served as authenticated"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
