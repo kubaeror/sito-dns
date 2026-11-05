@@ -1028,27 +1028,37 @@ impl AuthManager {
     /// one. The guard is owned by the blocking task, so cancelling the caller
     /// cannot release it before the write completes.
     async fn save_users_async(&self) {
+        if let Err(e) = self.try_save_users_async().await {
+            tracing::error!(error = %e, "Failed to persist users file");
+        }
+    }
+
+    /// Persists users and surfaces the failure to callers that must roll back a
+    /// credential change when the write did not land.
+    pub(crate) async fn try_save_users_async(&self) -> Result<(), AuthStorageError> {
         // Use an owned guard moved into the blocking closure: if the caller is
         // cancelled mid-write, the closure keeps the lock until the write
         // finishes so a newer save cannot complete (and be overwritten) first.
         let persist = self.persist_lock.clone().lock_owned().await;
-        let (path, toml_str) = match self.users_toml() {
-            Ok(Some(entry)) => entry,
-            Ok(None) => return,
-            Err(e) => {
-                tracing::error!(error = %e, "Refusing to persist users file");
-                return;
-            }
+        let Some((path, toml_str)) = self.users_toml()? else {
+            return Ok(());
         };
+        let write_path = path.clone();
         match tokio::task::spawn_blocking(move || {
             let _persist = persist;
             write_secret_file(&path, &toml_str)
         })
         .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::error!("Failed to persist users file: {e}"),
-            Err(e) => tracing::error!("Users persistence task failed: {e}"),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(AuthStorageError::Io {
+                path: write_path,
+                source: e,
+            }),
+            Err(e) => Err(AuthStorageError::Io {
+                path: write_path,
+                source: std::io::Error::other(e.to_string()),
+            }),
         }
     }
 
@@ -1549,17 +1559,30 @@ impl AuthManager {
 
     /// Creates or updates a user account. Hashing runs on the blocking pool.
     pub async fn create_user(&self, username: &str, password: &str, role: Role) {
-        let Ok((hash, is_default)) = hash_password_blocking(password.to_string()).await else {
-            tracing::error!(user = username, "Failed to hash password for new user");
-            return;
-        };
+        if let Err(e) = self.create_user_persisted(username, password, role).await {
+            tracing::error!(user = username, error = %e, "Failed to create user");
+        }
+    }
+
+    /// Creates or updates a user account and only reports success after the
+    /// account store has been written. A failed write rolls the in-memory
+    /// mutation back.
+    pub(crate) async fn create_user_persisted(
+        &self,
+        username: &str,
+        password: &str,
+        role: Role,
+    ) -> Result<(), String> {
+        let (hash, is_default) = hash_password_blocking(password.to_string())
+            .await
+            .map_err(|e| format!("failed to hash password for '{username}': {e}"))?;
         let user = UserAccount {
             username: username.to_string(),
             password_hash: hash,
             role,
             totp: None,
         };
-        let existed = {
+        let previous_user = {
             let mut users = lock(&self.users);
             if let Some(existing) = users.get(username)
                 && existing.role == Role::Admin
@@ -1569,56 +1592,111 @@ impl AuthManager {
                 // The internal create path can overwrite an existing
                 // account. Never let that remove the sole remaining Admin,
                 // even though request handlers already reject duplicates.
-                tracing::error!(
-                    user = %username,
-                    "Refusing to overwrite the last remaining Admin with a non-Admin role"
-                );
-                return;
+                return Err(format!(
+                    "refusing to overwrite the last remaining Admin '{username}' with a non-Admin role"
+                ));
             }
-            users.insert(username.to_string(), user).is_some()
+            users.insert(username.to_string(), user)
         };
+        if let Err(e) = self.try_save_users_async().await {
+            let mut users = lock(&self.users);
+            match previous_user.clone() {
+                Some(previous) => {
+                    users.insert(username.to_string(), previous);
+                }
+                None => {
+                    users.remove(username);
+                }
+            }
+            return Err(format!("failed to persist users file: {e}"));
+        }
         if username == "admin" {
             self.default_admin_active
                 .store(is_default, Ordering::SeqCst);
         }
-        if existed {
+        if previous_user.is_some() {
             // Overwriting an account (new password/role) revokes its sessions
             // and credentials so the previous identity cannot keep access.
             self.purge_user_sessions(username).await;
             self.revoke_tokens_for_owner(username).await;
         }
-        self.save_users_async().await;
+        Ok(())
     }
 
     /// Updates password for an existing user and invalidates their sessions.
     pub async fn update_user_password(&self, username: &str, password: &str) -> bool {
-        let Ok((hash, is_default)) = hash_password_blocking(password.to_string()).await else {
-            return false;
-        };
+        self.update_user_password_tracked(username, password)
+            .await
+            .is_ok()
+    }
 
-        let updated = {
+    /// Updates a password and returns the previous hash only after the new
+    /// hash has been persisted. Callers that must undo the change when a later
+    /// step fails can pass the returned hash to
+    /// [`Self::restore_user_password_hash`].
+    pub(crate) async fn update_user_password_tracked(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<String>, String> {
+        let (hash, is_default) = hash_password_blocking(password.to_string())
+            .await
+            .map_err(|e| format!("failed to hash password for '{username}': {e}"))?;
+
+        let previous_hash = {
             let mut users = lock(&self.users);
-            match users.get_mut(username) {
-                Some(user) => {
-                    user.password_hash = hash;
-                    true
-                }
-                None => false,
-            }
+            let Some(user) = users.get_mut(username) else {
+                return Err(format!("user '{username}' does not exist"));
+            };
+            let previous = user.password_hash.clone();
+            user.password_hash = hash;
+            previous
         };
-        if !updated {
-            return false;
+        if let Err(e) = self.try_save_users_async().await {
+            let mut users = lock(&self.users);
+            if let Some(user) = users.get_mut(username) {
+                user.password_hash.clone_from(&previous_hash);
+            }
+            return Err(format!("failed to persist users file: {e}"));
         }
         if username == "admin" {
             self.default_admin_active
                 .store(is_default, Ordering::SeqCst);
         }
-        self.save_users_async().await;
         self.purge_user_sessions(username).await;
         // A password change invalidates every credential derived from the old
         // password, including owned API tokens.
         self.revoke_tokens_for_owner(username).await;
-        true
+        Ok(Some(previous_hash))
+    }
+
+    /// Restores a password hash previously returned by
+    /// [`Self::update_user_password_tracked`] and persists it.
+    #[cfg_attr(not(feature = "embed-ui"), allow(dead_code))]
+    pub(crate) async fn restore_user_password_hash(
+        &self,
+        username: &str,
+        previous_hash: &str,
+    ) -> Result<(), String> {
+        let is_default = username == "admin"
+            && verify_password_blocking("adminadmin".to_string(), previous_hash.to_string()).await;
+        {
+            let mut users = lock(&self.users);
+            let Some(user) = users.get_mut(username) else {
+                return Err(format!("user '{username}' does not exist"));
+            };
+            user.password_hash = previous_hash.to_string();
+        }
+        self.try_save_users_async()
+            .await
+            .map_err(|e| format!("failed to persist users file: {e}"))?;
+        if username == "admin" {
+            self.default_admin_active
+                .store(is_default, Ordering::SeqCst);
+        }
+        self.purge_user_sessions(username).await;
+        self.revoke_tokens_for_owner(username).await;
+        Ok(())
     }
 
     /// Verifies a user's current password without holding the users lock
