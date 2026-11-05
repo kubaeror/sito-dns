@@ -10,6 +10,75 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
+/// Conventional system-wide configuration path used by packages and the
+/// systemd unit.
+pub const SYSTEM_CONFIG_PATH: &str = "/etc/sito/config.toml";
+
+/// Resolves the configuration path for server-side commands.
+///
+/// `--config` always wins. Otherwise an existing `./config.toml` (development
+/// and manual installs) is preferred, then the system path. When neither
+/// exists the relative default is returned so first-boot setup can create it;
+/// commands that must fail closed use [`resolve_update_config_path`] instead.
+pub fn resolve_config_path(explicit: Option<&Path>) -> PathBuf {
+    resolve_config_path_from(
+        explicit,
+        Path::new("config.toml"),
+        Path::new(SYSTEM_CONFIG_PATH),
+    )
+}
+
+fn resolve_config_path_from(explicit: Option<&Path>, local: &Path, system: &Path) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    if local.is_file() {
+        return local.to_path_buf();
+    }
+    if system.is_file() {
+        return system.to_path_buf();
+    }
+    local.to_path_buf()
+}
+
+/// Resolves the configuration path for `sito update`, which cannot run without
+/// knowing the persisted signature policy.
+///
+/// An existing `/etc/sito/config.toml` is preferred over `./config.toml`
+/// because updates are usually run as root from an arbitrary cwd.
+pub fn resolve_update_config_path(explicit: Option<&Path>) -> Result<PathBuf, anyhow::Error> {
+    resolve_update_config_path_from(
+        explicit,
+        Path::new("config.toml"),
+        Path::new(SYSTEM_CONFIG_PATH),
+    )
+}
+
+fn resolve_update_config_path_from(
+    explicit: Option<&Path>,
+    local: &Path,
+    system: &Path,
+) -> Result<PathBuf, anyhow::Error> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    // A system configuration wins over a relative file for updates: the
+    // operator may run the command from any cwd after stopping the service,
+    // and a stray ./config.toml must not silently change the signature policy.
+    if system.is_file() {
+        return Ok(system.to_path_buf());
+    }
+    if local.is_file() {
+        return Ok(local.to_path_buf());
+    }
+    Err(anyhow::anyhow!(
+        "Refusing to update: no configuration file found at '{}' or '{}'. Pass --config <path> to choose the configuration explicitly (system installs use {}).",
+        system.display(),
+        local.display(),
+        SYSTEM_CONFIG_PATH
+    ))
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "sito",
@@ -18,9 +87,10 @@ use std::time::Duration;
     about = "High-performance, self-hosted, filtering DNS server"
 )]
 pub struct Cli {
-    /// Path to configuration file
-    #[arg(short, long, default_value = "config.toml")]
-    pub config: PathBuf,
+    /// Path to configuration file (default: ./config.toml when present, then
+    /// /etc/sito/config.toml)
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
 
     /// Skip web-based setup wizard gating and start with defaults immediately
     #[arg(long)]
@@ -28,6 +98,14 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Commands>,
+}
+
+impl Cli {
+    /// Configuration path after applying an explicit `--config` or
+    /// auto-detection (see [`resolve_config_path`]).
+    pub fn config_path(&self) -> PathBuf {
+        resolve_config_path(self.config.as_deref())
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -778,7 +856,7 @@ pub async fn run_update(
     check: bool,
     force: bool,
     repo: Option<&str>,
-    config_path: &Path,
+    config_path: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     println!("Checking for updates...");
     let info = sito_api::updater::check_for_update(repo)
@@ -796,6 +874,13 @@ pub async fn run_update(
         return Ok(());
     }
 
+    // Fail closed: if the configuration cannot be found/read or parsed we
+    // cannot know whether signatures are required, so refuse instead of
+    // silently downgrading to checksum-only verification. Resolving here also
+    // means `sudo sito update` works from any cwd after the service is stopped.
+    let config_path = resolve_update_config_path(config_path)?;
+    let require_signature = update_signature_policy(&config_path)?;
+
     if !info.update_available && !force {
         println!("\nsito is up to date.");
         return Ok(());
@@ -811,10 +896,6 @@ pub async fn run_update(
     }
 
     println!("\nApplying update to v{}...", info.latest_version);
-    // Fail closed: if the configuration cannot be read or parsed we cannot
-    // know whether signatures are required, so refuse instead of silently
-    // downgrading to checksum-only verification.
-    let require_signature = update_signature_policy(config_path)?;
     if require_signature {
         println!("Signature verification is required by configuration.");
     }
@@ -1107,7 +1188,7 @@ mod tests {
         let args_no_setup = vec!["sito", "--no-setup"];
         let cli = Cli::try_parse_from(args_no_setup).expect("parse args");
         assert!(cli.no_setup);
-        assert_eq!(cli.config, PathBuf::from("config.toml"));
+        assert_eq!(cli.config, None);
 
         let args_default = vec!["sito"];
         let cli_default = Cli::try_parse_from(args_default).expect("parse args");
@@ -1116,7 +1197,100 @@ mod tests {
         let args_custom = vec!["sito", "--config", "/etc/sito/custom.toml", "--no-setup"];
         let cli_custom = Cli::try_parse_from(args_custom).expect("parse args");
         assert!(cli_custom.no_setup);
-        assert_eq!(cli_custom.config, PathBuf::from("/etc/sito/custom.toml"));
+        assert_eq!(
+            cli_custom.config,
+            Some(PathBuf::from("/etc/sito/custom.toml"))
+        );
+    }
+
+    fn temp_config_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_config_path_{label}_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_server_config_path_resolution() {
+        let dir = temp_config_dir("server");
+        let local = dir.join("config.toml");
+        let system = dir.join("etc/sito/config.toml");
+        std::fs::create_dir_all(system.parent().unwrap()).unwrap();
+        let explicit = dir.join("explicit.toml");
+
+        // An explicit --config always wins, even when the file does not exist
+        // yet (the setup wizard may create it).
+        assert_eq!(
+            resolve_config_path_from(Some(&explicit), &local, &system),
+            explicit
+        );
+
+        // Neither location exists: keep the historical relative default so
+        // first-boot setup can create ./config.toml.
+        assert_eq!(resolve_config_path_from(None, &local, &system), local);
+
+        // A local config takes precedence over the system path.
+        std::fs::write(&local, "config_version = 1\n").unwrap();
+        assert_eq!(resolve_config_path_from(None, &local, &system), local);
+
+        // Without a local config, the system path is used.
+        std::fs::remove_file(&local).unwrap();
+        std::fs::write(&system, "config_version = 1\n").unwrap();
+        assert_eq!(resolve_config_path_from(None, &local, &system), system);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_config_path_resolution_fails_closed() {
+        let dir = temp_config_dir("update");
+        let local = dir.join("config.toml");
+        let system = dir.join("etc/sito/config.toml");
+        std::fs::create_dir_all(system.parent().unwrap()).unwrap();
+        let explicit = dir.join("explicit.toml");
+
+        // Explicit path wins even if missing; the read error is reported when
+        // the signature policy is loaded.
+        assert_eq!(
+            resolve_update_config_path_from(Some(&explicit), &local, &system).unwrap(),
+            explicit
+        );
+
+        // Missing local and system config: refuse with actionable guidance.
+        let err = resolve_update_config_path_from(None, &local, &system)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no configuration file found"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("--config"), "unexpected error: {err}");
+
+        // A local config is used when the system path does not exist.
+        std::fs::write(&local, "config_version = 1\n").unwrap();
+        assert_eq!(
+            resolve_update_config_path_from(None, &local, &system).unwrap(),
+            local
+        );
+
+        // The system config wins when both exist, so a stray ./config.toml
+        // cannot change the signature policy of a system install.
+        std::fs::write(&system, "config_version = 1\n").unwrap();
+        assert_eq!(
+            resolve_update_config_path_from(None, &local, &system).unwrap(),
+            system
+        );
+
+        // --config still overrides the system config.
+        assert_eq!(
+            resolve_update_config_path_from(Some(&explicit), &local, &system).unwrap(),
+            explicit
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

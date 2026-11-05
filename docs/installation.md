@@ -165,6 +165,12 @@ sudo systemctl stop sito
 sudo SITO_VERSION=1.9.1 bash contrib/install.sh
 ```
 
+Without `--config`, the CLI prefers an existing `/etc/sito/config.toml` and
+otherwise uses `./config.toml`, so the commands above work from `/root`
+after the service is stopped. Pass `--config <path>` when the configuration
+lives somewhere else. If neither location exists, `sito update` refuses to run
+instead of guessing the signature policy.
+
 The installer backs up the previous binary to `/usr/local/bin/sito.bak` and
 restores it automatically if the post-install health check fails. If you manage
 the binary manually, stop the service, replace `/usr/local/bin/sito`, re-apply

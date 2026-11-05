@@ -17,6 +17,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   failed transfer is reported instead of being silently skipped.
 
 ### Fixed
+- **`sito update` finds the system configuration**: without `--config`, the CLI
+  prefers an existing `/etc/sito/config.toml` and otherwise uses
+  `./config.toml`. The documented
+  `sudo systemctl stop sito && sudo sito update` path therefore works from
+  `/root` instead of failing to read `./config.toml`. If neither file exists,
+  updates refuse with an actionable error naming `--config`; the signature
+  policy is never silently skipped.
 - **HA failures are visible in status and healthchecks**: a master whose
   replication listener failed to initialize mTLS or bind, and a slave whose
   handshake never completed or that has not reached `synced`, now report

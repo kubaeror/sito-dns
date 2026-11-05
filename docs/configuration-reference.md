@@ -526,9 +526,10 @@ url = "https://lists.example.com/services.json"
 
 ## 16. Hot Reload Matrix
 
-The running server watches the file passed to `--config` (the CLI default is
-the relative `config.toml`; the systemd unit and container image pass
-`/etc/sito/config.toml`) and re-applies the settings below in-process. A
+The running server watches the file passed to `--config`. Without an explicit
+flag an existing `./config.toml` is preferred, then `/etc/sito/config.toml`
+(the systemd unit and container image pass `/etc/sito/config.toml` explicitly)
+and re-applies the settings below in-process. A
 configuration that cannot be parsed or validated is rejected as a whole: the
 previous settings stay active and the error is logged. The REST API reports
 restart-only changes in the `restart_required` field of `PUT /api/v1/config`

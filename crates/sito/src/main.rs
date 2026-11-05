@@ -14,12 +14,15 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // Resolve once before `cli.command` is moved out: an explicit --config
+    // wins, otherwise use ./config.toml or /etc/sito/config.toml.
+    let default_config_path = cli.config_path();
 
     // Handle subcommands
     if let Some(cmd) = cli.command {
         match cmd {
             Commands::CheckConfig { config } => {
-                let config_path = config.unwrap_or(cli.config);
+                let config_path = config.unwrap_or(default_config_path.clone());
                 if let Err(e) = run_check_config(&config_path) {
                     eprintln!("{e}");
                     std::process::exit(1);
@@ -33,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 // Read the configuration once: it provides both the probe
                 // targets and whether HA replication is part of this role.
-                let config_file = std::fs::read_to_string(&cli.config).ok();
+                let config_file = std::fs::read_to_string(&default_config_path).ok();
                 let config = config_file
                     .as_ref()
                     .and_then(|content| Config::from_toml_str(content).ok());
@@ -79,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             Commands::Backup { config, output } => {
-                let config_path = config.unwrap_or(cli.config);
+                let config_path = config.unwrap_or(default_config_path.clone());
                 if let Err(e) = run_backup(&config_path, output.as_deref()) {
                     eprintln!("{e}");
                     std::process::exit(1);
@@ -91,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
                 config,
                 force,
             } => {
-                let config_path = config.unwrap_or(cli.config);
+                let config_path = config.unwrap_or(default_config_path.clone());
                 if let Err(e) = run_restore(&input, &config_path, force) {
                     eprintln!("{e}");
                     std::process::exit(1);
@@ -117,7 +120,8 @@ async fn main() -> anyhow::Result<()> {
             },
             Commands::Update { check, force, repo } => {
                 if let Err(e) =
-                    sito::cli::run_update(check, force, repo.as_deref(), &cli.config).await
+                    sito::cli::run_update(check, force, repo.as_deref(), cli.config.as_deref())
+                        .await
                 {
                     eprintln!("{e}");
                     std::process::exit(1);
@@ -130,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
                 reset_all,
                 force,
             } => {
-                let config_path = config.unwrap_or(cli.config);
+                let config_path = config.unwrap_or(default_config_path.clone());
                 if let Err(e) = sito::cli::run_reset_admin_with_options(
                     &config_path,
                     password.as_deref(),
@@ -143,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             Commands::ResetSessions { config, force } => {
-                let config_path = config.unwrap_or(cli.config);
+                let config_path = config.unwrap_or(default_config_path.clone());
                 if let Err(e) = sito::cli::run_reset_sessions_with_options(&config_path, force) {
                     eprintln!("{e}");
                     std::process::exit(1);
@@ -154,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Server execution path
-    let config_path = cli.config;
+    let config_path = default_config_path;
     let (config, setup_pending) = if config_path.exists() {
         let content = std::fs::read_to_string(&config_path).map_err(|e| {
             anyhow::anyhow!(
