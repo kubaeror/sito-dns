@@ -810,6 +810,42 @@ async fn test_m8_ha_readiness_is_visible_in_health_and_status() {
     let _ = std::fs::remove_dir_all(&slave_dir);
 }
 
+// ----------------------------------------------------------------------------
+// Test 7c: An explicitly disabled master replication keeps its explanation
+// ----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_m8_ha_disabled_reason_is_exposed_in_status() {
+    let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+    let metrics = MetricsRegistry::new("0.1.0", "test");
+    let coordinator =
+        MasterCoordinator::new("master-disabled".to_string(), 1, signing_key, metrics);
+    coordinator.mark_replication_disabled();
+    let (master_ctx, master_token, master_dir) =
+        create_test_context("master", Some(coordinator), None, None).await;
+    let mut master_cfg = (**master_ctx.config.load()).clone();
+    master_cfg.ha = Some(toml::from_str("replication_port = 0").unwrap());
+    master_ctx.config.store(Arc::new(master_cfg));
+    let master_app = create_router(master_ctx);
+
+    // Replication is deliberately off, so the node is ready, but the reason
+    // must not be lost: operators need to see why there is no listener.
+    let status = get_json(&master_app, "/api/v1/ha/status", Some(&master_token)).await;
+    assert_eq!(status["ready"], true);
+    assert!(
+        status["readiness_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replication_port"),
+        "disabled replication must stay explained in /ha/status: {status}"
+    );
+
+    let health = get_json(&master_app, "/health", None).await;
+    assert_eq!(health["ha"]["required"], false);
+    assert_eq!(health["ha"]["ready"], true);
+
+    let _ = std::fs::remove_dir_all(&master_dir);
+}
+
 /// GETs `path` from the router and decodes a JSON body.
 async fn get_json(app: &axum::Router, path: &str, token: Option<&str>) -> serde_json::Value {
     let mut request = Request::builder().uri(path);

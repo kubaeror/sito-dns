@@ -66,7 +66,18 @@ impl ServerContext {
     /// reason instead of silently treating the node as healthy.
     #[must_use]
     pub fn ha_readiness(&self, config: &Config) -> sito_ha::HaReadiness {
+        // A role with no `[ha]` section is simply not an HA deployment. A
+        // master that *did* configure `[ha]` but explicitly disabled the
+        // listener (`replication_port = 0`) still has a meaningful state: the
+        // coordinator carries the "replication disabled" explanation and must
+        // be surfaced instead of being discarded as a generic ready.
         if !ha_readiness_required(config) {
+            if config.ha.is_some()
+                && config.server.role == "master"
+                && let Some(coordinator) = self.master_coordinator.as_ref()
+            {
+                return coordinator.readiness();
+            }
             return sito_ha::HaReadiness::ready();
         }
         match config.server.role.as_str() {
