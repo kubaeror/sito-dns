@@ -2284,10 +2284,18 @@ pub async fn wizard_complete_handler(
             }
         };
 
+        // Defense in depth: if another writer completed setup while this
+        // request waited, do not mutate credentials with a stale bootstrap
+        // snapshot. The completion lock should already have prevented this.
+        if bootstrapping && ctx.auth_mgr.is_setup_complete() && !ctx.auth_mgr.setup_token_required()
+        {
+            return error_response(StatusCode::CONFLICT, "Setup has already been completed.");
+        }
+
         // Change and persist the administrator credential before the
         // configuration file. Setup must never be persisted with the bootstrap
         // password still active.
-        if is_first_run && !ctx.auth_mgr.has_user(admin_user) {
+        if bootstrapping && !ctx.auth_mgr.has_user(admin_user) {
             if let Err(e) = ctx
                 .auth_mgr
                 .create_user_persisted(admin_user, effective_password, Role::Admin)
@@ -3445,6 +3453,123 @@ mod tests {
         assert!(ctx.auth_mgr.is_first_run());
 
         std::fs::set_permissions(&auth_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Regression (1.9.2 review): concurrent completions are serialized, so a
+    /// request that re-reads the token state after another completion cannot
+    /// skip token validation and overwrite the new password.
+    #[tokio::test]
+    async fn test_concurrent_wizard_completion_only_one_succeeds() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_race_{}", rand::random::<u64>()));
+        let auth_dir = temp_dir.join("auth");
+        let _ = std::fs::create_dir_all(&auth_dir);
+        let mut ctx = mock_context(&temp_dir).await;
+        ctx.auth_mgr = Arc::new(crate::auth::AuthManager::with_storage(&auth_dir, 24, 5).unwrap());
+        let token = ctx.auth_mgr.setup_token().expect("setup token provisioned");
+        let form = || WizardCompleteForm {
+            setup_token: Some(token.clone()),
+            admin_user: Some("admin".to_string()),
+            admin_password: Some("RacedPassword123!".to_string()),
+            confirm_password: Some("RacedPassword123!".to_string()),
+            upstream: Some("1.1.1.1:53".to_string()),
+            ..Default::default()
+        };
+
+        let first = wizard_complete_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(form()),
+        );
+        let second = wizard_complete_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(form()),
+        );
+        let (first, second) = tokio::join!(first, second);
+        let statuses = [first.status(), second.status()];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::SEE_OTHER)
+                .count(),
+            1,
+            "exactly one completion may win: {statuses:?}"
+        );
+        assert!(
+            statuses.iter().all(|status| !status.is_success()),
+            "no completion may report a body success: {statuses:?}"
+        );
+        assert!(!ctx.auth_mgr.setup_token_required());
+        assert!(ctx.auth_mgr.has_user("admin"));
+        assert!(matches!(
+            ctx.auth_mgr
+                .login("admin", "RacedPassword123!", "127.0.0.1")
+                .await,
+            crate::auth::LoginResult::Success(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Regression (1.9.2 review): a failed write while deleting the bootstrap
+    /// `admin` must not be reported as a successful setup.
+    #[tokio::test]
+    async fn test_wizard_bootstrap_delete_persist_failure_keeps_setup_pending() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_delfail_{}", rand::random::<u64>()));
+        let auth_dir = temp_dir.join("auth");
+        let _ = std::fs::create_dir_all(&auth_dir);
+        let mut ctx = mock_context(&temp_dir).await;
+        ctx.auth_mgr = Arc::new(crate::auth::AuthManager::with_storage(&auth_dir, 24, 5).unwrap());
+        ctx.set_setup_pending(true);
+        let token = ctx.auth_mgr.setup_token().expect("setup token provisioned");
+        ctx.auth_mgr
+            .create_user("owner", "OwnerPassword123!", Role::Admin)
+            .await;
+
+        // The credential update write succeeds; the following delete write
+        // fails.
+        crate::auth::manager::SECRET_WRITE_FAIL_AFTER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((auth_dir.join("users.toml"), 1));
+
+        let form = WizardCompleteForm {
+            setup_token: Some(token),
+            admin_user: Some("owner".to_string()),
+            admin_password: Some("NewOwnerPassword123!".to_string()),
+            confirm_password: Some("NewOwnerPassword123!".to_string()),
+            upstream: Some("1.1.1.1:53".to_string()),
+            ..Default::default()
+        };
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Form(form),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(ctx.is_setup_pending());
+        assert!(ctx.auth_mgr.setup_token_required());
+        assert!(ctx.auth_mgr.has_user("admin"));
+        assert!(ctx.auth_mgr.has_user("owner"));
+        assert!(ctx.auth_mgr.is_default_admin_active());
+        assert!(ctx.auth_mgr.is_first_run());
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("owner", "OwnerPassword123!")
+                .await,
+            "the credential change must be rolled back"
+        );
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
