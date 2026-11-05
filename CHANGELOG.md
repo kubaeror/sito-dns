@@ -8,6 +8,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **HA pushes preserve node-local listeners and certificates**: a slave's
+  persisted configuration now keeps its own `dns.bind`, `[dns.tls]`/`[tls]`
+  paths, `[acme]`, `web.bind`/`web.port` and the complete
+  `[integrations.mikrotik]` section instead of inheriting the master's. A
+  master bound to one address can no longer make a slave fail to bind (or use
+  certificate paths that do not exist on that node), and the runbook's IPv6-vs-
+  IPv4 bind difference between master and slave is safe on the first push.
 - **HA master restarts reconcile `config.toml`**: a master that restarts with a
   persisted `ha_state.toml` now compares the sanitized current configuration
   with the stored bundle (semantically) and republishes at `N + 1` when they

@@ -397,23 +397,15 @@ async fn build_persisted_config(
         toml::Value::String(live.server.data_dir.to_string_lossy().into_owned()),
     );
 
-    if let Some(local_credentials) = live
-        .integrations
-        .as_ref()
-        .and_then(|i| i.get("mikrotik"))
-        .and_then(toml::Value::as_table)
-        && let Some(pushed_mikrotik) = pushed
-            .get_mut("integrations")
-            .and_then(|i| i.as_table_mut())
-            .and_then(|i| i.get_mut("mikrotik"))
-            .and_then(toml::Value::as_table_mut)
-    {
-        for key in ["token", "password"] {
-            if let Some(value) = local_credentials.get(key) {
-                pushed_mikrotik.insert(key.to_string(), value.clone());
-            }
-        }
-    }
+    // Node-local listener, TLS and ACME identity. The master's bind addresses
+    // may not exist on this node (or may already be in use) and its
+    // certificate paths are local to the master, so the live node-local values
+    // are authoritative for the persisted document.
+    preserve_node_local_listener_config(&mut pushed, live)?;
+
+    // `[integrations.mikrotik]` describes the router on this node's LAN and
+    // carries per-node credentials. None of it is shared cluster state.
+    preserve_node_local_mikrotik(&mut pushed, live)?;
 
     // Authoritative removal: the bundle's structured fields decide whether the
     // section exists at all. `clients_value` already includes the node-local
@@ -464,6 +456,133 @@ async fn build_persisted_config(
     }
 
     toml::to_string_pretty(&pushed).map_err(|e| HaError::Serialization(e.to_string()))
+}
+
+/// Encodes a serializable configuration section as a TOML value.
+fn section_value<T: serde::Serialize>(value: &T) -> Result<toml::Value, HaError> {
+    toml::Value::try_from(value).map_err(|e| HaError::Serialization(e.to_string()))
+}
+
+/// Returns `table[key]` as a mutable table, creating it when absent.
+fn ensure_section<'a>(
+    table: &'a mut toml::Table,
+    key: &str,
+) -> Result<&'a mut toml::Table, HaError> {
+    table
+        .entry(key.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| HaError::Validation {
+            field: key.to_string(),
+            reason: format!("Pushed [{key}] section is not a table"),
+        })
+}
+
+/// Restores the node-local listener, TLS and ACME identity into `pushed`.
+///
+/// The master's `dns.bind` addresses, `web.bind`/`web.port`, certificate paths
+/// and ACME account/cache settings are local to the master node. A slave with
+/// different addresses would fail to bind (or expose the admin UI on the wrong
+/// interface) and its TLS material lives at different paths.
+fn preserve_node_local_listener_config(
+    pushed: &mut toml::Table,
+    live: &Config,
+) -> Result<(), HaError> {
+    {
+        let dns = ensure_section(pushed, "dns")?;
+        dns.insert(
+            "bind".to_string(),
+            toml::Value::Array(
+                live.dns
+                    .bind
+                    .iter()
+                    .map(|addr| toml::Value::String(addr.to_string()))
+                    .collect(),
+            ),
+        );
+        match live.dns.tls.as_ref() {
+            Some(tls) => {
+                dns.insert("tls".to_string(), section_value(tls)?);
+            }
+            None => {
+                dns.remove("tls");
+            }
+        }
+    }
+
+    match live.tls.as_ref() {
+        Some(tls) => {
+            pushed.insert("tls".to_string(), section_value(tls)?);
+        }
+        None => {
+            pushed.remove("tls");
+        }
+    }
+
+    match live.acme.as_ref() {
+        Some(acme) => {
+            pushed.insert("acme".to_string(), section_value(acme)?);
+        }
+        None => {
+            pushed.remove("acme");
+        }
+    }
+
+    // Only materialize `[web]` when either side declares it; a node that never
+    // configured it keeps using the built-in defaults.
+    if pushed.contains_key("web") || live.web.is_some() {
+        let web_config = live.get_web_config();
+        let web = ensure_section(pushed, "web")?;
+        web.insert(
+            "bind".to_string(),
+            toml::Value::String(web_config.bind.to_string()),
+        );
+        web.insert(
+            "port".to_string(),
+            toml::Value::Integer(i64::from(web_config.port)),
+        );
+    }
+
+    Ok(())
+}
+
+/// Restores the node-local `[integrations.mikrotik]` section into `pushed`.
+///
+/// The router lives on this node's LAN and carries per-node credentials, so
+/// the whole section is node-local rather than only `token`/`password`.
+fn preserve_node_local_mikrotik(pushed: &mut toml::Table, live: &Config) -> Result<(), HaError> {
+    let local = live
+        .integrations
+        .as_ref()
+        .and_then(|integrations| integrations.get("mikrotik"))
+        .cloned();
+    match local {
+        Some(value) => {
+            let integrations = ensure_section(pushed, "integrations")?;
+            integrations.insert("mikrotik".to_string(), value);
+        }
+        None => {
+            if let Some(integrations) = pushed
+                .get_mut("integrations")
+                .and_then(toml::Value::as_table_mut)
+            {
+                integrations.remove("mikrotik");
+            }
+        }
+    }
+
+    // An empty `[integrations]` left over from removing the master's MikroTik
+    // section would look like a restart-only `integrations` change on the next
+    // apply, so drop it entirely.
+    if pushed
+        .get("integrations")
+        .and_then(toml::Value::as_table)
+        .is_some_and(toml::Table::is_empty)
+    {
+        pushed.remove("integrations");
+    }
+
+    Ok(())
 }
 
 /// Reads the node-local `[clients] client_id_secrets` table (name -> secret)
@@ -1727,6 +1846,234 @@ url = "https://192.168.1.1"
         );
     }
 
+    /// Node-local listener, TLS, ACME and RouterOS identity must never be
+    /// replaced by the master's values: a master bound to `192.168.1.10` must
+    /// not make a slave at `.11` fail to bind, and certificate paths that only
+    /// exist on the master must not reach the slave's persisted file.
+    #[tokio::test]
+    async fn test_persisted_config_preserves_node_local_listener_tls_and_web() {
+        let local = r#"
+config_version = 1
+
+[server]
+role = "slave"
+instance_name = "slave-1"
+data_dir = "/var/lib/sito-slave"
+
+[dns]
+bind = ["192.168.1.11"]
+
+[dns.tls]
+cert = "/etc/sito/slave-dns.crt"
+key = "/etc/sito/slave-dns.key"
+
+[tls]
+cert = "/etc/sito/slave.crt"
+key = "/etc/sito/slave.key"
+
+[acme]
+enabled = true
+email = "slave@example.com"
+domains = ["slave.example"]
+cache_dir = "/var/lib/sito/acme"
+
+[web]
+bind = "127.0.0.1"
+port = 8081
+
+[integrations.mikrotik]
+url = "https://192.168.1.7"
+token = "local-token"
+password = "local-routeros-password"
+"#;
+        let pushed = r#"
+config_version = 1
+
+[server]
+role = "slave"
+data_dir = "/var/lib/sito-master"
+
+[dns]
+bind = ["192.168.1.10", "::"]
+
+[dns.tls]
+cert = "/etc/sito/master-dns.crt"
+key = "/etc/sito/master-dns.key"
+
+[tls]
+cert = "/etc/sito/master.crt"
+key = "/etc/sito/master.key"
+
+[acme]
+enabled = true
+email = "master@example.com"
+domains = ["master.example"]
+cache_dir = "/var/lib/sito-master/acme"
+
+[web]
+bind = "192.168.1.10"
+port = 80
+
+[integrations.mikrotik]
+url = "https://192.168.9.9"
+"#;
+
+        let live = Config::from_toml_str(local).expect("node-local config");
+        let bundle = test_bundle(2, pushed, None, None);
+        let merged = build_persisted_config(pushed, &bundle, None, &live, None)
+            .await
+            .expect("build persisted config");
+        let table: toml::Table = merged.parse().unwrap();
+
+        assert_eq!(
+            table
+                .get("dns")
+                .and_then(|dns| dns.get("bind"))
+                .and_then(toml::Value::as_array)
+                .map(|bind| bind
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<Vec<_>>()),
+            Some(vec!["192.168.1.11"]),
+            "the slave must keep its own bind list, not the master's: {merged}"
+        );
+        assert_eq!(
+            table
+                .get("dns")
+                .and_then(|dns| dns.get("tls"))
+                .and_then(|tls| tls.get("cert"))
+                .and_then(toml::Value::as_str),
+            Some("/etc/sito/slave-dns.crt"),
+            "the slave must keep its own [dns.tls] certificate path"
+        );
+        assert_eq!(
+            table
+                .get("tls")
+                .and_then(|tls| tls.get("cert"))
+                .and_then(toml::Value::as_str),
+            Some("/etc/sito/slave.crt"),
+            "the slave must keep its own [tls] certificate path"
+        );
+        assert_eq!(
+            table
+                .get("tls")
+                .and_then(|tls| tls.get("key"))
+                .and_then(toml::Value::as_str),
+            Some("/etc/sito/slave.key"),
+            "the slave must keep its own [tls] key path"
+        );
+        assert_eq!(
+            table
+                .get("acme")
+                .and_then(|acme| acme.get("email"))
+                .and_then(toml::Value::as_str),
+            Some("slave@example.com"),
+            "the slave must keep its own [acme] identity"
+        );
+        assert_eq!(
+            table
+                .get("acme")
+                .and_then(|acme| acme.get("cache_dir"))
+                .and_then(toml::Value::as_str),
+            Some("/var/lib/sito/acme"),
+            "the slave must keep its own [acme] cache directory"
+        );
+        assert_eq!(
+            table
+                .get("web")
+                .and_then(|web| web.get("bind"))
+                .and_then(toml::Value::as_str),
+            Some("127.0.0.1"),
+            "the slave must keep its own web bind address"
+        );
+        assert_eq!(
+            table
+                .get("web")
+                .and_then(|web| web.get("port"))
+                .and_then(toml::Value::as_integer),
+            Some(8081),
+            "the slave must keep its own web port"
+        );
+        assert_eq!(
+            table
+                .get("integrations")
+                .and_then(|integrations| integrations.get("mikrotik"))
+                .and_then(|mikrotik| mikrotik.get("url"))
+                .and_then(toml::Value::as_str),
+            Some("https://192.168.1.7"),
+            "the RouterOS URL is node-local and must come from the slave"
+        );
+        assert_eq!(
+            table
+                .get("integrations")
+                .and_then(|integrations| integrations.get("mikrotik"))
+                .and_then(|mikrotik| mikrotik.get("password"))
+                .and_then(toml::Value::as_str),
+            Some("local-routeros-password"),
+            "the RouterOS password must survive a push"
+        );
+    }
+
+    /// A slave without certificate material must not inherit the master's TLS
+    /// and ACME paths: they are local to the master and a restart on the slave
+    /// would fail to load them.
+    #[tokio::test]
+    async fn test_pushed_tls_and_acme_are_removed_when_slave_has_none() {
+        let pushed = r#"
+config_version = 1
+
+[server]
+role = "slave"
+
+[dns]
+bind = ["192.168.1.10"]
+[dns.tls]
+cert = "/etc/sito/master-dns.crt"
+key = "/etc/sito/master-dns.key"
+
+[tls]
+cert = "/etc/sito/master.crt"
+key = "/etc/sito/master.key"
+
+[acme]
+enabled = true
+email = "master@example.com"
+domains = ["master.example"]
+"#;
+        let live = Config::default();
+        let bundle = test_bundle(2, pushed, None, None);
+        let merged = build_persisted_config(pushed, &bundle, None, &live, None)
+            .await
+            .expect("build persisted config");
+        let table: toml::Table = merged.parse().unwrap();
+
+        assert!(
+            table.get("tls").is_none(),
+            "the master's [tls] section must not be persisted on a slave without one: {merged}"
+        );
+        assert!(
+            table.get("acme").is_none(),
+            "the master's [acme] section must not be persisted on a slave without one: {merged}"
+        );
+        assert!(
+            table.get("dns").and_then(|dns| dns.get("tls")).is_none(),
+            "the master's [dns.tls] section must not be persisted on a slave: {merged}"
+        );
+        let expected_bind: Vec<String> = live.dns.bind.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            table
+                .get("dns")
+                .and_then(|dns| dns.get("bind"))
+                .and_then(toml::Value::as_array)
+                .map(|bind| bind
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<Vec<_>>()),
+            Some(expected_bind.iter().map(String::as_str).collect()),
+            "the slave's default bind list must be preserved"
+        );
+    }
+
     /// I4 regression: the local file is expected but unreadable/unparseable.
     /// The push must fail (applied:false) and the file must stay untouched.
     #[tokio::test]
@@ -2686,8 +3033,9 @@ ttl = 60
 
     /// The WP-5.1 end-to-end scenario: a realistic master config with a
     /// `[tls] key` path and structured `client_id_secrets` must replicate
-    /// successfully (no unresolvable `${SECRET:tls_key}` placeholder) and the
-    /// wire bundle must not carry the client secret.
+    /// successfully (no unresolvable `${SECRET:tls_key}` placeholder).
+    /// Certificate paths are node-local: the slave keeps its own `[tls]`
+    /// paths and the wire bundle must not carry the client secret.
     #[tokio::test]
     async fn test_push_with_tls_path_and_client_secrets_applies() {
         use crate::bundle::sanitize_config_for_bundle;
@@ -2734,10 +3082,10 @@ client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
         let dir = std::env::temp_dir().join(format!("sito_ha_tls_{}", rand::random::<u64>()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let path = dir.join("config.toml");
-        // The slave keeps its node-local secret.
+        // The slave keeps its node-local secret and TLS paths.
         tokio::fs::write(
             &path,
-            "[server]\nrole = \"slave\"\ninstance_name = \"slave-tls\"\n\n[clients]\nclient_id_secrets = { \"kids-tablet\" = \"client_shared_secret_9876\" }\n",
+            "[server]\nrole = \"slave\"\ninstance_name = \"slave-tls\"\n\n[tls]\ncert = \"/etc/sito/slave.crt\"\nkey = \"/etc/sito/slave.key\"\n\n[clients]\nclient_id_secrets = { \"kids-tablet\" = \"client_shared_secret_9876\" }\n",
         )
         .await
         .unwrap();
@@ -2749,8 +3097,8 @@ client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
             .expect("a config with a TLS key path and client secrets must replicate");
         assert_eq!(tracker.get_state(), SlaveState::Synced);
 
-        // The persisted configuration keeps the node-local secret and the TLS
-        // path, and a restart can parse it.
+        // The persisted configuration keeps the node-local secret and the
+        // slave's own TLS paths, and a restart can parse it.
         let persisted: toml::Table = tokio::fs::read_to_string(&path)
             .await
             .unwrap()
@@ -2761,7 +3109,8 @@ client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
                 .get("tls")
                 .and_then(|t| t.get("key"))
                 .and_then(toml::Value::as_str),
-            Some("/etc/sito/tls.key")
+            Some("/etc/sito/slave.key"),
+            "the master's certificate path must not replace the slave's"
         );
         assert_eq!(
             persisted

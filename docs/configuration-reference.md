@@ -428,6 +428,14 @@ unreadable watermark fails startup rather than resetting to version 0; delete
 it only when you intend to force a full resync from the master. The watermark
 is node-local and must not be copied between slaves.
 
+Replication preserves node-local identity. The master does not overwrite a
+slave's `dns.bind`, `[dns.tls]`/`[tls]` certificate paths, `[acme]` account and
+cache settings, `web.bind`/`web.port`, `[ha]`, `server.instance_name`,
+`server.data_dir`, `[integrations.mikrotik]` or `clients.client_id_secrets`.
+`dns.port` and the other listener ports are shared configuration; the runbook's
+master `bind = ["0.0.0.0", "::"]` and slave `bind = ["0.0.0.0"]` therefore
+coexist, including on hosts without IPv6.
+
 Cluster terms are node-persisted, not configuration keys: the master stores the
 current term inside `ha_state.toml` and only an explicit promotion (editing the
 state file and restarting, see `docs/runbook-ha.md`) raises it. A promotion must
