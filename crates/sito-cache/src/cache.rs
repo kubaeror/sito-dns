@@ -11,7 +11,7 @@ use tracing::{debug, trace, warn};
 use sito_core::config::CacheConfig;
 use sito_proto::rdata::SOA;
 use sito_proto::{
-    DNSClass, Message, MessageType, Name, RData, RecordType, ResponseCode, encode_message,
+    DNSClass, Message, MessageType, Name, RData, Record, RecordType, ResponseCode, encode_message,
 };
 
 use crate::entry::{CacheEntry, ValidationStatus};
@@ -503,7 +503,21 @@ impl DnsCache {
             // RFC 2308: the negative answer must never outlive the CNAME chain
             // that led to it. Otherwise the cached NODATA/NXDOMAIN would keep
             // being served after the alias TTL expired.
-            let max_lifespan = clamped_ttl.min(cname_chain_ttl.unwrap_or(u32::MAX));
+            //
+            // A Secure negative answer is only proven by its NSEC/NSEC3 denial
+            // records (and their RRSIGs), whose TTLs the validator has already
+            // capped by the authenticated TTL/signature expiry. The SOA can be
+            // signed with a longer lifetime, so the entry must not outlive the
+            // denial proof. Without a proof a Secure negative has no
+            // authenticated lifetime at all (lifespan 0, fail closed).
+            let denial_ttl = if validation_status.is_secure() {
+                Some(denial_proof_ttl(&response.authorities).unwrap_or(0))
+            } else {
+                None
+            };
+            let max_lifespan = clamped_ttl
+                .min(cname_chain_ttl.unwrap_or(u32::MAX))
+                .min(denial_ttl.unwrap_or(u32::MAX));
 
             for answer in &response.answers {
                 answer_ttls.push(answer.ttl.min(max_lifespan));
@@ -653,7 +667,7 @@ fn answer_owners_are_relevant(qname: &Name, response: &Message) -> bool {
 /// `authorities` (`min(SOA TTL, SOA MINIMUM)`) whose owner is one of
 /// `chain_names` or an ancestor of one. A SOA for an unrelated zone is out of
 /// bailiwick and is ignored.
-fn negative_ttl_from_soa(authorities: &[sito_proto::Record], chain_names: &[Name]) -> Option<u32> {
+fn negative_ttl_from_soa(authorities: &[Record], chain_names: &[Name]) -> Option<u32> {
     for auth in authorities {
         if let RData::SOA(SOA { minimum, .. }) = &auth.data
             && chain_names.iter().any(|name| auth.name.zone_of(name))
@@ -662,6 +676,32 @@ fn negative_ttl_from_soa(authorities: &[sito_proto::Record], chain_names: &[Name
         }
     }
     None
+}
+
+/// Authenticated lifetime of the NSEC/NSEC3 denial proof in `authorities`.
+///
+/// Returns the minimum TTL among the denial records and their RRSIGs. The
+/// DNSSEC validator's `apply_authenticated_ttls` has already capped every TTL
+/// by the RRSIG original TTL and remaining validity, so this minimum is the
+/// time the proof remains trustworthy. `None` when no NSEC/NSEC3 is present.
+fn denial_proof_ttl(authorities: &[Record]) -> Option<u32> {
+    let mut saw_denial = false;
+    let mut min_ttl = u32::MAX;
+    for record in authorities {
+        match record.record_type() {
+            RecordType::NSEC | RecordType::NSEC3 => {
+                saw_denial = true;
+                min_ttl = min_ttl.min(record.ttl);
+            }
+            // A signature can expire before the RR it covers. Including every
+            // RRSIG in the authority section can only shorten the lifespan.
+            RecordType::RRSIG => {
+                min_ttl = min_ttl.min(record.ttl);
+            }
+            _ => {}
+        }
+    }
+    saw_denial.then_some(min_ttl)
 }
 
 /// Names on the CNAME chain starting at `qname` (including `qname` itself) and

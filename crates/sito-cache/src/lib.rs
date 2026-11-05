@@ -453,6 +453,78 @@ mod tests {
         );
     }
 
+    /// A Secure negative answer is only as trustworthy as its NSEC/NSEC3
+    /// denial proof. The SOA-derived negative TTL must not outlive the denial
+    /// record or its RRSIG (RFC 4035 §5.3.3).
+    #[tokio::test]
+    async fn test_secure_negative_ttl_is_capped_by_denial_proof() {
+        let config = make_test_config(60, 3600, 3600);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("missing-ttl.example.").unwrap();
+        let query = query_for(83, &qname);
+        let mut response = Message::response(83, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.metadata.response_code = ResponseCode::NXDomain;
+        // The SOA is signed with a long TTL, while the actual denial proof
+        // (NSEC + RRSIG) expires after 10 seconds.
+        response.authorities.push(Record::from_rdata(
+            Name::from_str("example.").unwrap(),
+            3600,
+            RData::SOA(SOA::new(
+                Name::from_str("ns1.example.").unwrap(),
+                Name::from_str("hostmaster.example.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                3600,
+            )),
+        ));
+        for code in [RecordType::NSEC, RecordType::RRSIG] {
+            response.authorities.push(Record::from_rdata(
+                qname.clone(),
+                10,
+                RData::Unknown {
+                    code,
+                    rdata: NULL::default(),
+                },
+            ));
+        }
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Secure)
+            .await;
+
+        let (cached, status) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("cache hit");
+        assert_eq!(status, ValidationStatus::Secure);
+        assert_eq!(cached.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(
+            cached.authorities[0].ttl, 10,
+            "the SOA-derived negative TTL must be capped by the denial proof"
+        );
+        assert!(
+            cached.authorities.iter().all(|record| record.ttl <= 10),
+            "no authority record may outlive the denial proof: {:?}",
+            cached.authorities
+        );
+
+        // The entry must decrement from the denial TTL (10 s), not from the
+        // 3600 s SOA TTL.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let (later, _) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("still within the denial lifespan");
+        assert!(
+            later.authorities[0].ttl < 10,
+            "the negative lifespan must be the denial TTL (got {})",
+            later.authorities[0].ttl
+        );
+    }
+
     /// The stale fallback must expose the recorded validation status (so the
     /// pipeline can refuse Unchecked entries) and strip every DNSSEC RR type,
     /// not just RRSIG.
