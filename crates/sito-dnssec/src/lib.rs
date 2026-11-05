@@ -38,6 +38,43 @@ const MAX_DNSKEYS: usize = 64;
 const MAX_DS_RECORDS: usize = 64;
 /// Maximum number of RRSIG records evaluated from a single response.
 const MAX_RRSIGS: usize = 128;
+/// Hard upper bound on cryptographic RRSIG verification attempts for one
+/// client response. Upstream data is untrusted: without this bound a crafted
+/// message with 64 DNSKEYs and 128 RRSIGs could force thousands of RSA/ECDSA
+/// verifications per query.
+const MAX_VERIFICATIONS_PER_RESPONSE: u32 = 256;
+/// Maximum candidate keys tried for a single RRSIG. Trusted/validated keys are
+/// tried first, so this only drops unvalidated response keys.
+const MAX_CANDIDATE_KEYS_PER_RRSIG: usize = 8;
+
+/// Per-response budget for cryptographic RRSIG verification attempts.
+///
+/// Every `verify_rrsig` call in the response-validation path must consume one
+/// unit first. A crafted authoritative response cannot make the resolver
+/// perform more than `MAX_VERIFICATIONS_PER_RESPONSE` signature checks.
+#[derive(Debug)]
+struct VerifyBudget {
+    remaining: u32,
+}
+
+impl VerifyBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_VERIFICATIONS_PER_RESPONSE,
+        }
+    }
+
+    /// Consumes one verification slot, returning false when the budget is
+    /// exhausted. Callers must fail closed (stop verifying) on false.
+    fn try_consume(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
 /// Hard bound on the validated-key cache; DNSKEYs are re-discoverable.
 const KEY_CACHE_MAX_ENTRIES: usize = 4096;
 /// Hard bound on the known-signed-zone cache; zones are re-discoverable.
@@ -249,6 +286,9 @@ pub struct DnssecMetrics {
     pub key_cache_hits: AtomicU64,
     /// DNSKEY lookups that had to be resolved from the response or upstream.
     pub key_cache_misses: AtomicU64,
+    /// Cryptographic RRSIG verification attempts made while validating
+    /// responses (bounded per response; see `MAX_VERIFICATIONS_PER_RESPONSE`).
+    pub signature_verifications: AtomicU64,
     pub bogus_by_upstream_reason: DashMap<(String, String), AtomicU64>,
 }
 
@@ -296,6 +336,17 @@ impl DnssecMetrics {
     #[must_use]
     pub fn key_cache_misses(&self) -> u64 {
         self.key_cache_misses.load(Ordering::Relaxed)
+    }
+
+    /// Records one cryptographic RRSIG verification attempt.
+    pub fn record_signature_verification(&self) {
+        self.signature_verifications.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative cryptographic RRSIG verification attempts.
+    #[must_use]
+    pub fn signature_verifications(&self) -> u64 {
+        self.signature_verifications.load(Ordering::Relaxed)
     }
 
     pub fn record_bogus(&self, upstream: Option<&str>, reason: &str) {
@@ -981,6 +1032,7 @@ fn has_valid_rrsig_for(
     signer_zone: &LowerName,
     keys: &[DNSKEY],
     now: u32,
+    budget: &mut VerifyBudget,
 ) -> bool {
     for record in response
         .answers
@@ -1005,6 +1057,9 @@ fn has_valid_rrsig_for(
                 || key.calculate_key_tag().ok() != Some(rrsig.input().key_tag)
             {
                 continue;
+            }
+            if !budget.try_consume() {
+                return false;
             }
             if verify_rrsig_covered(response, owner, rrsig, key) {
                 return true;
@@ -1040,6 +1095,8 @@ fn ds_response_status(
     if !parent_zone.zone_of(&LowerName::from(cut)) {
         return DsStatus::Unknown;
     }
+    // Bound the work one fetched DS/denial response can cause.
+    let mut budget = VerifyBudget::new();
 
     // A DS RRset at the cut: only meaningful when signed by the parent.
     let has_ds = response
@@ -1050,7 +1107,15 @@ fn ds_response_status(
             record.name == *cut && matches!(record.data, RData::DNSSEC(DNSSECRData::DS(_)))
         });
     if has_ds {
-        if !has_valid_rrsig_for(response, cut, RecordType::DS, parent_zone, parent_keys, now) {
+        if !has_valid_rrsig_for(
+            response,
+            cut,
+            RecordType::DS,
+            parent_zone,
+            parent_keys,
+            now,
+            &mut budget,
+        ) {
             return DsStatus::Unknown;
         }
         let ttl = response
@@ -1083,6 +1148,7 @@ fn ds_response_status(
             parent_zone,
             parent_keys,
             now,
+            &mut budget,
         ) {
             return DsStatus::Unknown;
         }
@@ -1128,6 +1194,7 @@ fn ds_response_status(
                 parent_zone,
                 parent_keys,
                 now,
+                &mut budget,
             )
         {
             return DsStatus::InZone;
@@ -1165,6 +1232,7 @@ fn ds_response_status(
                 parent_zone,
                 parent_keys,
                 now,
+                &mut budget,
             ) {
                 return DsStatus::Unknown;
             }
@@ -1211,6 +1279,7 @@ fn ds_response_status(
                         parent_zone,
                         parent_keys,
                         now,
+                        &mut budget,
                     )
                 {
                     return DsStatus::Unsigned(record.ttl.max(1));
@@ -1238,6 +1307,7 @@ fn ds_response_status(
                     parent_zone,
                     parent_keys,
                     now,
+                    &mut budget,
                 )
             })
             .collect();
@@ -1955,6 +2025,7 @@ impl DnssecValidator {
                 zone,
                 &anchored,
                 now,
+                &mut VerifyBudget::new(),
             )
         {
             return None;
@@ -2105,7 +2176,15 @@ impl DnssecValidator {
             .cloned()
             .collect();
         if matched.is_empty()
-            || !has_valid_rrsig_for(&message, &cut_name, RecordType::DNSKEY, cut, &matched, now)
+            || !has_valid_rrsig_for(
+                &message,
+                &cut_name,
+                RecordType::DNSKEY,
+                cut,
+                &matched,
+                now,
+                &mut VerifyBudget::new(),
+            )
         {
             return None;
         }
@@ -2331,8 +2410,18 @@ impl DnssecValidator {
         // building, never evidence about the original response. Remember
         // where they begin so validation can tell them apart.
         let original_additionals = response.additionals.len();
-        let baseline =
-            self.validate_response_inner(response, upstream, now, Some(original_additionals), true);
+        // One verification budget covers both passes (pre-fetch and strict)
+        // for this response, so a crafted message cannot double its work by
+        // forcing the chain walk.
+        let mut verify_budget = VerifyBudget::new();
+        let baseline = self.validate_response_inner(
+            response,
+            upstream,
+            now,
+            Some(original_additionals),
+            true,
+            &mut verify_budget,
+        );
         if baseline != ValidationOutcome::Indeterminate || self.mode == DnssecMode::Disabled {
             return baseline;
         }
@@ -2376,6 +2465,7 @@ impl DnssecValidator {
             now,
             Some(original_additionals),
             false,
+            &mut verify_budget,
         );
         response.additionals.truncate(original_additionals);
         outcome
@@ -2401,6 +2491,7 @@ impl DnssecValidator {
         dnskeys: &[(Name, DNSKEY)],
         rrsigs: &[(Name, SIG)],
         now: u32,
+        budget: &mut VerifyBudget,
     ) -> KeySetBuild {
         let mut result = KeySetBuild::default();
         let anchors = self.trust_anchors.load();
@@ -2443,7 +2534,7 @@ impl DnssecValidator {
 
         let mut changed = true;
         let mut rounds = 0u8;
-        while changed && rounds < 16 {
+        'walk: while changed && rounds < 16 {
             changed = false;
             rounds += 1;
 
@@ -2472,6 +2563,11 @@ impl DnssecValidator {
                         {
                             continue;
                         }
+                        if !budget.try_consume() {
+                            // Bounded work: stop walking the forged chain.
+                            break 'walk;
+                        }
+                        self.metrics.record_signature_verification();
                         if !verify_rrsig_covered(response, ds_owner, sig, parent_key) {
                             continue;
                         }
@@ -2551,6 +2647,11 @@ impl DnssecValidator {
                     {
                         continue;
                     }
+                    if !budget.try_consume() {
+                        // Bounded work: stop walking the forged chain.
+                        break 'walk;
+                    }
+                    self.metrics.record_signature_verification();
                     if !verify_rrsig_covered(response, owner, sig, signer_key) {
                         continue;
                     }
@@ -2635,7 +2736,8 @@ impl DnssecValidator {
         // No fetcher is available here, so a present-but-unchecked relevant
         // RRSIG stays Indeterminate: callers that can fetch the chain add
         // their own strict post-fetch pass.
-        self.validate_response_inner(response, upstream, now, None, true)
+        let mut verify_budget = VerifyBudget::new();
+        self.validate_response_inner(response, upstream, now, None, true, &mut verify_budget)
     }
 
     /// Validate a response, treating additional-section records starting at
@@ -2659,6 +2761,7 @@ impl DnssecValidator {
         now: u32,
         helper_additionals: Option<usize>,
         allow_unchecked_signatures: bool,
+        budget: &mut VerifyBudget,
     ) -> ValidationOutcome {
         if self.mode == DnssecMode::Disabled {
             response.metadata.authentic_data = false;
@@ -2766,7 +2869,8 @@ impl DnssecValidator {
         }
 
         // Extend trust from anchors to derived keys (DS delegation, KSK->ZSK).
-        let key_set = self.build_validated_key_set(response, &response_dnskeys, &rrsigs, now);
+        let key_set =
+            self.build_validated_key_set(response, &response_dnskeys, &rrsigs, now, budget);
 
         // Validate each RRSIG. Secure/AD is granted only when the answer RRset
         // relevant to the question (or a complete denial proof) is covered by a
@@ -2824,11 +2928,15 @@ impl DnssecValidator {
             let key_tag = rrsig.input().key_tag;
 
             // Candidate keys for this RRSIG: the validated-key cache plus every
-            // response DNSKEY with the same owner, tag and algorithm. All
-            // candidates are tried because a key tag is not a unique key
+            // response DNSKEY with the same owner, tag and algorithm. Multiple
+            // candidates are considered because a key tag is not a unique key
             // identity (RFC 4035 5.3.1): an anchored key and a same-tag forgery
             // can both match, and stopping at the first match would let the
             // forgery shadow -- or inherit -- the real key's trust.
+            //
+            // Trusted keys are tried first and the list is capped, so a flood
+            // of same-tag response keys cannot starve the real signer or
+            // multiply the cryptographic work per signature.
             let lower_signer = LowerName::from(signer_name);
             let cached_key = self
                 .key_cache
@@ -2847,6 +2955,18 @@ impl DnssecValidator {
                     candidates.push(dnskey.clone());
                 }
             }
+            candidates.sort_by_key(|dnskey| {
+                let trusted = anchors.contains(dnskey.public_key())
+                    || anchors.contains_with_name(dnskey.public_key(), &lower_signer)
+                    || key_set
+                        .validated
+                        .contains(&(lower_signer.clone(), dnskey_fingerprint(dnskey)))
+                    || self
+                        .key_cache
+                        .is_validated(&lower_signer, key_tag, dnskey, now);
+                !trusted
+            });
+            candidates.truncate(MAX_CANDIDATE_KEYS_PER_RRSIG);
             if candidates.is_empty() {
                 // No usable key material: the chain fetch path may resolve it.
                 continue;
@@ -2885,6 +3005,12 @@ impl DnssecValidator {
                     continue;
                 }
 
+                if !budget.try_consume() {
+                    // Hard per-response cap; the remaining signatures stay
+                    // unverified (never secure).
+                    break;
+                }
+                self.metrics.record_signature_verification();
                 if dnskey
                     .verify_rrsig(
                         rrsig_owner,
@@ -4902,7 +5028,13 @@ mod tests {
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
         let fingerprint = dnskey_fingerprint(&root_key);
         let dnskeys = vec![(root.clone(), root_key)];
-        let result = validator.build_validated_key_set(&response, &dnskeys, &[], now);
+        let result = validator.build_validated_key_set(
+            &response,
+            &dnskeys,
+            &[],
+            now,
+            &mut VerifyBudget::new(),
+        );
 
         assert!(result.validated.contains(&(lower.clone(), fingerprint)));
         assert!(
@@ -5201,8 +5333,13 @@ mod tests {
             RData::DNSSEC(DNSSECRData::DNSKEY(root_key.clone())),
         ));
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
-        let result =
-            validator.build_validated_key_set(&response, &[(root.clone(), root_key)], &[], now);
+        let result = validator.build_validated_key_set(
+            &response,
+            &[(root.clone(), root_key)],
+            &[],
+            now,
+            &mut VerifyBudget::new(),
+        );
         assert!(
             !result.validated.is_empty(),
             "expected validated keys, got none"
@@ -5864,6 +6001,56 @@ mod tests {
         assert!(
             sig_ttl <= 30,
             "the RRSIG TTL must be capped as well, got {sig_ttl}"
+        );
+    }
+
+    /// A crafted response must not be able to force unbounded cryptographic
+    /// work: 128 RRSIGs (bounded by `MAX_RRSIGS`) each offering 64 candidate
+    /// DNSKEYs (bounded by `MAX_DNSKEYS`) used to mean thousands of ECDSA/RSA
+    /// verifications per client query.
+    #[test]
+    fn test_crafted_dnskey_rrsig_counts_stay_within_verification_budget() {
+        let (origin, dnskey, _a_record, rrsig_record, _) =
+            create_test_signed_domain("bounded.example.");
+
+        let mut trust_anchors = TrustAnchors::empty();
+        trust_anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new())
+            .with_trust_anchors(trust_anchors);
+
+        let mut msg = Message::new(4, MessageType::Response, OpCode::Query);
+        msg.queries
+            .push(Query::query(origin.clone(), RecordType::A));
+        // The signed RRset is replaced with a different address: every
+        // candidate key fails verification, which is the attacker's
+        // maximum-work case.
+        msg.answers.push(Record::from_rdata(
+            origin.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(198, 51, 100, 9))),
+        ));
+        for _ in 0..MAX_RRSIGS {
+            msg.answers.push(rrsig_record.clone());
+        }
+        for _ in 0..MAX_DNSKEYS {
+            msg.additionals.push(Record::from_rdata(
+                origin.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+            ));
+        }
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator.validate_response(&mut msg, Some("crafted"), now);
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "forged data must stay Bogus, got {outcome:?}"
+        );
+        let attempts = validator.metrics.signature_verifications();
+        assert!(
+            attempts <= u64::from(MAX_VERIFICATIONS_PER_RESPONSE),
+            "crafted response exceeded the verification budget: {attempts} attempts"
         );
     }
 
