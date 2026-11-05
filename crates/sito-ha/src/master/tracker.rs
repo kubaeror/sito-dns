@@ -56,8 +56,14 @@ pub struct ActiveSlave {
 }
 
 impl ActiveSlave {
-    pub fn to_summary(&self, current_version: u64) -> SlaveSummary {
-        let diverged = self.synced_version > current_version;
+    /// Builds the API summary.
+    ///
+    /// `latched_divergence` is true when the coordinator has a sticky
+    /// divergence record for this instance (fork, newer term, or same-term
+    /// version gap). It is OR'ed with the version-comparison fallback so a
+    /// rejected push is never reported as simply in sync.
+    pub fn to_summary(&self, current_version: u64, latched_divergence: bool) -> SlaveSummary {
+        let diverged = latched_divergence || self.synced_version > current_version;
         let lag = if diverged {
             0
         } else {

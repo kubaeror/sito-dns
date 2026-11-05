@@ -54,10 +54,25 @@ pub struct ResyncOutcome {
 #[cfg(test)]
 type StateWriteHook = Arc<dyn Fn(u64) + Send + Sync>;
 
-/// A version-continuity violation observed on a slave acknowledgement.
+/// Severity of a recorded divergence. Ordered so a fork outranks a term
+/// mismatch, which outranks a same-term version gap; `mark_diverged` never
+/// downgrades an existing higher-severity record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DivergenceKind {
+    /// Same term, peer reports a version above the master.
+    Ahead,
+    /// Peer reports a newer term (this master is stale).
+    Term,
+    /// Same term and version but a different signed payload (fork).
+    Fork,
+}
+
+/// A divergence observed for one connected slave.
 #[derive(Debug, Clone)]
 struct Divergence {
+    kind: DivergenceKind,
     acked_version: u64,
+    acked_term: u64,
     reason: String,
 }
 
@@ -94,9 +109,9 @@ pub struct MasterCoordinator {
     /// Test-only hook called by the asynchronous state writer.
     #[cfg(test)]
     state_write_hook: Arc<Mutex<Option<StateWriteHook>>>,
-    /// Version-continuity violations per currently connected slave; an entry is
-    /// removed when a push above its version is applied or the slave
-    /// disconnects, so the metric series cannot outlive the record.
+    /// Divergence records per currently connected slave. They are sticky: only
+    /// an explicit operator resync/promotion or disconnect removes them, never
+    /// an unrelated version advance.
     diverged: Arc<Mutex<HashMap<String, Divergence>>>,
 }
 
@@ -351,8 +366,8 @@ impl MasterCoordinator {
         self.current_term.load(Ordering::SeqCst)
     }
 
-    /// Returns true when a version-continuity violation (a slave acknowledging
-    /// a version above the master's) is currently recorded.
+    /// Returns true when any divergence (version gap, stale term, or fork) is
+    /// currently latched.
     pub fn is_diverged(&self) -> bool {
         !self.diverged.lock().unwrap().is_empty()
     }
@@ -363,22 +378,44 @@ impl MasterCoordinator {
             .lock()
             .unwrap()
             .values()
-            .max_by_key(|d| d.acked_version)
+            .max_by_key(|d| (d.kind, d.acked_version, d.acked_term))
             .map(|d| d.reason.clone())
     }
 
-    /// Records a version-continuity violation for one instance, keeping the
-    /// most severe version that instance reported.
-    fn mark_diverged(&self, instance: &str, acked_version: u64, reason: String) {
+    /// Returns true when a same-version payload fork is latched.
+    fn has_fork_divergence(&self) -> bool {
+        self.diverged
+            .lock()
+            .unwrap()
+            .values()
+            .any(|d| d.kind == DivergenceKind::Fork)
+    }
+
+    /// Records a divergence for one instance, keeping the most severe kind and
+    /// version that instance reported.
+    ///
+    /// Records are deliberately sticky: nothing here is cleared by an
+    /// unrelated version advance. Only [`Self::trigger_resync`] (an explicit
+    /// operator action) or disconnecting the slave removes them.
+    fn mark_diverged(
+        &self,
+        kind: DivergenceKind,
+        instance: &str,
+        acked_version: u64,
+        acked_term: u64,
+        reason: String,
+    ) {
         let mut diverged = self.diverged.lock().unwrap();
         if diverged
             .get(instance)
-            .is_none_or(|d| acked_version >= d.acked_version)
+            .is_none_or(|d| (kind, acked_version) >= (d.kind, d.acked_version))
         {
             diverged.insert(
                 instance.to_string(),
                 Divergence {
+                    kind,
                     acked_version,
+                    acked_term,
                     reason,
                 },
             );
@@ -386,27 +423,21 @@ impl MasterCoordinator {
         }
     }
 
-    /// Clears each divergence record once a version above its divergent one was
-    /// successfully applied by the master's slaves (or the operator published
-    /// past it).
+    /// Clears every divergence record and gauge after an explicit operator
+    /// resync/promotion.
     ///
-    /// The slaves lock is held across the connectivity check and gauge update
-    /// so a concurrent disconnect cannot remove the record/metric and have this
-    /// path recreate a stale `0` series.
-    fn clear_divergence_above(&self, version: u64) {
+    /// The slaves lock is taken first to match [`Self::unregister_session`]'s
+    /// lock order (slaves then diverged), so a concurrent disconnect cannot
+    /// leave a stale metric series behind.
+    fn clear_all_divergence(&self) {
         let slaves = self.slaves.lock().unwrap();
         let mut diverged = self.diverged.lock().unwrap();
-        let cleared: Vec<String> = diverged
-            .iter()
-            .filter(|(_, d)| version > d.acked_version)
-            .map(|(instance, _)| instance.clone())
-            .collect();
-        for instance in cleared {
-            diverged.remove(&instance);
-            if slaves.contains_key(&instance) {
-                self.metrics.set_ha_diverged(&instance, false);
+        for instance in diverged.keys() {
+            if slaves.contains_key(instance) {
+                self.metrics.set_ha_diverged(instance, false);
             }
         }
+        diverged.clear();
     }
 
     /// Validates monotonicity, sanitizes and signs `bundle` without publishing
@@ -421,6 +452,17 @@ impl MasterCoordinator {
         // structured `clients` value is sanitized exactly like `config_toml`.
         let mut bundle = bundle;
         bundle.strip_structured_secrets();
+
+        // A same-version fork is a self-detected signal that this master's
+        // content disagrees with a slave at the same version. Do not publish
+        // over it: the operator must resolve the fork and explicitly resync.
+        if self.has_fork_divergence() {
+            return Err(HaError::Validation {
+                field: "divergence".to_string(),
+                reason: "Refusing to publish while a same-version payload fork is latched; resolve the fork and run an explicit resync/promotion"
+                    .to_string(),
+            });
+        }
 
         let version = bundle.version;
         let current = self.current_version.load(Ordering::SeqCst);
@@ -678,12 +720,18 @@ impl MasterCoordinator {
     }
 
     /// Triggers a re-push of the current active configuration bundle to all slaves.
+    /// Triggers a re-push of the current active configuration bundle to all slaves.
+    ///
+    /// This is the explicit operator recovery action: it also clears every
+    /// sticky divergence latch so publishing may resume after the fork or
+    /// stale-master condition has been resolved out of band.
     pub fn trigger_resync(&self) -> ResyncOutcome {
         let push_opt = self.active_push.lock().unwrap().clone();
         let slaves_notified = match push_opt {
             Some(ref push) => self.broadcast(push),
             None => 0,
         };
+        self.clear_all_divergence();
         ResyncOutcome {
             version: self.get_current_version(),
             active_bundle: push_opt.is_some(),
@@ -695,7 +743,11 @@ impl MasterCoordinator {
     pub fn list_slaves(&self) -> Vec<SlaveSummary> {
         let cur_v = self.get_current_version();
         let slaves = self.slaves.lock().unwrap();
-        slaves.values().map(|s| s.to_summary(cur_v)).collect()
+        let diverged = self.diverged.lock().unwrap();
+        slaves
+            .values()
+            .map(|s| s.to_summary(cur_v, diverged.contains_key(&s.instance)))
+            .collect()
     }
 
     /// Returns the count of currently connected slaves.
@@ -872,7 +924,13 @@ impl MasterCoordinator {
                 current_term,
                 "{reason}"
             );
-            self.mark_diverged(&slave_instance, have_version, reason);
+            self.mark_diverged(
+                DivergenceKind::Term,
+                &slave_instance,
+                have_version,
+                have_term,
+                reason,
+            );
         }
         if have_term == current_term && have_version > current {
             let reason = format!(
@@ -886,7 +944,13 @@ impl MasterCoordinator {
                 current_term,
                 "{reason}"
             );
-            self.mark_diverged(&slave_instance, have_version, reason);
+            self.mark_diverged(
+                DivergenceKind::Ahead,
+                &slave_instance,
+                have_version,
+                current_term,
+                reason,
+            );
         }
 
         let (tx, mut rx) = mpsc::channel::<HaMessage>(32);
@@ -1124,7 +1188,7 @@ impl MasterCoordinator {
                         current_term,
                         "{reason}"
                     );
-                    self.mark_diverged(slave_instance, version, reason);
+                    self.mark_diverged(DivergenceKind::Term, slave_instance, version, term, reason);
                     return true;
                 }
 
@@ -1144,7 +1208,13 @@ impl MasterCoordinator {
                             current_term,
                             "{reason}"
                         );
-                        self.mark_diverged(slave_instance, version, reason);
+                        self.mark_diverged(
+                            DivergenceKind::Fork,
+                            slave_instance,
+                            version,
+                            term,
+                            reason,
+                        );
                         if let Some(slave) = self.slaves.lock().unwrap().get_mut(slave_instance)
                             && slave.connection_id == connection_id
                         {
@@ -1196,9 +1266,6 @@ impl MasterCoordinator {
                     self.metrics
                         .set_ha_config_version(slave_instance, version as f64);
                     self.stale_repushes.lock().unwrap().remove(slave_instance);
-                    // Applying a version above the last divergence restores
-                    // continuity.
-                    self.clear_divergence_above(version);
                 } else if version < current {
                     warn!(
                         instance = %slave_instance,
@@ -1222,7 +1289,13 @@ impl MasterCoordinator {
                         current_term,
                         "{reason}"
                     );
-                    self.mark_diverged(slave_instance, version, reason);
+                    self.mark_diverged(
+                        DivergenceKind::Ahead,
+                        slave_instance,
+                        version,
+                        current_term,
+                        reason,
+                    );
                 }
             }
             HaMessage::StatsReport {
@@ -2376,6 +2449,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_term_divergence_survives_another_slave_version_advance() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx_a, _rx_a) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "newer-term-slave".to_string(),
+            ActiveSlave {
+                instance: "newer-term-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx_a,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+        let (tx_b, _rx_b) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "synced-slave".to_string(),
+            ActiveSlave {
+                instance: "synced-slave".to_string(),
+                remote_addr: "127.0.0.1:1001".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx_b,
+                capabilities: vec![],
+                connection_id: 2,
+            },
+        );
+
+        // Slave A knows a newer term: sticky term divergence.
+        let newer_term = HaMessage::Ack {
+            version: 3,
+            term: 1,
+            applied: true,
+            conflict: None,
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("newer-term-slave", 1, &newer_term));
+        assert!(coordinator.is_diverged());
+        assert!(coordinator.diverged_reason().unwrap().contains("term"));
+
+        // Slave B applying the master's current version must not clear the
+        // unrelated term divergence.
+        let synced = HaMessage::Ack {
+            version: 2,
+            term: 0,
+            applied: true,
+            conflict: None,
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("synced-slave", 2, &synced));
+        assert!(
+            coordinator.is_diverged(),
+            "a different slave's success must not clear a term divergence"
+        );
+        assert!(coordinator.diverged_reason().unwrap().contains("term"));
+        let summaries = coordinator.list_slaves();
+        let newer = summaries
+            .iter()
+            .find(|s| s.instance == "newer-term-slave")
+            .unwrap();
+        assert!(
+            newer.diverged,
+            "latched divergence must be visible in the API summary"
+        );
+        let rendered = coordinator.metrics.render_prometheus();
+        assert!(
+            rendered.contains(r#"sito_ha_diverged{instance="newer-term-slave"} 1"#),
+            "the sticky gauge must stay raised: {rendered}"
+        );
+
+        // Only an explicit resync clears it.
+        coordinator.trigger_resync();
+        assert!(!coordinator.is_diverged());
+        assert!(
+            coordinator
+                .metrics
+                .render_prometheus()
+                .contains(r#"sito_ha_diverged{instance="newer-term-slave"} 0"#),
+            "resync must zero the divergence gauge"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fork_divergence_blocks_publishing_until_resync() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx, _rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "forked-slave".to_string(),
+            ActiveSlave {
+                instance: "forked-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+
+        let fork = HaMessage::Ack {
+            version: 2,
+            term: 0,
+            applied: false,
+            conflict: Some(AckConflict::SameVersionFork),
+            error: Some("same-version payload fork".to_string()),
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("forked-slave", 1, &fork));
+        assert!(coordinator.diverged_reason().unwrap().contains("fork"));
+
+        let err = coordinator
+            .update_bundle(test_bundle(3))
+            .expect_err("publishing must stop while a fork is latched");
+        assert!(
+            matches!(err, HaError::Validation { ref field, .. } if field == "divergence"),
+            "unexpected error: {err:?}"
+        );
+
+        // Explicit operator resync clears the latch; publishing resumes.
+        assert_eq!(coordinator.trigger_resync().version, 2);
+        assert!(!coordinator.is_diverged());
+        assert_eq!(coordinator.update_bundle(test_bundle(3)).unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_same_term_ahead_divergence_is_sticky_until_resync() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx, _rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "ahead-slave".to_string(),
+            ActiveSlave {
+                instance: "ahead-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+
+        let ahead = HaMessage::Ack {
+            version: 50,
+            term: 0,
+            applied: true,
+            conflict: None,
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("ahead-slave", 1, &ahead));
+        assert!(coordinator.is_diverged());
+
+        // An ACK for the master's own version does not auto-clear the latch.
+        let current = HaMessage::Ack {
+            version: 2,
+            term: 0,
+            applied: true,
+            conflict: None,
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("ahead-slave", 1, &current));
+        assert!(
+            coordinator.is_diverged(),
+            "same-term divergence must stay latched until explicit resync"
+        );
+
+        coordinator.trigger_resync();
+        assert!(!coordinator.is_diverged());
+    }
+
+    #[tokio::test]
     async fn test_ack_from_newer_term_marks_master_stale() {
         let coordinator = test_coordinator();
         coordinator.update_bundle(test_bundle(2)).unwrap();
@@ -2552,7 +2819,13 @@ mod tests {
                 connection_id: 1,
             },
         );
-        coordinator.mark_diverged("slave-1", 50, "continuity broken".to_string());
+        coordinator.mark_diverged(
+            DivergenceKind::Term,
+            "slave-1",
+            50,
+            0,
+            "continuity broken".to_string(),
+        );
         assert!(
             coordinator
                 .metrics
@@ -2593,7 +2866,13 @@ mod tests {
                 connection_id: 1,
             },
         );
-        coordinator.mark_diverged("slave-a", 50, "a is ahead".to_string());
+        coordinator.mark_diverged(
+            DivergenceKind::Ahead,
+            "slave-a",
+            50,
+            0,
+            "a is ahead".to_string(),
+        );
         assert!(coordinator.unregister_session("slave-a", 1));
 
         // A more severe divergence on a different, connected instance.
@@ -2612,7 +2891,13 @@ mod tests {
                 connection_id: 2,
             },
         );
-        coordinator.mark_diverged("slave-b", 60, "b is ahead".to_string());
+        coordinator.mark_diverged(
+            DivergenceKind::Ahead,
+            "slave-b",
+            60,
+            0,
+            "b is ahead".to_string(),
+        );
 
         let rendered = coordinator.metrics.render_prometheus();
         assert!(
@@ -2639,17 +2924,23 @@ mod tests {
             capabilities: vec![],
             connection_id: 1,
         };
-        let diverged = entry.to_summary(5);
+        let diverged = entry.to_summary(5, false);
         assert!(diverged.diverged);
         assert_eq!(diverged.lag, 0, "diverged lag must not look in sync");
 
-        let synced = entry.to_summary(9);
+        let synced = entry.to_summary(9, false);
         assert!(!synced.diverged);
         assert_eq!(synced.lag, 0);
 
-        let behind = entry.to_summary(12);
+        let behind = entry.to_summary(12, false);
         assert!(!behind.diverged);
         assert_eq!(behind.lag, 3);
+
+        // A latched divergence (fork/term/ahead) must be visible even when the
+        // version counter alone would look in sync.
+        let latched = entry.to_summary(9, true);
+        assert!(latched.diverged);
+        assert_eq!(latched.lag, 0);
     }
 
     #[tokio::test]

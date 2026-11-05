@@ -40,6 +40,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   arrives. The ACK carries a structured `same_version_fork` reason; the master
   records divergence and stops reporting the slave as synced instead of letting
   the next version silently win the fork.
+- **HA divergence is sticky**: divergence records now retain their kind
+  (same-term version gap, newer term, or same-version fork) and are no longer
+  cleared by an unrelated slave applying the current version. A same-version
+  fork blocks further publishing on that master until an explicit
+  `POST /api/v1/ha/resync` (or the slave disconnecting) clears the latch. The
+  slave list reports a latched divergence even when its version counter would
+  otherwise look in sync.
 - **DNSSEC verification amplification (security)**: a crafted authoritative
   response can no longer force unbounded cryptographic work. Each response now
   has a hard budget of 256 RRSIG verification attempts (shared across the
