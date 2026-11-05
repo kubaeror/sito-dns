@@ -22,8 +22,9 @@ pub use bundle::{
 };
 pub use config::HaConfig;
 pub use crypto::{
-    Ed25519SigningKey, GeneratedCerts, compute_blake3_fingerprint, generate_ha_certs,
-    generate_ha_certs_with_sans, parse_public_key, verify_ed25519_signature,
+    CertOwnership, Ed25519SigningKey, GeneratedCerts, compute_blake3_fingerprint,
+    generate_ha_certs, generate_ha_certs_with_options, generate_ha_certs_with_sans,
+    parse_public_key, verify_ed25519_signature,
 };
 pub use error::HaError;
 pub use master::{MasterCoordinator, ResyncOutcome, SlaveSummary, spawn_master_server};

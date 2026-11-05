@@ -7,6 +7,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+- **`sito ha gen-certs --uid/--gid`**: the generator can transfer the generated
+  certificates and private keys to the unprivileged HA runtime user. Container
+  deployments run as uid/gid `65532` and systemd runs as `sito`; keys generated
+  by root were previously unreadable by the runtime, so the mTLS replication
+  listener failed to start while DNS health stayed green. Both flags are
+  required together, the chown is applied after every file is written, and a
+  failed transfer is reported instead of being silently skipped.
+
 ### Fixed
 - **HA compares effective `[auth]` policy, not raw TOML**: an `[auth]` table
   that spells out the default values (as `config.example.toml` does) is now

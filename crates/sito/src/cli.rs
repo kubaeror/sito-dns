@@ -136,6 +136,15 @@ pub enum HaCommands {
         /// (hostname or IP address). Repeatable.
         #[arg(long = "san", value_name = "HOST_OR_IP", action = clap::ArgAction::Append)]
         san: Vec<String>,
+        /// Transfer the generated certificates and private keys to this uid.
+        /// Requires --gid. Use the runtime user (for example 65532 in the
+        /// container image) so an unprivileged daemon can read its key.
+        #[arg(long, requires = "gid", value_name = "UID")]
+        uid: Option<u32>,
+        /// Transfer the generated certificates and private keys to this gid.
+        /// Requires --uid.
+        #[arg(long, requires = "uid", value_name = "GID")]
+        gid: Option<u32>,
     },
 }
 
@@ -649,15 +658,37 @@ pub fn prepare_no_setup_bootstrap(
 }
 
 /// Executes the `ha gen-certs` subcommand.
+///
+/// `uid`/`gid` transfer every generated certificate and private key to the
+/// unprivileged HA runtime user. They must be provided together; clap enforces
+/// this for the CLI and the check below covers programmatic callers.
 pub fn run_ha_gen_certs(
     dir: &Path,
     master: bool,
     slave: bool,
     san: &[String],
+    uid: Option<u32>,
+    gid: Option<u32>,
 ) -> Result<(), anyhow::Error> {
-    let certs = sito_ha::generate_ha_certs_with_sans(dir, master, slave, san)
+    let ownership = match (uid, gid) {
+        (Some(uid), Some(gid)) => Some(sito_ha::CertOwnership { uid, gid }),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "--uid and --gid must be provided together so the generated keys are usable by exactly one runtime identity"
+            ));
+        }
+    };
+
+    let certs = sito_ha::generate_ha_certs_with_options(dir, master, slave, san, ownership)
         .map_err(|e| anyhow::anyhow!("Failed to generate HA certificates: {e}"))?;
     print!("{}", certs.summary());
+    if let Some(owner) = ownership {
+        println!(
+            "Certificate files are owned by {}:{}; private keys remain mode 0600.",
+            owner.uid, owner.gid
+        );
+    }
     Ok(())
 }
 
@@ -1073,6 +1104,73 @@ mod tests {
             Some(Commands::Healthcheck { setup_fallback, .. }) => assert!(setup_fallback),
             other => panic!("expected healthcheck command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_cli_ha_gen_certs_uid_gid() {
+        let cli = Cli::try_parse_from([
+            "sito",
+            "ha",
+            "gen-certs",
+            "--dir",
+            "/tmp/certs",
+            "--uid",
+            "65532",
+            "--gid",
+            "65532",
+        ])
+        .expect("parse args");
+        match cli.command {
+            Some(Commands::Ha {
+                command: HaCommands::GenCerts { uid, gid, .. },
+            }) => {
+                assert_eq!(uid, Some(65532));
+                assert_eq!(gid, Some(65532));
+            }
+            other => panic!("expected ha gen-certs command, got {other:?}"),
+        }
+
+        // --uid and --gid are a pair: half an ownership request must fail
+        // instead of silently producing runtime-unreadable keys.
+        let err = Cli::try_parse_from([
+            "sito",
+            "ha",
+            "gen-certs",
+            "--dir",
+            "/tmp/certs",
+            "--uid",
+            "65532",
+        ])
+        .expect_err("--uid without --gid must be rejected");
+        assert!(err.to_string().contains("--gid"), "unexpected error: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_ha_gen_certs_applies_uid_gid() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_gen_certs_owner_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe");
+        std::fs::write(&probe, b"x").unwrap();
+        let meta = std::fs::metadata(&probe).unwrap();
+        let (uid, gid) = (meta.uid(), meta.gid());
+
+        run_ha_gen_certs(&dir, true, true, &[], Some(uid), Some(gid))
+            .expect("gen-certs with the invoking uid/gid must succeed");
+        for name in ["ca.key", "master.key", "slave.key"] {
+            let meta = std::fs::metadata(dir.join(name)).unwrap();
+            assert_eq!(meta.uid(), uid, "{name} uid");
+            assert_eq!(meta.gid(), gid, "{name} gid");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{name} mode");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression: the healthcheck used to prefer `::1` whenever any bind was

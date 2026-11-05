@@ -13,6 +13,19 @@ use std::path::{Path, PathBuf};
 
 use crate::error::HaError;
 
+/// Ownership applied to generated certificate and private-key files.
+///
+/// HA runtimes are unprivileged (`sito` under systemd, uid/gid `65532` in the
+/// container image). Generating the keys as root without transferring them
+/// leaves them unreadable by the runtime, which disables the replication
+/// listener without affecting DNS health. `--uid/--gid` makes the handover
+/// explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CertOwnership {
+    pub uid: u32,
+    pub gid: u32,
+}
+
 /// Information about generated certificates and their BLAKE3 pinning fingerprints.
 #[derive(Debug, Clone)]
 pub struct GeneratedCerts {
@@ -127,7 +140,7 @@ pub fn generate_ha_certs(
     gen_master: bool,
     gen_slave: bool,
 ) -> Result<GeneratedCerts, HaError> {
-    generate_ha_certs_with_sans(dir, gen_master, gen_slave, &[])
+    generate_ha_certs_with_options(dir, gen_master, gen_slave, &[], None)
 }
 
 /// Like [`generate_ha_certs`], with additional subject alternative names
@@ -135,10 +148,32 @@ pub fn generate_ha_certs(
 /// an IP address first and otherwise added as a DNS name.
 pub fn generate_ha_certs_with_sans(
     dir: &Path,
+    gen_master: bool,
+    gen_slave: bool,
+    extra_sans: &[String],
+) -> Result<GeneratedCerts, HaError> {
+    generate_ha_certs_with_options(dir, gen_master, gen_slave, extra_sans, None)
+}
+
+/// Like [`generate_ha_certs_with_sans`], additionally transferring every
+/// generated file (certificates and private keys) to `ownership`.
+///
+/// The chown happens only after all files are written, so a failed ownership
+/// transfer leaves the keys owner-only under the invoking user and returns an
+/// error instead of starting a node with unreadable keys.
+pub fn generate_ha_certs_with_options(
+    dir: &Path,
     mut gen_master: bool,
     mut gen_slave: bool,
     extra_sans: &[String],
+    ownership: Option<CertOwnership>,
 ) -> Result<GeneratedCerts, HaError> {
+    if ownership.is_some() && !cfg!(unix) {
+        return Err(HaError::Validation {
+            field: "uid".to_string(),
+            reason: "certificate ownership transfer is only supported on Unix".to_string(),
+        });
+    }
     if !gen_master && !gen_slave {
         gen_master = true;
         gen_slave = true;
@@ -296,7 +331,7 @@ pub fn generate_ha_certs_with_sans(
             (None, None, None, None, None)
         };
 
-    Ok(GeneratedCerts {
+    let certs = GeneratedCerts {
         ca_cert_path,
         ca_cert_pem,
         ca_key_path,
@@ -311,6 +346,55 @@ pub fn generate_ha_certs_with_sans(
         slave_fingerprint,
         slave_key_path,
         slave_key_pem,
+    };
+
+    if let Some(owner) = ownership {
+        transfer_ownership(&certs, owner)?;
+    }
+
+    Ok(certs)
+}
+
+/// Transfers every generated certificate and key file to `ownership`.
+///
+/// Certificates are included so a restrictive umask cannot leave the public
+/// certificate unreadable by the runtime user either. Failure is fatal: a
+/// silently skipped chown would recreate the original bug.
+#[cfg(unix)]
+fn transfer_ownership(certs: &GeneratedCerts, owner: CertOwnership) -> Result<(), HaError> {
+    use std::os::unix::fs::chown;
+
+    let mut paths: Vec<&Path> = vec![&certs.ca_cert_path, &certs.ca_key_path];
+    for path in [
+        certs.master_cert_path.as_deref(),
+        certs.master_key_path.as_deref(),
+        certs.slave_cert_path.as_deref(),
+        certs.slave_key_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        paths.push(path);
+    }
+
+    for path in paths {
+        chown(path, Some(owner.uid), Some(owner.gid)).map_err(|e| {
+            HaError::Crypto(format!(
+                "Failed to chown '{}' to {}:{}: {e}. Run gen-certs as root (or the file owner) to transfer certificate ownership to the runtime user",
+                path.display(),
+                owner.uid,
+                owner.gid
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn transfer_ownership(_certs: &GeneratedCerts, _owner: CertOwnership) -> Result<(), HaError> {
+    Err(HaError::Validation {
+        field: "uid".to_string(),
+        reason: "certificate ownership transfer is only supported on Unix".to_string(),
     })
 }
 
@@ -401,6 +485,114 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// `gen-certs --uid/--gid` must hand the generated files to the runtime
+    /// user. The test runs as either root (chown succeeds) or an unprivileged
+    /// user (chown to another uid must fail loudly instead of being ignored).
+    #[cfg(unix)]
+    #[test]
+    fn test_generate_ha_certs_applies_requested_ownership() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ha_owner_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+
+        // Discover the invoking uid/gid from a file we own.
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let probe = temp_dir.join("probe");
+        std::fs::write(&probe, b"x").unwrap();
+        let probe_meta = std::fs::metadata(&probe).unwrap();
+        let euid = probe_meta.uid();
+        let egid = probe_meta.gid();
+
+        // Own uid/gid always succeeds and must be reflected on every file.
+        let certs = generate_ha_certs_with_options(
+            &temp_dir,
+            true,
+            true,
+            &[],
+            Some(CertOwnership {
+                uid: euid,
+                gid: egid,
+            }),
+        )
+        .expect("owning generated files to the invoking user must succeed");
+        for path in [
+            certs.ca_cert_path.as_path(),
+            certs.ca_key_path.as_path(),
+            certs.master_cert_path.as_ref().unwrap().as_path(),
+            certs.master_key_path.as_ref().unwrap().as_path(),
+            certs.slave_cert_path.as_ref().unwrap().as_path(),
+            certs.slave_key_path.as_ref().unwrap().as_path(),
+        ] {
+            let meta = std::fs::metadata(path).unwrap();
+            assert_eq!(meta.uid(), euid, "{} uid", path.display());
+            assert_eq!(meta.gid(), egid, "{} gid", path.display());
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // A different owner is only possible for a privileged caller. Either
+        // way the request must be honored or rejected; it must never be
+        // silently ignored.
+        let foreign_dir = std::env::temp_dir().join(format!(
+            "sito_ha_owner_foreign_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let result = generate_ha_certs_with_options(
+            &foreign_dir,
+            true,
+            true,
+            &[],
+            Some(CertOwnership {
+                uid: 65532,
+                gid: 65532,
+            }),
+        );
+        if euid == 0 {
+            let certs = result.expect("root must be able to chown generated keys");
+            let meta = std::fs::metadata(certs.master_key_path.as_ref().unwrap()).unwrap();
+            assert_eq!(meta.uid(), 65532);
+            assert_eq!(meta.gid(), 65532);
+        } else {
+            let err = result.expect_err("unprivileged chown to another uid must fail");
+            assert!(
+                err.to_string().contains("chown"),
+                "error must name the failed chown: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&foreign_dir);
+    }
+
+    #[test]
+    fn test_generate_ha_certs_without_ownership_keeps_invoking_owner() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let temp_dir = std::env::temp_dir().join(format!(
+                "sito_ha_no_owner_test_{}_{}",
+                std::process::id(),
+                rand::random::<u32>()
+            ));
+            let certs = generate_ha_certs_with_options(&temp_dir, true, true, &[], None).unwrap();
+            let probe = temp_dir.join("probe");
+            std::fs::write(&probe, b"x").unwrap();
+            let euid = std::fs::metadata(&probe).unwrap().uid();
+            assert_eq!(
+                std::fs::metadata(certs.master_key_path.as_ref().unwrap())
+                    .unwrap()
+                    .uid(),
+                euid,
+                "omitting --uid must not change ownership"
+            );
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        }
     }
 
     #[test]

@@ -83,8 +83,11 @@ async fn main() -> anyhow::Result<()> {
                     master,
                     slave,
                     san,
+                    uid,
+                    gid,
                 } => {
-                    if let Err(e) = sito::cli::run_ha_gen_certs(&dir, master, slave, &san) {
+                    if let Err(e) = sito::cli::run_ha_gen_certs(&dir, master, slave, &san, uid, gid)
+                    {
                         eprintln!("{e}");
                         std::process::exit(1);
                     }
