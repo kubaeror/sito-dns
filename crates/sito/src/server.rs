@@ -903,6 +903,13 @@ pub async fn run_server_full(
 ) -> anyhow::Result<()> {
     validate_typed_sections(&config)?;
 
+    // Make the historical wildcard defaults visible at startup. This is a
+    // warning, not a refusal: existing Docker/quickstart configurations must
+    // keep starting. 1.10.0 changes the defaults and is documented separately.
+    for warning in config.network_exposure_warnings() {
+        warn!("NETWORK EXPOSURE: {warning}");
+    }
+
     // Hold a single-instance lease for the whole server lifetime. The reset
     // commands use the same lease to distinguish "stopped" from "running" and
     // refuse to pretend that credentials/sessions were revoked live.
@@ -1122,13 +1129,6 @@ pub async fn run_server_full(
     let web_cfg = config_arc.load().get_web_config();
     if web_cfg.enabled {
         let web_addr = SocketAddr::new(web_cfg.bind, web_cfg.port);
-        // DNS TLS does not terminate the admin UI: axum serves plain HTTP here
-        // regardless, so warn whenever the UI is reachable beyond loopback.
-        if !web_cfg.bind.is_loopback() {
-            warn!(
-                "Admin web UI listening on {web_addr} over plain HTTP; credentials and the setup token are transmitted in plaintext. Terminate TLS in front of it (reverse proxy) or bind to loopback."
-            );
-        }
         let listener = tokio::net::TcpListener::bind(web_addr).await.map_err(|e| {
             anyhow::anyhow!("Failed to bind web admin interface to {web_addr}: {e}")
         })?;

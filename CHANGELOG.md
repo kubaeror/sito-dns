@@ -8,6 +8,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+- **Startup network-exposure warnings**: the historical defaults still bind the
+  admin UI to `0.0.0.0:8080` over plain HTTP and DNS to `0.0.0.0`/`::` with no
+  client allow-list, so startup now logs an actionable warning for each exposed
+  listener. A declared `https://` `web.public_url` (or
+  `web.tls_terminated_by_proxy = true` when no public URL is set) marks a
+  deliberate TLS reverse-proxy deployment; loopback binds and
+  `web.enabled = false` do not warn. The warnings contain only bind addresses
+  and ports, never credentials or tokens. Changing the default bind remains
+  planned for 1.10.0; 1.9.2 keeps existing configurations working.
 - **`sito ha gen-certs --uid/--gid`**: the generator can transfer the generated
   certificates and private keys to the unprivileged HA runtime user. Container
   deployments run as uid/gid `65532` and systemd runs as `sito`; keys generated
