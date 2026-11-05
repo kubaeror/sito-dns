@@ -119,7 +119,9 @@ ExecStart=/usr/local/bin/sito --config /etc/sito/config.toml
 # The service runs unprivileged with ProtectSystem=strict, so in-app updates
 # cannot replace the binary in /usr/local/bin. Updates must be applied as root
 # while the service is stopped: sudo systemctl stop sito && sudo sito update
-# (or re-run this installer). See docs/installation.md "Updating sito".
+# (or re-run this installer). The installer also installs cosign because
+# server.update_require_signature defaults to true. See docs/installation.md
+# "Updating sito".
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -170,6 +172,17 @@ otherwise uses `./config.toml`, so the commands above work from `/root`
 after the service is stopped. Pass `--config <path>` when the configuration
 lives somewhere else. If neither location exists, `sito update` refuses to run
 instead of guessing the signature policy.
+
+`sito update` verifies the release with cosign because
+`server.update_require_signature` defaults to `true`. The installer installs a
+checksum-verified `cosign` (v2.6.5, matching the release workflow) to
+`/usr/local/bin` when it is missing; `SITO_INSTALL_COSIGN=0` skips this, and
+`COSIGN_VERSION` pins a different cosign release. `sito update` refuses before
+downloading anything when signatures are required but cosign is unavailable,
+and names both the missing verifier and the configuration key. If you installed
+the binary manually, install cosign first; only set
+`server.update_require_signature = false` when you intentionally accept
+SHA-256-only integrity.
 
 The installer backs up the previous binary to `/usr/local/bin/sito.bak` and
 restores it automatically if the post-install health check fails. If you manage
@@ -400,7 +413,10 @@ cosign verify-blob \
 
 The identity pins the artifact to this repository's release workflow and the
 OIDC issuer pins it to GitHub Actions. `SITO_REQUIRE_SIGNATURE=1|0` controls
-whether `install.sh` enforces signature verification.
+whether `install.sh` enforces signature verification. The installer also
+installs cosign itself (checksum-verified, `COSIGN_VERSION` defaults to
+`v2.6.5`) so the default `sito update` signature policy works after a fresh
+install; set `SITO_INSTALL_COSIGN=0` to manage cosign externally.
 
 ### 6.3 SBOM
 

@@ -17,6 +17,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   failed transfer is reported instead of being silently skipped.
 
 ### Fixed
+- **Self-update prerequisites are installed and checked up front**: a fresh
+  systemd install could not use the documented `sito update` path because
+  `server.update_require_signature` defaults to `true` while `install.sh` only
+  checked for cosign instead of installing it. The installer now installs a
+  checksum-verified cosign binary (`v2.6.5` by default, architecture-matched,
+  `SITO_INSTALL_COSIGN=0` to opt out) to `/usr/local/bin`, and `sito update`
+  refuses before downloading when signatures are required but cosign is
+  unavailable, naming the verifier, the install path and the configuration key.
 - **`sito update` finds the system configuration**: without `--config`, the CLI
   prefers an existing `/etc/sito/config.toml` and otherwise uses
   `./config.toml`. The documented

@@ -4,7 +4,9 @@ set -euo pipefail
 
 REPO="kubaeror/sito-dns"
 SITO_VERSION="${SITO_VERSION:-latest}"
+COSIGN_VERSION="${COSIGN_VERSION:-v2.6.5}"
 INSTALL_BIN="/usr/local/bin/sito"
+COSIGN_INSTALL_BIN="/usr/local/bin/cosign"
 CONFIG_DIR="/etc/sito"
 DATA_DIR="/var/lib/sito"
 SERVICE_PATH="/etc/systemd/system/sito.service"
@@ -19,6 +21,8 @@ for arg in "$@"; do
             echo "Usage: install.sh [--uninstall]"
             echo "  --uninstall  Remove the sito binary and systemd unit (keeps config/data)"
             echo "  SITO_VERSION=<version>  Pin a specific release version (default: latest)"
+            echo "  SITO_INSTALL_COSIGN=0   Skip automatic cosign installation"
+            echo "  COSIGN_VERSION=<tag>    Pin the cosign release (default: v2.6.5)"
             exit 0
             ;;
     esac
@@ -233,12 +237,83 @@ download_file() {
     return 1
 }
 
+# Installs a checksum-verified cosign binary when the host has none. The
+# updater requires cosign while server.update_require_signature keeps its
+# default (true), so a fresh systemd install must ship the verifier or the
+# documented `sito update` command cannot run.
+install_cosign_if_missing() {
+    if command -v cosign >/dev/null 2>&1; then
+        echo "cosign already installed: $(command -v cosign)"
+        return 0
+    fi
+
+    if [ "${SITO_INSTALL_COSIGN:-1}" != "1" ]; then
+        echo "Warning: 'cosign' is not installed and SITO_INSTALL_COSIGN=${SITO_INSTALL_COSIGN:-1}." >&2
+        echo "Warning: 'sito update' will refuse to run until cosign is installed or" >&2
+        echo "Warning: server.update_require_signature is set to false." >&2
+        return 0
+    fi
+
+    case "${COSIGN_VERSION}" in
+        v[0-9]* ) ;;
+        *)
+            echo "Error: COSIGN_VERSION must look like v2.6.5 (got '${COSIGN_VERSION}')." >&2
+            exit 1
+            ;;
+    esac
+    case "${COSIGN_VERSION}" in
+        *[!0-9A-Za-z._-]* )
+            echo "Error: Invalid COSIGN_VERSION '${COSIGN_VERSION}'." >&2
+            exit 1
+            ;;
+    esac
+
+    local asset
+    case "${TARGET}" in
+        x86_64-unknown-linux-gnu)
+            asset="cosign-linux-amd64"
+            ;;
+        aarch64-unknown-linux-gnu)
+            asset="cosign-linux-arm64"
+            ;;
+        armv7-unknown-linux-gnueabihf)
+            asset="cosign-linux-arm"
+            ;;
+        *)
+            echo "Error: No cosign release asset for target ${TARGET}." >&2
+            exit 1
+            ;;
+    esac
+
+    local base_url="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}"
+    echo "Installing cosign ${COSIGN_VERSION} (${asset}) for self-update verification..."
+    download_file "${base_url}/${asset}" "${TMP_DIR}/${asset}"
+    download_file "${base_url}/cosign_checksums.txt" "${TMP_DIR}/cosign_checksums.txt"
+
+    (
+        cd "${TMP_DIR}"
+        if ! awk -v asset="${asset}" '$2 == asset { found = 1 } END { exit found ? 0 : 1 }' cosign_checksums.txt; then
+            echo "Error: cosign checksum entry for ${asset} was not found." >&2
+            exit 1
+        fi
+        if ! awk -v asset="${asset}" '$2 == asset' cosign_checksums.txt | sha256sum -c -; then
+            echo "Error: cosign checksum verification failed for ${asset}!" >&2
+            exit 1
+        fi
+    )
+
+    install -m 0755 "${TMP_DIR}/${asset}" "${COSIGN_INSTALL_BIN}"
+    echo "Installed cosign to ${COSIGN_INSTALL_BIN}."
+}
+
 # Support installing a locally built binary only when explicitly requested
 # (verification cannot be performed for local builds).
 if [ "${USE_LOCAL_BINARY}" -eq 1 ]; then
     echo "Using existing local release binary target/release/sito (verification skipped)..."
     cp -f "target/release/sito" "${INSTALL_BIN}"
 else
+    install_cosign_if_missing
+
     download_file "${DOWNLOAD_URL}" "${TMP_DIR}/${TARBALL_NAME}"
     download_file "${CHECKSUMS_URL}" "${TMP_DIR}/SHA256SUMS"
 
@@ -264,6 +339,7 @@ else
         fi
         if ! command -v cosign >/dev/null 2>&1; then
             echo "Error: SITO_REQUIRE_SIGNATURE=1 but 'cosign' is not installed." >&2
+            echo "Install cosign or re-run this installer without SITO_INSTALL_COSIGN=0." >&2
             exit 1
         fi
     fi
@@ -288,6 +364,8 @@ else
         elif ! command -v cosign >/dev/null 2>&1; then
             echo "Notice: Release ships cosign signatures, but 'cosign' tool is not installed."
             echo "Warning: Relying solely on SHA-256 checksum verification. Consider installing cosign for supply chain security."
+            echo "Warning: 'sito update' will refuse to run until cosign is installed or" >&2
+            echo "Warning: server.update_require_signature is set to false." >&2
         fi
     fi
 
@@ -365,7 +443,9 @@ ExecStart=/usr/local/bin/sito --config /etc/sito/config.toml
 # The service runs unprivileged with ProtectSystem=strict, so in-app updates
 # cannot replace the binary in /usr/local/bin. Updates must be applied as root
 # while the service is stopped: sudo systemctl stop sito && sudo sito update
-# (or re-run this installer). See docs/installation.md "Updating sito".
+# (or re-run this installer). The installer also installs cosign because
+# server.update_require_signature defaults to true. See docs/installation.md
+# "Updating sito".
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true

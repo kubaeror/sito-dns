@@ -851,6 +851,26 @@ fn update_signature_policy(config_path: &Path) -> Result<bool, anyhow::Error> {
     Ok(cfg.server.update_require_signature)
 }
 
+/// Refuses to start an update when the persisted policy requires signatures
+/// but no verifier can enforce it.
+///
+/// The check runs before the release is downloaded so a missing `cosign`
+/// binary is reported as an actionable configuration problem instead of a
+/// verification failure halfway through an update.
+fn update_preflight(config_path: &Path, cosign_available: bool) -> Result<bool, anyhow::Error> {
+    let require_signature = update_signature_policy(config_path)?;
+    if require_signature && !cosign_available {
+        return Err(anyhow::anyhow!(
+            "Refusing to update: configuration '{}' sets server.update_require_signature = true, \
+             but the 'cosign' binary was not found in /usr/bin, /usr/local/bin or PATH. Install \
+             cosign (re-run contrib/install.sh or see docs/installation.md \"Updating sito\") or \
+             set server.update_require_signature = false only if you accept SHA-256-only integrity.",
+            config_path.display()
+        ));
+    }
+    Ok(require_signature)
+}
+
 /// Executes the `update` subcommand.
 pub async fn run_update(
     check: bool,
@@ -879,7 +899,7 @@ pub async fn run_update(
     // silently downgrading to checksum-only verification. Resolving here also
     // means `sudo sito update` works from any cwd after the service is stopped.
     let config_path = resolve_update_config_path(config_path)?;
-    let require_signature = update_signature_policy(&config_path)?;
+    let require_signature = update_preflight(&config_path, sito_api::updater::cosign_available())?;
 
     if !info.update_available && !force {
         println!("\nsito is up to date.");
@@ -1289,6 +1309,33 @@ mod tests {
             resolve_update_config_path_from(Some(&explicit), &local, &system).unwrap(),
             explicit
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_preflight_requires_cosign_when_signatures_required() {
+        let dir = temp_config_dir("preflight");
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, "config_version = 1\n").unwrap();
+
+        // Default policy requires signatures; without cosign the update must
+        // be refused before downloading anything.
+        let err = update_preflight(&cfg, false).unwrap_err().to_string();
+        assert!(err.contains("cosign"), "unexpected error: {err}");
+        assert!(
+            err.contains("update_require_signature"),
+            "unexpected error: {err}"
+        );
+        assert!(update_preflight(&cfg, true).unwrap());
+
+        // Explicit opt-out allows checksum-only verification without cosign.
+        std::fs::write(
+            &cfg,
+            "config_version = 1\n[server]\nupdate_require_signature = false\n",
+        )
+        .unwrap();
+        assert!(!update_preflight(&cfg, false).unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
