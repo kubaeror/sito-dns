@@ -254,6 +254,14 @@ pub struct AppliedWatermark {
     pub payload_hash: String,
     /// Unix milliseconds at which the bundle was applied.
     pub timestamp: u64,
+    /// Set when a same-version payload-hash mismatch proved that this node and
+    /// its master are on different forks. All same-term pushes are rejected
+    /// until an explicit higher-term promotion arrives.
+    #[serde(default)]
+    pub forked: bool,
+    /// Version at which the fork was detected.
+    #[serde(default)]
+    pub forked_at_version: u64,
 }
 
 impl AppliedWatermark {
@@ -462,6 +470,15 @@ pub fn verify_and_unpack_push_with_watermark(
     let (bundle, payload_hash) = verify_and_unpack_push_inner(push, master_pubkey)?;
 
     if let Some(watermark) = watermark {
+        if watermark.forked && bundle.term <= watermark.term {
+            return Err(HaError::Validation {
+                field: "term".to_string(),
+                reason: format!(
+                    "A same-version payload fork was latched at term {} version {}; refusing term {} version {} until a strictly higher-term promotion arrives",
+                    watermark.term, watermark.forked_at_version, bundle.term, bundle.version
+                ),
+            });
+        }
         if bundle.term < watermark.term {
             return Err(HaError::Validation {
                 field: "term".to_string(),

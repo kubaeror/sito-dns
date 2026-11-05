@@ -27,7 +27,7 @@ pub use crypto::{
 };
 pub use error::HaError;
 pub use master::{MasterCoordinator, ResyncOutcome, SlaveSummary, spawn_master_server};
-pub use protocol::{HaMessage, PROTOCOL_VERSION, UpstreamReport};
+pub use protocol::{AckConflict, HaMessage, PROTOCOL_VERSION, UpstreamReport};
 pub use slave::{
     SlaveAppHandles, SlaveConfigApplier, SlaveState, SlaveStatusTracker, apply_config_push,
     spawn_slave_worker,

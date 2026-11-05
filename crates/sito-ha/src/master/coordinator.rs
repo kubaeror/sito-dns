@@ -23,7 +23,7 @@ use crate::config::HaConfig;
 use crate::crypto::Ed25519SigningKey;
 use crate::error::HaError;
 use crate::master::tracker::{ActiveSlave, SlaveStatsSummary, SlaveSummary};
-use crate::protocol::HaMessage;
+use crate::protocol::{AckConflict, HaMessage};
 use crate::transport::{build_server_tls_config, ws_config};
 
 /// Maximum amount by which an authenticated peer may report being ahead of the
@@ -902,7 +902,9 @@ impl MasterCoordinator {
                 ActiveSlave {
                     instance: slave_instance.clone(),
                     remote_addr: peer_addr,
-                    synced_version: have_version,
+                    // Never trust the peer's Hello claim for the *reported*
+                    // synced version: only an applied ACK proves it.
+                    synced_version: 0,
                     last_ping: Instant::now(),
                     connected_at: Utc::now(),
                     last_stats: None,
@@ -913,9 +915,7 @@ impl MasterCoordinator {
             );
             #[allow(clippy::cast_possible_wrap)]
             self.metrics.set_ha_slaves_connected(slaves.len() as i64);
-            #[allow(clippy::cast_precision_loss)]
-            self.metrics
-                .set_ha_config_version(&slave_instance, have_version as f64);
+            self.metrics.set_ha_config_version(&slave_instance, 0.0);
         }
 
         // Always enqueue the current push on connect; a slave that is already
@@ -1077,6 +1077,7 @@ impl MasterCoordinator {
                 version,
                 term,
                 applied,
+                conflict,
                 error,
             } => {
                 // Ignore acknowledgements from a superseded connection: the
@@ -1107,17 +1108,6 @@ impl MasterCoordinator {
                     return true;
                 }
 
-                if !applied {
-                    warn!(
-                        instance = %slave_instance,
-                        version,
-                        term,
-                        error = ?error,
-                        "Slave failed to apply configuration bundle"
-                    );
-                    return true;
-                }
-
                 if term > current_term {
                     // The replica knows a newer epoch: this master is stale.
                     // Adopting the peer's counter would let a partitioned old
@@ -1135,7 +1125,44 @@ impl MasterCoordinator {
                         "{reason}"
                     );
                     self.mark_diverged(slave_instance, version, reason);
-                } else if term < current_term {
+                    return true;
+                }
+
+                if !applied {
+                    if conflict == Some(AckConflict::SameVersionFork) {
+                        // Same term and version but different content: this is
+                        // the fork signal. Latch it so the next version from the
+                        // forked master cannot silently win, and stop reporting
+                        // the slave as synced.
+                        let reason = format!(
+                            "slave '{slave_instance}' rejected term {term} version {version} with a same-version payload-hash fork: this master must not publish over the forked configuration until an explicit resync/promotion"
+                        );
+                        error!(
+                            instance = %slave_instance,
+                            acked_version = version,
+                            acked_term = term,
+                            current_term,
+                            "{reason}"
+                        );
+                        self.mark_diverged(slave_instance, version, reason);
+                        if let Some(slave) = self.slaves.lock().unwrap().get_mut(slave_instance)
+                            && slave.connection_id == connection_id
+                        {
+                            slave.synced_version = 0;
+                        }
+                    }
+                    warn!(
+                        instance = %slave_instance,
+                        version,
+                        term,
+                        conflict = ?conflict,
+                        error = ?error,
+                        "Slave failed to apply configuration bundle"
+                    );
+                    return true;
+                }
+
+                if term < current_term {
                     // Our epoch is newer; the replica is stale even if its
                     // old-epoch version counter is higher. Re-push the active
                     // bundle of the current term so it adopts the promotion.
@@ -2078,6 +2105,7 @@ mod tests {
         let ack = HaMessage::Ack {
             version: 1,
             term: 0,
+            conflict: None,
             applied: true,
             error: None,
         }
@@ -2215,6 +2243,7 @@ mod tests {
         let ack = HaMessage::Ack {
             version: 10,
             term: 0,
+            conflict: None,
             applied: true,
             error: None,
         };
@@ -2273,6 +2302,7 @@ mod tests {
         let ack = HaMessage::Ack {
             version: 50,
             term: 0,
+            conflict: None,
             applied: true,
             error: None,
         }
@@ -2302,6 +2332,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_same_version_fork_ack_marks_divergence_and_unsyncs_slave() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx, _rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "forked-slave".to_string(),
+            ActiveSlave {
+                instance: "forked-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 2,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+
+        let ack = HaMessage::Ack {
+            version: 2,
+            term: 0,
+            applied: false,
+            conflict: Some(AckConflict::SameVersionFork),
+            error: Some("same-version payload fork".to_string()),
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("forked-slave", 1, &ack));
+        assert!(
+            coordinator.is_diverged(),
+            "a fork ACK must latch divergence"
+        );
+        let reason = coordinator.diverged_reason().unwrap();
+        assert!(reason.contains("fork"), "reason: {reason}");
+        assert_eq!(
+            coordinator.slaves.lock().unwrap()["forked-slave"].synced_version,
+            0,
+            "a rejected fork push must not leave the slave reported as synced"
+        );
+    }
+
+    #[tokio::test]
     async fn test_ack_from_newer_term_marks_master_stale() {
         let coordinator = test_coordinator();
         coordinator.update_bundle(test_bundle(2)).unwrap();
@@ -2326,6 +2400,7 @@ mod tests {
         let ack = HaMessage::Ack {
             version: 3,
             term: 2,
+            conflict: None,
             applied: true,
             error: None,
         }
@@ -2771,6 +2846,7 @@ mod tests {
         let ack = HaMessage::Ack {
             version: u64::MAX,
             term: 0,
+            conflict: None,
             applied: true,
             error: None,
         }

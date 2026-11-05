@@ -130,6 +130,52 @@ impl SlaveStatusTracker {
         self.watermark.lock().unwrap().clone()
     }
 
+    /// Returns true when a same-version payload fork has been latched.
+    pub fn is_forked(&self) -> bool {
+        self.watermark
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|watermark| watermark.forked)
+    }
+
+    /// Durably latches a same-version payload fork.
+    ///
+    /// The applied version/term/payload hash are preserved (they describe the
+    /// configuration this node is still serving); only the fork marker is
+    /// added. All same-term pushes are refused until a strictly higher-term
+    /// promotion is applied.
+    pub fn latch_fork(&self, version: u64, term: u64) -> Result<(), HaError> {
+        #[allow(clippy::cast_sign_loss)]
+        let timestamp = Utc::now().timestamp_millis() as u64;
+        let mut watermark = self.get_watermark().unwrap_or(AppliedWatermark {
+            version,
+            term,
+            payload_hash: String::new(),
+            timestamp,
+            forked: false,
+            forked_at_version: 0,
+        });
+        watermark.forked = true;
+        watermark.forked_at_version = version;
+
+        if let Some(path) = self.watermark_path.lock().unwrap().clone() {
+            let payload = serde_json::to_vec_pretty(&watermark).map_err(|e| {
+                HaError::Serialization(format!("Failed to serialize HA watermark: {e}"))
+            })?;
+            Self::write_private_atomic(&path, &payload).map_err(|e| HaError::Validation {
+                field: "ha_watermark".to_string(),
+                reason: format!(
+                    "Failed to persist the fork latch at {}: {e}",
+                    path.display()
+                ),
+            })?;
+        }
+
+        *self.watermark.lock().unwrap() = Some(watermark);
+        Ok(())
+    }
+
     /// Atomically persists `{version, term, payload_hash, timestamp}` (0600)
     /// and updates the in-memory watermark only after the write succeeds.
     ///
@@ -160,6 +206,8 @@ impl SlaveStatusTracker {
             term,
             payload_hash: payload_hash.trim_start_matches("blake3:").to_string(),
             timestamp,
+            forked: false,
+            forked_at_version: 0,
         };
 
         if let Some(path) = self.watermark_path.lock().unwrap().clone() {

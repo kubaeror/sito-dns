@@ -8,6 +8,23 @@ use crate::error::HaError;
 /// Protocol version number.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Structured reason a slave rejected a pushed bundle.
+///
+/// A same-version payload-hash mismatch (`same_version_fork`) means the master
+/// and slave disagree about the content of the same configuration version:
+/// that is a fork, not a replay, and both sides must latch divergence until an
+/// explicit higher-term promotion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AckConflict {
+    /// The master's bundle term is older than the slave's applied term.
+    StaleTerm,
+    /// The master's bundle version is not above the slave's applied version.
+    StaleVersion,
+    /// Same term and version but different signed payload: the cluster forked.
+    SameVersionFork,
+}
+
 /// High-level protocol messages exchanged over the WebSocket replication channel.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
@@ -55,6 +72,10 @@ pub enum HaMessage {
         #[serde(default)]
         term: u64,
         applied: bool,
+        /// Structured rejection reason. Older peers omit it, in which case
+        /// only `error` is available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conflict: Option<AckConflict>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -166,6 +187,7 @@ mod tests {
             version: 42,
             term: 3,
             applied: true,
+            conflict: None,
             error: None,
         };
         let ack_json = ack.to_json().unwrap();

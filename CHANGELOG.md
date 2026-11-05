@@ -31,6 +31,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `version` in `ha_state.toml`; existing state files without a term load as
   term 0 and old signed bundles remain verifiable. Upgrade slaves before
   promoting a master (see `docs/runbook-ha.md`).
+- **Same-term HA forks are latched**: when a slave receives the same version
+  and term with a different signed payload hash, it now persists a fork marker
+  in `ha_watermark.toml`, degrades immediately, and rejects every further push
+  in that term until an explicit higher-term promotion (with a higher version)
+  arrives. The ACK carries a structured `same_version_fork` reason; the master
+  records divergence and stops reporting the slave as synced instead of letting
+  the next version silently win the fork.
 - **DNSSEC verification amplification (security)**: a crafted authoritative
   response can no longer force unbounded cryptographic work. Each response now
   has a hard budget of 256 RRSIG verification attempts (shared across the

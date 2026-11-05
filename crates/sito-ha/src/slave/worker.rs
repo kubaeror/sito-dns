@@ -28,7 +28,7 @@ use crate::bundle::{
 use crate::config::HaConfig;
 use crate::crypto::parse_public_key;
 use crate::error::HaError;
-use crate::protocol::{HaMessage, UpstreamReport};
+use crate::protocol::{AckConflict, HaMessage, UpstreamReport};
 use crate::slave::state::{SlaveState, SlaveStatusTracker};
 use crate::transport::{
     ExponentialBackoff, SLAVE_HANDSHAKE_TIMEOUT, build_client_tls_config, ws_config,
@@ -1013,11 +1013,36 @@ where
             // same-version push is only acceptable when it is the identical
             // signed payload.
             if let Some(watermark) = tracker.get_watermark() {
+                if watermark.forked && push_term <= watermark.term {
+                    // A fork was already latched: only a strictly higher-term
+                    // promotion may resume replication.
+                    let _ = tracker.latch_fork(watermark.version, watermark.term);
+                    tracker.mark_degraded(format!(
+                        "HA fork latched at term {} version {}: refusing term {push_term} until explicit higher-term promotion",
+                        watermark.term, watermark.forked_at_version
+                    ));
+                    let ack = HaMessage::Ack {
+                        version: watermark.version,
+                        term: watermark.term,
+                        applied: false,
+                        conflict: Some(AckConflict::SameVersionFork),
+                        error: Some(format!(
+                            "Term {push_term} is blocked by the latched same-version fork at term {} version {}",
+                            watermark.term, watermark.forked_at_version
+                        )),
+                    };
+                    ws_stream
+                        .send(WsMessage::Text(ack.to_json()?.into()))
+                        .await
+                        .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                    return Ok(());
+                }
                 if push_term < watermark.term {
                     let ack = HaMessage::Ack {
                         version: watermark.version,
                         term: watermark.term,
                         applied: false,
+                        conflict: Some(AckConflict::StaleTerm),
                         error: Some(format!(
                             "Push term {push_term} is below the applied term {} (stale master/epoch rejected)",
                             watermark.term
@@ -1035,6 +1060,7 @@ where
                             version: watermark.version,
                             term: watermark.term,
                             applied: false,
+                            conflict: Some(AckConflict::StaleVersion),
                             error: Some(format!(
                                 "Push version {target_version} is below the applied watermark {} (replay rejected)",
                                 watermark.version
@@ -1053,13 +1079,27 @@ where
                             target_version,
                             payload_hash_blake3,
                         ) {
+                            // Same term and version but different content: this
+                            // is a fork. Latch it durably so the next same-term
+                            // version from the forked master cannot overwrite
+                            // the applied configuration.
+                            if let Err(e) = tracker.latch_fork(watermark.version, watermark.term) {
+                                warn!(
+                                    error = %e,
+                                    "Failed to persist the HA fork latch"
+                                );
+                            }
+                            let reason = format!(
+                                "Same-version payload fork at term {} version {}: master content differs from the applied bundle",
+                                watermark.term, watermark.version
+                            );
+                            tracker.mark_degraded(reason.clone());
                             let ack = HaMessage::Ack {
                                 version: watermark.version,
                                 term: watermark.term,
                                 applied: false,
-                                error: Some(format!(
-                                    "Push version {target_version} does not match the applied payload hash (same-version replay rejected)"
-                                )),
+                                conflict: Some(AckConflict::SameVersionFork),
+                                error: Some(reason),
                             };
                             ws_stream
                                 .send(WsMessage::Text(ack.to_json()?.into()))
@@ -1073,6 +1113,7 @@ where
                             version: watermark.version,
                             term: watermark.term,
                             applied: true,
+                            conflict: None,
                             error: None,
                         };
                         ws_stream
@@ -1092,6 +1133,7 @@ where
                     version: tracker.get_version(),
                     term: tracker.get_term(),
                     applied: false,
+                    conflict: Some(AckConflict::StaleTerm),
                     error: Some(format!(
                         "Push term {push_term} is below the current term {} (stale master/epoch rejected)",
                         tracker.get_term()
@@ -1112,6 +1154,7 @@ where
                     version: tracker.get_version(),
                     term: tracker.get_term(),
                     applied: true,
+                    conflict: None,
                     error: None,
                 };
                 ws_stream
@@ -1147,6 +1190,7 @@ where
                         version: v,
                         term: tracker.get_term(),
                         applied: true,
+                        conflict: None,
                         error: None,
                     };
                     ws_stream
@@ -1159,6 +1203,7 @@ where
                         version: target_version,
                         term: push_term,
                         applied: false,
+                        conflict: None,
                         error: Some(e.to_string()),
                     };
                     let _ = ws_stream.send(WsMessage::Text(ack.to_json()?.into())).await;
@@ -1404,6 +1449,7 @@ nta = ["internal.example"]
             HaMessage::Ack {
                 version: 5,
                 term: 0,
+                conflict: None,
                 applied: true,
                 ..
             }
@@ -1983,6 +2029,7 @@ ttl = 60
             HaMessage::Ack {
                 version: 1,
                 term: 0,
+                conflict: None,
                 applied: true,
                 ..
             }
@@ -1996,6 +2043,173 @@ ttl = 60
             push_payload_hash(&push).unwrap(),
             "the ACK must only be sent after the exact signed payload is on disk"
         );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A same-version payload fork latches the slave: every further push in the
+    /// same term is rejected until an explicit higher-term promotion arrives.
+    #[tokio::test]
+    async fn test_same_version_fork_latches_and_blocks_same_term_versions() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_fork_latch_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let watermark_path = dir.join("ha_watermark.toml");
+        let tracker = SlaveStatusTracker::new("slave-fork".to_string(), 0, None)
+            .with_watermark_path(watermark_path.clone())
+            .unwrap();
+        let handles = test_handles(None).await;
+        let config_toml = "config_version = 1\n[server]\nrole = \"slave\"\n";
+
+        // Applied state: term 0, version 50, payload B.
+        let applied = ConfigBundle {
+            term: 0,
+            ..test_bundle(50, config_toml, None, None)
+        };
+        let applied_push = build_and_sign_push(&applied, &signing_key).unwrap();
+        assert_eq!(
+            apply_config_push(&applied_push, &tracker, &handles, &signing_key.public_key())
+                .await
+                .unwrap(),
+            50
+        );
+        assert!(!tracker.is_forked());
+
+        let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            slave_socket,
+            Role::Client,
+            Some(ws_config()),
+        )
+        .await;
+        let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer_socket,
+            Role::Server,
+            Some(ws_config()),
+        )
+        .await;
+
+        // Same term and version, different content: fork signal.
+        let mut forked = test_bundle(50, config_toml, None, None);
+        forked.term = 0;
+        forked.custom_rules = vec!["||fork-a.example^".to_string()];
+        let forked_push = build_and_sign_push(&forked, &signing_key).unwrap();
+        tracker.set_state(SlaveState::Synced);
+        handle_master_message(
+            &forked_push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+
+        match read_ack(&mut peer).await {
+            HaMessage::Ack {
+                version,
+                term,
+                applied,
+                conflict,
+                ..
+            } => {
+                assert_eq!(version, 50);
+                assert_eq!(term, 0);
+                assert!(!applied);
+                assert_eq!(conflict, Some(AckConflict::SameVersionFork));
+            }
+            other => panic!("expected an ACK, got {other:?}"),
+        }
+        assert!(tracker.is_forked(), "the fork must be latched");
+        assert_eq!(
+            tracker.get_state(),
+            SlaveState::Degraded,
+            "a fork must degrade the slave immediately"
+        );
+        let persisted: crate::bundle::AppliedWatermark =
+            serde_json::from_str(&tokio::fs::read_to_string(&watermark_path).await.unwrap())
+                .unwrap();
+        assert!(persisted.forked, "the latch must be durable");
+        assert_eq!(persisted.version, 50);
+
+        // The forked master's next version in the same term is refused.
+        let forked_next = ConfigBundle {
+            term: 0,
+            ..test_bundle(51, config_toml, None, None)
+        };
+        let forked_next_push = build_and_sign_push(&forked_next, &signing_key).unwrap();
+        handle_master_message(
+            &forked_next_push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+        match read_ack(&mut peer).await {
+            HaMessage::Ack {
+                version,
+                applied,
+                conflict,
+                ..
+            } => {
+                assert_eq!(version, 50);
+                assert!(!applied);
+                assert_eq!(conflict, Some(AckConflict::SameVersionFork));
+            }
+            other => panic!("expected an ACK, got {other:?}"),
+        }
+        assert_eq!(tracker.get_version(), 50);
+        let live_rules = &handles.runtime.snapshot().config.filtering.custom_rules;
+        assert!(
+            !live_rules
+                .iter()
+                .any(|rule| rule.contains("fork-a.example")),
+            "the forked configuration must never become live: {live_rules:?}"
+        );
+
+        // An explicit higher-term promotion (with a higher version) resumes
+        // replication and clears the latch.
+        let promoted = ConfigBundle {
+            term: 1,
+            ..test_bundle(51, config_toml, None, None)
+        };
+        let promoted_push = build_and_sign_push(&promoted, &signing_key).unwrap();
+        handle_master_message(
+            &promoted_push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+        match read_ack(&mut peer).await {
+            HaMessage::Ack {
+                version,
+                term,
+                applied,
+                conflict,
+                ..
+            } => {
+                assert_eq!(version, 51);
+                assert_eq!(term, 1);
+                assert!(applied);
+                assert_eq!(conflict, None);
+            }
+            other => panic!("expected an ACK, got {other:?}"),
+        }
+        assert_eq!(tracker.get_version(), 51);
+        assert_eq!(tracker.get_term(), 1);
+        assert!(!tracker.is_forked(), "a higher term clears the latch");
+        assert!(!tracker.get_watermark().unwrap().forked);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -2080,6 +2294,7 @@ ttl = 60
                 term,
                 applied,
                 error,
+                ..
             } => {
                 assert_eq!(version, 5);
                 assert_eq!(term, 1);
@@ -2148,6 +2363,7 @@ ttl = 60
             HaMessage::Ack {
                 version: 5,
                 term: 0,
+                conflict: None,
                 applied: true,
                 ..
             }
