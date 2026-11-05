@@ -297,7 +297,15 @@ When a slave node fails or must be reprovisioned from bare metal:
    Deploy the `sito` binary or Docker container to the new host.
 2. **Obtain Cluster CA and Slave Cert**:
    Copy `/etc/sito/certs/ca.crt` from the master, along with a valid slave certificate and private key.
-3. **Configure Minimal Slave Configuration**:
+3. **Configure Minimal Slave Configuration and align restart-only fields**:
+   Restart-only shared settings must already match the master's
+   `config.toml` before the first push. The template below uses the shipped
+   `config.example.toml` values (`log_format = "pretty"` and the default
+   `[auth]` policy); copy the master's values if it overrides either. A
+   mismatch makes the slave reject the push with `restart_required`, enter
+   `Degraded`, and keep its previous configuration and file until it is
+   restarted with matching values.
+
    Create `/etc/sito/config.toml`:
    ```toml
    config_version = 1
@@ -306,9 +314,20 @@ When a slave node fails or must be reprovisioned from bare metal:
    role = "slave"
    instance_name = "sito-slave-2"
    data_dir = "/var/lib/sito"
+   # Restart-only shared value; must match the master's config.toml.
+   # config.example.toml uses "pretty".
+   log_format = "pretty"
 
    [dns]
    bind = ["0.0.0.0"]
+
+   # Restart-only shared policy; must match the master's [auth].
+   # These are the defaults (and the values in config.example.toml).
+   [auth]
+   session_ttl_hours = 24
+   login_rate_limit = 5
+   session_persist = true
+   token_default_ttl_days = 90
 
    [ha]
    master_url = "wss://192.168.1.10:8953"
@@ -331,7 +350,7 @@ When a slave node fails or must be reprovisioned from bare metal:
    ```bash
    curl -s http://localhost:8080/api/v1/ha/status | jq .
    ```
-   The slave will transition through `Connecting` -> `HelloSent` -> `Applying` -> `Synced` (or `HelloSent` -> `Synced` when it is already at the master's version) in under 2 seconds. Verify that custom rules, rewrites, and client lists match the master. `Degraded` is only cleared by a successful apply or an early ACK for the already-running version.
+   The slave will transition through `Connecting` -> `HelloSent` -> `Applying` -> `Synced` (or `HelloSent` -> `Synced` when it is already at the master's version) in under 2 seconds once the restart-only fields from step 3 match the master. If the first push is rejected with `restart_required`, align `server.log_format` and the `[auth]` policy with the master and restart the slave; the master keeps reporting it unsynced until then. Verify that custom rules, rewrites, and client lists match the master. `Degraded` is only cleared by a successful apply or an early ACK for the already-running version.
 
    If `data_dir/ha_watermark.toml` is corrupt or restored from a different
    node, the slave refuses to start rather than dropping its replay guard.
