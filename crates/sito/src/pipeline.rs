@@ -2397,8 +2397,19 @@ mod tests {
 
     /// Builds a pipeline around `upstream` with the standard test registries.
     async fn build_test_pipeline(
+        config: Config,
+        upstream: std::sync::Arc<UpstreamManager>,
+    ) -> (DnsPipeline, std::path::PathBuf) {
+        let validator = sito_dnssec::DnssecValidator::from_config(&config.dns.dnssec);
+        build_test_pipeline_with_validator(config, upstream, validator).await
+    }
+
+    /// Builds a pipeline with a caller-supplied DNSSEC validator (used by
+    /// tests that need a specific trust anchor).
+    async fn build_test_pipeline_with_validator(
         mut config: Config,
         upstream: std::sync::Arc<UpstreamManager>,
+        dnssec: sito_dnssec::DnssecValidator,
     ) -> (DnsPipeline, std::path::PathBuf) {
         use sito_clients::{ClientRegistry, ClientsConfig, ParentalRegistry, ServiceRegistry};
         use sito_filter::HostsFilterEngine;
@@ -2423,9 +2434,7 @@ mod tests {
             filter,
             cache,
             upstream,
-            std::sync::Arc::new(sito_dnssec::DnssecValidator::from_config(
-                &config.dns.dnssec,
-            )),
+            std::sync::Arc::new(dnssec),
             std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(ClientRegistry::new(
                 ClientsConfig::default(),
             )))),
@@ -2888,6 +2897,159 @@ mod tests {
             "a stale entry must never be served as authenticated"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// A validated Secure NXDOMAIN/NODATA must be cached for DO=0 clients too.
+    ///
+    /// The pipeline strips NSEC/NSEC3/RRSIG before inserting a DO=0 response.
+    /// The denial-proof TTL cap must therefore already be applied to the SOA
+    /// (in `apply_authenticated_ttls`); deriving the cap only from the cached
+    /// (stripped) records produced a zero lifespan and sent every repeated
+    /// negative query upstream.
+    #[tokio::test]
+    async fn test_do0_secure_negative_answer_is_cached() {
+        use hickory_proto::dnssec::TrustAnchors;
+        use hickory_proto::dnssec::rdata::{DNSSECRData, NSEC};
+        use hickory_proto::rr::{LowerName, RecordSet};
+        use sito_dnssec::DnssecMode;
+        use sito_proto::rdata::SOA;
+
+        let (origin, dnskey, signer) =
+            sito_dnssec::test_util::create_test_signer("signed.example.");
+        let qname = Name::from_str("empty.signed.example.").unwrap();
+        let next = Name::from_str("zzz.signed.example.").unwrap();
+
+        // Signed SOA (long-lived) plus a signed NSEC NODATA proof (10 s).
+        let soa = Record::from_rdata(
+            origin.clone(),
+            3600,
+            RData::SOA(SOA::new(
+                Name::from_str("ns1.signed.example.").unwrap(),
+                Name::from_str("hostmaster.signed.example.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                3600,
+            )),
+        );
+        let mut soa_set = RecordSet::new(origin.clone(), RecordType::SOA, 3600);
+        soa_set.insert(soa.clone(), 0);
+        let mut soa_sig = sito_dnssec::test_util::sign_test_rrset(&soa_set, &signer);
+        soa_sig.ttl = 3600;
+
+        let nsec = NSEC::new(next, [RecordType::SOA, RecordType::NSEC, RecordType::RRSIG]);
+        let nsec_record =
+            Record::from_rdata(qname.clone(), 10, RData::DNSSEC(DNSSECRData::NSEC(nsec)));
+        let mut nsec_set = RecordSet::new(qname.clone(), RecordType::NSEC, 10);
+        nsec_set.insert(nsec_record.clone(), 0);
+        let mut nsec_sig = sito_dnssec::test_util::sign_test_rrset(&nsec_set, &signer);
+        nsec_sig.ttl = 10;
+
+        let mut template = Message::new(0, MessageType::Response, OpCode::Query);
+        template.metadata.response_code = ResponseCode::NoError;
+        template.authorities = vec![soa, soa_sig, nsec_record, nsec_sig];
+        template.additionals.push(Record::from_rdata(
+            origin.clone(),
+            3600,
+            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+        ));
+
+        let mock_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_socket.local_addr().unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_task = std::sync::Arc::clone(&calls);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((len, src)) = mock_socket.recv_from(&mut buf).await {
+                if let Ok(query) = sito_proto::decode_message(&buf[..len]) {
+                    calls_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut resp = template.clone();
+                    resp.metadata.id = query.metadata.id;
+                    resp.queries = query.queries.clone();
+                    if let Ok(encoded) = sito_proto::encode_message(&resp) {
+                        let _ = mock_socket.send_to(&encoded, src).await;
+                    }
+                }
+            }
+        });
+
+        let mut config = Config::default();
+        config.upstream.servers = vec![mock_addr.to_string()];
+        config.dns.cache.serve_stale_hours = 0;
+        let bootstrap =
+            sito_upstream::BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            sito_upstream::UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+
+        let mut anchors = TrustAnchors::empty();
+        anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let validator =
+            DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+        let (pipeline, temp_dir) =
+            build_test_pipeline_with_validator(config, upstream, validator).await;
+
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let make_query = |id: u16| {
+            let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+            query.queries.push(hickory_proto::op::Query::query(
+                qname.clone(),
+                RecordType::A,
+            ));
+            // No DO bit: a plain client.
+            query
+        };
+
+        let first = pipeline
+            .handle(make_query(1), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.metadata.response_code, ResponseCode::NoError);
+        assert!(first.answers.is_empty(), "expected a NODATA answer");
+        assert!(
+            !first.metadata.authentic_data,
+            "DO=0 responses never carry AD"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "first query must reach the upstream"
+        );
+        let soa_ttl = first
+            .authorities
+            .iter()
+            .find(|record| record.record_type() == RecordType::SOA)
+            .expect("negative answer carries an SOA")
+            .ttl;
+        assert!(
+            soa_ttl <= 10,
+            "the validator must cap the SOA TTL by the denial proof before the DO=0 strip (got {soa_ttl})"
+        );
+
+        let (_, status) = pipeline
+            .cache
+            .get_for_query_with_status(&make_query(2))
+            .await
+            .expect("the Secure negative answer must have a non-zero cache lifespan");
+        assert_eq!(
+            status,
+            ValidationStatus::Secure,
+            "the denial proof must validate before being cached for DO=0"
+        );
+
+        let second = pipeline.handle(make_query(3), client).await.unwrap();
+        assert_eq!(second.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(second.answers.len(), 0);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a repeated DO=0 Secure negative must be served from the fresh cache"
+        );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

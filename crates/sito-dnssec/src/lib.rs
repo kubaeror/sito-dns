@@ -200,6 +200,53 @@ fn apply_authenticated_ttls(response: &mut Message, now: u32) {
             }
         }
     }
+
+    // A negative answer is authenticated by its NSEC/NSEC3 denial proof, not
+    // by the SOA. A zone can sign the SOA with a longer TTL/expiry than the
+    // proof, so cap the SOA-derived negative TTL here, while the DNSSEC
+    // records are still present. The pipeline strips them for DO=0 clients
+    // before caching, and the cache must not use the stripped records to
+    // decide how long a Secure negative may live.
+    let Some(query) = response.queries.first() else {
+        return;
+    };
+    let qname = query.name().clone();
+    let qtype = query.query_type();
+    if !is_negative_response(response, &qname, qtype) {
+        return;
+    }
+    let Some(denial_ttl) = authenticated_denial_ttl(response) else {
+        return;
+    };
+    for section in [&mut response.answers, &mut response.authorities] {
+        for record in section.iter_mut() {
+            if matches!(record.data, RData::SOA(_)) {
+                record.ttl = record.ttl.min(denial_ttl);
+            }
+        }
+    }
+}
+
+/// Minimum authenticated TTL of the NSEC/NSEC3 denial records and the RRSIGs
+/// covering them. Returns `None` when the response carries no denial proof.
+fn authenticated_denial_ttl(response: &Message) -> Option<u32> {
+    response
+        .answers
+        .iter()
+        .chain(response.authorities.iter())
+        .filter_map(|record| match &record.data {
+            RData::DNSSEC(DNSSECRData::NSEC(_) | DNSSECRData::NSEC3(_)) => Some(record.ttl),
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
+                if matches!(
+                    rrsig.input().type_covered,
+                    RecordType::NSEC | RecordType::NSEC3
+                ) =>
+            {
+                Some(record.ttl)
+            }
+            _ => None,
+        })
+        .min()
 }
 
 /// DNSSEC validation mode.

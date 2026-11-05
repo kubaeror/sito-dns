@@ -504,14 +504,19 @@ impl DnsCache {
             // that led to it. Otherwise the cached NODATA/NXDOMAIN would keep
             // being served after the alias TTL expired.
             //
-            // A Secure negative answer is only proven by its NSEC/NSEC3 denial
+            // A Secure negative answer is proven by its NSEC/NSEC3 denial
             // records (and their RRSIGs), whose TTLs the validator has already
             // capped by the authenticated TTL/signature expiry. The SOA can be
             // signed with a longer lifetime, so the entry must not outlive the
-            // denial proof. Without a proof a Secure negative has no
-            // authenticated lifetime at all (lifespan 0, fail closed).
+            // denial proof.
+            //
+            // When the proof is still present (DO=1 responses) apply the same
+            // cap here as defense in depth. DO=0 responses are stripped of
+            // DNSSEC records before caching; for those, the validator already
+            // capped the SOA TTL in `apply_authenticated_ttls`, so no proof
+            // here means nothing further to cap (not a zero lifespan).
             let denial_ttl = if validation_status.is_secure() {
-                Some(denial_proof_ttl(&response.authorities).unwrap_or(0))
+                denial_proof_ttl(&response.authorities)
             } else {
                 None
             };
