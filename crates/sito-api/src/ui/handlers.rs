@@ -1604,9 +1604,9 @@ fn update_action_html(info: &crate::updater::UpdateInfo, csrf_token: &str) -> St
     }
 
     format!(
-        r##"<form hx-post="/ui/system/update/apply" hx-target="#update-container" hx-swap="innerHTML" style="margin-top: 14px;">
+        r##"<form hx-post="/ui/system/update/apply" hx-target="#update-container" hx-swap="innerHTML" hx-disabled-elt="button" style="margin-top: 14px;">
             <input type="hidden" name="csrf_token" value="{}">
-            <button type="submit" class="btn btn-primary" @click="this.disabled=true; this.innerText='Updating...';">
+            <button type="submit" class="btn btn-primary" @click="this.innerText='Updating...';">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
                 Download & Install v{}
             </button>
@@ -3046,6 +3046,17 @@ mod tests {
         assert!(
             !html.contains("this.form.submit()"),
             "native form submission bypasses htmx and would omit the CSRF header: {html}"
+        );
+        // A submit button disabled during its click handler returns from the
+        // activation behavior without firing the form's submit event, so htmx
+        // must own the disabled state after the event has started.
+        assert!(
+            html.contains(r#"hx-disabled-elt="button""#),
+            "htmx must disable the button after submit: {html}"
+        );
+        assert!(
+            !html.contains("this.disabled"),
+            "the click handler must not disable the submit button before htmx sees submit: {html}"
         );
 
         let docker = crate::updater::UpdateInfo {
