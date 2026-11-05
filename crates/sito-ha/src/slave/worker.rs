@@ -1016,7 +1016,12 @@ where
                 if watermark.forked && push_term <= watermark.term {
                     // A fork was already latched: only a strictly higher-term
                     // promotion may resume replication.
-                    let _ = tracker.latch_fork(watermark.version, watermark.term);
+                    if let Err(e) = tracker.latch_fork(watermark.version, watermark.term) {
+                        warn!(
+                            error = %e,
+                            "Failed to re-persist the HA fork latch; the in-memory latch still applies"
+                        );
+                    }
                     tracker.mark_degraded(format!(
                         "HA fork latched at term {} version {}: refusing term {push_term} until explicit higher-term promotion",
                         watermark.term, watermark.forked_at_version
@@ -1099,15 +1104,23 @@ where
                             payload_hash_blake3,
                         ) {
                             // Same term and version but different content: this
-                            // is a fork. Latch it durably so the next same-term
-                            // version from the forked master cannot overwrite
-                            // the applied configuration.
-                            if let Err(e) = tracker.latch_fork(watermark.version, watermark.term) {
-                                warn!(
-                                    error = %e,
-                                    "Failed to persist the HA fork latch"
-                                );
-                            }
+                            // is a fork. Latch it (in memory and durably) so
+                            // the next same-term version from the forked master
+                            // cannot overwrite the applied configuration. A
+                            // failed durable write still leaves the in-memory
+                            // latch, but is reported in the ACK.
+                            let latch_error = match tracker
+                                .latch_fork(watermark.version, watermark.term)
+                            {
+                                Ok(()) => None,
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        "Failed to persist the HA fork latch; keeping the in-memory latch"
+                                    );
+                                    Some(e.to_string())
+                                }
+                            };
                             let reason = format!(
                                 "Same-version payload fork at term {} version {}: master content differs from the applied bundle",
                                 watermark.term, watermark.version
@@ -1118,7 +1131,12 @@ where
                                 term: watermark.term,
                                 applied: false,
                                 conflict: Some(AckConflict::SameVersionFork),
-                                error: Some(reason),
+                                error: Some(match latch_error {
+                                    Some(e) => {
+                                        format!("{reason} (fork latch could not be persisted: {e})")
+                                    }
+                                    None => reason,
+                                }),
                             };
                             ws_stream
                                 .send(WsMessage::Text(ack.to_json()?.into()))
@@ -2231,6 +2249,136 @@ ttl = 60
         assert!(!tracker.get_watermark().unwrap().forked);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A failed durable fork-latch write must still keep the in-memory latch and
+    /// refuse the next same-term version; it must not proceed as if unlatched.
+    #[tokio::test]
+    async fn test_fork_latch_write_failure_still_refuses_same_term_push() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_fork_latch_fail_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tracker = SlaveStatusTracker::new("slave-fork-fail".to_string(), 0, None)
+            .with_watermark_path(dir.join("ha_watermark.toml"))
+            .unwrap();
+        let handles = test_handles(None).await;
+        let config_toml = "config_version = 1\n[server]\nrole = \"slave\"\n";
+
+        let applied = ConfigBundle {
+            term: 0,
+            ..test_bundle(50, config_toml, None, None)
+        };
+        let applied_push = build_and_sign_push(&applied, &signing_key).unwrap();
+        assert_eq!(
+            apply_config_push(&applied_push, &tracker, &handles, &signing_key.public_key())
+                .await
+                .unwrap(),
+            50
+        );
+
+        // Sabotage the watermark path: its parent becomes a regular file, so
+        // the next atomic latch write fails.
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+        tokio::fs::write(&dir, b"not-a-directory").await.unwrap();
+
+        let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            slave_socket,
+            Role::Client,
+            Some(ws_config()),
+        )
+        .await;
+        let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer_socket,
+            Role::Server,
+            Some(ws_config()),
+        )
+        .await;
+
+        let mut forked = test_bundle(50, config_toml, None, None);
+        forked.term = 0;
+        forked.custom_rules = vec!["||fork-write-fail.example^".to_string()];
+        let forked_push = build_and_sign_push(&forked, &signing_key).unwrap();
+        tracker.set_state(SlaveState::Synced);
+        handle_master_message(
+            &forked_push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+
+        match read_ack(&mut peer).await {
+            HaMessage::Ack {
+                applied,
+                conflict,
+                error,
+                ..
+            } => {
+                assert!(!applied);
+                assert_eq!(conflict, Some(AckConflict::SameVersionFork));
+                assert!(
+                    error.unwrap_or_default().contains("could not be persisted"),
+                    "the ACK must surface the latch write failure"
+                );
+            }
+            other => panic!("expected an ACK, got {other:?}"),
+        }
+        assert!(
+            tracker.is_forked(),
+            "the in-memory latch must survive a failed durable write"
+        );
+        assert_eq!(tracker.get_state(), SlaveState::Degraded);
+
+        let forked_next = ConfigBundle {
+            term: 0,
+            ..test_bundle(51, config_toml, None, None)
+        };
+        let forked_next_push = build_and_sign_push(&forked_next, &signing_key).unwrap();
+        handle_master_message(
+            &forked_next_push.to_json().unwrap(),
+            &mut ws,
+            &tracker,
+            &handles,
+            Some(&signing_key.public_key()),
+        )
+        .await
+        .unwrap();
+        match read_ack(&mut peer).await {
+            HaMessage::Ack {
+                version,
+                applied,
+                conflict,
+                ..
+            } => {
+                assert_eq!(version, 50);
+                assert!(!applied);
+                assert_eq!(conflict, Some(AckConflict::SameVersionFork));
+            }
+            other => panic!("expected an ACK, got {other:?}"),
+        }
+        assert_eq!(tracker.get_version(), 50);
+        assert!(
+            !handles
+                .runtime
+                .snapshot()
+                .config
+                .filtering
+                .custom_rules
+                .iter()
+                .any(|rule| rule.contains("fork-write-fail")),
+            "the forked configuration must not become live"
+        );
+
+        let _ = tokio::fs::remove_file(&dir).await;
     }
 
     /// A stale master from an older term must not overwrite a newer slave,

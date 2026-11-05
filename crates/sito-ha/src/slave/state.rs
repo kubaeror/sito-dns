@@ -159,6 +159,11 @@ impl SlaveStatusTracker {
         watermark.forked = true;
         watermark.forked_at_version = version;
 
+        // Fail closed: latch in memory before the durable write so a failed
+        // write cannot let the next same-term push through. The caller still
+        // receives the error and must not treat replication as recovered.
+        *self.watermark.lock().unwrap() = Some(watermark.clone());
+
         if let Some(path) = self.watermark_path.lock().unwrap().clone() {
             let payload = serde_json::to_vec_pretty(&watermark).map_err(|e| {
                 HaError::Serialization(format!("Failed to serialize HA watermark: {e}"))
@@ -172,7 +177,6 @@ impl SlaveStatusTracker {
             })?;
         }
 
-        *self.watermark.lock().unwrap() = Some(watermark);
         Ok(())
     }
 
