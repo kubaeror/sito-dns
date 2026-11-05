@@ -8,6 +8,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **HA peer version bounds (security)**: an authenticated replica can no longer
+  freeze publishing by reporting `u64::MAX` (or any implausibly high
+  `have_version`/ACK version). The master rejects Hello values more than
+  1,000,000 above its own sequence without seeding or registering, ignores
+  implausible ACK versions without rebasing, rejects publishing or restoring a
+  sequence at `u64::MAX`, and uses `checked_add` for every sequence increment.
 - **DNSSEC verification amplification (security)**: a crafted authoritative
   response can no longer force unbounded cryptographic work. Each response now
   has a hard budget of 256 RRSIG verification attempts (shared across the

@@ -26,6 +26,15 @@ use crate::master::tracker::{ActiveSlave, SlaveStatsSummary, SlaveSummary};
 use crate::protocol::HaMessage;
 use crate::transport::{build_server_tls_config, ws_config};
 
+/// Maximum amount by which an authenticated peer may report being ahead of the
+/// master's sequence before the report is treated as implausible (and therefore
+/// hostile or corrupt) instead of as promotion evidence.
+///
+/// A single replica must never be able to freeze publishing by reporting a
+/// gigantic version: values above this bound are rejected without touching the
+/// master's counter or persisted state.
+pub const MAX_PEER_VERSION_LEAD: u64 = 1_000_000;
+
 /// Outcome of a manual resynchronization request, surfaced honestly by the
 /// `/ha/resync` API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +267,18 @@ impl MasterCoordinator {
         if bundle.version == 0 {
             return Ok(None);
         }
+        if bundle.version == u64::MAX {
+            // A state file at the ceiling can never advance again. Treat it as
+            // a hard error instead of silently resuming a frozen master; the
+            // operator must restore a backup or re-seed the sequence.
+            return Err(HaError::Validation {
+                field: "version".to_string(),
+                reason: format!(
+                    "Persisted HA state at {} has version u64::MAX and can never advance; restore the state file from backup or re-seed an explicit version",
+                    path.display()
+                ),
+            });
+        }
         // State files written by older versions may still embed structured
         // client secrets; strip them before signing/broadcasting.
         let mut bundle = bundle;
@@ -370,6 +391,18 @@ impl MasterCoordinator {
     /// Returns true when the local sequence was raised.
     fn seed_version_from_hello(&self, instance: &str, have_version: u64) -> bool {
         let mut current = self.current_version.load(Ordering::SeqCst);
+        // Defense in depth: the caller checks this too, but never let a
+        // `u64::MAX`-style report reach the counter through any path.
+        if have_version > current.saturating_add(MAX_PEER_VERSION_LEAD) {
+            warn!(
+                instance = %instance,
+                have_version,
+                current,
+                max_lead = MAX_PEER_VERSION_LEAD,
+                "Refusing to seed the master version from an implausible peer version"
+            );
+            return false;
+        }
         loop {
             if have_version <= current {
                 return false;
@@ -422,6 +455,13 @@ impl MasterCoordinator {
                 reason: format!(
                     "Refusing to publish non-monotonic configuration version {version} (current {current})"
                 ),
+            });
+        }
+        if version == u64::MAX {
+            return Err(HaError::Validation {
+                field: "version".to_string(),
+                reason: "Refusing to publish configuration version u64::MAX: the sequence could never advance again"
+                    .to_string(),
             });
         }
 
@@ -798,6 +838,24 @@ impl MasterCoordinator {
             "Received authenticated Hello from replica slave"
         );
 
+        // Reject implausible peer versions before they can influence the local
+        // sequence. An authenticated replica reporting `u64::MAX` (or any
+        // value far beyond the master's counter) would otherwise seed the
+        // version and make every subsequent publish non-monotonic, freezing
+        // replication.
+        let current = self.get_current_version();
+        if have_version > current.saturating_add(MAX_PEER_VERSION_LEAD) {
+            error!(
+                instance = %slave_instance,
+                peer = %peer_addr,
+                have_version,
+                current,
+                max_lead = MAX_PEER_VERSION_LEAD,
+                "Rejecting Hello with an implausible have_version"
+            );
+            return;
+        }
+
         let (tx, mut rx) = mpsc::channel::<HaMessage>(32);
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
 
@@ -809,7 +867,13 @@ impl MasterCoordinator {
         let seeded = self.seed_version_from_hello(&slave_instance, have_version);
         let active_bundle = self.active_bundle.lock().unwrap().clone();
         if seeded && let Some(bundle) = active_bundle {
-            let next_version = self.get_current_version().saturating_add(1);
+            let Some(next_version) = self.get_current_version().checked_add(1) else {
+                error!(
+                    instance = %slave_instance,
+                    "Cannot republish the active bundle: the HA version sequence is exhausted"
+                );
+                return;
+            };
             let mut rebased = bundle;
             rebased.version = next_version;
             if let Err(e) = self.update_bundle_async(rebased).await {
@@ -1025,6 +1089,19 @@ impl MasterCoordinator {
                 }
 
                 let current = self.get_current_version();
+                if applied && version > current.saturating_add(MAX_PEER_VERSION_LEAD) {
+                    // Never use an implausible peer-driven version as a seed,
+                    // a rebase input, or a persisted value. A single replica
+                    // must not be able to freeze publishing with `u64::MAX`.
+                    error!(
+                        instance = %slave_instance,
+                        acked_version = version,
+                        current,
+                        max_lead = MAX_PEER_VERSION_LEAD,
+                        "Ignoring ACK with an implausible version"
+                    );
+                    return true;
+                }
                 if applied && version == current {
                     info!(
                         instance = %slave_instance,
@@ -1077,7 +1154,13 @@ impl MasterCoordinator {
                     if let Some(bundle) = active_bundle
                         && bundle.version <= version
                     {
-                        let next_version = version.saturating_add(1);
+                        let Some(next_version) = version.checked_add(1) else {
+                            error!(
+                                instance = %slave_instance,
+                                "Cannot republish above the divergent version: the sequence is exhausted"
+                            );
+                            return true;
+                        };
                         let mut rebased = bundle;
                         rebased.version = next_version;
                         warn!(
@@ -2321,5 +2404,165 @@ mod tests {
         );
 
         let _ = shutdown_tx.send(true);
+    }
+
+    #[test]
+    fn test_update_bundle_rejects_u64_max_version() {
+        let coordinator = test_coordinator();
+        let err = coordinator
+            .update_bundle(test_bundle(u64::MAX))
+            .expect_err("u64::MAX must never be persisted as the active version");
+        assert!(
+            matches!(err, HaError::Validation { ref field, .. } if field == "version"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            coordinator.get_current_version(),
+            1,
+            "a rejected publish must not advance the sequence"
+        );
+        assert!(
+            coordinator.active_bundle.lock().unwrap().is_none(),
+            "a rejected publish must not store an active bundle"
+        );
+    }
+
+    #[test]
+    fn test_restore_rejects_u64_max_state_instead_of_freezing() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_max_state_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("ha_state.toml");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&test_bundle(u64::MAX)).unwrap(),
+        )
+        .unwrap();
+
+        let coordinator = test_coordinator().with_state_path(state_path);
+        let err = coordinator
+            .restore_state()
+            .expect_err("a persisted u64::MAX sequence must fail closed");
+        assert!(matches!(err, HaError::Validation { ref field, .. } if field == "version"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_hello_u64_max_does_not_seed_or_register() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (server_socket, client_socket) = tokio::io::duplex(64 * 1024);
+        let server_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            server_socket,
+            Role::Server,
+            Some(WebSocketConfig::default()),
+        )
+        .await;
+        let mut client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            client_socket,
+            Role::Client,
+            Some(WebSocketConfig::default()),
+        )
+        .await;
+
+        let coord = coordinator.clone();
+        let session = tokio::spawn(async move {
+            coord
+                .handle_connection(server_ws, "127.0.0.1:1000".parse().unwrap())
+                .await;
+        });
+
+        let hello = HaMessage::Hello {
+            instance: "hostile-slave".to_string(),
+            have_version: u64::MAX,
+            capabilities: vec![],
+            token: None,
+            role: Some("slave".to_string()),
+            protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        };
+        client_ws
+            .send(WsMessage::Text(hello.to_json().unwrap().into()))
+            .await
+            .unwrap();
+
+        // The master closes the session without pushing or adopting the value.
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match client_ws.next().await {
+                    Some(Ok(WsMessage::Close(_)) | Err(_)) | None => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "an implausible Hello must close the session"
+        );
+        session.await.unwrap();
+        assert_eq!(
+            coordinator.get_current_version(),
+            2,
+            "u64::MAX must never seed the master sequence"
+        );
+        assert_eq!(coordinator.connected_slave_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ack_u64_max_does_not_freeze_publishing() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "hostile-slave".to_string(),
+            ActiveSlave {
+                instance: "hostile-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 2,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+
+        let ack = HaMessage::Ack {
+            version: u64::MAX,
+            applied: true,
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(
+            coordinator
+                .process_slave_msg("hostile-slave", 1, &ack)
+                .await
+        );
+
+        assert_eq!(
+            coordinator.get_current_version(),
+            2,
+            "an implausible ACK must not change the master sequence"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an implausible ACK must not trigger a rebase push"
+        );
+        assert_eq!(
+            coordinator.update_bundle(test_bundle(3)).unwrap(),
+            3,
+            "publishing must keep working after an implausible ACK"
+        );
     }
 }

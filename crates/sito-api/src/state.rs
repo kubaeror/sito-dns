@@ -143,7 +143,12 @@ impl ServerContext {
             return;
         }
 
-        let new_version = coordinator.get_current_version().saturating_add(1);
+        let Some(new_version) = coordinator.get_current_version().checked_add(1) else {
+            tracing::error!(
+                "Refusing to publish HA bundle: the configuration version sequence is exhausted"
+            );
+            return;
+        };
         #[allow(clippy::cast_sign_loss)]
         let bundle = sito_ha::ConfigBundle {
             version: new_version,
