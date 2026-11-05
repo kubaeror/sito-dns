@@ -96,9 +96,12 @@ pub enum Commands {
         /// Optional path to configuration file (defaults to main --config)
         #[arg(short, long)]
         config: Option<PathBuf>,
-        /// Optional new admin password (defaults to adminadmin)
+        /// New admin password (a random one is generated and printed once when omitted)
         #[arg(short, long)]
         password: Option<String>,
+        /// Also delete every non-admin account (full account-store replacement)
+        #[arg(long = "reset-all", alias = "reset-users")]
+        reset_all: bool,
     },
     /// Invalidate all persisted web sessions and API tokens (users are kept)
     ResetSessions {
@@ -724,8 +727,48 @@ pub async fn run_update(
     Ok(())
 }
 
+/// Outcome of `reset-admin`, including a generated password so callers can
+/// print it exactly once without persisting it anywhere else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetAdminOutcome {
+    pub users_path: PathBuf,
+    /// `Some` when the password was generated because none was supplied.
+    pub generated_password: Option<String>,
+    pub reset_all_users: bool,
+}
+
+/// Generates a 192-bit random hex password for `reset-admin`.
+fn generate_reset_admin_password() -> String {
+    let mut bytes = [0u8; 24];
+    rand::rng().fill(&mut bytes);
+    let mut password = String::with_capacity(48);
+    for byte in &bytes {
+        let _ = std::fmt::Write::write_fmt(&mut password, format_args!("{byte:02x}"));
+    }
+    password
+}
+
+/// Applies the shared API/wizard password policy to an operator-supplied
+/// `reset-admin` password.
+fn validate_reset_admin_password(password: &str) -> Result<(), anyhow::Error> {
+    sito_api::handlers::auth_handlers::validate_password_policy(password)
+        .map_err(|problem| anyhow::anyhow!("Invalid admin password: {}", problem.detail))
+}
+
+/// Executes the `reset-admin` subcommand, preserving non-admin accounts.
+pub fn run_reset_admin(
+    config_path: &Path,
+    password: Option<&str>,
+) -> Result<ResetAdminOutcome, anyhow::Error> {
+    run_reset_admin_with_options(config_path, password, false)
+}
+
 /// Executes the `reset-admin` subcommand.
-pub fn run_reset_admin(config_path: &Path, password: Option<&str>) -> Result<(), anyhow::Error> {
+pub fn run_reset_admin_with_options(
+    config_path: &Path,
+    password: Option<&str>,
+    reset_all_users: bool,
+) -> Result<ResetAdminOutcome, anyhow::Error> {
     let content = std::fs::read_to_string(config_path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to read configuration file '{}': {}",
@@ -742,23 +785,42 @@ pub fn run_reset_admin(config_path: &Path, password: Option<&str>) -> Result<(),
         )
     })?;
 
-    let pass = password.unwrap_or("adminadmin");
-    let users_path = sito_api::AuthManager::reset_admin_credentials(&config.server.data_dir, pass)
-        .map_err(|e| anyhow::anyhow!("Failed to reset admin credentials: {e}"))?;
+    let (pass, generated_password) = if let Some(password) = password {
+        validate_reset_admin_password(password)?;
+        (password.to_string(), None)
+    } else {
+        let generated = generate_reset_admin_password();
+        (generated.clone(), Some(generated))
+    };
+
+    let users_path = if reset_all_users {
+        sito_api::AuthManager::reset_admin_credentials_full(&config.server.data_dir, &pass)
+    } else {
+        sito_api::AuthManager::reset_admin_credentials(&config.server.data_dir, &pass)
+    }
+    .map_err(|e| anyhow::anyhow!("Failed to reset admin credentials: {e}"))?;
 
     println!(
         "Administrative credentials successfully reset in '{}'.\nUsername: admin",
         users_path.display()
     );
-    if password.is_none() {
-        println!(
-            "Password: adminadmin (Warning: Please change this default password upon logging in!)"
-        );
+    if let Some(generated) = generated_password.as_deref() {
+        println!("Password: {generated}");
+        println!("Store this password now; it is not written anywhere else.");
     } else {
         println!("Password: (custom password set)");
     }
+    if reset_all_users {
+        println!("All non-admin accounts were removed (--reset-all).");
+    } else {
+        println!("Other user accounts were preserved.");
+    }
 
-    Ok(())
+    Ok(ResetAdminOutcome {
+        users_path,
+        generated_password,
+        reset_all_users,
+    })
 }
 
 /// Executes the `reset-sessions` subcommand: removes persisted sessions and API tokens.
@@ -1175,6 +1237,118 @@ mod tests {
             let mode = std::fs::metadata(&restored).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "restore must repair loose permissions");
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn reset_admin_fixture() -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("sito_reset_admin_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "config_version = 1\n[server]\ndata_dir = \"{}\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        (dir, config_path)
+    }
+
+    #[test]
+    fn test_cli_reset_admin_reset_all_flag() {
+        for flag in ["--reset-all", "--reset-users"] {
+            let cli = Cli::try_parse_from(["sito", "reset-admin", flag]).expect("parse args");
+            assert!(matches!(
+                cli.command,
+                Some(Commands::ResetAdmin {
+                    reset_all: true,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reset_admin_rejects_weak_or_default_passwords() {
+        let (dir, config_path) = reset_admin_fixture();
+        let _ = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+
+        for weak in ["adminadmin", "short", "has space 123"] {
+            let err = run_reset_admin(&config_path, Some(weak))
+                .expect_err("weak password must be rejected");
+            assert!(
+                !err.to_string().is_empty(),
+                "rejection must explain the password policy"
+            );
+        }
+
+        // The users file was not rotated by the rejected attempts.
+        let mgr = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(matches!(
+            mgr.login("admin", "adminadmin", "127.0.0.1").await,
+            sito_api::auth::LoginResult::Success(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reset_admin_without_password_never_writes_default() {
+        let (dir, config_path) = reset_admin_fixture();
+        let _ = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+
+        let outcome = run_reset_admin(&config_path, None).expect("generated-password reset");
+        let generated = outcome
+            .generated_password
+            .expect("missing --password must generate one");
+        assert_ne!(generated, "adminadmin");
+        validate_reset_admin_password(&generated).expect("generated password meets policy");
+
+        let mgr = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(matches!(
+            mgr.login("admin", "adminadmin", "127.0.0.1").await,
+            sito_api::auth::LoginResult::InvalidCredentials { .. }
+        ));
+        assert!(matches!(
+            mgr.login("admin", &generated, "127.0.0.1").await,
+            sito_api::auth::LoginResult::Success(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reset_admin_preserves_non_admin_users_by_default() {
+        let (dir, config_path) = reset_admin_fixture();
+        {
+            let mgr = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+            mgr.update_user_password("admin", "OldAdminPassword1!")
+                .await;
+            mgr.create_user("alice", "AlicePassword1!", sito_api::auth::Role::Operator)
+                .await;
+        }
+
+        run_reset_admin(&config_path, Some("NewAdminPassword1!")).expect("reset admin password");
+
+        let mgr = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            mgr.has_user("alice"),
+            "non-admin accounts must be preserved"
+        );
+        assert_eq!(mgr.role_of("alice"), Some(sito_api::auth::Role::Operator));
+        assert!(matches!(
+            mgr.login("admin", "NewAdminPassword1!", "127.0.0.1").await,
+            sito_api::auth::LoginResult::Success(_)
+        ));
+
+        // The explicit full reset is the only path that removes other accounts.
+        let outcome =
+            run_reset_admin_with_options(&config_path, Some("NewAdminPassword2!"), true).unwrap();
+        assert!(outcome.reset_all_users);
+        let mgr = sito_api::AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(!mgr.has_user("alice"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

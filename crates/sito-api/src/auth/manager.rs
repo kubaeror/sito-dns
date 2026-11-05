@@ -808,21 +808,41 @@ impl AuthManager {
         Ok(mgr)
     }
 
-    /// Resets the administrative account credentials and persists to users.toml.
-    /// If an existing users.toml exists, it will be backed up before being overwritten.
+    /// Resets the administrative account credentials and preserves every
+    /// non-admin account already present in `users.toml`. The file is backed up
+    /// before being rewritten. Use [`Self::reset_admin_credentials_full`] when
+    /// a full account-store replacement is explicitly intended.
     pub fn reset_admin_credentials(
         data_dir: impl AsRef<Path>,
         new_password: &str,
     ) -> std::io::Result<PathBuf> {
-        let path = data_dir.as_ref().join("users.toml");
+        Self::reset_admin_credentials_inner(data_dir.as_ref(), new_password, false)
+    }
+
+    /// Full `reset-admin --reset-all`: replaces the account store with only the
+    /// `admin` account. Also the recovery path for an unparseable `users.toml`.
+    pub fn reset_admin_credentials_full(
+        data_dir: impl AsRef<Path>,
+        new_password: &str,
+    ) -> std::io::Result<PathBuf> {
+        Self::reset_admin_credentials_inner(data_dir.as_ref(), new_password, true)
+    }
+
+    fn reset_admin_credentials_inner(
+        data_dir: &Path,
+        new_password: &str,
+        reset_all_users: bool,
+    ) -> std::io::Result<PathBuf> {
+        let path = data_dir.join("users.toml");
         // Resolve the key before copying anything: a recovery backup must never
         // retain legacy plaintext TOTP secrets. `reset-admin` is the recovery
         // path, so a malformed key must not make recovery impossible: move it
         // aside and generate a fresh one (the reset rotates credentials and
         // invalidates existing sessions/tokens anyway).
         let key_path = totp_key_path(&path);
-        let secret_store = match TotpSecretStore::load_or_create(&key_path) {
-            Ok(store) => store,
+        let key_was_missing = !key_path.exists();
+        let (secret_store, key_was_rotated) = match TotpSecretStore::load_or_create(&key_path) {
+            Ok(store) => (store, false),
             Err(e) => {
                 let backup =
                     key_path.with_extension(format!("corrupt.{}", chrono::Utc::now().timestamp()));
@@ -835,7 +855,7 @@ impl AuthManager {
                 if key_path.exists() {
                     std::fs::rename(&key_path, &backup)?;
                 }
-                TotpSecretStore::load_or_create(&key_path)?
+                (TotpSecretStore::load_or_create(&key_path)?, true)
             }
         };
         if path.exists() {
@@ -860,12 +880,47 @@ impl AuthManager {
                 ),
             }
         }
+        let mut preserved_users = if path.exists() && !reset_all_users {
+            let content = std::fs::read_to_string(&path)?;
+            let mut file: UsersFile = toml::from_str(&content).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "users file '{}' is unparseable ({e}); refusing to delete non-admin accounts. Re-run with --reset-all to replace the account store.",
+                        path.display()
+                    ),
+                )
+            })?;
+            file.users.retain(|user| user.username != "admin");
+            // A newly generated/rotated key cannot decrypt existing TOTP
+            // secrets. Preserve the accounts but drop the unusable second
+            // factor instead of failing to start later.
+            if key_was_missing || key_was_rotated {
+                for user in &mut file.users {
+                    if user
+                        .totp
+                        .as_ref()
+                        .is_some_and(|totp| TotpSecretStore::is_encrypted(&totp.secret))
+                    {
+                        tracing::warn!(
+                            user = %user.username,
+                            "Dropping an existing TOTP secret because the encryption key was regenerated during admin reset"
+                        );
+                        user.totp = None;
+                    }
+                }
+            }
+            file.users
+        } else {
+            Vec::new()
+        };
+
         // Rotate the user-secret generation *before* installing the new
         // credentials so every live session and API token is rejected as soon
         // as the reset takes effect, and remove the persisted stores.
-        let generation = rotate_auth_generation(data_dir.as_ref())?;
+        let generation = rotate_auth_generation(data_dir)?;
         for name in ["sessions.toml", "tokens.toml"] {
-            let store = data_dir.as_ref().join(name);
+            let store = data_dir.join(name);
             if store.exists() {
                 std::fs::remove_file(&store)?;
                 tracing::info!(path = %store.display(), "Removed persisted auth store on admin reset");
@@ -902,6 +957,12 @@ impl AuthManager {
             // one when the key was lost (the reset is the documented recovery).
             secret_store: Some(secret_store),
         };
+        {
+            let mut users = lock(&mgr.users);
+            for user in preserved_users.drain(..) {
+                users.insert(user.username.clone(), user);
+            }
+        }
         mgr.create_user_internal("admin", new_password, Role::Admin);
         mgr.save_users_initial();
         Ok(path)
@@ -3287,7 +3348,8 @@ mod tests {
         );
         std::fs::write(dir.join("users.toml"), corrupt_content).unwrap();
 
-        AuthManager::reset_admin_credentials(&dir, "resetpassword1").unwrap();
+        // Replacing an unparseable store requires the explicit full reset.
+        AuthManager::reset_admin_credentials_full(&dir, "resetpassword1").unwrap();
 
         let backups: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
@@ -3383,9 +3445,9 @@ mod tests {
         std::fs::write(&users_file, "corrupt garbage").unwrap();
         assert!(AuthManager::with_storage(&temp_dir, 24, 5).is_err());
 
-        // Perform admin credentials reset
+        // Perform admin credentials reset (a corrupt store needs a full reset)
         let reset_path =
-            AuthManager::reset_admin_credentials(&temp_dir, "newpassword_reset").unwrap();
+            AuthManager::reset_admin_credentials_full(&temp_dir, "newpassword_reset").unwrap();
         assert_eq!(reset_path, users_file);
 
         // Now loading with_storage must succeed
