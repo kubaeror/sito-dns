@@ -740,37 +740,78 @@ fn lease_holder(pid: Option<u32>) -> String {
     pid.map_or_else(|| "a live process".to_string(), |pid| format!("pid {pid}"))
 }
 
-/// Refuses destructive resets while a server holds the data directory lease,
-/// unless the operator explicitly passed `--force`.
+/// Data-directory access held for the whole duration of a reset.
 ///
-/// Returns the detected service status (with the live PID when known) when the
-/// reset is allowed.
-fn ensure_reset_allowed(
+/// When the service is stopped the CLI owns the service lease until this value
+/// is dropped. That closes the check-then-write race: a server started by a
+/// supervisor or by `systemctl start` cannot acquire the lease and start serving
+/// stale in-memory state between the run check and the disk writes. When the
+/// operator forced a reset on a live server, no exclusive lease is possible and
+/// callers must print the persisted-only warning.
+#[derive(Debug)]
+enum ResetAccess {
+    Stopped {
+        _lease: crate::service_lock::ServiceLease,
+    },
+    Running {
+        pid: Option<u32>,
+    },
+}
+
+impl ResetAccess {
+    fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+}
+
+/// Acquires reset access, refusing a live service unless `--force` was given.
+///
+/// Acquisition *is* the run check. If the lease was free we hold it through the
+/// reset; if it was held we know a server is live. `force_hint` is the
+/// command-specific consequence of using `--force`, so the refusals do not
+/// mention unrelated credentials.
+fn begin_reset(
     data_dir: &Path,
     action: &str,
     force: bool,
-) -> Result<crate::service_lock::ServiceStatus, anyhow::Error> {
-    let status = crate::service_lock::status(data_dir).map_err(|e| {
-        anyhow::anyhow!(
-            "Refusing to {action}: cannot determine whether sito is running for '{}': {e}",
+    force_hint: &str,
+) -> Result<ResetAccess, anyhow::Error> {
+    match crate::service_lock::ServiceLease::acquire(data_dir) {
+        Ok(lease) => Ok(ResetAccess::Stopped { _lease: lease }),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // The lease is held, so a server was live. Read the PID only to
+            // make the message useful; it cannot change the verdict.
+            let pid = match crate::service_lock::status(data_dir) {
+                Ok(crate::service_lock::ServiceStatus::Running { pid }) => pid,
+                _ => None,
+            };
+            if force {
+                Ok(ResetAccess::Running { pid })
+            } else {
+                Err(anyhow::anyhow!(
+                    "Refusing to {action} while sito is running ({}).\n\
+                     Stop the service first:\n  sudo systemctl stop sito\n\
+                     Then run this command again and start it:\n  sudo systemctl start sito\n\
+                     {force_hint}",
+                    lease_holder(pid)
+                ))
+            }
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "Refusing to {action}: cannot acquire the service lease in '{}': {e}",
             data_dir.display()
-        )
-    })?;
-
-    match status {
-        crate::service_lock::ServiceStatus::Stopped => Ok(status),
-        crate::service_lock::ServiceStatus::Running { .. } if force => Ok(status),
-        crate::service_lock::ServiceStatus::Running { pid } => Err(anyhow::anyhow!(
-            "Refusing to {action} while sito is running ({}).\n\
-             Stop the service first:\n  sudo systemctl stop sito\n\
-             Then run this command again and start it:\n  sudo systemctl start sito\n\
-             Use --force only if you understand that live sessions and API tokens remain \
-             valid until the service is restarted and that a new admin password will not \
-             take effect until then.",
-            lease_holder(pid)
         )),
     }
 }
+
+const ADMIN_FORCE_HINT: &str = "Use --force only if you understand that live sessions and API tokens \
+     remain valid until the service is restarted and that a new admin password will not take effect \
+     until then.";
+const SESSIONS_FORCE_HINT: &str = ADMIN_FORCE_HINT;
+
+const ADMIN_LIVE_STATE: &str =
+    "The running server still accepts the old admin password and rejects the new one";
+const SESSIONS_LIVE_STATE: &str = "Existing web sessions and API tokens remain valid";
 
 /// Warning printed by `--force` when the server is still running.
 fn running_service_warning(pid: Option<u32>, live_state: &str) -> String {
@@ -841,10 +882,12 @@ pub fn run_reset_admin_with_options(
         )
     })?;
 
-    let service = ensure_reset_allowed(
+    // Keep the returned guard alive through the writes below.
+    let access = begin_reset(
         &config.server.data_dir,
         "reset administrative credentials",
         force,
+        ADMIN_FORCE_HINT,
     )?;
 
     let (pass, generated_password) = if let Some(password) = password {
@@ -862,18 +905,12 @@ pub fn run_reset_admin_with_options(
     }
     .map_err(|e| anyhow::anyhow!("Failed to reset admin credentials: {e}"))?;
 
-    if let crate::service_lock::ServiceStatus::Running { pid } = service {
+    if let ResetAccess::Running { pid } = &access {
         println!(
             "Administrative credentials were written to '{}'.\nUsername: admin",
             users_path.display()
         );
-        println!(
-            "{}",
-            running_service_warning(
-                pid,
-                "The running server still accepts the old admin password and rejects the new one",
-            )
-        );
+        println!("{}", running_service_warning(*pid, ADMIN_LIVE_STATE));
     } else {
         println!(
             "Administrative credentials successfully reset in '{}'.\nUsername: admin",
@@ -926,7 +963,13 @@ pub fn run_reset_sessions_with_options(
     })?;
 
     let data_dir = &config.server.data_dir;
-    let service = ensure_reset_allowed(data_dir, "reset sessions and API tokens", force)?;
+    // Keep the returned guard alive through the writes below.
+    let access = begin_reset(
+        data_dir,
+        "reset sessions and API tokens",
+        force,
+        SESSIONS_FORCE_HINT,
+    )?;
 
     let mut removed = 0;
     for name in ["sessions.toml", "tokens.toml"] {
@@ -950,17 +993,14 @@ pub fn run_reset_sessions_with_options(
             "No persisted sessions or tokens found in '{}'.",
             data_dir.display()
         );
-    } else if matches!(service, crate::service_lock::ServiceStatus::Running { .. }) {
+    } else if access.is_running() {
         println!("Persisted web sessions and API tokens were removed.");
     } else {
         println!("All web sessions and API tokens have been invalidated.");
     }
 
-    if let crate::service_lock::ServiceStatus::Running { pid } = service {
-        println!(
-            "{}",
-            running_service_warning(pid, "Existing web sessions and API tokens remain valid")
-        );
+    if let ResetAccess::Running { pid } = &access {
+        println!("{}", running_service_warning(*pid, SESSIONS_LIVE_STATE));
     }
     Ok(())
 }
@@ -1384,6 +1424,48 @@ mod tests {
             cli.command,
             Some(Commands::ResetSessions { force: false, .. })
         ));
+    }
+
+    /// The reset must own the service lease for its whole duration, so a
+    /// supervisor or `systemctl start` cannot slip a live server between the
+    /// run check and the disk writes.
+    #[test]
+    fn test_reset_holds_service_lease_until_access_is_dropped() {
+        let (dir, _config_path) = reset_admin_fixture();
+        let access = begin_reset(&dir, "test reset", false, SESSIONS_FORCE_HINT)
+            .expect("stopped service must be allowed");
+        assert!(matches!(access, ResetAccess::Stopped { .. }));
+
+        let err = crate::service_lock::ServiceLease::acquire(&dir)
+            .expect_err("a server must not start while a reset holds the lease");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        drop(access);
+        drop(
+            crate::service_lock::ServiceLease::acquire(&dir)
+                .expect("lease must be released when the reset ends"),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_begin_reset_refuses_or_forces_live_service() {
+        let (dir, _config_path) = reset_admin_fixture();
+        let lease = crate::service_lock::ServiceLease::acquire(&dir).unwrap();
+
+        let err = begin_reset(&dir, "test reset", false, SESSIONS_FORCE_HINT)
+            .expect_err("a live service must be refused without --force");
+        let message = err.to_string();
+        assert!(message.contains("live sessions and API tokens remain valid"));
+
+        let access = begin_reset(&dir, "test reset", true, ADMIN_FORCE_HINT)
+            .expect("--force must allow a live service");
+        assert!(access.is_running());
+
+        drop(access);
+        drop(lease);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
