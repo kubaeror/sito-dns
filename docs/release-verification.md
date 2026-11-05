@@ -159,12 +159,21 @@ Expected: `latest rule: 0`.
 
 ### 6. GitHub release state
 
+`isPrerelease` is available from `gh release view`, but `isLatest` is not; the
+latest-release pointer must be read from `gh release list`.
+
 ```bash
-gh release view "${RELEASE_TAG}" --json tagName,isPrerelease,isLatest
+gh release view "${RELEASE_TAG}" --json tagName,isPrerelease
+gh release list --limit 100 --json tagName,isLatest \
+  --jq '.[] | select(.isLatest) | .tagName'
 ```
 
-Expected for a stable tag: `"isPrerelease": false` and `"isLatest": true`.
-Expected for a prerelease tag: `"isPrerelease": true` and `"isLatest": false`.
+Expected for a stable tag: `gh release view` prints
+`{"isPrerelease":false,"tagName":"vX.Y.Z"}` and the `gh release list` command
+prints the same tag (`vX.Y.Z`). Expected for a prerelease tag: `gh release view`
+prints `{"isPrerelease":true,"tagName":"vX.Y.Z-<suffix>"}` and `gh release list`
+prints the previous stable tag (for example `vX.Y.<Z-1>`), never the prerelease
+tag. If no release is marked latest, the list command prints nothing.
 
 ## Verify the signed release assets
 
