@@ -130,6 +130,16 @@ fn canonical_config_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Compares two sanitized bundle documents semantically, falling back to byte
+/// comparison when either side is not valid TOML. Used at master startup to
+/// decide whether `config.toml` still matches the persisted bundle.
+fn sanitized_configs_equal(a: &str, b: &str) -> bool {
+    match (a.parse::<toml::Table>(), b.parse::<toml::Table>()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// Builds one protocol's hot-reloadable TLS acceptor and starts its certificate
 /// watcher. Returns `None` (with a warning) when the certificate material cannot
 /// be loaded, matching the previous per-protocol behaviour.
@@ -285,13 +295,18 @@ fn init_ha(
 
         let initial_toml = std::fs::read_to_string(config_path)
             .unwrap_or_else(|_| toml::to_string_pretty(config).unwrap_or_default());
-        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&initial_toml).unwrap_or_default();
+        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&initial_toml).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to sanitize '{}' for the HA bundle: {e}",
+                config_path.display()
+            )
+        })?;
         if let Some(ref token) = ha_config.slave_token
             && let Err(e) = sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])
         {
             anyhow::bail!("Refusing to publish HA bundle with a leaked secret: {e}");
         }
-        let list_metadata = config
+        let list_metadata: Vec<sito_ha::FilterListMetadata> = config
             .filtering
             .lists
             .iter()
@@ -303,25 +318,59 @@ fn init_ha(
             })
             .collect();
 
-        if restored_version.is_none() {
+        // Runs on every startup and on an explicit reconciliation: the bundle
+        // is always built from the configuration currently on disk.
+        let build_bundle = |version: u64| -> sito_ha::ConfigBundle {
             #[allow(clippy::cast_sign_loss)]
-            let initial_bundle = sito_ha::ConfigBundle {
-                version: 1,
+            sito_ha::ConfigBundle {
+                version,
                 term: coordinator.get_current_term(),
                 timestamp: chrono::Utc::now().timestamp_millis() as u64,
-                config_toml: sanitized_toml,
+                config_toml: sanitized_toml.clone(),
                 custom_rules: config.filtering.custom_rules.clone(),
                 rewrites: config.rewrites.clone(),
                 clients: config.clients.clone(),
-                lists: list_metadata,
-            };
-            coordinator.update_bundle(initial_bundle)?;
-            info!("Published initial HA configuration bundle version 1");
+                lists: list_metadata.clone(),
+            }
+        };
+
+        if let Some(restored_version) = restored_version {
+            // A restart must never resume a bundle that no longer matches the
+            // current `config.toml`: slaves would stay on the old shared
+            // configuration indefinitely. Republish a fresh `N + 1` bundle
+            // whenever the sanitized document differs (semantically, so a
+            // formatting-only rewrite does not churn the sequence).
+            let restored_bundle = coordinator
+                .active_bundle
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|bundle| bundle.config_toml.clone());
+            let config_changed = restored_bundle
+                .as_deref()
+                .is_none_or(|restored| !sanitized_configs_equal(restored, &sanitized_toml));
+
+            if config_changed {
+                let next_version = restored_version.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Cannot reconcile the HA bundle: persisted version {restored_version} cannot advance"
+                    )
+                })?;
+                coordinator.update_bundle(build_bundle(next_version))?;
+                info!(
+                    version = next_version,
+                    previous_version = restored_version,
+                    "Republished HA configuration bundle because config.toml changed since the persisted bundle"
+                );
+            } else {
+                info!(
+                    version = restored_version,
+                    "Resumed HA configuration sequence from persisted state"
+                );
+            }
         } else {
-            info!(
-                version = restored_version.unwrap_or_default(),
-                "Resumed HA configuration sequence from persisted state"
-            );
+            coordinator.update_bundle(build_bundle(1))?;
+            info!("Published initial HA configuration bundle version 1");
         }
 
         // Spawn master replication listener if replication_port > 0
@@ -1981,6 +2030,91 @@ mod tests {
                 r#"sito_ha_startup_noop_total{role="master",reason="replication_disabled"} 1"#
             ),
             "the production startup path must expose the no-op: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: a master restart with a persisted `ha_state.toml` used to
+    /// resume the old bundle and never compare it with `config.toml`, leaving
+    /// every slave on stale configuration. A changed config must republish at
+    /// `N + 1`; an unchanged config must resume the existing sequence.
+    #[tokio::test]
+    async fn test_master_restart_republishes_changed_config() {
+        let dir =
+            std::env::temp_dir().join(format!("sito_init_ha_reconcile_{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+
+        let mut config = Config::default();
+        config.server.role = "master".to_string();
+        config.server.instance_name = "master-reconcile".to_string();
+        config.server.data_dir = dir.clone();
+        config.ha = None;
+        config.upstream.servers = vec!["1.1.1.1".to_string()];
+        std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+        let metrics = sito_stats::MetricsRegistry::new("1.9.0", "test");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let first = init_ha(&config, &config_path, &metrics, &shutdown_rx)
+            .expect("first master startup must publish v1");
+        let first_coordinator = first.coordinator.expect("master coordinator");
+        assert_eq!(
+            first_coordinator.current_version.load(Ordering::SeqCst),
+            1,
+            "a fresh master must start at version 1"
+        );
+        drop(first_coordinator);
+
+        // Restarting with an unchanged config must not churn the sequence.
+        let unchanged = init_ha(&config, &config_path, &metrics, &shutdown_rx)
+            .expect("unchanged restart must succeed");
+        let unchanged_coordinator = unchanged.coordinator.expect("master coordinator");
+        assert_eq!(
+            unchanged_coordinator.current_version.load(Ordering::SeqCst),
+            1,
+            "an unchanged config must resume the persisted version"
+        );
+        let unchanged_bundle = unchanged_coordinator
+            .active_bundle
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("restored bundle");
+        assert!(
+            unchanged_bundle.config_toml.contains("1.1.1.1"),
+            "an unchanged restart must keep the persisted bundle"
+        );
+        drop(unchanged_coordinator);
+
+        // Editing the master config and restarting must publish N + 1 so
+        // connected slaves pick up the new shared configuration.
+        config.upstream.servers = vec!["9.9.9.9".to_string()];
+        std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        let changed = init_ha(&config, &config_path, &metrics, &shutdown_rx)
+            .expect("changed restart must republish the bundle");
+        let changed_coordinator = changed.coordinator.expect("master coordinator");
+        assert_eq!(
+            changed_coordinator.current_version.load(Ordering::SeqCst),
+            2,
+            "a changed config must republish at N + 1"
+        );
+        let changed_bundle = changed_coordinator
+            .active_bundle
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("republished bundle");
+        assert!(
+            changed_bundle.config_toml.contains("9.9.9.9"),
+            "the republished bundle must carry the current config: {}",
+            changed_bundle.config_toml
+        );
+        assert!(
+            !changed_bundle.config_toml.contains("1.1.1.1"),
+            "the republished bundle must not carry the stale config: {}",
+            changed_bundle.config_toml
         );
 
         let _ = std::fs::remove_dir_all(&dir);

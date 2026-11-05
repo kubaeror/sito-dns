@@ -8,6 +8,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **HA master restarts reconcile `config.toml`**: a master that restarts with a
+  persisted `ha_state.toml` now compares the sanitized current configuration
+  with the stored bundle (semantically) and republishes at `N + 1` when they
+  differ. Previously it resumed the old bundle and never pushed the edited
+  configuration, leaving every slave on stale settings indefinitely. An
+  unchanged configuration still resumes the existing sequence without churn.
 - **HA peer version bounds (security)**: an authenticated replica can no longer
   freeze publishing by reporting `u64::MAX` (or any implausibly high
   `have_version`/ACK version). The master rejects Hello values more than
