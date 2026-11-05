@@ -41,6 +41,12 @@ fn decode_owner_hash(owner: &Name) -> Option<Vec<u8>> {
 }
 
 fn hash_name(record: &Nsec3Record<'_>, name: &Name) -> Option<Vec<u8>> {
+    // RFC 9276: never hash a name more than MAX_ITERATIONS times. This check
+    // lives here (not only in `evaluate_nsec3_denial`) because `matches` and
+    // `covers` are also called from the DS-status paths without a pre-filter.
+    if record.rdata.iterations() > MAX_ITERATIONS {
+        return None;
+    }
     let digest = record
         .rdata
         .hash_algorithm()
@@ -364,6 +370,68 @@ mod tests {
                 "iterations={iterations}"
             );
         }
+    }
+
+    /// `matches`/`covers` are also reachable from paths that do not pre-filter
+    /// on `MAX_ITERATIONS` (the DS-status NSEC3 branches). They must enforce
+    /// the RFC 9276 cap themselves instead of hashing the name 65535 times.
+    #[test]
+    fn test_iterations_above_cap_disable_matches_and_covers() {
+        let zone = Name::from_ascii("example.").unwrap();
+        let qname = Name::from_ascii("capped.example.").unwrap();
+        let iterations = 65535;
+        // Computing this hash here is a single deliberate cost; the point is
+        // that validation must never perform it for an over-cap record.
+        let qname_hash = Nsec3HashAlgorithm::SHA1
+            .hash(&[], &qname, iterations)
+            .unwrap()
+            .as_ref()
+            .to_vec();
+
+        let exact_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            iterations,
+            Vec::new(),
+            increment(&qname_hash),
+            [RecordType::SOA, RecordType::RRSIG],
+        );
+        let exact_label = BASE32_DNSSEC.encode(&qname_hash);
+        let exact_owner = Name::from_ascii(format!("{exact_label}.{}", zone.to_ascii())).unwrap();
+        let exact = Nsec3Record {
+            owner: &exact_owner,
+            rdata: &exact_rdata,
+        };
+        assert!(
+            !matches(&exact, &qname),
+            "an over-cap NSEC3 must never match"
+        );
+
+        let covering_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            iterations,
+            Vec::new(),
+            increment(&qname_hash),
+            [RecordType::SOA, RecordType::RRSIG],
+        );
+        let covering_label = BASE32_DNSSEC.encode(&decrement(&qname_hash));
+        let covering_owner =
+            Name::from_ascii(format!("{covering_label}.{}", zone.to_ascii())).unwrap();
+        let covering = Nsec3Record {
+            owner: &covering_owner,
+            rdata: &covering_rdata,
+        };
+        assert!(
+            !covers(&covering, &qname),
+            "an over-cap NSEC3 must never cover"
+        );
+
+        assert_eq!(
+            evaluate_nsec3_denial(&[exact], &qname, RecordType::A, false),
+            Nsec3Denial::Incomplete,
+            "the exact-match/opt-out denial path must ignore over-cap records"
+        );
     }
 
     fn decrement(bytes: &[u8]) -> Vec<u8> {
