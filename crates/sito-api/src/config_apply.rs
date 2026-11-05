@@ -585,8 +585,16 @@ pub fn restart_required_fields(old: &Config, new: &Config) -> Vec<String> {
         "server.log_format",
         &mut fields,
     );
-    // [auth] sessions/token policy is read once at startup.
-    mark(old.auth != new.auth, "auth", &mut fields);
+    // [auth] sessions/token policy is read once at startup. Compare the
+    // effective typed policy, not the raw TOML: an explicitly configured
+    // default (`[auth]` with the default values) is equivalent to omitting the
+    // section, and HA sanitization strips inert legacy keys such as
+    // `admin_password_hash`/`tokens` from the replicated table.
+    mark(
+        old.get_auth_config() != new.get_auth_config(),
+        "auth",
+        &mut fields,
+    );
     // Only the admin listener's enabled/bind/port are bound at startup;
     // `web.trusted_proxies`, `web.metrics_auth`, `web.public_url` and
     // `web.tls_terminated_by_proxy` are read per request and hot-applied.
@@ -939,6 +947,66 @@ mod tests {
             restart_required_fields(&old, &new2).is_empty(),
             "changing only the DoH hostname must not require a restart: {:?}",
             restart_required_fields(&old, &new2)
+        );
+    }
+
+    /// Regression: `[auth]` was compared as raw TOML, so a master that spells
+    /// out the default policy (or carries inert legacy keys) was treated as a
+    /// restart-only change against a slave that omits `[auth]`. That made
+    /// every push fail with `restart_required: auth`. Only a real effective
+    /// policy difference may require a restart.
+    #[test]
+    fn test_restart_auth_compares_effective_policy_not_raw_toml() {
+        let without_auth = Config::default();
+
+        let mut with_default_auth = without_auth.clone();
+        with_default_auth.auth = Some(
+            toml::from_str(
+                r#"
+                session_ttl_hours = 24
+                login_rate_limit = 5
+                session_persist = true
+                token_default_ttl_days = 90
+                "#,
+            )
+            .unwrap(),
+        );
+        assert!(
+            restart_required_fields(&without_auth, &with_default_auth).is_empty(),
+            "explicit defaults must be equivalent to omitting [auth]: {:?}",
+            restart_required_fields(&without_auth, &with_default_auth)
+        );
+        assert!(
+            restart_required_fields(&with_default_auth, &without_auth).is_empty(),
+            "removing an explicit-default [auth] must not require a restart: {:?}",
+            restart_required_fields(&with_default_auth, &without_auth)
+        );
+
+        // Sanitization strips these inert legacy keys from replicated bundles;
+        // their presence must not look like a policy change either.
+        let mut legacy_auth = without_auth.clone();
+        legacy_auth.auth = Some(
+            toml::from_str(
+                r#"
+                admin_password_hash = "$argon2id$legacy"
+                tokens = ["legacy-token"]
+                "#,
+            )
+            .unwrap(),
+        );
+        assert!(
+            restart_required_fields(&without_auth, &legacy_auth).is_empty(),
+            "inert legacy [auth] keys must not require a restart: {:?}",
+            restart_required_fields(&without_auth, &legacy_auth)
+        );
+
+        // A genuine policy change still needs a restart.
+        let mut changed_policy = without_auth.clone();
+        changed_policy.auth = Some(toml::from_str("session_ttl_hours = 1").unwrap());
+        let fields = restart_required_fields(&without_auth, &changed_policy);
+        assert!(
+            fields.iter().any(|field| field == "auth"),
+            "a real [auth] policy change must be reported: {fields:?}"
         );
     }
 

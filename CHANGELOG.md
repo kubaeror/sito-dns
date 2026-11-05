@@ -8,6 +8,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **HA compares effective `[auth]` policy, not raw TOML**: an `[auth]` table
+  that spells out the default values (as `config.example.toml` does) is now
+  equivalent to omitting the section, and inert legacy keys stripped during
+  bundle sanitization no longer look like a restart-only change. Previously
+  the documented master example plus the minimal slave template produced
+  `restart_required: auth` on every push and left the slave permanently
+  `Degraded`. A genuine policy change such as `session_ttl_hours` is still
+  rejected until a coordinated restart.
 - **HA restart-only changes are rejected, not ACKed as applied**: a push that
   changes a restart-only field which is not node-local (for example
   `server.log_format` or `[auth]`) now fails before anything is applied or

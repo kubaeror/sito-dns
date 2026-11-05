@@ -443,6 +443,12 @@ file, enters `Degraded`, and ACKs `applied: false` with a `restart_required`
 reason naming the fields. Restart the slave with the intended configuration (or
 change those fields locally) before expecting the master to report it synced.
 
+`[auth]` is compared as effective policy: an explicit table containing the
+default values is equivalent to omitting `[auth]`, and legacy keys already
+stripped from replicated bundles (`admin_password_hash`, `tokens`) do not count
+as changes. Non-default `session_ttl_hours`, `login_rate_limit`,
+`session_persist` or `token_default_ttl_days` still require a restart.
+
 Cluster terms are node-persisted, not configuration keys: the master stores the
 current term inside `ha_state.toml` and only an explicit promotion (editing the
 state file and restarting, see `docs/runbook-ha.md`) raises it. A promotion must

@@ -1215,6 +1215,125 @@ servers = ["9.9.9.9"]
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+/// Regression: an explicit `[auth]` table with the default policy must be
+/// equivalent to omitting it. The shipped master example spells the defaults
+/// out while the runbook's minimal slave has no `[auth]`; before the fix every
+/// such push was rejected with `restart_required: auth`. A genuine policy
+/// change must still be rejected.
+#[tokio::test]
+async fn test_m8_push_default_auth_policy_is_not_rejected() {
+    let signing_key = Ed25519SigningKey::generate().unwrap();
+    let (ctx, _token, temp_dir) = create_test_context("slave", None, None, None).await;
+
+    let hooks = Arc::new(RecordingDnssecHooks {
+        validator: Arc::new(ArcSwap::from_pointee(
+            sito_dnssec::DnssecValidator::from_config(&Config::default().dns.dnssec),
+        )),
+        observed_nta: Arc::new(Mutex::new(Vec::new())),
+    });
+    let applier = Arc::new(sito::server::HaConfigApplier::new(
+        ctx.clone(),
+        hooks.clone(),
+    ));
+    applier.mark_listeners_ready();
+
+    let tracker = SlaveStatusTracker::new("slave-default-auth".to_string(), 0, None);
+    let handles = SlaveAppHandles {
+        runtime: ctx.runtime.clone(),
+        filter: ctx.filter.clone(),
+        metrics: ctx.metrics.clone(),
+        config_path: Some(ctx.config_path.clone()),
+        applier,
+    };
+
+    // Master example: explicit `[auth]` with exactly the default values.
+    // Slave: no `[auth]` section at all.
+    let default_auth_toml = r#"
+config_version = 1
+
+[server]
+role = "slave"
+
+[auth]
+session_ttl_hours = 24
+login_rate_limit = 5
+session_persist = true
+token_default_ttl_days = 90
+
+[upstream]
+servers = ["9.9.9.9"]
+"#;
+    let push = build_and_sign_push(
+        &ConfigBundle {
+            version: 2,
+            term: 0,
+            timestamp: 1,
+            config_toml: default_auth_toml.to_string(),
+            custom_rules: vec![],
+            rewrites: None,
+            clients: None,
+            lists: vec![],
+        },
+        &signing_key,
+    )
+    .unwrap();
+
+    let applied =
+        sito_ha::apply_config_push(&push, &tracker, &handles, signing_key.public_key().as_ref())
+            .await
+            .expect("an explicit-default [auth] must not be treated as restart-only");
+    assert_eq!(applied, 2);
+    assert_eq!(tracker.get_state(), SlaveState::Synced);
+    assert_eq!(tracker.get_version(), 2);
+
+    // A real policy change is still a restart-only difference and must not be
+    // acknowledged as applied.
+    let config_before = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
+    let changed_policy_toml =
+        default_auth_toml.replace("session_ttl_hours = 24", "session_ttl_hours = 1");
+    let push = build_and_sign_push(
+        &ConfigBundle {
+            version: 3,
+            term: 0,
+            timestamp: 2,
+            config_toml: changed_policy_toml,
+            custom_rules: vec![],
+            rewrites: None,
+            clients: None,
+            lists: vec![],
+        },
+        &signing_key,
+    )
+    .unwrap();
+
+    let err =
+        sito_ha::apply_config_push(&push, &tracker, &handles, signing_key.public_key().as_ref())
+            .await
+            .expect_err("a real [auth] policy change must still require a restart");
+    let message = err.to_string();
+    assert!(
+        message.contains("restart_required"),
+        "the rejection must identify the restart-only change: {message}"
+    );
+    assert!(
+        message.contains("auth"),
+        "the rejection must name the [auth] section: {message}"
+    );
+    assert_eq!(tracker.get_state(), SlaveState::Degraded);
+    assert_eq!(
+        tracker.get_version(),
+        2,
+        "the watermark must not advance for the rejected policy change"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+        config_before,
+        "the persisted file must keep the previously applied policy"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 /// D-01 startup-order regression: a push that arrives before the DNS listener
 /// generation and rate limiters exist is refused (so the worker ACKs
 /// `applied:false` and retries) instead of being applied and persisted with
