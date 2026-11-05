@@ -147,7 +147,22 @@ Open **`http://<server-ip>:8080`** in any browser to launch the 6-section config
 * **Filtering:** Choose blocking modes, enable CNAME cloaking defense, and subscribe to popular blocklists (OISD, StevenBlack, HaGeZi).
 * **Web Panel & Statistics:** Configure web bind and retention policies.
 
-While setup is pending, the server prints a one-time setup token to the console. Open `/wizard?setup_token=<token>` (or send the `X-Setup-Token` header). Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` credential. If credentials are lost, `sito reset-admin` generates a new random password and prints it once; it preserves non-admin accounts unless `--reset-all` is passed.
+While setup is pending, the server prints a one-time setup token to the console. Open `/wizard?setup_token=<token>` (or send the `X-Setup-Token` header). Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` credential.
+
+If credentials are lost, stop the service, reset the admin account, then start it
+again:
+
+```bash
+sudo systemctl stop sito
+sudo sito reset-admin --config /etc/sito/config.toml   # prints a generated password once
+sudo systemctl start sito
+```
+
+`reset-admin` preserves non-admin accounts unless `--reset-all` is passed. The
+reset commands refuse to run while a server holds the data directory. `--force`
+writes the change to disk anyway, but the running server keeps its in-memory
+state: existing sessions/tokens stay valid and the new admin password does not
+take effect until the service is restarted.
 
 Once setup is submitted, DNS listeners are bound in-process without needing a server restart.
 

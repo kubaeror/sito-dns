@@ -340,19 +340,25 @@ sito --config /etc/sito/config.toml healthcheck --setup-fallback
 
 Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard. While setup is pending the server prints a one-time setup token to the console; open `http://<host-ip>:8080/wizard?setup_token=<token>` or send the `X-Setup-Token` header. Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` already exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` account.
 
-If the wizard is skipped with `--no-setup`, a random administrator password is generated and printed once, and the panel binds to loopback. If credentials are lost later, run:
+If the wizard is skipped with `--no-setup`, a random administrator password is generated and printed once, and the panel binds to loopback. If credentials are lost later, stop the service so the running process cannot keep serving the old credentials, reset the account, then start it again:
 
 ```bash
+sudo systemctl stop sito
+
 # Generate a new random password and print it once:
 sudo sito --config /etc/sito/config.toml reset-admin
 
 # Or supply your own strong password (same policy as the wizard/API):
 sudo sito --config /etc/sito/config.toml reset-admin --password '<new-password>'
+
+sudo systemctl start sito
 ```
 
 `reset-admin` preserves other accounts. Add `--reset-all` (alias
 `--reset-users`) only when you explicitly want to remove every non-admin
-account.
+account. The reset commands refuse to run while the service holds
+`<data_dir>/sito.pid`; `--force` only updates the on-disk state and requires a
+restart before the new password or session revocation takes effect.
 
 ---
 

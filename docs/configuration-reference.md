@@ -318,8 +318,18 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 | `web.trusted_proxies`| array of IP addresses | `[]` | Individual proxy IPs trusted to supply `X-Forwarded-For`/`X-Forwarded-Proto` (CIDR is **not** supported here). |
 | `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required (must be ≥ 1). |
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
-| `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL; corrupt stores are backed up and start empty. Use `sito reset-sessions` to invalidate everything. |
+| `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL; corrupt stores are backed up and start empty. Stop the service before `sito reset-sessions`; the reset refuses to run against a live server unless `--force` is given. |
 | `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
+
+The running server holds an exclusive advisory lease on `<data_dir>/sito.pid`
+and keeps users, sessions, API tokens and the auth generation in memory.
+`sito reset-sessions` and `sito reset-admin` inspect that lease and refuse to
+run while it is held, because a file-only reset would not revoke live
+credentials. Stop the service (`sudo systemctl stop sito`), run the reset, then
+start it (`sudo systemctl start sito`). `--force` performs the on-disk reset
+while the server runs and warns that live sessions/tokens and any new admin
+password take effect only after a restart. A leftover `sito.pid` from a crash is
+harmless: only the lock, not the file's existence, marks the service as running.
 
 Accounts are stored in `<data_dir>/users.toml` (0600). TOTP secrets are
 encrypted at rest with AES-256-GCM using `<data_dir>/totp.key` (0600, created
@@ -334,10 +344,12 @@ While a first-boot setup token is active, or `users.toml` still contains the
 bootstrap `admin` / `adminadmin` credential, the HTTP middleware disables login,
 token authentication and every non-wizard API/UI route. Only `/wizard`,
 `/ui/wizard/*`, static assets, `/health` and `/status` remain reachable. On an
-already-configured deployment this state is recovered with `sito reset-admin`:
-without `--password` it generates a new random password and prints it once,
-supplied passwords must pass the shared policy, and non-admin accounts are
-preserved unless `--reset-all` is given.
+already-configured deployment this state is recovered by stopping the service
+and running `sito reset-admin` (then starting it again): without `--password` it
+generates a new random password and prints it once, supplied passwords must pass
+the shared policy, and non-admin accounts are preserved unless `--reset-all` is
+given. The command refuses to run while the service lease is held unless
+`--force` is passed.
 
 Two additional `[web]` keys are read from the raw table:
 

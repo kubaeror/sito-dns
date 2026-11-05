@@ -8,6 +8,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
+- **Reset commands no longer claim live revocation**: the server now holds an
+  exclusive lease on `<data_dir>/sito.pid`. `sito reset-sessions` and
+  `sito reset-admin` refuse to run while that lease is held, because the running
+  process keeps users, sessions, API tokens and the auth generation in memory.
+  The documented recovery sequence is `systemctl stop sito` → reset →
+  `systemctl start sito`. `--force` performs the on-disk reset anyway and prints
+  a warning that existing sessions/tokens remain valid and a new admin password
+  is not accepted until the service is restarted. A stale `sito.pid` from a
+  crash does not block resets; only the live lock does.
 - **First-boot login gating (P0)**: with `config.toml` present but
   `users.toml` still holding the bootstrap `admin/adminadmin`, the setup token
   was active while `setup_pending` was false. The default password could log in
