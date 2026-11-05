@@ -459,6 +459,15 @@ impl DnsCache {
         let mut authority_ttls = Vec::new();
         let mut additional_ttls = Vec::new();
 
+        // `min_ttl` is a floor for *unvalidated* data. Raising a Secure entry
+        // would let an AD=1 answer outlive the TTL/RRSIG validity that
+        // authenticated it (RFC 4035 §5.3.3).
+        let ttl_floor = if validation_status.is_secure() {
+            0
+        } else {
+            config.min_ttl
+        };
+
         let max_lifespan_secs = if is_negative {
             // RFC 2308 requires a SOA record owned by an ancestor of the query
             // name (or of a CNAME target on the chain) to derive the negative
@@ -472,8 +481,7 @@ impl DnsCache {
                 );
                 return;
             };
-            let clamped_ttl =
-                soa_ttl.clamp(config.min_ttl, config.negative_ttl_max.max(config.min_ttl));
+            let clamped_ttl = soa_ttl.clamp(ttl_floor, config.negative_ttl_max.max(config.min_ttl));
             // RFC 2308: the negative answer must never outlive the CNAME chain
             // that led to it. Otherwise the cached NODATA/NXDOMAIN would keep
             // being served after the alias TTL expired.
@@ -494,19 +502,19 @@ impl DnsCache {
             let effective_max_ttl = config.max_ttl.max(config.min_ttl);
 
             for ans in &response.answers {
-                let clamped = ans.ttl.clamp(config.min_ttl, effective_max_ttl);
+                let clamped = ans.ttl.clamp(ttl_floor, effective_max_ttl);
                 answer_ttls.push(clamped);
                 min_record_ttl = min_record_ttl.min(clamped);
             }
 
             for auth in &response.authorities {
-                let clamped = auth.ttl.clamp(config.min_ttl, effective_max_ttl);
+                let clamped = auth.ttl.clamp(ttl_floor, effective_max_ttl);
                 authority_ttls.push(clamped);
                 min_record_ttl = min_record_ttl.min(clamped);
             }
 
             for add in &response.additionals {
-                let clamped = add.ttl.clamp(config.min_ttl, effective_max_ttl);
+                let clamped = add.ttl.clamp(ttl_floor, effective_max_ttl);
                 additional_ttls.push(clamped);
                 min_record_ttl = min_record_ttl.min(clamped);
             }

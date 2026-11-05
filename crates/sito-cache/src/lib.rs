@@ -409,6 +409,50 @@ mod tests {
         assert_eq!(status, ValidationStatus::Secure);
     }
 
+    /// `min_ttl` is a cache policy floor for unvalidated data only. Raising a
+    /// `Secure` TTL above the RRSIG-authenticated TTL would serve AD=1 data
+    /// after its signature/TTL expired.
+    #[tokio::test]
+    async fn test_secure_ttl_is_not_raised_to_min_ttl() {
+        let config = make_test_config(60, 3600, 3600);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("secure-ttl.example.").unwrap();
+        let query = query_for(80, &qname);
+        let mut response = answer_response(80, &qname, [192, 0, 2, 80]);
+        response.answers[0].ttl = 10;
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Secure)
+            .await;
+
+        let (cached, status) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("cache hit");
+        assert_eq!(status, ValidationStatus::Secure);
+        assert_eq!(
+            cached.answers[0].ttl, 10,
+            "a Secure TTL must never be raised above its authenticated value"
+        );
+
+        // Unvalidated entries keep the existing min_ttl floor.
+        let other = Name::from_str("unchecked-ttl.example.").unwrap();
+        let other_query = query_for(81, &other);
+        let mut other_response = answer_response(81, &other, [192, 0, 2, 81]);
+        other_response.answers[0].ttl = 10;
+        cache
+            .insert_with_status(&other_query, &other_response, ValidationStatus::Unchecked)
+            .await;
+        let (cached, _) = cache
+            .get_for_query_with_status(&other_query)
+            .await
+            .expect("cache hit");
+        assert_eq!(
+            cached.answers[0].ttl, 60,
+            "unvalidated entries must still be clamped up to min_ttl"
+        );
+    }
+
     #[tokio::test]
     async fn test_serve_stale_fallback() {
         let mut config = make_test_config(1, 1, 300);
