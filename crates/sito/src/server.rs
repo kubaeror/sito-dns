@@ -894,6 +894,24 @@ pub async fn run_server_with_shutdown(
     run_server_full(config, config_path, custom_shutdown, false).await
 }
 
+/// Startup phases that expose different listeners. The admin UI starts even in
+/// setup-pending mode; DNS listeners start only after setup (or immediately in
+/// a normal boot), so their warning is emitted at that transition.
+#[derive(Clone, Copy)]
+enum ExposurePhase {
+    Startup,
+    DnsListeners,
+}
+
+/// Returns the exposure warnings relevant to a startup phase.
+fn exposure_warnings_for_phase(config: &Config, phase: ExposurePhase) -> Vec<String> {
+    let warning = match phase {
+        ExposurePhase::Startup => config.web_exposure_warning(),
+        ExposurePhase::DnsListeners => config.dns_exposure_warning(),
+    };
+    warning.into_iter().collect()
+}
+
 /// Runs the DNS server with custom config path, shutdown receiver, and setup-pending mode.
 pub async fn run_server_full(
     config: Config,
@@ -906,7 +924,7 @@ pub async fn run_server_full(
     // Make the historical wildcard defaults visible at startup. This is a
     // warning, not a refusal: existing Docker/quickstart configurations must
     // keep starting. 1.10.0 changes the defaults and is documented separately.
-    for warning in config.network_exposure_warnings() {
+    for warning in exposure_warnings_for_phase(&config, ExposurePhase::Startup) {
         warn!("NETWORK EXPOSURE: {warning}");
     }
 
@@ -1242,6 +1260,11 @@ pub async fn run_server_full(
                         doq: None,
                         doh3: None,
                     });
+                for warning in
+                    exposure_warnings_for_phase(&current_cfg, ExposurePhase::DnsListeners)
+                {
+                    warn!("NETWORK EXPOSURE: {warning}");
+                }
                 let manager = DnsListenerManager::start(
                     &current_cfg,
                     pipeline.clone(),
@@ -1284,6 +1307,9 @@ pub async fn run_server_full(
         // Start from the current configuration (the watcher may already have
         // applied a file change during startup), not the stale startup copy.
         let listener_config = config_arc.load();
+        for warning in exposure_warnings_for_phase(&listener_config, ExposurePhase::DnsListeners) {
+            warn!("NETWORK EXPOSURE: {warning}");
+        }
         let manager = DnsListenerManager::start(
             &listener_config,
             pipeline.clone(),
@@ -2185,5 +2211,41 @@ mod tests {
 
         drop(watchers);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: the DNS warning must not claim listeners exist during
+    /// setup-pending mode, and the post-wizard transition must use the
+    /// configuration the wizard actually wrote.
+    #[test]
+    fn test_exposure_warning_phases_suppress_dns_while_setup_pending() {
+        let default = Config::default();
+        let startup = exposure_warnings_for_phase(&default, ExposurePhase::Startup);
+        assert_eq!(
+            startup.len(),
+            1,
+            "setup-pending startup must warn only for the admin UI: {startup:?}"
+        );
+        assert!(startup[0].contains("admin web UI"));
+        assert!(
+            !startup.iter().any(|w| w.contains("DNS listeners")),
+            "DNS is not bound during setup-pending mode: {startup:?}"
+        );
+
+        let dns_starting = exposure_warnings_for_phase(&default, ExposurePhase::DnsListeners);
+        assert_eq!(
+            dns_starting.len(),
+            1,
+            "the DNS transition must emit exactly the DNS warning: {dns_starting:?}"
+        );
+        assert!(dns_starting[0].contains("DNS listeners"));
+
+        // The wizard may change dns.bind to loopback; the transition warning
+        // must use the then-current configuration, not the startup defaults.
+        let mut completed = Config::default();
+        completed.dns.bind = vec!["127.0.0.1".parse().expect("valid loopback")];
+        assert!(
+            exposure_warnings_for_phase(&completed, ExposurePhase::DnsListeners).is_empty(),
+            "a loopback DNS bind must not warn after setup completes"
+        );
     }
 }

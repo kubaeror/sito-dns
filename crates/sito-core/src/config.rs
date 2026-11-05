@@ -222,37 +222,57 @@ impl Config {
     /// names; they never include credentials, tokens or URL userinfo.
     #[must_use]
     pub fn network_exposure_warnings(&self) -> Vec<String> {
-        let mut warnings = Vec::new();
+        self.web_exposure_warning()
+            .into_iter()
+            .chain(self.dns_exposure_warning())
+            .collect()
+    }
 
+    /// Returns the admin-UI exposure warning, if the UI is reachable beyond
+    /// loopback over plain HTTP without a declared TLS reverse proxy.
+    ///
+    /// The caller emits this while the web listener is starting, regardless of
+    /// setup-pending state: the admin UI binds in both modes.
+    #[must_use]
+    pub fn web_exposure_warning(&self) -> Option<String> {
         // The admin UI is plain HTTP in-process. A declared TLS reverse proxy
         // is the operator's explicit acknowledgement that a proxy fronts it;
         // otherwise a non-loopback bind exposes credentials directly.
         let web = self.get_web_config();
-        if web.enabled && !web.bind.is_loopback() && !self.web_tls_declared() {
-            warnings.push(format!(
-                "admin web UI is reachable at {} over plain HTTP; credentials, session cookies and the first-boot setup token cross the network in cleartext. Set web.bind = \"127.0.0.1\" and use an SSH tunnel or a TLS reverse proxy, or restrict TCP {} to trusted clients with a host firewall",
-                SocketAddr::new(web.bind, web.port),
-                web.port
-            ));
+        if !web.enabled || web.bind.is_loopback() || self.web_tls_declared() {
+            return None;
         }
+        Some(format!(
+            "admin web UI is reachable at {} over plain HTTP; credentials, session cookies and the first-boot setup token cross the network in cleartext. Set web.bind = \"127.0.0.1\" and use an SSH tunnel or a TLS reverse proxy, or restrict TCP {} to trusted clients with a host firewall",
+            SocketAddr::new(web.bind, web.port),
+            web.port
+        ))
+    }
 
+    /// Returns the DNS exposure warning, if listeners are about to bind a
+    /// wildcard address without a client allow-list.
+    ///
+    /// Call this only when DNS listeners are actually starting: during
+    /// setup-pending mode no DNS port is bound, so emitting it there would be
+    /// false.
+    #[must_use]
+    pub fn dns_exposure_warning(&self) -> Option<String> {
         // sito has no DNS client allow-list: a wildcard bind accepts recursion
         // from every source. Rate limiting attenuates abuse, it does not
         // authorize clients.
-        if self.dns_listeners_exposed() {
-            let binds = self
-                .dns
-                .bind
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            warnings.push(format!(
-                "DNS listeners bind to {binds} and accept queries from any source; sito has no DNS client allow-list and rate limiting is not an access control. Restrict the DNS ports to your LAN with a host firewall or set dns.bind to specific LAN addresses"
-            ));
+        if !self.dns_listeners_exposed() {
+            return None;
         }
-
-        warnings
+        let binds = self
+            .dns
+            .bind
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "DNS listeners bind to {binds} and accept queries from any source; sito has no DNS client allow-list and rate limiting is not an access control. Restrict the DNS ports to your LAN with a host firewall or set dns.bind to specific LAN addresses"
+        ))
     }
 
     /// True when the configuration explicitly declares that the admin scheme

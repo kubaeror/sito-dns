@@ -14,7 +14,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   listener. A declared `https://` `web.public_url` (or
   `web.tls_terminated_by_proxy = true` when no public URL is set) marks a
   deliberate TLS reverse-proxy deployment; loopback binds and
-  `web.enabled = false` do not warn. The warnings contain only bind addresses
+  `web.enabled = false` do not warn. The DNS warning is emitted only when DNS
+  listeners actually start: it is suppressed during setup-pending mode and
+  re-evaluated against the configuration written by the wizard when the
+  listeners start. The warnings contain only bind addresses
   and ports, never credentials or tokens. Changing the default bind remains
   planned for 1.10.0; 1.9.2 keeps existing configurations working.
 - **`sito ha gen-certs --uid/--gid`**: the generator can transfer the generated
