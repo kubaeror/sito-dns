@@ -478,12 +478,26 @@ fn ensure_section<'a>(
         })
 }
 
+/// `[web]` keys whose values describe this node. The master's copies must
+/// never replace them: the admin listener is bound per host, and the proxy,
+/// metrics-auth and public-URL settings describe how this node is reached.
+const NODE_LOCAL_WEB_KEYS: [&str; 7] = [
+    "enabled",
+    "bind",
+    "port",
+    "trusted_proxies",
+    "metrics_auth",
+    "public_url",
+    "tls_terminated_by_proxy",
+];
+
 /// Restores the node-local listener, TLS and ACME identity into `pushed`.
 ///
-/// The master's `dns.bind` addresses, `web.bind`/`web.port`, certificate paths
-/// and ACME account/cache settings are local to the master node. A slave with
-/// different addresses would fail to bind (or expose the admin UI on the wrong
-/// interface) and its TLS material lives at different paths.
+/// The master's `dns.bind` addresses, the complete `[web]` identity,
+/// certificate paths and ACME account/cache settings are local to the master
+/// node. A slave with different addresses would fail to bind (or expose the
+/// admin UI on the wrong interface) and its TLS material lives at different
+/// paths.
 fn preserve_node_local_listener_config(
     pushed: &mut toml::Table,
     live: &Config,
@@ -529,18 +543,29 @@ fn preserve_node_local_listener_config(
     }
 
     // Only materialize `[web]` when either side declares it; a node that never
-    // configured it keeps using the built-in defaults.
+    // configured it keeps using the built-in defaults. Read the raw local
+    // table so keys that only exist in raw form (`public_url`,
+    // `tls_terminated_by_proxy`) survive as well. A key absent locally is
+    // removed instead of inherited so the slave's effective default applies;
+    // cluster-shared `[web]` keys (legacy `acme_*`) still come from the push.
     if pushed.contains_key("web") || live.web.is_some() {
-        let web_config = live.get_web_config();
+        let local_web = live
+            .web
+            .as_ref()
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
         let web = ensure_section(pushed, "web")?;
-        web.insert(
-            "bind".to_string(),
-            toml::Value::String(web_config.bind.to_string()),
-        );
-        web.insert(
-            "port".to_string(),
-            toml::Value::Integer(i64::from(web_config.port)),
-        );
+        for key in NODE_LOCAL_WEB_KEYS {
+            match local_web.get(key) {
+                Some(value) => {
+                    web.insert(key.to_string(), value.clone());
+                }
+                None => {
+                    web.remove(key);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -2021,6 +2046,114 @@ url = "https://192.168.9.9"
             Some("local-routeros-password"),
             "the RouterOS password must survive a push"
         );
+    }
+
+    /// Regression: a slave that disables the admin listener must not receive
+    /// the master's `web.enabled = true`. That false difference made the push
+    /// fail with `restart_required: web`, so the slave stayed `Degraded` and
+    /// replication never converged. The complete node-local web identity must
+    /// survive; only cluster-shared `[web]` keys (legacy ACME) follow the
+    /// master.
+    #[tokio::test]
+    async fn test_persisted_config_preserves_node_local_web_identity() {
+        let local = r#"
+config_version = 1
+
+[server]
+role = "slave"
+
+[web]
+enabled = false
+bind = "127.0.0.1"
+port = 8081
+trusted_proxies = ["10.0.0.2"]
+metrics_auth = false
+public_url = "https://slave.example"
+tls_terminated_by_proxy = true
+acme_enabled = true
+acme_email = "slave@example.com"
+acme_domains = ["slave.example"]
+"#;
+        let pushed = r#"
+config_version = 1
+
+[server]
+role = "slave"
+
+[web]
+enabled = true
+bind = "192.168.1.10"
+port = 80
+trusted_proxies = ["10.0.0.1"]
+metrics_auth = true
+public_url = "https://master.example"
+tls_terminated_by_proxy = false
+acme_enabled = false
+"#;
+
+        let live = Config::from_toml_str(local).expect("node-local config");
+        let bundle = test_bundle(2, pushed, None, None);
+        let merged = build_persisted_config(pushed, &bundle, None, &live, None)
+            .await
+            .expect("build persisted config");
+        let table: toml::Table = merged.parse().unwrap();
+        let web = table
+            .get("web")
+            .and_then(toml::Value::as_table)
+            .expect("[web] must be persisted");
+
+        assert_eq!(
+            web.get("enabled").and_then(toml::Value::as_bool),
+            Some(false),
+            "the slave must keep its own web.enabled: {merged}"
+        );
+        assert_eq!(
+            web.get("bind").and_then(toml::Value::as_str),
+            Some("127.0.0.1"),
+            "the slave must keep its own web.bind"
+        );
+        assert_eq!(
+            web.get("port").and_then(toml::Value::as_integer),
+            Some(8081),
+            "the slave must keep its own web.port"
+        );
+        assert_eq!(
+            web.get("trusted_proxies")
+                .and_then(toml::Value::as_array)
+                .map(|proxies| proxies
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<Vec<_>>()),
+            Some(vec!["10.0.0.2"]),
+            "the slave must keep its own web.trusted_proxies"
+        );
+        assert_eq!(
+            web.get("metrics_auth").and_then(toml::Value::as_bool),
+            Some(false),
+            "the slave must keep its own web.metrics_auth"
+        );
+        assert_eq!(
+            web.get("public_url").and_then(toml::Value::as_str),
+            Some("https://slave.example"),
+            "the slave must keep its own web.public_url"
+        );
+        assert_eq!(
+            web.get("tls_terminated_by_proxy")
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "the slave must keep its own web.tls_terminated_by_proxy"
+        );
+        assert_eq!(
+            web.get("acme_enabled").and_then(toml::Value::as_bool),
+            Some(false),
+            "cluster-shared [web] keys must still come from the master"
+        );
+
+        // The restart-only check compares the effective typed listener
+        // fields. `config_apply`'s regression test asserts the same pair does
+        // not report `web`.
+        let applied = Config::from_toml_str(&merged).expect("merged config");
+        assert_eq!(applied.get_web_config(), live.get_web_config());
     }
 
     /// A slave without certificate material must not inherit the master's TLS

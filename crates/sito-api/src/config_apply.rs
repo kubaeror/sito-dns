@@ -950,6 +950,67 @@ mod tests {
         );
     }
 
+    /// Regression: HA restores the slave's node-local `[web]` identity before
+    /// the restart check runs. A master with `web.enabled = true` (and its own
+    /// proxy/public-URL settings) must therefore not make a slave that
+    /// disabled the listener report `restart_required: web`. A genuine
+    /// listener-shape change on the slave still requires a restart.
+    #[test]
+    fn test_restart_web_ignores_preserved_node_local_identity() {
+        let live = Config::from_toml_str(
+            r#"
+config_version = 1
+
+[web]
+enabled = false
+bind = "127.0.0.1"
+port = 8081
+trusted_proxies = ["10.0.0.2"]
+metrics_auth = false
+public_url = "https://slave.example"
+tls_terminated_by_proxy = true
+"#,
+        )
+        .expect("live slave config");
+
+        // Document as produced by `build_persisted_config`: the live web
+        // identity is restored while the master's cluster-shared `[web]`
+        // keys survive.
+        let preserved = Config::from_toml_str(
+            r#"
+config_version = 1
+
+[web]
+enabled = false
+bind = "127.0.0.1"
+port = 8081
+trusted_proxies = ["10.0.0.2"]
+metrics_auth = false
+public_url = "https://slave.example"
+tls_terminated_by_proxy = true
+acme_enabled = false
+"#,
+        )
+        .expect("merged persisted config");
+
+        assert!(
+            restart_required_fields(&live, &preserved).is_empty(),
+            "preserved node-local web identity must not require a restart: {:?}",
+            restart_required_fields(&live, &preserved)
+        );
+
+        // Changing the actual listener shape locally still requires a restart.
+        let mut enabled = preserved.clone();
+        let mut web = enabled.get_web_config();
+        web.enabled = true;
+        enabled.set_web_config(web);
+        let fields = restart_required_fields(&live, &enabled);
+        assert!(
+            fields.iter().any(|field| field == "web"),
+            "a genuine web listener change must still be reported: {fields:?}"
+        );
+    }
+
     /// Regression: `[auth]` was compared as raw TOML, so a master that spells
     /// out the default policy (or carries inert legacy keys) was treated as a
     /// restart-only change against a slave that omits `[auth]`. That made

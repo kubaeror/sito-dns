@@ -47,8 +47,11 @@ still answers. The same visibility applies to a failed listener bind, a slave
 that cannot complete the handshake, and a slave that has not reached `Synced`.
 Readiness is read from the admin web listener, so keep `[web] enabled = true`
 (the default) on HA nodes; the healthcheck fails closed when HA is configured
-but the web listener cannot report readiness. The unauthenticated `/health`
-endpoint exposes only the generic ready flag; read `readiness_reason` on the
+but the web listener cannot report readiness. This readiness policy is
+independent of replication: HA preserves each node's node-local `[web]`
+identity, so a slave that disables the listener can still converge to `Synced`
+while the healthcheck reports not ready. The unauthenticated `/health` endpoint
+exposes only the generic ready flag; read `readiness_reason` on the
 authenticated `/api/v1/ha/status` endpoint (or the logs) for the detailed
 cause.
 
@@ -393,6 +396,13 @@ When a slave node fails or must be reprovisioned from bare metal:
    # Required when the master sets a slave_token (recommended)
    slave_token = "<SHARED_TOKEN>"
    ```
+
+   `[web]` is node-local identity, not a shared setting: the master does not
+   overwrite the slave's `enabled`, `bind`, `port`, `trusted_proxies`,
+   `metrics_auth`, `public_url` or `tls_terminated_by_proxy`. A slave may keep
+   `web.enabled = false` and still synchronize. The HA readiness healthcheck
+   still requires the admin web listener, so a slave with it disabled can be
+   `Synced` but reports not ready.
 4. **Register Slave Fingerprint on Master**:
    If the master enforces pinned fingerprints, add the new slave's certificate fingerprint to `pinned_slave_fingerprints` in `/etc/sito/config.toml` on the master.
 5. **Start Slave**:
@@ -421,7 +431,7 @@ When a slave node fails or must be reprovisioned from bare metal:
 | Symptom | Probable Cause | Action |
 |---|---|---|
 | Slave state is `Degraded` | Configuration apply failed, corrupted bundle, or an unresolvable `${SECRET:...}` placeholder | Check the service journal (`journalctl -u sito`) for `apply_config_push` errors. The slave keeps its last good snapshot and reports `Degraded`; fix the configuration on the master and re-push. The reason is exposed as `degraded_reason` in `GET /api/v1/ha/status`. |
-| Push rejected with `restart_required` | The master bundle changed a restart-only field that is not node-local (for example `server.log_format` or `[auth]`) | The slave kept its previous live configuration and file and ACKs `applied:false`. Restart the slave after setting the intended value locally, or change the shared setting only when a coordinated restart is acceptable. Node-local listener/TLS/web/MikroTik fields are preserved automatically and do not trigger this. |
+| Push rejected with `restart_required` | The master bundle changed a restart-only field that is not node-local (for example `server.log_format` or `[auth]`) | The slave kept its previous live configuration and file and ACKs `applied:false`. Restart the slave after setting the intended value locally, or change the shared setting only when a coordinated restart is acceptable. Node-local listener/TLS/`[web]`/MikroTik fields are preserved automatically and do not trigger this; web identity (including `enabled`) is node-local, so a slave may run with the admin listener disabled and still synchronize (the readiness healthcheck separately requires it). |
 | Slave state is `Connecting` in loop | Network unreachable, firewall blocking 8953, or mTLS handshake failed/timed out | Check `nc -zv 192.168.1.10 8953`. Check TLS certificate expiration or fingerprint mismatch in logs. `readiness_reason` carries the last connection/handshake error. |
 | `GET /api/v1/ha/status` reports `"ready": false` or the container healthcheck fails while DNS answers | The replication listener or slave worker is not operational: key/certificate unreadable by the runtime user, listener bind failure, or the slave has not reached `Synced` | Read `readiness_reason` and the service logs. Fixing certificate ownership (`chown sito:sito` or `65532:65532`, mode `0600`) and restarting restores the listener. A healthy DNS probe alone no longer marks the node healthy. |
 | Log says `Failed to initialize mTLS ... Permission denied` | Private key is owned by root or another user that the service account cannot read | Regenerate with `--uid/--gid` for the runtime user, or `chown` the key files; keep keys mode `0600`. |

@@ -462,11 +462,15 @@ is node-local and must not be copied between slaves.
 
 Replication preserves node-local identity. The master does not overwrite a
 slave's `dns.bind`, `[dns.tls]`/`[tls]` certificate paths, `[acme]` account and
-cache settings, `web.bind`/`web.port`, `[ha]`, `server.instance_name`,
-`server.data_dir`, `[integrations.mikrotik]` or `clients.client_id_secrets`.
-`dns.port` and the other listener ports are shared configuration; the runbook's
-master `bind = ["0.0.0.0", "::"]` and slave `bind = ["0.0.0.0"]` therefore
-coexist, including on hosts without IPv6.
+cache settings, the `[web]` admin identity (`enabled`, `bind`, `port`,
+`trusted_proxies`, `metrics_auth`, `public_url`, `tls_terminated_by_proxy`),
+`[ha]`, `server.instance_name`, `server.data_dir`,
+`[integrations.mikrotik]` or `clients.client_id_secrets`. Web identity is
+node-local: a slave may disable the admin listener or reach it through a
+different bind/proxy/URL than the master, and those differences do not make a
+push fail. `dns.port` and the other listener ports are shared configuration;
+the runbook's master `bind = ["0.0.0.0", "::"]` and slave
+`bind = ["0.0.0.0"]` therefore coexist, including on hosts without IPv6.
 
 If a push changes a restart-only field that is **not** preserved as node-local
 (for example `server.log_format` or `[auth]`), the slave rejects the push before
@@ -597,6 +601,15 @@ and `POST /api/v1/config/reload`.
 > (`enabled`/`bind`/`port`), `[tls]`, `[acme]`, `[ha]` and `[integrations]`.
 > Everything else applies live. Editing a config file also logs a warning for
 > restart-only changes (the watcher applies the rest).
+>
+> On HA slaves the master's `[web]` values are replaced with the node-local
+> ones before this check, so an intentional difference in web identity does
+> not produce `restart_required: web`. Changing a slave's own listener shape
+> still requires restarting that slave.
+>
+> The HA readiness healthcheck still requires the admin web listener. A slave
+> with `web.enabled = false` can replicate and become `Synced`, but it reports
+> not ready; this policy is unchanged.
 >
 > Same-transport port collisions are rejected at validation: `dns.dot_port`
 > with `dns.doh_port` (both TCP) and `dns.doq_port` with `dns.doh3_port` (both
