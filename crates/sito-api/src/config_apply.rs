@@ -446,6 +446,14 @@ async fn apply_inner(
         hooks.apply(cfg, &clients).await?;
     }
 
+    // A DNSSEC mode/validate/anchor/NTA change invalidates every cached
+    // validation decision. Without this, an entry validated under the old
+    // policy would keep being served (Secure with AD=1 after an anchor was
+    // removed, or Unchecked after validation was enabled).
+    if ctx.config.load().dns.dnssec != cfg.dns.dnssec {
+        ctx.cache.flush();
+    }
+
     // 4. Cache policy, query-log privacy and the coherent runtime snapshot.
     ctx.cache.update_config(cfg.dns.cache.clone()).await;
     ctx.querylog_sender
@@ -617,6 +625,71 @@ mod tests {
                 "target '{target}' must be accepted"
             );
         }
+    }
+
+    /// A DNSSEC policy change invalidates every cached validation decision:
+    /// an old Insecure/Unchecked entry must not outlive the policy that
+    /// produced it.
+    #[tokio::test]
+    async fn test_dnssec_policy_change_flushes_response_cache() {
+        use sito_proto::{
+            DNSClass, Message, MessageType, OpCode, Query, RData, Record, RecordType,
+        };
+
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_dnssec_flush");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        for (index, change) in ["mode", "trust_anchors", "nta"].into_iter().enumerate() {
+            let name = sito_proto::Name::from_ascii(format!("policy-{index}.example.")).unwrap();
+            let mut query = Message::new(
+                u16::try_from(index).unwrap() + 1,
+                MessageType::Query,
+                OpCode::Query,
+            );
+            query
+                .queries
+                .push(Query::query(name.clone(), RecordType::A));
+            let mut response = Message::response(query.metadata.id, OpCode::Query);
+            response.queries = query.queries.clone();
+            response.answers.push(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::A(sito_proto::rdata::A("192.0.2.200".parse().unwrap())),
+            ));
+            ctx.cache.insert(&query, &response).await;
+            assert!(
+                ctx.cache
+                    .get(&name, RecordType::A, DNSClass::IN)
+                    .await
+                    .is_some(),
+                "cache seed for {change} must succeed"
+            );
+
+            let mut candidate = (**ctx.config.load()).clone();
+            match change {
+                "mode" => candidate.dns.dnssec.mode = "disabled".to_string(),
+                "trust_anchors" => candidate
+                    .dns
+                    .dnssec
+                    .trust_anchors
+                    .push("example.:13:AQID".to_string()),
+                "nta" => candidate.dns.dnssec.nta.push("nta.example".to_string()),
+                other => panic!("unhandled policy change {other}"),
+            }
+            apply_full_config(&ctx, &candidate, FilterApply::Deferred, None)
+                .await
+                .unwrap();
+
+            assert!(
+                ctx.cache
+                    .get(&name, RecordType::A, DNSClass::IN)
+                    .await
+                    .is_none(),
+                "changing dnssec {change} must flush cached validation decisions"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// B regression: two rapid pushes end at the newer document (a stale event
