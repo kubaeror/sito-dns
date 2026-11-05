@@ -461,7 +461,9 @@ pub fn verify_and_unpack_push(
 /// is higher, because a term increase is the explicit promotion signal. Within
 /// the same term the version must advance; an equal version is accepted only
 /// when it is the same signed payload (idempotent re-delivery). A higher term
-/// is a new epoch and may (re)start the version sequence.
+/// is a new epoch, but it does **not** reset the sequence: the promoted version
+/// must also be above the applied watermark, so an explicit promotion raises
+/// both term and version.
 pub fn verify_and_unpack_push_with_watermark(
     push: &HaMessage,
     watermark: Option<&AppliedWatermark>,

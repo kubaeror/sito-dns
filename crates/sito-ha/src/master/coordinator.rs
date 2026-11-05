@@ -382,15 +382,6 @@ impl MasterCoordinator {
             .map(|d| d.reason.clone())
     }
 
-    /// Returns true when a same-version payload fork is latched.
-    fn has_fork_divergence(&self) -> bool {
-        self.diverged
-            .lock()
-            .unwrap()
-            .values()
-            .any(|d| d.kind == DivergenceKind::Fork)
-    }
-
     /// Records a divergence for one instance, keeping the most severe kind and
     /// version that instance reported.
     ///
@@ -423,21 +414,44 @@ impl MasterCoordinator {
         }
     }
 
-    /// Clears every divergence record and gauge after an explicit operator
-    /// resync/promotion.
+    /// Clears the advisory (non-fork) divergence records after an explicit
+    /// operator resync.
     ///
-    /// The slaves lock is taken first to match [`Self::unregister_session`]'s
-    /// lock order (slaves then diverged), so a concurrent disconnect cannot
-    /// leave a stale metric series behind.
-    fn clear_all_divergence(&self) {
+    /// A real same-version fork is not cleared here: re-pushing a stale active
+    /// bundle cannot resolve it. The fork record clears only when that slave
+    /// disconnects or successfully applies the current bundle after a
+    /// promotion/reconciliation.
+    fn clear_advisory_divergence(&self) {
         let slaves = self.slaves.lock().unwrap();
         let mut diverged = self.diverged.lock().unwrap();
-        for instance in diverged.keys() {
-            if slaves.contains_key(instance) {
-                self.metrics.set_ha_diverged(instance, false);
+        let cleared: Vec<String> = diverged
+            .iter()
+            .filter(|(_, d)| d.kind != DivergenceKind::Fork)
+            .map(|(instance, _)| instance.clone())
+            .collect();
+        for instance in cleared {
+            diverged.remove(&instance);
+            if slaves.contains_key(&instance) {
+                self.metrics.set_ha_diverged(&instance, false);
             }
         }
-        diverged.clear();
+    }
+
+    /// Clears one instance's *fork* divergence after it successfully applied
+    /// the master's current bundle/term.
+    ///
+    /// Advisory ahead/newer-term records stay sticky until an explicit resync
+    /// or disconnect: a same-term version advance by the same slave is not
+    /// proof that the earlier continuity condition is gone.
+    fn clear_divergence_for(&self, instance: &str) {
+        let slaves = self.slaves.lock().unwrap();
+        let mut diverged = self.diverged.lock().unwrap();
+        let is_fork = diverged
+            .get(instance)
+            .is_some_and(|d| d.kind == DivergenceKind::Fork);
+        if is_fork && diverged.remove(instance).is_some() && slaves.contains_key(instance) {
+            self.metrics.set_ha_diverged(instance, false);
+        }
     }
 
     /// Validates monotonicity, sanitizes and signs `bundle` without publishing
@@ -452,17 +466,6 @@ impl MasterCoordinator {
         // structured `clients` value is sanitized exactly like `config_toml`.
         let mut bundle = bundle;
         bundle.strip_structured_secrets();
-
-        // A same-version fork is a self-detected signal that this master's
-        // content disagrees with a slave at the same version. Do not publish
-        // over it: the operator must resolve the fork and explicitly resync.
-        if self.has_fork_divergence() {
-            return Err(HaError::Validation {
-                field: "divergence".to_string(),
-                reason: "Refusing to publish while a same-version payload fork is latched; resolve the fork and run an explicit resync/promotion"
-                    .to_string(),
-            });
-        }
 
         let version = bundle.version;
         let current = self.current_version.load(Ordering::SeqCst);
@@ -722,16 +725,19 @@ impl MasterCoordinator {
     /// Triggers a re-push of the current active configuration bundle to all slaves.
     /// Triggers a re-push of the current active configuration bundle to all slaves.
     ///
-    /// This is the explicit operator recovery action: it also clears every
-    /// sticky divergence latch so publishing may resume after the fork or
-    /// stale-master condition has been resolved out of band.
+    /// This is the explicit operator recovery action. It clears advisory
+    /// (ahead/newer-term) records only when a push was actually queued; a real
+    /// same-version fork is left latched until the slave accepts the current
+    /// bundle (after promotion/reconciliation) or disconnects.
     pub fn trigger_resync(&self) -> ResyncOutcome {
         let push_opt = self.active_push.lock().unwrap().clone();
         let slaves_notified = match push_opt {
             Some(ref push) => self.broadcast(push),
             None => 0,
         };
-        self.clear_all_divergence();
+        if push_opt.is_some() && slaves_notified > 0 {
+            self.clear_advisory_divergence();
+        }
         ResyncOutcome {
             version: self.get_current_version(),
             active_bundle: push_opt.is_some(),
@@ -1127,6 +1133,29 @@ impl MasterCoordinator {
         owned
     }
 
+    /// Returns true when the master's currently active push has exactly this
+    /// term and version.
+    ///
+    /// Used to bind a structured fork rejection to a push the master actually
+    /// sent: an authenticated peer cannot invent a fork for an arbitrary
+    /// (possibly huge) version.
+    fn active_push_matches(&self, term: u64, version: u64) -> bool {
+        self.active_push
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|push| {
+                matches!(
+                    push,
+                    HaMessage::ConfigPush {
+                        version: pushed_version,
+                        term: pushed_term,
+                        ..
+                    } if *pushed_version == version && *pushed_term == term
+                )
+            })
+    }
+
     fn process_slave_msg(&self, slave_instance: &str, connection_id: u64, text: &str) -> bool {
         let msg = match HaMessage::from_json(text) {
             Ok(m) => m,
@@ -1158,15 +1187,18 @@ impl MasterCoordinator {
 
                 let current = self.get_current_version();
                 let current_term = self.get_current_term();
-                if applied && version > current.saturating_add(MAX_PEER_VERSION_LEAD) {
+                if version > current.saturating_add(MAX_PEER_VERSION_LEAD) {
                     // Never use an implausible peer-driven version as a seed,
                     // a rebase input, or a persisted value. A single replica
                     // must not be able to freeze publishing with `u64::MAX`.
+                    // This applies to `applied:false` ACKs too: a forged
+                    // rejection must not carry an unbounded version.
                     error!(
                         instance = %slave_instance,
                         acked_version = version,
                         current,
                         max_lead = MAX_PEER_VERSION_LEAD,
+                        applied,
                         "Ignoring ACK with an implausible version"
                     );
                     return true;
@@ -1194,12 +1226,27 @@ impl MasterCoordinator {
 
                 if !applied {
                     if conflict == Some(AckConflict::SameVersionFork) {
+                        // Only a push the master actually sent can prove a
+                        // fork. Without this binding an authenticated replica
+                        // could latch a fabricated fork for any version and
+                        // (before publishing was decoupled) block the cluster.
+                        if !self.active_push_matches(term, version) {
+                            warn!(
+                                instance = %slave_instance,
+                                acked_version = version,
+                                acked_term = term,
+                                current,
+                                current_term,
+                                "Ignoring same-version fork ACK without a matching active push"
+                            );
+                            return true;
+                        }
                         // Same term and version but different content: this is
-                        // the fork signal. Latch it so the next version from the
-                        // forked master cannot silently win, and stop reporting
-                        // the slave as synced.
+                        // the fork signal. Record it so the slave is reported
+                        // unsynced and can never silently "win" the fork; this
+                        // does not stop publishing to other replicas.
                         let reason = format!(
-                            "slave '{slave_instance}' rejected term {term} version {version} with a same-version payload-hash fork: this master must not publish over the forked configuration until an explicit resync/promotion"
+                            "slave '{slave_instance}' rejected term {term} version {version} with a same-version payload-hash fork: resolve the fork or promote the slave"
                         );
                         error!(
                             instance = %slave_instance,
@@ -1266,6 +1313,10 @@ impl MasterCoordinator {
                     self.metrics
                         .set_ha_config_version(slave_instance, version as f64);
                     self.stale_repushes.lock().unwrap().remove(slave_instance);
+                    // This slave has accepted the current term/version, so a
+                    // real fork record for it is now resolved. Advisory
+                    // ahead/newer-term records stay sticky until resync.
+                    self.clear_divergence_for(slave_instance);
                 } else if version < current {
                     warn!(
                         instance = %slave_instance,
@@ -2543,7 +2594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fork_divergence_blocks_publishing_until_resync() {
+    async fn test_fork_divergence_does_not_block_publishing_and_clears_on_accept() {
         let coordinator = test_coordinator();
         coordinator.update_bundle(test_bundle(2)).unwrap();
 
@@ -2562,6 +2613,21 @@ mod tests {
                 connection_id: 1,
             },
         );
+        let (other_tx, mut other_rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "other-slave".to_string(),
+            ActiveSlave {
+                instance: "other-slave".to_string(),
+                remote_addr: "127.0.0.1:1001".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: other_tx,
+                capabilities: vec![],
+                connection_id: 2,
+            },
+        );
 
         let fork = HaMessage::Ack {
             version: 2,
@@ -2575,16 +2641,97 @@ mod tests {
         assert!(coordinator.process_slave_msg("forked-slave", 1, &fork));
         assert!(coordinator.diverged_reason().unwrap().contains("fork"));
 
-        let err = coordinator
-            .update_bundle(test_bundle(3))
-            .expect_err("publishing must stop while a fork is latched");
+        // One forked replica must not stop the master's sequence or the push
+        // to healthy replicas.
+        assert_eq!(coordinator.update_bundle(test_bundle(3)).unwrap(), 3);
+        match other_rx.try_recv().expect("healthy slave must receive v3") {
+            HaMessage::ConfigPush { version, term, .. } => {
+                assert_eq!(version, 3);
+                assert_eq!(term, 0);
+            }
+            other => panic!("expected ConfigPush, got {other:?}"),
+        }
+        assert!(coordinator.is_diverged(), "the fork stays visible");
+        let forked = coordinator
+            .list_slaves()
+            .into_iter()
+            .find(|s| s.instance == "forked-slave")
+            .unwrap();
+        assert!(forked.diverged, "the forked slave must stay unsynced");
+
+        // A resync does not fabricate recovery: it re-pushes the current
+        // bundle and keeps the real fork latch until the slave accepts it.
+        let outcome = coordinator.trigger_resync();
+        assert!(outcome.active_bundle);
         assert!(
-            matches!(err, HaError::Validation { ref field, .. } if field == "divergence"),
-            "unexpected error: {err:?}"
+            coordinator.is_diverged(),
+            "a resync must not clear a real fork latch"
         );
 
-        // Explicit operator resync clears the latch; publishing resumes.
-        assert_eq!(coordinator.trigger_resync().version, 2);
+        // Once the slave accepts the current bundle (after promotion or local
+        // reconciliation), its own latch clears.
+        let accepted = HaMessage::Ack {
+            version: 3,
+            term: 0,
+            applied: true,
+            conflict: None,
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("forked-slave", 1, &accepted));
+        assert!(!coordinator.is_diverged());
+    }
+
+    #[tokio::test]
+    async fn test_fabricated_fork_ack_without_matching_push_is_ignored() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx, _rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "liar-slave".to_string(),
+            ActiveSlave {
+                instance: "liar-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+
+        // No push was ever sent at version 999, so this cannot prove a fork.
+        let fabricated = HaMessage::Ack {
+            version: 999,
+            term: 0,
+            applied: false,
+            conflict: Some(AckConflict::SameVersionFork),
+            error: Some("fabricated".to_string()),
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("liar-slave", 1, &fabricated));
+        assert!(
+            !coordinator.is_diverged(),
+            "a fork ACK must be bound to a push the master sent"
+        );
+
+        // Even `u64::MAX` in an applied:false ACK is rejected before it can
+        // influence state, and publishing continues.
+        let huge = HaMessage::Ack {
+            version: u64::MAX,
+            term: 0,
+            applied: false,
+            conflict: Some(AckConflict::SameVersionFork),
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("liar-slave", 1, &huge));
         assert!(!coordinator.is_diverged());
         assert_eq!(coordinator.update_bundle(test_bundle(3)).unwrap(), 3);
     }

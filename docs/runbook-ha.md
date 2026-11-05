@@ -113,10 +113,12 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
    itself in `GET /api/v1/ha/status` with `"diverged": true` plus a
    `diverged_reason` and stops replicating, rather than republishing its stale
    bundle over newer configuration. Divergence is sticky until the slave
-   disconnects or an operator calls `POST /api/v1/ha/resync`; a same-version
-   payload fork additionally blocks new publishes on that master until the
-   latch is explicitly cleared. Recovery is always the explicit promotion
-   above, not waiting for an automatic rebase.
+   disconnects, accepts the master's current bundle after promotion or local
+   reconciliation, or (for advisory ahead/newer-term records only) an operator
+   calls `POST /api/v1/ha/resync`. A same-version payload fork is **not**
+   cleared by a resync: re-pushing the same stale bundle cannot resolve it.
+   Recovery is always the explicit promotion above (or disconnecting and
+   fixing/re-syncing the forked replica), not waiting for an automatic rebase.
 
 4. **Verify or generate master certificates**:
    `sito` uses the certificates configured in `[ha] cert`/`key` for mTLS and
@@ -349,7 +351,7 @@ When a slave node fails or must be reprovisioned from bare metal:
 | Slave state is `Connecting` in loop | Network unreachable, firewall blocking 8953, or mTLS handshake failed/timed out | Check `nc -zv 192.168.1.10 8953`. Check TLS certificate expiration or fingerprint mismatch in logs. |
 | `Signature verification failed` | Bundle signature does not match master public key | Verify that the master didn't regenerate `ha_signing.key` without updating slaves. Compare `master_pubkey` from the master's `/api/v1/ha/status` with the slave config. |
 | `Incoming version <= have_version` | Out of order or replayed bundle | Normal during network blips; the master will send the latest monotonic version. After a promotion, an older-term master is rejected even with a higher version; promote the master explicitly (section 2). |
-| Master reports `"diverged": true` | A slave is ahead in the same term, reports a newer term (stale/partitioned master, lost/corrupt `ha_state.toml`, or forked master), or reported a same-version payload fork | Read `diverged_reason`. Divergence is **sticky**: it is not cleared by another slave applying the current version. The master intentionally does **not** rebase/republish over it. A same-version fork also blocks further publishing until an explicit `POST /api/v1/ha/resync` (or the slave disconnecting) clears the latch. Isolate the stale master, resolve the fork, restore its state file or perform the explicit promotion in section 2 (raise both `term` and `version`), then restart it. |
+| Master reports `"diverged": true` | A slave is ahead in the same term, reports a newer term (stale/partitioned master, lost/corrupt `ha_state.toml`, or forked master), or reported a same-version payload fork | Read `diverged_reason`. Divergence is **sticky**: it is not cleared by another slave applying the current version. A same-version fork marks that slave unsynced and visible but does **not** stop publishing to healthy replicas; it clears when that slave accepts the current bundle after promotion/reconciliation or disconnects. `POST /api/v1/ha/resync` clears only advisory ahead/newer-term records, not a real fork. Isolate the stale master, resolve the fork, restore its state file or perform the explicit promotion in section 2 (raise both `term` and `version`), then restart it. |
 | Slave reports a same-version payload fork | The master and slave hold different signed content for the same term and version (split brain) | The slave persists a fork latch in `ha_watermark.toml`, degrades, and rejects all same-term pushes; the master records divergence and stops showing the slave as synced. Do not retry the same version. Isolate the forked master and perform an explicit promotion with a strictly higher `term` **and** `version` (section 2); the promoted bundle clears the latch. |
 | API returns `409 Conflict` | Mutation attempted directly on a slave node | Perform configuration edits on the master node indicated in the `X-Dnsd-Master` header. |
 | `POST /api/v1/ha/resync` returns `503` | No HA coordinator/tracker on the node, the replication worker stopped, or the push could not be queued | Check the node's role and `GET /api/v1/ha/status`. A `429` means a resync is already queued; retry shortly. |
