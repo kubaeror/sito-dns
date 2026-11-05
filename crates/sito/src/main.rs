@@ -118,10 +118,17 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
             },
-            Commands::Update { check, force, repo } => {
+            Commands::Update {
+                config,
+                check,
+                force,
+                repo,
+            } => {
+                // Accept both the global `--config` (before the subcommand)
+                // and the documented `sito update --config <path>` form.
+                let config = config.or(cli.config);
                 if let Err(e) =
-                    sito::cli::run_update(check, force, repo.as_deref(), cli.config.as_deref())
-                        .await
+                    sito::cli::run_update(check, force, repo.as_deref(), config.as_deref()).await
                 {
                     eprintln!("{e}");
                     std::process::exit(1);

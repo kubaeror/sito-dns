@@ -169,9 +169,10 @@ sudo SITO_VERSION=1.9.1 bash contrib/install.sh
 
 Without `--config`, the CLI prefers an existing `/etc/sito/config.toml` and
 otherwise uses `./config.toml`, so the commands above work from `/root`
-after the service is stopped. Pass `--config <path>` when the configuration
-lives somewhere else. If neither location exists, `sito update` refuses to run
-instead of guessing the signature policy.
+after the service is stopped. Pass `sito update --config <path>` (or
+`sito --config <path> update`) when the configuration lives somewhere else. If
+neither location exists, `sito update` refuses to run instead of guessing the
+signature policy.
 
 `sito update` verifies the release with cosign because
 `server.update_require_signature` defaults to `true`. The installer installs a

@@ -72,7 +72,7 @@ fn resolve_update_config_path_from(
         return Ok(local.to_path_buf());
     }
     Err(anyhow::anyhow!(
-        "Refusing to update: no configuration file found at '{}' or '{}'. Pass --config <path> to choose the configuration explicitly (system installs use {}).",
+        "Refusing to update: no configuration file found at '{}' or '{}'. Pass 'sito update --config <path>' (or place --config before the subcommand) to choose the configuration explicitly (system installs use {}).",
         system.display(),
         local.display(),
         SYSTEM_CONFIG_PATH
@@ -159,6 +159,10 @@ pub enum Commands {
     },
     /// Check for and install software updates
     Update {
+        /// Optional path to configuration file (defaults to main --config; the
+        /// long form is required because -c selects --check)
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Only check for available updates without installing
         #[arg(short, long)]
         check: bool,
@@ -1221,6 +1225,28 @@ mod tests {
             cli_custom.config,
             Some(PathBuf::from("/etc/sito/custom.toml"))
         );
+    }
+
+    #[test]
+    fn test_cli_update_accepts_config_before_and_after_subcommand() {
+        // The documented/error text says `--config <path>`; it must work after
+        // the subcommand as well as in the historical global position.
+        let cli = Cli::try_parse_from(["sito", "update", "--config", "/etc/sito/config.toml"])
+            .expect("parse update --config");
+        match cli.command {
+            Some(Commands::Update { config, .. }) => {
+                assert_eq!(config, Some(PathBuf::from("/etc/sito/config.toml")))
+            }
+            other => panic!("expected update command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["sito", "--config", "/etc/sito/config.toml", "update"])
+            .expect("parse global --config update");
+        assert_eq!(cli.config, Some(PathBuf::from("/etc/sito/config.toml")));
+        match cli.command {
+            Some(Commands::Update { config, .. }) => assert_eq!(config, None),
+            other => panic!("expected update command, got {other:?}"),
+        }
     }
 
     fn temp_config_dir(label: &str) -> PathBuf {
