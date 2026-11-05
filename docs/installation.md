@@ -18,9 +18,11 @@ LAN defaults, not internet-safe defaults:
   access control. Any host that can reach the DNS ports can recurse through
   this server.
 
-Sito logs a startup warning for each exposed listener. Access the panel only
-from a trusted LAN or through an SSH tunnel, and keep the DNS ports closed to
-the internet.
+Sito logs a startup warning for each exposed listener. Reach the panel through
+an SSH tunnel or a TLS reverse proxy. The firewall examples below allow SSH
+before enabling the default-deny policy and **do not open 8080**, so the direct
+`http://<server-ip>:8080` URL stops working after `ufw enable`; use the tunnel
+or add the temporary LAN-scoped rule shown under "Safe admin access".
 
 ### Recommended LAN-only firewall
 
@@ -28,7 +30,8 @@ Replace `192.168.0.0/24` with your LAN subnet. The examples intentionally do
 **not** open the admin port:
 
 ```bash
-# UFW
+# UFW: allow SSH first so a remote session survives enabling the firewall
+sudo ufw allow OpenSSH
 sudo ufw default deny incoming
 sudo ufw allow from 192.168.0.0/24 to any port 53 proto udp comment 'sito DNS (UDP, LAN)'
 sudo ufw allow from 192.168.0.0/24 to any port 53 proto tcp comment 'sito DNS (TCP, LAN)'
@@ -39,6 +42,10 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address
 sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.0.0/24" port port="53" protocol="tcp" accept'
 sudo firewall-cmd --reload
 ```
+
+> [!CAUTION]
+> On a remote host, enable the SSH rule **before** `ufw enable`. Enabling a
+> default-deny policy without it drops the SSH session.
 
 If you enable DoT/DoH/DoH3, restrict `853`/`443` to the clients that actually
 need them instead of opening them to everyone.
@@ -51,6 +58,15 @@ workstation:
 ```bash
 ssh -L 8080:127.0.0.1:8080 user@server
 # then browse http://127.0.0.1:8080
+```
+
+If you need direct browser access from the LAN only during first-time setup,
+add a temporary LAN-scoped rule and remove it when setup is complete:
+
+```bash
+sudo ufw allow from 192.168.0.0/24 to any port 8080 proto tcp
+# after setup:
+sudo ufw delete allow from 192.168.0.0/24 to any port 8080 proto tcp
 ```
 
 For browser access without a tunnel, keep `web.bind = "127.0.0.1"` and put a
@@ -91,8 +107,9 @@ The installer automatically:
 5. Deploys the hardened systemd unit, enables, and starts the service.
 6. Runs post-install health verification (`systemctl is-active` and HTTP check).
 7. Prompts you to complete setup via the web wizard at `http://<server-ip>:8080`
-   and prints LAN-only firewall guidance (it does not recommend publishing the
-   admin or DNS ports to the internet).
+   and prints LAN-only firewall guidance. The advice allows SSH first, does not
+   open 8080, and points at the SSH tunnel or a temporary LAN-scoped rule for
+   first-time setup.
 
 ---
 
@@ -133,7 +150,7 @@ sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito
 
 ### 2.4 Configuration Skeleton (Optional)
 > [!NOTE]
-> On a clean boot without an existing `config.toml`, **sito** starts in **setup-pending mode** serving only the web panel on port 8080. You can simply open `http://<server-ip>:8080` to generate your configuration via the web wizard, or pass `--no-setup` to boot immediately with a generated administrator password (printed once) and the panel bound to loopback.
+> On a clean boot without an existing `config.toml`, **sito** starts in **setup-pending mode** serving only the web panel on port 8080. You can open `http://<server-ip>:8080` from the LAN to generate your configuration via the web wizard, or pass `--no-setup` to boot immediately with a generated administrator password (printed once) and the panel bound to loopback. If the LAN-only firewall from this guide is enabled, it does not open 8080: use the SSH tunnel (`ssh -L 8080:127.0.0.1:8080 user@server`) or the temporary LAN-scoped rule instead.
 >
 > If you prefer to supply configuration up-front, create `/etc/sito/config.toml`:
 
@@ -438,7 +455,7 @@ have bound with its mTLS key, and a slave must have reached `Synced`. A healthy
 DNS response alone no longer masks an HA failure. See `docs/runbook-ha.md`
 (certificate ownership) if the probe reports an unreadable key.
 
-Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard. While setup is pending the server prints a one-time setup token to the console; open `http://<host-ip>:8080/wizard?setup_token=<token>` or send the `X-Setup-Token` header. Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` already exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` account.
+Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard (or use the SSH tunnel above when the LAN-only firewall is enabled). While setup is pending the server prints a one-time setup token to the console; open `http://<host-ip>:8080/wizard?setup_token=<token>` or send the `X-Setup-Token` header. Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` already exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` account.
 
 If the wizard is skipped with `--no-setup`, a random administrator password is generated and printed once, and the panel binds to loopback. If credentials are lost later, stop the service so the running process cannot keep serving the old credentials, reset the account, then start it again:
 

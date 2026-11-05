@@ -588,6 +588,9 @@ fn test_m9_network_exposure_guidance_is_lan_only() {
     for expected in [
         "Firewall guidance (LAN-only by default)",
         "Do not expose port 8080 to the internet",
+        "ufw allow OpenSSH",
+        "do not open 8080",
+        "ufw allow from 192.168.0.0/24 to any port 8080 proto tcp",
         "ssh -L 8080:127.0.0.1:8080",
         "ufw allow from 192.168.0.0/24 to any port 53 proto udp",
         "reverse proxy",
@@ -604,6 +607,8 @@ fn test_m9_network_exposure_guidance_is_lan_only() {
         "docs/installation.md must have a network-exposure/firewall section"
     );
     for expected in [
+        "sudo ufw allow OpenSSH",
+        "do not open 8080",
         "ssh -L 8080:127.0.0.1:8080",
         "1.10.0",
         "web.bind",

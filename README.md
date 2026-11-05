@@ -150,7 +150,7 @@ cargo build --release --locked --features "embed-ui,mimalloc"
 ### 🧙 First-Time Setup Wizard
 On a fresh installation without a configuration file, **sito** starts in **setup-pending mode** on port `8080` (DNS listener ports 53/853/443 remain closed until initial setup is confirmed).
 
-Open **`http://<server-ip>:8080`** from a trusted LAN host (or through an SSH tunnel) to launch the 6-section configuration wizard:
+Open **`http://<server-ip>:8080`** from a trusted LAN host (or through an SSH tunnel; the LAN-only firewall in the installation guide does not open 8080) to launch the 6-section configuration wizard:
 * **Administrator Account:** Set a custom admin username and a password. The wizard rejects the bootstrap password `adminadmin`, passwords shorter than 8 characters, and passwords containing whitespace or control characters. The bootstrap account cannot log in while setup is pending.
 * **DNS Listeners:** Configure IPv4/IPv6 bindings, UDP/TCP, DoT, and DoH ports.
 * **Upstream Resolvers:** Select presets (Cloudflare, Quad9, Google) with live latency testing.
