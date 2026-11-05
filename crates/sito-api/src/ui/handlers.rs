@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use crate::auth::manager::LoginResult;
+use crate::auth::manager::{LoginResult, TotpMutationError, UserMutationError};
 use crate::auth::rbac::AuthUser;
 use crate::auth::resolve_client_ip;
 use crate::auth::session::{
@@ -267,16 +267,18 @@ pub async fn login_submit(
             csrf_token: "",
         })
         .into_response(),
-        LoginResult::InvalidCredentials { .. } => HtmlTemplate(LoginTemplate {
-            is_authenticated: false,
-            username: &form.username,
-            user_role: "",
-            active_tab: "login",
-            version: env!("CARGO_PKG_VERSION"),
-            error_message: "Invalid username or password.",
-            csrf_token: "",
-        })
-        .into_response(),
+        LoginResult::InvalidCredentials { .. } | LoginResult::StaleCredentials => {
+            HtmlTemplate(LoginTemplate {
+                is_authenticated: false,
+                username: &form.username,
+                user_role: "",
+                active_tab: "login",
+                version: env!("CARGO_PKG_VERSION"),
+                error_message: "Invalid username or password.",
+                csrf_token: "",
+            })
+            .into_response()
+        }
     }
 }
 
@@ -2637,9 +2639,18 @@ pub async fn users_create_handler(
         );
     }
 
-    ctx.auth_mgr
-        .create_user(username, &form.password, role)
-        .await;
+    if let Err(e) = ctx
+        .auth_mgr
+        .create_user_persisted(username, &form.password, role)
+        .await
+    {
+        return users_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::internal_error(format!("Failed to persist the user store: {e}")),
+        );
+    }
     tracing::info!(
         actor = %user.username,
         target = %username,
@@ -2758,17 +2769,21 @@ pub async fn account_password_handler(
             ProblemDetails::bad_request("Current password is incorrect"),
         );
     }
-    if !ctx
+    if let Err(err) = ctx
         .auth_mgr
-        .update_user_password(&user.username, &form.new_password)
+        .update_user_password_checked(&user.username, &form.new_password)
         .await
     {
-        return account_problem_page(
-            &ctx,
-            &user,
-            &csrf,
-            ProblemDetails::not_found("User account not found"),
-        );
+        let problem = match err {
+            UserMutationError::NotFound => ProblemDetails::not_found("User account not found"),
+            UserMutationError::LastAdmin => {
+                ProblemDetails::bad_request("Cannot remove the last remaining admin account")
+            }
+            UserMutationError::Persistence(detail) => ProblemDetails::internal_error(format!(
+                "Failed to persist the user store while changing the password: {detail}"
+            )),
+        };
+        return account_problem_page(&ctx, &user, &csrf, problem);
     }
     tracing::info!(user = %user.username, "User changed their password from the web UI");
     // Password changes revoke every session for the account, including this
@@ -2962,13 +2977,17 @@ pub async fn account_totp_disable_handler(
         }
     }
 
-    if !ctx.auth_mgr.disable_totp(&user.username).await {
-        return account_problem_page(
-            &ctx,
-            &user,
-            &csrf,
-            ProblemDetails::not_found("User account not found"),
-        );
+    if let Err(err) = ctx.auth_mgr.try_disable_totp(&user.username).await {
+        let problem = match err {
+            TotpMutationError::NotFound => ProblemDetails::not_found("User account not found"),
+            TotpMutationError::InvalidCode => {
+                ProblemDetails::bad_request("Invalid TOTP verification code")
+            }
+            TotpMutationError::Persistence(detail) => ProblemDetails::internal_error(format!(
+                "Failed to persist the user store while disabling TOTP: {detail}"
+            )),
+        };
+        return account_problem_page(&ctx, &user, &csrf, problem);
     }
     tracing::info!(user = %user.username, "User disabled TOTP 2FA from the web UI");
     // Disabling 2FA revokes every session for the account by design.

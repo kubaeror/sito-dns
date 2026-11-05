@@ -29,11 +29,17 @@ pub enum LoginResult {
     RateLimited,
     /// Invalid credentials.
     InvalidCredentials { remaining_attempts: u32 },
+    /// The account's credentials changed while the login was being verified.
+    /// The password used is no longer current, so no session was issued.
+    StaleCredentials,
 }
 
 #[derive(Debug, Clone)]
 struct PartialAuth {
     username: String,
+    /// Credential epoch observed when the password was verified. The second
+    /// factor may only complete a login for the same credential state.
+    credential_epoch: u64,
     expires_at: Instant,
     failed_attempts: u32,
 }
@@ -71,6 +77,12 @@ pub struct UserAccount {
     pub username: String,
     pub password_hash: String,
     pub role: Role,
+    /// Monotonic credential revision for this account. Password, role, TOTP,
+    /// deletion/recreation and admin-reset changes advance it so a session or
+    /// API token issued under the previous credential state is rejected.
+    /// `0` deserializes from users files written before the field existed.
+    #[serde(default)]
+    pub credential_epoch: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub totp: Option<TotpConfig>,
 }
@@ -116,10 +128,32 @@ pub enum UserMutationError {
     Persistence(String),
 }
 
+/// Failure of a TOTP enable/disable mutation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TotpMutationError {
+    #[error("user not found")]
+    NotFound,
+    #[error("invalid or expired TOTP verification code")]
+    InvalidCode,
+    #[error("failed to persist users file: {0}")]
+    Persistence(String),
+}
+
 #[derive(Debug, Clone)]
 struct PendingTotp {
     config: TotpConfig,
     created_at: Instant,
+}
+
+/// Test-only latch that pauses a login after the password (or TOTP code) was
+/// verified but before the session is inserted. It lets a regression test
+/// deterministically interleave a credential mutation with an in-flight
+/// login without adding timing sleeps.
+#[cfg(test)]
+#[derive(Clone)]
+struct LoginGate {
+    reached: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -359,11 +393,6 @@ fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
     write_res
 }
 
-/// Atomically writes a secret file with owner-only permissions, logging errors.
-fn atomic_write_secret(path: &Path, content: &str) {
-    let _ = write_secret_file(path, content);
-}
-
 /// Writes a sanitized copy of `users.toml` to `backup_path`.
 ///
 /// Recovery copies must not reintroduce the plaintext-at-rest problem the
@@ -522,9 +551,17 @@ pub struct AuthManager {
     token_default_ttl_days: u64,
     /// Global user-secret generation; sessions/tokens must match it to be valid.
     generation: u64,
+    /// Monotonic source of per-user credential epochs. Seeded from the clock
+    /// and the highest epoch found on load so a deleted-and-recreated account
+    /// never receives an epoch an older session/token could still match.
+    credential_epoch_cursor: Arc<AtomicU64>,
     /// AES-256-GCM key for TOTP secrets (`<data_dir>/totp.key`); `None` for
     /// memory-only managers.
     secret_store: Option<TotpSecretStore>,
+    /// Test-only latch used to pause an in-flight login after credential
+    /// verification. Always `None` outside tests.
+    #[cfg(test)]
+    login_gate: Arc<Mutex<Option<LoginGate>>>,
 }
 
 impl Default for AuthManager {
@@ -667,7 +704,12 @@ impl AuthManager {
             sessions_revision: Arc::new(AtomicU64::new(0)),
             token_default_ttl_days,
             generation,
+            credential_epoch_cursor: Arc::new(AtomicU64::new(
+                chrono::Utc::now().timestamp_millis().max(0) as u64,
+            )),
             secret_store: None,
+            #[cfg(test)]
+            login_gate: Arc::new(Mutex::new(None)),
         };
 
         if let Some(ref path) = mgr.users_path {
@@ -789,6 +831,7 @@ impl AuthManager {
                     });
                     (has_usable_admin, admin_default_active)
                 };
+                mgr.seed_epoch_cursor();
 
                 // Legacy plaintext secrets are encrypted on this startup with
                 // exactly one atomic rewrite. Warnings name the account only.
@@ -836,7 +879,7 @@ impl AuthManager {
                 }
             })?);
             mgr.create_user_internal("admin", "adminadmin", Role::Admin);
-            mgr.save_users_initial();
+            mgr.save_users_initial()?;
         } else {
             // Memory-only fallback for tests
             mgr.create_user_internal("admin", "adminadmin", Role::Admin);
@@ -995,10 +1038,15 @@ impl AuthManager {
             sessions_revision: Arc::new(AtomicU64::new(0)),
             token_default_ttl_days: 0,
             generation,
+            credential_epoch_cursor: Arc::new(AtomicU64::new(
+                chrono::Utc::now().timestamp_millis().max(0) as u64,
+            )),
             // A reset replaces the account store; reuse an existing key so
             // backups of the previous users file stay decryptable, or create
             // one when the key was lost (the reset is the documented recovery).
             secret_store: Some(secret_store),
+            #[cfg(test)]
+            login_gate: Arc::new(Mutex::new(None)),
         };
         {
             let mut users = lock(&mgr.users);
@@ -1006,8 +1054,9 @@ impl AuthManager {
                 users.insert(user.username.clone(), user);
             }
         }
+        mgr.seed_epoch_cursor();
         mgr.create_user_internal("admin", new_password, Role::Admin);
-        mgr.save_users_initial();
+        mgr.save_users_initial().map_err(std::io::Error::other)?;
         Ok(path)
     }
 
@@ -1054,13 +1103,39 @@ impl AuthManager {
 
     /// Writes the users file synchronously. Constructor-only: the manager is
     /// not shared yet, so bypassing `persist_lock` cannot race a runtime save.
-    /// Every runtime path must use [`Self::save_users_async`] instead.
-    fn save_users_initial(&self) {
-        match self.users_toml() {
-            Ok(Some((path, toml_str))) => atomic_write_secret(&path, &toml_str),
-            Ok(None) => {}
-            Err(e) => tracing::error!(error = %e, "Refusing to persist users file"),
+    /// Every runtime path must use [`Self::try_save_users_async`] instead.
+    ///
+    /// Returns the write failure so `reset-admin` cannot report success when
+    /// the new credentials did not land.
+    fn save_users_initial(&self) -> Result<(), AuthStorageError> {
+        match self.users_toml()? {
+            Some((path, toml_str)) => write_secret_file(&path, &toml_str)
+                .map_err(|e| AuthStorageError::Io { path, source: e }),
+            None => Ok(()),
         }
+    }
+
+    /// Returns the next credential epoch. Always strictly greater than every
+    /// epoch already issued by this process and (after load) every epoch on
+    /// disk.
+    fn next_credential_epoch(&self) -> u64 {
+        self.credential_epoch_cursor
+            .fetch_add(1, Ordering::SeqCst)
+            .max(1)
+    }
+
+    /// Raises the epoch cursor above the clock and every loaded account so a
+    /// recreated account cannot reuse an epoch that a persisted credential
+    /// could still match.
+    fn seed_epoch_cursor(&self) {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let highest = lock(&self.users)
+            .values()
+            .map(|user| user.credential_epoch)
+            .max()
+            .unwrap_or(0);
+        self.credential_epoch_cursor
+            .store(now.max(highest).saturating_add(1), Ordering::SeqCst);
     }
 
     /// Persists users on the blocking pool so async handlers never perform
@@ -1069,15 +1144,9 @@ impl AuthManager {
     /// The snapshot is taken while holding `persist_lock` and the lock is held
     /// until the write finishes, so a stale snapshot cannot land after a newer
     /// one. The guard is owned by the blocking task, so cancelling the caller
-    /// cannot release it before the write completes.
-    async fn save_users_async(&self) {
-        if let Err(e) = self.try_save_users_async().await {
-            tracing::error!(error = %e, "Failed to persist users file");
-        }
-    }
-
-    /// Persists users and surfaces the failure to callers that must roll back a
-    /// credential change when the write did not land.
+    /// cannot release it before the write completes. Every caller must handle
+    /// the error and roll its in-memory change back: a credential mutation must
+    /// never report success when the write did not land.
     pub(crate) async fn try_save_users_async(&self) -> Result<(), AuthStorageError> {
         // Use an owned guard moved into the blocking closure: if the caller is
         // cancelled mid-write, the closure keeps the lock until the write
@@ -1236,6 +1305,7 @@ impl AuthManager {
         };
         match toml::from_str::<SessionsFile>(&content) {
             Ok(file) => {
+                let users = lock(&self.users);
                 let mut sessions = lock(&self.sessions);
                 for mut session in file.sessions {
                     if session.generation != self.generation {
@@ -1245,10 +1315,32 @@ impl AuthManager {
                         );
                         continue;
                     }
-                    if !session.is_expired() {
-                        session.ensure_csrf_token();
-                        sessions.insert(session.id.clone(), session);
+                    if session.is_expired() {
+                        continue;
                     }
+                    let Some(epoch) = session.credential_epoch else {
+                        tracing::warn!(
+                            session = %session.id,
+                            "Rejecting legacy persisted session without a credential epoch; re-login required"
+                        );
+                        continue;
+                    };
+                    let Some(user) = users.get(&session.username) else {
+                        tracing::warn!(
+                            session = %session.id,
+                            "Rejecting persisted session for a removed account"
+                        );
+                        continue;
+                    };
+                    if user.credential_epoch != epoch || user.role != session.role {
+                        tracing::warn!(
+                            session = %session.id,
+                            "Rejecting persisted session issued under stale credentials"
+                        );
+                        continue;
+                    }
+                    session.ensure_csrf_token();
+                    sessions.insert(session.id.clone(), session);
                 }
             }
             Err(e) => {
@@ -1276,7 +1368,7 @@ impl AuthManager {
         match toml::from_str::<TokensFile>(&content) {
             Ok(file) => {
                 let now = chrono::Utc::now().timestamp();
-                let mut tokens = lock(&self.tokens);
+                let users = lock(&self.users);
                 // Newest first so when the cap trims loaded tokens we keep the
                 // most recently issued ones.
                 let mut loaded: Vec<ApiTokenMeta> = file
@@ -1284,17 +1376,31 @@ impl AuthManager {
                     .into_iter()
                     .filter(|token| token.expires_at.is_none_or(|exp| now < exp))
                     .filter(|token| {
-                        if token.generation == self.generation {
-                            true
-                        } else {
+                        if token.generation != self.generation {
                             tracing::warn!(
                                 token = %token.id,
                                 "Rejecting persisted API token issued under a previous auth generation"
                             );
-                            false
+                            return false;
+                        }
+                        let Some(epoch) = token.credential_epoch else {
+                            tracing::warn!(
+                                token = %token.id,
+                                "Rejecting legacy persisted API token without a credential epoch; re-issue required"
+                            );
+                            return false;
+                        };
+                        match token.owner.as_deref() {
+                            // Ownerless tokens are Admin-managed and not tied
+                            // to an account.
+                            None => true,
+                            Some(owner) => users.get(owner).is_some_and(|user| {
+                                user.credential_epoch == epoch && user.role >= token.scope
+                            }),
                         }
                     })
                     .collect();
+                let mut tokens = lock(&self.tokens);
                 loaded.sort_by_key(|t| std::cmp::Reverse(t.created_at));
                 for token in loaded {
                     if tokens.len() >= MAX_API_TOKENS {
@@ -1325,6 +1431,7 @@ impl AuthManager {
             username: username.to_string(),
             password_hash: hash,
             role,
+            credential_epoch: self.next_credential_epoch(),
             totp: None,
         };
         lock(&self.users).insert(username.to_string(), user);
@@ -1515,7 +1622,7 @@ impl AuthManager {
         role: Role,
         protect_last_admin: bool,
     ) -> Result<bool, UserMutationError> {
-        let changed = {
+        let (changed, previous_user) = {
             let mut users = lock(&self.users);
             let admin_count = users.values().filter(|u| u.role == Role::Admin).count();
             let Some(user) = users.get_mut(username) else {
@@ -1529,15 +1636,26 @@ impl AuthManager {
                 return Err(UserMutationError::LastAdmin);
             }
             let changed = user.role != role;
-            user.role = role;
-            changed
+            if changed {
+                let previous = user.clone();
+                user.role = role;
+                user.credential_epoch = self.next_credential_epoch();
+                (true, Some(previous))
+            } else {
+                (false, None)
+            }
         };
         if changed {
+            if let Err(e) = self.try_save_users_async().await {
+                if let Some(previous) = previous_user {
+                    lock(&self.users).insert(previous.username.clone(), previous);
+                }
+                return Err(UserMutationError::Persistence(e.to_string()));
+            }
             self.purge_user_sessions(username).await;
             // An Admin-scoped token must not survive a demotion, and a
             // promotion changes the account's effective privileges too.
             self.revoke_tokens_for_owner(username).await;
-            self.save_users_async().await;
         }
         Ok(changed)
     }
@@ -1645,6 +1763,9 @@ impl AuthManager {
             username: username.to_string(),
             password_hash: hash,
             role,
+            // Always a fresh epoch: overwriting or recreating an account must
+            // invalidate every credential issued for the previous identity.
+            credential_epoch: self.next_credential_epoch(),
             totp: None,
         };
         let previous_user = {
@@ -1703,26 +1824,24 @@ impl AuthManager {
         &self,
         username: &str,
         password: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<String>, UserMutationError> {
         let (hash, is_default) = hash_password_blocking(password.to_string())
             .await
-            .map_err(|e| format!("failed to hash password for '{username}': {e}"))?;
+            .map_err(UserMutationError::Persistence)?;
 
-        let previous_hash = {
+        let previous = {
             let mut users = lock(&self.users);
             let Some(user) = users.get_mut(username) else {
-                return Err(format!("user '{username}' does not exist"));
+                return Err(UserMutationError::NotFound);
             };
-            let previous = user.password_hash.clone();
+            let previous = user.clone();
             user.password_hash = hash;
+            user.credential_epoch = self.next_credential_epoch();
             previous
         };
         if let Err(e) = self.try_save_users_async().await {
-            let mut users = lock(&self.users);
-            if let Some(user) = users.get_mut(username) {
-                user.password_hash.clone_from(&previous_hash);
-            }
-            return Err(format!("failed to persist users file: {e}"));
+            lock(&self.users).insert(previous.username.clone(), previous);
+            return Err(UserMutationError::Persistence(e.to_string()));
         }
         if username == "admin" {
             self.default_admin_active
@@ -1732,7 +1851,19 @@ impl AuthManager {
         // A password change invalidates every credential derived from the old
         // password, including owned API tokens.
         self.revoke_tokens_for_owner(username).await;
-        Ok(Some(previous_hash))
+        Ok(Some(previous.password_hash))
+    }
+
+    /// Password update for request handlers that must distinguish a missing
+    /// account from a failed users-file write.
+    pub(crate) async fn update_user_password_checked(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<(), UserMutationError> {
+        self.update_user_password_tracked(username, password)
+            .await
+            .map(|_| ())
     }
 
     /// Restores a password hash previously returned by
@@ -1745,16 +1876,20 @@ impl AuthManager {
     ) -> Result<(), String> {
         let is_default = username == "admin"
             && verify_password_blocking("adminadmin".to_string(), previous_hash.to_string()).await;
-        {
+        let previous = {
             let mut users = lock(&self.users);
             let Some(user) = users.get_mut(username) else {
                 return Err(format!("user '{username}' does not exist"));
             };
+            let previous = user.clone();
             user.password_hash = previous_hash.to_string();
+            user.credential_epoch = self.next_credential_epoch();
+            previous
+        };
+        if let Err(e) = self.try_save_users_async().await {
+            lock(&self.users).insert(previous.username.clone(), previous);
+            return Err(format!("failed to persist users file: {e}"));
         }
-        self.try_save_users_async()
-            .await
-            .map_err(|e| format!("failed to persist users file: {e}"))?;
         if username == "admin" {
             self.default_admin_active
                 .store(is_default, Ordering::SeqCst);
@@ -1801,9 +1936,21 @@ impl AuthManager {
         changed
     }
 
-    async fn insert_session(&self, session: Session) {
-        let session = session.with_generation(self.generation);
-        {
+    /// Inserts a session only if the account still exists with `expected_epoch`
+    /// and the role observed when the password was verified. The users lock is
+    /// held across the re-check and the insert so a concurrent credential
+    /// mutation (which bumps the epoch under the same lock) cannot slip
+    /// between them.
+    async fn insert_session(&self, session: Session, expected_epoch: u64) -> Option<Session> {
+        let session = {
+            let users = lock(&self.users);
+            let user = users.get(&session.username)?;
+            if user.credential_epoch != expected_epoch {
+                return None;
+            }
+            let session = session
+                .with_generation(self.generation)
+                .with_credential(user.role, user.credential_epoch);
             let mut sessions = lock(&self.sessions);
             if !sessions.contains_key(&session.id) && sessions.len() >= MAX_SESSIONS {
                 sessions.retain(|_, s| !s.is_expired());
@@ -1820,15 +1967,31 @@ impl AuthManager {
                     sessions.remove(&oldest_key);
                 }
             }
-            sessions.insert(session.id.clone(), session);
+            sessions.insert(session.id.clone(), session.clone());
             self.sessions_revision.fetch_add(1, Ordering::SeqCst);
-        }
+            session
+        };
         self.save_sessions_async().await;
+        Some(session)
     }
 
     // ------------------------------------------------------------------
     // Login / TOTP
     // ------------------------------------------------------------------
+
+    /// Test-only pause between credential verification and session creation.
+    #[cfg(test)]
+    async fn await_login_test_gate(&self) {
+        let gate = lock(&self.login_gate).take();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.resume.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    #[allow(clippy::unused_async)]
+    async fn await_login_test_gate(&self) {}
 
     /// Primary login flow (`POST /auth/login`).
     pub async fn login(&self, username: &str, password: &str, client_ip: &str) -> LoginResult {
@@ -1855,6 +2018,7 @@ impl AuthManager {
                 (
                     u.password_hash.clone(),
                     u.role,
+                    u.credential_epoch,
                     u.totp.as_ref().is_some_and(|t| t.enabled),
                 )
             })
@@ -1862,7 +2026,7 @@ impl AuthManager {
 
         // Unknown user: run a dummy verification so the response time does not
         // reveal whether the account exists.
-        let Some((hash, role, totp_enabled)) = stored else {
+        let Some((hash, role, credential_epoch, totp_enabled)) = stored else {
             let _ =
                 verify_password_blocking(password.to_string(), dummy_password_hash().to_string())
                     .await;
@@ -1892,6 +2056,10 @@ impl AuthManager {
             };
         }
 
+        // Password valid. Pause here in tests so a credential mutation can be
+        // interleaved before the session is created.
+        self.await_login_test_gate().await;
+
         // Password valid: check if TOTP is enabled
         if totp_enabled {
             let mut bytes = [0u8; 32];
@@ -1917,6 +2085,7 @@ impl AuthManager {
                 partial_token.clone(),
                 PartialAuth {
                     username: username.to_string(),
+                    credential_epoch,
                     expires_at: now + Duration::from_secs(300), // 5 minutes
                     failed_attempts: 0,
                 },
@@ -1925,10 +2094,13 @@ impl AuthManager {
             return LoginResult::TotpRequired { partial_token };
         }
 
-        // Authentication successful
-        self.lockout.record_success(username);
+        // Authentication successful, provided the credential state did not
+        // change while the password was being verified.
         let session = Session::new(username, role, self.session_ttl_secs);
-        self.insert_session(session.clone()).await;
+        let Some(session) = self.insert_session(session, credential_epoch).await else {
+            return LoginResult::StaleCredentials;
+        };
+        self.lockout.record_success(username);
         LoginResult::Success(session)
     }
 
@@ -1949,12 +2121,16 @@ impl AuthManager {
         }
 
         // 2. Resolve and validate the partial token
-        let (username, is_expired) = {
+        let (username, partial_epoch, is_expired) = {
             let partials = lock(&self.partial_tokens);
             let Some(auth) = partials.get(partial_token) else {
                 return TotpVerifyResult::TokenExpired;
             };
-            (auth.username.clone(), Instant::now() >= auth.expires_at)
+            (
+                auth.username.clone(),
+                auth.credential_epoch,
+                Instant::now() >= auth.expires_at,
+            )
         };
 
         if is_expired {
@@ -1979,14 +2155,18 @@ impl AuthManager {
             let users = lock(&self.users);
             users
                 .get(&username)
-                .map(|user| (user.role, user.totp.clone()))
+                .map(|user| (user.role, user.credential_epoch, user.totp.clone()))
         };
-        let Some((role, Some(totp))) = snapshot else {
+        // The second factor must still belong to the credential state that
+        // passed the password check. A password change, TOTP enable/disable or
+        // role change while the code was entered invalidates the partial token.
+        let Some((role, credential_epoch, Some(totp))) = snapshot else {
             lock(&self.partial_tokens).remove(partial_token);
             return TotpVerifyResult::TokenExpired;
         };
-        if !totp.enabled {
-            return TotpVerifyResult::Invalid;
+        if credential_epoch != partial_epoch || !totp.enabled {
+            lock(&self.partial_tokens).remove(partial_token);
+            return TotpVerifyResult::TokenExpired;
         }
 
         // 4. Verify off the async worker without holding the users lock.
@@ -2010,20 +2190,33 @@ impl AuthManager {
         if let Some(updated_totp) = updated_totp
             && valid
         {
-            // Success: consume partial token, reset lockout, persist TOTP state.
+            // Test-only: allow a credential mutation to interleave after the
+            // code was verified but before the session is created.
+            self.await_login_test_gate().await;
+            // Success: consume the partial token first so it can never be
+            // replayed, then re-check the credential epoch before writing the
+            // TOTP state. A concurrent disable must win.
             lock(&self.partial_tokens).remove(partial_token);
-            self.lockout.record_success(&username);
-
             {
                 let mut users = lock(&self.users);
-                if let Some(user) = users.get_mut(&username) {
-                    user.totp = Some(updated_totp);
+                let Some(user) = users.get_mut(&username) else {
+                    return TotpVerifyResult::TokenExpired;
+                };
+                if user.credential_epoch != credential_epoch {
+                    return TotpVerifyResult::TokenExpired;
                 }
+                user.totp = Some(updated_totp);
             }
-            self.save_users_async().await;
+            if let Err(e) = self.try_save_users_async().await {
+                tracing::error!(error = %e, "Failed to persist TOTP state after verification");
+                return TotpVerifyResult::TokenExpired;
+            }
 
             let session = Session::new(&username, role, self.session_ttl_secs);
-            self.insert_session(session.clone()).await;
+            let Some(session) = self.insert_session(session, credential_epoch).await else {
+                return TotpVerifyResult::TokenExpired;
+            };
+            self.lockout.record_success(&username);
             return TotpVerifyResult::Success(session);
         }
 
@@ -2086,14 +2279,27 @@ impl AuthManager {
     }
 
     /// Confirms and activates TOTP for a user using initial code verification.
+    ///
+    /// Returns false for an invalid code or a failed users-file write; request
+    /// handlers use [`Self::try_confirm_totp_setup`] to report the difference.
     pub async fn confirm_totp_setup(&self, username: &str, code: &str) -> bool {
+        self.try_confirm_totp_setup(username, code).await.is_ok()
+    }
+
+    /// Confirms and activates TOTP, failing closed when the users file cannot
+    /// be written.
+    pub(crate) async fn try_confirm_totp_setup(
+        &self,
+        username: &str,
+        code: &str,
+    ) -> Result<(), TotpMutationError> {
         let item = lock(&self.pending_totp_setups).remove(username);
         let Some(mut item) = item else {
-            return false;
+            return Err(TotpMutationError::InvalidCode);
         };
 
         if Instant::now().duration_since(item.created_at) > PENDING_TOTP_TTL {
-            return false;
+            return Err(TotpMutationError::InvalidCode);
         }
 
         let _totp_guard = self.totp_verification_lock.lock().await;
@@ -2105,28 +2311,32 @@ impl AuthManager {
         })
         .await;
 
-        let Ok((mut config, ok)) = verified else {
-            return false;
-        };
+        let (mut config, ok) = verified.map_err(|_| TotpMutationError::InvalidCode)?;
         if !ok {
-            return false;
+            return Err(TotpMutationError::InvalidCode);
         }
 
         config.enabled = true;
-        {
+        let previous = {
             let mut users = lock(&self.users);
             let Some(user) = users.get_mut(username) else {
-                return false;
+                return Err(TotpMutationError::NotFound);
             };
+            let previous = user.clone();
             user.totp = Some(config);
+            user.credential_epoch = self.next_credential_epoch();
+            previous
+        };
+        if let Err(e) = self.try_save_users_async().await {
+            lock(&self.users).insert(previous.username.clone(), previous);
+            return Err(TotpMutationError::Persistence(e.to_string()));
         }
-        self.save_users_async().await;
         // Changing the second factor invalidates existing sessions and every
         // API token owned by the account, matching the disable lifecycle: a
         // credential must not outlive the factor it was issued under.
         self.purge_user_sessions(username).await;
         self.revoke_tokens_for_owner(username).await;
-        true
+        Ok(())
     }
 
     /// Returns true when the user has TOTP enabled.
@@ -2168,52 +2378,90 @@ impl AuthManager {
                     user.totp = Some(updated);
                 }
             }
-            self.save_users_async().await;
+            if let Err(e) = self.try_save_users_async().await {
+                // A consumed backup code or advanced replay counter that did
+                // not reach disk must not authorize a sensitive operation.
+                tracing::error!(error = %e, "Failed to persist TOTP verification state");
+                return false;
+            }
         }
         ok
     }
 
     /// Disables TOTP 2FA for a user and invalidates their sessions.
+    ///
+    /// Returns false for a missing account or a failed users-file write;
+    /// request handlers use [`Self::try_disable_totp`] to report the
+    /// difference.
     pub async fn disable_totp(&self, username: &str) -> bool {
-        let found = {
+        self.try_disable_totp(username).await.is_ok()
+    }
+
+    /// Disables TOTP, failing closed when the users file cannot be written.
+    pub(crate) async fn try_disable_totp(&self, username: &str) -> Result<(), TotpMutationError> {
+        let previous = {
             let mut users = lock(&self.users);
-            match users.get_mut(username) {
-                Some(user) => {
-                    user.totp = None;
-                    true
-                }
-                None => false,
+            let Some(user) = users.get_mut(username) else {
+                return Err(TotpMutationError::NotFound);
+            };
+            if user.totp.is_none() {
+                return Ok(());
             }
+            let previous = user.clone();
+            user.totp = None;
+            user.credential_epoch = self.next_credential_epoch();
+            previous
         };
-        if !found {
-            return false;
+        if let Err(e) = self.try_save_users_async().await {
+            lock(&self.users).insert(previous.username.clone(), previous);
+            return Err(TotpMutationError::Persistence(e.to_string()));
         }
         self.purge_user_sessions(username).await;
         // Disabling a second factor is a credential change: owned API tokens
         // must not outlive it.
         self.revoke_tokens_for_owner(username).await;
-        self.save_users_async().await;
-        true
+        Ok(())
     }
 
     /// Validates an active session from a cookie.
+    ///
+    /// Besides TTL and the global auth generation, the account must still
+    /// exist with the same role and credential epoch the session was issued
+    /// under. This makes password/role/TOTP/deletion revocations effective
+    /// even when a session insert raced the mutation or a persisted session
+    /// file outlived it.
     pub fn validate_session(&self, session_id: &str) -> Option<Session> {
-        let mut sessions = lock(&self.sessions);
-        if let Some(session) = sessions.get(session_id) {
-            let stale_generation = session.generation != self.generation;
-            let expired = session.is_expired();
-            if stale_generation || expired {
-                sessions.remove(session_id);
+        let session = {
+            let sessions = lock(&self.sessions);
+            sessions.get(session_id)?.clone()
+        };
+        let invalid = if session.generation != self.generation || session.is_expired() {
+            true
+        } else {
+            match session.credential_epoch {
+                // Prefix/legacy sessions have no epoch: force re-login.
+                None => true,
+                Some(epoch) => {
+                    let users = lock(&self.users);
+                    users.get(&session.username).is_none_or(|user| {
+                        user.credential_epoch != epoch || user.role != session.role
+                    })
+                }
+            }
+        };
+        if invalid {
+            let mut sessions = lock(&self.sessions);
+            if sessions.remove(session_id).is_some() {
                 // Readers may prune as a side effect; the pruner persists this
                 // removal within 60 seconds (revision guards the retry).
                 self.sessions_revision.fetch_add(1, Ordering::SeqCst);
                 self.sessions_dirty.store(true, Ordering::SeqCst);
-                return None;
             }
-            Some(session.clone())
-        } else {
-            None
+            return None;
         }
+        // Re-read after the user-table check: a concurrent revocation may have
+        // removed the session in the meantime. Never resurrect the old copy.
+        lock(&self.sessions).get(session_id).cloned()
     }
 
     /// Logs out and destroys an active session.
@@ -2269,6 +2517,14 @@ impl AuthManager {
     ) -> Result<(ApiTokenMeta, CreateTokenResponse), CreateTokenError> {
         let (mut meta, resp) = generate_token(name, scope);
         meta.generation = self.generation;
+        meta.credential_epoch = match owner {
+            Some(owner) => lock(&self.users)
+                .get(owner)
+                .map(|user| user.credential_epoch),
+            // Ownerless tokens are not tied to an account. `Some(0)` marks a
+            // post-upgrade token so legacy epochless entries can be rejected.
+            None => Some(0),
+        };
         meta.owner = owner.map(str::to_string);
         if self.token_default_ttl_days > 0 {
             let ttl_secs = i64::try_from(self.token_default_ttl_days)
@@ -2365,46 +2621,59 @@ impl AuthManager {
     pub fn validate_token(&self, token: &str) -> Option<ApiTokenMeta> {
         let hash = hash_token(token);
         let hash_bytes = hash.as_bytes();
-        let mut tokens = lock(&self.tokens);
+        let key = {
+            let tokens = lock(&self.tokens);
+            let mut matched_key: Option<String> = None;
+            for stored_hash in tokens.keys() {
+                let stored_bytes = stored_hash.as_bytes();
+                if stored_bytes.len() == hash_bytes.len()
+                    && bool::from(stored_bytes.ct_eq(hash_bytes))
+                {
+                    matched_key = Some(stored_hash.clone());
+                }
+            }
+            matched_key?
+        };
+
+        let meta = {
+            let tokens = lock(&self.tokens);
+            tokens.get(&key)?.clone()
+        };
         let now = chrono::Utc::now().timestamp();
-
-        let mut matched_key: Option<String> = None;
-        for stored_hash in tokens.keys() {
-            let stored_bytes = stored_hash.as_bytes();
-            if stored_bytes.len() == hash_bytes.len() && bool::from(stored_bytes.ct_eq(hash_bytes))
-            {
-                matched_key = Some(stored_hash.clone());
+        let invalid = if meta.generation != self.generation
+            || meta.expires_at.is_some_and(|expires_at| now >= expires_at)
+        {
+            true
+        } else {
+            match meta.credential_epoch {
+                // Legacy tokens have no epoch: re-issue after upgrade.
+                None => true,
+                Some(epoch) => match meta.owner.as_deref() {
+                    // Ownerless tokens are Admin-managed and not tied to an
+                    // account; the global generation still applies.
+                    None => false,
+                    Some(owner) => {
+                        let users = lock(&self.users);
+                        users.get(owner).is_none_or(|user| {
+                            user.credential_epoch != epoch || user.role < meta.scope
+                        })
+                    }
+                },
             }
+        };
+        let mut tokens = lock(&self.tokens);
+        if invalid {
+            if tokens.remove(&key).is_some() {
+                self.tokens_revision.fetch_add(1, Ordering::SeqCst);
+                self.tokens_dirty.store(true, Ordering::SeqCst);
+            }
+            return None;
         }
-
-        if let Some(key) = matched_key {
-            if tokens
-                .get(&key)
-                .is_some_and(|meta| meta.generation != self.generation)
-            {
-                tokens.remove(&key);
-                self.tokens_revision.fetch_add(1, Ordering::SeqCst);
-                self.tokens_dirty.store(true, Ordering::SeqCst);
-                return None;
-            }
-            if tokens
-                .get(&key)
-                .and_then(|meta| meta.expires_at)
-                .is_some_and(|expires_at| now >= expires_at)
-            {
-                tokens.remove(&key);
-                self.tokens_revision.fetch_add(1, Ordering::SeqCst);
-                self.tokens_dirty.store(true, Ordering::SeqCst);
-                return None;
-            }
-            if let Some(meta) = tokens.get_mut(&key) {
-                meta.last_used = Some(chrono::Utc::now().timestamp_millis());
-                self.tokens_revision.fetch_add(1, Ordering::SeqCst);
-                self.tokens_dirty.store(true, Ordering::SeqCst);
-                return Some(meta.clone());
-            }
-        }
-        None
+        let meta = tokens.get_mut(&key)?;
+        meta.last_used = Some(chrono::Utc::now().timestamp_millis());
+        self.tokens_revision.fetch_add(1, Ordering::SeqCst);
+        self.tokens_dirty.store(true, Ordering::SeqCst);
+        Some(meta.clone())
     }
 
     /// Prunes expired sessions, partial tokens, pending TOTP setups, API
@@ -4455,10 +4724,13 @@ mod tests {
     fn test_save_users_is_constructor_only() {
         let source = include_str!("manager.rs");
         // Build needles at runtime so this test's own source cannot match them.
-        let private_initial_fn = format!("{}{}", "fn save_users", "_initial(&self) {");
+        let private_initial_fn = format!(
+            "{}{}",
+            "fn save_users", "_initial(&self) -> Result<(), AuthStorageError> {"
+        );
         assert!(
             source.lines().any(|line| line.trim() == private_initial_fn),
-            "the synchronous constructor-only writer must exist as a private fn"
+            "the synchronous constructor-only writer must exist as a private fallible fn"
         );
         let public_initial_fn = format!("pub {private_initial_fn}");
         assert!(
@@ -4467,7 +4739,7 @@ mod tests {
                 .any(|line| line.trim_start().starts_with(&public_initial_fn)),
             "save_users_initial must stay private"
         );
-        let constructor_calls = format!("{}{}", "mgr.save_users", "_initial();");
+        let constructor_calls = format!("{}{}", "mgr.save_users", "_initial()");
         assert_eq!(
             source.matches(&constructor_calls).count(),
             2,
@@ -4815,6 +5087,362 @@ mod tests {
         };
         assert!(!totp_debug.contains(&secret));
         assert!(totp_debug.contains("<redacted>"));
+    }
+
+    // ------------------------------------------------------------------
+    // Credential epoch / revocation races
+    // ------------------------------------------------------------------
+
+    fn install_login_gate(
+        mgr: &AuthManager,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *lock(&mgr.login_gate) = Some(LoginGate {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+        (reached, resume)
+    }
+
+    /// A password change that lands after the password was verified but before
+    /// the session insert must invalidate the in-flight login.
+    #[tokio::test]
+    async fn test_password_change_during_login_cannot_create_session() {
+        let mgr = AuthManager::new();
+        let (reached, resume) = install_login_gate(&mgr);
+        let login_mgr = mgr.clone();
+        let login =
+            tokio::spawn(async move { login_mgr.login("admin", "adminadmin", "127.0.0.1").await });
+
+        reached.notified().await;
+        assert!(mgr.update_user_password("admin", "NewAdminPassword1").await);
+        resume.notify_one();
+
+        let result = login.await.expect("login task");
+        assert!(
+            !matches!(result, LoginResult::Success(_)),
+            "an in-flight login must not outlive the password it verified: {result:?}"
+        );
+        assert_eq!(mgr.sessions_len(), 0);
+    }
+
+    /// Demoting an account while its login is in flight must not issue a
+    /// session carrying the old (higher) role.
+    #[tokio::test]
+    async fn test_demotion_during_login_cannot_create_session() {
+        let mgr = AuthManager::new();
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        let (reached, resume) = install_login_gate(&mgr);
+        let login_mgr = mgr.clone();
+        let login = tokio::spawn(async move {
+            login_mgr
+                .login("alice", "AlicePassword1", "127.0.0.1")
+                .await
+        });
+
+        reached.notified().await;
+        assert!(mgr.set_user_role("alice", Role::Viewer).await);
+        resume.notify_one();
+
+        let result = login.await.expect("login task");
+        assert!(
+            !matches!(result, LoginResult::Success(_)),
+            "a demoted account must not receive a session with its old role: {result:?}"
+        );
+        assert_eq!(mgr.sessions_len(), 0);
+    }
+
+    /// Deleting an account while its login is in flight must not create a
+    /// session for the removed account.
+    #[tokio::test]
+    async fn test_deletion_during_login_cannot_create_session() {
+        let mgr = AuthManager::new();
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        let (reached, resume) = install_login_gate(&mgr);
+        let login_mgr = mgr.clone();
+        let login = tokio::spawn(async move {
+            login_mgr
+                .login("alice", "AlicePassword1", "127.0.0.1")
+                .await
+        });
+
+        reached.notified().await;
+        assert!(mgr.delete_user("alice").await);
+        resume.notify_one();
+
+        let result = login.await.expect("login task");
+        assert!(
+            !matches!(result, LoginResult::Success(_)),
+            "a deleted account must not receive a session: {result:?}"
+        );
+        assert_eq!(mgr.sessions_len(), 0);
+    }
+
+    /// Enabling TOTP while a password-only login is in flight must force the
+    /// second factor instead of issuing a session that bypasses it.
+    #[tokio::test]
+    async fn test_totp_enable_during_login_cannot_bypass_second_factor() {
+        let mgr = AuthManager::new();
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        let (reached, resume) = install_login_gate(&mgr);
+        let login_mgr = mgr.clone();
+        let login = tokio::spawn(async move {
+            login_mgr
+                .login("alice", "AlicePassword1", "127.0.0.1")
+                .await
+        });
+
+        reached.notified().await;
+        enable_totp(&mgr, "alice").await;
+        resume.notify_one();
+
+        let result = login.await.expect("login task");
+        assert!(
+            !matches!(result, LoginResult::Success(_)),
+            "TOTP enablement must not be bypassed by an in-flight login: {result:?}"
+        );
+        assert_eq!(mgr.sessions_len(), 0);
+    }
+
+    /// Disabling TOTP while the second factor is being verified must not let
+    /// the in-flight verification re-enable the factor or issue a session.
+    #[tokio::test]
+    async fn test_totp_disable_during_verification_cannot_create_session() {
+        let mgr = AuthManager::new();
+        let setup = enable_totp(&mgr, "admin").await;
+        let LoginResult::TotpRequired { partial_token } =
+            mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("expected TOTP challenge");
+        };
+        let code = setup.backup_codes[1].clone();
+
+        let (reached, resume) = install_login_gate(&mgr);
+        let verify_mgr = mgr.clone();
+        let verify = tokio::spawn(async move {
+            verify_mgr
+                .verify_totp(&partial_token, &code, "127.0.0.1")
+                .await
+        });
+
+        reached.notified().await;
+        assert!(mgr.disable_totp("admin").await);
+        resume.notify_one();
+
+        let result = verify.await.expect("verify task");
+        assert!(
+            !matches!(result, TotpVerifyResult::Success(_)),
+            "a disabled second factor must not authenticate an in-flight verification: {result:?}"
+        );
+        assert!(!mgr.totp_enabled("admin"), "disable must win the race");
+        assert_eq!(mgr.sessions_len(), 0);
+    }
+
+    /// Even when the session/token revocation writes fail, a restart must not
+    /// resurrect credentials issued before a password change.
+    #[tokio::test]
+    async fn test_restart_rejects_credentials_older_than_password_change() {
+        let dir = auth_temp_dir("epoch_restart");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        let LoginResult::Success(session) = mgr.login("alice", "AlicePassword1", "127.0.0.1").await
+        else {
+            panic!("login failed");
+        };
+        let (_meta, token) = mgr
+            .create_token("stale", Role::Viewer, Some("alice"))
+            .await
+            .expect("token");
+        assert!(dir.join("sessions.toml").exists());
+        assert!(dir.join("tokens.toml").exists());
+
+        // The users write succeeds, but the revocation writes fail: this is
+        // the crash window where the old session/token files survive.
+        {
+            let mut rules = SECRET_WRITE_FAIL_AFTER
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            rules.push((dir.join("sessions.toml"), 0));
+            rules.push((dir.join("tokens.toml"), 0));
+        }
+        assert!(mgr.update_user_password("alice", "AlicePassword2").await);
+        drop(mgr);
+
+        let reloaded = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            reloaded.validate_session(&session.id).is_none(),
+            "a persisted session must not survive a password change"
+        );
+        assert!(
+            reloaded.validate_token(&token.token).is_none(),
+            "a persisted API token must not survive a password change"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sessions and tokens written before the credential epoch existed must be
+    /// rejected after upgrade (forced re-login / re-issue).
+    #[tokio::test]
+    async fn test_epochless_persisted_credentials_are_rejected() {
+        let dir = auth_temp_dir("epoch_legacy");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            drop(mgr);
+        }
+
+        let legacy_session = r#"
+[[sessions]]
+id = "legacy-session"
+username = "admin"
+role = "admin"
+created_at = 0
+expires_at = 9999999999
+csrf_token = ""
+generation = 0
+"#;
+        std::fs::write(dir.join("sessions.toml"), legacy_session).unwrap();
+
+        let plaintext = "sito_legacy_epochless_token";
+        let legacy_token = format!(
+            r#"
+[[tokens]]
+id = "tok_legacy"
+name = "legacy"
+hash = "{}"
+scope = "viewer"
+created_at = 1
+generation = 0
+owner = "admin"
+"#,
+            hash_token(plaintext)
+        );
+        std::fs::write(dir.join("tokens.toml"), legacy_token).unwrap();
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(
+            mgr.validate_session("legacy-session").is_none(),
+            "an epochless persisted session must force re-login after upgrade"
+        );
+        assert!(
+            mgr.validate_token(plaintext).is_none(),
+            "an epochless persisted token must be rejected after upgrade"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // Fail-closed user persistence
+    // ------------------------------------------------------------------
+
+    /// A failed role write must roll the role back and leave existing sessions
+    /// valid instead of reporting success.
+    #[tokio::test]
+    async fn test_role_change_rolls_back_when_persistence_fails() {
+        let dir = auth_temp_dir("role_persist_failure");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        let LoginResult::Success(session) = mgr.login("alice", "AlicePassword1", "127.0.0.1").await
+        else {
+            panic!("login failed");
+        };
+        SECRET_WRITE_FAIL_AFTER
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((dir.join("users.toml"), 0));
+
+        let err = mgr
+            .set_user_role_checked("alice", Role::Viewer)
+            .await
+            .expect_err("a failed users write must not report success");
+        assert!(matches!(err, UserMutationError::Persistence(_)));
+        assert_eq!(mgr.role_of("alice"), Some(Role::Operator));
+        assert!(
+            mgr.validate_session(&session.id).is_some(),
+            "a rolled-back role change must not revoke the account's session"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed TOTP enable write must not report success or leave the factor
+    /// enabled in memory.
+    #[tokio::test]
+    async fn test_totp_enable_rolls_back_when_persistence_fails() {
+        let dir = auth_temp_dir("totp_enable_persist_failure");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        let setup = mgr.init_totp_setup("alice").await.expect("setup");
+        SECRET_WRITE_FAIL_AFTER
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((dir.join("users.toml"), 0));
+
+        assert!(
+            !mgr.confirm_totp_setup("alice", &setup.backup_codes[0])
+                .await,
+            "a failed write must not report TOTP enabled"
+        );
+        assert!(!mgr.totp_enabled("alice"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed TOTP disable write must leave the factor enabled and report a
+    /// failure.
+    #[tokio::test]
+    async fn test_totp_disable_rolls_back_when_persistence_fails() {
+        let dir = auth_temp_dir("totp_disable_persist_failure");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        mgr.create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        enable_totp(&mgr, "alice").await;
+        SECRET_WRITE_FAIL_AFTER
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((dir.join("users.toml"), 0));
+
+        assert!(
+            !mgr.disable_totp("alice").await,
+            "a failed write must not report TOTP disabled"
+        );
+        assert!(
+            mgr.totp_enabled("alice"),
+            "the second factor must remain enabled when its removal did not land"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `reset-admin` must report a users-file write failure instead of
+    /// claiming the new credentials are installed.
+    #[tokio::test]
+    async fn test_reset_admin_reports_users_write_failure() {
+        let dir = auth_temp_dir("reset_persist_failure");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            assert!(mgr.update_user_password("admin", "OldAdminPassword1").await);
+        }
+        SECRET_WRITE_FAIL_AFTER
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((dir.join("users.toml"), 0));
+
+        let result = AuthManager::reset_admin_credentials(&dir, "NewAdminPassword1");
+        assert!(
+            result.is_err(),
+            "reset-admin must not report success when users.toml was not written"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
