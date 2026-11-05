@@ -342,13 +342,13 @@ jobs:
           # the explicit allowlist.
           platforms="$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" \
             --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}}{{with .Platform.Variant}}/{{.}}{{end}} {{end}}')"
-          for expected in linux/amd64 linux/arm64 linux/arm/v7; do
-            if ! printf '%s\n' "${platforms}" | tr ' ' '\n' | grep -Fxq "${expected}"; then
-              echo "::error::image ${IMAGE}@${DIGEST} is missing platform ${expected}"
-              echo "platforms: ${platforms}"
-              exit 1
-            fi
-          done
+          # BuildKit reports 64-bit ARM as linux/arm64/v8 while some builders
+          # omit the implicit variant. The helper accepts both spellings and
+          # still enforces linux/amd64, linux/arm64 and linux/arm/v7.
+          if ! printf '%s\n' "${platforms}" | scripts/check-release-platforms.sh; then
+            echo "::error::image ${IMAGE}@${DIGEST} is missing a required platform"
+            exit 1
+          fi
 
           # `provenance: true` and `sbom: true` must have attached attestations
           # to the pushed index; fail closed if either is missing.

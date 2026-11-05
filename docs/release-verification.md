@@ -84,9 +84,12 @@ docker buildx imagetools inspect "${IMAGE}:${TAG}" \
   --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}}{{with .Platform.Variant}}/{{.}}{{end}} {{end}}'
 ```
 
-Expected: includes `linux/amd64`, `linux/arm64`, and `linux/arm/v7`. Attestation
-manifests also appear as `unknown/unknown`; they are expected and are not
-release platforms.
+Expected: includes `linux/amd64`, `linux/arm64` (or the equivalent OCI/BuildKit
+spelling `linux/arm64/v8`), and `linux/arm/v7`. Attestation manifests also
+appear as `unknown/unknown`; they are expected and are not release platforms.
+The release job runs the same allowlist through
+`scripts/check-release-platforms.sh`, normalizing `linux/arm64/v8` to
+`linux/arm64`; the other two platforms are still mandatory.
 
 ### 3. Provenance attestation is present
 
