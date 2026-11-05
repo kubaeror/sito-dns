@@ -207,6 +207,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   a legacy chain-cache format drops unsafe root/TLD `Signed` entries on load.
   Genuinely stripped responses under a proven-signed zone and genuinely bogus
   zones still fail closed with SERVFAIL in `validate` mode.
+- **Container image publication is gated on the verified release**: the
+  `docker-build-push` job now waits for the tag/version check, the binary
+  builds, the signed release/SBOM publication and the artifact E2E
+  verification. A tag that does not match the workspace version stops the
+  workflow before anything is published. Prerelease tags (containing `-`)
+  publish only their full version tag, never `latest`, the moving
+  `<major>.<minor>` tag, or a stable GitHub release. After the push, the
+  workflow verifies that every generated tag resolves to the reported digest,
+  that the index contains `linux/amd64`, `linux/arm64` and `linux/arm/v7`, and
+  that the SLSA provenance and SPDX SBOM attestations are present; any mismatch
+  fails the job. See `docs/release-verification.md`.
 
 ## [1.9.1] - 2026-11-04
 
