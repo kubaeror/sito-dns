@@ -75,6 +75,14 @@ allow_plaintext_doh = false
 | `max_tcp_connections` | integer | `256` | Maximum concurrent TCP, DoT, and DoH client connections. |
 | `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
+> [!WARNING]
+> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 1.9.2 has **no DNS client allow-list**.
+> `rate_limit_per_ip` only limits rate; it does not authorize clients. A wildcard bind therefore accepts recursive queries from any source
+> that can reach the host. Restrict the DNS ports to your LAN with a host
+> firewall, or bind specific LAN addresses. The server emits a startup warning
+> when a wildcard DNS bind is combined with an enabled DNS port. A
+> default-deny DNS client ACL is planned for 1.10.0.
+
 ---
 
 ## 4. `[dns.cache]` — Caching Layer
@@ -313,13 +321,24 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 |---|---|---|---|
 | `web.enabled` | boolean | `true` | Enable the web dashboard and REST API. |
 | `web.port` | integer | `8080` | Port for the Web Dashboard and REST API (`/api/v1/`; must be ≥ 1). |
-| `web.bind` | string (IP address) | `"0.0.0.0"` | Bind address for the web server. |
+| `web.bind` | string (IP address) | `"0.0.0.0"` | Bind address for the web server. The admin UI is served over plain HTTP; see the exposure warning below. |
 | `web.metrics_auth` | boolean | `true` | Require authentication (token or session) for `/metrics`. |
 | `web.trusted_proxies`| array of IP addresses | `[]` | Individual proxy IPs trusted to supply `X-Forwarded-For`/`X-Forwarded-Proto` (CIDR is **not** supported here). |
 | `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required (must be ≥ 1). |
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
 | `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL, but are revalidated against `users.toml` on load and on every request (account exists, role and credential epoch match); entries written before credential epochs existed are rejected once, so users re-login and API tokens are re-issued after upgrading. Corrupt stores are backed up and start empty. Stop the service before `sito reset-sessions`; the reset refuses to run against a live server unless `--force` is given. |
 | `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
+
+> [!WARNING]
+> `web.bind` defaults to `0.0.0.0` and the admin UI is served over plain HTTP
+> by axum (the DNS `[tls]` certificate never protects the admin scheme). Do not
+> expose port `8080` to the internet. The server emits a startup warning when
+> the UI is reachable beyond loopback unless an `https://` `web.public_url` (or
+> `web.tls_terminated_by_proxy = true` with no public URL) declares a TLS
+> reverse proxy. For remote access, bind `web.bind = "127.0.0.1"` and use an SSH
+> tunnel or reverse proxy. The loopback default is planned for 1.10.0; 1.9.2
+> keeps the historical default so existing configurations keep working.
+
 
 The running server holds an exclusive advisory lease on `<data_dir>/sito.pid`
 and keeps users, sessions, API tokens and the auth generation in memory.

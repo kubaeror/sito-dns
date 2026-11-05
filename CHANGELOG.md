@@ -26,6 +26,13 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   failed transfer is reported instead of being silently skipped.
 
 ### Fixed
+- **Installer and docs recommend LAN-only exposure**: `install.sh` no longer
+  tells operators to open 53, 853, 443 and 8080 to everyone. It now prints
+  LAN-scoped DNS firewall rules, an SSH tunnel for the admin UI, and
+  reverse-proxy guidance, and the primary docs/compose comments explain the
+  `127.0.0.1:8080`/TLS-proxy options without changing the shipped mappings.
+  Existing 1.9.2 configurations keep working; the default-bind change and a
+  DNS client ACL remain planned for 1.10.0.
 - **Web UI update form sends the CSRF token**: the system page's
   "Download & Install" button called native `form.submit()`, bypassing htmx
   and omitting the session-bound CSRF value, so the middleware rejected the

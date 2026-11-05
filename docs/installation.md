@@ -4,6 +4,74 @@ This guide covers deploying **sito** on Linux hosts using the automated one-line
 
 ---
 
+## Network Exposure and Firewall
+
+**Read this before the host is reachable from an untrusted network.** The
+1.9.2 defaults are deliberately unchanged for compatibility, so they are
+LAN defaults, not internet-safe defaults:
+
+* `web.bind` defaults to `0.0.0.0`, the admin UI is served over plain HTTP, and
+  port `8080` accepts setup and login requests from every reachable source.
+  There is no TLS in the admin listener itself.
+* `dns.bind` defaults to `["0.0.0.0", "::"]` and 1.9.2 has no DNS client
+  allow-list. `dns.rate_limit_per_ip` limits request rate; it is **not** an
+  access control. Any host that can reach the DNS ports can recurse through
+  this server.
+
+Sito logs a startup warning for each exposed listener. Access the panel only
+from a trusted LAN or through an SSH tunnel, and keep the DNS ports closed to
+the internet.
+
+### Recommended LAN-only firewall
+
+Replace `192.168.0.0/24` with your LAN subnet. The examples intentionally do
+**not** open the admin port:
+
+```bash
+# UFW
+sudo ufw default deny incoming
+sudo ufw allow from 192.168.0.0/24 to any port 53 proto udp comment 'sito DNS (UDP, LAN)'
+sudo ufw allow from 192.168.0.0/24 to any port 53 proto tcp comment 'sito DNS (TCP, LAN)'
+sudo ufw enable
+
+# firewalld (equivalent)
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.0.0/24" port port="53" protocol="udp" accept'
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.0.0/24" port port="53" protocol="tcp" accept'
+sudo firewall-cmd --reload
+```
+
+If you enable DoT/DoH/DoH3, restrict `853`/`443` to the clients that actually
+need them instead of opening them to everyone.
+
+### Safe admin access
+
+Do not publish port `8080` to the internet. Use an SSH tunnel from your
+workstation:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 user@server
+# then browse http://127.0.0.1:8080
+```
+
+For browser access without a tunnel, keep `web.bind = "127.0.0.1"` and put a
+TLS reverse proxy on the same host in front of it (set `web.trusted_proxies`
+and, for external URLs, `web.public_url = "https://..."`
+or `web.tls_terminated_by_proxy = true`). For DNS clients outside the LAN,
+restrict the DNS ports to those client addresses at the firewall.
+
+Docker users: `-p 8080:8080` publishes the panel on every host interface.
+Prefer `-p 127.0.0.1:8080:8080` plus an SSH tunnel or reverse proxy, and publish
+DNS only to the interface your clients use. The compose file documents this
+choice without changing the historical mapping.
+
+> [!NOTE]
+> Changing the default to loopback (`web.bind = "127.0.0.1"`) and adding a
+> default-deny DNS client ACL is planned for **1.10.0**. 1.9.2 keeps existing
+> configurations working; the startup warning and this firewall guidance are
+> the patch-release mitigation.
+
+---
+
 ## 1. Quick Install (Automated Shell Script)
 
 For systemd-based distributions (Debian/Ubuntu, Arch, RHEL/Fedora). Alpine
@@ -22,7 +90,9 @@ The installer automatically:
 4. Grants `CAP_NET_BIND_SERVICE` capability to bind ports 53 and 443 without root.
 5. Deploys the hardened systemd unit, enables, and starts the service.
 6. Runs post-install health verification (`systemctl is-active` and HTTP check).
-7. Prompts you to complete setup via the web wizard at `http://<server-ip>:8080`.
+7. Prompts you to complete setup via the web wizard at `http://<server-ip>:8080`
+   and prints LAN-only firewall guidance (it does not recommend publishing the
+   admin or DNS ports to the internet).
 
 ---
 

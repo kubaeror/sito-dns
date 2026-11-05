@@ -88,6 +88,17 @@ Client Query ──▶ [sito-transport] (UDP / TCP / DoT / DoH / DoQ / DoH3)
 curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/main/contrib/install.sh | sudo bash
 ```
 
+### Network exposure (read before exposing the host)
+
+The 1.9.2 defaults are intended for a trusted LAN: the admin UI listens on
+`0.0.0.0:8080` over plain HTTP, and DNS listens on `0.0.0.0`/`::` with no
+client allow-list. **Do not expose port 8080 to the internet.** Restrict DNS to
+your LAN with a host firewall, or bind `dns.bind` to your LAN address. For
+remote admin access, bind `web.bind = "127.0.0.1"` and use an SSH tunnel or a
+TLS reverse proxy. The server logs a startup warning for each exposed listener.
+The loopback-by-default change and a DNS client ACL are planned for 1.10.0;
+existing configurations keep working in 1.9.2.
+
 ### Option 2: Docker / Docker Compose
 ```yaml
 services:
@@ -139,7 +150,7 @@ cargo build --release --locked --features "embed-ui,mimalloc"
 ### 🧙 First-Time Setup Wizard
 On a fresh installation without a configuration file, **sito** starts in **setup-pending mode** on port `8080` (DNS listener ports 53/853/443 remain closed until initial setup is confirmed).
 
-Open **`http://<server-ip>:8080`** in any browser to launch the 6-section configuration wizard:
+Open **`http://<server-ip>:8080`** from a trusted LAN host (or through an SSH tunnel) to launch the 6-section configuration wizard:
 * **Administrator Account:** Set a custom admin username and a password. The wizard rejects the bootstrap password `adminadmin`, passwords shorter than 8 characters, and passwords containing whitespace or control characters. The bootstrap account cannot log in while setup is pending.
 * **DNS Listeners:** Configure IPv4/IPv6 bindings, UDP/TCP, DoT, and DoH ports.
 * **Upstream Resolvers:** Select presets (Cloudflare, Quad9, Google) with live latency testing.
