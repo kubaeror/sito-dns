@@ -94,11 +94,11 @@ serve_stale_hours = 12
 |---|---|---|---|
 | `enabled` | boolean | `true` | Enables or disables in-memory caching. |
 | `size_mb` | integer | `64` | Memory allocation ceiling for the cache in megabytes. |
-| `min_ttl` | integer | `60` | Minimum TTL (seconds) for unvalidated cached answers (overrides smaller upstream TTLs). DNSSEC-validated (`Secure`) answers keep the smaller authenticated TTL/RRSIG validity, so this floor can never extend their lifetime. |
+| `min_ttl` | integer | `60` | Minimum TTL (seconds) for unvalidated cached answers (overrides smaller upstream TTLs). DNSSEC-validated (`Secure`) answers keep the smaller authenticated TTL/RRSIG validity, so this floor can never extend their lifetime; Secure negative answers are also capped by the NSEC/NSEC3 denial proof TTL. |
 | `max_ttl` | integer | `86400` | Maximum TTL (seconds) to assign to cached answers (caps excessively high upstream TTLs). |
 | `negative_ttl_max` | integer | `3600` | Maximum TTL (seconds) for negative caching (NXDOMAIN / NODATA). |
 | `prefetch` | boolean | `true` | When `true`, automatically re-resolves frequently requested domains before TTL expires. |
-| `serve_stale_hours` | integer | `12` | Hours to serve expired cache records as fallback when upstreams are unreachable. Stale answers are served with all DNSSEC records removed and AD=0; entries cached without local validation (`Unchecked`) are not served while DNSSEC validation is active. |
+| `serve_stale_hours` | integer | `12` | Hours to serve expired cache records as fallback when upstreams are unreachable. Stale answers are served with all DNSSEC records removed and AD=0; while DNSSEC validation is active, entries cached without validation (`Unchecked`) or with an inconclusive result (`Indeterminate`) are not served. |
 
 ---
 

@@ -22,11 +22,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Secure answers no longer outlive their signature**: `dns.cache.min_ttl` is
   a floor for unvalidated data only. Raising a `Secure` entry above its
   authenticated TTL could serve AD=1 data after the RRSIG original TTL or
-  validity expired; validated records now keep the smaller TTL.
+  validity expired; validated records now keep the smaller TTL. Secure
+  NXDOMAIN/NODATA lifespans are additionally capped by the NSEC/NSEC3 denial
+  records and their RRSIGs, so a long-lived SOA can no longer extend a
+  validated negative answer past its proof.
 - **Stale cache entries follow the validation policy**: the RFC 8767 stale
-  fallback now uses the same status gate as fresh hits, so an `Unchecked` entry
-  is never served while local validation is active. Stale sanitization removes
-  every DNSSEC RR type (RRSIG, DNSKEY, DS, NSEC/NSEC3), not just RRSIGs.
+  fallback now refuses both `Unchecked` and `Indeterminate` entries while local
+  validation is active (an `Indeterminate` entry may be an inconclusive answer
+  or, in log-only mode, a Bogus result). Only authenticated `Secure`/`Insecure`
+  decisions are served from the stale window, always with AD=0. Stale
+  sanitization removes every DNSSEC RR type (RRSIG, DNSKEY, DS, NSEC/NSEC3),
+  not just RRSIGs.
 - **DNSSEC policy changes flush cached answers**: changing `dns.dnssec.mode`,
   `validate`, `trust_anchors`, `nta` or `ntp` invalidates the response cache,
   so a decision made under the old policy (Secure after an anchor removal, or
