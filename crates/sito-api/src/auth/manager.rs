@@ -106,12 +106,14 @@ pub enum CreateTokenError {
 
 /// Failure to apply a user mutation that must never leave the deployment
 /// without an Admin account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UserMutationError {
     #[error("user not found")]
     NotFound,
     #[error("operation would remove the last remaining admin account")]
     LastAdmin,
+    #[error("failed to persist users file: {0}")]
+    Persistence(String),
 }
 
 #[derive(Debug, Clone)]
@@ -261,10 +263,37 @@ pub(crate) static SECRET_WRITE_START_SIGNALS: Mutex<
     Vec<(PathBuf, tokio::sync::oneshot::Sender<()>)>,
 > = Mutex::new(Vec::new());
 
+/// Test-only write failures: `(path, skip)` allows the next `skip` writes to
+/// succeed and then fails the following write for that path exactly once.
+#[cfg(test)]
+pub(crate) static SECRET_WRITE_FAIL_AFTER: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
 /// Atomically writes a secret file with owner-only permissions.
 fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
     #[cfg(test)]
     {
+        let should_fail = {
+            let mut rules = SECRET_WRITE_FAIL_AFTER
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(index) = rules.iter().position(|(rule_path, _)| rule_path == path) {
+                if rules[index].1 == 0 {
+                    rules.remove(index);
+                    true
+                } else {
+                    rules[index].1 -= 1;
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if should_fail {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected users-file write failure",
+            ));
+        }
         let signal = {
             let mut signals = SECRET_WRITE_START_SIGNALS
                 .lock()
@@ -1535,7 +1564,7 @@ impl AuthManager {
         username: &str,
         protect_last_admin: bool,
     ) -> Result<(), UserMutationError> {
-        {
+        let (removed, previous_default_admin_active) = {
             let mut users = lock(&self.users);
             let Some(role) = users.get(username).map(|user| user.role) else {
                 return Err(UserMutationError::NotFound);
@@ -1546,10 +1575,21 @@ impl AuthManager {
             {
                 return Err(UserMutationError::LastAdmin);
             }
-            users.remove(username);
-        }
+            let removed = users.remove(username);
+            (removed, self.default_admin_active.load(Ordering::SeqCst))
+        };
         if username == "admin" {
             self.default_admin_active.store(false, Ordering::SeqCst);
+        }
+        if let Err(e) = self.try_save_users_async().await {
+            // The account is still on disk: restore it (and the bootstrap
+            // flag) so a failed write cannot look like a successful deletion.
+            if let Some(removed) = removed {
+                lock(&self.users).insert(username.to_string(), removed);
+            }
+            self.default_admin_active
+                .store(previous_default_admin_active, Ordering::SeqCst);
+            return Err(UserMutationError::Persistence(e.to_string()));
         }
         // A deleted account must lose access immediately: sessions are
         // not re-validated against the user table on every request.
@@ -1557,7 +1597,6 @@ impl AuthManager {
         // API tokens are credentials for the account too: never leave
         // them usable after the account is gone.
         self.revoke_tokens_for_owner(username).await;
-        self.save_users_async().await;
         Ok(())
     }
 
@@ -3565,6 +3604,109 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Regression: a custom-named Admin (or deletion of the literal `admin`
+    /// while another Admin exists) must survive restart without re-entering
+    /// setup-token mode.
+    #[tokio::test]
+    async fn test_custom_admin_survives_restart_without_setup_token() {
+        let dir = auth_temp_dir("custom_admin_restart");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            mgr.create_user("owner", "OwnerPassword123!", Role::Admin)
+                .await;
+            assert!(mgr.delete_user_checked("admin").await.is_ok());
+        }
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(mgr.has_user("owner"));
+        assert!(!mgr.has_user("admin"));
+        assert!(!mgr.setup_token_required());
+        assert!(!mgr.is_default_admin_active());
+        assert!(!mgr.is_first_run());
+        assert!(matches!(
+            mgr.login("owner", "OwnerPassword123!", "127.0.0.1").await,
+            LoginResult::Success(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store with only non-admin accounts has no usable Admin, so it must
+    /// stay recoverable through the setup token even though no default admin
+    /// exists.
+    #[tokio::test]
+    async fn test_no_admin_account_still_provisions_setup_token() {
+        let dir = auth_temp_dir("no_admin_token");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            mgr.create_user("viewer", "ViewerPassword123!", Role::Viewer)
+                .await;
+            assert!(mgr.delete_user("admin").await);
+        }
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        assert!(!mgr.has_user("admin"));
+        assert!(!mgr.is_first_run());
+        assert!(mgr.setup_token_required());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: a valid but wrong 32-byte `totp.key` must not leave the
+    /// server unable to start after `reset-admin` preserved TOTP accounts.
+    #[tokio::test]
+    async fn test_reset_admin_drops_totp_unreadable_by_current_key() {
+        let dir = auth_temp_dir("reset_wrong_totp_key");
+        {
+            let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+            mgr.create_user("alice", "AlicePassword123!", Role::Operator)
+                .await;
+            let setup = mgr.init_totp_setup("alice").await.expect("totp setup");
+            assert!(
+                mgr.confirm_totp_setup("alice", &setup.backup_codes[0])
+                    .await
+            );
+            assert!(mgr.totp_enabled("alice"));
+        }
+        // Replace the key with a structurally valid but different 32-byte key.
+        std::fs::write(dir.join("totp.key"), [0x5Au8; 32]).unwrap();
+
+        AuthManager::reset_admin_credentials(&dir, "NewAdminPassword123!").unwrap();
+
+        let mgr = AuthManager::with_storage(&dir, 24, 5)
+            .expect("preserved accounts must not make startup fail after reset");
+        assert!(mgr.has_user("alice"));
+        assert!(!mgr.totp_enabled("alice"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed users-file write during deletion must restore the account and
+    /// surface an error instead of reporting a successful deletion.
+    #[tokio::test]
+    async fn test_delete_user_rolls_back_when_persistence_fails() {
+        let dir = auth_temp_dir("delete_persist_failure");
+        let mgr = AuthManager::with_storage(&dir, 24, 5).unwrap();
+        mgr.create_user("owner", "OwnerPassword123!", Role::Admin)
+            .await;
+        let users_path = dir.join("users.toml");
+        SECRET_WRITE_FAIL_AFTER
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((users_path.clone(), 0));
+
+        let err = mgr
+            .delete_user_checked("admin")
+            .await
+            .expect_err("failed users write must not report success");
+        assert!(matches!(err, UserMutationError::Persistence(_)));
+        assert!(mgr.has_user("admin"));
+        assert!(mgr.has_user("owner"));
+        assert!(mgr.is_default_admin_active());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

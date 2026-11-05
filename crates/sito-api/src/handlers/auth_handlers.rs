@@ -543,6 +543,9 @@ pub(crate) fn user_mutation_problem(
         UserMutationError::LastAdmin => {
             ProblemDetails::bad_request(format!("Cannot {action} the last remaining admin account"))
         }
+        UserMutationError::Persistence(detail) => ProblemDetails::internal_error(format!(
+            "Failed to persist the user store while attempting to {action}: {detail}"
+        )),
     }
 }
 
