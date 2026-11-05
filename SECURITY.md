@@ -55,4 +55,4 @@ We commit to the following Service Level Agreement (SLA) for confirmed reports:
 - **ReDoS Prevention:** Rule parsing DFA engines (`regex-automata`) are guaranteed linear-time and non-backtracking.
 - **Backpressure Protection:** Unbounded queues and channel buffers are strictly prohibited on the DNS query hot path to protect against DoS-induced resource exhaustion.
 - **Dependency Audits:** Automated `cargo-deny` checks run on every PR to prevent vulnerable or banned crates from entering the dependency tree.
-- **Continuous Fuzzing:** Nightly `cargo-fuzz` targets test wire-format decoders, client ID extractors, and configuration parsers.
+- **Fuzzing Harnesses:** `cargo-fuzz` targets cover wire-format decoders, client ID extractors, and configuration parsers. The scheduled Nightly Fuzzing workflow runs them on a pinned nightly toolchain; PR CI compiles every target so harness bit-rot is caught before merge.
