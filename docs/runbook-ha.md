@@ -13,6 +13,39 @@ This runbook provides step-by-step operational procedures for managing, maintain
 - **Read-Only Enforcement**: Slave REST API endpoints reject mutating operations (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP `409 Conflict` and return the `X-Dnsd-Master: <master_url>` header to redirect operators to the authoritative master.
 - **Statistics Aggregation**: Slaves report traffic and upstream metrics to the master every 30 seconds via `stats_report`. The master stores the latest report per slave and exposes it through `GET /api/v1/ha/slaves`; replica counters are **not** merged into the master's own Prometheus registry. Scrape each replica's `/metrics` endpoint separately (labels such as `sito_ha_config_version{instance="..."}` identify the node).
 
+### Certificate ownership and the runtime user
+
+`sito ha gen-certs` writes private keys mode `0600`. The HA listener runs
+unprivileged, so ownership matters as much as the mode:
+
+- **systemd** runs as `User=sito` (see `contrib/systemd/sito.service`).
+- **Docker/Compose** runs as uid/gid `65532` (distroless `nonroot`).
+
+Generate as root with an explicit ownership transfer, or chown the copied
+files before starting the service:
+
+```bash
+# systemd host
+sudo sito ha gen-certs --dir /etc/sito/certs --master --slave \
+  --uid "$(id -u sito)" --gid "$(id -g sito)"
+
+# Docker Compose bind mount
+sudo chown -R 65532:65532 ha/master/certs ha/slave/certs
+sudo chmod 0600 ha/master/certs/*.key ha/slave/certs/*.key
+```
+
+`--uid` and `--gid` must be supplied together. The chown happens after every
+file is written and a failed transfer aborts generation, so a root-owned key
+cannot be mistaken for a working HA setup. Certificates (`*.crt`) may be
+world-readable; the private keys (`*.key`) must stay `0600`.
+
+A key that the runtime cannot read fails closed: the master listener logs
+`Failed to initialize mTLS for master HA replication server: ... Permission
+denied`, `GET /api/v1/ha/status` reports `ready: false` with a
+`readiness_reason`, and the `healthcheck` subcommand fails even though DNS
+still answers. The same visibility applies to a failed listener bind, a slave
+that cannot complete the handshake, and a slave that has not reached `Synced`.
+
 ---
 
 ## 2. Manual Slave -> Master Promotion Procedure
@@ -124,9 +157,11 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
    `sito` uses the certificates configured in `[ha] cert`/`key` for mTLS and
    pins the peer certificate with BLAKE3 fingerprints. If the promoted node
    uses the old master's certificate and its private key, no slave changes are
-   needed. Otherwise regenerate a certificate suite
-   (`sito ha gen-certs --dir /etc/sito/certs --master --slave`) and distribute
-   the values to every remaining slave:
+   needed. Otherwise regenerate a certificate suite with ownership transferred
+   to the runtime user
+   (`sito ha gen-certs --dir /etc/sito/certs --master --slave --uid "$(id -u sito)" --gid "$(id -g sito)"`,
+   or uid/gid `65532` for Docker) and distribute the values to every remaining
+   slave:
    ```toml
    [ha]
    master_fingerprint = "blake3:<BLAKE3_FINGERPRINT_OF_NEW_MASTER_CERT>"
@@ -159,6 +194,7 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
      "instance_name": "sito-master-promoted",
      "version": 11,
      "state": "active",
+     "ready": true,
      "slaves_connected": 0,
      "diverged": false,
      "master_pubkey": "9f2c...64-hex-chars"
@@ -167,7 +203,9 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
    `version` must be greater than or equal to the highest version the other
    slaves had already applied. `diverged` must be `false`; when it is `true`,
    read `diverged_reason` and follow the recovery steps above before pointing
-   clients at the node.
+   clients at the node. `ready` must be `true`; when it is `false`, read
+   `readiness_reason` (for example an unreadable key or a listener bind
+   failure) before promoting traffic to this node.
 
 7. **Update network routing and DHCP**:
    Update your router or DHCP server (e.g. MikroTik RouterOS) to point client DNS queries to the new master's IP:
@@ -210,13 +248,17 @@ values in each node's own `config.toml`.
 `sito` uses self-signed mTLS certificates with BLAKE3 fingerprint pinning. Follow this procedure to rotate certificates without causing replication interruption or DNS downtime.
 
 ### Step 1: Generate a New Certificate Suite
-Run the built-in certificate generator:
+Run the built-in certificate generator with ownership transferred to the
+runtime user (`sito` for systemd, uid/gid `65532` for Docker):
 ```bash
-sito ha gen-certs --dir /etc/sito/certs/next --master --slave \
-  --san 192.168.1.10 --san dns-master.lan
+sudo sito ha gen-certs --dir /etc/sito/certs/next --master --slave \
+  --san 192.168.1.10 --san dns-master.lan \
+  --uid "$(id -u sito)" --gid "$(id -g sito)"
 ```
-`--master` and `--slave` are boolean selectors for which certificate pairs to
-generate; omitting both generates the complete set (CA + master + slave).
+`--uid` and `--gid` must be supplied together; a failed chown aborts
+generation. `--master` and `--slave` are boolean selectors for which
+certificate pairs to generate; omitting both generates the complete set
+(CA + master + slave).
 `--san` is repeatable and adds a hostname or IP address to both certificates
 (in addition to `localhost`, `sito-master` / `sito-slave`, `127.0.0.1` and
 `::1`). Replication to LAN addresses such as `wss://192.168.1.10:8953` is
@@ -263,7 +305,10 @@ master_fingerprint = "OLD_MASTER_FINGERPRINT"
    cp /etc/sito/certs/next/slave.crt /etc/sito/certs/slave.crt
    cp /etc/sito/certs/next/slave.key /etc/sito/certs/slave.key
    chmod 0600 /etc/sito/certs/slave.key
+   # cp as root resets ownership: hand the key back to the runtime user.
+   chown sito:sito /etc/sito/certs/slave.crt /etc/sito/certs/slave.key
    ```
+   For Docker use `chown 65532:65532` instead.
 2. Restart the slave:
    ```bash
    systemctl restart sito
@@ -277,7 +322,10 @@ master_fingerprint = "OLD_MASTER_FINGERPRINT"
    cp /etc/sito/certs/next/master.crt /etc/sito/certs/master.crt
    cp /etc/sito/certs/next/master.key /etc/sito/certs/master.key
    chmod 0600 /etc/sito/certs/master.key
+   # cp as root resets ownership: hand the key back to the runtime user.
+   chown sito:sito /etc/sito/certs/master.crt /etc/sito/certs/master.key
    ```
+   For Docker use `chown 65532:65532` instead.
 3. Restart the master:
    ```bash
    systemctl restart sito
@@ -368,7 +416,9 @@ When a slave node fails or must be reprovisioned from bare metal:
 |---|---|---|
 | Slave state is `Degraded` | Configuration apply failed, corrupted bundle, or an unresolvable `${SECRET:...}` placeholder | Check the service journal (`journalctl -u sito`) for `apply_config_push` errors. The slave keeps its last good snapshot and reports `Degraded`; fix the configuration on the master and re-push. The reason is exposed as `degraded_reason` in `GET /api/v1/ha/status`. |
 | Push rejected with `restart_required` | The master bundle changed a restart-only field that is not node-local (for example `server.log_format` or `[auth]`) | The slave kept its previous live configuration and file and ACKs `applied:false`. Restart the slave after setting the intended value locally, or change the shared setting only when a coordinated restart is acceptable. Node-local listener/TLS/web/MikroTik fields are preserved automatically and do not trigger this. |
-| Slave state is `Connecting` in loop | Network unreachable, firewall blocking 8953, or mTLS handshake failed/timed out | Check `nc -zv 192.168.1.10 8953`. Check TLS certificate expiration or fingerprint mismatch in logs. |
+| Slave state is `Connecting` in loop | Network unreachable, firewall blocking 8953, or mTLS handshake failed/timed out | Check `nc -zv 192.168.1.10 8953`. Check TLS certificate expiration or fingerprint mismatch in logs. `readiness_reason` carries the last connection/handshake error. |
+| `GET /api/v1/ha/status` reports `"ready": false` or the container healthcheck fails while DNS answers | The replication listener or slave worker is not operational: key/certificate unreadable by the runtime user, listener bind failure, or the slave has not reached `Synced` | Read `readiness_reason` and the service logs. Fixing certificate ownership (`chown sito:sito` or `65532:65532`, mode `0600`) and restarting restores the listener. A healthy DNS probe alone no longer marks the node healthy. |
+| Log says `Failed to initialize mTLS ... Permission denied` | Private key is owned by root or another user that the service account cannot read | Regenerate with `--uid/--gid` for the runtime user, or `chown` the key files; keep keys mode `0600`. |
 | `Signature verification failed` | Bundle signature does not match master public key | Verify that the master didn't regenerate `ha_signing.key` without updating slaves. Compare `master_pubkey` from the master's `/api/v1/ha/status` with the slave config. |
 | `Incoming version <= have_version` | Out of order or replayed bundle | Normal during network blips; the master will send the latest monotonic version. After a promotion, an older-term master is rejected even with a higher version; promote the master explicitly (section 2). |
 | Master reports `"diverged": true` | A slave is ahead in the same term, reports a newer term (stale/partitioned master, lost/corrupt `ha_state.toml`, or forked master), or reported a same-version payload fork | Read `diverged_reason`. Divergence is **sticky**: it is not cleared by another slave applying the current version. A same-version fork marks that slave unsynced and visible but does **not** stop publishing to healthy replicas; it clears when that slave accepts the current bundle after promotion/reconciliation or disconnects. `POST /api/v1/ha/resync` clears only advisory ahead/newer-term records, not a real fork. Isolate the stale master, resolve the fork, restore its state file or perform the explicit promotion in section 2 (raise both `term` and `version`), then restart it. |

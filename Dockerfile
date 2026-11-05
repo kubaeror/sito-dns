@@ -79,6 +79,10 @@ COPY --from=builder /sito /usr/bin/sito
 # Data directory ownership: fresh named volumes inherit the nonroot ownership
 # below. Bind-mounted host directories must be handed to uid/gid 65532 once:
 #   sudo chown -R 65532:65532 /path/on/host
+# This includes HA certificate directories. Private keys stay mode 0600 but
+# must be owned by 65532, otherwise the mTLS replication listener cannot read
+# them (DNS health would still pass). Generate with `ha gen-certs --uid 65532
+# --gid 65532` or chown the copied keys after generating them.
 COPY --from=builder --chown=65532:65532 /sito-data/ /var/lib/sito/
 COPY --from=builder --chown=65532:65532 /sito-config/ /etc/sito/
 USER nonroot

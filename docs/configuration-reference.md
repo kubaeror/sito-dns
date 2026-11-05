@@ -417,6 +417,15 @@ replication_port = 8953
 | `allow_insecure_ws` | boolean | `false` | Allow plaintext `ws://` replication. Requires a non-empty `slave_token`; must be set explicitly on both ends. |
 | `stats_interval_secs` | integer | `30` | Interval between slave-to-master statistics reports. |
 
+Private keys referenced by `key` are read by the unprivileged service account
+(`sito` under systemd, uid/gid `65532` in the container image). Generate them
+with ownership transfer (`sito ha gen-certs --uid <UID> --gid <GID>`, both
+required together) or `chown` them after copying; a key owned by another user
+fails the mTLS listener even though DNS keeps answering. Replication readiness
+is exposed as `ready` and `readiness_reason` in `GET /api/v1/ha/status` (and
+`/health`), and the `healthcheck` subcommand fails when `[ha]` requires
+replication but the master listener or slave handshake is not ready.
+
 Slaves persist the last successfully applied bundle identity to
 `<data_dir>/ha_watermark.toml` (JSON, mode `0600`, written atomically) after
 the configuration is applied and before the push is acknowledged. The file

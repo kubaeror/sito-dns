@@ -13,11 +13,18 @@
 #    sito-master / sito-slave / 127.0.0.1 / ::1 SANs, so keep the default
 #    fingerprint pinning; see docs/runbook-ha.md for SAN/pinning details.)
 #
-# 2. Copy certificates to node directories:
+# 2. Copy certificates to node directories and hand them to the container
+#    runtime user (uid/gid 65532). The image is distroless nonroot: keys owned
+#    by your host user are unreadable inside the container, which disables the
+#    mTLS replication listener without failing the DNS healthcheck.
 #    mkdir -p ha/master/certs ha/slave/certs
 #    cp ha/certs/ca.crt ha/master/certs/ && cp ha/certs/ca.crt ha/slave/certs/
 #    cp ha/certs/master.crt ha/certs/master.key ha/master/certs/
 #    cp ha/certs/slave.crt ha/certs/slave.key ha/slave/certs/
+#    sudo chown -R 65532:65532 ha/master/certs ha/slave/certs
+#    sudo chmod 0600 ha/master/certs/*.key ha/slave/certs/*.key
+#    (Alternatively, generate directly with `--uid 65532 --gid 65532` as root:
+#    sudo sito ha gen-certs --dir ./ha/certs --master --slave --uid 65532 --gid 65532)
 #
 # 3. Update 'parent: eth0' below to match your host's physical network interface.
 # 4. Write each node's /etc/sito/config.toml inside the mounted directories
@@ -29,6 +36,12 @@
 #    image; only bind-mounted data directories need the same chown.
 # 5. Start the HA cluster:
 #    docker compose -f docker-compose.ha.yml up -d
+#
+# The healthcheck below fails when [ha] is configured but replication is not
+# ready (mTLS/key permissions, listener bind, initial slave handshake), so a
+# healthy DNS probe can no longer mask a broken HA node. Check
+# `docker inspect --format '{{json .State.Health}}' sito-master` and
+# GET /api/v1/ha/status (`ready` / `readiness_reason`) for the cause.
 #
 # DHCP CONFIGURATION (MikroTik RouterOS Option 6):
 # Configure RouterOS DHCP server to hand out both redundant DNS IPs:

@@ -338,6 +338,12 @@ sito --config /etc/sito/config.toml healthcheck
 sito --config /etc/sito/config.toml healthcheck --setup-fallback
 ```
 
+When the configuration contains a `[ha]` section with HA enabled for the node's
+role, the probe also requires replication to be ready: the master listener must
+have bound with its mTLS key, and a slave must have reached `Synced`. A healthy
+DNS response alone no longer masks an HA failure. See `docs/runbook-ha.md`
+(certificate ownership) if the probe reports an unreadable key.
+
 Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard. While setup is pending the server prints a one-time setup token to the console; open `http://<host-ip>:8080/wizard?setup_token=<token>` or send the `X-Setup-Token` header. Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` already exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` account.
 
 If the wizard is skipped with `--no-setup`, a random administrator password is generated and printed once, and the panel binds to loopback. If credentials are lost later, stop the service so the running process cannot keep serving the old credentials, reset the account, then start it again:
