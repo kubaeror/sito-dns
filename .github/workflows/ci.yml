@@ -105,6 +105,10 @@ jobs:
         run: |
           python3 -c "import yaml" >/dev/null 2>&1 || python3 -m pip install --quiet --break-system-packages pyyaml
           python3 contrib/tests/test_adguard_to_sito.py
+      - name: Test release verification helpers
+        run: |
+          bash scripts/test-check-release-platforms.sh
+          bash scripts/test-release-attestation-gate.sh
 
   docker-smoke:
     name: docker smoke
