@@ -352,13 +352,18 @@ jobs:
 
           # `provenance: true` and `sbom: true` must have attached attestations
           # to the pushed index; fail closed if either is missing.
+          #
+          # Consume the full payload in the helper.  A bare
+          # `printf ... | grep -q` can make printf die with SIGPIPE when grep
+          # exits early, which `pipefail` turns into a false negative after the
+          # image has already been published.
           provenance="$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .Provenance}}')"
-          if ! printf '%s' "${provenance}" | grep -q '"SLSA"'; then
+          if ! printf '%s' "${provenance}" | scripts/check-release-attestation.sh SLSA; then
             echo "::error::no SLSA provenance attestation on ${IMAGE}@${DIGEST}"
             exit 1
           fi
           sbom="$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .SBOM}}')"
-          if ! printf '%s' "${sbom}" | grep -q '"SPDX"'; then
+          if ! printf '%s' "${sbom}" | scripts/check-release-attestation.sh SPDX; then
             echo "::error::no SPDX SBOM attestation on ${IMAGE}@${DIGEST}"
             exit 1
           fi
