@@ -170,7 +170,9 @@ jobs:
       - name: Generate SPDX SBOM
         run: |
           cargo sbom --output-format spdx_json_2_3 > release-assets/sito.spdx.json
-          sha256sum release-assets/sito.spdx.json >> release-assets/SHA256SUMS
+          # Keep the unified checksum paths relative to the download directory so
+          # `sha256sum -c SHA256SUMS` works for users who download every asset.
+          (cd release-assets && sha256sum sito.spdx.json >> SHA256SUMS)
 
       - name: Sign release archives (cosign keyless)
         # Runs on tag pushes only (see the `on:` block): the signing identity
