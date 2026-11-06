@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.9.2"
+version = "1.9.3"
 edition = "2024"
 rust-version = "1.99.1"
 license = "GPL-3.0-only"
@@ -85,21 +85,21 @@ tar = "0.4"
 utoipa = { version = "6.0", features = ["axum_extras"] }
 
 # Internal workspace dependencies
-sito = { path = "crates/sito", version = "1.9.2" }
-sito-core = { path = "crates/sito-core", version = "1.9.2" }
-sito-proto = { path = "crates/sito-proto", version = "1.9.2" }
-sito-transport = { path = "crates/sito-transport", version = "1.9.2" }
-sito-upstream = { path = "crates/sito-upstream", version = "1.9.2" }
-sito-cache = { path = "crates/sito-cache", version = "1.9.2" }
-sito-filter = { path = "crates/sito-filter", version = "1.9.2" }
-sito-dnssec = { path = "crates/sito-dnssec", version = "1.9.2" }
-sito-clients = { path = "crates/sito-clients", version = "1.9.2" }
-sito-rewrites = { path = "crates/sito-rewrites", version = "1.9.2" }
-sito-api = { path = "crates/sito-api", version = "1.9.2" }
-sito-stats = { path = "crates/sito-stats", version = "1.9.2" }
-sito-runtime = { path = "crates/sito-runtime", version = "1.9.2" }
-sito-ha = { path = "crates/sito-ha", version = "1.9.2" }
-sito-test = { path = "crates/sito-test", version = "1.9.2" }
+sito = { path = "crates/sito", version = "1.9.3" }
+sito-core = { path = "crates/sito-core", version = "1.9.3" }
+sito-proto = { path = "crates/sito-proto", version = "1.9.3" }
+sito-transport = { path = "crates/sito-transport", version = "1.9.3" }
+sito-upstream = { path = "crates/sito-upstream", version = "1.9.3" }
+sito-cache = { path = "crates/sito-cache", version = "1.9.3" }
+sito-filter = { path = "crates/sito-filter", version = "1.9.3" }
+sito-dnssec = { path = "crates/sito-dnssec", version = "1.9.3" }
+sito-clients = { path = "crates/sito-clients", version = "1.9.3" }
+sito-rewrites = { path = "crates/sito-rewrites", version = "1.9.3" }
+sito-api = { path = "crates/sito-api", version = "1.9.3" }
+sito-stats = { path = "crates/sito-stats", version = "1.9.3" }
+sito-runtime = { path = "crates/sito-runtime", version = "1.9.3" }
+sito-ha = { path = "crates/sito-ha", version = "1.9.3" }
+sito-test = { path = "crates/sito-test", version = "1.9.3" }
 
 [workspace.lints.rust]
 # Future Rust lints can be specified here

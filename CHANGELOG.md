@@ -5,6 +5,34 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.9.3] - 2026-11-06
+
+Release-engineering patch. There are no runtime, configuration, API, or data
+changes; 1.9.3 is functionally identical to 1.9.2. It exists so the
+tag-triggered release pipeline produces a fully green run and the published
+checksum manifest is directly usable.
+
+### Fixed
+- **Release attestation gate is pipefail-safe.** The post-push SLSA/SPDX check
+  now consumes the complete `docker buildx imagetools inspect` payload before
+  checking it. Previously `printf ... | grep -q` could make `printf` die with
+  SIGPIPE when `grep` matched early; under `pipefail` that turned a valid
+  attestation into a false negative after the image had already been pushed.
+  The helper is covered by a regression test with a large multi-platform
+  payload.
+- **Unified `SHA256SUMS` uses a relative SBOM path.** The generated SBOM entry
+  is now `sito.spdx.json` (not `release-assets/sito.spdx.json`), so
+  `sha256sum -c SHA256SUMS` succeeds for users who download every release asset
+  into one directory.
+
+### Upgrade notes
+- No action is required. Configuration, databases, sessions, HA state, and API
+  contracts are unchanged from 1.9.2.
+- The 1.9.2 release artifacts and image remain valid; 1.9.3 only fixes the
+  release tooling.
+
+---
+
 ## [1.9.2] - 2026-11-05
 
 Security and correctness patch release for the 1.9 line. It fixes the DNSSEC

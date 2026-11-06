@@ -7,13 +7,13 @@ This guide covers deploying **sito** on Linux hosts using the automated one-line
 ## Network Exposure and Firewall
 
 **Read this before the host is reachable from an untrusted network.** The
-1.9.2 defaults are deliberately unchanged for compatibility, so they are
+1.9.3 defaults are deliberately unchanged for compatibility, so they are
 LAN defaults, not internet-safe defaults:
 
 * `web.bind` defaults to `0.0.0.0`, the admin UI is served over plain HTTP, and
   port `8080` accepts setup and login requests from every reachable source.
   There is no TLS in the admin listener itself.
-* `dns.bind` defaults to `["0.0.0.0", "::"]` and 1.9.2 has no DNS client
+* `dns.bind` defaults to `["0.0.0.0", "::"]` and 1.9.3 has no DNS client
   allow-list. `dns.rate_limit_per_ip` limits request rate; it is **not** an
   access control. Any host that can reach the DNS ports can recurse through
   this server.
@@ -82,7 +82,7 @@ choice without changing the historical mapping.
 
 > [!NOTE]
 > Changing the default to loopback (`web.bind = "127.0.0.1"`) and adding a
-> default-deny DNS client ACL is planned for **1.10.0**. 1.9.2 keeps existing
+> default-deny DNS client ACL is planned for **1.10.0**. 1.9.3 keeps existing
 > configurations working; the startup warning and this firewall guidance are
 > the patch-release mitigation.
 
@@ -251,7 +251,7 @@ sudo systemctl start sito
 
 # Option B: re-run the installer (SITO_VERSION pins a release)
 sudo systemctl stop sito
-sudo SITO_VERSION=1.9.2 bash contrib/install.sh
+sudo SITO_VERSION=1.9.3 bash contrib/install.sh
 ```
 
 Without `--config`, the CLI prefers an existing `/etc/sito/config.toml` and
@@ -495,12 +495,12 @@ sha256sum -c SHA256SUMS
 
 ```bash
 cosign verify-blob \
-  --certificate sito-v1.9.2-x86_64-unknown-linux-gnu.tar.gz.pem \
-  --signature   sito-v1.9.2-x86_64-unknown-linux-gnu.tar.gz.sig \
+  --certificate sito-v1.9.3-x86_64-unknown-linux-gnu.tar.gz.pem \
+  --signature   sito-v1.9.3-x86_64-unknown-linux-gnu.tar.gz.sig \
   --certificate-identity-regexp \
       '^https://github.com/kubaeror/sito-dns/\.github/workflows/release\.yml@refs/tags/.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  sito-v1.9.2-x86_64-unknown-linux-gnu.tar.gz
+  sito-v1.9.3-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 The identity pins the artifact to this repository's release workflow and the

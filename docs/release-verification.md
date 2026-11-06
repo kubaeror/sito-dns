@@ -61,7 +61,7 @@ the platform list, and the generated tags.
 Set the release tag and derive the Docker tag, which omits the leading `v`:
 
 ```bash
-RELEASE_TAG=v1.9.2
+RELEASE_TAG=v1.9.3
 IMAGE="ghcr.io/kubaeror/sito-dns"
 TAG="${RELEASE_TAG#v}"
 ```

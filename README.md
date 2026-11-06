@@ -90,14 +90,14 @@ curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/main/contrib/inst
 
 ### Network exposure (read before exposing the host)
 
-The 1.9.2 defaults are intended for a trusted LAN: the admin UI listens on
+The 1.9.3 defaults are intended for a trusted LAN: the admin UI listens on
 `0.0.0.0:8080` over plain HTTP, and DNS listens on `0.0.0.0`/`::` with no
 client allow-list. **Do not expose port 8080 to the internet.** Restrict DNS to
 your LAN with a host firewall, or bind `dns.bind` to your LAN address. For
 remote admin access, bind `web.bind = "127.0.0.1"` and use an SSH tunnel or a
 TLS reverse proxy. The server logs a startup warning for each exposed listener.
 The loopback-by-default change and a DNS client ACL are planned for 1.10.0;
-existing configurations keep working in 1.9.2.
+existing configurations keep working in 1.9.3.
 
 ### Option 2: Docker / Docker Compose
 ```yaml
@@ -191,8 +191,8 @@ Swagger UI / OpenAPI documentation is available at `http://localhost:8080/api/do
 * **[User Management & Authentication](docs/user-management.md):** Accounts, roles/RBAC, password changes, API tokens, TOTP 2FA, last-admin protection, and recovery — including the Admin **Users** page (`/users`), the per-user **Account** page (`/account`), and the Operator-only unidentified-clients table in the web panel.
 * **[Migrating from AdGuard Home](docs/migration-adguard.md):** Migration instructions and automated converter script (`contrib/adguard_to_sito.py`).
 * **[High-Availability Runbook](docs/runbook-ha.md):** Deployment architectures, mTLS certificates, failover, and slave promotion.
-* **[1.9.2 Release Notes](docs/release-notes-1.9.2.md):** User-visible behavior changes, upgrade notes, and known issues for 1.9.2.
-* **[Changelog](CHANGELOG.md):** Release notes for v1.9.2 and complete history of phases M0 through M9.
+* **[1.9.3 Release Notes](docs/release-notes-1.9.3.md):** User-visible behavior changes, upgrade notes, and known issues for 1.9.3.
+* **[Changelog](CHANGELOG.md):** Release notes for v1.9.3 and complete history of phases M0 through M9.
 
 ---
 
