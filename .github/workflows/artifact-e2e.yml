@@ -32,7 +32,7 @@ jobs:
   artifact-e2e:
     name: verify (${{ inputs.tag }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       TARGETS: |
         x86_64-unknown-linux-gnu
@@ -42,7 +42,32 @@ jobs:
       # Checked against Dockerfile.release below so the two cannot drift.
       RUNTIME_IMAGE: gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1
     steps:
+      - name: Resolve the release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${REQUESTED_TAG}" = "latest" ]; then
+            tag="$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName --jq .tagName)"
+          else
+            tag="${REQUESTED_TAG}"
+          fi
+          # The tag is interpolated into asset paths and a grep pattern below.
+          if ! printf '%s' "${tag}" | grep -Eq '^v[0-9][0-9A-Za-z.+-]*$'; then
+            echo "::error::unexpected release tag '${tag}'"
+            exit 1
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      # Check out the resolved tag, not the branch selected in the dispatch UI,
+      # so the Dockerfile.release / runtime-image check below reads the code
+      # that actually produced the release.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+          fetch-depth: 1
 
       - name: Verify the runtime image matches Dockerfile.release
         run: |
@@ -62,25 +87,6 @@ jobs:
             exit 1
           fi
           echo "RUNTIME_IMAGE matches Dockerfile.release"
-
-      - name: Resolve the release tag
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REQUESTED_TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          if [ "${REQUESTED_TAG}" = "latest" ]; then
-            tag="$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName --jq .tagName)"
-          else
-            tag="${REQUESTED_TAG}"
-          fi
-          # The tag is interpolated into asset paths and a grep pattern below.
-          if ! printf '%s' "${tag}" | grep -Eq '^v[0-9][0-9A-Za-z.+-]*$'; then
-            echo "::error::unexpected release tag '${tag}'"
-            exit 1
-          fi
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
 
       - name: Download the release artifacts
         env:

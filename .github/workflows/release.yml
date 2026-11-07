@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
 
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
 # Releases are published from tag pushes only. workflow_dispatch is
 # deliberately not supported: GitHub mints the OIDC identity from the ref that
 # triggered the run, so a dispatch run on a branch would sign with

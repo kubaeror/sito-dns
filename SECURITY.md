@@ -54,5 +54,5 @@ We commit to the following Service Level Agreement (SLA) for confirmed reports:
 - **Memory Safety:** Implemented in pure Rust with strict compile-time checks, eliminating memory corruption risks (buffer overflows, use-after-free).
 - **ReDoS Prevention:** Rule parsing DFA engines (`regex-automata`) are guaranteed linear-time and non-backtracking.
 - **Backpressure Protection:** Unbounded queues and channel buffers are strictly prohibited on the DNS query hot path to protect against DoS-induced resource exhaustion.
-- **Dependency Audits:** Automated `cargo-deny` checks run on every PR to prevent vulnerable or banned crates from entering the dependency tree.
+- **Dependency Audits:** Automated `cargo-deny` checks run on dependency-changing PRs and weekly to prevent vulnerable or banned crates from entering the dependency tree.
 - **Fuzzing:** Scheduled fuzzing was intentionally removed and is not part of CI.

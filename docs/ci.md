@@ -10,10 +10,10 @@ pin policy, and the monthly runner-minute budget.
 
 | Workflow | File | Triggers | Purpose |
 |---|---|---|---|
-| **CI** | `ci.yml` | `pull_request` to `main`, `push` to `main`, `merge_group`, `workflow_dispatch` (`full`) | Classifies the change set and runs `fmt`, `clippy`, `test`, the three-target `build` matrix, `openapi`, and `contrib`. Publishes the single required check `ci-gate`. |
-| **Docs** | `docs.yml` | `pull_request` and `push` to `main` on docs/workflow paths, `workflow_dispatch` | Runs the configuration-reference drift check and `actionlint` for `.github/workflows/**`. |
-| **Container** | `container.yml` | `pull_request` and `push` to `main` on container paths, `workflow_call`, `workflow_dispatch` | Validates both Compose files and builds/smoke-tests the development `Dockerfile`. |
-| **Security** | `security.yml` | `pull_request` and `push` to `main` on dependency paths, `workflow_call`, `workflow_dispatch` | Runs `cargo-deny check`. |
+| **CI** | `ci.yml` | `pull_request` to `main`, `push` to `main`, `merge_group`, `workflow_dispatch` (`full`) | Classifies the change set and runs `fmt`, `clippy`, `test`, the three-target `build` matrix, `openapi`, `contrib`, and the reusable `docs-check`, `container-check`, `security-check` lanes. Publishes the single required check `ci-gate`. |
+| **Docs** | `docs.yml` | `workflow_call` from CI, `push` to `main` on docs/workflow paths, `workflow_dispatch` | Runs the configuration-reference drift check and the pinned `actionlint` container for `.github/workflows/**`. |
+| **Container** | `container.yml` | `workflow_call` from CI and Weekly, `push` to `main` on container paths, `workflow_dispatch` | Validates both Compose files, builds/smoke-tests the development `Dockerfile`, and builds `Dockerfile.release` with stub binaries. |
+| **Security** | `security.yml` | `workflow_call` from CI and Weekly, `push` to `main` on dependency paths, `workflow_dispatch` | Runs `cargo-deny check`. |
 | **Weekly Quality** | `weekly.yml` | Sunday at 03:00 UTC (`schedule`), `workflow_dispatch` | Release-mode tests, Criterion benchmarks, plus the reusable Container and Security workflows. |
 | **Release** | `release.yml` | Push of a `v*` tag only | Verifies the tag, builds and signs the three release archives, publishes the GitHub release, verifies the artifacts, and publishes the multi-arch container image. |
 | **Artifact E2E** | `artifact-e2e.yml` | `workflow_call` from Release, `workflow_dispatch` with a tag | Re-downloads a published release and verifies checksums, signatures, and execution of every architecture in the release runtime image. |
@@ -28,19 +28,21 @@ branch would produce artifacts that cannot be verified. Use
 
 `ci.yml` classifies each pull request once in the `changes` job with
 `dorny/paths-filter`. The heavy jobs consume the `code`, `api`, and `contrib`
-outputs. Container, dependency, and workflow-path checks run in their own
-path-filtered workflows, so they do not need to be duplicated in `ci.yml`.
+outputs. Container, dependency, and workflow-path checks are reusable workflows
+that `ci.yml` calls on pull requests (`container-check`, `security-check`,
+`docs-check`) and that also run on `main` pushes when their paths match. They are
+part of the required `ci-gate` check, not separate advisory workflows.
 
 | Change | Lanes that run |
 |---|---|
-| Docs only (`docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates) | `ci.yml`: `changes` + `ci-gate` only. `docs.yml`: `meta` (configuration check only if the config reference changed). No Rust, Docker, or `cargo-deny`. |
-| Code (`crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`) | `ci.yml`: `changes`, `fmt`, `clippy`, `test`, `build` (x86_64, aarch64, armv7), `ci-gate`. Dependency changes also trigger `security.yml`. |
-| OpenAPI spec only (`docs/openapi.json` without crate changes) | `ci.yml`: `changes`, `openapi`, `ci-gate`; `docs.yml` also runs because the path is under `docs/`. |
+| Docs only (`docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates) | `ci.yml`: `changes`, `docs-check`, `ci-gate`. `docs-check` calls `docs.yml`, which runs `meta` (configuration check only if the config reference changed). No Rust, Docker, or `cargo-deny`. The `docs/openapi.json` exception below runs `openapi`. |
+| Code (`crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`) | `ci.yml`: `changes`, `fmt`, `clippy`, `test`, `build` (x86_64, aarch64, armv7), `ci-gate`. Dependency changes also run `security-check`. |
+| OpenAPI spec only (`docs/openapi.json` without crate changes) | `ci.yml`: `changes`, `openapi`, `ci-gate`; `docs-check` also runs because the path is under `docs/`. |
 | API crate (`crates/sito-api/**`) | Full code lane. `openapi` is skipped because `test` already regenerates and diffs the spec. |
 | Contrib/scripts (`contrib/**`, `scripts/**`) | `ci.yml`: `changes`, `contrib`, `ci-gate`. `contrib` runs `shellcheck` on the installer, the AdGuard converter fixture test, and the release-helper tests. |
-| Container (`Dockerfile`, `Dockerfile.*`, `.dockerignore`, `docker-compose*.yml`, `config.example.toml`, `contrib/systemd/**`) | `container.yml`: `compose` + `smoke`. `ci.yml`: `changes` + `ci-gate`. |
-| Dependencies (`Cargo.toml`, `Cargo.lock`, `deny.toml`, `rust-toolchain.toml`) | `security.yml`: `cargo-deny`. `Cargo.*` and the toolchain also match the code classifier, so the full code lane runs as well. |
-| Workflow files (`.github/workflows/**`) | `docs.yml`: `meta` with `actionlint`; `ci.yml`: `changes` + `ci-gate`. |
+| Container (`Dockerfile`, `Dockerfile.*`, `.dockerignore`, `docker-compose*.yml`, `config.example.toml`, `contrib/systemd/**`) | `ci.yml`: `changes`, `container-check`, `ci-gate`. `container-check` calls `container.yml` (`compose`, `smoke`, and `release-image`). |
+| Dependencies (`Cargo.toml`, `Cargo.lock`, `deny.toml`, `rust-toolchain.toml`) | `ci.yml`: the code lane plus `security-check`, `ci-gate`; `security-check` calls `security.yml` (`cargo-deny`). `Cargo.*` and the toolchain also match the code classifier, so the full code lane runs as well. |
+| Workflow files (`.github/workflows/**`) | `ci.yml`: `changes`, `docs-check`, `ci-gate`; `docs-check` calls `docs.yml` (`meta` with `actionlint`). |
 | Mixed changes | Union of the matching lanes. |
 
 `docs/openapi.json` matches both the `docs/**` filter and the `api` filter, so
@@ -55,7 +57,8 @@ If composite actions are added later, add a dedicated validator for them rather
 than relying on `actionlint`.
 
 A docs-only pull request therefore costs roughly the two small `ci.yml` jobs
-plus the docs `meta` job, not a Rust rebuild.
+(`changes`, `ci-gate`) plus the `docs-check` job, not a Rust rebuild. The one
+exception is a change to `docs/openapi.json`, which also runs the `openapi` job.
 
 ### Behavior on `push` to `main`
 
@@ -113,11 +116,12 @@ together.
 ## Required check and branch protection
 
 `ci-gate` is the single check that should be required for `main`. It depends on
-`changes`, `fmt`, `clippy`, `test`, `build`, `openapi`, and `contrib` and fails
-if any of them reports `failure` or `cancelled`. Jobs that were skipped because
-their paths did not change count as success, which is what lets a docs-only PR
-merge without a Rust run. Requiring every individual job instead would make
-docs-only PRs wait on checks that are intentionally absent.
+`changes`, `fmt`, `clippy`, `test`, `build`, `openapi`, `contrib`, `docs-check`,
+`container-check`, and `security-check` and fails if any of them reports
+`failure` or `cancelled`. Jobs that were skipped because their paths did not
+change count as success, which is what lets a docs-only PR merge without a Rust
+run. Requiring every individual job instead would make docs-only PRs wait on
+checks that are intentionally absent.
 
 Branch protection is a **manual repository setting**. This change and the
 workflow files do not modify repository settings. A repository administrator
@@ -223,7 +227,10 @@ for the ARM archives in artifact E2E, not for the image build.
 
 The development `Dockerfile` remains a from-source build and is what
 `container.yml` smoke-tests. The release image and the release archives contain
-the same binaries, so image and tarball behavior match.
+the same binaries, so image and tarball behavior match. `container.yml` also
+builds `Dockerfile.release` with stub binaries on container-path PRs and weekly
+runs, so path-mapping or syntax errors in the release image are caught before a
+tag exists.
 
 ## Scheduled fuzzing was intentionally removed
 
@@ -273,7 +280,8 @@ and makes every workflow change reviewable as an exact commit change.
 | `dorny/paths-filter` | `v4.0.3` | CI change classifier. |
 | `dtolnay/rust-toolchain` | `# master 2026-10-16` | The action has no release tags; the toolchain is pinned separately to **1.99.1** via `with: toolchain`. No floating `stable` or nightly refs. |
 | `Swatinem/rust-cache` | `v2.9.3` | Rust build cache, per-job/key scopes. |
-| `taiki-e/install-action` | `v2.90.2` | Always passed an explicit `tool:` (`cross`, `cargo-sbom@0.10.0`, `actionlint@1.7.12`); this version no longer injects defaults. |
+| `taiki-e/install-action` | `v2.90.2` | Always passed an explicit `tool:` (`cross`, `cargo-sbom@0.10.0`); this version no longer injects defaults. |
+| `rhysd/actionlint` | `1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667` | Pinned Docker image, run via `docker run`; not installed by an action. |
 | `EmbarkStudios/cargo-deny-action` | `v2.1.1` | Security lane. |
 | `docker/setup-buildx-action` | `v4.4.1` | Container and release image builds. |
 | `docker/build-push-action` | `v7.4.0` | Smoke build and release image publish. |
@@ -304,7 +312,7 @@ was **1,743 minutes per 30 days**, so the target is a substantial reduction, not
 an increase. 600 is the review threshold: a month at or above it should be
 investigated. It is a planning target, not a GitHub-enforced limit.
 
-Approximate cost per run (Linux, warm caches; cold caches are higher):
+Approximate runner-minutes per run (sum of billed jobs; parallel jobs count separately; warm caches; cold caches are higher):
 
 | Activity | Typical minutes |
 |---|---|
@@ -316,6 +324,9 @@ Approximate cost per run (Linux, warm caches; cold caches are higher):
 | Security-only PR (`cargo-deny`) | 1–2 |
 | Weekly run (release tests, benchmarks, container, security) | 25–35 |
 | Release run (prebuilt-image pipeline) | 25–35 |
+
+A weekly run bills `release-tests` and `perf` in parallel plus container and
+security, so the weekly row is the sum of those jobs, not one critical path.
 
 Dependency changes also match the code classifier, so a `Cargo.toml` or
 `Cargo.lock` PR costs the code lane plus the security lane, not just the

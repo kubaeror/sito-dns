@@ -203,6 +203,32 @@ jobs:
         run: |
           bash scripts/test-check-release-platforms.sh
           bash scripts/test-release-attestation-gate.sh
+      - name: Compile the CI usage helper
+        run: python3 -m py_compile scripts/ci_usage.py
+
+  docs-check:
+    name: docs-check
+    needs: changes
+    if: (needs.changes.outputs.docs == 'true' || needs.changes.outputs.config_docs == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.force == 'true') && (github.event_name != 'push' || github.ref != 'refs/heads/main')
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docs.yml
+
+  container-check:
+    name: container-check
+    needs: changes
+    if: (needs.changes.outputs.container == 'true' || needs.changes.outputs.force == 'true') && (github.event_name != 'push' || github.ref != 'refs/heads/main')
+    permissions:
+      contents: read
+    uses: ./.github/workflows/container.yml
+
+  security-check:
+    name: security-check
+    needs: changes
+    if: (needs.changes.outputs.deps == 'true' || needs.changes.outputs.force == 'true') && (github.event_name != 'push' || github.ref != 'refs/heads/main')
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security.yml
 
   build:
     name: build (${{ matrix.target }})
@@ -250,7 +276,7 @@ jobs:
   ci-gate:
     name: ci-gate
     if: always()
-    needs: [changes, fmt, clippy, test, build, openapi, contrib]
+    needs: [changes, fmt, clippy, test, build, openapi, contrib, docs-check, container-check, security-check]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

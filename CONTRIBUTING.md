@@ -115,7 +115,10 @@ cargo run -p sito -- --version
 
 Pull requests run only the lanes their paths need. `ci-gate` is the single
 required status check; jobs that are skipped because their paths did not change
-count as success. The full runbook, including branch protection, runner pins,
+count as success. Container, security, and docs are reusable workflows called by
+`ci.yml` on pull requests and also run on `main` pushes when their paths match,
+so they are part of the required `ci-gate` check rather than separate advisory
+workflows. The full runbook, including branch protection, runner pins,
 the release pipeline, and the runner-minute budget, is in
 [docs/ci.md](docs/ci.md).
 
@@ -124,17 +127,18 @@ the release pipeline, and the runner-minute budget, is in
 | `crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml` | CI code jobs: `fmt`, `clippy`, `test`, three-target `build` |
 | `docs/openapi.json` (without crate changes) | CI `openapi` |
 | `contrib/**`, `scripts/**` | CI `contrib` (shellcheck, AdGuard converter, release helpers) |
-| `docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, templates | Docs lane (config-reference drift; `actionlint` for workflow changes) |
-| `Dockerfile*`, `.dockerignore`, `docker-compose*.yml`, `config.example.toml`, `contrib/systemd/**` | Container lane (compose validation + image smoke) |
-| `Cargo.toml`, `Cargo.lock`, `deny.toml`, `rust-toolchain.toml` | Security lane (`cargo-deny`); `Cargo.*` also runs the code lane |
-| `.github/workflows/**` | Docs lane with `actionlint` |
+| `docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, templates | CI `docs-check` → Docs lane (config-reference drift; `actionlint` for workflow changes) |
+| `Dockerfile*`, `.dockerignore`, `docker-compose*.yml`, `config.example.toml`, `contrib/systemd/**` | CI `container-check` → Container lane (compose validation, image smoke, `Dockerfile.release` build) |
+| `Cargo.toml`, `Cargo.lock`, `deny.toml`, `rust-toolchain.toml` | CI `security-check` → Security lane (`cargo-deny`); `Cargo.*` also runs the code lane |
+| `.github/workflows/**` | CI `docs-check` → Docs lane with `actionlint` |
 
-A docs-only PR never builds Rust or Docker. To force every heavy CI lane anyway,
+A docs-only PR never builds Rust or Docker, except `docs/openapi.json`, which
+runs the `openapi` job. To force every heavy CI lane anyway,
 add the `ci:full` label and then push a commit so the new pull request event
 carries the label, or dispatch **CI** with `full` checked for a branch-level
 run. A plain re-run does not pick up a newly added label because GitHub replays
-the original event payload. The container and security lanes can be dispatched
-directly from the Actions tab.
+the original event payload. The container and security lanes can also be
+dispatched directly from the Actions tab.
 
 Local parity before pushing:
 
