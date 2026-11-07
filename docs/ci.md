@@ -99,19 +99,21 @@ overrides force the heavy `ci.yml` jobs even when the classifier says `code` or
   (`workflow_dispatch` input `full=true`). This is a branch-level run of the
   selected ref, not a run of the pull request payload.
 
-The override applies to `fmt`, `clippy`, `test`, `build`, `openapi`, and
-`contrib`. It does not apply on a push to `main`, where the heavy jobs remain
-skipped by design. The classifier reads `github.event.pull_request.labels` when
-the run starts. A plain **Re-run jobs** replays the original event payload and
-does **not** pick up a label added afterwards, so `force` stays false. If the
-label was added after the last push, push another commit (or otherwise create a
-new pull request event) to apply it. No workflow change is required for this
-procedure.
+The override applies to the code jobs (`fmt`, `clippy`, `test`, `build`,
+`openapi`, `contrib`) and to the reusable gate jobs `docs-check`,
+`container-check`, and `security-check`. It does not apply on a push to `main`,
+where the heavy jobs remain skipped by design. The classifier reads
+`github.event.pull_request.labels` when the run starts. A plain **Re-run jobs**
+replays the original event payload and does **not** pick up a label added
+afterwards, so `force` stays false. If the label was added after the last push,
+push another commit (or otherwise create a new pull request event) to apply it.
+No workflow change is required for this procedure.
 
-The override covers only `ci.yml`. To run the container or security lane on
-demand, dispatch `container.yml` or `security.yml` directly from the Actions
-tab; both accept `workflow_dispatch`. The weekly run exercises all of them
-together.
+The override is implemented through `ci.yml`; it does not change the standalone
+`push` runs of the reusable workflows. To run a lane on demand without the
+label, dispatch `docs.yml`, `container.yml`, or `security.yml` directly from the
+Actions tab; all three accept `workflow_dispatch`. The weekly run exercises the
+container and security lanes together.
 
 ## Required check and branch protection
 
@@ -232,6 +234,12 @@ builds `Dockerfile.release` with stub binaries on container-path PRs and weekly
 runs, so path-mapping or syntax errors in the release image are caught before a
 tag exists.
 
+A code or dependency change does **not** rebuild the development `Dockerfile`
+on its PR; the weekly container run is the feedback loop for code-induced image
+breakage. Run `container.yml` manually from the Actions tab when a change is
+likely to affect the from-source build (new system dependency, feature flag, or
+build-script change).
+
 ## Scheduled fuzzing was intentionally removed
 
 The previous scheduled fuzzing setup was removed as a deliberate decision
@@ -320,26 +328,34 @@ Approximate runner-minutes per run (sum of billed jobs; parallel jobs count sepa
 | Code PR (`changes`, `fmt`, `clippy`, `test`, `build` ×3, `ci-gate`) | 20–25 |
 | OpenAPI-only PR | 2–3 |
 | Contrib-only PR | 1–2 |
-| Container PR (`compose` + `smoke`) | 7–10 |
+| Container PR (`compose` + `smoke` + `release-image` stub build) | 8–11 |
 | Security-only PR (`cargo-deny`) | 1–2 |
-| Weekly run (release tests, benchmarks, container, security) | 25–35 |
+| Weekly run (release tests, benchmarks, container, security, `release-image`) | 26–36 |
 | Release run (prebuilt-image pipeline) | 25–35 |
 
-A weekly run bills `release-tests` and `perf` in parallel plus container and
-security, so the weekly row is the sum of those jobs, not one critical path.
+A weekly run bills `release-tests` and `perf` in parallel plus container,
+security, and the `release-image` stub build, so the weekly row is the sum of
+those jobs, not one critical path. The stub build adds roughly half a minute to
+a minute; the live first run took 22 seconds.
+
+Standard GitHub-hosted runners are free for public repositories. This budget is
+therefore a time, queue, and capacity target rather than an invoice; if the
+repository becomes private or uses larger runners, confirm the rates in
+Billing and treat the same numbers as billable minutes.
 
 Dependency changes also match the code classifier, so a `Cargo.toml` or
 `Cargo.lock` PR costs the code lane plus the security lane, not just the
 security row.
 
 Illustrative month using the midpoints of those ranges: ~10 code PRs (≈225),
-~5 docs PRs (≈8), four weekly runs (≈120), two releases (≈60), and a handful of
-container/security/openapi/contrib runs (≈60), for **≈473 minutes (~470)**. The
+~5 docs PRs (≈8), four weekly runs (≈124), two releases (≈60), and a handful of
+container/security/openapi/contrib runs (≈45–60), for **≈460–480 minutes**. The
 midpoint sits inside the 450–550 expected band; depending on cache warmth and
-actual run counts, the same mix can range from roughly 395 to 550. These
-per-run figures are estimates from warm-cache runs, not invoice data; the
-measured baseline of 1,743 minutes per 30 days is the reference point the
-rework is reducing.
+actual run counts, the same mix can range from roughly 400 to 550. These per-run
+figures are estimates from warm-cache runs, not invoice data; the measured
+baseline of 1,743 minutes per 30 days is the reference point the rework is
+reducing. Replace these estimates with `scripts/ci_usage.py` output after the
+first full month.
 
 The largest structural savings come from the docs-only classifier (no Rust or
 Docker), skipping heavy jobs on `main` pushes, cancelling superseded PR runs,

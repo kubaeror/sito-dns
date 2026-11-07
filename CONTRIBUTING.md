@@ -133,12 +133,17 @@ the release pipeline, and the runner-minute budget, is in
 | `.github/workflows/**` | CI `docs-check` → Docs lane with `actionlint` |
 
 A docs-only PR never builds Rust or Docker, except `docs/openapi.json`, which
-runs the `openapi` job. To force every heavy CI lane anyway,
-add the `ci:full` label and then push a commit so the new pull request event
-carries the label, or dispatch **CI** with `full` checked for a branch-level
-run. A plain re-run does not pick up a newly added label because GitHub replays
-the original event payload. The container and security lanes can also be
-dispatched directly from the Actions tab.
+runs the `openapi` job. To force every heavy CI lane anyway, including the
+`docs-check`, `container-check`, and `security-check` gate jobs, add the
+`ci:full` label and then push a commit so the new pull request event carries the
+label, or dispatch **CI** with `full` checked for a branch-level run. A plain
+re-run does not pick up a newly added label because GitHub replays the original
+event payload. The docs, container, and security lanes can also be dispatched
+directly from the Actions tab.
+
+The development `Dockerfile` is built on container-path PRs and in the weekly
+run. A code or dependency-only PR does not rebuild it; run `container.yml`
+manually when a change is likely to affect the from-source image build.
 
 Local parity before pushing:
 
@@ -147,6 +152,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features --locked
 python3 scripts/check_config_reference.py
+python3 -m py_compile scripts/ci_usage.py
 shellcheck -S warning contrib/install.sh
 docker compose -f docker-compose.yml config >/dev/null
 docker compose -f docker-compose.ha.yml config >/dev/null
