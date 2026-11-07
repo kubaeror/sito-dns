@@ -111,6 +111,58 @@ cargo deny check
 cargo run -p sito -- --version
 ```
 
+### CI lanes
+
+Pull requests run only the lanes their paths need. `ci-gate` is the single
+required status check; jobs that are skipped because their paths did not change
+count as success. Container, security, and docs are reusable workflows called by
+`ci.yml` on pull requests and also run on `main` pushes when their paths match,
+so they are part of the required `ci-gate` check rather than separate advisory
+workflows. The full runbook, including branch protection, runner pins,
+the release pipeline, and the runner-minute budget, is in
+[docs/ci.md](docs/ci.md).
+
+| Paths changed | Lane |
+|---|---|
+| `crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml` | CI code jobs: `fmt`, `clippy`, `test`, three-target `build` |
+| `docs/openapi.json` (without crate changes) | CI `openapi` |
+| `contrib/**`, `scripts/**` | CI `contrib` (shellcheck, AdGuard converter, release helpers) |
+| `docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, templates | CI `docs-check` → Docs lane (config-reference drift; `actionlint` for workflow changes) |
+| `Dockerfile*`, `.dockerignore`, `docker-compose*.yml`, `config.example.toml`, `contrib/systemd/**` | CI `container-check` → Container lane (compose validation, image smoke, `Dockerfile.release` build) |
+| `Cargo.toml`, `Cargo.lock`, `deny.toml`, `rust-toolchain.toml` | CI `security-check` → Security lane (`cargo-deny`); `Cargo.*` also runs the code lane |
+| `.github/workflows/**` | CI `docs-check` → Docs lane with `actionlint` |
+
+A docs-only PR never builds Rust or Docker, except `docs/openapi.json`, which
+runs the `openapi` job. To force every heavy CI lane anyway, including the
+`docs-check`, `container-check`, and `security-check` gate jobs, add the
+`ci:full` label and then push a commit so the new pull request event carries the
+label, or dispatch **CI** with `full` checked for a branch-level run. A plain
+re-run does not pick up a newly added label because GitHub replays the original
+event payload. The docs, container, and security lanes can also be dispatched
+directly from the Actions tab.
+
+The development `Dockerfile` is built on container-path PRs and in the weekly
+run. A code or dependency-only PR does not rebuild it; run `container.yml`
+manually when a change is likely to affect the from-source image build.
+
+Local parity before pushing:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features --locked
+python3 scripts/check_config_reference.py
+python3 -m py_compile scripts/ci_usage.py
+shellcheck -S warning contrib/install.sh
+docker compose -f docker-compose.yml config >/dev/null
+docker compose -f docker-compose.ha.yml config >/dev/null
+cargo deny check
+```
+
+Scheduled fuzzing is no longer part of CI, and there is no fuzz workflow or
+harness directory. See [docs/ci.md](docs/ci.md#scheduled-fuzzing-was-intentionally-removed)
+for the accepted risk and the change-control rule.
+
 ---
 
 ## 6. Conventional Commits

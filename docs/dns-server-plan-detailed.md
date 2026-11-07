@@ -940,7 +940,7 @@ Transports {udp, tcp, dot, doh2, doh3, doq} × scenarios {plain query, blocked d
 ### 18.3 Fuzzing
 
 - `cargo-fuzz` targets: DNS message decoder (if a custom parser ever appears), rule parser, TOML-config parser, ClientID extraction from URL/SNI
-- CI: 10 min/target nightly; corpus in a separate repo
+- CI: scheduled fuzzing was intentionally removed in the CI cost-reduction rework (variant A); no fuzz workflow or harness directory is maintained. Reintroducing coverage-guided fuzzing requires a new plan, a maintainer decision, and a budget review. See `docs/ci.md`.
 
 ### 18.4 Chaos / HA
 
@@ -951,9 +951,11 @@ Transports {udp, tcp, dot, doh2, doh3, doq} × scenarios {plain query, blocked d
 ### 18.5 CI pipeline
 
 ```
-PR: fmt → clippy -D warnings → cargo-deny → unit tests → integration (matrix) → build matrix (x86_64, aarch64, armv7)
-nightly: fuzzing + load regression (dnsperf)
-tag: release (cargo-dist: binaries, packages, multi-arch images, cosign signature, SBOM)
+PR: fmt → clippy -D warnings → unit tests → integration (matrix) → build matrix (x86_64, aarch64, armv7)
+    docs lane (config reference + actionlint) → container lane (compose + smoke + Dockerfile.release stub build)
+    security lane (cargo-deny on dependency changes)
+weekly: release-mode tests + criterion benchmarks + container/security smoke
+tag: release (binaries, multi-arch images, cosign signature, SBOM)
 ```
 
 ---

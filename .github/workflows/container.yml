@@ -1,0 +1,173 @@
+name: Container
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'Dockerfile.*'
+      - '.dockerignore'
+      - 'docker-compose*.yml'
+      - 'config.example.toml'
+      - 'contrib/systemd/**'
+  workflow_call:
+  workflow_dispatch:
+
+# Least privilege: building and smoke-testing the image only needs the source.
+permissions:
+  contents: read
+
+# `github.workflow` separates a weekly `workflow_call` (named after the caller,
+# "Weekly Quality") from a pull request or push run of this workflow, so the two
+# do not cancel each other.
+concurrency:
+  group: container-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compose:
+    name: compose
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Both compose files are shipped to users, so a syntax/typo regression
+      # must fail before release. The HA file is validated only: its macvlan
+      # network needs a real parent interface and cannot run on a runner.
+      - name: Validate compose files
+        run: |
+          docker compose -f docker-compose.yml config >/dev/null
+          docker compose -f docker-compose.ha.yml config >/dev/null
+
+  smoke:
+    name: smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: sito:ci
+          # Separate scope from release.yml so the PR cache does not evict the
+          # release build cache.
+          cache-from: type=gha,scope=container
+          cache-to: type=gha,mode=min,scope=container
+
+      - name: Write the smoke configuration
+        run: |
+          mkdir -p ci-smoke/config
+          cat > ci-smoke/config/config.toml <<'EOF'
+          config_version = 1
+
+          [dns]
+          bind = ["0.0.0.0"]
+          port = 5353
+          dot_port = 0
+          doh_port = 0
+          doq_port = 0
+          doh3_port = 0
+
+          [web]
+          enabled = false
+
+          # A plain upstream keeps the smoke run independent of TLS/DoH setup;
+          # the asserted name below is answered from a local rewrite anyway.
+          [upstream]
+          servers = ["1.1.1.1"]
+
+          [rewrites]
+          auto_ptr = true
+
+          [[rewrites.entries]]
+          domain = "smoke.test"
+          type = "A"
+          answer = "192.0.2.1"
+          EOF
+          docker run --rm \
+            -v "$PWD/ci-smoke/config:/etc/sito:ro" \
+            sito:ci check-config --config /etc/sito/config.toml
+
+      - name: Start the container
+        run: |
+          # A config file present with no users.toml makes the server refuse to
+          # start (fail closed). Seed one throwaway admin in the named data
+          # volume first; the volume inherits uid/gid 65532 from the image.
+          docker run --rm \
+            -v sito-smoke-data:/var/lib/sito \
+            -v "$PWD/ci-smoke/config:/etc/sito:ro" \
+            sito:ci reset-admin --password ci-smoke-admin
+          docker run -d --name sito-smoke \
+            -p 5353:5353/udp \
+            -v "$PWD/ci-smoke/config:/etc/sito:ro" \
+            -v sito-smoke-data:/var/lib/sito \
+            sito:ci
+
+      - name: Assert the rewrite is served
+        run: |
+          command -v dig >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y dnsutils)
+          expected="192.0.2.1"
+          answer=""
+          for _ in $(seq 1 30); do
+            if ! docker inspect -f '{{.State.Running}}' sito-smoke 2>/dev/null | grep -qx true; then
+              echo "::error::sito container exited before answering"
+              break
+            fi
+            answer="$(dig +short +time=1 +tries=1 @127.0.0.1 -p 5353 smoke.test A | head -n1 || true)"
+            if [ "${answer}" = "${expected}" ]; then
+              echo "smoke.test -> ${answer}"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::expected smoke.test -> ${expected}, got '${answer}'"
+          docker logs sito-smoke || true
+          exit 1
+
+      - name: Remove the smoke container and volume
+        if: always()
+        run: |
+          docker rm -f sito-smoke || true
+          docker volume rm sito-smoke-data || true
+
+  # Validates Dockerfile.release before a tag exists: the same named build
+  # context and platform set as release.yml, but with stub binaries and no push.
+  release-image:
+    name: release-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Stage stub binaries
+        run: |
+          set -euo pipefail
+          mkdir -p prebuilt/empty
+          : > prebuilt/empty/.keep
+          for arch in amd64 arm64 arm; do
+            mkdir -p "prebuilt/$arch"
+            printf '#!/bin/sh\nexit 0\n' > "prebuilt/$arch/sito"
+            chmod +x "prebuilt/$arch/sito"
+          done
+      - name: Build Dockerfile.release for all platforms (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.release
+          build-contexts: binaries=./prebuilt
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: false
+          load: false
+          provenance: false
+          sbom: false

@@ -1,0 +1,88 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '**/*.md'
+      - '.github/workflows/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - 'LICENSE'
+      - 'CODE_OF_CONDUCT.md'
+      - 'SECURITY.md'
+      - 'scripts/check_config_reference.py'
+  workflow_call:
+  workflow_dispatch:
+
+# Least privilege: docs checks only read the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  meta:
+    name: meta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Compute changed files
+        id: changed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            git fetch --no-tags origin "${BASE_REF}"
+            range="origin/${BASE_REF}...HEAD"
+          elif [ -n "${BEFORE_SHA}" ] && [ "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]; then
+            range="${BEFORE_SHA}..HEAD"
+          else
+            # workflow_dispatch (or a push with an all-zero before SHA): compare
+            # against the previous commit so the meta checks still see a change
+            # set instead of silently skipping.
+            if git rev-parse --verify -q 'HEAD^' >/dev/null; then
+              range="HEAD^..HEAD"
+            else
+              # Single-commit branch: diff the empty tree against HEAD so every
+              # tracked file is treated as changed instead of failing here.
+              range="$(git hash-object -t tree /dev/null)..HEAD"
+            fi
+          fi
+          git diff --name-only "${range}" > changed-files.txt
+          cat changed-files.txt
+          if grep -Eq '^(docs/configuration-reference\.md|scripts/check_config_reference\.py)$' changed-files.txt; then
+            echo "config_docs=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "config_docs=false" >> "${GITHUB_OUTPUT}"
+          fi
+          if grep -Eq '^\.github/workflows/' changed-files.txt; then
+            echo "workflows=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "workflows=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      # `if: always()` keeps the two checks independent: a failure in the
+      # configuration-reference step must not hide an actionlint failure (and
+      # the reverse). Each step is still gated on its own change flag.
+      - name: Verify configuration reference matches the config structs
+        if: always() && steps.changed.outputs.config_docs == 'true'
+        run: python3 scripts/check_config_reference.py --github
+
+      - name: Lint GitHub Actions workflows
+        if: always() && steps.changed.outputs.workflows == 'true'
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo:ro" \
+            -w /repo \
+            rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667

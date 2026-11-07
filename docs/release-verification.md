@@ -29,6 +29,11 @@ Consequences:
 - `docker-build-push` is blocking. It is not optional and has no
   `continue-on-error`.
 
+The container image is built from the already-built release binaries through
+`Dockerfile.release` (`binaries=./prebuilt`); no Rust compilation happens in the
+image pipeline. Artifact E2E executes all three architectures in the pinned
+`cc-debian13` runtime with QEMU for arm64 and armv7.
+
 ## Tag and publication rules
 
 | Tag | GitHub release | Docker tags |

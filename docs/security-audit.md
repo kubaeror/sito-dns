@@ -41,7 +41,7 @@ implementation of record.
   proven fails closed.
 * **Malicious subscription lists:** list parsing is fail-closed for regex
   budgets; hostile prefix/ACL load is bounded by the per-list byte cap and the
-  parse pipeline never panics (fuzz-tested).
+  parse pipeline never panics.
 * **Compromised client identity claims:** DoH path segments and DoT/DoQ SNI
   only identify a client when they match a configured shared secret; filter
   `$client=` matching uses only registry-resolved identity.
@@ -64,9 +64,7 @@ cargo deny check
 python3 scripts/check_config_reference.py
 ```
 
-Fuzzing targets (`fuzz/`) cover DNS wire parsing, ABP parsing, TOML config,
-client IDs, DNSSEC responses and HA bundles; `nightly-fuzz.yml` runs them with
-a pinned nightly toolchain.
+Scheduled fuzzing was intentionally removed and is not part of CI.
 
 ---
 
