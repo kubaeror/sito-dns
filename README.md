@@ -7,6 +7,9 @@
 [![MSRV: 1.99.1](https://img.shields.io/badge/MSRV-1.99.1-orange.svg)](rust-toolchain.toml)
 [![Rust Edition 2024](https://img.shields.io/badge/Edition-2024-purple.svg)](Cargo.toml)
 
+CI lanes, the required `ci-gate` check, the release pipeline, and the current
+runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
+
 > **sito** (noun, Polish for *sieve* / *strainer*) — A high-performance, memory-safe, self-hosted filtering DNS server written in Rust.
 
 `sito` is designed as a modern, rock-solid alternative to AdGuard Home and Pi-hole. Engineered in Rust (edition 2024), it combines sub-millisecond p99 latency, comprehensive ad/tracker/malware blocking (using AdGuard/ABP rule syntax), multi-protocol encryption (DoT, DoH H2, DoQ, DoH3), and automated master/slave high availability.

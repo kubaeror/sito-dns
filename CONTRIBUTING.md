@@ -111,6 +111,45 @@ cargo deny check
 cargo run -p sito -- --version
 ```
 
+### CI lanes
+
+Pull requests run only the lanes their paths need. `ci-gate` is the single
+required status check; jobs that are skipped because their paths did not change
+count as success. The full runbook, including branch protection, runner pins,
+the release pipeline, and the runner-minute budget, is in
+[docs/ci.md](docs/ci.md).
+
+| Paths changed | Lane |
+|---|---|
+| `crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml` | CI code jobs: `fmt`, `clippy`, `test`, three-target `build` |
+| `docs/openapi.json` (without crate changes) | CI `openapi` |
+| `contrib/**`, `scripts/**` | CI `contrib` (shellcheck, AdGuard converter, release helpers) |
+| `docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, templates | Docs lane (config-reference drift; `actionlint` for workflow changes) |
+| `Dockerfile*`, `.dockerignore`, `docker-compose*.yml`, `config.example.toml`, `contrib/systemd/**` | Container lane (compose validation + image smoke) |
+| `Cargo.toml`, `Cargo.lock`, `deny.toml`, `rust-toolchain.toml` | Security lane (`cargo-deny`); `Cargo.*` also runs the code lane |
+| `.github/workflows/**` | Docs lane with `actionlint` |
+
+A docs-only PR never builds Rust or Docker. To force every heavy CI lane anyway,
+add the `ci:full` label and re-run the workflow (label events do not start a run
+by themselves), or dispatch **CI** with `full` checked. The container and
+security lanes can be dispatched directly from the Actions tab.
+
+Local parity before pushing:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features --locked
+python3 scripts/check_config_reference.py
+shellcheck -S warning contrib/install.sh
+docker compose -f docker-compose.yml config >/dev/null
+cargo deny check
+```
+
+Scheduled fuzzing is no longer part of CI, and there is no fuzz workflow or
+harness directory. See [docs/ci.md](docs/ci.md#scheduled-fuzzing-was-intentionally-removed)
+for the accepted risk and the change-control rule.
+
 ---
 
 ## 6. Conventional Commits
