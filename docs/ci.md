@@ -11,7 +11,7 @@ pin policy, and the monthly runner-minute budget.
 | Workflow | File | Triggers | Purpose |
 |---|---|---|---|
 | **CI** | `ci.yml` | `pull_request` to `main`, `push` to `main`, `merge_group`, `workflow_dispatch` (`full`) | Classifies the change set and runs `fmt`, `clippy`, `test`, the three-target `build` matrix, `openapi`, and `contrib`. Publishes the single required check `ci-gate`. |
-| **Docs** | `docs.yml` | `pull_request` and `push` to `main` on docs/workflow paths, `workflow_dispatch` | Runs the configuration-reference drift check and `actionlint` for the paths that need them. |
+| **Docs** | `docs.yml` | `pull_request` and `push` to `main` on docs/workflow paths, `workflow_dispatch` | Runs the configuration-reference drift check and `actionlint` for `.github/workflows/**`. |
 | **Container** | `container.yml` | `pull_request` and `push` to `main` on container paths, `workflow_call`, `workflow_dispatch` | Validates both Compose files and builds/smoke-tests the development `Dockerfile`. |
 | **Security** | `security.yml` | `pull_request` and `push` to `main` on dependency paths, `workflow_call`, `workflow_dispatch` | Runs `cargo-deny check`. |
 | **Weekly Quality** | `weekly.yml` | Sunday at 03:00 UTC (`schedule`), `workflow_dispatch` | Release-mode tests, Criterion benchmarks, plus the reusable Container and Security workflows. |
@@ -40,7 +40,7 @@ path-filtered workflows, so they do not need to be duplicated in `ci.yml`.
 | Contrib/scripts (`contrib/**`, `scripts/**`) | `ci.yml`: `changes`, `contrib`, `ci-gate`. `contrib` runs `shellcheck` on the installer, the AdGuard converter fixture test, and the release-helper tests. |
 | Container (`Dockerfile`, `Dockerfile.*`, `.dockerignore`, `docker-compose*.yml`, `config.example.toml`, `contrib/systemd/**`) | `container.yml`: `compose` + `smoke`. `ci.yml`: `changes` + `ci-gate`. |
 | Dependencies (`Cargo.toml`, `Cargo.lock`, `deny.toml`, `rust-toolchain.toml`) | `security.yml`: `cargo-deny`. `Cargo.*` and the toolchain also match the code classifier, so the full code lane runs as well. |
-| Workflow and action files (`.github/workflows/**`, `.github/actions/**`) | `docs.yml`: `meta` with `actionlint`; `ci.yml`: `changes` + `ci-gate`. |
+| Workflow files (`.github/workflows/**`) | `docs.yml`: `meta` with `actionlint`; `ci.yml`: `changes` + `ci-gate`. |
 | Mixed changes | Union of the matching lanes. |
 
 `docs/openapi.json` matches both the `docs/**` filter and the `api` filter, so
@@ -49,10 +49,10 @@ it runs the `openapi` job and the docs lane. A change to
 the `meta` configuration-reference check. Independently of paths, every pull
 request pays the small `changes` + `ci-gate` overhead (roughly 1–2 minutes).
 
-The `meta` job's change detector and the `docs.yml` path filter both cover
-`.github/workflows/**` and `.github/actions/**`, so a change that touches only a
-workflow or a composite action runs the docs lane and gets `actionlint` coverage
-of both locations in the same step.
+`actionlint` discovers and lints `.github/workflows/**` only. It does not lint
+composite actions in `.github/actions/**` (there is no such directory today).
+If composite actions are added later, add a dedicated validator for them rather
+than relying on `actionlint`.
 
 A docs-only pull request therefore costs roughly the two small `ci.yml` jobs
 plus the docs `meta` job, not a Rust rebuild.

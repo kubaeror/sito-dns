@@ -47,7 +47,17 @@ jobs:
       - name: Verify the runtime image matches Dockerfile.release
         run: |
           set -euo pipefail
-          if ! grep -Fq "${RUNTIME_IMAGE}" Dockerfile.release; then
+          if [ ! -f Dockerfile.release ]; then
+            echo "::error::Dockerfile.release is missing"
+            exit 1
+          fi
+          # Anchor to a real `FROM` line carrying a full digest so a commented
+          # or unrelated reference cannot satisfy the check.
+          if ! grep -Eq '^FROM gcr\.io/distroless/cc-debian13:nonroot@sha256:[0-9a-f]{64}$' Dockerfile.release; then
+            echo "::error::Dockerfile.release has no pinned distroless runtime FROM line"
+            exit 1
+          fi
+          if ! grep -Fxq "FROM ${RUNTIME_IMAGE}" Dockerfile.release; then
             echo "::error::RUNTIME_IMAGE ${RUNTIME_IMAGE} does not match Dockerfile.release"
             exit 1
           fi

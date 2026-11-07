@@ -94,7 +94,6 @@ jobs:
               - 'rust-toolchain.toml'
             workflows:
               - '.github/workflows/**'
-              - '.github/actions/**'
 
       # `ci:full` on a pull request or `full=true` on workflow_dispatch runs
       # every heavy lane even when no matching path changed.
