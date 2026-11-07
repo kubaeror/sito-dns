@@ -276,30 +276,40 @@ the release jobs escalating to `contents: write`, `id-token: write`, or
 
 ## Monthly runner-minute budget
 
-The working budget is **3,000 GitHub-hosted runner-minutes per month** across
-all workflows. It is a planning and review target, not a GitHub-enforced limit;
-it is set so that a busy month with releases and weekly runs still has roughly
-25% headroom.
+The working budget is **600 GitHub-hosted runner-minutes per month**, with an
+expected steady state of **450–550 minutes**. The measured baseline before this
+rework was **1,743 minutes per 30 days**, so the target is a substantial
+reduction, not an increase. 600 is the review threshold: a month at or above it
+should be investigated. It is a planning target, not a GitHub-enforced limit.
 
 Approximate cost per run (Linux, warm caches; cold caches are higher):
 
 | Activity | Typical minutes |
 |---|---|
 | Docs-only PR (`changes` + `ci-gate` + docs `meta`) | 1–2 |
-| Code PR (`changes`, `fmt`, `clippy`, `test`, `build` ×3, `ci-gate`) | 40–70 |
-| OpenAPI-only PR | 5–10 |
-| Contrib-only PR | 3–5 |
-| Container PR (`compose` + `smoke`) | 10–20 |
-| Weekly run (release tests, benchmarks, container, security) | 60–90 |
-| Release run | 150–250 |
+| Code PR (`changes`, `fmt`, `clippy`, `test`, `build` ×3, `ci-gate`) | 20–25 |
+| OpenAPI-only PR | 2–3 |
+| Contrib-only PR | 1–2 |
+| Container PR (`compose` + `smoke`) | 7–10 |
+| Security-only PR (`cargo-deny`) | 1–2 |
+| Weekly run (release tests, benchmarks, container, security) | 25–35 |
+| Release run (prebuilt-image pipeline) | 25–35 |
 
-Illustrative month: 25 code PRs × ~55 minutes (≈1,375), four weekly runs × ~75
-(≈300), two releases × ~200 (≈400), and ~150 minutes of docs/container/security
-runs gives roughly **2,225 minutes**, inside the 3,000 budget.
+Dependency changes also match the code classifier, so a `Cargo.toml` or
+`Cargo.lock` PR costs the code lane plus the security lane, not just the
+security row.
+
+Illustrative month: ~10 code PRs (≈200–250), ~5 docs PRs (≈5–10), four weekly
+runs (≈100–140), two releases (≈50–70), and a handful of
+container/security/openapi/contrib runs (≈40–80) land around **450–550
+minutes**, below the 600-minute ceiling. These per-run figures are estimates
+from warm-cache runs, not invoice data; the measured baseline of 1,743 minutes
+per 30 days is the reference point the rework is reducing.
 
 The largest structural savings come from the docs-only classifier (no Rust or
 Docker), skipping heavy jobs on `main` pushes, cancelling superseded PR runs,
-and removing scheduled fuzzing. If usage approaches the budget:
+and removing scheduled fuzzing. If a month reaches the 600-minute review
+threshold:
 
 1. Measure the actual split with `scripts/ci_usage.py`.
 2. Check whether `test` or `build` dominates; those are the expensive jobs.
