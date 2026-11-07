@@ -1,0 +1,93 @@
+name: Docs
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - '**/*.md'
+      - '.github/workflows/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - 'LICENSE'
+      - 'CODE_OF_CONDUCT.md'
+      - 'SECURITY.md'
+      - 'scripts/check_config_reference.py'
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '**/*.md'
+      - '.github/workflows/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - 'LICENSE'
+      - 'CODE_OF_CONDUCT.md'
+      - 'SECURITY.md'
+      - 'scripts/check_config_reference.py'
+  workflow_dispatch:
+
+# Least privilege: docs checks only read the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  meta:
+    name: meta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Compute changed files
+        id: changed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            git fetch --no-tags origin "${BASE_REF}"
+            range="origin/${BASE_REF}...HEAD"
+          elif [ -n "${BEFORE_SHA}" ] && [ "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]; then
+            range="${BEFORE_SHA}..HEAD"
+          else
+            git fetch --no-tags origin "${DEFAULT_BRANCH}"
+            range="origin/${DEFAULT_BRANCH}...HEAD"
+          fi
+          git diff --name-only "${range}" > changed-files.txt
+          cat changed-files.txt
+          if grep -Eq '^(docs/configuration-reference\.md|scripts/check_config_reference\.py)$' changed-files.txt; then
+            echo "config_docs=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "config_docs=false" >> "${GITHUB_OUTPUT}"
+          fi
+          if grep -Eq '^\.github/(workflows|actions)/' changed-files.txt; then
+            echo "workflows=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "workflows=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Verify configuration reference matches the config structs
+        if: steps.changed.outputs.config_docs == 'true'
+        run: python3 scripts/check_config_reference.py --github
+
+      - name: Install actionlint
+        if: steps.changed.outputs.workflows == 'true'
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: actionlint@1.7.12
+
+      # SC2035 is a pre-existing info-level finding in release.yml
+      # (`sha256sum *.tar.gz`), which is owned by a separate change; ignore
+      # only that rule so every other workflow finding still fails the lane.
+      - name: Lint GitHub Actions workflows
+        if: steps.changed.outputs.workflows == 'true'
+        run: actionlint -ignore 'SC2035'
