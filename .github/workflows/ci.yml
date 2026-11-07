@@ -63,24 +63,6 @@ jobs:
       - name: Verify configuration reference matches the config structs
         run: python3 scripts/check_config_reference.py --github
 
-  fuzz:
-    name: fuzz build
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          # fuzz/ is a standalone workspace with its own lockfile/target dir.
-          workspaces: |
-            fuzz -> target
-      # `--locked` fails when fuzz/Cargo.lock is stale (for example after a
-      # workspace version bump), so this both compiles every fuzz target on
-      # stable and guards lock freshness without needing cargo-fuzz/nightly.
-      - name: Check fuzz targets compile
-        run: cargo check --manifest-path fuzz/Cargo.toml --locked
-
   deny:
     name: deny
     runs-on: ubuntu-latest

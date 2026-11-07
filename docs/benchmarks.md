@@ -5,7 +5,7 @@ resource consumption profile from the original reference-hardware run against
 the performance contracts in **ADR-0008 (Performance Budget)**. The absolute
 numbers below were captured on that hardware at v1.0.0 and are **not**
 re-measured on every release; CI gates performance only through the
-`cargo bench` job (see `.github/workflows/nightly-fuzz.yml`) and the
+`cargo bench` job (see `.github/workflows/weekly.yml`) and the
 `SITO_BENCH_TESTS` release-mode test run. Re-run
 `cargo bench -p sito-test --bench pipeline_bench` on your own hardware before
 comparing.

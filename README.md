@@ -1,7 +1,7 @@
 # sito 🛡️
 
 [![CI](https://github.com/kubaeror/sito-dns/actions/workflows/ci.yml/badge.svg)](https://github.com/kubaeror/sito-dns/actions/workflows/ci.yml)
-[![Nightly Fuzzing](https://github.com/kubaeror/sito-dns/actions/workflows/nightly-fuzz.yml/badge.svg)](https://github.com/kubaeror/sito-dns/actions/workflows/nightly-fuzz.yml)
+[![Weekly Quality](https://github.com/kubaeror/sito-dns/actions/workflows/weekly.yml/badge.svg)](https://github.com/kubaeror/sito-dns/actions/workflows/weekly.yml)
 [![Release](https://img.shields.io/github/v/release/kubaeror/sito-dns?include_prereleases&color=brightgreen)](https://github.com/kubaeror/sito-dns/releases)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 [![MSRV: 1.99.1](https://img.shields.io/badge/MSRV-1.99.1-orange.svg)](rust-toolchain.toml)

@@ -1,5 +1,4 @@
 target/
-fuzz/target/
 .git/
 .github/
 data/
