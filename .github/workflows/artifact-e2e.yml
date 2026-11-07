@@ -1,8 +1,8 @@
 name: Artifact E2E
 
 # Verifies an already-published release end to end: the unified checksum file,
-# the cosign keyless signature identity, and that the packaged binary accepts
-# the configuration shipped inside the archive.
+# the cosign keyless signature identity, and that every packaged binary accepts
+# the configuration shipped inside its archive.
 #
 # - `workflow_call`: invoked by release.yml after the tag-only release has been
 #   published. It is a job in that workflow rather than a `release: published`
@@ -33,6 +33,11 @@ jobs:
     name: verify (${{ inputs.tag }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      TARGETS: |
+        x86_64-unknown-linux-gnu
+        aarch64-unknown-linux-gnu
+        armv7-unknown-linux-gnueabihf
     steps:
       - name: Resolve the release tag
         id: release
@@ -63,10 +68,10 @@ jobs:
           gh release download "${TAG}" \
             --repo "${GITHUB_REPOSITORY}" \
             --dir release-assets \
-            --pattern 'sito-*-x86_64-unknown-linux-gnu.tar.gz' \
-            --pattern 'sito-*-x86_64-unknown-linux-gnu.tar.gz.sha256' \
-            --pattern 'sito-*-x86_64-unknown-linux-gnu.tar.gz.sig' \
-            --pattern 'sito-*-x86_64-unknown-linux-gnu.tar.gz.pem' \
+            --pattern 'sito-*.tar.gz' \
+            --pattern 'sito-*.tar.gz.sha256' \
+            --pattern 'sito-*.tar.gz.sig' \
+            --pattern 'sito-*.tar.gz.pem' \
             --pattern 'SHA256SUMS'
           ls -l release-assets
 
@@ -76,11 +81,18 @@ jobs:
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          archive="sito-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
-          sha256sum -c "${archive}.sha256"
-          # SHA256SUMS also covers the other architectures and the SBOM, which
-          # this job does not download; verify only the archive under test.
-          grep -F "  ${archive}" SHA256SUMS | sha256sum -c -
+          while IFS= read -r triple; do
+            [ -n "${triple}" ] || continue
+            archive="sito-${TAG}-${triple}.tar.gz"
+            if [ ! -f "${archive}" ]; then
+              echo "::error::missing release archive ${archive}"
+              exit 1
+            fi
+            sha256sum -c "${archive}.sha256"
+            # SHA256SUMS also covers the SBOM, which this job does not
+            # download; verify only the archive under test.
+            grep -F "  ${archive}" SHA256SUMS | sha256sum -c -
+          done <<< "${TARGETS}"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
@@ -88,29 +100,57 @@ jobs:
           # Pinned to v2 like release.yml: the v3 CLI changed its flag surface.
           cosign-release: 'v2.6.5'
 
-      - name: Verify the cosign keyless signature
+      - name: Verify the cosign keyless signatures
         working-directory: release-assets
         env:
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          archive="sito-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
-          cosign verify-blob \
-            --certificate "${archive}.pem" \
-            --signature "${archive}.sig" \
-            --certificate-identity-regexp \
-              '^https://github.com/kubaeror/sito-dns/\.github/workflows/release\.yml@refs/tags/.*$' \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "${archive}"
+          while IFS= read -r triple; do
+            [ -n "${triple}" ] || continue
+            archive="sito-${TAG}-${triple}.tar.gz"
+            cosign verify-blob \
+              --certificate "${archive}.pem" \
+              --signature "${archive}.sig" \
+              --certificate-identity-regexp \
+                '^https://github.com/kubaeror/sito-dns/\.github/workflows/release\.yml@refs/tags/.*$' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${archive}"
+          done <<< "${TARGETS}"
+
+      # The arm64 and armv7 archives are executed in containers for their own
+      # platform. QEMU provides the CPU emulation; the distroless release base
+      # image provides the matching glibc and dynamic loader.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64,arm
 
       - name: Extract and validate the shipped configuration
         working-directory: release-assets
         env:
           TAG: ${{ steps.release.outputs.tag }}
+          # Same runtime base as Dockerfile.release: the archive must run there.
+          RUNTIME_IMAGE: gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1
         run: |
           set -euo pipefail
-          archive="sito-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
-          dir="sito-${TAG}-x86_64-unknown-linux-gnu"
-          tar -xzf "${archive}"
-          "./${dir}/sito" --version
-          "./${dir}/sito" check-config --config "./${dir}/config.example.toml"
+          while IFS= read -r triple; do
+            [ -n "${triple}" ] || continue
+            case "${triple}" in
+              x86_64-*) platform="linux/amd64" ;;
+              aarch64-*) platform="linux/arm64" ;;
+              armv7-*) platform="linux/arm/v7" ;;
+              *) echo "::error::unmapped target '${triple}'"; exit 1 ;;
+            esac
+            archive="sito-${TAG}-${triple}.tar.gz"
+            dir="${archive%.tar.gz}"
+            tar -xzf "${archive}"
+            docker run --rm --platform "${platform}" \
+              --entrypoint "/assets/${dir}/sito" \
+              -v "${PWD}:/assets:ro" \
+              "${RUNTIME_IMAGE}" --version
+            docker run --rm --platform "${platform}" \
+              --entrypoint "/assets/${dir}/sito" \
+              -v "${PWD}:/assets:ro" \
+              "${RUNTIME_IMAGE}" check-config --config "/assets/${dir}/config.example.toml"
+          done <<< "${TARGETS}"

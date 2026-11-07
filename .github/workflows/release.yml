@@ -155,7 +155,7 @@ jobs:
           # unified SHA256SUMS consumed by the installer.
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.tar.gz.sha256" \) -exec cp {} release-assets/ \;
           cd release-assets
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum -- *.tar.gz > SHA256SUMS
           cd ..
 
       # The tag/version gate runs in the verify-tag job that all publishing
@@ -249,9 +249,33 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # No docker/setup-qemu-action: the Dockerfile builds on
-      # --platform=$BUILDPLATFORM and cross-compiles, so no target-architecture
-      # binaries are executed during the build.
+      # The image is assembled from the archives produced by build-binaries, so
+      # no Rust compilation happens here. The archives themselves were already
+      # checked by artifact-e2e before this job started.
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+
+      - name: Prepare prebuilt binaries
+        run: |
+          set -euo pipefail
+          mkdir -p prebuilt/empty
+          : > prebuilt/empty/.keep
+          declare -A map=( [x86_64-unknown-linux-gnu]=amd64 [aarch64-unknown-linux-gnu]=arm64 [armv7-unknown-linux-gnueabihf]=arm )
+          for triple in "${!map[@]}"; do
+            archive=$(find artifacts -name "sito-*-${triple}.tar.gz" -print -quit)
+            test -n "$archive"
+            tmp=$(mktemp -d)
+            tar -xzf "$archive" -C "$tmp"
+            install -D -m 0755 "$tmp/sito-"*"/sito" "prebuilt/${map[$triple]}/sito"
+            rm -rf "$tmp"
+          done
+          find prebuilt -type f -maxdepth 3 -print
+
+      # No docker/setup-qemu-action: the image is assembled from prebuilt
+      # target-architecture binaries, so nothing foreign is executed during the
+      # build.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -280,7 +304,10 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile.release
+          # The release archives extracted above form the `binaries` context;
+          # Dockerfile.release copies `/${TARGETARCH}/sito` from it.
+          build-contexts: binaries=./prebuilt
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -290,8 +317,6 @@ jobs:
           # verifies that both are present before the job can succeed.
           provenance: true
           sbom: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Verify the pushed image digest, platforms and attestations
         env:
@@ -379,3 +404,17 @@ jobs:
           echo "platforms: ${platforms}"
           echo "tags:"
           printf '%s\n' "${TAGS}"
+
+      - name: Smoke-test the published image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE}:${REF_NAME#v}"
+          # Override the entrypoint: it injects `--config /etc/sito/config.toml`
+          # and would otherwise duplicate/override the arguments below.
+          docker run --rm --entrypoint /usr/bin/sito "${image}" --version
+          docker run --rm --entrypoint /usr/bin/sito \
+            -v "${PWD}/config.example.toml:/config.toml:ro" \
+            "${image}" check-config --config /config.toml

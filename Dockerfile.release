@@ -1,0 +1,12 @@
+# syntax=docker/dockerfile:1
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1
+ARG TARGETARCH
+COPY --from=binaries --chmod=0755 /${TARGETARCH}/sito /usr/bin/sito
+COPY --chown=65532:65532 prebuilt/empty/ /var/lib/sito/
+COPY --chown=65532:65532 prebuilt/empty/ /etc/sito/
+USER nonroot
+EXPOSE 53/udp 53/tcp 853/tcp 853/udp 443/tcp 443/udp 8080/tcp 8953/tcp
+VOLUME ["/var/lib/sito"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["/usr/bin/sito", "--config", "/etc/sito/config.toml", "healthcheck", "--setup-fallback"]
+ENTRYPOINT ["/usr/bin/sito", "--config", "/etc/sito/config.toml"]
