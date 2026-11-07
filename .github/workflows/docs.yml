@@ -6,6 +6,7 @@ on:
       - 'docs/**'
       - '**/*.md'
       - '.github/workflows/**'
+      - '.github/actions/**'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE.md'
       - 'LICENSE'
@@ -18,6 +19,7 @@ on:
       - 'docs/**'
       - '**/*.md'
       - '.github/workflows/**'
+      - '.github/actions/**'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE.md'
       - 'LICENSE'
@@ -50,7 +52,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           BEFORE_SHA: ${{ github.event.before }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           if [ "${EVENT_NAME}" = "pull_request" ]; then
@@ -59,8 +60,10 @@ jobs:
           elif [ -n "${BEFORE_SHA}" ] && [ "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]; then
             range="${BEFORE_SHA}..HEAD"
           else
-            git fetch --no-tags origin "${DEFAULT_BRANCH}"
-            range="origin/${DEFAULT_BRANCH}...HEAD"
+            # workflow_dispatch (or a push with an all-zero before SHA): compare
+            # against the previous commit so the meta checks still see a change
+            # set instead of silently skipping.
+            range="HEAD^..HEAD"
           fi
           git diff --name-only "${range}" > changed-files.txt
           cat changed-files.txt
@@ -75,19 +78,19 @@ jobs:
             echo "workflows=false" >> "${GITHUB_OUTPUT}"
           fi
 
+      # `if: always()` keeps the two checks independent: a failure in the
+      # configuration-reference step must not hide an actionlint failure (and
+      # the reverse). Each step is still gated on its own change flag.
       - name: Verify configuration reference matches the config structs
-        if: steps.changed.outputs.config_docs == 'true'
+        if: always() && steps.changed.outputs.config_docs == 'true'
         run: python3 scripts/check_config_reference.py --github
 
       - name: Install actionlint
-        if: steps.changed.outputs.workflows == 'true'
+        if: always() && steps.changed.outputs.workflows == 'true'
         uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: actionlint@1.7.12
 
-      # SC2035 is a pre-existing info-level finding in release.yml
-      # (`sha256sum *.tar.gz`), which is owned by a separate change; ignore
-      # only that rule so every other workflow finding still fails the lane.
-      - name: Lint GitHub Actions workflows
-        if: steps.changed.outputs.workflows == 'true'
-        run: actionlint -ignore 'SC2035'
+      - name: Lint GitHub Actions workflows and composite actions
+        if: always() && steps.changed.outputs.workflows == 'true'
+        run: actionlint

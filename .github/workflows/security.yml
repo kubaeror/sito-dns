@@ -21,8 +21,11 @@ on:
 permissions:
   contents: read
 
+# `github.workflow` separates a weekly `workflow_call` (named after the caller,
+# "Weekly Quality") from a pull request or push run of this workflow, so the two
+# do not cancel each other.
 concurrency:
-  group: security-${{ github.event.pull_request.number || github.ref }}
+  group: security-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:

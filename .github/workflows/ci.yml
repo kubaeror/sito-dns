@@ -17,7 +17,6 @@ on:
 # classifier additionally reads the pull request file list.
 permissions:
   contents: read
-  pull-requests: read
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
@@ -35,6 +34,10 @@ jobs:
     name: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Reading the pull request file list is only needed by the path filter.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
       docs: ${{ steps.filter.outputs.docs }}
@@ -190,7 +193,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run shellcheck
-        run: shellcheck -S warning contrib/install.sh
+        run: |
+          command -v shellcheck >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y shellcheck)
+          shellcheck -S warning contrib/install.sh
       - name: Test AdGuard converter against the fixture
         run: |
           python3 -c "import yaml" >/dev/null 2>&1 || python3 -m pip install --quiet --break-system-packages pyyaml

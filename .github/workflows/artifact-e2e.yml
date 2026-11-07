@@ -38,7 +38,21 @@ jobs:
         x86_64-unknown-linux-gnu
         aarch64-unknown-linux-gnu
         armv7-unknown-linux-gnueabihf
+      # Same runtime base as Dockerfile.release: the archive must run there.
+      # Checked against Dockerfile.release below so the two cannot drift.
+      RUNTIME_IMAGE: gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify the runtime image matches Dockerfile.release
+        run: |
+          set -euo pipefail
+          if ! grep -Fq "${RUNTIME_IMAGE}" Dockerfile.release; then
+            echo "::error::RUNTIME_IMAGE ${RUNTIME_IMAGE} does not match Dockerfile.release"
+            exit 1
+          fi
+          echo "RUNTIME_IMAGE matches Dockerfile.release"
+
       - name: Resolve the release tag
         id: release
         env:
@@ -124,14 +138,13 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
+          image: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
           platforms: arm64,arm
 
       - name: Extract and validate the shipped configuration
         working-directory: release-assets
         env:
           TAG: ${{ steps.release.outputs.tag }}
-          # Same runtime base as Dockerfile.release: the archive must run there.
-          RUNTIME_IMAGE: gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1
         run: |
           set -euo pipefail
           while IFS= read -r triple; do

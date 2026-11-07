@@ -150,6 +150,7 @@ jobs:
 
       - name: Flatten artifacts and compute unified SHA256SUMS
         run: |
+          set -euo pipefail
           mkdir -p release-assets
           # Publish the per-archive .sha256 files as documented, plus the
           # unified SHA256SUMS consumed by the installer.
@@ -258,6 +259,7 @@ jobs:
           path: artifacts
 
       - name: Prepare prebuilt binaries
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p prebuilt/empty
@@ -265,13 +267,21 @@ jobs:
           declare -A map=( [x86_64-unknown-linux-gnu]=amd64 [aarch64-unknown-linux-gnu]=arm64 [armv7-unknown-linux-gnueabihf]=arm )
           for triple in "${!map[@]}"; do
             archive=$(find artifacts -name "sito-*-${triple}.tar.gz" -print -quit)
-            test -n "$archive"
+            if [ -z "$archive" ]; then
+              echo "::error::missing archive for ${triple}"
+              exit 1
+            fi
             tmp=$(mktemp -d)
             tar -xzf "$archive" -C "$tmp"
-            install -D -m 0755 "$tmp/sito-"*"/sito" "prebuilt/${map[$triple]}/sito"
+            mapfile -t extracted < <(find "$tmp" -mindepth 1 -maxdepth 1 -type d -name 'sito-*')
+            if [ "${#extracted[@]}" -ne 1 ]; then
+              echo "::error::expected exactly one sito-* directory for ${triple}, found ${#extracted[@]}"
+              exit 1
+            fi
+            install -D -m 0755 "${extracted[0]}/sito" "prebuilt/${map[$triple]}/sito"
             rm -rf "$tmp"
           done
-          find prebuilt -type f -maxdepth 3 -print
+          find prebuilt -maxdepth 3 -type f -print
 
       # No docker/setup-qemu-action: the image is assembled from prebuilt
       # target-architecture binaries, so nothing foreign is executed during the
@@ -408,13 +418,20 @@ jobs:
       - name: Smoke-test the published image
         env:
           IMAGE: ghcr.io/${{ github.repository }}
-          REF_NAME: ${{ github.ref_name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          image="${IMAGE}:${REF_NAME#v}"
+          # Pin the digest so the smoke test cannot drift to a newer tag pushed
+          # after the build step (and so it tests exactly what was attested).
+          image="${IMAGE}@${DIGEST}"
           # Override the entrypoint: it injects `--config /etc/sito/config.toml`
           # and would otherwise duplicate/override the arguments below.
           docker run --rm --entrypoint /usr/bin/sito "${image}" --version
           docker run --rm --entrypoint /usr/bin/sito \
             -v "${PWD}/config.example.toml:/config.toml:ro" \
             "${image}" check-config --config /config.toml
+          # Exercise the shipped default entrypoint with the shipped config
+          # mounted at the path it expects, so the image is usable as-is.
+          docker run --rm \
+            -v "${PWD}/config.example.toml:/etc/sito/config.toml:ro" \
+            "${image}" --version

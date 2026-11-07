@@ -40,7 +40,7 @@ path-filtered workflows, so they do not need to be duplicated in `ci.yml`.
 | Contrib/scripts (`contrib/**`, `scripts/**`) | `ci.yml`: `changes`, `contrib`, `ci-gate`. `contrib` runs `shellcheck` on the installer, the AdGuard converter fixture test, and the release-helper tests. |
 | Container (`Dockerfile`, `Dockerfile.*`, `.dockerignore`, `docker-compose*.yml`, `config.example.toml`, `contrib/systemd/**`) | `container.yml`: `compose` + `smoke`. `ci.yml`: `changes` + `ci-gate`. |
 | Dependencies (`Cargo.toml`, `Cargo.lock`, `deny.toml`, `rust-toolchain.toml`) | `security.yml`: `cargo-deny`. `Cargo.*` and the toolchain also match the code classifier, so the full code lane runs as well. |
-| Workflow files (`.github/workflows/**`) | `docs.yml`: `meta` with `actionlint`; `ci.yml`: `changes` + `ci-gate`. |
+| Workflow and action files (`.github/workflows/**`, `.github/actions/**`) | `docs.yml`: `meta` with `actionlint`; `ci.yml`: `changes` + `ci-gate`. |
 | Mixed changes | Union of the matching lanes. |
 
 `docs/openapi.json` matches both the `docs/**` filter and the `api` filter, so
@@ -49,12 +49,10 @@ it runs the `openapi` job and the docs lane. A change to
 the `meta` configuration-reference check. Independently of paths, every pull
 request pays the small `changes` + `ci-gate` overhead (roughly 1–2 minutes).
 
-The `meta` job's change detector also recognizes `.github/actions/**`, but that
-directory is not yet in the `docs.yml` path filter. A change that touches only
-`.github/actions/**` therefore runs `changes` + `ci-gate`; it gets `actionlint`
-coverage when the same pull request also touches a workflow file or another
-docs path. Adding the directory to the filter is a follow-up, not part of this
-documentation change.
+The `meta` job's change detector and the `docs.yml` path filter both cover
+`.github/workflows/**` and `.github/actions/**`, so a change that touches only a
+workflow or a composite action runs the docs lane and gets `actionlint` coverage
+of both locations in the same step.
 
 A docs-only pull request therefore costs roughly the two small `ci.yml` jobs
 plus the docs `meta` job, not a Rust rebuild.

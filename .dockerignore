@@ -6,6 +6,9 @@ docs/
 scripts/
 .opencode/
 docker-compose*.yml
+# Release staging directory (populated by release.yml); never part of a build.
+artifacts/
+# prebuilt/ is deliberately NOT ignored: Dockerfile.release consumes it.
 # HA deployment material (certificates, node configs, generated keys).
 ha/
 # Local environment and any PEM/key material must never enter the build context.
