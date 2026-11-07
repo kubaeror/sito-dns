@@ -130,9 +130,11 @@ the release pipeline, and the runner-minute budget, is in
 | `.github/workflows/**` | Docs lane with `actionlint` |
 
 A docs-only PR never builds Rust or Docker. To force every heavy CI lane anyway,
-add the `ci:full` label and re-run the workflow (label events do not start a run
-by themselves), or dispatch **CI** with `full` checked. The container and
-security lanes can be dispatched directly from the Actions tab.
+add the `ci:full` label and then push a commit so the new pull request event
+carries the label, or dispatch **CI** with `full` checked for a branch-level
+run. A plain re-run does not pick up a newly added label because GitHub replays
+the original event payload. The container and security lanes can be dispatched
+directly from the Actions tab.
 
 Local parity before pushing:
 
@@ -143,6 +145,7 @@ cargo test --workspace --all-features --locked
 python3 scripts/check_config_reference.py
 shellcheck -S warning contrib/install.sh
 docker compose -f docker-compose.yml config >/dev/null
+docker compose -f docker-compose.ha.yml config >/dev/null
 cargo deny check
 ```
 

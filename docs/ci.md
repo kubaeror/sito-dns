@@ -43,6 +43,12 @@ path-filtered workflows, so they do not need to be duplicated in `ci.yml`.
 | Workflow files (`.github/workflows/**`) | `docs.yml`: `meta` with `actionlint`; `ci.yml`: `changes` + `ci-gate`. |
 | Mixed changes | Union of the matching lanes. |
 
+`docs/openapi.json` matches both the `docs/**` filter and the `api` filter, so
+it runs the `openapi` job and the docs lane. A change to
+`scripts/check_config_reference.py` is also matched by the docs lane and runs
+the `meta` configuration-reference check. Independently of paths, every pull
+request pays the small `changes` + `ci-gate` overhead (roughly 1–2 minutes).
+
 The `meta` job's change detector also recognizes `.github/actions/**`, but that
 directory is not yet in the `docs.yml` path filter. A change that touches only
 `.github/actions/**` therefore runs `changes` + `ci-gate`; it gets `actionlint`
@@ -63,6 +69,10 @@ expensive work. The path-filtered `docs.yml`, `container.yml`, and
 `security.yml` workflows still run on `main` pushes when their paths match, so
 `main` keeps post-merge verification for those lanes.
 
+A direct push to `main` therefore bypasses the heavy code lane; it is not a
+substitute for PR validation. Protect `main` and merge through pull requests
+(and optionally a merge queue) so the heavy lane runs before the change lands.
+
 `merge_group` is a first-class trigger, so merge-queue runs execute the same
 heavy jobs as a pull request.
 
@@ -81,15 +91,21 @@ after a toolchain bump or when debugging an infrastructure change. Two
 overrides force the heavy `ci.yml` jobs even when the classifier says `code` or
 `contrib` is false:
 
-- Add the `ci:full` label to a pull request.
+- Add the `ci:full` label to a pull request **and then push a commit**. The
+  label must be present in the event payload when the run starts, so the push
+  must create a new `synchronize` event after the label is applied.
 - Run **CI → Run workflow** with `full` checked
-  (`workflow_dispatch` input `full=true`).
+  (`workflow_dispatch` input `full=true`). This is a branch-level run of the
+  selected ref, not a run of the pull request payload.
 
 The override applies to `fmt`, `clippy`, `test`, `build`, `openapi`, and
 `contrib`. It does not apply on a push to `main`, where the heavy jobs remain
-skipped by design. The label is read when a run starts; because label events
-are not a CI trigger, apply the label and then re-run the workflow (or push a
-commit) for it to take effect.
+skipped by design. The classifier reads `github.event.pull_request.labels` when
+the run starts. A plain **Re-run jobs** replays the original event payload and
+does **not** pick up a label added afterwards, so `force` stays false. If the
+label was added after the last push, push another commit (or otherwise create a
+new pull request event) to apply it. No workflow change is required for this
+procedure.
 
 The override covers only `ci.yml`. To run the container or security lane on
 demand, dispatch `container.yml` or `security.yml` directly from the Actions
@@ -115,7 +131,9 @@ must enable it once:
 3. Add **`ci-gate`** (from the CI workflow) as a required check.
 4. Optionally require branches to be up to date before merging. If a merge
    queue is enabled, keep `ci-gate` required; `ci.yml` already runs on
-   `merge_group`.
+   `merge_group`. A merge queue adds a second heavy code lane (~20–25 minutes)
+   for each queued PR, so re-evaluate the 600-minute budget before enabling
+   one.
 5. Save the rule.
 
 Until that setting exists, `ci-gate` is advisory: reviewers can see it, but
@@ -138,8 +156,8 @@ compatibility requirement:
   **glibc 2.41**. The project's release binaries are expected to run on that
   image and on glibc 2.39-or-newer hosts.
 - A binary linked against 2.43 would fail to start on the 2.41 release image
-  (and would break the artifact E2E job before publication), even though the
-  build itself would be green.
+  (and would break artifact E2E before the container image could be published),
+  even though the build itself would be green.
 
 Pinning 24.04 keeps the native x86_64 build at the 2.39 ABI and prevents a
 silent runner-image rollover from raising the release ABI. The aarch64 and
@@ -176,8 +194,10 @@ the workflow before any asset is built. The order is deliberate:
    SLSA provenance and SPDX SBOM attestations. A final smoke test pulls the
    published image and runs `--version` and `check-config`.
 
-The image is published only after the tag gate, the signed assets, the SBOM,
-and artifact E2E have all passed.
+The GitHub release is published by `sbom-and-release` before `artifact-e2e`
+runs; artifact E2E gates the container image, not the GitHub release. The image
+is published only after the tag gate, the signed assets, the SBOM, and artifact
+E2E have all passed.
 
 ### Release image: prebuilt binaries and `cc-debian13`
 
@@ -198,10 +218,10 @@ The runtime base is the pinned digest of
 2.39-built binaries), runs as uid/gid 65532, contains no shell or package
 manager, and keeps the same entrypoint, healthcheck, exposed ports, and
 `/var/lib/sito` volume as the development image. The same digest is pinned in
-`artifact-e2e.yml` as `RUNTIME_IMAGE`, where each archive is executed for its
-own platform under QEMU. That proves the packaged binary runs in exactly the
-runtime the published image uses. QEMU is used only for that verification, not
-for the image build.
+`artifact-e2e.yml` as `RUNTIME_IMAGE`, where the x86_64 archive runs natively
+and the aarch64 and armv7 archives run under QEMU. That proves each packaged
+binary runs in exactly the runtime the published image uses. QEMU is used only
+for the ARM archives in artifact E2E, not for the image build.
 
 The development `Dockerfile` remains a from-source build and is what
 `container.yml` smoke-tests. The release image and the release archives contain
@@ -242,9 +262,10 @@ existing tests cannot catch.
 ## Action pin policy
 
 Every third-party action is pinned to a **full 40-character commit SHA** with a
-`# vX.Y.Z` comment. Mutable tags and branches are not accepted. This protects
-the build from a tag being retargeted upstream and makes every workflow change
-reviewable as an exact commit change.
+version comment: normally `# vX.Y.Z`, or `# master <date>` for an action that
+has no release tags, such as `dtolnay/rust-toolchain`. Mutable tags and branches
+are not accepted. This protects the build from a tag being retargeted upstream
+and makes every workflow change reviewable as an exact commit change.
 
 | Action | Pin | Notes |
 |---|---|---|
@@ -252,7 +273,7 @@ reviewable as an exact commit change.
 | `actions/upload-artifact` | `v7.0.2` | Release archives, benchmark estimates. |
 | `actions/download-artifact` | `v8.0.2` | Release SBOM and image jobs. |
 | `dorny/paths-filter` | `v4.0.3` | CI change classifier. |
-| `dtolnay/rust-toolchain` | commit dated 2026-10-16 | The action has no release tags; the toolchain is pinned separately to **1.99.1** via `with: toolchain`. No floating `stable` or nightly refs. |
+| `dtolnay/rust-toolchain` | `# master 2026-10-16` | The action has no release tags; the toolchain is pinned separately to **1.99.1** via `with: toolchain`. No floating `stable` or nightly refs. |
 | `Swatinem/rust-cache` | `v2.9.3` | Rust build cache, per-job/key scopes. |
 | `taiki-e/install-action` | `v2.90.2` | Always passed an explicit `tool:` (`cross`, `cargo-sbom@0.10.0`, `actionlint@1.7.12`); this version no longer injects defaults. |
 | `EmbarkStudios/cargo-deny-action` | `v2.1.1` | Security lane. |
@@ -266,7 +287,7 @@ reviewable as an exact commit change.
 
 To update an action, change the SHA and the version comment in the same commit,
 keep any required inputs explicit, and let the docs lane's `actionlint` validate
-the workflow. Never replace a pin with a tag. Release-only pins (cosign,
+the workflow. Never replace a pin with a tag. Release-critical pins (cosign,
 build-push, action-gh-release, download-artifact) deserve a full release
 dry-run because a silent input change can break signing or attestations.
 
@@ -277,10 +298,13 @@ the release jobs escalating to `contents: write`, `id-token: write`, or
 ## Monthly runner-minute budget
 
 The working budget is **600 GitHub-hosted runner-minutes per month**, with an
-expected steady state of **450–550 minutes**. The measured baseline before this
-rework was **1,743 minutes per 30 days**, so the target is a substantial
-reduction, not an increase. 600 is the review threshold: a month at or above it
-should be investigated. It is a planning target, not a GitHub-enforced limit.
+expected steady state of **450–550 minutes**. The 600-minute ceiling assumes no
+merge queue: with a merge queue enabled, each code PR also runs the heavy code
+lane in the merge group, adding roughly 20–25 minutes per PR, so the budget must
+be re-evaluated before enabling one. The measured baseline before this rework
+was **1,743 minutes per 30 days**, so the target is a substantial reduction, not
+an increase. 600 is the review threshold: a month at or above it should be
+investigated. It is a planning target, not a GitHub-enforced limit.
 
 Approximate cost per run (Linux, warm caches; cold caches are higher):
 
@@ -299,12 +323,14 @@ Dependency changes also match the code classifier, so a `Cargo.toml` or
 `Cargo.lock` PR costs the code lane plus the security lane, not just the
 security row.
 
-Illustrative month: ~10 code PRs (≈200–250), ~5 docs PRs (≈5–10), four weekly
-runs (≈100–140), two releases (≈50–70), and a handful of
-container/security/openapi/contrib runs (≈40–80) land around **450–550
-minutes**, below the 600-minute ceiling. These per-run figures are estimates
-from warm-cache runs, not invoice data; the measured baseline of 1,743 minutes
-per 30 days is the reference point the rework is reducing.
+Illustrative month using the midpoints of those ranges: ~10 code PRs (≈225),
+~5 docs PRs (≈8), four weekly runs (≈120), two releases (≈60), and a handful of
+container/security/openapi/contrib runs (≈60), for **≈473 minutes (~470)**. The
+midpoint sits inside the 450–550 expected band; depending on cache warmth and
+actual run counts, the same mix can range from roughly 395 to 550. These
+per-run figures are estimates from warm-cache runs, not invoice data; the
+measured baseline of 1,743 minutes per 30 days is the reference point the
+rework is reducing.
 
 The largest structural savings come from the docs-only classifier (no Rust or
 Docker), skipping heavy jobs on `main` pushes, cancelling superseded PR runs,
@@ -349,7 +375,8 @@ python3 scripts/ci_usage.py --repo kubaeror/sito-dns --since 30d --json > ci-usa
 `--since` accepts `Nd` (days), `Nw` (weeks), `Nm` (30-day months), an ISO date,
 or an ISO timestamp. The default is `30d`. The text report prints a
 per-workflow table, a per-job table, and a total; `--json` emits the same data
-as an object with `total_minutes`, `workflows`, and `jobs`.
+as an object with `total_minutes`, `workflows`, and `jobs`, plus a `truncated`
+flag that is true when the page cap was reached and the totals are partial.
 
 The measurement covers job execution time, not queue latency, cache storage,
 artifact storage, or per-OS billing multipliers (all jobs here run Linux, so

@@ -165,12 +165,15 @@ def resolve_repo(repo: str | None) -> str:
     return inferred
 
 
-def iter_runs(repo: str, since: dt.datetime) -> list[dict[str, Any]]:
-    """Return workflow runs created at or after ``since``.
+def iter_runs(
+    repo: str, since: dt.datetime
+) -> tuple[list[dict[str, Any]], bool]:
+    """Return workflow runs created at or after ``since`` and a truncation flag.
 
     The runs endpoint is ordered newest-first. Stop at the first run older than
     the window instead of using a server-side filter, so the behaviour does not
-    depend on the API's date-query syntax.
+    depend on the API's date-query syntax. The flag is true when the page cap
+    was reached before the window was exhausted.
     """
     selected: list[dict[str, Any]] = []
     page = 1
@@ -180,7 +183,7 @@ def iter_runs(repo: str, since: dt.datetime) -> list[dict[str, Any]]:
         )
         runs = data.get("workflow_runs")
         if not isinstance(runs, list) or not runs:
-            return selected
+            return selected, False
 
         reached_older = False
         for run in runs:
@@ -193,19 +196,16 @@ def iter_runs(repo: str, since: dt.datetime) -> list[dict[str, Any]]:
             selected.append(run)
 
         if reached_older or len(runs) < PER_PAGE:
-            return selected
+            return selected, False
         page += 1
 
-    print(
-        f"ci_usage: warning: stopped after {MAX_PAGES} pages of runs; "
-        "the window is larger than this script handles in one pass",
-        file=sys.stderr,
-    )
-    return selected
+    return selected, True
 
 
-def fetch_jobs(repo: str, run_id: Any) -> list[dict[str, Any]]:
-    """Fetch every job of a workflow run (paged)."""
+def fetch_jobs(
+    repo: str, run_id: Any
+) -> tuple[list[dict[str, Any]], bool]:
+    """Fetch every job of a workflow run (paged) and a truncation flag."""
     jobs: list[dict[str, Any]] = []
     page = 1
     while page <= MAX_PAGES:
@@ -215,16 +215,16 @@ def fetch_jobs(repo: str, run_id: Any) -> list[dict[str, Any]]:
         )
         batch = data.get("jobs")
         if not isinstance(batch, list) or not batch:
-            break
+            return jobs, False
         jobs.extend(job for job in batch if isinstance(job, dict))
         total = data.get("total_count")
         if (
             len(batch) < PER_PAGE
             or (isinstance(total, int) and len(jobs) >= total)
         ):
-            break
+            return jobs, False
         page += 1
-    return jobs
+    return jobs, True
 
 
 def measure(repo: str, since: dt.datetime) -> dict[str, Any]:
@@ -236,13 +236,19 @@ def measure(repo: str, since: dt.datetime) -> dict[str, Any]:
     jobs_counted = 0
     missing_timestamps = 0
     invalid_timestamps = 0
+    truncated = False
 
-    for run in iter_runs(repo, since):
+    runs, truncated = iter_runs(repo, since)
+    for run in runs:
         runs_scanned += 1
         run_name = str(run.get("name") or "unknown").strip() or "unknown"
 
         run_id = run.get("id")
-        run_jobs = fetch_jobs(repo, run_id) if run_id is not None else []
+        if run_id is not None:
+            run_jobs, jobs_truncated = fetch_jobs(repo, run_id)
+            truncated = truncated or jobs_truncated
+        else:
+            run_jobs = []
 
         workflow_name = run_name
         if run_jobs:
@@ -306,6 +312,7 @@ def measure(repo: str, since: dt.datetime) -> dict[str, Any]:
         "jobs_counted": jobs_counted,
         "jobs_missing_timestamps": missing_timestamps,
         "jobs_invalid_timestamps": invalid_timestamps,
+        "truncated": truncated,
         "total_minutes": total_minutes,
         "workflows": workflow_rows,
         "jobs": job_rows,
@@ -353,6 +360,11 @@ def print_report(result: dict[str, Any]) -> None:
         print(
             "Invalid timestamps: "
             f"{result['jobs_invalid_timestamps']} (completed before started)"
+        )
+    if result["truncated"]:
+        print(
+            f"WARNING: results are truncated at the {MAX_PAGES}-page cap; "
+            "totals are partial."
         )
     print()
 
@@ -410,6 +422,7 @@ def to_json(result: dict[str, Any]) -> str:
         "jobs_counted": result["jobs_counted"],
         "jobs_missing_timestamps": result["jobs_missing_timestamps"],
         "jobs_invalid_timestamps": result["jobs_invalid_timestamps"],
+        "truncated": result["truncated"],
         "total_minutes": result["total_minutes"],
         "workflows": [
             {
@@ -453,7 +466,9 @@ def build_parser() -> argparse.ArgumentParser:
             "--since accepts Nd (days), Nw (weeks), Nm (30-day months), an ISO\n"
             "date (2026-10-01), or an ISO timestamp. The default is 30d.\n\n"
             "The result covers job execution time only; queue latency, storage,\n"
-            "and per-OS billing multipliers are not included."
+            "and per-OS billing multipliers are not included. If a report hits the\n"
+            "page cap, `truncated` is true in --json output and the text report\n"
+            "prints a warning."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
