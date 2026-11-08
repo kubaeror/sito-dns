@@ -223,13 +223,12 @@ mod tests {
         let challenges: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
         challenges.insert("known-token".to_string(), "key-auth-value".to_string());
 
-        // Pick a port that is free on both families.
+        // Pick a port that is free on both families. The shared broker keeps
+        // the v4 reservation until the test process exits, so no other test in
+        // this binary can race us before start_acme_http01_listener binds it.
         let port = loop {
-            let probe = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-            let port = probe.local_addr().unwrap().port();
-            // Release the v4 probe first: a dual-stack `[::]` bind conflicts
-            // with an actively-listening `0.0.0.0` socket.
-            drop(probe);
+            let port =
+                sito_test_support::reserve_port_number().expect("reserve an ACME HTTP-01 port");
             match std::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)) {
                 Ok(v6) => {
                     drop(v6);

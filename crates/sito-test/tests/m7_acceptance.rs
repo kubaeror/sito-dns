@@ -278,11 +278,8 @@ async fn test_m7_doh3_post_and_get_queries() {
 #[tokio::test]
 async fn test_m7_doh_alt_svc_header_advertisement() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-
-    let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
-    let local_addr = listener.local_addr().unwrap();
-    drop(listener);
+    let port = sito_test_support::reserve_port_number().expect("reserve DoH port");
+    let local_addr = SocketAddr::from(([127, 0, 0, 1], port));
 
     let doh_config = DohConfig::new(local_addr, None).with_alt_svc_port(Some(443));
 
