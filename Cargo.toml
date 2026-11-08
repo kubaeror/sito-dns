@@ -58,7 +58,7 @@ aho-corasick = "1.1"
 regex-automata = { version = "0.4", features = ["dfa-build", "syntax", "hybrid"] }
 criterion = "0.8"
 rustls-pki-types = { version = "1.15", features = ["std"] }
-rcgen = "0.14"
+rcgen = { version = "0.14", features = ["x509-parser"] }
 base64 = "0.23"
 notify = "8.2"
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "matched-path", "query", "ws", "form", "json"] }

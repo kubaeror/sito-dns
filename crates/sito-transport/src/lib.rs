@@ -21,8 +21,10 @@ pub mod tls;
 pub mod udp;
 
 pub use acme::{
-    AcmeServiceConfig, days_until_expiration, generate_tls_alpn_01_cert,
-    obtain_or_renew_certificate, start_acme_manager, write_secret_file,
+    AcmeChallengeOptions, AcmeServiceConfig, certificate_needs_renewal, days_until_expiration,
+    generate_tls_alpn_01_cert, obtain_or_renew_certificate,
+    obtain_or_renew_certificate_for_transports, record_bootstrap_cert, start_acme_manager,
+    start_acme_manager_for_transports, write_secret_file,
 };
 pub use acme_http::start_acme_http01_listener;
 pub use doh::{DohConfig, start_doh_listener};
@@ -34,9 +36,10 @@ pub use limiter::RateLimiter;
 pub use net::bind_tcp_listener;
 pub use tcp::{TcpConfig, start_tcp_listener};
 pub use tls::{
-    CertWatcher, DynamicCertResolver, TlsAcceptorManager, TlsError, build_server_config,
-    generate_self_signed_cert, load_certificates, load_private_key, load_server_config,
-    load_server_config_with_challenges, validate_certificate_validity,
+    BOOTSTRAP_CERT_VALIDITY_DAYS, CertWatcher, DynamicCertResolver, TlsAcceptorManager, TlsError,
+    TlsManagerSet, build_server_config, generate_self_signed_cert, load_certificates,
+    load_private_key, load_server_config, load_server_config_with_challenges,
+    validate_certificate_validity,
 };
 pub use udp::{UdpConfig, create_reuseport_udp_socket, start_udp_listener};
 

@@ -20,7 +20,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tracing::{debug, error, info, warn};
 
-use crate::tls::{TlsAcceptorManager, create_certified_key, load_server_config_with_challenges};
+use crate::tls::{TlsAcceptorManager, TlsManagerSet, create_certified_key};
 
 /// Enforce owner-only permissions (0600) on an existing secret file.
 ///
@@ -80,6 +80,9 @@ pub struct AcmeServiceConfig {
     pub directory_url: Option<String>,
     pub renew_before_days: u32,
     pub storage_dir: PathBuf,
+    /// Optional PEM root certificate used to trust a private/test ACME
+    /// directory. Public Let's Encrypt directories leave this unset.
+    root_certificate: Option<PathBuf>,
 }
 
 impl AcmeServiceConfig {
@@ -92,6 +95,7 @@ impl AcmeServiceConfig {
             directory_url: None,
             renew_before_days: 30,
             storage_dir,
+            root_certificate: None,
         }
     }
 
@@ -111,6 +115,35 @@ impl AcmeServiceConfig {
     pub fn with_renew_before_days(mut self, days: u32) -> Self {
         self.renew_before_days = days;
         self
+    }
+
+    /// Trust a private ACME directory whose TLS certificate chains to the
+    /// given root PEM file (for private CAs and integration tests).
+    #[must_use]
+    pub fn with_root_certificate(mut self, root: impl Into<PathBuf>) -> Self {
+        self.root_certificate = Some(root.into());
+        self
+    }
+
+    /// Whether the certificate currently stored for ACME is a bootstrap
+    /// placeholder rather than a CA-issued certificate.
+    ///
+    /// Bootstrap certificates are detected by an explicit marker, a short
+    /// validity, or being self-signed. The self-signed check also recovers
+    /// installations upgraded from versions that wrote a year-4096 bootstrap
+    /// certificate without a marker.
+    pub fn is_bootstrap_cert(&self) -> bool {
+        if bootstrap_marker_path(&self.storage_dir).exists() {
+            return true;
+        }
+        let Ok(cert_bytes) = std::fs::read(self.storage_dir.join("cert.pem")) else {
+            return false;
+        };
+        if is_self_signed(&cert_bytes) {
+            return true;
+        }
+        days_until_expiration(&cert_bytes)
+            .is_ok_and(|days| days <= crate::tls::BOOTSTRAP_CERT_VALIDITY_DAYS)
     }
 
     /// Determine the directory URL to use.
@@ -176,6 +209,94 @@ pub fn generate_tls_alpn_01_cert(
     Ok((cert_der, priv_der))
 }
 
+/// Build an ACME account client, optionally trusting a private root.
+fn account_builder(config: &AcmeServiceConfig) -> Result<instant_acme::AccountBuilder, String> {
+    match config.root_certificate.as_ref() {
+        Some(root) => Account::builder_with_root(root).map_err(|e| {
+            format!(
+                "Failed to build account client with root {}: {e}",
+                root.display()
+            )
+        }),
+        None => Account::builder().map_err(|e| format!("Failed to build account client: {e}")),
+    }
+}
+
+/// Move unusable account credentials aside so a failed parse or a directory
+/// change cannot block all future renewals.
+fn set_account_credentials_aside(creds_file: &Path, suffix: &str) -> Result<PathBuf, String> {
+    let backup = creds_file.with_extension(format!("json.{suffix}"));
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(creds_file, &backup).map_err(|e| {
+        format!(
+            "Failed to move unusable account credentials {} to {}: {e}",
+            creds_file.display(),
+            backup.display()
+        )
+    })?;
+    warn!(
+        "Moved ACME account credentials from {} to {}",
+        creds_file.display(),
+        backup.display()
+    );
+    Ok(backup)
+}
+
+/// Directory URL recorded inside serialized account credentials.
+fn account_credentials_directory(data: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()?
+        .get("directory")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Register a new ACME account and persist its credentials atomically.
+async fn register_account(
+    config: &AcmeServiceConfig,
+    directory_url: &str,
+    creds_file: &Path,
+) -> Result<Account, String> {
+    info!(
+        "Registering new ACME account for {} at {}",
+        config.email, directory_url
+    );
+    let new_account = NewAccount {
+        contact: &[&format!("mailto:{}", config.email)],
+        terms_of_service_agreed: true,
+        only_return_existing: false,
+    };
+
+    let (account, creds) = account_builder(config)?
+        .create(&new_account, directory_url.to_string(), None)
+        .await
+        .map_err(|e| format!("Failed to create ACME account: {e}"))?;
+
+    let serialized = serde_json::to_vec_pretty(&creds)
+        .map_err(|e| format!("Failed to serialize account credentials: {e}"))?;
+
+    std::fs::create_dir_all(&config.storage_dir).map_err(|e| {
+        format!(
+            "Failed to create ACME storage directory {}: {e}",
+            config.storage_dir.display()
+        )
+    })?;
+    // Atomic replace: a crash can never leave a half-written account.json that
+    // blocks the next renewal.
+    write_atomic(creds_file, &serialized, 0o600).map_err(|e| {
+        format!(
+            "Failed to persist account credentials to {}: {e}",
+            creds_file.display()
+        )
+    })?;
+
+    info!(
+        "ACME account successfully created and saved to {:?}",
+        creds_file
+    );
+    Ok(account)
+}
+
 /// Load or create an ACME account from the storage directory.
 async fn load_or_create_account(
     config: &AcmeServiceConfig,
@@ -192,48 +313,52 @@ async fn load_or_create_account(
         enforce_secret_file_permissions(&creds_file);
         let creds_data = std::fs::read_to_string(&creds_file)
             .map_err(|e| format!("Failed to read account credentials file: {e}"))?;
-        let creds: AccountCredentials = serde_json::from_str(&creds_data)
-            .map_err(|e| format!("Failed to deserialize account credentials: {e}"))?;
-        let account = Account::builder()
-            .map_err(|e| format!("Failed to build account client: {e}"))?
+
+        let creds: AccountCredentials = match serde_json::from_str(&creds_data) {
+            Ok(creds) => creds,
+            Err(e) => {
+                warn!(
+                    "ACME account credentials at {} are corrupt ({e}); \
+                     backing them up and registering again",
+                    creds_file.display()
+                );
+                set_account_credentials_aside(&creds_file, "corrupt")?;
+                return register_account(config, directory_url, &creds_file).await;
+            }
+        };
+
+        // `from_credentials` would use the directory stored in the file and
+        // silently ignore a staging/production switch (or a custom directory).
+        // Credentials without a directory URL (pre-0.4 format) cannot be
+        // verified against the configured directory either.
+        match account_credentials_directory(&creds_data) {
+            Some(stored_directory) if stored_directory == directory_url => {}
+            Some(stored_directory) => {
+                warn!(
+                    "ACME account credentials were registered with directory {stored_directory} \
+                     but {directory_url} is configured; backing them up and registering again"
+                );
+                set_account_credentials_aside(&creds_file, "bak")?;
+                return register_account(config, directory_url, &creds_file).await;
+            }
+            None => {
+                warn!(
+                    "ACME account credentials do not record a directory URL; \
+                     registering again for {directory_url}"
+                );
+                set_account_credentials_aside(&creds_file, "bak")?;
+                return register_account(config, directory_url, &creds_file).await;
+            }
+        }
+
+        let account = account_builder(config)?
             .from_credentials(creds)
             .await
             .map_err(|e| format!("Failed to restore account from credentials: {e}"))?;
         return Ok(account);
     }
 
-    info!(
-        "Registering new ACME account for {} at {}",
-        config.email, directory_url
-    );
-    let new_account = NewAccount {
-        contact: &[&format!("mailto:{}", config.email)],
-        terms_of_service_agreed: true,
-        only_return_existing: false,
-    };
-
-    let (account, creds) = Account::builder()
-        .map_err(|e| format!("Failed to build account client: {e}"))?
-        .create(&new_account, directory_url.to_string(), None)
-        .await
-        .map_err(|e| format!("Failed to create ACME account: {e}"))?;
-
-    let serialized = serde_json::to_string_pretty(&creds)
-        .map_err(|e| format!("Failed to serialize account credentials: {e}"))?;
-
-    let _ = std::fs::create_dir_all(&config.storage_dir);
-    write_secret_file(&creds_file, serialized.as_bytes()).map_err(|e| {
-        format!(
-            "Failed to persist account credentials to {}: {e}",
-            creds_file.display()
-        )
-    })?;
-
-    info!(
-        "ACME account successfully created and saved to {:?}",
-        creds_file
-    );
-    Ok(account)
+    register_account(config, directory_url, &creds_file).await
 }
 
 /// Writes `contents` to `path` atomically: a temp file in the same directory
@@ -285,6 +410,64 @@ fn pair_metadata_path(storage_dir: &Path) -> std::path::PathBuf {
     storage_dir.join("pair.sha256")
 }
 
+/// Path of the marker identifying a self-signed bootstrap placeholder pair.
+fn bootstrap_marker_path(storage_dir: &Path) -> std::path::PathBuf {
+    storage_dir.join("bootstrap")
+}
+
+/// Record that the pair currently in `storage_dir` is the bootstrap
+/// placeholder. Also writes the normal pair fingerprint so a later rotation is
+/// detectable, and so an interrupted bootstrap write is not mistaken for a
+/// complete pair.
+pub fn record_bootstrap_cert(storage_dir: &Path) -> std::io::Result<()> {
+    write_pair_metadata(storage_dir)?;
+    write_atomic(&bootstrap_marker_path(storage_dir), b"1\n", 0o644)
+}
+
+/// Write the certificate/key pair fingerprint marker for `storage_dir`.
+fn write_pair_metadata(storage_dir: &Path) -> std::io::Result<()> {
+    let cert_path = storage_dir.join("cert.pem");
+    let key_path = storage_dir.join("key.pem");
+    let (Some(cert_hash), Some(key_hash)) = (file_sha256(&cert_path), file_sha256(&key_path))
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "certificate or key is missing",
+        ));
+    };
+    write_atomic(
+        &pair_metadata_path(storage_dir),
+        format!("{cert_hash} {key_hash}\n").as_bytes(),
+        0o644,
+    )
+}
+
+/// Remove the bootstrap marker after a CA-issued certificate is installed.
+fn clear_bootstrap_marker(storage_dir: &Path) {
+    match std::fs::remove_file(bootstrap_marker_path(storage_dir)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            "Failed to remove bootstrap certificate marker in {:?}: {e}",
+            storage_dir.display()
+        ),
+    }
+}
+
+/// Whether the first certificate in `cert_pem` is self-signed.
+fn is_self_signed(cert_pem: &[u8]) -> bool {
+    let Ok(certs) = CertificateDer::pem_slice_iter(cert_pem).collect::<Result<Vec<_>, _>>() else {
+        return false;
+    };
+    let Some(first) = certs.first() else {
+        return false;
+    };
+    let Ok((_, x509)) = x509_parser::parse_x509_certificate(first.as_ref()) else {
+        return false;
+    };
+    x509.tbs_certificate.subject == x509.tbs_certificate.issuer
+}
+
 /// Whether the stored pair fingerprint matches the certificate and key files.
 ///
 /// A missing marker is treated as unknown (older installs, manual certs) so
@@ -308,6 +491,11 @@ pub fn certificate_needs_renewal(config: &AcmeServiceConfig) -> bool {
     let key_path = config.storage_dir.join("key.pem");
 
     if !cert_path.exists() || !key_path.exists() {
+        return true;
+    }
+
+    if config.is_bootstrap_cert() {
+        info!("ACME storage contains a bootstrap certificate; issuance needed");
         return true;
     }
 
@@ -347,6 +535,34 @@ pub fn certificate_needs_renewal(config: &AcmeServiceConfig) -> bool {
             warn!("Failed to check certificate expiration (will renew): {e}");
             true
         }
+    }
+}
+
+/// Which challenge types the running server can actually answer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AcmeChallengeOptions {
+    /// A TCP listener serving port 443 with the `acme-tls/1` ALPN is bound.
+    pub tls_alpn_available: bool,
+    /// The dedicated HTTP-01 listener is bound and reachable.
+    pub http01_available: bool,
+}
+
+/// Select a challenge type the CA offers and this deployment can answer.
+///
+/// TLS-ALPN-01 is only usable when a TCP listener on port 443 answers the
+/// `acme-tls/1` ALPN; a DoT-only or custom-DoH-port deployment must fall back
+/// to HTTP-01 instead of retrying an impossible challenge forever.
+fn select_challenge_type(
+    offers_tls_alpn: bool,
+    offers_http01: bool,
+    options: AcmeChallengeOptions,
+) -> Option<ChallengeType> {
+    if options.tls_alpn_available && offers_tls_alpn {
+        Some(ChallengeType::TlsAlpn01)
+    } else if options.http01_available && offers_http01 {
+        Some(ChallengeType::Http01)
+    } else {
+        None
     }
 }
 
@@ -395,9 +611,49 @@ pub async fn obtain_or_renew_certificate(
     config: &AcmeServiceConfig,
     acceptor_mgr: Option<&TlsAcceptorManager>,
     http01_challenges: Option<&Arc<dashmap::DashMap<String, String>>>,
-    alpn_protocols: &[Vec<u8>],
+    _alpn_protocols: &[Vec<u8>],
 ) -> Result<bool, String> {
+    let managers = TlsManagerSet::from_doh(acceptor_mgr.cloned());
+    let challenge_options = AcmeChallengeOptions {
+        // Preserve the historical API contract for direct callers: an
+        // acceptor is assumed to answer TLS-ALPN-01. Server startup uses the
+        // explicit port-aware entry point below.
+        tls_alpn_available: acceptor_mgr.is_some(),
+        http01_available: http01_challenges.is_some(),
+    };
+    obtain_or_renew_certificate_for_transports(
+        config,
+        &managers,
+        http01_challenges,
+        challenge_options,
+    )
+    .await
+}
+
+/// Obtain or renew a certificate and reload every encrypted transport.
+///
+/// `challenge_options` describes the listeners that are actually bound; the
+/// server passes the port-aware result so an unusable TLS-ALPN-01 challenge is
+/// never selected.
+pub async fn obtain_or_renew_certificate_for_transports(
+    config: &AcmeServiceConfig,
+    managers: &TlsManagerSet,
+    http01_challenges: Option<&Arc<dashmap::DashMap<String, String>>>,
+    challenge_options: AcmeChallengeOptions,
+) -> Result<bool, String> {
+    let cert_path = config.storage_dir.join("cert.pem");
+    let key_path = config.storage_dir.join("key.pem");
+
     if !certificate_needs_renewal(config) {
+        // Best effort: make sure every transport serves the persisted pair.
+        // This heals a restart that selected static material and a previous
+        // reload that failed after issuance.
+        if cert_path.exists()
+            && key_path.exists()
+            && let Err(e) = managers.reload_all(&cert_path, &key_path)
+        {
+            warn!("Failed to reload transports from persisted ACME certificate: {e}");
+        }
         return Ok(false);
     }
 
@@ -424,7 +680,7 @@ pub async fn obtain_or_renew_certificate(
     // Challenge registrations are cleaned up on every exit path (including
     // early errors) by this RAII guard.
     let mut challenges = ChallengeCleanup {
-        mgr: acceptor_mgr,
+        mgr: managers.doh.as_ref(),
         alpn_domains: Vec::new(),
         http01: http01_challenges,
         http_tokens: Vec::new(),
@@ -440,30 +696,27 @@ pub async fn obtain_or_renew_certificate(
                 _ => auth.identifier().to_string(),
             };
 
-            // Select challenge type (prefer TLS-ALPN-01 if acceptor_mgr is available, fallback to HTTP-01)
-            let selected_challenge = if acceptor_mgr.is_some()
-                && auth
-                    .challenges
-                    .iter()
-                    .any(|c| c.r#type == ChallengeType::TlsAlpn01)
-            {
-                ChallengeType::TlsAlpn01
-            } else if http01_challenges.is_some()
-                && auth
-                    .challenges
-                    .iter()
-                    .any(|c| c.r#type == ChallengeType::Http01)
-            {
-                ChallengeType::Http01
-            } else {
-                return Err(format!(
-                    "No supported challenge type available for domain '{domain}'"
-                ));
-            };
+            // Prefer TLS-ALPN-01 only when the running server actually has a
+            // TCP 443 listener; otherwise fall back to HTTP-01.
+            let offers_tls_alpn = auth
+                .challenges
+                .iter()
+                .any(|c| c.r#type == ChallengeType::TlsAlpn01);
+            let offers_http01 = auth
+                .challenges
+                .iter()
+                .any(|c| c.r#type == ChallengeType::Http01);
+            let selected_challenge =
+                select_challenge_type(offers_tls_alpn, offers_http01, challenge_options)
+                    .ok_or_else(|| {
+                        format!("No supported challenge type available for domain '{domain}'")
+                    })?;
 
             match selected_challenge {
                 ChallengeType::TlsAlpn01 => {
-                    let mgr = acceptor_mgr.unwrap();
+                    let mgr = managers.doh.as_ref().ok_or_else(|| {
+                        "TLS-ALPN-01 selected but no DoH TLS manager is available".to_string()
+                    })?;
                     let mut challenge = auth
                         .challenge(ChallengeType::TlsAlpn01)
                         .ok_or_else(|| format!("TLS-ALPN-01 challenge missing for {domain}"))?;
@@ -485,7 +738,9 @@ pub async fn obtain_or_renew_certificate(
                     debug!("Registered TLS-ALPN-01 challenge for {}", domain);
                 }
                 ChallengeType::Http01 => {
-                    let challenges_map = http01_challenges.unwrap();
+                    let challenges_map = http01_challenges.ok_or_else(|| {
+                        "HTTP-01 selected but no challenge store is available".to_string()
+                    })?;
                     let mut challenge = auth
                         .challenge(ChallengeType::Http01)
                         .ok_or_else(|| format!("HTTP-01 challenge missing for {domain}"))?;
@@ -538,9 +793,12 @@ pub async fn obtain_or_renew_certificate(
         .map_err(|e| format!("Failed to retrieve issued certificate: {e}"))?;
 
     // Persist certificates to disk
-    let _ = std::fs::create_dir_all(&config.storage_dir);
-    let cert_path = config.storage_dir.join("cert.pem");
-    let key_path = config.storage_dir.join("key.pem");
+    std::fs::create_dir_all(&config.storage_dir).map_err(|e| {
+        format!(
+            "Failed to create ACME storage directory {}: {e}",
+            config.storage_dir.display()
+        )
+    })?;
 
     // Write the key first, then the certificate, each atomically. On any
     // failure remove the certificate so `certificate_needs_renewal` retries
@@ -561,60 +819,64 @@ pub async fn obtain_or_renew_certificate(
     }
     // Record the completed pair so a partially finished rotation is detected
     // even after a crash (rustls does not verify that cert and key match).
-    let pair_marker = if let (Some(cert_hash), Some(key_hash)) =
-        (file_sha256(&cert_path), file_sha256(&key_path))
-    {
-        format!("{cert_hash} {key_hash}\n")
-    } else {
-        let _ = std::fs::remove_file(&cert_path);
-        return Err("Failed to fingerprint the rotated certificate/key pair".to_string());
-    };
-    if let Err(e) = write_atomic(
-        &pair_metadata_path(&config.storage_dir),
-        pair_marker.as_bytes(),
-        0o644,
-    ) {
+    if let Err(e) = write_pair_metadata(&config.storage_dir) {
         let _ = std::fs::remove_file(&cert_path);
         return Err(format!("Failed to record the certificate/key pair: {e}"));
     }
+
+    // The real certificate is installed: the placeholder must no longer force
+    // a fresh order on every renewal check.
+    clear_bootstrap_marker(&config.storage_dir);
 
     info!(
         "ACME certificate and private key saved to {:?}",
         config.storage_dir
     );
 
-    // Reload the running server TLS config if acceptor_mgr is provided.
-    // Reuse the manager's shared challenge-key map so in-flight ACME
-    // TLS-ALPN-01 challenges survive the reload, and carry over the SNI
-    // virtual-host certificates so they are not dropped.
-    if let Some(mgr) = acceptor_mgr {
-        let sni_certs = mgr.sni_certs();
-        match load_server_config_with_challenges(
-            &cert_path,
-            &key_path,
-            sni_certs.as_slice(),
-            alpn_protocols.to_vec(),
-            mgr.challenge_keys(),
-        ) {
-            Ok(new_config) => {
-                mgr.reload(new_config);
-                info!("TlsAcceptorManager successfully reloaded with ACME certificate");
-            }
-            Err(e) => {
-                error!("Failed to reload server TLS config with new ACME cert: {e}");
-            }
-        }
+    // Reload every encrypted transport from the issued pair. Each manager
+    // reloads with its own ALPN list and keeps its shared challenge keys and
+    // SNI virtual-host certificates.
+    match managers.reload_all(&cert_path, &key_path) {
+        Ok(()) => info!("All TLS transports reloaded with the ACME certificate"),
+        Err(e) => error!("Failed to reload one or more TLS transports with new ACME cert: {e}"),
     }
 
     Ok(true)
 }
 
 /// Spawns the ACME manager background task for initial acquisition and periodic renewal.
+///
+/// Kept as a compatibility wrapper around
+/// [`start_acme_manager_for_transports`] for callers that only have a DoH
+/// manager.
 pub fn start_acme_manager(
     config: AcmeServiceConfig,
     acceptor_mgr: Option<TlsAcceptorManager>,
     http01_challenges: Option<Arc<dashmap::DashMap<String, String>>>,
-    alpn_protocols: Vec<Vec<u8>>,
+    _alpn_protocols: Vec<Vec<u8>>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let managers = TlsManagerSet::from_doh(acceptor_mgr);
+    let challenge_options = AcmeChallengeOptions {
+        tls_alpn_available: !managers.is_empty(),
+        http01_available: http01_challenges.is_some(),
+    };
+    start_acme_manager_for_transports(
+        config,
+        managers,
+        http01_challenges,
+        challenge_options,
+        shutdown_rx,
+    )
+}
+
+/// Spawns the ACME manager with an explicit set of transport managers and a
+/// port-aware challenge selection.
+pub fn start_acme_manager_for_transports(
+    config: AcmeServiceConfig,
+    managers: TlsManagerSet,
+    http01_challenges: Option<Arc<dashmap::DashMap<String, String>>>,
+    challenge_options: AcmeChallengeOptions,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     /// Steady-state check cadence once renewal is not immediately required.
@@ -632,11 +894,11 @@ pub fn start_acme_manager(
 
         // Initial acquisition/renewal check on startup. Failures retry with a
         // bounded backoff instead of waiting the full steady-state interval.
-        let initial_ok = match obtain_or_renew_certificate(
+        let initial_ok = match obtain_or_renew_certificate_for_transports(
             &config,
-            acceptor_mgr.as_ref(),
+            &managers,
             http01_challenges.as_ref(),
-            &alpn_protocols,
+            challenge_options,
         )
         .await
         {
@@ -667,11 +929,11 @@ pub fn start_acme_manager(
                 }
                 () = tokio::time::sleep(next_delay) => {
                     debug!("Running periodic ACME renewal check...");
-                    match obtain_or_renew_certificate(
+                    match obtain_or_renew_certificate_for_transports(
                         &config,
-                        acceptor_mgr.as_ref(),
+                        &managers,
                         http01_challenges.as_ref(),
-                        &alpn_protocols,
+                        challenge_options,
                     ).await {
                         Ok(_) => {
                             next_delay = ACME_CHECK_INTERVAL;
@@ -695,6 +957,13 @@ mod tests {
     use crate::tls::generate_test_cert;
     use std::os::unix::fs::PermissionsExt;
 
+    fn rand_suffix() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64
+    }
+
     #[test]
     fn test_days_until_expiration() {
         let (cert_pem, _) = generate_test_cert(&["localhost"]);
@@ -704,6 +973,127 @@ mod tests {
             days >= 0,
             "Test cert should be valid for non-negative days: {days}"
         );
+    }
+
+    /// Regression (P1-12): TLS-ALPN-01 must only be chosen when a TCP 443
+    /// listener is available. A deployment without one must use HTTP-01.
+    #[test]
+    fn test_challenge_selection_requires_tls_alpn_listener() {
+        let http_only = AcmeChallengeOptions {
+            tls_alpn_available: false,
+            http01_available: true,
+        };
+        assert_eq!(
+            select_challenge_type(true, true, http_only),
+            Some(ChallengeType::Http01),
+            "TLS-ALPN-01 must not be selected without a bound 443 listener"
+        );
+
+        let tls_available = AcmeChallengeOptions {
+            tls_alpn_available: true,
+            http01_available: true,
+        };
+        assert_eq!(
+            select_challenge_type(true, true, tls_available),
+            Some(ChallengeType::TlsAlpn01)
+        );
+
+        // If TLS-ALPN-01 is unavailable and the CA does not offer HTTP-01,
+        // there is no usable challenge.
+        assert_eq!(select_challenge_type(true, false, http_only), None);
+        // HTTP-01 availability is also required to select HTTP-01.
+        assert_eq!(
+            select_challenge_type(false, true, AcmeChallengeOptions::default()),
+            None
+        );
+    }
+
+    /// Generates a CA-signed (non-bootstrap) certificate chain for the given
+    /// domain. Returns `(cert_pem, key_pem)`.
+    fn generate_ca_signed_cert(domain: &str) -> (String, String) {
+        let ca_key = rcgen::KeyPair::generate().expect("CA key");
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "sito test CA");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("CA cert");
+
+        let key = rcgen::KeyPair::generate().expect("leaf key");
+        let params = rcgen::CertificateParams::new(vec![domain.to_string()]).expect("leaf params");
+        let cert = params
+            .signed_by(&key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
+            .expect("leaf cert");
+        (
+            format!("{}{}", cert.pem(), ca_cert.pem()),
+            key.serialize_pem(),
+        )
+    }
+
+    /// Bootstrap detection must not flag a genuine CA-issued certificate.
+    #[test]
+    fn test_is_bootstrap_cert_distinguishes_real_certificate() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_is_bootstrap_{}_{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let config = AcmeServiceConfig::new(
+            "admin@example.com".into(),
+            vec!["acme.example.com".into()],
+            dir.clone(),
+        );
+
+        let (bootstrap_cert, bootstrap_key) =
+            crate::tls::generate_self_signed_cert(&["acme.example.com".into()])
+                .expect("bootstrap cert");
+        std::fs::write(dir.join("cert.pem"), bootstrap_cert).expect("write cert");
+        write_secret_file(&dir.join("key.pem"), bootstrap_key.as_bytes()).expect("write key");
+        assert!(
+            config.is_bootstrap_cert(),
+            "a self-signed placeholder must be detected as bootstrap"
+        );
+
+        let (real_cert, real_key) = generate_ca_signed_cert("acme.example.com");
+        std::fs::write(dir.join("cert.pem"), real_cert).expect("write cert");
+        write_secret_file(&dir.join("key.pem"), real_key.as_bytes()).expect("write key");
+        assert!(
+            !config.is_bootstrap_cert(),
+            "a CA-issued certificate must not be treated as a bootstrap placeholder"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit marker marks a legacy bootstrap pair even when its validity
+    /// has not yet expired.
+    #[test]
+    fn test_bootstrap_marker_forces_detection() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_bootstrap_marker_{}_{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let (cert_pem, key_pem) = generate_ca_signed_cert("acme.example.com");
+        std::fs::write(dir.join("cert.pem"), cert_pem).expect("write cert");
+        write_secret_file(&dir.join("key.pem"), key_pem.as_bytes()).expect("write key");
+        let config = AcmeServiceConfig::new(
+            "admin@example.com".into(),
+            vec!["acme.example.com".into()],
+            dir.clone(),
+        );
+        assert!(!config.is_bootstrap_cert());
+
+        record_bootstrap_cert(&dir).expect("record bootstrap marker");
+        assert!(config.is_bootstrap_cert());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -718,6 +1108,52 @@ mod tests {
         );
         let certified = create_certified_key(vec![cert_der], &priv_der).unwrap();
         assert_eq!(certified.cert.len(), 1);
+    }
+
+    /// Regression (P0-1): a bootstrap self-signed certificate written by the
+    /// startup path carries no `pair.sha256` marker and used to be valid until
+    /// year 4096, so `certificate_needs_renewal` skipped ACME forever.
+    #[test]
+    fn test_fresh_bootstrap_certificate_requires_renewal() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_bootstrap_renew_{}_{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let (cert_pem, key_pem) =
+            crate::tls::generate_self_signed_cert(&["acme.example.com".into()])
+                .expect("bootstrap cert");
+        std::fs::write(dir.join("cert.pem"), cert_pem).expect("write cert");
+        write_secret_file(&dir.join("key.pem"), key_pem.as_bytes()).expect("write key");
+
+        let config = AcmeServiceConfig::new(
+            "admin@example.com".into(),
+            vec!["acme.example.com".into()],
+            dir.clone(),
+        );
+        assert!(
+            certificate_needs_renewal(&config),
+            "a fresh bootstrap certificate must never suppress ACME issuance"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (P0-1): the bootstrap certificate must be short-lived (or
+    /// explicitly marked bootstrap) so operators never keep serving it for
+    /// centuries when issuance fails.
+    #[test]
+    fn test_bootstrap_certificate_is_short_lived() {
+        let (cert_pem, _) = crate::tls::generate_self_signed_cert(&["acme.example.com".into()])
+            .expect("bootstrap cert");
+        let days = days_until_expiration(cert_pem.as_bytes()).expect("parse bootstrap cert");
+        assert!(
+            (0..=7).contains(&days),
+            "bootstrap certificate validity must not exceed 7 days, got {days}"
+        );
     }
 
     #[test]

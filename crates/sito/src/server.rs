@@ -17,11 +17,11 @@ use sito_dnssec::DnssecValidator;
 use sito_filter::HostsFilterEngine;
 use sito_stats::{MetricsRegistry, QueryLogWriter, StatsDb};
 use sito_transport::{
-    AcmeServiceConfig, CertWatcher, Doh3Config, DohConfig, DoqConfig, DotConfig, TcpConfig,
-    TlsAcceptorManager, UdpConfig, generate_self_signed_cert, load_server_config,
-    load_server_config_with_challenges, start_acme_manager, start_doh_listener,
-    start_doh3_listener, start_doq_listener, start_dot_listener, start_tcp_listener,
-    start_udp_listener,
+    AcmeChallengeOptions, AcmeServiceConfig, CertWatcher, Doh3Config, DohConfig, DoqConfig,
+    DotConfig, TcpConfig, TlsAcceptorManager, TlsManagerSet, UdpConfig, generate_self_signed_cert,
+    load_server_config, load_server_config_with_challenges, record_bootstrap_cert,
+    start_acme_manager_for_transports, start_doh_listener, start_doh3_listener, start_doq_listener,
+    start_dot_listener, start_tcp_listener, start_udp_listener, write_secret_file,
 };
 use sito_upstream::{BootstrapResolver, UpstreamManager};
 
@@ -141,8 +141,11 @@ fn sanitized_configs_equal(a: &str, b: &str) -> bool {
 }
 
 /// Builds one protocol's hot-reloadable TLS acceptor and starts its certificate
-/// watcher. Returns `None` (with a warning) when the certificate material cannot
-/// be loaded, matching the previous per-protocol behaviour.
+/// watcher.
+///
+/// Errors are fatal: a configured encrypted listener must never silently fall
+/// back to "not running" because its certificate material is unreadable,
+/// expired, or does not match the key.
 #[allow(clippy::too_many_arguments)]
 fn build_tls_acceptor(
     protocol: &str,
@@ -152,29 +155,64 @@ fn build_tls_acceptor(
     alpn: &[Vec<u8>],
     challenge_keys: Option<Arc<dashmap::DashMap<String, Arc<rustls::sign::CertifiedKey>>>>,
     cert_watchers: &mut Vec<sito_transport::CertWatcher>,
-) -> Option<TlsAcceptorManager> {
+) -> anyhow::Result<TlsAcceptorManager> {
     let config = match challenge_keys.clone() {
         Some(keys) => {
             load_server_config_with_challenges(cert, key, sni_tuples, alpn.to_vec(), keys)
         }
         None => load_server_config(cert, key, sni_tuples, alpn.to_vec()),
+    }
+    .map_err(|e| anyhow::anyhow!("Failed to initialize {protocol} TLS configuration: {e}"))?;
+
+    let manager = match challenge_keys {
+        Some(keys) => TlsAcceptorManager::with_challenge_keys(config, keys),
+        None => TlsAcceptorManager::new(config),
     };
-    match config {
-        Ok(config) => {
-            let manager = match challenge_keys {
-                Some(keys) => TlsAcceptorManager::with_challenge_keys(config, keys),
-                None => TlsAcceptorManager::new(config),
-            };
-            match CertWatcher::start(cert, key, sni_tuples, alpn, manager.clone()) {
-                Ok(watcher) => cert_watchers.push(watcher),
-                Err(e) => warn!(protocol, "Certificate watcher failed to start: {e}"),
-            }
-            Some(manager)
-        }
-        Err(e) => {
-            warn!(protocol, "Failed to initialize TLS configuration: {e}");
-            None
-        }
+    match CertWatcher::start(cert, key, sni_tuples, alpn, manager.clone()) {
+        Ok(watcher) => cert_watchers.push(watcher),
+        Err(e) => warn!(protocol, "Certificate watcher failed to start: {e}"),
+    }
+    Ok(manager)
+}
+
+/// Selects the certificate/key pair encrypted listeners should serve.
+///
+/// When ACME is enabled, a usable ACME certificate stored on disk takes
+/// precedence over static `[tls]` files so a restart cannot silently revert
+/// DoH/DoT/DoQ/DoH3 to stale static material. A bootstrap placeholder never
+/// wins over a real static pair; if no static pair exists it is kept so the
+/// ACME manager can replace it in place.
+fn choose_tls_material(
+    static_pair: Option<(PathBuf, PathBuf)>,
+    acme_pair: Option<(PathBuf, PathBuf)>,
+    acme_is_bootstrap: bool,
+    acme_enabled: bool,
+) -> Option<(PathBuf, PathBuf)> {
+    if !acme_enabled {
+        return static_pair;
+    }
+    match acme_pair {
+        Some(acme_pair) if !acme_is_bootstrap => Some(acme_pair),
+        // A bootstrap/expired placeholder is never served when a static pair
+        // exists. Without one, returning `None` makes startup write a fresh
+        // short-lived placeholder instead of failing on the stale pair.
+        _ => static_pair,
+    }
+}
+
+/// Challenge types the configured listeners can actually answer.
+///
+/// TLS-ALPN-01 requires a TCP listener on port 443 that advertises
+/// `acme-tls/1`; only the DoH manager does. A custom DoH port or a failed
+/// HTTP-01 bind must not produce a challenge the deployment cannot answer.
+fn acme_challenge_options(
+    config: &Config,
+    doh_tls_available: bool,
+    http01_available: bool,
+) -> AcmeChallengeOptions {
+    AcmeChallengeOptions {
+        tls_alpn_available: doh_tls_available && config.dns.doh_port == 443,
+        http01_available,
     }
 }
 
@@ -1418,118 +1456,20 @@ async fn init_tls_and_acme(
     } else {
         (None, None, Vec::new())
     };
-
-    // If static cert/key not provided, but ACME is enabled, establish ACME storage directory and bootstrap cert
-    let (effective_cert, effective_key) = match (cert_file, key_file) {
-        (Some(c), Some(k)) => (Some(c), Some(k)),
-        _ if is_acme_enabled => {
-            let Some(acme) = acme_cfg.as_ref() else {
-                // `is_acme_enabled` is derived from `acme_cfg`; this guard
-                // keeps the startup path panic-free even if that changes.
-                anyhow::bail!("ACME is enabled but the ACME configuration is missing");
-            };
-            let storage_dir = acme
-                .cache_dir
-                .clone()
-                .unwrap_or_else(|| config.server.data_dir.join("acme"));
-            let cert_path = storage_dir.join("cert.pem");
-            let key_path = storage_dir.join("key.pem");
-
-            if !cert_path.exists() || !key_path.exists() {
-                let _ = tokio::fs::create_dir_all(&storage_dir).await;
-                match generate_self_signed_cert(&acme.domains) {
-                    Ok((cert_pem, key_pem)) => {
-                        let cert_target = cert_path.clone();
-                        let key_target = key_path.clone();
-                        let written =
-                            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                                std::fs::write(&cert_target, cert_pem)?;
-                                // The bootstrap private key must be 0600: local
-                                // users must not read it before ACME replaces it.
-                                sito_transport::write_secret_file(&key_target, key_pem.as_bytes())?;
-                                Ok(())
-                            })
-                            .await;
-                        match written {
-                            Ok(Ok(())) => info!(
-                                "Generated bootstrap self-signed certificate in {:?}",
-                                storage_dir
-                            ),
-                            Ok(Err(e)) => {
-                                warn!("Failed to write bootstrap self-signed certificate: {e}");
-                            }
-                            Err(e) => {
-                                warn!("Bootstrap certificate task failed: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to generate bootstrap self-signed certificate: {e}");
-                    }
-                }
-            }
-            if cert_path.exists() && key_path.exists() {
-                (Some(cert_path), Some(key_path))
-            } else {
-                (None, None)
-            }
-        }
-        _ => (None, None),
+    let static_pair = match (cert_file, key_file) {
+        (Some(cert), Some(key)) => Some((cert, key)),
+        _ => None,
     };
 
-    let http01_challenges = Arc::new(dashmap::DashMap::<String, String>::new());
-    let challenge_keys = Arc::new(dashmap::DashMap::new());
-    // Kept alive for the lifetime of the server so certificate hot-reload works.
-    let mut cert_watchers: Vec<sito_transport::CertWatcher> = Vec::new();
-
-    let (dot_acceptor_mgr, doh_acceptor_mgr, doq_acceptor_mgr, doh3_acceptor_mgr) =
-        if let (Some(cert), Some(key)) = (&effective_cert, &effective_key) {
-            let doh_mgr = build_tls_acceptor(
-                "doh",
-                cert,
-                key,
-                &sni_tuples,
-                &[b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()],
-                Some(challenge_keys.clone()),
-                &mut cert_watchers,
-            );
-            let dot_mgr = build_tls_acceptor(
-                "dot",
-                cert,
-                key,
-                &sni_tuples,
-                &[b"dot".to_vec()],
-                None,
-                &mut cert_watchers,
-            );
-            let doq_mgr = build_tls_acceptor(
-                "doq",
-                cert,
-                key,
-                &sni_tuples,
-                &[b"doq".to_vec()],
-                None,
-                &mut cert_watchers,
-            );
-            let doh3_mgr = build_tls_acceptor(
-                "doh3",
-                cert,
-                key,
-                &sni_tuples,
-                &[b"h3".to_vec()],
-                None,
-                &mut cert_watchers,
-            );
-            (dot_mgr, doh_mgr, doq_mgr, doh3_mgr)
-        } else {
-            (None, None, None, None)
+    // Build the ACME service configuration once; it is also used to decide
+    // whether an existing stored certificate should take precedence over
+    // static `[tls]` material at startup.
+    let acme_service_cfg = if is_acme_enabled {
+        let Some(acme) = acme_cfg.as_ref() else {
+            // `is_acme_enabled` is derived from `acme_cfg`; this guard
+            // keeps the startup path panic-free even if that changes.
+            anyhow::bail!("ACME is enabled but the ACME configuration is missing");
         };
-
-    // If ACME is enabled, start ACME renewal background manager
-    if let Some(acme) = acme_cfg
-        && acme.enabled
-        && !acme.domains.is_empty()
-    {
         let email = if let Some(email) = acme.email.clone() {
             email
         } else {
@@ -1542,11 +1482,120 @@ async fn init_tls_and_acme(
             .cache_dir
             .clone()
             .unwrap_or_else(|| config.server.data_dir.join("acme"));
-        let doh_alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()];
-        let service_cfg =
-            AcmeServiceConfig::new(email, acme.domains, storage_dir).with_staging(acme.staging);
+        Some(
+            AcmeServiceConfig::new(email, acme.domains.clone(), storage_dir)
+                .with_staging(acme.staging),
+        )
+    } else {
+        None
+    };
 
+    let (acme_pair, acme_is_bootstrap) = if let Some(service_cfg) = &acme_service_cfg {
+        let cert_path = service_cfg.storage_dir.join("cert.pem");
+        let key_path = service_cfg.storage_dir.join("key.pem");
+        let pair = (cert_path.exists() && key_path.exists()).then_some((cert_path, key_path));
+        (pair, service_cfg.is_bootstrap_cert())
+    } else {
+        (None, false)
+    };
+
+    let mut material =
+        choose_tls_material(static_pair, acme_pair, acme_is_bootstrap, is_acme_enabled);
+
+    // With no static and no stored certificate, ACME still needs encrypted
+    // listeners during issuance; generate the short-lived bootstrap pair.
+    if material.is_none()
+        && let Some(service_cfg) = &acme_service_cfg
+    {
+        std::fs::create_dir_all(&service_cfg.storage_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create ACME storage directory {}: {e}",
+                service_cfg.storage_dir.display()
+            )
+        })?;
+        let (cert_pem, key_pem) = generate_self_signed_cert(&service_cfg.domains)
+            .map_err(|e| anyhow::anyhow!("Failed to generate bootstrap certificate: {e}"))?;
+        let cert_path = service_cfg.storage_dir.join("cert.pem");
+        let key_path = service_cfg.storage_dir.join("key.pem");
+        std::fs::write(&cert_path, cert_pem).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to write bootstrap certificate to {}: {e}",
+                cert_path.display()
+            )
+        })?;
+        // The bootstrap private key must be 0600: local users must not read it
+        // before ACME replaces it.
+        write_secret_file(&key_path, key_pem.as_bytes()).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to write bootstrap key to {}: {e}",
+                key_path.display()
+            )
+        })?;
+        record_bootstrap_cert(&service_cfg.storage_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to record bootstrap certificate in {}: {e}",
+                service_cfg.storage_dir.display()
+            )
+        })?;
+        info!(
+            "Generated bootstrap self-signed certificate in {:?}",
+            service_cfg.storage_dir
+        );
+        material = Some((cert_path, key_path));
+    }
+
+    let http01_challenges = Arc::new(dashmap::DashMap::<String, String>::new());
+    let challenge_keys = Arc::new(dashmap::DashMap::new());
+    // Kept alive for the lifetime of the server so certificate hot-reload works.
+    let mut cert_watchers: Vec<sito_transport::CertWatcher> = Vec::new();
+
+    let (dot_acceptor_mgr, doh_acceptor_mgr, doq_acceptor_mgr, doh3_acceptor_mgr) =
+        if let Some((cert, key)) = &material {
+            let doh_mgr = build_tls_acceptor(
+                "doh",
+                cert,
+                key,
+                &sni_tuples,
+                &[b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()],
+                Some(challenge_keys.clone()),
+                &mut cert_watchers,
+            )?;
+            let dot_mgr = build_tls_acceptor(
+                "dot",
+                cert,
+                key,
+                &sni_tuples,
+                &[b"dot".to_vec()],
+                None,
+                &mut cert_watchers,
+            )?;
+            let doq_mgr = build_tls_acceptor(
+                "doq",
+                cert,
+                key,
+                &sni_tuples,
+                &[b"doq".to_vec()],
+                None,
+                &mut cert_watchers,
+            )?;
+            let doh3_mgr = build_tls_acceptor(
+                "doh3",
+                cert,
+                key,
+                &sni_tuples,
+                &[b"h3".to_vec()],
+                None,
+                &mut cert_watchers,
+            )?;
+            (Some(dot_mgr), Some(doh_mgr), Some(doq_mgr), Some(doh3_mgr))
+        } else {
+            (None, None, None, None)
+        };
+
+    // If ACME is enabled, start ACME renewal background manager
+    if let (Some(service_cfg), Some(acme)) = (acme_service_cfg, acme_cfg.as_ref()) {
         // Dedicated plaintext HTTP-01 listener (ACME validators always use port 80).
+        let mut http01_available = false;
         if acme.http_port > 0 {
             let acme_http_addr = SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -1560,6 +1609,7 @@ async fn init_tls_and_acme(
             .await
             {
                 Ok(_handle) => {
+                    http01_available = true;
                     info!(
                         port = acme.http_port,
                         "ACME HTTP-01 challenge listener active"
@@ -1573,11 +1623,21 @@ async fn init_tls_and_acme(
             }
         }
 
-        let _acme_handle = start_acme_manager(
+        // TLS-ALPN-01 validators connect to TCP port 443. The DoH manager is
+        // the only one that advertises `acme-tls/1`, so both must line up.
+        let challenge_options =
+            acme_challenge_options(config, doh_acceptor_mgr.is_some(), http01_available);
+        let managers = TlsManagerSet {
+            dot: dot_acceptor_mgr.clone(),
+            doh: doh_acceptor_mgr.clone(),
+            doq: doq_acceptor_mgr.clone(),
+            doh3: doh3_acceptor_mgr.clone(),
+        };
+        let _acme_handle = start_acme_manager_for_transports(
             service_cfg,
-            doh_acceptor_mgr.clone(),
+            managers,
             Some(http01_challenges.clone()),
-            doh_alpn,
+            challenge_options,
             shutdown_rx.clone(),
         );
     }
@@ -2171,6 +2231,99 @@ mod tests {
             services.service_count() > 0,
             "service rules must be present"
         );
+    }
+
+    /// Regression (P1-12): TLS-ALPN-01 must only be offered when DoH actually
+    /// listens on TCP 443; a custom DoH port must fall back to HTTP-01.
+    #[test]
+    fn test_acme_challenge_options_require_port_443() {
+        let mut config = Config::default();
+        config.dns.doh_port = 443;
+        let options = acme_challenge_options(&config, true, true);
+        assert!(options.tls_alpn_available);
+        assert!(options.http01_available);
+
+        config.dns.doh_port = 8443;
+        let options = acme_challenge_options(&config, true, true);
+        assert!(
+            !options.tls_alpn_available,
+            "TLS-ALPN-01 needs a TCP 443 listener, not just any TLS manager"
+        );
+        assert!(options.http01_available);
+
+        let options = acme_challenge_options(&config, false, false);
+        assert!(!options.tls_alpn_available);
+        assert!(!options.http01_available);
+    }
+
+    /// Regression (P1-12/P2-13): a restart must prefer the stored ACME
+    /// certificate over static `[tls]` files, but a bootstrap placeholder must
+    /// not displace a real static pair.
+    #[test]
+    fn test_choose_tls_material_prefers_acme_certificate_on_restart() {
+        let static_pair = Some((
+            PathBuf::from("/etc/sito/static-cert.pem"),
+            PathBuf::from("/etc/sito/static-key.pem"),
+        ));
+        let acme_pair = Some((
+            PathBuf::from("/var/lib/sito/acme/cert.pem"),
+            PathBuf::from("/var/lib/sito/acme/key.pem"),
+        ));
+
+        assert_eq!(
+            choose_tls_material(static_pair.clone(), acme_pair.clone(), false, true),
+            acme_pair,
+            "a usable ACME certificate must win over static material after restart"
+        );
+        assert_eq!(
+            choose_tls_material(static_pair.clone(), acme_pair.clone(), true, true),
+            static_pair,
+            "a bootstrap placeholder must not displace a real static pair"
+        );
+        assert_eq!(
+            choose_tls_material(None, acme_pair.clone(), true, true),
+            None,
+            "a stale bootstrap pair is regenerated instead of being served"
+        );
+        assert_eq!(
+            choose_tls_material(static_pair.clone(), None, false, true),
+            static_pair,
+            "without ACME material the static pair is used while issuance runs"
+        );
+        assert_eq!(
+            choose_tls_material(static_pair.clone(), acme_pair.clone(), false, false),
+            static_pair,
+            "with ACME disabled only static material is used"
+        );
+    }
+
+    /// Regression (P0-1): invalid configured certificate material must abort
+    /// startup for the encrypted listeners instead of silently running without
+    /// them.
+    #[tokio::test]
+    async fn test_invalid_tls_material_is_fatal() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_tls_fatal_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = Config::default();
+        config.tls = Some(sito_core::config::TlsConfig {
+            cert: Some(dir.join("missing-cert.pem")),
+            key: Some(dir.join("missing-key.pem")),
+            sni_certs: Vec::new(),
+        });
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let acceptors = tokio::sync::Mutex::new(None);
+        let result = init_tls_and_acme(&config, &shutdown_rx, &acceptors).await;
+        assert!(
+            result.is_err(),
+            "unreadable certificate material must fail startup, not disable encrypted listeners"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

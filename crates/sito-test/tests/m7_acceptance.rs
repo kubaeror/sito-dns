@@ -488,11 +488,12 @@ async fn test_m7_anti_doh_bypass_filter_and_pipeline() {
 async fn test_m7_acme_certificate_management() {
     let (cert_pem, key_pem) = create_mock_tls_pair("example.com");
 
-    // Test expiration calculation
+    // Test expiration calculation. `generate_self_signed_cert` produces the
+    // short-lived bootstrap placeholder (WP-0.2), not a long-lived certificate.
     let days = days_until_expiration(cert_pem.as_bytes()).expect("calculate days until expiration");
     assert!(
-        days >= 30,
-        "Fresh certificate should have >= 30 days validity, got {days}"
+        (0..=7).contains(&days),
+        "Bootstrap certificate must be short-lived (<= 7 days), got {days}"
     );
 
     // Test TLS-ALPN-01 challenge cert generation (RFC 8737)
