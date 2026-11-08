@@ -35,8 +35,8 @@ use rustls::pki_types::{
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde_json::{Value, json};
 use sito_transport::{
-    AcmeChallengeOptions, AcmeServiceConfig, TlsAcceptorManager, TlsManagerSet,
-    certificate_needs_renewal, days_until_expiration, generate_self_signed_cert,
+    AcmeChallengeAvailability, AcmeChallengeOptions, AcmeServiceConfig, TlsAcceptorManager,
+    TlsManagerSet, certificate_needs_renewal, days_until_expiration, generate_self_signed_cert,
     load_server_config, load_server_config_with_challenges,
     obtain_or_renew_certificate_for_transports, record_bootstrap_cert,
 };
@@ -817,10 +817,11 @@ async fn test_acme_without_443_listener_falls_back_to_http01() {
         ..TlsManagerSet::default()
     };
     let http01 = Arc::new(dashmap::DashMap::new());
-    let options = AcmeChallengeOptions {
-        tls_alpn_available: false,
-        http01_available: true,
-    };
+    // This is the ACME manager's state before any 443 listener binds; it is
+    // also what `record_doh_listener_binding` leaves after a failed 443 bind.
+    let availability = AcmeChallengeAvailability::default();
+    availability.set_http01_available(true);
+    let options = availability.options();
 
     let issued =
         obtain_or_renew_certificate_for_transports(&config, &managers, Some(&http01), options)
@@ -833,6 +834,59 @@ async fn test_acme_without_443_listener_falls_back_to_http01() {
         state.selected_challenges.last().map(String::as_str),
         Some("http-01"),
         "a deployment without a bound TCP 443 listener must fall back to HTTP-01"
+    );
+
+    let _ = std::fs::remove_dir_all(&storage);
+}
+
+/// Important 3 regression: if the certificate is issued but a transport fails
+/// to reload it, the caller must see an error so the retry/backoff path runs
+/// instead of reporting success and waiting 12 hours.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_failed_post_issuance_reload_is_reported() {
+    let mock = start_mock_acme().await;
+    let storage = test_dir("reload_failure");
+    write_bootstrap(&storage);
+
+    let config = config_for(&storage, &mock);
+    let challenge_keys = Arc::new(dashmap::DashMap::new());
+    let doh = build_manager(
+        &storage.join("cert.pem"),
+        &storage.join("key.pem"),
+        b"h2",
+        Some(challenge_keys),
+    );
+    // A missing SNI pair makes every reload attempt fail after issuance.
+    doh.set_sni_certs(vec![(
+        "broken.example.test".to_string(),
+        storage.join("missing-sni-cert.pem"),
+        storage.join("missing-sni-key.pem"),
+    )]);
+    let managers = TlsManagerSet {
+        doh: Some(doh),
+        ..TlsManagerSet::default()
+    };
+    let http01 = Arc::new(dashmap::DashMap::new());
+    let options = AcmeChallengeOptions {
+        tls_alpn_available: true,
+        http01_available: true,
+    };
+
+    let error =
+        obtain_or_renew_certificate_for_transports(&config, &managers, Some(&http01), options)
+            .await
+            .expect_err("a failed post-issuance reload must be reported");
+    assert!(
+        error.contains("failed to reload TLS transports"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        storage.join("cert.pem").exists(),
+        "the issued certificate must still be persisted for the retry path"
+    );
+    assert!(
+        !config.is_bootstrap_cert(),
+        "the persisted certificate must be the CA-issued one"
     );
 
     let _ = std::fs::remove_dir_all(&storage);

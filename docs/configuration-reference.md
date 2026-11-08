@@ -146,6 +146,7 @@ enabled = false
 email = "admin@example.com"
 domains = ["dns.example.com"]
 staging = false
+allow_bootstrap_cert = false
 ```
 
 | Key | Type | Default | Description |
@@ -159,6 +160,7 @@ staging = false
 | `acme.staging` | boolean | `false` | When `true`, uses Let's Encrypt Staging API to avoid rate limits during testing. |
 | `acme.cache_dir` | string | `None` | Directory used to persist ACME account keys and certificates (defaults to `<data_dir>/acme`). |
 | `acme.http_port` | integer | `80` | Port for the dedicated ACME HTTP-01 challenge listener. |
+| `acme.allow_bootstrap_cert` | boolean | `false` | Serve a short-lived self-signed certificate on encrypted listeners while the first ACME certificate is being issued. When `false` (default), DoT/DoH/DoQ/DoH3 stay disabled until a trusted certificate exists. |
 
 ---
 

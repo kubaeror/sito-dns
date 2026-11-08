@@ -194,6 +194,7 @@ impl Config {
                     staging,
                     cache_dir,
                     http_port: default_acme_http_port(),
+                    allow_bootstrap_cert: false,
                 });
             }
         }
@@ -1531,6 +1532,13 @@ pub struct AcmeConfig {
     pub cache_dir: Option<PathBuf>,
     #[serde(default = "default_acme_http_port")]
     pub http_port: u16,
+    /// Serve a short-lived self-signed bootstrap certificate on encrypted
+    /// listeners while the first ACME certificate is being issued.
+    ///
+    /// Defaults to `false` (fail closed): encrypted listeners stay disabled
+    /// until a real certificate exists unless the operator explicitly opts in.
+    #[serde(default)]
+    pub allow_bootstrap_cert: bool,
 }
 
 fn default_acme_http_port() -> u16 {
@@ -2179,6 +2187,23 @@ key = "/path/to/key.pem"
                 .any(|w| w.contains("admin web UI")),
             "an explicit http:// public URL must still warn even with the proxy flag"
         );
+    }
+
+    /// D12: bootstrap serving is opt-in and defaults to fail-closed.
+    #[test]
+    fn test_acme_allow_bootstrap_cert_defaults_false() {
+        let default: AcmeConfig = toml::from_str("enabled = true\ndomains = [\"dns.example.com\"]")
+            .expect("parse default acme config");
+        assert!(
+            !default.allow_bootstrap_cert,
+            "bootstrap certificate serving must be disabled by default"
+        );
+
+        let opted_in: AcmeConfig = toml::from_str(
+            "enabled = true\ndomains = [\"dns.example.com\"]\nallow_bootstrap_cert = true",
+        )
+        .expect("parse opted-in acme config");
+        assert!(opted_in.allow_bootstrap_cert);
     }
 
     /// Warnings are written to logs; they must never echo credentials or

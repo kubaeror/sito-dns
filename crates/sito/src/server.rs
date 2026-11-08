@@ -17,7 +17,7 @@ use sito_dnssec::DnssecValidator;
 use sito_filter::HostsFilterEngine;
 use sito_stats::{MetricsRegistry, QueryLogWriter, StatsDb};
 use sito_transport::{
-    AcmeChallengeOptions, AcmeServiceConfig, CertWatcher, Doh3Config, DohConfig, DoqConfig,
+    AcmeChallengeAvailability, AcmeServiceConfig, CertWatcher, Doh3Config, DohConfig, DoqConfig,
     DotConfig, TcpConfig, TlsAcceptorManager, TlsManagerSet, UdpConfig, generate_self_signed_cert,
     load_server_config, load_server_config_with_challenges, record_bootstrap_cert,
     start_acme_manager_for_transports, start_doh_listener, start_doh3_listener, start_doq_listener,
@@ -175,45 +175,71 @@ fn build_tls_acceptor(
     Ok(manager)
 }
 
-/// Selects the certificate/key pair encrypted listeners should serve.
+/// What encrypted listeners should do with the material found at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TlsStartupMaterial {
+    /// Serve this certificate/key pair.
+    Pair(PathBuf, PathBuf),
+    /// No usable pair exists; write a short-lived bootstrap pair.
+    GenerateBootstrap,
+    /// No trusted pair and bootstrap serving is not opted in.
+    Disabled,
+}
+
+/// Selects the startup action for encrypted listeners.
 ///
-/// When ACME is enabled, a usable ACME certificate stored on disk takes
+/// When ACME is enabled, a usable CA-issued certificate stored on disk takes
 /// precedence over static `[tls]` files so a restart cannot silently revert
 /// DoH/DoT/DoQ/DoH3 to stale static material. A bootstrap placeholder never
-/// wins over a real static pair; if no static pair exists it is kept so the
-/// ACME manager can replace it in place.
+/// wins over a real static pair. If no trusted pair exists, a bootstrap is
+/// generated only when the operator opted in with
+/// `acme.allow_bootstrap_cert = true`; otherwise encrypted listeners stay
+/// disabled until a real certificate is available.
 fn choose_tls_material(
     static_pair: Option<(PathBuf, PathBuf)>,
     acme_pair: Option<(PathBuf, PathBuf)>,
-    acme_is_bootstrap: bool,
+    acme_pair_usable: bool,
     acme_enabled: bool,
-) -> Option<(PathBuf, PathBuf)> {
+    allow_bootstrap_cert: bool,
+) -> TlsStartupMaterial {
     if !acme_enabled {
-        return static_pair;
+        return static_pair.map_or(TlsStartupMaterial::Disabled, |(cert, key)| {
+            TlsStartupMaterial::Pair(cert, key)
+        });
     }
-    match acme_pair {
-        Some(acme_pair) if !acme_is_bootstrap => Some(acme_pair),
-        // A bootstrap/expired placeholder is never served when a static pair
-        // exists. Without one, returning `None` makes startup write a fresh
-        // short-lived placeholder instead of failing on the stale pair.
-        _ => static_pair,
+
+    if let Some((cert, key)) = acme_pair
+        && acme_pair_usable
+    {
+        return TlsStartupMaterial::Pair(cert, key);
+    }
+    if let Some((cert, key)) = static_pair {
+        return TlsStartupMaterial::Pair(cert, key);
+    }
+    if allow_bootstrap_cert {
+        TlsStartupMaterial::GenerateBootstrap
+    } else {
+        TlsStartupMaterial::Disabled
     }
 }
 
-/// Challenge types the configured listeners can actually answer.
-///
-/// TLS-ALPN-01 requires a TCP listener on port 443 that advertises
-/// `acme-tls/1`; only the DoH manager does. A custom DoH port or a failed
-/// HTTP-01 bind must not produce a challenge the deployment cannot answer.
-fn acme_challenge_options(
+/// Record whether a TCP DoH listener actually bound port 443 with the
+/// `acme-tls/1` ALPN. Called after every bind/rebind so ACME challenge
+/// selection reflects reality rather than configuration intent.
+fn record_doh_listener_binding(
+    availability: &AcmeChallengeAvailability,
     config: &Config,
-    doh_tls_available: bool,
-    http01_available: bool,
-) -> AcmeChallengeOptions {
-    AcmeChallengeOptions {
-        tls_alpn_available: doh_tls_available && config.dns.doh_port == 443,
-        http01_available,
-    }
+    doh_manager: Option<&TlsAcceptorManager>,
+    doh_bound: bool,
+) {
+    let advertises_acme_alpn = doh_manager.is_some_and(|manager| {
+        manager
+            .alpn_protocols()
+            .iter()
+            .any(|protocol| protocol.as_slice() == b"acme-tls/1")
+    });
+    availability
+        .set_tls_alpn_available(doh_bound && config.dns.doh_port == 443 && advertises_acme_alpn);
 }
 
 /// Builds per-client upstream managers, reusing existing managers by key so a
@@ -1297,6 +1323,7 @@ pub async fn run_server_full(
                         doh: None,
                         doq: None,
                         doh3: None,
+                        acme_challenges: AcmeChallengeAvailability::default(),
                     });
                 for warning in
                     exposure_warnings_for_phase(&current_cfg, ExposurePhase::DnsListeners)
@@ -1341,6 +1368,7 @@ pub async fn run_server_full(
                 doh: None,
                 doq: None,
                 doh3: None,
+                acme_challenges: AcmeChallengeAvailability::default(),
             });
         // Start from the current configuration (the watcher may already have
         // applied a file change during startup), not the stale startup copy.
@@ -1490,58 +1518,81 @@ async fn init_tls_and_acme(
         None
     };
 
-    let (acme_pair, acme_is_bootstrap) = if let Some(service_cfg) = &acme_service_cfg {
+    let (acme_pair, acme_pair_usable) = if let Some(service_cfg) = &acme_service_cfg {
         let cert_path = service_cfg.storage_dir.join("cert.pem");
         let key_path = service_cfg.storage_dir.join("key.pem");
         let pair = (cert_path.exists() && key_path.exists()).then_some((cert_path, key_path));
-        (pair, service_cfg.is_bootstrap_cert())
+        let usable = pair.is_some()
+            && !service_cfg.is_bootstrap_cert()
+            && !service_cfg.stored_cert_is_expired();
+        (pair, usable)
     } else {
         (None, false)
     };
 
-    let mut material =
-        choose_tls_material(static_pair, acme_pair, acme_is_bootstrap, is_acme_enabled);
+    // D12: bootstrap serving is opt-in and defaults to fail-closed.
+    let allow_bootstrap_cert = acme_cfg
+        .as_ref()
+        .is_some_and(|acme| acme.enabled && acme.allow_bootstrap_cert);
+    let material = match choose_tls_material(
+        static_pair,
+        acme_pair,
+        acme_pair_usable,
+        is_acme_enabled,
+        allow_bootstrap_cert,
+    ) {
+        TlsStartupMaterial::Pair(cert, key) => Some((cert, key)),
+        TlsStartupMaterial::Disabled => None,
+        TlsStartupMaterial::GenerateBootstrap => {
+            let Some(service_cfg) = &acme_service_cfg else {
+                anyhow::bail!(
+                    "Bootstrap certificate was requested but ACME configuration is missing"
+                );
+            };
+            std::fs::create_dir_all(&service_cfg.storage_dir).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create ACME storage directory {}: {e}",
+                    service_cfg.storage_dir.display()
+                )
+            })?;
+            let (cert_pem, key_pem) = generate_self_signed_cert(&service_cfg.domains)
+                .map_err(|e| anyhow::anyhow!("Failed to generate bootstrap certificate: {e}"))?;
+            let cert_path = service_cfg.storage_dir.join("cert.pem");
+            let key_path = service_cfg.storage_dir.join("key.pem");
+            std::fs::write(&cert_path, cert_pem).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to write bootstrap certificate to {}: {e}",
+                    cert_path.display()
+                )
+            })?;
+            // The bootstrap private key must be 0600: local users must not
+            // read it before ACME replaces it.
+            write_secret_file(&key_path, key_pem.as_bytes()).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to write bootstrap key to {}: {e}",
+                    key_path.display()
+                )
+            })?;
+            record_bootstrap_cert(&service_cfg.storage_dir).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to record bootstrap certificate in {}: {e}",
+                    service_cfg.storage_dir.display()
+                )
+            })?;
+            info!(
+                "Generated bootstrap self-signed certificate in {:?} (allow_bootstrap_cert = true)",
+                service_cfg.storage_dir
+            );
+            Some((cert_path, key_path))
+        }
+    };
 
-    // With no static and no stored certificate, ACME still needs encrypted
-    // listeners during issuance; generate the short-lived bootstrap pair.
-    if material.is_none()
-        && let Some(service_cfg) = &acme_service_cfg
-    {
-        std::fs::create_dir_all(&service_cfg.storage_dir).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to create ACME storage directory {}: {e}",
-                service_cfg.storage_dir.display()
-            )
-        })?;
-        let (cert_pem, key_pem) = generate_self_signed_cert(&service_cfg.domains)
-            .map_err(|e| anyhow::anyhow!("Failed to generate bootstrap certificate: {e}"))?;
-        let cert_path = service_cfg.storage_dir.join("cert.pem");
-        let key_path = service_cfg.storage_dir.join("key.pem");
-        std::fs::write(&cert_path, cert_pem).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to write bootstrap certificate to {}: {e}",
-                cert_path.display()
-            )
-        })?;
-        // The bootstrap private key must be 0600: local users must not read it
-        // before ACME replaces it.
-        write_secret_file(&key_path, key_pem.as_bytes()).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to write bootstrap key to {}: {e}",
-                key_path.display()
-            )
-        })?;
-        record_bootstrap_cert(&service_cfg.storage_dir).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to record bootstrap certificate in {}: {e}",
-                service_cfg.storage_dir.display()
-            )
-        })?;
-        info!(
-            "Generated bootstrap self-signed certificate in {:?}",
-            service_cfg.storage_dir
+    if material.is_none() && is_acme_enabled {
+        warn!(
+            "ACME is enabled but no trusted certificate is available and \
+             acme.allow_bootstrap_cert is false; encrypted listeners are disabled \
+             until ACME issuance completes and the server is restarted"
         );
-        material = Some((cert_path, key_path));
     }
 
     let http01_challenges = Arc::new(dashmap::DashMap::<String, String>::new());
@@ -1592,6 +1643,10 @@ async fn init_tls_and_acme(
             (None, None, None, None)
         };
 
+    // Live challenge state starts fail-safe: no TLS-ALPN-01 until a 443 DoH
+    // listener actually binds (done later by `start_dns_listeners`).
+    let acme_challenges = AcmeChallengeAvailability::new(false, false);
+
     // If ACME is enabled, start ACME renewal background manager
     if let (Some(service_cfg), Some(acme)) = (acme_service_cfg, acme_cfg.as_ref()) {
         // Dedicated plaintext HTTP-01 listener (ACME validators always use port 80).
@@ -1623,10 +1678,7 @@ async fn init_tls_and_acme(
             }
         }
 
-        // TLS-ALPN-01 validators connect to TCP port 443. The DoH manager is
-        // the only one that advertises `acme-tls/1`, so both must line up.
-        let challenge_options =
-            acme_challenge_options(config, doh_acceptor_mgr.is_some(), http01_available);
+        acme_challenges.set_http01_available(http01_available);
         let managers = TlsManagerSet {
             dot: dot_acceptor_mgr.clone(),
             doh: doh_acceptor_mgr.clone(),
@@ -1637,7 +1689,7 @@ async fn init_tls_and_acme(
             service_cfg,
             managers,
             Some(http01_challenges.clone()),
-            challenge_options,
+            acme_challenges.clone(),
             shutdown_rx.clone(),
         );
     }
@@ -1648,6 +1700,7 @@ async fn init_tls_and_acme(
         doh: doh_acceptor_mgr,
         doq: doq_acceptor_mgr,
         doh3: doh3_acceptor_mgr,
+        acme_challenges,
     });
 
     Ok(cert_watchers)
@@ -1734,6 +1787,8 @@ struct ListenerAcceptors {
     doh: Option<TlsAcceptorManager>,
     doq: Option<TlsAcceptorManager>,
     doh3: Option<TlsAcceptorManager>,
+    /// Live ACME challenge-listener state, updated after every DNS bind.
+    acme_challenges: AcmeChallengeAvailability,
 }
 
 /// Settings that determine how the DNS listeners are constructed. Changing
@@ -1788,6 +1843,7 @@ impl DnsListenerManager {
         rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
     ) -> anyhow::Result<Self> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let acme_challenges = acceptors.acme_challenges.clone();
         let (handles, limiters) = start_dns_listeners(
             config,
             pipeline,
@@ -1796,6 +1852,7 @@ impl DnsListenerManager {
             acceptors.doh,
             acceptors.doq,
             acceptors.doh3,
+            acme_challenges,
         )
         .await?;
 
@@ -1884,12 +1941,16 @@ async fn start_dns_listeners(
     doh_acceptor_mgr: Option<TlsAcceptorManager>,
     doq_acceptor_mgr: Option<TlsAcceptorManager>,
     doh3_acceptor_mgr: Option<TlsAcceptorManager>,
+    acme_challenges: AcmeChallengeAvailability,
 ) -> anyhow::Result<(
     Vec<tokio::task::JoinHandle<()>>,
     Vec<Arc<sito_transport::RateLimiter>>,
 )> {
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let mut handles = Vec::new();
+    // No TLS-ALPN-01 until a 443 DoH listener actually binds in this pass.
+    acme_challenges.set_tls_alpn_available(false);
+    let mut doh_443_bound = false;
 
     // One limiter per client IP shared by every listener (all bind addresses
     // and protocols), so an attacker cannot multiply the budget by switching
@@ -1975,6 +2036,9 @@ async fn start_dns_listeners(
                 let doh_handle =
                     start_doh_listener(doh_config, pipeline.clone(), shutdown_rx.clone()).await?;
                 handles.push(doh_handle);
+                if config.dns.doh_port == 443 {
+                    doh_443_bound = true;
+                }
             }
         }
 
@@ -2013,6 +2077,13 @@ async fn start_dns_listeners(
             }
         }
     }
+
+    record_doh_listener_binding(
+        &acme_challenges,
+        config,
+        doh_acceptor_mgr.as_ref(),
+        doh_443_bound,
+    );
 
     Ok((handles, rate_limiters))
 }
@@ -2233,27 +2304,58 @@ mod tests {
         );
     }
 
-    /// Regression (P1-12): TLS-ALPN-01 must only be offered when DoH actually
-    /// listens on TCP 443; a custom DoH port must fall back to HTTP-01.
+    /// Regression (P1-12/Important 2): TLS-ALPN-01 must only be offered when
+    /// DoH actually bound TCP 443. A failed/absent bind or a custom DoH port
+    /// must fall back to HTTP-01.
     #[test]
-    fn test_acme_challenge_options_require_port_443() {
+    fn test_acme_challenge_availability_requires_bound_443() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_bind_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let (cert_pem, key_pem) =
+            generate_self_signed_cert(&["localhost".to_string()]).expect("self-signed cert");
+        std::fs::write(&cert, cert_pem).unwrap();
+        std::fs::write(&key, key_pem).unwrap();
+        let manager = TlsAcceptorManager::new(
+            load_server_config(&cert, &key, &[], vec![b"acme-tls/1".to_vec()]).expect("TLS config"),
+        );
+
         let mut config = Config::default();
         config.dns.doh_port = 443;
-        let options = acme_challenge_options(&config, true, true);
-        assert!(options.tls_alpn_available);
-        assert!(options.http01_available);
+        let availability = AcmeChallengeAvailability::default();
+
+        // The ACME manager starts before the DNS bind: nothing is available.
+        assert!(!availability.options().tls_alpn_available);
+
+        record_doh_listener_binding(&availability, &config, Some(&manager), false);
+        assert!(
+            !availability.options().tls_alpn_available,
+            "a failed/absent 443 bind must not enable TLS-ALPN-01"
+        );
 
         config.dns.doh_port = 8443;
-        let options = acme_challenge_options(&config, true, true);
+        record_doh_listener_binding(&availability, &config, Some(&manager), true);
         assert!(
-            !options.tls_alpn_available,
-            "TLS-ALPN-01 needs a TCP 443 listener, not just any TLS manager"
+            !availability.options().tls_alpn_available,
+            "TLS-ALPN-01 needs port 443, not just any bound TLS listener"
         );
-        assert!(options.http01_available);
 
-        let options = acme_challenge_options(&config, false, false);
-        assert!(!options.tls_alpn_available);
-        assert!(!options.http01_available);
+        config.dns.doh_port = 443;
+        record_doh_listener_binding(&availability, &config, Some(&manager), true);
+        assert!(
+            availability.options().tls_alpn_available,
+            "a bound 443 DoH listener with acme-tls/1 enables TLS-ALPN-01"
+        );
+
+        record_doh_listener_binding(&availability, &config, None, true);
+        assert!(!availability.options().tls_alpn_available);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression (P1-12/P2-13): a restart must prefer the stored ACME
@@ -2269,32 +2371,133 @@ mod tests {
             PathBuf::from("/var/lib/sito/acme/cert.pem"),
             PathBuf::from("/var/lib/sito/acme/key.pem"),
         ));
+        let static_pair_value = static_pair.clone().expect("static pair");
+        let acme_pair_value = acme_pair.clone().expect("acme pair");
 
         assert_eq!(
-            choose_tls_material(static_pair.clone(), acme_pair.clone(), false, true),
-            acme_pair,
+            choose_tls_material(static_pair.clone(), acme_pair.clone(), true, true, false),
+            TlsStartupMaterial::Pair(acme_pair_value.0.clone(), acme_pair_value.1.clone()),
             "a usable ACME certificate must win over static material after restart"
         );
         assert_eq!(
-            choose_tls_material(static_pair.clone(), acme_pair.clone(), true, true),
-            static_pair,
+            choose_tls_material(static_pair.clone(), acme_pair.clone(), false, true, true),
+            TlsStartupMaterial::Pair(static_pair_value.0.clone(), static_pair_value.1.clone()),
             "a bootstrap placeholder must not displace a real static pair"
         );
         assert_eq!(
-            choose_tls_material(None, acme_pair.clone(), true, true),
-            None,
-            "a stale bootstrap pair is regenerated instead of being served"
+            choose_tls_material(None, acme_pair.clone(), false, true, false),
+            TlsStartupMaterial::Disabled,
+            "D12: bootstrap must not be served by default"
         );
         assert_eq!(
-            choose_tls_material(static_pair.clone(), None, false, true),
-            static_pair,
+            choose_tls_material(None, acme_pair.clone(), false, true, true),
+            TlsStartupMaterial::GenerateBootstrap,
+            "opting in allows a fresh bootstrap while ACME issues"
+        );
+        assert_eq!(
+            choose_tls_material(None, None, false, true, false),
+            TlsStartupMaterial::Disabled,
+            "ACME-only with no certificate is fail-closed by default"
+        );
+        assert_eq!(
+            choose_tls_material(None, None, false, true, true),
+            TlsStartupMaterial::GenerateBootstrap,
+            "ACME-only with the opt-in generates a bootstrap certificate"
+        );
+        assert_eq!(
+            choose_tls_material(static_pair.clone(), None, false, true, false),
+            TlsStartupMaterial::Pair(static_pair_value.0.clone(), static_pair_value.1.clone()),
             "without ACME material the static pair is used while issuance runs"
         );
         assert_eq!(
-            choose_tls_material(static_pair.clone(), acme_pair.clone(), false, false),
-            static_pair,
+            choose_tls_material(static_pair.clone(), acme_pair.clone(), false, false, false),
+            TlsStartupMaterial::Pair(static_pair_value.0.clone(), static_pair_value.1.clone()),
             "with ACME disabled only static material is used"
         );
+    }
+
+    /// Critical 1 regression: a CA-issued certificate with only ~5 days left
+    /// has a ~90-day lifetime. It must not be classified as a bootstrap
+    /// placeholder and must not be overwritten during startup selection.
+    #[test]
+    fn test_short_remaining_validity_does_not_trigger_bootstrap_replacement() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_short_remaining_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let ca_key = rcgen::KeyPair::generate().expect("CA key");
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "sito test CA");
+        let now = time::OffsetDateTime::now_utc();
+        let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+        let mut leaf_params = rcgen::CertificateParams::new(vec!["dns.example.test".to_string()])
+            .expect("leaf params");
+        leaf_params.not_before = now - time::Duration::days(85);
+        leaf_params.not_after = now + time::Duration::days(5);
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
+            .expect("leaf cert");
+
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, leaf_cert.pem()).expect("write cert");
+        write_secret_file(&key_path, leaf_key.serialize_pem().as_bytes()).expect("write key");
+
+        let config = AcmeServiceConfig::new(
+            "admin@example.test".to_string(),
+            vec!["dns.example.test".to_string()],
+            dir.clone(),
+        )
+        .with_renew_before_days(30);
+        assert!(
+            !config.is_bootstrap_cert(),
+            "remaining validity must not classify a CA certificate as bootstrap"
+        );
+
+        let acme_pair = Some((cert_path.clone(), key_path.clone()));
+        let acme_pair_value = acme_pair.clone().expect("acme pair");
+        let acme_pair_usable = !config.is_bootstrap_cert() && !config.stored_cert_is_expired();
+        assert_eq!(
+            choose_tls_material(None, acme_pair.clone(), acme_pair_usable, true, false),
+            TlsStartupMaterial::Pair(acme_pair_value.0.clone(), acme_pair_value.1.clone()),
+            "a still-valid CA certificate must be retained even though renewal is due"
+        );
+
+        // An actually expired CA certificate is not served, but is not
+        // overwritten either: encrypted listeners are disabled by default.
+        let expired_key = rcgen::KeyPair::generate().expect("expired leaf key");
+        let mut expired_params =
+            rcgen::CertificateParams::new(vec!["dns.example.test".to_string()])
+                .expect("expired leaf params");
+        expired_params.not_before = now - time::Duration::days(95);
+        expired_params.not_after = now - time::Duration::days(5);
+        let expired_cert = expired_params
+            .signed_by(
+                &expired_key,
+                &rcgen::Issuer::from_params(&ca_params, &ca_key),
+            )
+            .expect("expired leaf cert");
+        std::fs::write(&cert_path, expired_cert.pem()).expect("write expired cert");
+        write_secret_file(&key_path, expired_key.serialize_pem().as_bytes())
+            .expect("write expired key");
+        assert!(
+            config.stored_cert_is_expired(),
+            "the expired certificate must be detected"
+        );
+        assert_eq!(
+            choose_tls_material(None, acme_pair, false, true, false),
+            TlsStartupMaterial::Disabled,
+            "an expired CA certificate must not be replaced or served without opt-in"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression (P0-1): invalid configured certificate material must abort

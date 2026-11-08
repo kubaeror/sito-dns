@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use instant_acme::{
@@ -18,7 +19,7 @@ use instant_acme::{
 };
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::tls::{TlsAcceptorManager, TlsManagerSet, create_certified_key};
 
@@ -129,9 +130,13 @@ impl AcmeServiceConfig {
     /// placeholder rather than a CA-issued certificate.
     ///
     /// Bootstrap certificates are detected by an explicit marker, a short
-    /// validity, or being self-signed. The self-signed check also recovers
+    /// total lifetime, or being self-signed. The self-signed check also recovers
     /// installations upgraded from versions that wrote a year-4096 bootstrap
     /// certificate without a marker.
+    ///
+    /// This deliberately uses total lifetime, not remaining validity: a
+    /// legitimate 90-day CA certificate in its last 7 days is still a real
+    /// certificate and must never be replaced by a self-signed placeholder.
     pub fn is_bootstrap_cert(&self) -> bool {
         if bootstrap_marker_path(&self.storage_dir).exists() {
             return true;
@@ -142,8 +147,20 @@ impl AcmeServiceConfig {
         if is_self_signed(&cert_bytes) {
             return true;
         }
-        days_until_expiration(&cert_bytes)
+        certificate_lifetime_days(&cert_bytes)
             .is_ok_and(|days| days <= crate::tls::BOOTSTRAP_CERT_VALIDITY_DAYS)
+    }
+
+    /// Whether the certificate currently stored for ACME is already expired.
+    ///
+    /// An expired CA certificate must not be served, but it also must not be
+    /// silently overwritten by a bootstrap certificate unless the operator
+    /// explicitly opted in.
+    pub fn stored_cert_is_expired(&self) -> bool {
+        let Ok(cert_bytes) = std::fs::read(self.storage_dir.join("cert.pem")) else {
+            return false;
+        };
+        days_until_expiration(&cert_bytes).is_ok_and(|days| days < 0)
     }
 
     /// Determine the directory URL to use.
@@ -181,6 +198,27 @@ pub fn days_until_expiration(cert_pem: &[u8]) -> Result<i64, String> {
     let seconds_left = not_after - now;
     let days_left = seconds_left / 86400;
     Ok(days_left)
+}
+
+/// Total lifetime of the first certificate in `cert_pem`, in whole days
+/// (`not_after - not_before`).
+///
+/// Unlike [`days_until_expiration`], this is stable for the lifetime of the
+/// certificate and is therefore the correct signal for distinguishing a
+/// short-lived bootstrap placeholder from a real CA certificate that happens
+/// to be close to expiry.
+pub fn certificate_lifetime_days(cert_pem: &[u8]) -> Result<i64, String> {
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to parse PEM certificate: {e}"))?;
+    let first = certs
+        .first()
+        .ok_or_else(|| "Certificate chain is empty".to_string())?;
+    let (_, x509) = x509_parser::parse_x509_certificate(first.as_ref())
+        .map_err(|e| format!("Failed to parse X.509 DER certificate: {e}"))?;
+    let not_before = x509.validity().not_before.timestamp();
+    let not_after = x509.validity().not_after.timestamp();
+    Ok((not_after - not_before) / 86400)
 }
 
 /// Generate a TLS-ALPN-01 (RFC 8737) challenge certificate.
@@ -547,6 +585,43 @@ pub struct AcmeChallengeOptions {
     pub http01_available: bool,
 }
 
+/// Live challenge-listener state shared by the DNS listener manager and the
+/// ACME background manager.
+///
+/// Listener bindings start before ACME attempts and can change on a hot
+/// rebind, so the ACME manager reads this at every attempt instead of capturing
+/// a configuration-derived snapshot. The default (nothing bound) is fail-safe:
+/// only HTTP-01 can be selected.
+#[derive(Clone, Debug, Default)]
+pub struct AcmeChallengeAvailability {
+    tls_alpn_available: Arc<AtomicBool>,
+    http01_available: Arc<AtomicBool>,
+}
+
+impl AcmeChallengeAvailability {
+    pub fn new(tls_alpn_available: bool, http01_available: bool) -> Self {
+        Self {
+            tls_alpn_available: Arc::new(AtomicBool::new(tls_alpn_available)),
+            http01_available: Arc::new(AtomicBool::new(http01_available)),
+        }
+    }
+
+    pub fn set_tls_alpn_available(&self, available: bool) {
+        self.tls_alpn_available.store(available, Ordering::Relaxed);
+    }
+
+    pub fn set_http01_available(&self, available: bool) {
+        self.http01_available.store(available, Ordering::Relaxed);
+    }
+
+    pub fn options(&self) -> AcmeChallengeOptions {
+        AcmeChallengeOptions {
+            tls_alpn_available: self.tls_alpn_available.load(Ordering::Relaxed),
+            http01_available: self.http01_available.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Select a challenge type the CA offers and this deployment can answer.
 ///
 /// TLS-ALPN-01 is only usable when a TCP listener on port 443 answers the
@@ -836,10 +911,15 @@ pub async fn obtain_or_renew_certificate_for_transports(
     // Reload every encrypted transport from the issued pair. Each manager
     // reloads with its own ALPN list and keeps its shared challenge keys and
     // SNI virtual-host certificates.
-    match managers.reload_all(&cert_path, &key_path) {
-        Ok(()) => info!("All TLS transports reloaded with the ACME certificate"),
-        Err(e) => error!("Failed to reload one or more TLS transports with new ACME cert: {e}"),
-    }
+    //
+    // A failure must surface to the caller: reporting success would make the
+    // manager wait the full steady-state interval while transports keep
+    // serving the bootstrap certificate. The retry path calls `reload_all`
+    // again even when the persisted certificate no longer needs renewal.
+    managers
+        .reload_all(&cert_path, &key_path)
+        .map_err(|e| format!("Certificate issued but failed to reload TLS transports: {e}"))?;
+    info!("All TLS transports reloaded with the ACME certificate");
 
     Ok(true)
 }
@@ -857,26 +937,24 @@ pub fn start_acme_manager(
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let managers = TlsManagerSet::from_doh(acceptor_mgr);
-    let challenge_options = AcmeChallengeOptions {
-        tls_alpn_available: !managers.is_empty(),
-        http01_available: http01_challenges.is_some(),
-    };
+    let challenge_availability =
+        AcmeChallengeAvailability::new(!managers.is_empty(), http01_challenges.is_some());
     start_acme_manager_for_transports(
         config,
         managers,
         http01_challenges,
-        challenge_options,
+        challenge_availability,
         shutdown_rx,
     )
 }
 
 /// Spawns the ACME manager with an explicit set of transport managers and a
-/// port-aware challenge selection.
+/// live view of which challenge listeners are actually bound.
 pub fn start_acme_manager_for_transports(
     config: AcmeServiceConfig,
     managers: TlsManagerSet,
     http01_challenges: Option<Arc<dashmap::DashMap<String, String>>>,
-    challenge_options: AcmeChallengeOptions,
+    challenge_availability: AcmeChallengeAvailability,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     /// Steady-state check cadence once renewal is not immediately required.
@@ -898,7 +976,7 @@ pub fn start_acme_manager_for_transports(
             &config,
             &managers,
             http01_challenges.as_ref(),
-            challenge_options,
+            challenge_availability.options(),
         )
         .await
         {
@@ -933,7 +1011,7 @@ pub fn start_acme_manager_for_transports(
                         &config,
                         &managers,
                         http01_challenges.as_ref(),
-                        challenge_options,
+                        challenge_availability.options(),
                     ).await {
                         Ok(_) => {
                             next_delay = ACME_CHECK_INTERVAL;
@@ -975,6 +1053,33 @@ mod tests {
         );
     }
 
+    /// The default availability (nothing bound yet) must not select
+    /// TLS-ALPN-01; a successful 443 bind flips it dynamically.
+    #[test]
+    fn test_challenge_availability_defaults_to_http01() {
+        let availability = AcmeChallengeAvailability::default();
+        assert!(!availability.options().tls_alpn_available);
+        assert!(!availability.options().http01_available);
+
+        availability.set_http01_available(true);
+        assert_eq!(
+            select_challenge_type(true, true, availability.options()),
+            Some(ChallengeType::Http01)
+        );
+
+        availability.set_tls_alpn_available(true);
+        assert_eq!(
+            select_challenge_type(true, true, availability.options()),
+            Some(ChallengeType::TlsAlpn01)
+        );
+
+        availability.set_tls_alpn_available(false);
+        assert_eq!(
+            select_challenge_type(true, true, availability.options()),
+            Some(ChallengeType::Http01)
+        );
+    }
+
     /// Regression (P1-12): TLS-ALPN-01 must only be chosen when a TCP 443
     /// listener is available. A deployment without one must use HTTP-01.
     #[test]
@@ -1011,6 +1116,15 @@ mod tests {
     /// Generates a CA-signed (non-bootstrap) certificate chain for the given
     /// domain. Returns `(cert_pem, key_pem)`.
     fn generate_ca_signed_cert(domain: &str) -> (String, String) {
+        let now = time::OffsetDateTime::now_utc();
+        generate_ca_signed_cert_with_window(domain, now, now + time::Duration::days(90))
+    }
+
+    fn generate_ca_signed_cert_with_window(
+        domain: &str,
+        not_before: time::OffsetDateTime,
+        not_after: time::OffsetDateTime,
+    ) -> (String, String) {
         let ca_key = rcgen::KeyPair::generate().expect("CA key");
         let mut ca_params = rcgen::CertificateParams::default();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -1020,7 +1134,10 @@ mod tests {
         let ca_cert = ca_params.self_signed(&ca_key).expect("CA cert");
 
         let key = rcgen::KeyPair::generate().expect("leaf key");
-        let params = rcgen::CertificateParams::new(vec![domain.to_string()]).expect("leaf params");
+        let mut params =
+            rcgen::CertificateParams::new(vec![domain.to_string()]).expect("leaf params");
+        params.not_before = not_before;
+        params.not_after = not_after;
         let cert = params
             .signed_by(&key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
             .expect("leaf cert");
@@ -1063,6 +1180,53 @@ mod tests {
         assert!(
             !config.is_bootstrap_cert(),
             "a CA-issued certificate must not be treated as a bootstrap placeholder"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Critical regression: a legitimate CA certificate that is merely close
+    /// to expiry must still be treated as a real certificate. Its total
+    /// lifetime is 90 days even though only 5 days remain.
+    #[test]
+    fn test_certificate_in_last_week_is_not_bootstrap() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_short_remaining_{}_{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let now = time::OffsetDateTime::now_utc();
+        let (cert_pem, key_pem) = generate_ca_signed_cert_with_window(
+            "acme.example.com",
+            now - time::Duration::days(85),
+            now + time::Duration::days(5),
+        );
+        std::fs::write(dir.join("cert.pem"), &cert_pem).expect("write cert");
+        write_secret_file(&dir.join("key.pem"), key_pem.as_bytes()).expect("write key");
+
+        let config = AcmeServiceConfig::new(
+            "admin@example.com".into(),
+            vec!["acme.example.com".into()],
+            dir.clone(),
+        )
+        .with_renew_before_days(30);
+
+        assert!(
+            !config.is_bootstrap_cert(),
+            "remaining validity must not classify a CA certificate as bootstrap"
+        );
+        let lifetime =
+            certificate_lifetime_days(cert_pem.as_bytes()).expect("certificate lifetime");
+        assert!(
+            (89..=91).contains(&lifetime),
+            "expected a ~90-day certificate lifetime, got {lifetime}"
+        );
+        assert!(
+            certificate_needs_renewal(&config),
+            "a certificate with 5 days left must still be renewed"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
