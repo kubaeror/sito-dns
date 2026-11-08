@@ -129,14 +129,14 @@ impl AcmeServiceConfig {
     /// Whether the certificate currently stored for ACME is a bootstrap
     /// placeholder rather than a CA-issued certificate.
     ///
-    /// Bootstrap certificates are detected by an explicit marker, a short
-    /// total lifetime, or being self-signed. The self-signed check also recovers
-    /// installations upgraded from versions that wrote a year-4096 bootstrap
-    /// certificate without a marker.
+    /// Bootstrap certificates are detected by an explicit marker or by being
+    /// self-signed. The self-signed check also recovers installations upgraded
+    /// from versions that wrote a year-4096 bootstrap certificate without a
+    /// marker.
     ///
-    /// This deliberately uses total lifetime, not remaining validity: a
-    /// legitimate 90-day CA certificate in its last 7 days is still a real
-    /// certificate and must never be replaced by a self-signed placeholder.
+    /// Total lifetime is deliberately not used: short-lived CA-issued
+    /// certificates exist, and a CA-issued certificate must never be replaced
+    /// by a self-signed placeholder.
     pub fn is_bootstrap_cert(&self) -> bool {
         if bootstrap_marker_path(&self.storage_dir).exists() {
             return true;
@@ -144,11 +144,7 @@ impl AcmeServiceConfig {
         let Ok(cert_bytes) = std::fs::read(self.storage_dir.join("cert.pem")) else {
             return false;
         };
-        if is_self_signed(&cert_bytes) {
-            return true;
-        }
-        certificate_lifetime_days(&cert_bytes)
-            .is_ok_and(|days| days <= crate::tls::BOOTSTRAP_CERT_VALIDITY_DAYS)
+        is_self_signed(&cert_bytes)
     }
 
     /// Whether the certificate currently stored for ACME is already expired.
@@ -160,7 +156,10 @@ impl AcmeServiceConfig {
         let Ok(cert_bytes) = std::fs::read(self.storage_dir.join("cert.pem")) else {
             return false;
         };
-        days_until_expiration(&cert_bytes).is_ok_and(|days| days < 0)
+        // Compare seconds, not whole days: `days_until_expiration` truncates
+        // toward zero, so a certificate that expired one hour ago still has a
+        // day count of 0.
+        seconds_until_expiration(&cert_bytes).is_ok_and(|seconds| seconds <= 0)
     }
 
     /// Determine the directory URL to use.
@@ -175,8 +174,12 @@ impl AcmeServiceConfig {
     }
 }
 
-/// Calculate the number of days remaining until an X.509 certificate expires.
-pub fn days_until_expiration(cert_pem: &[u8]) -> Result<i64, String> {
+/// Seconds remaining until the first certificate in `cert_pem` expires.
+///
+/// Negative values mean the certificate is already expired. This is the
+/// precise form used for expiry decisions; [`days_until_expiration`] truncates
+/// the remainder into whole days for display/threshold comparisons.
+pub fn seconds_until_expiration(cert_pem: &[u8]) -> Result<i64, String> {
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Failed to parse PEM certificate: {e}"))?;
@@ -195,18 +198,21 @@ pub fn days_until_expiration(cert_pem: &[u8]) -> Result<i64, String> {
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let seconds_left = not_after - now;
-    let days_left = seconds_left / 86400;
-    Ok(days_left)
+    Ok(not_after - now)
+}
+
+/// Calculate the number of days remaining until an X.509 certificate expires.
+pub fn days_until_expiration(cert_pem: &[u8]) -> Result<i64, String> {
+    Ok(seconds_until_expiration(cert_pem)? / 86400)
 }
 
 /// Total lifetime of the first certificate in `cert_pem`, in whole days
 /// (`not_after - not_before`).
 ///
 /// Unlike [`days_until_expiration`], this is stable for the lifetime of the
-/// certificate and is therefore the correct signal for distinguishing a
-/// short-lived bootstrap placeholder from a real CA certificate that happens
-/// to be close to expiry.
+/// certificate. It is diagnostics/test signal only: bootstrap classification
+/// uses the explicit marker or a self-signed issuer so short-lived CA-issued
+/// certificates are never misclassified.
 pub fn certificate_lifetime_days(cert_pem: &[u8]) -> Result<i64, String> {
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<Vec<_>, _>>()
@@ -723,11 +729,10 @@ pub async fn obtain_or_renew_certificate_for_transports(
         // Best effort: make sure every transport serves the persisted pair.
         // This heals a restart that selected static material and a previous
         // reload that failed after issuance.
-        if cert_path.exists()
-            && key_path.exists()
-            && let Err(e) = managers.reload_all(&cert_path, &key_path)
-        {
-            warn!("Failed to reload transports from persisted ACME certificate: {e}");
+        if cert_path.exists() && key_path.exists() {
+            managers.reload_all(&cert_path, &key_path).map_err(|e| {
+                format!("Failed to reload transports from persisted ACME certificate: {e}")
+            })?;
         }
         return Ok(false);
     }
@@ -1228,6 +1233,92 @@ mod tests {
             certificate_needs_renewal(&config),
             "a certificate with 5 days left must still be renewed"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: a certificate expired by less than a day still has a
+    /// truncated day count of 0. Expiry must be decided from seconds so
+    /// startup does not pass the pair to TLS validation and abort.
+    #[test]
+    fn test_certificate_expired_one_hour_ago_is_expired() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_expired_hour_{}_{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let now = time::OffsetDateTime::now_utc();
+        let (cert_pem, key_pem) = generate_ca_signed_cert_with_window(
+            "acme.example.com",
+            now - time::Duration::days(90),
+            now - time::Duration::hours(1),
+        );
+        std::fs::write(dir.join("cert.pem"), &cert_pem).expect("write cert");
+        write_secret_file(&dir.join("key.pem"), key_pem.as_bytes()).expect("write key");
+
+        let config = AcmeServiceConfig::new(
+            "admin@example.com".into(),
+            vec!["acme.example.com".into()],
+            dir.clone(),
+        );
+        assert!(
+            !config.is_bootstrap_cert(),
+            "a CA-issued certificate is never a bootstrap placeholder"
+        );
+        assert!(
+            config.stored_cert_is_expired(),
+            "an hour-old expiry must be detected (days_until_expiration returns 0)"
+        );
+
+        let seconds = seconds_until_expiration(cert_pem.as_bytes()).expect("seconds remaining");
+        assert!(
+            (-3600..=-3590).contains(&seconds),
+            "expected ~1 hour past expiry, got {seconds}s"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A CA-issued short-lived certificate (<= 7 days total) must not be
+    /// classified as a bootstrap placeholder just because of its lifetime.
+    #[test]
+    fn test_short_lived_ca_certificate_is_not_bootstrap() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_short_lived_ca_{}_{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let now = time::OffsetDateTime::now_utc();
+        let (cert_pem, key_pem) = generate_ca_signed_cert_with_window(
+            "acme.example.com",
+            now - time::Duration::days(1),
+            now + time::Duration::days(4),
+        );
+        std::fs::write(dir.join("cert.pem"), &cert_pem).expect("write cert");
+        write_secret_file(&dir.join("key.pem"), key_pem.as_bytes()).expect("write key");
+
+        let config = AcmeServiceConfig::new(
+            "admin@example.com".into(),
+            vec!["acme.example.com".into()],
+            dir.clone(),
+        );
+        let lifetime =
+            certificate_lifetime_days(cert_pem.as_bytes()).expect("certificate lifetime");
+        assert!(
+            (4..=5).contains(&lifetime),
+            "expected a ~5-day certificate lifetime, got {lifetime}"
+        );
+        assert!(
+            !config.is_bootstrap_cert(),
+            "a short-lived CA certificate must not be treated as bootstrap"
+        );
+        assert!(!config.stored_cert_is_expired());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

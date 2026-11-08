@@ -2476,8 +2476,8 @@ mod tests {
         let mut expired_params =
             rcgen::CertificateParams::new(vec!["dns.example.test".to_string()])
                 .expect("expired leaf params");
-        expired_params.not_before = now - time::Duration::days(95);
-        expired_params.not_after = now - time::Duration::days(5);
+        expired_params.not_before = now - time::Duration::days(90);
+        expired_params.not_after = now - time::Duration::hours(1);
         let expired_cert = expired_params
             .signed_by(
                 &expired_key,

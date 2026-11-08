@@ -889,6 +889,17 @@ async fn test_failed_post_issuance_reload_is_reported() {
         "the persisted certificate must be the CA-issued one"
     );
 
+    // The no-renewal branch must also surface a persistent reload failure so
+    // the manager keeps retrying instead of waiting for the steady-state tick.
+    let retry_error =
+        obtain_or_renew_certificate_for_transports(&config, &managers, Some(&http01), options)
+            .await
+            .expect_err("a persistent reload failure must be reported on the no-renewal path");
+    assert!(
+        retry_error.contains("persisted ACME certificate"),
+        "unexpected error: {retry_error}"
+    );
+
     let _ = std::fs::remove_dir_all(&storage);
 }
 
