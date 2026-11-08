@@ -171,10 +171,15 @@ fn strip_dnssec_records(response: &mut Message) {
 /// (RFC 6891 §6.1.1). DNSSEC records are removed only when the client did not
 /// request them, and the DO bit is echoed exactly.
 ///
-/// The RFC 8914 Extended DNS Error option (code 15) is generated locally by
-/// the DNSSEC layer and is not client-specific, so it is preserved.
+/// The RFC 8914 Extended DNS Error option (code 15) is retained as a
+/// non-client-specific diagnostic; it may come from local validation or the
+/// upstream. Every other option is dropped because it can be client-specific
+/// (COOKIE, ECS, NSID, padding).
 fn shape_response(query: &Message, response: &mut Message, client_wants_dnssec: bool) {
+    response.metadata.id = query.metadata.id;
+    response.metadata.op_code = query.metadata.op_code;
     response.metadata.message_type = MessageType::Response;
+    response.metadata.authoritative = false;
     response.metadata.recursion_desired = query.metadata.recursion_desired;
     response.metadata.recursion_available = true;
     response.metadata.checking_disabled = query.metadata.checking_disabled;
@@ -1343,6 +1348,7 @@ impl QueryHandler for DnsPipeline {
             );
             response.metadata.response_code = ResponseCode::FormErr;
             response.metadata.recursion_desired = query.metadata.recursion_desired;
+            response.metadata.recursion_available = true;
             response.metadata.checking_disabled = query.metadata.checking_disabled;
             if let Some(client_edns) = &query.edns {
                 let mut edns = Edns::new();
@@ -3669,6 +3675,10 @@ mod tests {
             "RD must come from the query"
         );
         assert!(
+            resp.metadata.checking_disabled,
+            "CD must come from the query"
+        );
+        assert!(
             resp.edns.is_some(),
             "a cache hit for an EDNS client must include OPT"
         );
@@ -3715,14 +3725,30 @@ mod tests {
             RecordType::AAAA,
         ));
         let resp = pipeline
-            .handle(multi, client)
+            .handle(multi, client.clone())
             .await
             .expect("multi-question queries get a FORMERR response");
         assert_eq!(resp.metadata.response_code, ResponseCode::FormErr);
         assert!(
+            resp.metadata.recursion_available,
+            "FORMERR must consistently advertise recursion availability"
+        );
+        assert!(
             resp.queries.is_empty(),
             "a multi-question FORMERR must not echo questions"
         );
+
+        let zero = Message::new(11, MessageType::Query, OpCode::Query);
+        let resp = pipeline
+            .handle(zero, client)
+            .await
+            .expect("zero-question queries get a FORMERR response");
+        assert_eq!(resp.metadata.response_code, ResponseCode::FormErr);
+        assert!(
+            resp.metadata.recursion_available,
+            "zero-question FORMERR must set RA like the multi-question path"
+        );
+
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,

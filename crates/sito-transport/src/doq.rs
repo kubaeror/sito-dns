@@ -232,7 +232,12 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
 
                         // Process incoming bidirectional streams (RFC 9250 section 4.2)
                         let mut stream_tasks = tokio::task::JoinSet::new();
-                        while let Ok((send, recv)) = conn.accept_bi().await {
+                        loop {
+                            tokio::select! {
+                                accept_res = conn.accept_bi() => {
+                                    let Ok((send, recv)) = accept_res else {
+                                        break;
+                                    };
                             let Ok(stream_permit) = stream_semaphore.clone().try_acquire_owned() else {
                                 warn!(
                                     "DoQ global stream limit reached; abandoning stream from {}",
@@ -377,12 +382,19 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                   let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
                               }
                             });
+                            // Reap completed stream tasks continuously, not
+                            // only when the connection closes.
+                            crate::admission::reap_finished(&mut stream_tasks);
+                                }
+                                Some(_) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {}
+                            }
                         }
                         // The connection is gone; abort any streams still
                         // blocked on a peer and wait for their tasks to finish.
                         stream_tasks.abort_all();
                         while stream_tasks.join_next().await.is_some() {}
                     });
+                    crate::admission::reap_finished(&mut connection_tasks);
                 }
             }
         }

@@ -40,6 +40,26 @@ pub(crate) const DOH3_MAX_BIDI_STREAMS: u32 = 16;
 /// of the connection cap.
 const DOH3_REQUESTS_PER_CONNECTION: usize = 4;
 
+/// Overridable timing limits for the DoH3 listener.
+///
+/// Production uses [`Doh3Limits::default`]; tests inject short deadlines so a
+/// behaviour that would otherwise need a ten-second stall can be exercised
+/// quickly.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Doh3Limits {
+    pub request_timeout: Duration,
+    pub handshake_timeout: Duration,
+}
+
+impl Default for Doh3Limits {
+    fn default() -> Self {
+        Self {
+            request_timeout: REQUEST_TIMEOUT,
+            handshake_timeout: QUIC_HANDSHAKE_TIMEOUT,
+        }
+    }
+}
+
 /// Maximum accepted size of an HTTP/3 field section (request headers). The
 /// default in h3 0.0.8 is `VarInt::MAX`, which lets a peer force unbounded
 /// buffering before the limit is checked.
@@ -182,7 +202,17 @@ fn decode_dns_query_param(query: &str) -> Option<String> {
 pub async fn start_doh3_listener<H: QueryHandler + 'static>(
     config: Doh3Config,
     handler: Arc<H>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    start_doh3_listener_with_limits(config, handler, shutdown_rx, Doh3Limits::default())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
+    config: Doh3Config,
+    handler: Arc<H>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    limits: Doh3Limits,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let rustls_cfg = if let Some(ref custom_cfg) = config.server_config {
         custom_cfg.clone()
@@ -262,7 +292,7 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                     connection_tasks.spawn(async move {
                         let _permit = permit;
                         let _per_ip_permit = per_ip_permit;
-                        let conn = match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
+                        let conn = match tokio::time::timeout(limits.handshake_timeout, incoming).await {
                             Ok(Ok(c)) => c,
                             Ok(Err(e)) => {
                                 debug!("DoH3 QUIC handshake failed: {}", e);
@@ -271,7 +301,7 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                             Err(_) => {
                                 debug!(
                                     "DoH3 QUIC handshake timed out after {}s",
-                                    QUIC_HANDSHAKE_TIMEOUT.as_secs()
+                                    limits.handshake_timeout.as_secs()
                                 );
                                 return;
                             }
@@ -307,7 +337,12 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                         };
 
                         let mut request_tasks = tokio::task::JoinSet::new();
-                        while let Ok(Some(resolver)) = h3_conn.accept().await {
+                        loop {
+                            tokio::select! {
+                                accept_res = h3_conn.accept() => {
+                                    let Ok(Some(resolver)) = accept_res else {
+                                        break;
+                                    };
                             let handler = Arc::clone(&handler);
                             let rate_limiter = Arc::clone(&rate_limiter);
                             let request_semaphore = Arc::clone(&request_semaphore);
@@ -325,24 +360,34 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                         "DoH3 global request limit reached for client {}",
                                         client_ip
                                     );
-                                    if let Ok(Ok((_req, mut stream))) = tokio::time::timeout(
-                                        STREAM_TIMEOUT,
-                                        resolver.resolve_request(),
-                                    )
-                                    .await
-                                    {
-                                        let resp = http::Response::builder()
-                                            .status(http::StatusCode::SERVICE_UNAVAILABLE)
-                                            .header(http::header::RETRY_AFTER, "1")
-                                            .body(())
-                                            .unwrap();
-                                        let _ = stream.send_response(resp).await;
-                                        let _ = stream.finish().await;
+                                    let busy = tokio::time::timeout(limits.request_timeout, async {
+                                        if let Ok(Ok((_req, mut stream))) = tokio::time::timeout(
+                                            STREAM_TIMEOUT,
+                                            resolver.resolve_request(),
+                                        )
+                                        .await
+                                        {
+                                            let resp = http::Response::builder()
+                                                .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                                                .header(http::header::RETRY_AFTER, "1")
+                                                .body(())
+                                                .unwrap();
+                                            let _ = stream.send_response(resp).await;
+                                            let _ = stream.finish().await;
+                                        }
+                                    })
+                                    .await;
+                                    if busy.is_err() {
+                                        debug!(
+                                            "DoH3 503 response to {} exceeded the {}s deadline",
+                                            client_ip,
+                                            limits.request_timeout.as_secs()
+                                        );
                                     }
                                     return;
                                 };
 
-                                let handled = tokio::time::timeout(REQUEST_TIMEOUT, async move {
+                                let handled = tokio::time::timeout(limits.request_timeout, async move {
                                 let (req, mut stream) =
                                     match tokio::time::timeout(
                                         STREAM_TIMEOUT,
@@ -616,14 +661,21 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                     debug!(
                                         "DoH3 request from {} exceeded the {}s deadline",
                                         client_ip,
-                                        REQUEST_TIMEOUT.as_secs()
+                                        limits.request_timeout.as_secs()
                                     );
                                 }
                             });
+                            // Reap completed request tasks continuously, not
+                            // only when the H3 connection closes.
+                            crate::admission::reap_finished(&mut request_tasks);
+                                }
+                                Some(_) = request_tasks.join_next(), if !request_tasks.is_empty() => {}
+                            }
                         }
                         request_tasks.abort_all();
                         while request_tasks.join_next().await.is_some() {}
                     });
+                    crate::admission::reap_finished(&mut connection_tasks);
                 }
             }
         }
@@ -675,6 +727,7 @@ mod tests {
     };
     use sito_test_support::reserve_udp_port_number;
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::watch;
 
     #[tokio::test]
@@ -969,6 +1022,260 @@ mod tests {
     /// Regression: the GET `dns` parameter used to be split on `&`/`=` without
     /// percent-decoding, so a `%3D`-encoded (padded) base64 value was rejected
     /// even though the DoH path accepts it.
+    /// P2-17: the whole DoH3 request is bounded by one total deadline. A
+    /// client that sends headers and one body byte then stalls must be cut off
+    /// without waiting for the per-chunk 10 s timeout.
+    #[tokio::test]
+    async fn test_doh3_total_request_deadline_cuts_off_stalled_body() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_doh3_deadline_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+
+        let server_config =
+            crate::tls::load_server_config(&cert_file, &key_file, &[], vec![b"h3".to_vec()])
+                .unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let listener_handle = start_doh3_listener_with_limits(
+            Doh3Config::new(actual_addr, Some(acceptor_mgr)),
+            handler,
+            shutdown_rx,
+            Doh3Limits {
+                request_timeout: Duration::from_millis(300),
+                handshake_timeout: Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for c in crate::tls::load_certificates(&cert_file).unwrap() {
+            root_store.add(c).unwrap();
+        }
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls)).unwrap(),
+        ));
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_config);
+        let conn = client_endpoint
+            .connect(actual_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://localhost/dns-query")
+            .header(http::header::CONTENT_TYPE, "application/dns-message")
+            .body(())
+            .unwrap();
+        let mut stream = send_request.send_request(req).await.unwrap();
+        // One body byte only: the server must not wait for the rest.
+        stream.send_data(Bytes::from_static(&[0])).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.recv_response())
+            .await
+            .expect("the total request deadline must fire well before the per-chunk timeout");
+        assert!(
+            result.is_err(),
+            "the stalled request must be aborted at the total deadline"
+        );
+
+        drop(send_request);
+        driver_task.abort();
+        let _ = shutdown_tx.send(true);
+        let _ = listener_handle.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P1-11/P2-17: the DoH3 global request cap returns 503 when saturated.
+    #[tokio::test]
+    async fn test_doh3_global_request_cap_returns_503() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_doh3_request_cap_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+
+        let server_config =
+            crate::tls::load_server_config(&cert_file, &key_file, &[], vec![b"h3".to_vec()])
+                .unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let handler = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move |query: Message, _client: ClientContext| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                async move {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    while !release.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                    resp.queries = query.queries.clone();
+                    Some(resp)
+                }
+            })
+        };
+
+        let mut config = Doh3Config::new(actual_addr, Some(acceptor_mgr));
+        // Request budget = max_connections * 4 = 4.
+        config.max_connections = 1;
+        config.rate_limiter = Some(Arc::new(RateLimiter::new(0, 0)));
+        let listener_handle = start_doh3_listener_with_limits(
+            config,
+            handler,
+            shutdown_rx,
+            Doh3Limits {
+                request_timeout: Duration::from_secs(5),
+                handshake_timeout: Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for c in crate::tls::load_certificates(&cert_file).unwrap() {
+            root_store.add(c).unwrap();
+        }
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls)).unwrap(),
+        ));
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_config);
+        let conn = client_endpoint
+            .connect(actual_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let wire = encode_message(&{
+            let mut query = Message::new(9500, MessageType::Query, OpCode::Query);
+            query.queries.push(Query::query(
+                Name::from_str("busy.doh3.example.").unwrap(),
+                RecordType::A,
+            ));
+            query
+        })
+        .unwrap();
+
+        let request = |wire: Vec<u8>| {
+            let req = http::Request::builder()
+                .method(http::Method::POST)
+                .uri("https://localhost/dns-query")
+                .header(http::header::CONTENT_TYPE, "application/dns-message")
+                .body(())
+                .unwrap();
+            (req, wire)
+        };
+
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let (req, body) = request(wire.clone());
+            let mut stream = send_request.send_request(req).await.unwrap();
+            stream.send_data(Bytes::from(body)).await.unwrap();
+            stream.finish().await.unwrap();
+            held.push(stream);
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while entered.load(Ordering::SeqCst) < 4 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "four requests must reach the handler and hold the request budget"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (req, body) = request(wire);
+        let mut overflow = send_request.send_request(req).await.unwrap();
+        overflow.send_data(Bytes::from(body)).await.unwrap();
+        overflow.finish().await.unwrap();
+        let overflow_resp = tokio::time::timeout(Duration::from_secs(3), overflow.recv_response())
+            .await
+            .expect("the global request cap must answer promptly")
+            .expect("a 503 response");
+        assert_eq!(
+            overflow_resp.status(),
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "the saturated global request cap must return 503"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        for mut stream in held {
+            let resp = tokio::time::timeout(Duration::from_secs(3), stream.recv_response())
+                .await
+                .expect("the held requests must complete")
+                .expect("a response");
+            assert_eq!(resp.status(), http::StatusCode::OK);
+            while let Ok(Ok(Some(_))) =
+                tokio::time::timeout(Duration::from_secs(2), stream.recv_data()).await
+            {
+                // Drain bodies so the client driver can finish cleanly.
+            }
+        }
+
+        drop(send_request);
+        driver_task.abort();
+        let _ = shutdown_tx.send(true);
+        let _ = listener_handle.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[test]
     fn test_doh3_get_dns_param_decoding_matches_doh() {
         assert_eq!(decode_dns_query_param("dns=abc"), Some("abc".to_string()));

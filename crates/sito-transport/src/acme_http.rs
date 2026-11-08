@@ -277,6 +277,7 @@ pub(crate) fn start_acme_http01_listener_on_with_limits(
                             );
                         }
                     });
+                    crate::admission::reap_finished(&mut tasks);
                 }
             }
         }
@@ -423,11 +424,13 @@ mod tests {
             Arc::clone(&challenges),
             shutdown_rx,
             AcmeHttpLimits {
-                max_connections: 1,
+                // Global capacity is deliberately larger than the per-IP cap
+                // so this test proves the per-IP limit independently.
+                max_connections: 2,
                 max_connections_per_ip: 1,
                 connection_lifetime: Duration::from_millis(250),
                 header_read_timeout: Duration::from_millis(200),
-                rate_per_sec: 0,
+                rate_per_sec: 100,
             },
         )
         .unwrap();

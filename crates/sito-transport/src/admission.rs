@@ -11,6 +11,18 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::task::JoinSet;
+
+/// Reaps every completed task from a `JoinSet<()>` without blocking.
+///
+/// Tokio retains a completed task's handle until it is joined. Long-lived
+/// QUIC/TCP listeners spawn one task per connection/stream, so completed
+/// handles must be drained continuously or the set becomes an unbounded
+/// per-listener memory leak. All listener tasks return `()`, so outputs can be
+/// discarded.
+pub(crate) fn reap_finished(tasks: &mut JoinSet<()>) {
+    while tasks.try_join_next().is_some() {}
+}
 
 /// Upper bound on the time an accept loop waits after a failed `accept`.
 ///
@@ -194,5 +206,28 @@ mod tests {
         assert!(limiter.try_acquire(ip).is_none());
         drop(permit);
         assert!(limiter.try_acquire(ip).is_some());
+    }
+
+    /// Regression (Important 1): completed tasks must be reaped. A `JoinSet`
+    /// keeps a handle per finished task until it is joined, so a long-lived
+    /// listener that only drains on shutdown grows without bound.
+    #[tokio::test]
+    async fn test_join_set_reaping_bounds_retained_entries() {
+        let mut tasks = JoinSet::new();
+        for _ in 0..100 {
+            tasks.spawn(async {});
+        }
+        // Let the spawned tasks complete.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !tasks.is_empty(),
+            "the test must observe completed-but-unjoined handles"
+        );
+        reap_finished(&mut tasks);
+        assert_eq!(
+            tasks.len(),
+            0,
+            "completed task handles must not accumulate in the JoinSet"
+        );
     }
 }
