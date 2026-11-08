@@ -8,6 +8,7 @@ compile_error!("sito-transport requires a Unix-based operating system (Linux/mac
 
 pub mod acme;
 pub mod acme_http;
+mod admission;
 pub mod doh;
 pub mod doh3;
 pub mod doq;

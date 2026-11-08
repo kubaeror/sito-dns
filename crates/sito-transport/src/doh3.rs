@@ -12,7 +12,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, trace, warn};
 
 use sito_core::client::ClientContext;
-use sito_proto::{decode_message, encode_message};
+use sito_proto::{decode_message, encode_message, truncate_for_framing};
 
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
@@ -24,6 +24,21 @@ const MAX_DOH3_BODY_BYTES: usize = 65_535;
 /// Upper bound on a single stream step (request setup, each body chunk): a
 /// client that opens a stream and stalls must not pin a task forever.
 const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Total wall-clock budget for one DoH3 request, including all body chunks and
+/// handler work. Per-step timeouts alone let a client reset the clock forever
+/// by dribbling one chunk at a time.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bounded wait for the QUIC/TLS handshake.
+const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum number of concurrent client-initiated bidirectional streams.
+pub(crate) const DOH3_MAX_BIDI_STREAMS: u32 = 16;
+
+/// Global in-flight request budget per DoH3 endpoint, expressed as a multiple
+/// of the connection cap.
+const DOH3_REQUESTS_PER_CONNECTION: usize = 4;
 
 /// Maximum accepted size of an HTTP/3 field section (request headers). The
 /// default in h3 0.0.8 is `VarInt::MAX`, which lets a peer force unbounded
@@ -94,8 +109,8 @@ pub fn build_quinn_h3_server_config(
     let timeout = quinn::IdleTimeout::try_from(idle_timeout)
         .map_err(|e| format!("Invalid idle timeout: {e}"))?;
     transport_cfg.max_idle_timeout(Some(timeout));
-    transport_cfg.max_concurrent_bidi_streams(100u32.into());
-    transport_cfg.max_concurrent_uni_streams(100u32.into());
+    transport_cfg.max_concurrent_bidi_streams(DOH3_MAX_BIDI_STREAMS.into());
+    transport_cfg.max_concurrent_uni_streams(DOH3_MAX_BIDI_STREAMS.into());
     // The h3 0.0.8 frame decoder buffers a complete HEADERS payload before the
     // field-section limit applies, so the QUIC flow-control windows are the
     // effective memory bound for a request. Keep them small: 128 KiB per
@@ -195,6 +210,15 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
     });
     rate_limiter.spawn_pruner(shutdown_rx.clone());
     let semaphore = Arc::new(Semaphore::new(config.max_connections));
+    let per_ip_limiter = crate::admission::PerIpConnectionLimiter::new(
+        crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP,
+    );
+    let request_semaphore = Arc::new(Semaphore::new(
+        config
+            .max_connections
+            .saturating_mul(DOH3_REQUESTS_PER_CONNECTION)
+            .max(1),
+    ));
     let acceptor_mgr = config.acceptor_mgr.clone();
     let dedicated_hostname = config.dedicated_hostname.clone();
 
@@ -202,6 +226,7 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
     let mut accept_shutdown_rx = shutdown_rx.clone();
 
     let handle = tokio::spawn(async move {
+        let mut connection_tasks = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 res = accept_shutdown_rx.changed() => {
@@ -220,17 +245,34 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                         incoming.refuse();
                         continue;
                     };
+                    let Some(per_ip_permit) = per_ip_limiter.try_acquire(incoming.remote_address().ip()) else {
+                        warn!(
+                            "DoH3 per-IP connection limit ({}) reached; rejecting connection",
+                            crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP
+                        );
+                        incoming.refuse();
+                        continue;
+                    };
 
                     let handler = Arc::clone(&handler);
                     let rate_limiter = Arc::clone(&rate_limiter);
+                    let request_semaphore = Arc::clone(&request_semaphore);
                     let dedicated_hostname = dedicated_hostname.clone();
 
-                    tokio::spawn(async move {
+                    connection_tasks.spawn(async move {
                         let _permit = permit;
-                        let conn = match incoming.await {
-                            Ok(c) => c,
-                            Err(e) => {
+                        let _per_ip_permit = per_ip_permit;
+                        let conn = match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
+                            Ok(Ok(c)) => c,
+                            Ok(Err(e)) => {
                                 debug!("DoH3 QUIC handshake failed: {}", e);
+                                return;
+                            }
+                            Err(_) => {
+                                debug!(
+                                    "DoH3 QUIC handshake timed out after {}s",
+                                    QUIC_HANDSHAKE_TIMEOUT.as_secs()
+                                );
                                 return;
                             }
                         };
@@ -264,18 +306,43 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                             }
                         };
 
+                        let mut request_tasks = tokio::task::JoinSet::new();
                         while let Ok(Some(resolver)) = h3_conn.accept().await {
                             let handler = Arc::clone(&handler);
                             let rate_limiter = Arc::clone(&rate_limiter);
+                            let request_semaphore = Arc::clone(&request_semaphore);
                             let sni = sni.clone();
                             let dedicated_hostname = dedicated_hostname.clone();
 
-                            tokio::spawn(async move {
+                            request_tasks.spawn(async move {
                                 if !rate_limiter.check(client_ip) {
                                     debug!("DoH3 rate limit exceeded for client {}", client_ip);
                                     return;
                                 }
 
+                                let Ok(_request_permit) = request_semaphore.clone().try_acquire_owned() else {
+                                    debug!(
+                                        "DoH3 global request limit reached for client {}",
+                                        client_ip
+                                    );
+                                    if let Ok(Ok((_req, mut stream))) = tokio::time::timeout(
+                                        STREAM_TIMEOUT,
+                                        resolver.resolve_request(),
+                                    )
+                                    .await
+                                    {
+                                        let resp = http::Response::builder()
+                                            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                                            .header(http::header::RETRY_AFTER, "1")
+                                            .body(())
+                                            .unwrap();
+                                        let _ = stream.send_response(resp).await;
+                                        let _ = stream.finish().await;
+                                    }
+                                    return;
+                                };
+
+                                let handled = tokio::time::timeout(REQUEST_TIMEOUT, async move {
                                 let (req, mut stream) =
                                     match tokio::time::timeout(
                                         STREAM_TIMEOUT,
@@ -501,6 +568,29 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
 
                                 if let Some(resp) = response
                                     && let Ok(encoded) = encode_message(&resp) {
+                                        // DNS-over-HTTPS carries a single DNS
+                                        // message; responses over the 65,535-byte
+                                        // framing limit must be truncated with
+                                        // TC=1 rather than emitted oversized.
+                                        let encoded = if encoded.len() > MAX_DOH3_BODY_BYTES {
+                                            warn!(
+                                                "DoH3 response of {} bytes exceeds the 65535-byte limit; sending TC=1",
+                                                encoded.len()
+                                            );
+                                            if let Some(truncated) = truncate_for_framing(&encoded) {
+                                                truncated
+                                            } else {
+                                                let resp = http::Response::builder()
+                                                    .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+                                                    .body(())
+                                                    .unwrap();
+                                                let _ = stream.send_response(resp).await;
+                                                let _ = stream.finish().await;
+                                                return;
+                                            }
+                                        } else {
+                                            encoded
+                                        };
                                         let http_resp = http::Response::builder()
                                             .status(http::StatusCode::OK)
                                             .header(http::header::CONTENT_TYPE, "application/dns-message")
@@ -521,12 +611,25 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
                                     .unwrap();
                                 let _ = stream.send_response(no_content).await;
                                 let _ = stream.finish().await;
+                                }).await;
+                                if handled.is_err() {
+                                    debug!(
+                                        "DoH3 request from {} exceeded the {}s deadline",
+                                        client_ip,
+                                        REQUEST_TIMEOUT.as_secs()
+                                    );
+                                }
                             });
                         }
+                        request_tasks.abort_all();
+                        while request_tasks.join_next().await.is_some() {}
                     });
                 }
             }
         }
+        // The endpoint is closed; wait for connection tasks so shutdown does
+        // not leave detached tasks behind.
+        while connection_tasks.join_next().await.is_some() {}
     });
 
     // Cert reload watcher
@@ -735,6 +838,126 @@ mod tests {
         }
         let percent_dns_resp = decode_message(&percent_body).unwrap();
         assert_eq!(percent_dns_resp.metadata.id, 8001);
+
+        drop(send_request);
+        driver_task.abort();
+        let _ = shutdown_tx.send(true);
+        let _ = listener_handle.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P1-14: DoH3 responses over the 65,535-byte DNS framing limit must be
+    /// truncated (TC=1) rather than sent as an oversized body.
+    #[tokio::test]
+    async fn test_doh3_truncates_oversized_response() {
+        let temp_dir = std::env::temp_dir().join(format!("sito_doh3_large_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+
+        let server_config =
+            crate::tls::load_server_config(&cert_file, &key_file, &[], vec![b"h3".to_vec()])
+                .unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            let qname = query.queries[0].name().clone();
+            for i in 0..6000u32 {
+                resp.answers.push(Record::from_rdata(
+                    qname.clone(),
+                    300,
+                    RData::A(A(std::net::Ipv4Addr::from(i))),
+                ));
+            }
+            Some(resp)
+        });
+
+        let listener_handle = start_doh3_listener(
+            Doh3Config::new(actual_addr, Some(acceptor_mgr)),
+            handler,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        let certs = crate::tls::load_certificates(&cert_file).unwrap();
+        for c in certs {
+            root_store.add(c).unwrap();
+        }
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"h3".to_vec()];
+
+        let quic_client_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls)).unwrap();
+        let client_config = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_config);
+
+        let conn = client_endpoint
+            .connect(actual_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let wire = encode_message(&{
+            let mut query = Message::new(9001, MessageType::Query, OpCode::Query);
+            query.queries.push(Query::query(
+                Name::from_str("large.doh3.example.").unwrap(),
+                RecordType::A,
+            ));
+            query
+        })
+        .unwrap();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&wire);
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(format!("https://localhost/dns-query?dns={b64}"))
+            .header(http::header::ACCEPT, "application/dns-message")
+            .body(())
+            .unwrap();
+        let mut stream = send_request.send_request(req).await.unwrap();
+        stream.finish().await.unwrap();
+        let resp = stream.recv_response().await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let mut body = Vec::new();
+        while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+            body.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
+        }
+        assert!(
+            body.len() <= 65_535,
+            "a DoH3 DNS response must fit the 65535-byte framing limit (got {})",
+            body.len()
+        );
+        let dns_resp = decode_message(&body).unwrap();
+        assert!(
+            dns_resp.metadata.truncation,
+            "an oversized DoH3 response must be truncated with TC=1"
+        );
 
         drop(send_request);
         driver_task.abort();

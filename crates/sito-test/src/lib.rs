@@ -443,9 +443,18 @@ mod tests {
             RData::A(A(Ipv4Addr::new(192, 0, 2, 1)))
         );
 
-        // Check Cache-Control: no-store header on raw HTTP response
+        // Check Cache-Control: no-store header on raw HTTP response.
+        let mut raw_query = sito_proto::Message::new(
+            4242,
+            sito_proto::MessageType::Query,
+            sito_proto::OpCode::Query,
+        );
+        raw_query.queries.push(sito_proto::Query::query(
+            Name::from_str("doh.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let query_wire = sito_proto::encode_message(&raw_query).unwrap();
         let http_client = client.doh_http_client().unwrap();
-        let query_wire = sito_proto::encode_message(&resp_post).unwrap();
         let http_resp = http_client
             .post(&doh_url)
             .header("Content-Type", "application/dns-message")

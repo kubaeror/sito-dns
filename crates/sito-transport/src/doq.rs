@@ -29,6 +29,31 @@ const DOQ_EXCESSIVE_LOAD: u32 = 4;
 /// and never completes the length prefix/body must not pin a task forever.
 const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bounded wait for the QUIC/TLS handshake. A connection slot must not be held
+/// by a peer that never completes the handshake.
+const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-stream QUIC flow-control window. A DoQ query is at most 65,537 bytes
+/// (2-octet length prefix + DNS message), so 128 KiB is enough headroom while
+/// making the old quinn default of 1.25 MiB per stream impossible.
+pub(crate) const DOQ_STREAM_RECEIVE_WINDOW: u32 = 128 * 1024;
+
+/// Per-connection QUIC flow-control window. With at most
+/// [`DOQ_MAX_BIDI_STREAMS`] concurrent streams this bounds buffered query data
+/// to the connection window instead of tens of GiB.
+pub(crate) const DOQ_CONNECTION_RECEIVE_WINDOW: u32 = 2 * 1024 * 1024;
+
+/// Maximum number of concurrent client-initiated bidirectional streams.
+///
+/// quinn's default is effectively unbounded (`VarInt::MAX`); 100 was still
+/// enough for one connection to spawn tens of thousands of tasks across the
+/// connection cap. Sixteen is ample for pipelined DNS queries.
+pub(crate) const DOQ_MAX_BIDI_STREAMS: u32 = 16;
+
+/// Global in-flight stream budget per DoQ endpoint, expressed as a multiple of
+/// the connection cap. Acquired before a stream body is read.
+const DOQ_STREAMS_PER_CONNECTION: usize = 4;
+
 /// Configuration options for the DoQ listener.
 #[derive(Clone)]
 pub struct DoqConfig {
@@ -83,8 +108,10 @@ pub fn build_quinn_server_config(
     let timeout = quinn::IdleTimeout::try_from(idle_timeout)
         .map_err(|e| format!("Invalid idle timeout: {e}"))?;
     transport_cfg.max_idle_timeout(Some(timeout));
-    transport_cfg.max_concurrent_bidi_streams(100u32.into());
+    transport_cfg.max_concurrent_bidi_streams(DOQ_MAX_BIDI_STREAMS.into());
     transport_cfg.max_concurrent_uni_streams(0u32.into());
+    transport_cfg.stream_receive_window(quinn::VarInt::from_u32(DOQ_STREAM_RECEIVE_WINDOW));
+    transport_cfg.receive_window(quinn::VarInt::from_u32(DOQ_CONNECTION_RECEIVE_WINDOW));
 
     quinn_cfg.transport_config(Arc::new(transport_cfg));
 
@@ -123,12 +150,24 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
     });
     rate_limiter.spawn_pruner(shutdown_rx.clone());
     let semaphore = Arc::new(Semaphore::new(config.max_connections));
+    // Global stream budget: bounds buffered query bodies/tasks even when a
+    // client keeps every allowed connection open.
+    let stream_semaphore = Arc::new(Semaphore::new(
+        config
+            .max_connections
+            .saturating_mul(DOQ_STREAMS_PER_CONNECTION)
+            .max(1),
+    ));
+    let per_ip_limiter = crate::admission::PerIpConnectionLimiter::new(
+        crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP,
+    );
     let acceptor_mgr = config.acceptor_mgr.clone();
 
     let endpoint_accept = endpoint.clone();
     let mut accept_shutdown_rx = shutdown_rx.clone();
 
     let handle = tokio::spawn(async move {
+        let mut connection_tasks = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 res = accept_shutdown_rx.changed() => {
@@ -147,16 +186,33 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                         incoming.refuse();
                         continue;
                     };
+                    let Some(per_ip_permit) = per_ip_limiter.try_acquire(incoming.remote_address().ip()) else {
+                        warn!(
+                            "DoQ per-IP connection limit ({}) reached; rejecting connection",
+                            crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP
+                        );
+                        incoming.refuse();
+                        continue;
+                    };
 
                     let handler = Arc::clone(&handler);
                     let rate_limiter = Arc::clone(&rate_limiter);
+                    let stream_semaphore = Arc::clone(&stream_semaphore);
 
-                    tokio::spawn(async move {
+                    connection_tasks.spawn(async move {
                         let _permit = permit;
-                        let conn = match incoming.await {
-                            Ok(c) => c,
-                            Err(e) => {
+                        let _per_ip_permit = per_ip_permit;
+                        let conn = match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
+                            Ok(Ok(c)) => c,
+                            Ok(Err(e)) => {
                                 debug!("DoQ QUIC handshake failed: {}", e);
+                                return;
+                            }
+                            Err(_) => {
+                                debug!(
+                                    "DoQ QUIC handshake timed out after {}s",
+                                    QUIC_HANDSHAKE_TIMEOUT.as_secs()
+                                );
                                 return;
                             }
                         };
@@ -175,12 +231,36 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                         trace!("DoQ QUIC connection established from {}", peer_addr);
 
                         // Process incoming bidirectional streams (RFC 9250 section 4.2)
+                        let mut stream_tasks = tokio::task::JoinSet::new();
                         while let Ok((send, recv)) = conn.accept_bi().await {
+                            let Ok(stream_permit) = stream_semaphore.clone().try_acquire_owned() else {
+                                warn!(
+                                    "DoQ global stream limit reached; abandoning stream from {}",
+                                    client_ip
+                                );
+                                let mut send = send;
+                                let _ = send.reset(DOQ_EXCESSIVE_LOAD.into());
+                                continue;
+                            };
+
+                            // Admit the query before reading any body data: a
+                            // client must not force buffering by opening
+                            // streams while over its rate budget.
+                            if !rate_limiter.check(client_ip) {
+                                debug!(
+                                    "DoQ per-query rate limit exceeded for client {}",
+                                    client_ip
+                                );
+                                let mut send = send;
+                                let _ = send.reset(DOQ_EXCESSIVE_LOAD.into());
+                                continue;
+                            }
+
                             let handler = Arc::clone(&handler);
                             let sni = sni.clone();
-                            let stream_limiter = Arc::clone(&rate_limiter);
 
-                            tokio::spawn(async move {
+                            stream_tasks.spawn(async move {
+                              let _stream_permit = stream_permit;
                               let mut send = send;
                               let mut recv = recv;
                               let timed = tokio::time::timeout(
@@ -210,18 +290,7 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                     return;
                                 }
 
-                                // Per-query budget: the connection-time check
-                                // alone lets one QUIC connection issue
-                                // unlimited streams.
-                                if !stream_limiter.check(client_ip) {
-                                    debug!(
-                                        "DoQ per-query rate limit exceeded for client {}",
-                                        client_ip
-                                    );
-                                    let _ = send.reset(DOQ_EXCESSIVE_LOAD.into());
-                                    return;
-                                }
-
+                                // Rate admission happened before the body read.
                                 let query = match decode_message(&query_buf) {
                                     Ok(mut q) => {
                                         // RFC 9250 §4.2.1: the DNS Message ID on
@@ -309,10 +378,17 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                               }
                             });
                         }
+                        // The connection is gone; abort any streams still
+                        // blocked on a peer and wait for their tasks to finish.
+                        stream_tasks.abort_all();
+                        while stream_tasks.join_next().await.is_some() {}
                     });
                 }
             }
         }
+        // The endpoint is closed; wait for connection tasks so shutdown does
+        // not leave detached tasks behind.
+        while connection_tasks.join_next().await.is_some() {}
     });
 
     // If acceptor_mgr is provided, monitor for certificate reload and update endpoint
@@ -663,6 +739,199 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    fn doq_test_acceptor(name: &str) -> (TlsAcceptorManager, String, std::path::PathBuf) {
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        let temp_dir = std::env::temp_dir().join(format!("sito_doq_{name}_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        std::fs::write(&cert_file, &cert_pem).unwrap();
+        std::fs::write(&key_file, &key_pem).unwrap();
+        let server_config =
+            crate::tls::load_server_config(&cert_file, &key_file, &[], vec![b"doq".to_vec()])
+                .unwrap();
+        (TlsAcceptorManager::new(server_config), cert_pem, temp_dir)
+    }
+
+    async fn connect_doq(
+        actual_addr: SocketAddr,
+        cert_pem: &str,
+    ) -> (quinn::Endpoint, quinn::Connection) {
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
+        root_store.add(cert_der).unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"doq".to_vec()];
+
+        let quic_client_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls)).unwrap();
+        let client_cfg = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
+
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_cfg);
+        let conn = client_endpoint
+            .connect(actual_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        (client_endpoint, conn)
+    }
+
+    fn doq_query(id: u16) -> Message {
+        let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("doq-test.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        query
+    }
+
+    /// P1-10: QUIC flow-control windows and stream caps must be explicit and
+    /// bounded; quinn defaults allow 1.25 MiB per stream and effectively
+    /// unbounded streams per connection.
+    #[test]
+    fn test_doq_quic_windows_and_stream_caps_are_bounded() {
+        const {
+            assert!(
+                DOQ_STREAM_RECEIVE_WINDOW >= 65_537,
+                "the stream window must fit one maximum-size DNS message"
+            );
+        };
+        const {
+            assert!(
+                DOQ_STREAM_RECEIVE_WINDOW <= 256 * 1024,
+                "the per-stream window must not allow megabyte-scale buffering"
+            );
+        };
+        const {
+            assert!(
+                DOQ_CONNECTION_RECEIVE_WINDOW <= 4 * 1024 * 1024,
+                "the per-connection window must be bounded"
+            );
+        };
+        const {
+            assert!(
+                DOQ_MAX_BIDI_STREAMS <= 32,
+                "one connection must not be able to create thousands of stream tasks"
+            );
+        };
+    }
+
+    /// P1-10: rate admission happens before the query body is read. With the
+    /// budget exhausted, opening a stream without sending any bytes must be
+    /// rejected immediately instead of pinning a task until the body timeout.
+    #[tokio::test]
+    async fn test_doq_rate_check_before_body_read() {
+        let (acceptor_mgr, cert_pem, temp_dir) = doq_test_acceptor("rate_before_body");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let mut config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
+        // Burst of one: the first query spends the only token.
+        config.rate_limiter = Some(Arc::new(RateLimiter::new(1, 1)));
+        let _handle = start_doq_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (_client_endpoint, conn) = connect_doq(actual_addr, &cert_pem).await;
+
+        let wire = encode_message(&doq_query(0)).unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&(wire.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        send.write_all(&wire).await.unwrap();
+        send.finish().unwrap();
+        let mut len_buf = [0u8; 2];
+        recv.read_exact(&mut len_buf)
+            .await
+            .expect("the first query is admitted");
+
+        // Second stream: send one byte so the QUIC stream is created, then
+        // stop. The rate check must run (and fail) before the server waits for
+        // the rest of a body it will reject.
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[0]).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), recv.read_exact(&mut len_buf))
+            .await
+            .expect("the server must not wait for a body it will reject");
+        match result {
+            Err(quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code))) => {
+                assert_eq!(code.into_inner(), u64::from(DOQ_EXCESSIVE_LOAD));
+            }
+            other => panic!("expected a DOQ_EXCESSIVE_LOAD reset, got {other:?}"),
+        }
+
+        let _ = send.finish();
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P1-10: a global stream semaphore bounds in-flight stream tasks even
+    /// when the client keeps one connection open.
+    #[tokio::test]
+    async fn test_doq_global_stream_semaphore_rejects_excess_streams() {
+        let (acceptor_mgr, cert_pem, temp_dir) = doq_test_acceptor("stream_cap");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let mut config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
+        config.max_connections = 1; // stream budget = 4
+        config.rate_limiter = Some(Arc::new(RateLimiter::new(0, 0)));
+        let _handle = start_doq_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (_client_endpoint, conn) = connect_doq(actual_addr, &cert_pem).await;
+
+        // Four streams stall after one byte and hold the budget.
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let (mut send, recv) = conn.open_bi().await.unwrap();
+            send.write_all(&[0]).await.unwrap();
+            held.push((send, recv));
+        }
+
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[0]).await.unwrap();
+        let mut len_buf = [0u8; 2];
+        let result = tokio::time::timeout(Duration::from_secs(2), recv.read_exact(&mut len_buf))
+            .await
+            .expect("the excess stream must be rejected without waiting for a body");
+        match result {
+            Err(quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code))) => {
+                assert_eq!(code.into_inner(), u64::from(DOQ_EXCESSIVE_LOAD));
+            }
+            other => panic!("expected a DOQ_EXCESSIVE_LOAD reset, got {other:?}"),
+        }
+
+        drop(held);
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[tokio::test]
     async fn test_doq_accepts_queries_larger_than_4096_bytes() {
         let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
@@ -724,15 +993,22 @@ mod tests {
             .unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
 
-        // RFC 9250 permits DNS messages up to 65535 bytes; build a query well
-        // above the previous 4096-byte server cap.
+        // RFC 9250 permits DNS messages up to 65535 bytes; build a single-
+        // question query well above the previous 4096-byte server cap using an
+        // EDNS padding option (the pipeline rejects multi-question messages).
         let mut query = Message::new(0, MessageType::Query, OpCode::Query);
-        for i in 0..300 {
-            query.queries.push(Query::query(
-                Name::from_str(&format!("q{i}.example.com.")).unwrap(),
-                RecordType::A,
+        query.queries.push(Query::query(
+            Name::from_str("large-query.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let mut edns = sito_proto::Edns::new();
+        edns.set_max_payload(4096);
+        edns.options_mut()
+            .insert(sito_proto::rdata::opt::EdnsOption::Unknown(
+                12,
+                vec![0u8; 5000],
             ));
-        }
+        query.set_edns(edns);
         let wire = encode_message(&query).unwrap();
         assert!(
             wire.len() > 4096,

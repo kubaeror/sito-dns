@@ -161,6 +161,52 @@ fn strip_dnssec_records(response: &mut Message) {
     }
 }
 
+/// Single response-shaping path applied to every response before it leaves the
+/// pipeline.
+///
+/// DNS responses must echo the *current* client's question and RD/CD bits, not
+/// the stored/upstream question. EDNS is rebuilt from the client request so
+/// upstream-only options (COOKIE, NSID, ECS, padding, unknown options) cannot
+/// leak to another client, and a non-EDNS client never receives an OPT record
+/// (RFC 6891 §6.1.1). DNSSEC records are removed only when the client did not
+/// request them, and the DO bit is echoed exactly.
+///
+/// The RFC 8914 Extended DNS Error option (code 15) is generated locally by
+/// the DNSSEC layer and is not client-specific, so it is preserved.
+fn shape_response(query: &Message, response: &mut Message, client_wants_dnssec: bool) {
+    response.metadata.message_type = MessageType::Response;
+    response.metadata.recursion_desired = query.metadata.recursion_desired;
+    response.metadata.recursion_available = true;
+    response.metadata.checking_disabled = query.metadata.checking_disabled;
+    response.queries.clone_from(&query.queries);
+
+    let extended_error = response.edns.as_ref().and_then(|edns| {
+        edns.options()
+            .options
+            .iter()
+            .find(|(code, _)| u16::from(*code) == 15)
+            .map(|(_, option)| option.clone())
+    });
+
+    match &query.edns {
+        Some(client_edns) => {
+            let mut edns = Edns::new();
+            edns.set_max_payload(client_edns.max_payload());
+            edns.set_dnssec_ok(client_edns.flags().dnssec_ok);
+            if let Some(option) = extended_error {
+                edns.options_mut().insert(option);
+            }
+            response.set_edns(edns);
+        }
+        // RFC 6891: a response to a non-EDNS query must not contain an OPT RR.
+        None => response.edns = None,
+    }
+
+    if !client_wants_dnssec {
+        strip_dnssec_records(response);
+    }
+}
+
 /// Masks the host bits of an address so the cache key and the forwarded ECS
 /// option describe the same network prefix.
 fn truncate_ip(addr: IpAddr, prefix: u8) -> IpAddr {
@@ -1236,9 +1282,10 @@ impl DnsPipeline {
                     resp.metadata.authentic_data = false;
                     ValidationStatus::Unchecked
                 };
-                if !bg_wants_dnssec {
-                    strip_dnssec_records(&mut resp);
-                }
+                // Store the same client-neutral shape that the normal path
+                // caches: the current question/flags, no client-specific EDNS
+                // options, and DNSSEC material only for a DO=1 key.
+                shape_response(&bg_query, &mut resp, bg_wants_dnssec);
                 if resp.metadata.response_code == ResponseCode::NoError
                     || resp.metadata.response_code == ResponseCode::NXDomain
                 {
@@ -1274,6 +1321,37 @@ impl QueryHandler for DnsPipeline {
     async fn handle(&self, query: Message, client: ClientContext) -> Option<Message> {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         let _guard = InFlightGuard(Arc::clone(&self.in_flight));
+
+        // P2-18: a DNS response (QR=1) is never a query to resolve. Drop it
+        // instead of running it through policy/cache/upstream paths.
+        if query.metadata.message_type != MessageType::Query {
+            debug!("Dropping non-query DNS message (QR=1)");
+            return None;
+        }
+        // Multi-question messages are not resolvable by this pipeline (and
+        // are used by DoS probes to amplify work). Reject with FORMERR at the
+        // start; the question section is deliberately not echoed.
+        if query.queries.len() != 1 {
+            debug!(
+                questions = query.queries.len(),
+                "Rejecting multi-question DNS query with FORMERR"
+            );
+            let mut response = Message::new(
+                query.metadata.id,
+                MessageType::Response,
+                query.metadata.op_code,
+            );
+            response.metadata.response_code = ResponseCode::FormErr;
+            response.metadata.recursion_desired = query.metadata.recursion_desired;
+            response.metadata.checking_disabled = query.metadata.checking_disabled;
+            if let Some(client_edns) = &query.edns {
+                let mut edns = Edns::new();
+                edns.set_max_payload(client_edns.max_payload());
+                edns.set_dnssec_ok(client_edns.flags().dnssec_ok);
+                response.set_edns(edns);
+            }
+            return Some(response);
+        }
 
         // One snapshot per query: config, clients and rewrites cannot be torn
         // apart by a concurrent hot reload.
@@ -1776,9 +1854,9 @@ impl QueryHandler for DnsPipeline {
 
                     // A DO=0 client must never receive DNSSEC records, and the
                     // stripped form is what gets cached under the DO=0 key.
-                    if !client_wants_dnssec {
-                        strip_dnssec_records(&mut upstream_resp);
-                    }
+                    // Shape before caching so the stored entry never carries
+                    // upstream-only EDNS options either.
+                    shape_response(&query, &mut upstream_resp, client_wants_dnssec);
 
                     if cache_enabled
                         && (upstream_resp.metadata.response_code == ResponseCode::NoError
@@ -1865,6 +1943,7 @@ impl QueryHandler for DnsPipeline {
                             if let Some(ref m) = self.metrics {
                                 m.inc_cache_stale_served();
                             }
+                            shape_response(&query, &mut stale_resp, client_wants_dnssec);
                             stale_resp.metadata.id = query_id;
                             return QueryOutcome {
                                 response: Some(stale_resp),
@@ -1939,10 +2018,18 @@ impl QueryHandler for DnsPipeline {
             let _ = ql.try_send(entry);
         }
 
-        // Never assert AD for a client that did not signal DNSSEC awareness.
+        // Single shaping point for every response (cache hit, upstream, stale
+        // or synthesized): copy the current question/RD/CD, rebuild EDNS from
+        // this client, strip upstream-only options, and remove DNSSEC records
+        // only when the client did not request them.
         let mut response = outcome.response;
-        if !client_accepts_ad && let Some(resp) = response.as_mut() {
-            resp.metadata.authentic_data = false;
+        if let Some(resp) = response.as_mut() {
+            shape_response(&query, resp, client_wants_dnssec);
+            // Never assert AD for a client that did not signal DNSSEC
+            // awareness.
+            if !client_accepts_ad {
+                resp.metadata.authentic_data = false;
+            }
         }
         response
     }
@@ -3406,6 +3493,243 @@ mod tests {
                 .is_some_and(|e| e.option(EdnsCode::DAU).is_none()),
             "DO-dependent EDNS options must be stripped"
         );
+    }
+
+    #[test]
+    fn test_response_shaping_strips_upstream_edns_and_opt_for_non_edns_clients() {
+        use hickory_proto::rr::rdata::NULL;
+
+        let name = Name::from_str("shape.example.").unwrap();
+        let mut query = Message::new(1, MessageType::Query, OpCode::Query);
+        query
+            .queries
+            .push(hickory_proto::op::Query::query(name.clone(), RecordType::A));
+
+        let mut response = Message::response(1, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.answers.push(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 50))),
+        ));
+        response.answers.push(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::Unknown {
+                code: RecordType::RRSIG,
+                rdata: NULL::default(),
+            },
+        ));
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(10, vec![1, 2, 3, 4])); // COOKIE
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(3, vec![b'x'])); // NSID
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(12, vec![0; 8])); // padding
+        response.set_edns(edns);
+
+        // A non-EDNS client must never receive an OPT record or DNSSEC data.
+        shape_response(&query, &mut response, false);
+        assert!(
+            response.edns.is_none(),
+            "a non-EDNS client must not receive an OPT record"
+        );
+        assert_eq!(response.answers.len(), 1, "RRSIG must be stripped");
+
+        // An EDNS client gets a fresh OPT with only the DO echo; upstream
+        // COOKIE/NSID/padding options are never replayed.
+        let mut edns_query = query.clone();
+        edns_query.set_edns(Edns::new());
+        let mut response = Message::response(1, OpCode::Query);
+        response.queries = query.queries.clone();
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(10, vec![1, 2, 3, 4]));
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(3, vec![b'x']));
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(12, vec![0; 8]));
+        response.set_edns(edns);
+
+        shape_response(&edns_query, &mut response, false);
+        let shaped = response.edns.expect("EDNS clients keep an OPT record");
+        assert!(
+            shaped.options().options.is_empty(),
+            "upstream-only EDNS options must be stripped: {:?}",
+            shaped.options().options
+        );
+        assert!(!shaped.flags().dnssec_ok, "DO must echo the client's bit");
+    }
+
+    #[test]
+    fn test_response_shaping_copies_question_flags_and_do() {
+        use hickory_proto::rr::rdata::NULL;
+
+        let stored_name = Name::from_str("mixed.example.").unwrap();
+        let current_name = Name::from_str("MiXeD.ExAmPle.").unwrap();
+
+        let mut query = Message::new(22, MessageType::Query, OpCode::Query);
+        query.queries.push(hickory_proto::op::Query::query(
+            current_name.clone(),
+            RecordType::A,
+        ));
+        query.metadata.recursion_desired = true;
+        query.metadata.checking_disabled = true;
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        query.set_edns(edns);
+
+        let mut response = Message::response(22, OpCode::Query);
+        response.queries.push(hickory_proto::op::Query::query(
+            stored_name.clone(),
+            RecordType::A,
+        ));
+        response.metadata.recursion_desired = false;
+        response.metadata.checking_disabled = false;
+        response.answers.push(Record::from_rdata(
+            current_name.clone(),
+            300,
+            RData::Unknown {
+                code: RecordType::RRSIG,
+                rdata: NULL::default(),
+            },
+        ));
+
+        shape_response(&query, &mut response, true);
+        assert!(response.metadata.recursion_desired);
+        assert!(response.metadata.checking_disabled);
+        assert_eq!(response.queries.len(), 1);
+        assert_eq!(
+            response.queries[0].name().to_string(),
+            current_name.to_string(),
+            "the current client question must be echoed, not the stored one"
+        );
+        assert!(
+            response.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok),
+            "the DO bit must echo the current client's request"
+        );
+        assert_eq!(
+            response.answers.len(),
+            1,
+            "a DO=1 client keeps DNSSEC records"
+        );
+    }
+
+    /// P2-84: a cache hit must copy the current question and RD bit, and
+    /// must not replay the stored entry's (absent) EDNS state to a client
+    /// that sent OPT.
+    #[tokio::test]
+    async fn test_cache_hit_copies_current_question_and_flags() {
+        let mut config = Config::default();
+        config.filtering.enabled = false;
+        config.dns.dnssec.validate = false;
+        let (pipeline, _calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+        let stored_name = Name::from_str("cache-shape.example.").unwrap();
+        let mut stored_query = Message::new(1, MessageType::Query, OpCode::Query);
+        stored_query.queries.push(hickory_proto::op::Query::query(
+            stored_name.clone(),
+            RecordType::A,
+        ));
+        stored_query.metadata.checking_disabled = true;
+
+        let mut cached = Message::response(1, OpCode::Query);
+        cached.queries = stored_query.queries.clone();
+        cached.metadata.recursion_desired = false;
+        cached.answers.push(Record::from_rdata(
+            stored_name.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 84))),
+        ));
+        pipeline
+            .cache
+            .insert_with_status(&stored_query, &cached, ValidationStatus::Insecure)
+            .await;
+
+        let current_name = Name::from_str("CaChE-ShApE.ExAmPlE.").unwrap();
+        let mut current_query = Message::new(2, MessageType::Query, OpCode::Query);
+        current_query.queries.push(hickory_proto::op::Query::query(
+            current_name.clone(),
+            RecordType::A,
+        ));
+        current_query.metadata.recursion_desired = true;
+        // CD is part of the cache key; keep it identical so this is a hit.
+        current_query.metadata.checking_disabled = true;
+        current_query.set_edns(Edns::new());
+
+        let resp = pipeline
+            .handle(current_query, client)
+            .await
+            .expect("cache hit response");
+
+        assert!(
+            resp.metadata.recursion_desired,
+            "RD must come from the query"
+        );
+        assert!(
+            resp.edns.is_some(),
+            "a cache hit for an EDNS client must include OPT"
+        );
+        assert_eq!(
+            resp.queries[0].name().to_string(),
+            current_name.to_string(),
+            "a cache hit must echo the current question, not the stored one"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P2-18: QR=1 messages are dropped and multi-question messages are
+    /// rejected with FORMERR before policy/cache/upstream work starts.
+    #[tokio::test]
+    async fn test_pipeline_rejects_qr1_and_multi_question_queries() {
+        use std::sync::atomic::Ordering;
+
+        let mut config = Config::default();
+        config.filtering.enabled = false;
+        config.dns.dnssec.validate = false;
+        let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("reject.example.").unwrap();
+
+        let mut response_message = Message::new(9, MessageType::Response, OpCode::Query);
+        response_message
+            .queries
+            .push(hickory_proto::op::Query::query(name.clone(), RecordType::A));
+        assert!(
+            pipeline
+                .handle(response_message, client.clone())
+                .await
+                .is_none(),
+            "a QR=1 message must be dropped"
+        );
+
+        let mut multi = Message::new(10, MessageType::Query, OpCode::Query);
+        multi
+            .queries
+            .push(hickory_proto::op::Query::query(name.clone(), RecordType::A));
+        multi.queries.push(hickory_proto::op::Query::query(
+            Name::from_str("second.example.").unwrap(),
+            RecordType::AAAA,
+        ));
+        let resp = pipeline
+            .handle(multi, client)
+            .await
+            .expect("multi-question queries get a FORMERR response");
+        assert_eq!(resp.metadata.response_code, ResponseCode::FormErr);
+        assert!(
+            resp.queries.is_empty(),
+            "a multi-question FORMERR must not echo questions"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "rejected queries must not reach upstream"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     #[test]

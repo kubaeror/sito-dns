@@ -5,6 +5,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -12,8 +13,39 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use dashmap::DashMap;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto::Builder as ConnBuilder;
+use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
-use tracing::{error, info, warn};
+use tokio::sync::Semaphore;
+use tracing::{debug, error, info, warn};
+
+use crate::admission::{AcceptBackoff, PerIpConnectionLimiter};
+use crate::limiter::RateLimiter;
+
+/// Resource limits for the ACME HTTP-01 listener. The challenge endpoint is
+/// publicly reachable by design, so it needs the same slowloris and flood
+/// bounds as the DNS listeners even before ACME is configured.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AcmeHttpLimits {
+    pub max_connections: usize,
+    pub max_connections_per_ip: usize,
+    pub connection_lifetime: Duration,
+    pub header_read_timeout: Duration,
+    pub rate_per_sec: u32,
+}
+
+impl Default for AcmeHttpLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: 32,
+            max_connections_per_ip: 4,
+            connection_lifetime: Duration::from_secs(60),
+            header_read_timeout: Duration::from_secs(10),
+            rate_per_sec: 20,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct ChallengeState {
@@ -133,7 +165,22 @@ pub async fn start_acme_http01_listener(
 pub fn start_acme_http01_listener_on(
     listener: TcpListener,
     challenges: Arc<DashMap<String, String>>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    start_acme_http01_listener_on_with_limits(
+        listener,
+        challenges,
+        shutdown_rx,
+        AcmeHttpLimits::default(),
+    )
+}
+
+/// Serves ACME HTTP-01 challenges with explicit resource limits.
+pub(crate) fn start_acme_http01_listener_on_with_limits(
+    listener: TcpListener,
+    challenges: Arc<DashMap<String, String>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    limits: AcmeHttpLimits,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let local_addr = listener.local_addr()?;
     info!("ACME HTTP-01 listener started on http://{local_addr}");
@@ -144,20 +191,98 @@ pub fn start_acme_http01_listener_on(
             get(challenge_response),
         )
         .with_state(ChallengeState { challenges });
+    let service = TowerToHyperService::new(app);
+
+    let semaphore = Arc::new(Semaphore::new(limits.max_connections.max(1)));
+    let per_ip_limiter = PerIpConnectionLimiter::new(limits.max_connections_per_ip);
+    let rate_limiter = Arc::new(RateLimiter::new(
+        limits.rate_per_sec,
+        RateLimiter::burst_for_rate(limits.rate_per_sec),
+    ));
+    rate_limiter.spawn_pruner(shutdown_rx.clone());
 
     let handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                while !*shutdown_rx.borrow_and_update() {
-                    if shutdown_rx.changed().await.is_err() {
+        let mut accept_backoff = AcceptBackoff::default();
+        let mut tasks = tokio::task::JoinSet::new();
+
+        loop {
+            tokio::select! {
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
+                        debug!("ACME HTTP-01 listener stopping due to shutdown");
                         break;
                     }
                 }
-            })
-            .await
-        {
-            warn!("ACME HTTP-01 listener stopped with error: {e}");
+                accept_res = listener.accept() => {
+                    let (stream, peer_addr) = match accept_res {
+                        Ok(conn) => {
+                            accept_backoff.reset();
+                            conn
+                        }
+                        Err(e) => {
+                            let delay = accept_backoff.next_delay();
+                            warn!(
+                                "ACME HTTP-01 accept error: {}; retrying after {:?}",
+                                e, delay
+                            );
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                    };
+
+                    if !rate_limiter.check(peer_addr.ip()) {
+                        debug!(
+                            "ACME HTTP-01 connection rate limit exceeded for {}",
+                            peer_addr.ip()
+                        );
+                        continue;
+                    }
+
+                    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                        debug!(
+                            "ACME HTTP-01 max connections ({}) reached; dropping connection from {}",
+                            limits.max_connections, peer_addr
+                        );
+                        continue;
+                    };
+                    let Some(per_ip_permit) = per_ip_limiter.try_acquire(peer_addr.ip()) else {
+                        debug!(
+                            "ACME HTTP-01 per-IP connection limit ({}) reached; dropping connection from {}",
+                            limits.max_connections_per_ip, peer_addr
+                        );
+                        continue;
+                    };
+
+                    let service = service.clone();
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        let _per_ip_permit = per_ip_permit;
+                        let mut builder = ConnBuilder::new(TokioExecutor::new());
+                        builder
+                            .http1()
+                            .header_read_timeout(limits.header_read_timeout)
+                            .timer(TokioTimer::new());
+                        let io = TokioIo::new(stream);
+                        if tokio::time::timeout(
+                            limits.connection_lifetime,
+                            builder.serve_connection(io, service),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            debug!(
+                                "ACME HTTP-01 connection from {} reached the {}s lifetime",
+                                peer_addr,
+                                limits.connection_lifetime.as_secs()
+                            );
+                        }
+                    });
+                }
+            }
         }
+
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
     });
 
     Ok(handle)
@@ -167,6 +292,7 @@ pub fn start_acme_http01_listener_on(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -278,6 +404,66 @@ mod tests {
         }
 
         let _ = shutdown_tx.send(true);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// P2-20: the HTTP-01 listener bounds connections, per-source connections
+    /// and connection lifetime, and resumes serving after a slot is released.
+    #[tokio::test]
+    async fn test_acme_http01_connection_limits_and_lifetime() {
+        let challenges: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        challenges.insert("known-token".to_string(), "key-auth-value".to_string());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = start_acme_http01_listener_on_with_limits(
+            listener,
+            Arc::clone(&challenges),
+            shutdown_rx,
+            AcmeHttpLimits {
+                max_connections: 1,
+                max_connections_per_ip: 1,
+                connection_lifetime: Duration::from_millis(250),
+                header_read_timeout: Duration::from_millis(200),
+                rate_per_sec: 0,
+            },
+        )
+        .unwrap();
+
+        // Hold the only connection slot without sending a request.
+        let mut held = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The second connection is accepted and dropped immediately.
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        second
+            .write_all(
+                b"GET /.well-known/acme-challenge/known-token HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), second.read_to_end(&mut buf)).await;
+        assert!(
+            !String::from_utf8_lossy(&buf).contains("200 OK"),
+            "a second connection must not be served while the slot is held"
+        );
+
+        // The lifetime (or header timeout) releases the slot; service resumes.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(3),
+            http_get(addr, "/.well-known/acme-challenge/known-token"),
+        )
+        .await
+        .expect("a new connection must be served after the slot is released");
+        assert_eq!(status, 200);
+        assert_eq!(body, "key-auth-value");
+
+        let _ = held.shutdown().await;
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
 }

@@ -25,14 +25,25 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// indefinitely.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum lifetime of one DoH connection, independent of activity. A peer
+/// that keeps a connection busy (or dribbles just enough bytes) still releases
+/// its connection slot.
+const MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(300);
+
+/// Total wall-clock budget for reading and answering one DoH request.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum number of concurrent HTTP/2 streams per connection.
+const MAX_H2_CONCURRENT_STREAMS: u32 = 32;
+
 /// Maximum DNS message size accepted on the DoH path (RFC 8484 over the
 /// 65535-byte DNS-over-TCP framing limit). Larger bodies are rejected before
 /// buffering beyond this bound.
 pub(crate) const MAX_DOH_BODY_BYTES: usize = 65_535;
 
 use axum::Router;
-use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::body::{Body, to_bytes};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
@@ -42,7 +53,7 @@ use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use hyper_util::service::TowerToHyperService;
 
 use sito_core::client::ClientContext;
-use sito_proto::{decode_message, encode_message};
+use sito_proto::{decode_message, encode_message, truncate_for_framing};
 
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
@@ -94,6 +105,9 @@ impl DohConfig {
 struct DohState<H: QueryHandler> {
     handler: Arc<H>,
     rate_limiter: Arc<RateLimiter>,
+    /// Global in-flight request budget. Acquired before any request body is
+    /// read so a client cannot force buffering simply by opening streams.
+    request_semaphore: Arc<Semaphore>,
     alt_svc_header: Option<HeaderValue>,
     dedicated_hostname: Option<String>,
 }
@@ -164,11 +178,17 @@ impl<S: AsyncRead + Unpin> AsyncRead for IdleTimeoutStream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        let before = buf.filled().len();
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
-                this.sleep
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + this.timeout);
+                // Only reset the idle deadline when the peer actually made
+                // progress. A zero-length read is EOF (or a wake-up without
+                // data) and must not extend the connection's lifetime.
+                if buf.filled().len() > before {
+                    this.sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + this.timeout);
+                }
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -209,6 +229,10 @@ fn connection_builder() -> ConnBuilder<TokioExecutor> {
         .header_read_timeout(HEADER_READ_TIMEOUT)
         .timer(TokioTimer::new());
     builder
+        .http2()
+        .max_concurrent_streams(Some(MAX_H2_CONCURRENT_STREAMS))
+        .timer(TokioTimer::new());
+    builder
 }
 
 fn decode_base64url(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
@@ -217,17 +241,24 @@ fn decode_base64url(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
 }
 
+/// Total request budget and admission are enforced before the body is read.
+///
+/// The previous implementation extracted `Bytes` before this function ran, so
+/// axum buffered up to `DefaultBodyLimit` for every request before the rate
+/// check. Reading the body only after admission bounds both memory and work.
 #[allow(clippy::too_many_arguments)]
 async fn handle_doh_request<H: QueryHandler>(
     state: Arc<DohState<H>>,
     peer_addr: SocketAddr,
     client_id: Option<String>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
     params: HashMap<String, String>,
-    body: Bytes,
+    request: Request,
 ) -> Response {
+    let (parts, body) = request.into_parts();
+    let method = parts.method;
+    let uri = parts.uri;
+    let headers = parts.headers;
+
     if let Some(ref expected) = state.dedicated_hostname
         && !host_matches(&uri, &headers, expected)
     {
@@ -244,6 +275,56 @@ async fn handle_doh_request<H: QueryHandler>(
         return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
     }
 
+    let Ok(_request_permit) = state.request_semaphore.clone().try_acquire_owned() else {
+        debug!("DoH global request limit reached for client {}", client_ip);
+        let mut response = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server is handling too many DNS requests",
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
+    };
+
+    if let Ok(response) = tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        process_doh_request(
+            Arc::clone(&state),
+            client_ip,
+            client_id,
+            method,
+            uri,
+            headers,
+            params,
+            body,
+        ),
+    )
+    .await
+    {
+        response
+    } else {
+        debug!(
+            "DoH request from {} exceeded the {}s deadline",
+            client_ip,
+            REQUEST_TIMEOUT.as_secs()
+        );
+        (StatusCode::GATEWAY_TIMEOUT, "DNS request timed out").into_response()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_doh_request<H: QueryHandler>(
+    state: Arc<DohState<H>>,
+    client_ip: std::net::IpAddr,
+    client_id: Option<String>,
+    method: Method,
+    _uri: Uri,
+    headers: HeaderMap,
+    params: HashMap<String, String>,
+    body: Body,
+) -> Response {
     let wire_bytes = match method {
         Method::POST => {
             let is_dns_message = headers
@@ -265,15 +346,18 @@ async fn handle_doh_request<H: QueryHandler>(
                     .into_response();
             }
 
-            if body.is_empty() {
-                return (StatusCode::BAD_REQUEST, "Empty DNS query body").into_response();
-            }
-            if body.len() > MAX_DOH_BODY_BYTES {
+            // `to_bytes` enforces the cap while streaming, so an oversized
+            // body is rejected without buffering it in full.
+            let Ok(body) = to_bytes(body, MAX_DOH_BODY_BYTES).await else {
                 return (
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "DNS message exceeds the 65535-byte limit",
                 )
                     .into_response();
+            };
+
+            if body.is_empty() {
+                return (StatusCode::BAD_REQUEST, "Empty DNS query body").into_response();
             }
             body.to_vec()
         }
@@ -320,6 +404,29 @@ async fn handle_doh_request<H: QueryHandler>(
     match response {
         Some(resp) => match encode_message(&resp) {
             Ok(encoded) => {
+                // RFC 8484 carries one DNS message; a response over the
+                // 65,535-byte DNS framing limit cannot be represented and
+                // must be truncated (TC=1) instead of emitting an oversized
+                // `application/dns-message` body.
+                let encoded = if encoded.len() > MAX_DOH_BODY_BYTES {
+                    warn!(
+                        "DoH response of {} bytes exceeds the 65535-byte limit; sending TC=1",
+                        encoded.len()
+                    );
+                    match truncate_for_framing(&encoded) {
+                        Some(truncated) => truncated,
+                        None => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "DNS response could not be truncated",
+                            )
+                                .into_response();
+                        }
+                    }
+                } else {
+                    encoded
+                };
+
                 let mut resp_builder = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/dns-message")
@@ -328,7 +435,7 @@ async fn handle_doh_request<H: QueryHandler>(
                     resp_builder = resp_builder.header(header::ALT_SVC, alt_svc);
                 }
                 resp_builder
-                    .body(axum::body::Body::from(encoded))
+                    .body(Body::from(encoded))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
             }
             Err(e) => {
@@ -347,37 +454,20 @@ async fn handle_doh_request<H: QueryHandler>(
 async fn doh_route<H: QueryHandler>(
     State(state): State<Arc<DohState<H>>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
-    body: Bytes,
+    request: Request,
 ) -> Response {
-    handle_doh_request(state, peer_addr, None, method, uri, headers, params, body).await
+    handle_doh_request(state, peer_addr, None, params, request).await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn doh_route_with_client<H: QueryHandler>(
     State(state): State<Arc<DohState<H>>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Path(client_id): Path<String>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
-    body: Bytes,
+    request: Request,
 ) -> Response {
-    handle_doh_request(
-        state,
-        peer_addr,
-        Some(client_id),
-        method,
-        uri,
-        headers,
-        params,
-        body,
-    )
-    .await
+    handle_doh_request(state, peer_addr, Some(client_id), params, request).await
 }
 
 /// Inserts the connection's peer address into every request as a
@@ -429,6 +519,11 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
                 RateLimiter::burst_for_rate(config.rate_limit_per_ip),
             ))
         }),
+        // Two in-flight requests per connection slot: enough for ordinary
+        // HTTP/2 concurrency while still bounding pre-body buffering.
+        request_semaphore: Arc::new(Semaphore::new(
+            config.max_connections.saturating_mul(2).max(2),
+        )),
         alt_svc_header,
         dedicated_hostname: config.dedicated_hostname,
     });
@@ -447,9 +542,13 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
     let router_service = TowerToHyperService::new(app);
 
     let semaphore = Arc::new(Semaphore::new(config.max_connections));
+    let per_ip_limiter = crate::admission::PerIpConnectionLimiter::new(
+        crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP,
+    );
     let acceptor_mgr = config.acceptor_mgr;
 
     let handle = tokio::spawn(async move {
+        let mut accept_backoff = crate::admission::AcceptBackoff::default();
         loop {
             tokio::select! {
                 res = shutdown_rx.changed() => {
@@ -460,9 +559,17 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
                 }
                 accept_res = listener.accept() => {
                     let (tcp_stream, peer_addr) = match accept_res {
-                        Ok(conn) => conn,
+                        Ok(conn) => {
+                            accept_backoff.reset();
+                            conn
+                        }
                         Err(e) => {
-                            warn!("DoH accept error: {}", e);
+                            let delay = accept_backoff.next_delay();
+                            warn!(
+                                "DoH accept error: {}; retrying after {:?}",
+                                e, delay
+                            );
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                     };
@@ -471,6 +578,13 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
                         warn!(
                             "DoH max connections ({}) reached; rejecting connection from {}",
                             config.max_connections, peer_addr
+                        );
+                        continue;
+                    };
+                    let Some(per_ip_permit) = per_ip_limiter.try_acquire(peer_addr.ip()) else {
+                        warn!(
+                            "DoH per-IP connection limit ({}) reached; rejecting connection from {}",
+                            crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP, peer_addr
                         );
                         continue;
                     };
@@ -483,6 +597,7 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
 
                     tokio::spawn(async move {
                         let _permit = permit;
+                        let _per_ip_permit = per_ip_permit;
 
                         if let Some(mgr) = maybe_mgr {
                             let acceptor = mgr.acceptor();
@@ -492,11 +607,24 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
                                         tls_stream,
                                         IDLE_TIMEOUT,
                                     ));
-                                    if let Err(e) = connection_builder()
-                                        .serve_connection_with_upgrades(io, hyper_service)
-                                        .await
+                                    match timeout(
+                                        MAX_CONNECTION_LIFETIME,
+                                        connection_builder()
+                                            .serve_connection_with_upgrades(io, hyper_service),
+                                    )
+                                    .await
                                     {
-                                        trace!("DoH TLS connection error for {}: {}", peer_addr, e);
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(e)) => {
+                                            trace!("DoH TLS connection error for {}: {}", peer_addr, e);
+                                        }
+                                        Err(_) => {
+                                            debug!(
+                                                "DoH TLS connection for {} reached the {}s lifetime",
+                                                peer_addr,
+                                                MAX_CONNECTION_LIFETIME.as_secs()
+                                            );
+                                        }
                                     }
                                 }
                                 Ok(Err(e)) => {
@@ -515,11 +643,24 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
                                 tcp_stream,
                                 IDLE_TIMEOUT,
                             ));
-                            if let Err(e) = connection_builder()
-                                .serve_connection_with_upgrades(io, hyper_service)
-                                .await
+                            match timeout(
+                                MAX_CONNECTION_LIFETIME,
+                                connection_builder()
+                                    .serve_connection_with_upgrades(io, hyper_service),
+                            )
+                            .await
                             {
-                                trace!("DoH plain HTTP connection error for {}: {}", peer_addr, e);
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    trace!("DoH plain HTTP connection error for {}: {}", peer_addr, e);
+                                }
+                                Err(_) => {
+                                    debug!(
+                                        "DoH plain HTTP connection for {} reached the {}s lifetime",
+                                        peer_addr,
+                                        MAX_CONNECTION_LIFETIME.as_secs()
+                                    );
+                                }
                             }
                         }
                     });
@@ -534,7 +675,13 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sito_proto::rdata::A;
+    use sito_proto::{Message, MessageType, Name, OpCode, Query, RData, Record, RecordType};
     use sito_test_support::reserve_port_number;
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     #[test]
     fn test_dedicated_hostname_matching() {
@@ -691,6 +838,223 @@ mod tests {
             resp.headers().get("alt-svc").map(|v| v.to_str().unwrap()),
             Some("h3=\":8443\"; ma=86400")
         );
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
+    fn test_query(id: u16, name: &str) -> Message {
+        let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+        query
+            .queries
+            .push(Query::query(Name::from_str(name).unwrap(), RecordType::A));
+        query
+    }
+
+    /// P1-11: a rate-limited request must be rejected from its headers without
+    /// waiting for (or buffering) the request body. The old handler extracted
+    /// `Bytes`, so it blocked on a body that never arrived before the rate
+    /// check could run.
+    #[tokio::test]
+    async fn test_doh_rate_check_before_body_read() {
+        let port = reserve_port_number().unwrap();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let mut config = DohConfig::new(addr, None);
+        config.rate_limiter = Some(Arc::new(RateLimiter::new(1, 1)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = start_doh_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+
+        // Spend the single token with a complete request.
+        let wire = encode_message(&test_query(1, "rate.example.")).unwrap();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&wire);
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        first
+            .write_all(
+                format!(
+                    "GET /dns-query?dns={b64} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        first.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+            "the first request must be admitted"
+        );
+
+        // A POST with a declared body but no body bytes. Admission must reject
+        // it before hyper/axum waits for the body.
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        second
+            .write_all(
+                b"POST /dns-query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/dns-message\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 256];
+        let read = tokio::time::timeout(Duration::from_secs(2), second.read(&mut buf))
+            .await
+            .expect("the rate limit must be enforced before reading the body")
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf[..read]);
+        assert!(
+            text.starts_with("HTTP/1.1 429"),
+            "expected 429 before the body is read, got: {text}"
+        );
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
+    /// P1-11: a global request cap bounds in-flight requests independently of
+    /// the connection cap and returns 503 when exhausted.
+    #[tokio::test]
+    async fn test_doh_global_request_cap_returns_503() {
+        let port = reserve_port_number().unwrap();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let handler = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move |query: Message, _client: ClientContext| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                async move {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    while !release.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                    resp.queries = query.queries.clone();
+                    Some(resp)
+                }
+            })
+        };
+
+        let mut config = DohConfig::new(addr, None);
+        // Global request budget is max_connections * 2 = 4.
+        config.max_connections = 2;
+        config.rate_limiter = Some(Arc::new(RateLimiter::new(0, 0)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = start_doh_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap();
+        let url = format!("http://{addr}/dns-query");
+        let wire = encode_message(&test_query(2, "busy.example.")).unwrap();
+
+        let mut requests = Vec::new();
+        for _ in 0..4 {
+            let client = client.clone();
+            let url = url.clone();
+            let wire = wire.clone();
+            requests.push(tokio::spawn(async move {
+                client
+                    .post(url)
+                    .header("Content-Type", "application/dns-message")
+                    .body(wire)
+                    .send()
+                    .await
+            }));
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while entered.load(Ordering::SeqCst) < 4 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "four requests must reach the handler"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let overflow = client
+            .post(&url)
+            .header("Content-Type", "application/dns-message")
+            .body(wire)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            overflow.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "the global request cap must answer 503"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        for request in requests {
+            assert_eq!(
+                request.await.unwrap().unwrap().status(),
+                reqwest::StatusCode::OK
+            );
+        }
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
+    /// P1-14: a DNS response larger than the 65,535-byte framing limit must be
+    /// returned truncated (TC=1), never as an oversized DNS message.
+    #[tokio::test]
+    async fn test_doh_truncates_oversized_response() {
+        let port = reserve_port_number().unwrap();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            let qname = query.queries[0].name().clone();
+            for i in 0..6000u32 {
+                resp.answers.push(Record::from_rdata(
+                    qname.clone(),
+                    300,
+                    RData::A(A(std::net::Ipv4Addr::from(i))),
+                ));
+            }
+            Some(resp)
+        });
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = start_doh_listener(DohConfig::new(addr, None), handler, shutdown_rx)
+            .await
+            .unwrap();
+
+        let wire = encode_message(&test_query(3, "large.example.")).unwrap();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&wire);
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/dns-query?dns={b64}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body = resp.bytes().await.unwrap();
+        assert!(
+            body.len() <= MAX_DOH_BODY_BYTES,
+            "a DNS response must fit the 65535-byte framing limit (got {})",
+            body.len()
+        );
+        let dns_resp = decode_message(&body).unwrap();
+        assert!(
+            dns_resp.metadata.truncation,
+            "an oversized response must be truncated with TC=1"
+        );
+
         let _ = shutdown_tx.send(true);
         handle.await.unwrap();
     }

@@ -1,7 +1,12 @@
-//! Per-IP rate limiting using a token bucket in DashMap.
+//! Per-prefix rate limiting using a token bucket in DashMap.
+//!
+//! Buckets are keyed by the network prefix of the client address: IPv4 `/24`
+//! and IPv6 `/64`. This mirrors the privacy/caching granularity used elsewhere
+//! in the resolver and prevents a single subscriber from multiplying its budget
+//! by rotating through addresses inside its own allocation.
 
 use dashmap::DashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -11,20 +16,41 @@ struct Bucket {
     last_replenished: Instant,
 }
 
-/// Default maximum number of source IP buckets tracked at once.
+/// Default maximum number of source-prefix buckets tracked at once.
 pub const DEFAULT_MAX_BUCKETS: usize = 100_000;
 
-/// Token-bucket based rate limiter keyed by client IP address.
+/// Number of buckets sampled when the table is full. Sampling keeps eviction
+/// O(1) under a spoofed-source flood while still approximating least-recently
+/// used rather than picking an arbitrary entry.
+const EVICTION_SAMPLE: usize = 32;
+
+/// Returns the rate-limit key for an address: IPv4 `/24`, IPv6 `/64`.
+///
+/// Non-global forms (IPv4-mapped IPv6, loopback, etc.) keep their family and
+/// are masked the same way.
+pub(crate) fn rate_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => {
+            let bits = u32::from(v4) & 0xFFFF_FF00;
+            IpAddr::V4(Ipv4Addr::from(bits))
+        }
+        IpAddr::V6(v6) => {
+            let bits = u128::from(v6) & 0xFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000;
+            IpAddr::V6(Ipv6Addr::from(bits))
+        }
+    }
+}
+
+/// Token-bucket based rate limiter keyed by client network prefix.
 ///
 /// The configured rate lives in atomics so `dns.rate_limit_per_ip` can be
 /// hot-reloaded without rebinding listeners.
 ///
-/// Semantics are per source IP: every source gets an independent bucket so one
-/// client cannot consume another's budget. The bucket table is bounded
+/// Semantics are per source prefix: every prefix gets an independent bucket so
+/// one client cannot consume another's budget. The bucket table is bounded
 /// ([`DEFAULT_MAX_BUCKETS`] by default) so spoofed/sprayed source addresses
-/// cannot grow memory without limit; when the table is full an arbitrary
-/// (typically stale) entry is evicted, and a source whose bucket was evicted
-/// simply starts again with a full burst allowance.
+/// cannot grow memory without limit; when the table is full the least recently
+/// used of a sampled set of entries is evicted.
 #[derive(Debug)]
 pub struct RateLimiter {
     rate_per_sec: AtomicU32,
@@ -41,7 +67,7 @@ impl RateLimiter {
         Self::with_max_buckets(rate_per_sec, burst, DEFAULT_MAX_BUCKETS)
     }
 
-    /// Create a new RateLimiter with an explicit bound on tracked source IPs.
+    /// Create a new RateLimiter with an explicit bound on tracked prefixes.
     pub fn with_max_buckets(rate_per_sec: u32, burst: u32, max_buckets: usize) -> Self {
         Self {
             rate_per_sec: AtomicU32::new(rate_per_sec),
@@ -66,7 +92,7 @@ impl RateLimiter {
             .store(Self::burst_for_rate(rate_per_sec).max(1), Ordering::Relaxed);
     }
 
-    /// Check if a request from the given IP is allowed.
+    /// Check if a request from the given address is allowed.
     /// Returns `true` if permitted, `false` if rate limit exceeded.
     pub fn check(&self, ip: IpAddr) -> bool {
         let rate_per_sec = self.rate_per_sec.load(Ordering::Relaxed);
@@ -74,15 +100,16 @@ impl RateLimiter {
             return true;
         }
 
+        let key = rate_key(ip);
         let now = Instant::now();
         let max_tokens = f64::from(self.burst.load(Ordering::Relaxed));
         let refill_rate = f64::from(rate_per_sec);
 
-        if !self.buckets.contains_key(&ip) {
+        if !self.buckets.contains_key(&key) {
             self.evict_for_capacity();
         }
 
-        let mut entry = self.buckets.entry(ip).or_insert_with(|| Bucket {
+        let mut entry = self.buckets.entry(key).or_insert_with(|| Bucket {
             tokens: max_tokens,
             last_replenished: now,
         });
@@ -99,27 +126,38 @@ impl RateLimiter {
         }
     }
 
-    /// Evict a single bucket when the table is at capacity. Uses an arbitrary
-    /// entry so the cost stays O(1) under a spoofed-source flood; `prune`
-    /// still removes genuinely idle entries on its periodic sweep.
+    /// Evicts one bucket when the table is at capacity.
+    ///
+    /// Only a small sample is inspected so a spoofed-source flood cannot turn
+    /// every new prefix into a full-table scan. Among the sample, the bucket
+    /// with the oldest last-use timestamp (approximate LRU) is removed.
     fn evict_for_capacity(&self) {
         if self.buckets.len() < self.max_buckets {
             return;
         }
-        // Collect the key in its own scope so the DashMap iterator (and its
-        // shard guard) is dropped before taking a write lock for removal.
         let victim = {
-            let mut iter = self.buckets.iter();
-            iter.next().map(|entry| *entry.key())
+            let mut oldest: Option<(IpAddr, Instant)> = None;
+            for entry in self.buckets.iter().take(EVICTION_SAMPLE) {
+                let used = entry.value().last_replenished;
+                if oldest.is_none_or(|(_, current)| used < current) {
+                    oldest = Some((*entry.key(), used));
+                }
+            }
+            oldest.map(|(key, _)| key)
         };
         if let Some(victim) = victim {
             self.buckets.remove(&victim);
         }
     }
 
-    /// Number of currently tracked source IP buckets.
+    /// Number of currently tracked source-prefix buckets.
     pub fn tracked_buckets(&self) -> usize {
         self.buckets.len()
+    }
+
+    #[cfg(test)]
+    fn tracks_for_test(&self, ip: IpAddr) -> bool {
+        self.buckets.contains_key(&rate_key(ip))
     }
 
     /// Prune old buckets that have been inactive for more than 60 seconds.
@@ -227,9 +265,10 @@ mod tests {
         let max = 8;
         let limiter = RateLimiter::with_max_buckets(10, 5, max);
 
-        // More distinct (spoofed) sources than the table can hold.
+        // More distinct (spoofed) sources than the table can hold. Vary the
+        // /24 so each address maps to its own rate-limit bucket.
         for i in 0..255u8 {
-            let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, i));
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 51, i, 1));
             assert!(limiter.check(ip), "first request from a new source allowed");
         }
 
@@ -244,8 +283,8 @@ mod tests {
     fn test_rate_limiter_eviction_keeps_serving() {
         let limiter = RateLimiter::with_max_buckets(2, 2, 2);
         let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        let b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
-        let c = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3));
+        let b = IpAddr::V4(Ipv4Addr::new(192, 0, 3, 1));
+        let c = IpAddr::V4(Ipv4Addr::new(192, 0, 4, 1));
 
         assert!(limiter.check(a));
         assert!(limiter.check(a));
@@ -254,5 +293,68 @@ mod tests {
         // Third source forces an eviction but must still be served.
         assert!(limiter.check(c));
         assert!(limiter.tracked_buckets() <= 2);
+    }
+
+    /// P2-19: rate-limit keys are network prefixes, not full addresses, so
+    /// rotating inside one allocation does not multiply the budget.
+    #[test]
+    fn test_rate_limiter_keys_ipv4_24_and_ipv6_64() {
+        let limiter = RateLimiter::with_max_buckets(1, 1, 16);
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let same_prefix = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 250));
+        let other_prefix = IpAddr::V4(Ipv4Addr::new(192, 0, 3, 1));
+
+        assert!(limiter.check(a));
+        assert!(
+            !limiter.check(same_prefix),
+            "another address in the same /24 must share the bucket"
+        );
+        assert!(
+            limiter.check(other_prefix),
+            "a different /24 has its own bucket"
+        );
+
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1));
+        let v6_same = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0xffff, 0, 0, 2));
+        let v6_other = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 1));
+        assert!(limiter.check(v6));
+        assert!(
+            !limiter.check(v6_same),
+            "another address in the same /64 must share the bucket"
+        );
+        assert!(
+            limiter.check(v6_other),
+            "a different /64 has its own bucket"
+        );
+    }
+
+    /// P2-19: when full, evict the least recently used bucket instead of an
+    /// arbitrary one.
+    #[test]
+    fn test_rate_limiter_evicts_least_recently_used() {
+        let limiter = RateLimiter::with_max_buckets(1, 1, 2);
+        let a = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(198, 51, 101, 1));
+        let c = IpAddr::V4(Ipv4Addr::new(198, 51, 102, 1));
+
+        assert!(limiter.check(a));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(limiter.check(b));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Adding `c` evicts `a`, the oldest entry.
+        assert!(limiter.check(c));
+
+        assert!(
+            !limiter.tracks_for_test(a),
+            "the least recently used bucket must have been evicted"
+        );
+        assert!(
+            limiter.tracks_for_test(b),
+            "a recently used bucket must not have been evicted"
+        );
+        assert!(
+            !limiter.check(b),
+            "the recently used bucket must still hold its exhausted budget"
+        );
     }
 }
