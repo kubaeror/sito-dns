@@ -1093,17 +1093,15 @@ async fn test_m8_ha_runtime_child_probe() {
                 shutdown_rx,
             );
 
-            let mut readiness = coordinator.readiness();
-            for _ in 0..100 {
-                if readiness.ready {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                readiness = coordinator.readiness();
-            }
+            let ready = wait_until(Duration::from_secs(2), || {
+                let coordinator = coordinator.clone();
+                async move { coordinator.readiness().ready }
+            })
+            .await;
             assert!(
-                readiness.ready,
-                "listener did not become ready after chown: {readiness:?}"
+                ready,
+                "listener did not become ready after chown: {:?}",
+                coordinator.readiness()
             );
 
             let (ctx, token, dir) =
@@ -1899,7 +1897,7 @@ async fn test_m8_chaos_master_mid_push_kill() {
         ..Default::default()
     };
     let (_resync_tx, resync_rx) = tokio::sync::mpsc::channel(1);
-    let _worker = spawn_slave_worker(
+    let worker = spawn_slave_worker(
         slave_ha_cfg,
         slave_tracker.clone(),
         slave_handles,
@@ -1926,9 +1924,16 @@ async fn test_m8_chaos_master_mid_push_kill() {
         lists: vec![],
     };
     coordinator.update_bundle(bundle).unwrap();
+    // No coordinator event exposes "WebSocket write in flight". This short
+    // bounded delay lets the push leave the master so the test genuinely kills
+    // it mid-push; the assertion accepts version 1 or 2, so a slower or faster
+    // machine cannot make the test flaky.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let _ = shutdown_tx.send(true);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let joined = tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("slave worker must stop after shutdown");
+    joined.expect("slave worker task panicked");
 
     // Assert slave version is strictly 1 (or 2 if finished before kill), never corrupted
     let v = slave_tracker.get_version();

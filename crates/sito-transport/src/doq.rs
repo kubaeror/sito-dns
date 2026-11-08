@@ -356,6 +356,7 @@ mod tests {
     use sito_proto::{
         Message, MessageType, Name, OpCode, Query, RData, Record, RecordType, ResponseCode,
     };
+    use sito_test_support::reserve_udp_port_number;
     use std::str::FromStr;
     use tokio::sync::watch;
 
@@ -377,9 +378,7 @@ mod tests {
         let acceptor_mgr = TlsAcceptorManager::new(server_config);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = udp_socket.local_addr().unwrap().port();
-        drop(udp_socket);
+        let port = reserve_udp_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
@@ -481,9 +480,7 @@ mod tests {
         let acceptor_mgr = TlsAcceptorManager::new(server_config);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = udp_socket.local_addr().unwrap().port();
-        drop(udp_socket);
+        let port = reserve_udp_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
@@ -586,9 +583,7 @@ mod tests {
         let acceptor_mgr = TlsAcceptorManager::new(server_config);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = udp_socket.local_addr().unwrap().port();
-        drop(udp_socket);
+        let port = reserve_udp_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
@@ -686,9 +681,7 @@ mod tests {
         let acceptor_mgr = TlsAcceptorManager::new(server_config);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = udp_socket.local_addr().unwrap().port();
-        drop(udp_socket);
+        let port = reserve_udp_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = DoqConfig::new(actual_addr, Some(acceptor_mgr));

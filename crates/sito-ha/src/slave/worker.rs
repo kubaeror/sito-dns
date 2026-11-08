@@ -3086,10 +3086,7 @@ ttl = 60
     /// new connection attempt, only by a successful apply.
     #[tokio::test]
     async fn test_degraded_state_survives_reconnect_attempts() {
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap().port()
-        };
+        let port = sito_test_support::reserve_port_number().unwrap();
         let ha_config = HaConfig {
             master_url: Some(format!("ws://127.0.0.1:{port}")),
             allow_insecure_ws: true,

@@ -15,6 +15,7 @@ members = [
     "crates/sito-stats",
     "crates/sito-ha",
     "crates/sito-test",
+    "crates/sito-test-support",
     "crates/sito-runtime",
 ]
 
@@ -100,6 +101,7 @@ sito-stats = { path = "crates/sito-stats", version = "1.9.3" }
 sito-runtime = { path = "crates/sito-runtime", version = "1.9.3" }
 sito-ha = { path = "crates/sito-ha", version = "1.9.3" }
 sito-test = { path = "crates/sito-test", version = "1.9.3" }
+sito-test-support = { path = "crates/sito-test-support", version = "1.9.3" }
 
 [workspace.lints.rust]
 # Future Rust lints can be specified here

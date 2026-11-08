@@ -38,6 +38,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+sito-test-support.workspace = true
 
 [lints]
 workspace = true

@@ -49,6 +49,7 @@ mod tests {
         Edns, Message, MessageType, Name, OpCode, Query, RData, Record, RecordType, ResponseCode,
         decode_message, encode_message,
     };
+    use sito_test_support::{reserve_port_number, reserve_udp_port_number};
     use std::net::SocketAddr;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -60,12 +61,7 @@ mod tests {
     #[tokio::test]
     async fn test_udp_query_and_response() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-
-        // Create socket to get an ephemeral port
-        let std_socket = create_reuseport_udp_socket(&bind_addr).unwrap();
-        let port = std_socket.local_addr().unwrap().port();
-        drop(std_socket);
+        let port = reserve_udp_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = UdpConfig {
@@ -122,11 +118,7 @@ mod tests {
     #[tokio::test]
     async fn test_udp_truncation_when_exceeding_buffer() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-
-        let std_socket = create_reuseport_udp_socket(&bind_addr).unwrap();
-        let port = std_socket.local_addr().unwrap().port();
-        drop(std_socket);
+        let port = reserve_udp_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = UdpConfig {
@@ -184,11 +176,7 @@ mod tests {
     #[tokio::test]
     async fn test_udp_truncates_to_configured_edns_size_even_when_client_advertises_larger() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-
-        let std_socket = create_reuseport_udp_socket(&bind_addr).unwrap();
-        let port = std_socket.local_addr().unwrap().port();
-        drop(std_socket);
+        let port = reserve_udp_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let configured_edns_size = 1232u16;
@@ -260,11 +248,7 @@ mod tests {
     #[tokio::test]
     async fn test_udp_concurrent_queries_no_head_of_line_blocking() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-
-        let std_socket = create_reuseport_udp_socket(&bind_addr).unwrap();
-        let port = std_socket.local_addr().unwrap().port();
-        drop(std_socket);
+        let port = reserve_udp_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         // Single worker listener to guarantee tests run on the same worker
@@ -346,9 +330,7 @@ mod tests {
     #[tokio::test]
     async fn test_tcp_query_and_pipelining() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = reserve_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = TcpConfig {
@@ -416,9 +398,7 @@ mod tests {
     #[tokio::test]
     async fn test_tcp_per_query_rate_limit_drops_excess_on_same_connection() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = reserve_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = TcpConfig {
@@ -484,9 +464,7 @@ mod tests {
     #[tokio::test]
     async fn test_tcp_zero_length_frame_closes_connection() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = reserve_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = TcpConfig {
@@ -529,9 +507,7 @@ mod tests {
     #[tokio::test]
     async fn test_tcp_large_response_keeps_framing_in_sync() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = reserve_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = TcpConfig {
@@ -648,9 +624,7 @@ mod tests {
         let acceptor_mgr = TlsAcceptorManager::new(server_config);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = reserve_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let mut config = DotConfig::new(actual_addr, acceptor_mgr);
@@ -778,9 +752,7 @@ mod tests {
         let acceptor_mgr = TlsAcceptorManager::new(server_config);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = reserve_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = DotConfig::new(actual_addr, acceptor_mgr);
@@ -842,9 +814,7 @@ mod tests {
         let acceptor_mgr = TlsAcceptorManager::new(server_config);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = reserve_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = DotConfig::new(actual_addr, acceptor_mgr);
@@ -942,9 +912,7 @@ mod tests {
         let acceptor_mgr = TlsAcceptorManager::new(server_config);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = reserve_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let mut config = DotConfig::new(actual_addr, acceptor_mgr);
@@ -994,9 +962,7 @@ mod tests {
         use base64::Engine;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = reserve_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = DohConfig::new(actual_addr, None);
@@ -1104,9 +1070,7 @@ mod tests {
     #[tokio::test]
     async fn test_doh_error_responses() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = reserve_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = DohConfig::new(actual_addr, None);
@@ -1180,9 +1144,7 @@ mod tests {
         let acceptor_mgr = TlsAcceptorManager::new(server_config);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = reserve_port_number().unwrap();
 
         let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let config = DohConfig::new(actual_addr, Some(acceptor_mgr));
@@ -1252,9 +1214,7 @@ mod tests {
 
         // TCP
         let (tcp_tx, tcp_rx) = watch::channel(false);
-        let tcp_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let tcp_port = tcp_probe.local_addr().unwrap().port();
-        drop(tcp_probe);
+        let tcp_port = reserve_port_number().unwrap();
         let tcp_handle = start_tcp_listener(
             TcpConfig {
                 bind_addr: SocketAddr::from(([127, 0, 0, 1], tcp_port)),
@@ -1274,9 +1234,7 @@ mod tests {
 
         // UDP (one worker)
         let (udp_tx, udp_rx) = watch::channel(false);
-        let udp_probe = create_reuseport_udp_socket(&"127.0.0.1:0".parse().unwrap()).unwrap();
-        let udp_port = udp_probe.local_addr().unwrap().port();
-        drop(udp_probe);
+        let udp_port = reserve_udp_port_number().unwrap();
         let udp_handles = start_udp_listener(
             &UdpConfig {
                 bind_addr: SocketAddr::from(([127, 0, 0, 1], udp_port)),
@@ -1328,9 +1286,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // UDP
-        let udp_probe = create_reuseport_udp_socket(&"127.0.0.1:0".parse().unwrap()).unwrap();
-        let udp_port = udp_probe.local_addr().unwrap().port();
-        drop(udp_probe);
+        let udp_port = reserve_udp_port_number().unwrap();
         let udp_handles = start_udp_listener(
             &UdpConfig {
                 bind_addr: SocketAddr::from(([127, 0, 0, 1], udp_port)),
@@ -1345,9 +1301,7 @@ mod tests {
         .unwrap();
 
         // TCP
-        let tcp_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let tcp_port = tcp_probe.local_addr().unwrap().port();
-        drop(tcp_probe);
+        let tcp_port = reserve_port_number().unwrap();
         let tcp_handle = start_tcp_listener(
             TcpConfig {
                 bind_addr: SocketAddr::from(([127, 0, 0, 1], tcp_port)),
@@ -1362,9 +1316,7 @@ mod tests {
         .unwrap();
 
         // DoT
-        let dot_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dot_port = dot_probe.local_addr().unwrap().port();
-        drop(dot_probe);
+        let dot_port = reserve_port_number().unwrap();
         let mut dot_config = DotConfig::new(
             SocketAddr::from(([127, 0, 0, 1], dot_port)),
             acceptor_mgr.clone(),
@@ -1376,9 +1328,7 @@ mod tests {
             .unwrap();
 
         // DoH (plaintext: no TLS acceptor needed)
-        let doh_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let doh_port = doh_probe.local_addr().unwrap().port();
-        drop(doh_probe);
+        let doh_port = reserve_port_number().unwrap();
         let mut doh_config = DohConfig::new(SocketAddr::from(([127, 0, 0, 1], doh_port)), None);
         doh_config.rate_limit_per_ip = u32::MAX;
         doh_config.rate_limiter = None;
@@ -1387,9 +1337,7 @@ mod tests {
             .unwrap();
 
         // DoQ
-        let doq_probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let doq_port = doq_probe.local_addr().unwrap().port();
-        drop(doq_probe);
+        let doq_port = reserve_udp_port_number().unwrap();
         let mut doq_config = DoqConfig::new(
             SocketAddr::from(([127, 0, 0, 1], doq_port)),
             Some(acceptor_mgr.clone()),
@@ -1401,9 +1349,7 @@ mod tests {
             .unwrap();
 
         // DoH3
-        let doh3_probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let doh3_port = doh3_probe.local_addr().unwrap().port();
-        drop(doh3_probe);
+        let doh3_port = reserve_udp_port_number().unwrap();
         let mut doh3_config = Doh3Config::new(
             SocketAddr::from(([127, 0, 0, 1], doh3_port)),
             Some(acceptor_mgr),

@@ -261,9 +261,7 @@ mod tests {
         )
         .with_token(Some("required-slave-token".to_string()));
 
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        let port = reserve_port();
 
         let master_ha_cfg = HaConfig {
             replication_port: port,
@@ -380,10 +378,7 @@ mod tests {
     }
 
     fn reserve_port() -> u16 {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        port
+        sito_test_support::reserve_port_number().expect("reserve a replication port")
     }
 
     async fn wait_until(timeout_ms: u64, mut cond: impl FnMut() -> bool) -> bool {

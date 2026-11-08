@@ -2108,8 +2108,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_master_bind_failure_records_startup_noop() {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
+        // Keep the probe listener bound so the master cannot bind the port.
+        let port_lease = sito_test_support::reserve_port().unwrap();
+        let port = port_lease.port();
         let coordinator = test_coordinator();
         let metrics = coordinator.metrics.clone();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2132,7 +2133,7 @@ mod tests {
                 .contains(r#"sito_ha_startup_noop_total{role="master",reason="bind_failed"} 1"#),
             "a listener bind failure must be observable: {rendered}"
         );
-        drop(probe);
+        drop(port_lease);
     }
 
     #[tokio::test]
@@ -2178,9 +2179,7 @@ mod tests {
     async fn test_master_listener_bind_marks_readiness_ready() {
         let coordinator = test_coordinator();
         let observer = coordinator.clone();
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        let port = sito_test_support::reserve_port_number().unwrap();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = spawn_master_server(
@@ -2215,8 +2214,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_master_bind_failure_marks_readiness_failed() {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
+        // Keep the probe listener bound so the master cannot bind the port.
+        let port_lease = sito_test_support::reserve_port().unwrap();
+        let port = port_lease.port();
         let coordinator = test_coordinator();
         let observer = coordinator.clone();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2242,7 +2242,7 @@ mod tests {
                 .contains("Failed to bind"),
             "readiness must name the bind failure"
         );
-        drop(probe);
+        drop(port_lease);
     }
 
     #[tokio::test]
@@ -3232,10 +3232,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_master_rejects_oversized_websocket_hello() {
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap().port()
-        };
+        let port = sito_test_support::reserve_port_number().unwrap();
         let coordinator = test_coordinator().with_token(Some("tok".to_string()));
         let master_cfg = HaConfig {
             replication_port: port,

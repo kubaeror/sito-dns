@@ -39,6 +39,7 @@ serde_json.workspace = true
 [dev-dependencies]
 rcgen.workspace = true
 reqwest.workspace = true
+sito-test-support.workspace = true
 
 [lints]
 workspace = true

@@ -3187,6 +3187,7 @@ dependencies = [
  "sito-rewrites",
  "sito-runtime",
  "sito-stats",
+ "sito-test-support",
  "subtle",
  "thiserror",
  "tokio",
@@ -3282,6 +3283,7 @@ dependencies = [
  "sito-rewrites",
  "sito-runtime",
  "sito-stats",
+ "sito-test-support",
  "sito-transport",
  "sito-upstream",
  "subtle",
@@ -3294,6 +3296,13 @@ dependencies = [
  "tracing",
  "utoipa",
  "webpki-roots",
+]
+
+[[package]]
+name = "sito-test-support"
+version = "1.9.3"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
@@ -3322,6 +3331,7 @@ dependencies = [
  "serde_json",
  "sito-core",
  "sito-proto",
+ "sito-test-support",
  "socket2",
  "thiserror",
  "time",

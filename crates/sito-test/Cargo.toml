@@ -19,6 +19,7 @@ sito-dnssec.workspace = true
 sito-clients.workspace = true
 sito-rewrites.workspace = true
 sito-ha.workspace = true
+sito-test-support.workspace = true
 blake3.workspace = true
 arc-swap.workspace = true
 bytes.workspace = true

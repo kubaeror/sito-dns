@@ -141,8 +141,9 @@ Commands were run at `acccdc4` (v1.9.3) and match the plan's recorded baseline:
 
 A green baseline is not evidence that the security properties above hold.
 
-WP-0.1 verification on this branch after adding the regression-harness tests:
-`cargo test --workspace --all-features --locked` → **1,065 passed, 0 failed,
+WP-0.1 verification on this branch after adding the regression-harness tests
+and the shared `sito-test-support` port broker:
+`cargo test --workspace --all-features --locked` → **1,068 passed, 0 failed,
 0 ignored**; `cargo fmt --all --check`, `cargo clippy --workspace
 --all-features --all-targets -- -D warnings`, and `cargo deny check` are green.
 The weekly workflow now sets `SITO_PERF_TESTS=1` so the opt-in 50k insertion

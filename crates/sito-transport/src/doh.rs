@@ -534,6 +534,7 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sito_test_support::reserve_port_number;
 
     #[test]
     fn test_dedicated_hostname_matching() {
@@ -570,11 +571,9 @@ mod tests {
         use sito_proto::{Message, MessageType, Name, OpCode, Query, RecordType};
         use std::str::FromStr;
         use std::sync::Mutex;
-        use tokio::net::TcpListener;
 
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
+        let port = reserve_port_number().unwrap();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
         let seen: Arc<Mutex<Option<ClientContext>>> = Arc::new(Mutex::new(None));
         let seen_handler = Arc::clone(&seen);
@@ -627,7 +626,6 @@ mod tests {
     async fn test_alt_svc_header_matches_doh3_port_configuration() {
         use sito_proto::{Message, MessageType, Name, OpCode, Query, RecordType};
         use std::str::FromStr;
-        use tokio::net::TcpListener;
 
         let handler = Arc::new(|query: Message, _client: ClientContext| async move {
             let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
@@ -653,9 +651,8 @@ mod tests {
         };
 
         // No DoH3 port configured: no Alt-Svc advertisement.
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
+        let port = reserve_port_number().unwrap();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = start_doh_listener(
@@ -676,9 +673,8 @@ mod tests {
         handle.await.unwrap();
 
         // Configured DoH3 port: advertised as h3.
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
+        let port = reserve_port_number().unwrap();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = start_doh_listener(
