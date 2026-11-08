@@ -29,6 +29,8 @@ mod tests {
         mock_upstream.add_a_record("example.com", Ipv4Addr::new(93, 184, 216, 34), 300);
 
         let mut config = Config::default();
+        // This acceptance test exercises transport/filtering, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
 
         let server = TestServerInstance::spawn(config).await.unwrap();
@@ -345,6 +347,8 @@ mod tests {
         mock_upstream.add_a_record("secure.example.com", Ipv4Addr::new(93, 184, 216, 34), 300);
 
         let mut config = Config::default();
+        // This acceptance test exercises transport/filtering, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
         config.dns.dot_port = 0;
         config.tls = Some(sito_core::config::TlsConfig {
@@ -395,6 +399,8 @@ mod tests {
         mock_upstream.add_a_record("doh.example.com", Ipv4Addr::new(192, 0, 2, 1), 300);
 
         let mut config = Config::default();
+        // This acceptance test exercises transport/filtering, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
         config.dns.doh_port = 0;
         config.tls = Some(sito_core::config::TlsConfig {
@@ -863,6 +869,8 @@ mod tests {
         mock_upstream.add_a_record("reload.test", Ipv4Addr::new(10, 1, 1, 1), 300);
 
         let mut config = Config::default();
+        // This acceptance test exercises transport/filtering, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
         config.dns.dot_port = 0;
         config.tls = Some(sito_core::config::TlsConfig {
@@ -1117,6 +1125,8 @@ mod tests {
         .unwrap();
 
         let mut config = Config::default();
+        // This acceptance test exercises transport/filtering, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
         config.filtering.custom_rules = vec!["||ad-tracker.com^".to_string()];
         config.clients = Some(clients_val);
@@ -1302,6 +1312,8 @@ mod tests {
         .unwrap();
 
         let mut config = Config::default();
+        // This acceptance test exercises transport/filtering, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
         config.rewrites = Some(rewrites_val);
         config.clients = Some(clients_val);

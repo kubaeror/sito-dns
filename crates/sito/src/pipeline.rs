@@ -45,6 +45,66 @@ fn query_has_do(query: &Message) -> bool {
         .is_some_and(|edns| edns.flags().dnssec_ok)
 }
 
+/// Maximum wall-clock time the pipeline spends on DNSSEC validation and its
+/// DNSKEY/DS chain fetches for one query.
+///
+/// The fetcher performs network I/O and an upstream can stall a response (or
+/// an attacker can black-hole DS/DNSKEY queries). A bound here keeps one query
+/// from pinning a worker for the upstream timeout times the chain depth.
+const DNSSEC_VALIDATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Validates a response under a hard wall-clock deadline.
+///
+/// On timeout strict (`Validate`) mode fails closed with SERVFAIL (never an
+/// unvalidated answer), while `LogOnly` keeps the response without AD, and
+/// `Disabled` never calls this helper.
+async fn validate_dnssec_with_deadline(
+    validator: &DnssecValidator,
+    response: &mut Message,
+    upstream: Option<&str>,
+    now: u32,
+    fetcher: &dyn sito_core::DnssecKeyFetcher,
+    deadline: std::time::Duration,
+) -> sito_dnssec::ValidationOutcome {
+    use sito_dnssec::{DnssecMode, ValidationOutcome};
+
+    // The chain walk appends fetched DNSKEY/DS helpers to the response. If the
+    // future is cancelled on timeout, drop anything it already appended so
+    // unvalidated helper records cannot leak to the client (or into a log-only
+    // cached response).
+    let original_additionals = response.additionals.len();
+    if let Ok(outcome) = tokio::time::timeout(
+        deadline,
+        validator.validate_with_key_fetcher(response, upstream, now, fetcher),
+    )
+    .await
+    {
+        return outcome;
+    }
+    response.additionals.truncate(original_additionals);
+
+    response.metadata.authentic_data = false;
+    if validator.mode == DnssecMode::Validate {
+        response.metadata.response_code = ResponseCode::ServFail;
+        response.answers.clear();
+        sito_dnssec::apply_ede(
+            response,
+            sito_dnssec::EDE_DNSSEC_BOGUS,
+            "DNSSEC validation timed out",
+        );
+        let outcome = ValidationOutcome::Bogus {
+            reason: "DNSSEC validation timed out".to_string(),
+            ede_code: sito_dnssec::EDE_DNSSEC_BOGUS,
+        };
+        validator.metrics.record_validation(&outcome);
+        outcome
+    } else {
+        let outcome = ValidationOutcome::Indeterminate;
+        validator.metrics.record_validation(&outcome);
+        outcome
+    }
+}
+
 /// Copies the query-derived metadata (ID/opcode are set by the caller) that
 /// every synthesized or error response must echo: RD, CD, the question and a
 /// minimal OPT record with the client's DO bit.
@@ -1136,9 +1196,15 @@ impl DnsPipeline {
                         .as_secs() as u32;
                     let key_fetcher =
                         sito_upstream::UpstreamKeyFetcher::new(Arc::clone(&bg_upstream));
-                    let outcome = validator
-                        .validate_with_key_fetcher(&mut resp, None, now, &key_fetcher)
-                        .await;
+                    let outcome = validate_dnssec_with_deadline(
+                        &validator,
+                        &mut resp,
+                        None,
+                        now,
+                        &key_fetcher,
+                        DNSSEC_VALIDATION_DEADLINE,
+                    )
+                    .await;
                     validation_status(Some(&outcome))
                 } else {
                     // No local validation ran: never trust an upstream AD bit.
@@ -1650,14 +1716,15 @@ impl QueryHandler for DnsPipeline {
                         // Clone the validator for the awaited call so no ArcSwap
                         // guard is held across the await.
                         let validator = self.dnssec.load_full();
-                        let outcome = validator
-                            .validate_with_key_fetcher(
-                                &mut upstream_resp,
-                                Some(upstream_name.as_str()),
-                                now,
-                                &key_fetcher,
-                            )
-                            .await;
+                        let outcome = validate_dnssec_with_deadline(
+                            &validator,
+                            &mut upstream_resp,
+                            Some(upstream_name.as_str()),
+                            now,
+                            &key_fetcher,
+                            DNSSEC_VALIDATION_DEADLINE,
+                        )
+                        .await;
                         if let Some(ref m) = self.metrics {
                             if matches!(outcome, sito_dnssec::ValidationOutcome::Bogus { .. }) {
                                 m.inc_dnssec_bogus(&upstream_name);
@@ -1856,6 +1923,117 @@ mod tests {
     use super::*;
     use sito_core::client::ClientContext;
     use sito_core::config::FilteringConfig;
+
+    /// A fetcher that never answers, simulating a black-holed DS/DNSKEY
+    /// lookup. The deadline wrapper must not wait for it indefinitely.
+    struct BlockingFetcher;
+
+    #[async_trait::async_trait]
+    impl sito_core::DnssecKeyFetcher for BlockingFetcher {
+        async fn query(
+            &self,
+            _name: &Name,
+            _rtype: RecordType,
+        ) -> Result<Message, sito_core::error::UpstreamError> {
+            std::future::pending::<Result<Message, sito_core::error::UpstreamError>>().await
+        }
+    }
+
+    /// Builds an answer with eight CNAME hops and one relevant (unverifiable)
+    /// RRSIG, so validation reaches the blocking chain fetch.
+    fn cname_chain_needing_key_fetch(now: u32) -> Message {
+        use hickory_proto::dnssec::Algorithm;
+        use hickory_proto::dnssec::rdata::{RRSIG, SigInput};
+        use hickory_proto::op::Query;
+        use hickory_proto::rr::SerialNumber;
+
+        let origin = Name::from_str("timeout.example.").unwrap();
+        let qname = Name::from_str("h0.timeout.example.").unwrap();
+        let mut response = Message::new(7, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+        for hop in 0..8 {
+            let current = Name::from_str(&format!("h{hop}.timeout.example.")).unwrap();
+            let next = Name::from_str(&format!("h{}.timeout.example.", hop + 1)).unwrap();
+            response
+                .answers
+                .push(Record::from_rdata(current, 300, RData::CNAME(CNAME(next))));
+        }
+        response.answers.push(Record::from_rdata(
+            qname,
+            300,
+            RData::DNSSEC(hickory_proto::dnssec::rdata::DNSSECRData::RRSIG(
+                RRSIG::from_sig(
+                    SigInput {
+                        type_covered: RecordType::CNAME,
+                        algorithm: Algorithm::ECDSAP256SHA256,
+                        num_labels: 3,
+                        original_ttl: 300,
+                        sig_expiration: SerialNumber::new(now.saturating_add(300)),
+                        sig_inception: SerialNumber::new(now.saturating_sub(300)),
+                        key_tag: 1234,
+                        signer_name: origin,
+                    },
+                    vec![0u8; 64],
+                ),
+            )),
+        ));
+        response
+    }
+
+    #[tokio::test]
+    async fn test_dnssec_validation_deadline_fails_closed_in_validate_mode() {
+        let validator = DnssecValidator::new(sito_dnssec::DnssecMode::Validate, Vec::new());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+        let mut response = cname_chain_needing_key_fetch(now);
+
+        let outcome = validate_dnssec_with_deadline(
+            &validator,
+            &mut response,
+            Some("blocked"),
+            now,
+            &BlockingFetcher,
+            std::time::Duration::from_millis(25),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, sito_dnssec::ValidationOutcome::Bogus { .. }),
+            "a blocked key fetch must not produce an unvalidated answer: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+        assert_eq!(response.answers.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_dnssec_validation_deadline_keeps_log_only_response() {
+        let validator = DnssecValidator::new(sito_dnssec::DnssecMode::LogOnly, Vec::new());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+        let mut response = cname_chain_needing_key_fetch(now);
+
+        let outcome = validate_dnssec_with_deadline(
+            &validator,
+            &mut response,
+            Some("blocked"),
+            now,
+            &BlockingFetcher,
+            std::time::Duration::from_millis(25),
+        )
+        .await;
+
+        assert_eq!(outcome, sito_dnssec::ValidationOutcome::Indeterminate);
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(!response.metadata.authentic_data);
+        assert!(!response.answers.is_empty(), "log-only keeps the response");
+    }
 
     fn rewrite_rule(rcode: &str, rtype: Option<&str>, value: Option<&str>) -> DnsRewriteRule {
         DnsRewriteRule {

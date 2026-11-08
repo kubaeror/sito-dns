@@ -730,6 +730,13 @@ fn is_negative_response(response: &Message, qname: &Name, qtype: RecordType) -> 
     if response.metadata.response_code != ResponseCode::NoError {
         return false;
     }
+    // A CNAME at the queried name *is* the positive answer for QTYPE=CNAME.
+    // Following the chain first would inspect the target name and wrongly
+    // classify the answer as NODATA, replacing a valid signature check with a
+    // denial-proof check that can never succeed.
+    if qtype == RecordType::CNAME && cname_target(response, qname).is_some() {
+        return false;
+    }
     let target = negative_answer_name(response, qname);
     !response.answers.iter().any(|record| {
         record.name == target && (record.record_type() == qtype || qtype == RecordType::ANY)
@@ -838,7 +845,7 @@ fn evaluate_denial(
     // span several records (e.g. qname cover plus wildcard cover), so the
     // whole signed set must be evaluated together.
     let mut nsec_groups: HashMap<LowerName, (Name, Vec<NsecRecord<'_>>)> = HashMap::new();
-    let mut nsec3_groups: HashMap<LowerName, Vec<Nsec3Record<'_>>> = HashMap::new();
+    let mut nsec3_groups: HashMap<LowerName, (Name, Vec<Nsec3Record<'_>>)> = HashMap::new();
 
     for record in response
         .authorities
@@ -872,7 +879,8 @@ fn evaluate_denial(
                 (_, Some(nsec3)) if trusted.covered == RecordType::NSEC3 => {
                     nsec3_groups
                         .entry(trusted.signer.clone())
-                        .or_default()
+                        .or_insert_with(|| (trusted.signer_name.clone(), Vec::new()))
+                        .1
                         .push(Nsec3Record {
                             owner: &record.name,
                             rdata: nsec3,
@@ -890,8 +898,8 @@ fn evaluate_denial(
             return DenialResult::Secure;
         }
     }
-    for records in nsec3_groups.values() {
-        match evaluate_nsec3_denial(records, negative_name, qtype, nxdomain) {
+    for (signer_name, records) in nsec3_groups.values() {
+        match evaluate_nsec3_denial(records, negative_name, qtype, nxdomain, signer_name) {
             Nsec3Denial::Secure => return DenialResult::Secure,
             Nsec3Denial::OptOut => opt_out = true,
             Nsec3Denial::Incomplete => {}
@@ -1062,18 +1070,82 @@ fn verify_rrsig_covered(response: &Message, owner: &Name, rrsig: &SIG, key: &DNS
         .is_ok()
 }
 
-/// Whether the response carries any signature record.
-fn response_has_rrsigs(response: &Message) -> bool {
-    response
+/// Whether every RRset relevant to the question carries an RRSIG.
+///
+/// The unsigned-delegation probe is driven by this predicate. Presence of one
+/// signature anywhere is not enough: a forged positive answer plus an
+/// unrelated junk RRSIG must still probe, and a signed CNAME whose target
+/// answer has no RRSIG must probe that target. Signatures that cover a
+/// relevant RRset count even if they turn out to be forged; validation checks
+/// them and fails closed.
+fn response_has_complete_relevant_signatures(
+    response: &Message,
+    qname: &Name,
+    qtype: RecordType,
+) -> bool {
+    let negative = is_negative_response(response, qname, qtype);
+    let covered: HashSet<(LowerName, RecordType)> = response
         .answers
         .iter()
         .chain(response.authorities.iter())
-        .any(|record| {
-            matches!(
-                record.data,
-                RData::DNSSEC(DNSSECRData::RRSIG(_) | DNSSECRData::SIG(_))
-            )
+        .filter_map(|record| {
+            let sig: &SIG = match &record.data {
+                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => rrsig,
+                RData::DNSSEC(DNSSECRData::SIG(sig)) => sig,
+                _ => return None,
+            };
+            Some((LowerName::from(&record.name), sig.input().type_covered))
         })
+        .collect();
+
+    let relevant = relevant_answer_keys(response, qname, qtype);
+    for record in &response.answers {
+        if matches!(
+            record.data,
+            RData::DNSSEC(DNSSECRData::RRSIG(_) | DNSSECRData::SIG(_))
+        ) {
+            continue;
+        }
+        let key = (LowerName::from(&record.name), record.record_type());
+        if !relevant.contains(&key) {
+            continue;
+        }
+        if !covered.contains(&key) {
+            return false;
+        }
+    }
+
+    if negative {
+        let negative_name = negative_answer_name(response, qname);
+        let negative_lower = LowerName::from(&negative_name);
+        // A denial proof needs an RRSIG over the NSEC/NSEC3 RRset in this
+        // response, signed by a zone containing the negative answer name.
+        return response
+            .answers
+            .iter()
+            .chain(response.authorities.iter())
+            .any(|record| {
+                let sig: &SIG = match &record.data {
+                    RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => rrsig,
+                    RData::DNSSEC(DNSSECRData::SIG(sig)) => sig,
+                    _ => return false,
+                };
+                matches!(
+                    sig.input().type_covered,
+                    RecordType::NSEC | RecordType::NSEC3
+                ) && LowerName::from(&sig.input().signer_name).zone_of(&negative_lower)
+                    && response
+                        .answers
+                        .iter()
+                        .chain(response.authorities.iter())
+                        .any(|candidate| {
+                            candidate.name == record.name
+                                && candidate.record_type() == sig.input().type_covered
+                        })
+            });
+    }
+
+    true
 }
 
 /// Whether an RRSIG is inside its validity window (allowing clock skew).
@@ -1335,8 +1407,13 @@ fn ds_response_status(
                 _ => None,
             })
             .collect();
-        if nsec3::evaluate_nsec3_denial(&records, cut, RecordType::DS, false)
-            == nsec3::Nsec3Denial::OptOut
+        if nsec3::evaluate_nsec3_denial(
+            &records,
+            cut,
+            RecordType::DS,
+            false,
+            &Name::from(parent_zone.clone()),
+        ) == nsec3::Nsec3Denial::OptOut
         {
             for record in &nsec3_records {
                 if let RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) = &record.data
@@ -1397,7 +1474,13 @@ fn ds_response_status(
                 _ => None,
             })
             .collect();
-        match nsec3::evaluate_nsec3_denial(&authenticated_records, cut, RecordType::DS, true) {
+        match nsec3::evaluate_nsec3_denial(
+            &authenticated_records,
+            cut,
+            RecordType::DS,
+            true,
+            &Name::from(parent_zone.clone()),
+        ) {
             Nsec3Denial::Secure => return DsStatus::InZone,
             Nsec3Denial::OptOut => {
                 for record in &authenticated_nsec3 {
@@ -2394,6 +2477,28 @@ impl DnssecValidator {
             .insert(name.clone(), now.saturating_add(PROBE_BACKOFF_SECS));
     }
 
+    /// Converts an inconclusive validation result into the configured policy
+    /// outcome: strict mode fails closed with SERVFAIL, `LogOnly` keeps the
+    /// response with AD cleared, and disabled validation never gets here.
+    fn indeterminate_outcome(
+        &self,
+        response: &mut Message,
+        upstream: Option<&str>,
+    ) -> ValidationOutcome {
+        if self.mode == DnssecMode::Validate {
+            return self.handle_bogus(
+                response,
+                upstream,
+                "DNSSEC validation could not be completed",
+                EDE_DNSSEC_BOGUS,
+            );
+        }
+        response.metadata.authentic_data = false;
+        let outcome = ValidationOutcome::Indeterminate;
+        self.metrics.record_validation(&outcome);
+        outcome
+    }
+
     /// Validates a response, resolving missing DNSKEY/DS records through the
     /// fetcher when the in-response chain is incomplete.
     ///
@@ -2420,7 +2525,11 @@ impl DnssecValidator {
         if self.mode != DnssecMode::Disabled
             && let Some(query) = response.queries.first()
         {
-            has_rrsigs = response_has_rrsigs(response);
+            has_rrsigs = response_has_complete_relevant_signatures(
+                response,
+                query.name(),
+                query.query_type(),
+            );
             query_is_nta = self.is_nta(query.name());
             if !has_rrsigs && !query_is_nta {
                 // Probe every distinct name in the CNAME chain, including
@@ -2475,10 +2584,7 @@ impl DnssecValidator {
                 .first()
                 .map_or_else(Name::root, |q| q.name().clone());
             if !self.signed_chain_contains(response, &qname, now) {
-                response.metadata.authentic_data = false;
-                let outcome = ValidationOutcome::Indeterminate;
-                self.metrics.record_validation(&outcome);
-                return outcome;
+                return self.indeterminate_outcome(response, upstream);
             }
         }
 
@@ -2504,7 +2610,7 @@ impl DnssecValidator {
 
         let signers = collect_rrsig_signers(response);
         if signers.is_empty() {
-            return baseline;
+            return self.indeterminate_outcome(response, upstream);
         }
 
         let anchors = self.trust_anchors.load();
@@ -2544,6 +2650,15 @@ impl DnssecValidator {
             &mut verify_budget,
         );
         response.additionals.truncate(original_additionals);
+
+        // Strict mode is fail-closed: once validation and its chain fetch have
+        // run, an `Indeterminate` result (no usable key, blocked fetch, unknown
+        // delegation) is not an acceptable answer for a validating client.
+        // `LogOnly` keeps the response and AD=0 for diagnostics; CD=1 and
+        // disabled validation never reach this path.
+        if outcome == ValidationOutcome::Indeterminate {
+            return self.indeterminate_outcome(response, upstream);
+        }
         outcome
     }
 
@@ -3207,18 +3322,13 @@ impl DnssecValidator {
             });
 
         // A validated CNAME chain whose target crosses into an unsigned zone
-        // (either outside any signed zone or under a proven unsigned child
-        // delegation) is Insecure (AD=0), not Bogus.
+        // is Insecure (AD=0) only when an authenticated DS denial proves the
+        // target delegation is unsigned. Merely lacking signed-zone evidence
+        // is not proof: an attacker can strip the target's RRSIGs. Without the
+        // DS denial the strict pass below keeps the response Bogus.
         let cname_to_unsigned_zone =
             signed_cname_to_unsigned_target(response, &qname, &trusted_covered, &rrsigs)
-                .is_some_and(|target| {
-                    let target_lower = LowerName::from(&target);
-                    self.insecure_zone_covers(&target_lower, now)
-                        || (!self.signed_zone_contains(&target_lower, now)
-                            && !trusted_sigs
-                                .iter()
-                                .any(|sig| sig.signer.zone_of(&target_lower)))
-                });
+                .is_some_and(|target| self.insecure_zone_covers(&LowerName::from(&target), now));
 
         let negative = is_negative_response(response, &qname, qtype);
         let negative_name = if negative {
@@ -3407,6 +3517,18 @@ impl DnssecValidator {
                 "No valid RRSIG covers the answer RRset",
                 EDE_DNSSEC_BOGUS,
             );
+        }
+
+        // The response carried RRSIGs, but none of them covers (or could ever
+        // cover) the answer. Those signatures are junk and must not count as
+        // signed-zone evidence: for an otherwise unsigned response the result
+        // is Insecure, not Indeterminate. A signed zone with a stripped answer
+        // already failed closed in the `signed_zone_evidence` branch above.
+        if !has_relevant_rrsig && !has_denial_rrsig && !has_trusted_sig {
+            response.metadata.authentic_data = false;
+            let outcome = ValidationOutcome::Insecure;
+            self.metrics.record_validation(&outcome);
+            return outcome;
         }
 
         // RRSIGs were present and valid, but could not link to a trust anchor.
@@ -4513,9 +4635,13 @@ mod tests {
             .validate_with_key_fetcher(&mut response, Some("test"), now, &fetcher)
             .await;
 
-        assert_eq!(outcome, ValidationOutcome::Indeterminate);
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a failed chain fetch must SERVFAIL in validate mode: {outcome:?}"
+        );
         // One DNSKEY and one DS lookup for the signer zone, then stop.
         assert_eq!(fetcher.calls(), 2);
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
         assert!(
             response.additionals.is_empty(),
             "unexpected additionals: {:?}",
@@ -6941,11 +7067,11 @@ mod tests {
             .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
             .await;
 
-        assert_eq!(
-            outcome,
-            ValidationOutcome::Indeterminate,
-            "an unauthenticated covering proof must not produce InZone/Signed"
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "an unauthenticated covering proof must not produce InZone/Signed: {outcome:?}"
         );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
         assert!(!response.metadata.authentic_data);
         assert!(
             validator
@@ -7435,9 +7561,10 @@ mod tests {
 
     /// Important regression (I2): an offline probe for a CNAME target in a
     /// signed zone must not fall through to Insecure just because the original
-    /// qname is a legitimately unsigned delegation.
+    /// qname is a legitimately unsigned delegation. In strict mode it fails
+    /// closed with SERVFAIL.
     #[tokio::test]
-    async fn test_failed_cname_target_probe_is_indeterminate_not_insecure() {
+    async fn test_failed_cname_target_probe_fails_closed_not_insecure() {
         let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
         let unsigned_cut = Name::from_str("unsigned.signed.example.").expect("cut");
         let qname = Name::from_str("www.unsigned.signed.example.").expect("qname");
@@ -7471,13 +7598,12 @@ mod tests {
             .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
             .await;
 
-        assert_eq!(
-            outcome,
-            ValidationOutcome::Indeterminate,
-            "a failed probe for a signed CNAME target must fail closed with AD=0, not Insecure"
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a failed probe for a signed CNAME target must SERVFAIL, not Insecure: {outcome:?}"
         );
         assert!(!response.metadata.authentic_data);
-        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
     }
 
     /// A root-anchored cold start must follow a signed intermediate cut
@@ -7814,8 +7940,8 @@ mod tests {
         }
     }
 
-    /// Offline policy: a never-proven zone is Indeterminate (AD=0) and backed
-    /// off, while cached signed evidence stays fail-closed (Bogus) and cached
+    /// Offline policy: a never-proven zone fails closed (Bogus/SERVFAIL) and is
+    /// backed off, cached signed evidence stays fail-closed (Bogus), and cached
     /// unsigned evidence stays Insecure.
     #[tokio::test]
     async fn test_offline_probe_policy() {
@@ -7828,12 +7954,11 @@ mod tests {
         let outcome = validator
             .validate_with_key_fetcher(&mut response, Some("offline"), now, &offline)
             .await;
-        assert_eq!(
-            outcome,
-            ValidationOutcome::Indeterminate,
-            "a never-proven zone must not be downgraded to Insecure while offline"
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a never-proven zone must fail closed while offline: {outcome:?}"
         );
-        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
         assert!(!response.metadata.authentic_data);
         let calls = offline.calls();
         assert!(calls > 0, "the probe must have been attempted");
@@ -7845,12 +7970,16 @@ mod tests {
             "a failed probe must never be persisted"
         );
 
-        // A second query inside the backoff window must not fetch again.
+        // A second query inside the backoff window must not fetch again, but
+        // strict mode still fails closed.
         let mut second = stripped_response(&qname);
         let second_outcome = validator
             .validate_with_key_fetcher(&mut second, Some("offline"), now, &offline)
             .await;
-        assert_eq!(second_outcome, ValidationOutcome::Indeterminate);
+        assert!(
+            matches!(second_outcome, ValidationOutcome::Bogus { .. }),
+            "a backed-off failed probe must still SERVFAIL: {second_outcome:?}"
+        );
         assert_eq!(
             offline.calls(),
             calls,
@@ -8016,7 +8145,7 @@ mod tests {
     }
 
     #[test]
-    fn test_signed_cname_to_unsigned_external_zone_is_insecure() {
+    fn test_signed_cname_to_unsigned_external_zone_without_ds_denial_is_not_insecure() {
         use hickory_proto::rr::RecordSet;
         use hickory_proto::rr::rdata::CNAME;
 
@@ -8057,8 +8186,252 @@ mod tests {
 
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
         let outcome = validator.validate_response(&mut msg, Some("cname-unsigned"), now);
-        assert_eq!(outcome, ValidationOutcome::Insecure);
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Indeterminate,
+            "without an authenticated DS denial the target is not proven unsigned"
+        );
         assert!(!msg.metadata.authentic_data);
         assert_eq!(msg.metadata.response_code, ResponseCode::NoError);
+    }
+
+    /// Hostile regression: absence of signed-zone evidence for a CNAME target
+    /// is not proof that the target is unsigned. An attacker can strip the
+    /// target's RRSIG. Only an authenticated DS denial (`insecure_zone_covers`)
+    /// may downgrade the chain to Insecure; strict mode must fail closed.
+    #[tokio::test]
+    async fn test_signed_cname_to_stripped_target_without_ds_denial_is_bogus() {
+        use hickory_proto::rr::RecordSet;
+        use hickory_proto::rr::rdata::CNAME;
+
+        let (validator, origin, _key, signer) = signed_zone_validator("signed.example.");
+        let alias = Name::from_str("alias.signed.example.").expect("alias");
+        let target = Name::from_str("www.unsigned.org.").expect("target");
+
+        let cname_record =
+            Record::from_rdata(alias.clone(), 300, RData::CNAME(CNAME(target.clone())));
+        let mut cname_set = RecordSet::new(alias.clone(), RecordType::CNAME, 0);
+        cname_set.insert(cname_record.clone(), 0);
+        let cname_sig = sign_test_rrset(&cname_set, &signer);
+
+        let mut response = Message::new(9, MessageType::Response, OpCode::Query);
+        response.queries.push(Query::query(alias, RecordType::A));
+        response.answers.push(cname_record);
+        response.answers.push(cname_sig);
+        // The target answer carries no RRSIG: a stripped signature.
+        response.answers.push(Record::from_rdata(
+            target,
+            300,
+            RData::A(A(Ipv4Addr::new(198, 51, 100, 8))),
+        ));
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let offline = OfflineFetcher::new();
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("cname-stripped"), now, &offline)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a stripped CNAME target without a DS denial must fail closed: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(response.answers.len(), 0);
+        let _ = origin;
+    }
+
+    /// The fail-closed CNAME rule must not over-block a target whose unsigned
+    /// delegation is proven by an authenticated DS denial.
+    #[tokio::test]
+    async fn test_signed_cname_to_authenticated_unsigned_target_is_insecure() {
+        use hickory_proto::rr::RecordSet;
+        use hickory_proto::rr::rdata::CNAME;
+
+        let (validator, origin, zone_key, signer) = signed_zone_validator("signed.example.");
+        let cut = Name::from_str("unsigned.signed.example.").expect("cut");
+        let alias = Name::from_str("alias.signed.example.").expect("alias");
+        let target = Name::from_str("www.unsigned.signed.example.").expect("target");
+
+        let ds_message = signed_nsec_response(
+            &origin,
+            &cut,
+            &Name::from_str("z.signed.example.").expect("next"),
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+            &cut,
+            &zone_key,
+            &signer,
+            ResponseCode::NoError,
+        );
+        let fetcher = StaticFetcher::new().with(&cut, RecordType::DS, ds_message);
+
+        let cname_record =
+            Record::from_rdata(alias.clone(), 300, RData::CNAME(CNAME(target.clone())));
+        let mut cname_set = RecordSet::new(alias.clone(), RecordType::CNAME, 0);
+        cname_set.insert(cname_record.clone(), 0);
+        let cname_sig = sign_test_rrset(&cname_set, &signer);
+
+        let mut response = Message::new(9, MessageType::Response, OpCode::Query);
+        response.queries.push(Query::query(alias, RecordType::A));
+        response.answers.push(cname_record);
+        response.answers.push(cname_sig);
+        response.answers.push(Record::from_rdata(
+            target,
+            300,
+            RData::A(A(Ipv4Addr::new(198, 51, 100, 9))),
+        ));
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("cname-unsigned"), now, &fetcher)
+            .await;
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Insecure,
+            "an authenticated DS denial must still downgrade the target: {outcome:?}"
+        );
+        assert!(!response.metadata.authentic_data);
+    }
+
+    /// Hostile regression: one unrelated junk RRSIG must not suppress the
+    /// unsigned-delegation probe. Before the fix it made the response
+    /// Indeterminate (AD=0) without ever asking whether the name is a
+    /// legitimately unsigned delegation.
+    #[tokio::test]
+    async fn test_junk_rrsig_does_not_suppress_unsigned_probe() {
+        use hickory_proto::rr::RecordSet;
+
+        let (zone, zone_key, zone_signer) = create_test_signer("signed.example.");
+        let cut = Name::from_str("unsigned.signed.example.").expect("cut");
+        let qname = Name::from_str("www.unsigned.signed.example.").expect("qname");
+
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+        validator.add_trust_anchor(&zone_key, LowerName::from(&zone));
+
+        let ds_message = signed_nsec_response(
+            &zone,
+            &cut,
+            &Name::from_str("z.signed.example.").expect("next"),
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+            &cut,
+            &zone_key,
+            &zone_signer,
+            ResponseCode::NoError,
+        );
+        let fetcher = StaticFetcher::new()
+            .with(
+                &zone,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&zone, &zone_key, &zone_signer),
+            )
+            .with(&cut, RecordType::DS, ds_message);
+
+        // A validly signed RRSIG for an RRset that is not in the response and
+        // not relevant to the question: pure junk from the validator's point
+        // of view.
+        let unrelated = Name::from_str("junk.signed.example.").expect("junk");
+        let mut set = RecordSet::new(unrelated.clone(), RecordType::A, 0);
+        set.insert(
+            Record::from_rdata(unrelated, 300, RData::A(A(Ipv4Addr::new(203, 0, 113, 99)))),
+            0,
+        );
+        let junk_sig = sign_test_rrset(&set, &zone_signer);
+
+        let mut response = Message::new(10, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+        response.answers.push(Record::from_rdata(
+            qname,
+            300,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 99))),
+        ));
+        response.answers.push(junk_sig);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Insecure,
+            "the probe must run and prove the delegation unsigned"
+        );
+        assert!(!response.metadata.authentic_data);
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            fetcher.calls() > 0,
+            "junk RRSIGs must not suppress the delegation probe"
+        );
+    }
+
+    /// Strict post-fetch `Indeterminate` is not an acceptable answer for a
+    /// validating client: no usable key means SERVFAIL, not AD=0. `LogOnly`
+    /// keeps the response for diagnostics.
+    #[tokio::test]
+    async fn test_post_fetch_indeterminate_fails_closed_except_log_only() {
+        let (origin, _dnskey, signer) = create_test_signer("unlinked.example.");
+        let (answer, answer_sig) = signed_a_response(&origin, &signer);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+        let build = || {
+            let mut response = Message::new(11, MessageType::Response, OpCode::Query);
+            response
+                .queries
+                .push(Query::query(origin.clone(), RecordType::A));
+            response.answers.push(answer.clone());
+            response.answers.push(answer_sig.clone());
+            response
+        };
+
+        let strict = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+        let offline = OfflineFetcher::new();
+        let mut response = build();
+        let outcome = strict
+            .validate_with_key_fetcher(&mut response, Some("strict"), now, &offline)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "post-fetch Indeterminate must SERVFAIL in validate mode: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+        assert_eq!(response.answers.len(), 0);
+
+        let log_only = DnssecValidator::new(DnssecMode::LogOnly, Vec::new());
+        let offline = OfflineFetcher::new();
+        let mut response = build();
+        let outcome = log_only
+            .validate_with_key_fetcher(&mut response, Some("log-only"), now, &offline)
+            .await;
+        assert_eq!(outcome, ValidationOutcome::Indeterminate);
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(!response.metadata.authentic_data);
+        assert!(!response.answers.is_empty(), "log-only keeps the answer");
+    }
+
+    #[test]
+    fn test_qtype_cname_positive_answer_is_not_negative() {
+        use hickory_proto::rr::rdata::CNAME;
+
+        let qname = Name::from_str("alias.example.").expect("qname");
+        let target = Name::from_str("target.example.").expect("target");
+        let mut response = Message::new(12, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname.clone(), RecordType::CNAME));
+        response.answers.push(Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::CNAME(CNAME(target.clone())),
+        ));
+        response.metadata.response_code = ResponseCode::NoError;
+
+        assert!(
+            !is_negative_response(&response, &qname, RecordType::CNAME),
+            "a CNAME at the qname answers QTYPE=CNAME positively"
+        );
+        assert!(
+            is_negative_response(&response, &qname, RecordType::A),
+            "the same response is NODATA for QTYPE=A"
+        );
     }
 }

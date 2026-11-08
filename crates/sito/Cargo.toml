@@ -39,6 +39,7 @@ tracing-subscriber.workspace = true
 mimalloc = { workspace = true, optional = true }
 
 [dev-dependencies]
+async-trait.workspace = true
 rcgen.workspace = true
 time.workspace = true
 

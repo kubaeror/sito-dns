@@ -3006,6 +3006,7 @@ version = "1.9.3"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "async-trait",
  "axum",
  "chrono",
  "clap",
