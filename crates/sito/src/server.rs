@@ -361,14 +361,26 @@ fn init_ha(
         // recoverable state starts a fresh v1 sequence.
         let restored_version = coordinator.restore_state()?;
 
-        let initial_toml = std::fs::read_to_string(config_path)
-            .unwrap_or_else(|_| toml::to_string_pretty(config).unwrap_or_default());
+        let initial_toml = match std::fs::read_to_string(config_path) {
+            Ok(raw) => raw,
+            Err(_) => toml::to_string_pretty(config).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to serialize the running configuration for the initial HA bundle: {e}"
+                )
+            })?,
+        };
         let sanitized_toml = sito_ha::sanitize_config_for_bundle(&initial_toml).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to sanitize '{}' for the HA bundle: {e}",
                 config_path.display()
             )
         })?;
+        if sanitized_toml.trim().is_empty() {
+            anyhow::bail!(
+                "Refusing to publish an empty initial HA bundle derived from '{}'",
+                config_path.display()
+            );
+        }
         if let Some(ref token) = ha_config.slave_token
             && let Err(e) = sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])
         {
@@ -463,6 +475,20 @@ fn init_ha(
             ha_config.master_url.clone(),
         )
         .with_watermark_path(config.server.data_dir.join("ha_watermark.toml"))?;
+        // A local edit/revert while the process was stopped must not let the
+        // next identical push take the same-version early-ACK path. Compare the
+        // on-disk document with the digest recorded when the bundle was applied.
+        if let Ok(document) = std::fs::read_to_string(config_path) {
+            tracker
+                .verify_applied_config(&document)
+                .map_err(|e| anyhow::anyhow!("Failed to verify applied HA configuration: {e}"))?;
+            if tracker.has_local_config_drift() {
+                tracing::warn!(
+                    path = %config_path.display(),
+                    "Local configuration drifted from the last applied HA bundle; waiting for the master to re-apply it"
+                );
+            }
+        }
         let (resync_tx, resync_rx) = tokio::sync::mpsc::channel(4);
         (None, Some(tracker), Some(resync_tx), Some(resync_rx))
     };

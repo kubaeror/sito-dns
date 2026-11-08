@@ -77,6 +77,58 @@ pub enum FilterApply {
 pub struct AppliedReport {
     /// Settings that changed but are only read at process start.
     pub restart_required: Vec<String>,
+    /// HA publication result on a master, or `None` for non-HA nodes.
+    pub ha_publish: Option<HaPublishReport>,
+}
+
+/// Client-visible summary of an HA publication attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaPublishReport {
+    /// `published`, `no_slaves` or `failed`.
+    pub status: String,
+    /// Failure detail, never containing secret material.
+    pub error: Option<String>,
+    /// RFC3339 timestamp of the first scheduled retry.
+    pub retry_at: Option<String>,
+}
+
+impl HaPublishReport {
+    #[must_use]
+    pub fn from_outcome(outcome: sito_ha::PublishOutcome) -> Self {
+        match outcome {
+            sito_ha::PublishOutcome::Published { .. } => Self {
+                status: "published".to_string(),
+                error: None,
+                retry_at: None,
+            },
+            sito_ha::PublishOutcome::NoSlaves => Self {
+                status: "no_slaves".to_string(),
+                error: None,
+                retry_at: None,
+            },
+            // Callers normally treat this as an apply error before building a
+            // report; keep a faithful representation for completeness.
+            sito_ha::PublishOutcome::TooLarge { bytes, limit } => Self {
+                status: "failed".to_string(),
+                error: Some(format!(
+                    "configuration bundle is {bytes} bytes, above the {limit}-byte replication limit"
+                )),
+                retry_at: None,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn failed(error: impl Into<String>) -> Self {
+        let retry_at = chrono::Utc::now()
+            .checked_add_signed(chrono::TimeDelta::try_seconds(1).unwrap_or_default())
+            .map(|at| at.to_rfc3339());
+        Self {
+            status: "failed".to_string(),
+            error: Some(error.into()),
+            retry_at,
+        }
+    }
 }
 
 /// Deep validation of a candidate configuration.
@@ -241,6 +293,7 @@ async fn apply_full_config_locked(
     match apply_inner(ctx, candidate, filter_apply, hooks).await {
         Ok(()) => Ok(AppliedReport {
             restart_required: restart_required_fields(&previous, candidate),
+            ha_publish: None,
         }),
         Err(e) => {
             // Roll the components applied so far back to the previous
@@ -342,7 +395,8 @@ async fn apply_and_persist_document_locked(
     hooks: Option<&dyn ConfigApplyHooks>,
 ) -> Result<AppliedReport, ProblemDetails> {
     let previous = (**ctx.config.load()).clone();
-    let report = apply_full_config_locked(ctx, candidate, filter_apply, hooks).await?;
+    let previous_document = tokio::fs::read_to_string(&ctx.config_path).await.ok();
+    let mut report = apply_full_config_locked(ctx, candidate, filter_apply, hooks).await?;
 
     if let Err(e) = save_config_document_atomic(&ctx.config_path, document, candidate).await {
         if let Err(rollback_err) =
@@ -355,7 +409,59 @@ async fn apply_and_persist_document_locked(
         }
         return Err(e);
     }
-    ctx.publish_bundle().await;
+
+    match ctx.publish_bundle().await {
+        Ok(sito_ha::PublishOutcome::TooLarge { bytes, limit }) => {
+            // An oversized bundle is the one HA failure that is an apply
+            // error: the configuration cannot be replicated at all. Roll both
+            // the live configuration and the persisted document back (D8) and
+            // republish the restored configuration so readiness recovers.
+            tracing::error!(
+                bytes,
+                limit,
+                "HA bundle exceeds the replication limit; rolling back the local apply"
+            );
+            if let Some(previous_document) = previous_document.as_deref()
+                && let Err(e) =
+                    save_config_document_atomic(&ctx.config_path, previous_document, &previous)
+                        .await
+            {
+                tracing::error!(
+                    error = %e.detail,
+                    "Failed to restore the previous configuration document after an oversized HA bundle"
+                );
+            }
+            if let Err(e) = apply_full_config_locked(ctx, &previous, FilterApply::Sync, hooks).await
+            {
+                tracing::error!(
+                    error = %e.detail,
+                    "Failed to roll back in-memory configuration after an oversized HA bundle"
+                );
+            }
+            if let Err(e) = ctx.publish_bundle().await {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to republish the restored configuration after an oversized HA bundle"
+                );
+            }
+            return Err(ProblemDetails::bad_request(format!(
+                "The configuration produces a {bytes}-byte HA bundle, above the {limit}-byte WebSocket replication limit; it was not applied. Reduce filter lists/rules or configuration size"
+            )));
+        }
+        Ok(outcome) => {
+            if ctx.master_coordinator.is_some() {
+                report.ha_publish = Some(HaPublishReport::from_outcome(outcome));
+            }
+        }
+        Err(e) => {
+            // D8: the local apply and persist succeeded; an HA publish failure
+            // must not roll it back. Surface the failure, leave HA readiness
+            // false, and let the background retry recover.
+            tracing::error!(error = %e, "HA publication failed after a successful local apply");
+            report.ha_publish = Some(HaPublishReport::failed(e.to_string()));
+        }
+    }
+
     Ok(report)
 }
 
@@ -427,7 +533,18 @@ pub async fn apply_config_document_event(
 
     match apply_full_config_locked(ctx, &new_cfg, filter_apply, hooks).await {
         Ok(report) => {
-            ctx.publish_bundle().await;
+            // A slave's shared configuration is master-owned. If an external
+            // edit changed the document, the applied-config digest no longer
+            // matches and the node must stop reporting `Synced` instead of
+            // silently serving drift until the next push.
+            if let Some(ref tracker) = ctx.slave_tracker
+                && let Err(e) = tracker.verify_applied_config(&current)
+            {
+                tracing::warn!(error = %e, "Failed to verify the applied HA configuration digest");
+            }
+            if let Err(e) = ctx.publish_bundle().await {
+                tracing::warn!(error = %e, "HA publication failed after a file-watcher apply");
+            }
             ConfigFileApplyOutcome::Applied(report)
         }
         Err(e) => ConfigFileApplyOutcome::Rejected(e),

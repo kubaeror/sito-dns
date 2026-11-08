@@ -3366,6 +3366,17 @@
           "message"
         ],
         "properties": {
+          "ha_publish": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HaPublishStatus",
+                "description": "HA publication result when this node is a cluster master. Omitted for\nnon-HA nodes and slaves."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "message": {
             "type": "string"
           },
@@ -3662,6 +3673,33 @@
           "total_queries": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "HaPublishStatus": {
+        "type": "object",
+        "description": "Outcome of publishing a configuration to HA replica slaves.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable failure reason. Never contains secret material."
+          },
+          "retry_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC3339 timestamp of the first background retry, when one is scheduled."
+          },
+          "status": {
+            "type": "string",
+            "description": "`published`, `no_slaves` or `failed`."
           }
         }
       },

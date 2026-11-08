@@ -17,9 +17,9 @@ pub mod slave;
 pub mod transport;
 
 pub use bundle::{
-    AppliedWatermark, ConfigBundle, FilterListMetadata, build_and_sign_push, push_payload_hash,
-    sanitize_config_for_bundle, scan_for_secrets, substitute_secrets, verify_and_unpack_push,
-    verify_and_unpack_push_with_watermark, watermark_covers,
+    AppliedWatermark, ConfigBundle, FilterListMetadata, build_and_sign_push, config_digest,
+    push_payload_hash, sanitize_config_for_bundle, scan_for_secrets, substitute_secrets,
+    verify_and_unpack_push, verify_and_unpack_push_with_watermark, watermark_covers,
 };
 pub use config::HaConfig;
 pub use crypto::{
@@ -28,7 +28,9 @@ pub use crypto::{
     parse_public_key, verify_ed25519_signature,
 };
 pub use error::HaError;
-pub use master::{MasterCoordinator, ResyncOutcome, SlaveSummary, spawn_master_server};
+pub use master::{
+    MasterCoordinator, PublishOutcome, ResyncOutcome, SlaveSummary, spawn_master_server,
+};
 pub use protocol::{AckConflict, HaMessage, PROTOCOL_VERSION, UpstreamReport};
 pub use readiness::{HaReadiness, HaReadinessState};
 pub use slave::{

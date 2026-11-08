@@ -28,6 +28,11 @@ pub enum HaError {
     #[error("Secret leak detected: bundle contains raw secret '{secret_name}'")]
     SecretLeak { secret_name: String },
 
+    #[error(
+        "Configuration bundle is {bytes} bytes (limit {limit} bytes); it cannot be replicated over the HA WebSocket channel. Reduce the configuration size (for example filter lists/rules) or raise the transport limit"
+    )]
+    BundleTooLarge { bytes: usize, limit: usize },
+
     #[error("Configuration rollback error: {0}")]
     Rollback(String),
 

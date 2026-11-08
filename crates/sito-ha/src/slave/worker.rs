@@ -22,8 +22,8 @@ use sito_stats::MetricsRegistry;
 use sito_stats::metrics::MetricsSnapshot;
 
 use crate::bundle::{
-    ConfigBundle, push_payload_hash, substitute_secrets, verify_and_unpack_push_with_watermark,
-    watermark_covers,
+    ConfigBundle, config_digest, push_payload_hash, substitute_secrets,
+    verify_and_unpack_push_with_watermark, watermark_covers,
 };
 use crate::config::HaConfig;
 use crate::crypto::parse_public_key;
@@ -31,7 +31,8 @@ use crate::error::HaError;
 use crate::protocol::{AckConflict, HaMessage, UpstreamReport};
 use crate::slave::state::{SlaveState, SlaveStatusTracker};
 use crate::transport::{
-    ExponentialBackoff, SLAVE_HANDSHAKE_TIMEOUT, build_client_tls_config, ws_config,
+    ExponentialBackoff, SLAVE_HANDSHAKE_TIMEOUT, WS_SEND_TIMEOUT, build_client_tls_config,
+    ws_config,
 };
 
 /// Applies and persists a configuration pushed by the master.
@@ -121,13 +122,21 @@ pub async fn apply_config_push(
 
     // An identical re-delivery of the already-applied bundle needs no work and
     // must not rewrite local configuration; acknowledge it as synced. A newer
-    // term with the same payload only records the promoted epoch.
+    // term with the same payload only records the promoted epoch. A locally
+    // drifted configuration must not take this shortcut: it has to apply the
+    // bundle so the on-disk document matches the shared state again.
     if let Some(ref applied) = watermark
         && bundle.version == applied.version
         && payload_hash == applied.normalized_hash()
+        && !tracker.has_local_config_drift()
     {
         if bundle.term > applied.term {
-            tracker.persist_watermark(bundle.version, bundle.term, &payload_hash)?;
+            tracker.persist_watermark_with_config_digest(
+                bundle.version,
+                bundle.term,
+                &payload_hash,
+                applied.applied_config_digest.as_deref(),
+            )?;
         }
         tracker.mark_synced_with_term(bundle.version, bundle.term);
         return Ok(bundle.version);
@@ -290,9 +299,17 @@ pub async fn apply_config_push(
         return Err(HaError::Rollback(reason));
     }
 
-    // Persist the applied-version watermark before acknowledging: a crash
-    // between apply and ACK must still leave a restart able to reject replays.
-    if let Err(e) = tracker.persist_watermark(bundle.version, bundle.term, &payload_hash) {
+    // Persist the applied-version watermark and the digest of the exact
+    // document that was applied before acknowledging: a crash between apply
+    // and ACK must still leave a restart able to reject replays and detect a
+    // local edit to the shared configuration.
+    let applied_config_digest = config_digest(&document);
+    if let Err(e) = tracker.persist_watermark_with_config_digest(
+        bundle.version,
+        bundle.term,
+        &payload_hash,
+        Some(&applied_config_digest),
+    ) {
         let reason = format!("Failed to persist the applied-version watermark: {e}");
         error!(
             error = %e,
@@ -990,10 +1007,12 @@ where
         role: Some("slave".to_string()),
         protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
     };
-    ws_stream
-        .send(WsMessage::Text(hello.to_json()?.into()))
-        .await
-        .map_err(|e| HaError::Connection(format!("Failed to send Hello message: {e}")))?;
+    send_slave_message(
+        &mut ws_stream,
+        WsMessage::Text(hello.to_json()?.into()),
+        "Hello",
+    )
+    .await?;
 
     tracker.set_state(SlaveState::HelloSent);
     info!(
@@ -1019,11 +1038,34 @@ where
     // instead of resolving `None` forever.
     let mut resync_open = true;
 
+    // Master-loss deadline: the master pings every `ping_interval_secs`; a
+    // partition, blackholed peer or hung master must not leave the slave
+    // reporting `Synced` (and `/health` green) forever. Any received frame
+    // (ping/pong, stats, push) proves the session is alive.
+    let ping_secs = ha_config.ping_interval_secs.max(1);
+    let liveness_deadline = Duration::from_secs(ping_secs.saturating_mul(3));
+    let mut liveness_interval = tokio::time::interval(Duration::from_secs(ping_secs));
+    liveness_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_frame = Instant::now();
+
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
                     break;
+                }
+            }
+
+            _ = liveness_interval.tick() => {
+                if last_frame.elapsed() > liveness_deadline {
+                    let reason = format!(
+                        "master heartbeat timed out: no frame for {:?} (deadline {:?}); marking replication not ready",
+                        last_frame.elapsed(),
+                        liveness_deadline
+                    );
+                    tracker.set_connection_error(Some(reason.clone()));
+                    tracker.set_state(SlaveState::Connecting);
+                    return Err(HaError::Timeout(reason));
                 }
             }
 
@@ -1043,7 +1085,7 @@ where
                     role: Some("slave".to_string()),
                     protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
                 };
-                let _ = ws_stream.send(WsMessage::Text(hello.to_json()?.into())).await;
+                send_slave_message(&mut ws_stream, WsMessage::Text(hello.to_json()?.into()), "resync Hello").await?;
             }
 
             _ = stats_ticker.tick() => {
@@ -1056,22 +1098,28 @@ where
                     build_stats_report(&handles.metrics, &last_stats_snapshot, window_s);
                 last_stats_snapshot = snapshot;
                 if let Ok(json) = stats.to_json() {
-                    let _ = ws_stream.send(WsMessage::Text(json.into())).await;
+                    send_slave_message(&mut ws_stream, WsMessage::Text(json.into()), "stats report").await?;
                 }
             }
 
             msg_opt = ws_stream.next() => {
+                last_frame = Instant::now();
                 match msg_opt {
                     Some(Ok(WsMessage::Text(txt))) => {
                         handle_master_message(&txt, &mut ws_stream, tracker, handles, master_pubkey).await?;
+                        // An apply can take longer than the liveness deadline;
+                        // the frame arrived in time, so restart the clock after
+                        // processing it instead of falsely timing out.
+                        last_frame = Instant::now();
                     }
                     Some(Ok(WsMessage::Binary(bin))) => {
                         if let Ok(txt) = std::str::from_utf8(&bin) {
                             handle_master_message(txt, &mut ws_stream, tracker, handles, master_pubkey).await?;
+                            last_frame = Instant::now();
                         }
                     }
                     Some(Ok(WsMessage::Ping(p))) => {
-                        let _ = ws_stream.send(WsMessage::Pong(p)).await;
+                        send_slave_message(&mut ws_stream, WsMessage::Pong(p), "Pong").await?;
                     }
                     Some(Ok(WsMessage::Close(_))) => {
                         info!("Master closed replication WebSocket connection");
@@ -1091,6 +1139,29 @@ where
     }
 
     Ok(())
+}
+
+/// Sends one WebSocket message with a hard write deadline.
+///
+/// A slow or stalled peer must not pin the replication task (and its queues)
+/// forever; `WS_SEND_TIMEOUT` is the same budget as the connect/handshake
+/// path.
+async fn send_slave_message<S>(
+    ws_stream: &mut tokio_tungstenite::WebSocketStream<S>,
+    message: WsMessage,
+    context: &str,
+) -> Result<(), HaError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(WS_SEND_TIMEOUT, ws_stream.send(message))
+        .await
+        .map_err(|_| {
+            HaError::Timeout(format!(
+                "HA slave {context} send timed out after {WS_SEND_TIMEOUT:?}"
+            ))
+        })?
+        .map_err(|e| HaError::Connection(format!("Failed to send {context}: {e}")))
 }
 
 /// Builds a window-scoped stats report from the registry and the snapshot
@@ -1143,13 +1214,15 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let msg = HaMessage::from_json(text)?;
+    macro_rules! send_ack {
+        ($ack:expr) => {
+            send_slave_message(ws_stream, WsMessage::Text($ack.to_json()?.into()), "Ack").await?
+        };
+    }
     match msg {
         HaMessage::Ping { ts } => {
             let pong = HaMessage::Pong { ts };
-            ws_stream
-                .send(WsMessage::Text(pong.to_json()?.into()))
-                .await
-                .map_err(|e| HaError::Connection(format!("Failed to send Pong: {e}")))?;
+            send_slave_message(ws_stream, WsMessage::Text(pong.to_json()?.into()), "Pong").await?;
         }
         HaMessage::ConfigPush {
             ref version,
@@ -1189,10 +1262,7 @@ where
                             watermark.term, watermark.forked_at_version
                         )),
                     };
-                    ws_stream
-                        .send(WsMessage::Text(ack.to_json()?.into()))
-                        .await
-                        .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                    send_ack!(ack);
                     return Ok(());
                 }
                 if push_term < watermark.term {
@@ -1206,10 +1276,7 @@ where
                             watermark.term
                         )),
                     };
-                    ws_stream
-                        .send(WsMessage::Text(ack.to_json()?.into()))
-                        .await
-                        .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                    send_ack!(ack);
                     return Ok(());
                 }
                 if push_term > watermark.term && target_version <= watermark.version {
@@ -1225,10 +1292,7 @@ where
                         conflict: Some(AckConflict::StaleVersion),
                         error: Some(reason),
                     };
-                    ws_stream
-                        .send(WsMessage::Text(ack.to_json()?.into()))
-                        .await
-                        .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                    send_ack!(ack);
                     return Ok(());
                 }
                 if push_term == watermark.term {
@@ -1243,13 +1307,10 @@ where
                                 watermark.version
                             )),
                         };
-                        ws_stream
-                            .send(WsMessage::Text(ack.to_json()?.into()))
-                            .await
-                            .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                        send_ack!(ack);
                         return Ok(());
                     }
-                    if target_version == watermark.version {
+                    if target_version == watermark.version && !tracker.has_local_config_drift() {
                         if !watermark_covers(
                             &watermark,
                             push_term,
@@ -1291,12 +1352,7 @@ where
                                     None => reason,
                                 }),
                             };
-                            ws_stream
-                                .send(WsMessage::Text(ack.to_json()?.into()))
-                                .await
-                                .map_err(|e| {
-                                    HaError::Connection(format!("Failed to send Ack: {e}"))
-                                })?;
+                            send_ack!(ack);
                             return Ok(());
                         }
                         let ack = HaMessage::Ack {
@@ -1306,10 +1362,7 @@ where
                             conflict: None,
                             error: None,
                         };
-                        ws_stream
-                            .send(WsMessage::Text(ack.to_json()?.into()))
-                            .await
-                            .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                        send_ack!(ack);
                         if tracker.get_state() != SlaveState::Degraded {
                             tracker.mark_synced_with_term(watermark.version, watermark.term);
                         }
@@ -1329,17 +1382,19 @@ where
                         tracker.get_term()
                     )),
                 };
-                ws_stream
-                    .send(WsMessage::Text(ack.to_json()?.into()))
-                    .await
-                    .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                send_ack!(ack);
                 return Ok(());
             }
 
             // Already at (or ahead of) this version in the same term:
             // acknowledge without re-applying. The master always pushes on
-            // connect.
-            if push_term == tracker.get_term() && target_version <= tracker.get_version() {
+            // connect. A locally drifted configuration must not take this
+            // early-ACK path: it has to apply the bundle and persist a fresh
+            // digest first.
+            if push_term == tracker.get_term()
+                && target_version <= tracker.get_version()
+                && !tracker.has_local_config_drift()
+            {
                 let ack = HaMessage::Ack {
                     version: tracker.get_version(),
                     term: tracker.get_term(),
@@ -1347,10 +1402,7 @@ where
                     conflict: None,
                     error: None,
                 };
-                ws_stream
-                    .send(WsMessage::Text(ack.to_json()?.into()))
-                    .await
-                    .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                send_ack!(ack);
                 // The connection is fully synchronized: reflect that instead of
                 // leaving the state at `hello_sent`. A `Degraded` state is only
                 // cleared by a successful apply, so an early ACK for the
@@ -1383,10 +1435,7 @@ where
                         conflict: None,
                         error: None,
                     };
-                    ws_stream
-                        .send(WsMessage::Text(ack.to_json()?.into()))
-                        .await
-                        .map_err(|e| HaError::Connection(format!("Failed to send Ack: {e}")))?;
+                    send_ack!(ack);
                 }
                 Err(e) => {
                     let ack = HaMessage::Ack {
@@ -1396,7 +1445,7 @@ where
                         conflict: None,
                         error: Some(e.to_string()),
                     };
-                    let _ = ws_stream.send(WsMessage::Text(ack.to_json()?.into())).await;
+                    send_ack!(ack);
                 }
             }
         }

@@ -1581,7 +1581,9 @@ pub async fn system_reload_handler(
             &format!("Failed to apply configuration: {}", e.detail),
         );
     }
-    crate::publish_bundle(&ctx).await;
+    if let Err(e) = crate::publish_bundle(&ctx).await {
+        tracing::error!(error = %e, "HA publication failed after a UI config reload");
+    }
     Redirect::to("/system").into_response()
 }
 

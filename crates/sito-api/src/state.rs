@@ -161,17 +161,57 @@ impl ServerContext {
 
     /// Publishes an updated HA configuration bundle to all connected replica slaves,
     /// incrementing the configuration version monotonic counter.
-    pub async fn publish_bundle(&self) {
+    ///
+    /// Returns the observable publish outcome. Sanitization/read/persist
+    /// failures are errors, never an empty bundle; an oversized envelope is
+    /// `TooLarge` because it is a configuration error the caller must surface
+    /// (and roll back). A failed publish is also recorded in HA readiness and
+    /// a bounded background retry is scheduled.
+    pub async fn publish_bundle(&self) -> Result<sito_ha::PublishOutcome, sito_ha::HaError> {
+        let result = self.publish_bundle_inner().await;
+        if result.is_err() {
+            self.schedule_publish_retry();
+        }
+        result
+    }
+
+    async fn publish_bundle_inner(&self) -> Result<sito_ha::PublishOutcome, sito_ha::HaError> {
+        use sito_ha::HaError;
+
         let Some(ref coordinator) = self.master_coordinator else {
-            return;
+            return Ok(sito_ha::PublishOutcome::NoSlaves);
         };
 
         let config = self.config.load();
         let raw_toml = match tokio::fs::read_to_string(&self.config_path).await {
             Ok(raw) => raw,
-            Err(_) => toml::to_string_pretty(&**config).unwrap_or_default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::to_string_pretty(&**config)
+                .map_err(|e| {
+                    HaError::Serialization(format!(
+                        "Failed to serialize the running configuration for HA publication: {e}"
+                    ))
+                })?,
+            Err(e) => {
+                return Err(HaError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to read '{}' for HA publication: {e}",
+                        self.config_path.display()
+                    ),
+                )));
+            }
         };
-        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&raw_toml).unwrap_or_default();
+        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&raw_toml)?;
+        if sanitized_toml.trim().is_empty() {
+            return Err(HaError::Validation {
+                field: "config_toml".to_string(),
+                reason: format!(
+                    "Refusing to publish an empty HA bundle derived from '{}'; \
+                     check the configuration before retrying",
+                    self.config_path.display()
+                ),
+            });
+        }
         let list_metadata = config
             .filtering
             .lists
@@ -186,21 +226,22 @@ impl ServerContext {
 
         // Defense in depth: refuse to broadcast a bundle that embeds a known
         // secret in plaintext.
-        if let Some(ref ha_val) = self.config.load().ha
+        if let Some(ref ha_val) = config.ha
             && let Ok(ha_cfg) = sito_ha::HaConfig::from_toml_value(ha_val)
             && let Some(ref token) = ha_cfg.slave_token
-            && let Err(e) = sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])
         {
-            tracing::error!("Refusing to publish HA bundle: {e}");
-            return;
+            sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])?;
         }
 
-        let Some(new_version) = coordinator.get_current_version().checked_add(1) else {
-            tracing::error!(
-                "Refusing to publish HA bundle: the configuration version sequence is exhausted"
-            );
-            return;
-        };
+        let new_version = coordinator
+            .get_current_version()
+            .checked_add(1)
+            .ok_or_else(|| HaError::Validation {
+                field: "version".to_string(),
+                reason:
+                    "Refusing to publish HA bundle: the configuration version sequence is exhausted"
+                        .to_string(),
+            })?;
         #[allow(clippy::cast_sign_loss)]
         let bundle = sito_ha::ConfigBundle {
             version: new_version,
@@ -213,17 +254,64 @@ impl ServerContext {
             lists: list_metadata,
         };
 
-        if let Err(e) = coordinator.update_bundle_async(bundle).await {
-            tracing::error!(
-                version = new_version,
-                "Failed to update HA bundle and broadcast to slaves: {e}"
-            );
-        } else {
-            tracing::info!(
-                version = new_version,
-                "Updated HA bundle and broadcasted to slaves"
-            );
+        match coordinator.publish_bundle_async(bundle).await {
+            Ok(outcome) => {
+                tracing::info!(
+                    version = new_version,
+                    outcome = ?outcome,
+                    "Updated HA bundle"
+                );
+                Ok(outcome)
+            }
+            Err(e) => {
+                tracing::error!(
+                    version = new_version,
+                    "Failed to update HA bundle and broadcast to slaves: {e}"
+                );
+                Err(e)
+            }
         }
+    }
+
+    /// Schedules one bounded background retry loop with exponential backoff.
+    ///
+    /// The local configuration has already been persisted by the caller and
+    /// must not be rolled back because of an HA failure (D8). The coordinator
+    /// guard keeps a burst of failed API writes from spawning many loops.
+    fn schedule_publish_retry(&self) {
+        let Some(ref coordinator) = self.master_coordinator else {
+            return;
+        };
+        if !coordinator.begin_publish_retry() {
+            return;
+        }
+        let retry_ctx = self.clone();
+        let retry_coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            let mut delay = std::time::Duration::from_secs(1);
+            for attempt in 1..=5 {
+                tokio::time::sleep(delay).await;
+                match retry_ctx.publish_bundle().await {
+                    Ok(outcome) => {
+                        tracing::info!(
+                            attempt,
+                            outcome = ?outcome,
+                            "HA publish retry completed"
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            attempt,
+                            error = %e,
+                            "HA publish retry failed; backing off"
+                        );
+                        delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                    }
+                }
+            }
+            retry_coordinator.end_publish_retry();
+        });
     }
 }
 
@@ -238,8 +326,10 @@ pub fn sanitize_clients_for_bundle(clients: Option<&toml::Value>) -> Option<toml
 }
 
 /// Helper function to publish an updated configuration bundle to replica slaves.
-pub async fn publish_bundle(ctx: &ServerContext) {
-    ctx.publish_bundle().await;
+pub async fn publish_bundle(
+    ctx: &ServerContext,
+) -> Result<sito_ha::PublishOutcome, sito_ha::HaError> {
+    ctx.publish_bundle().await
 }
 
 // Axum FromRef implementations for modular extractors

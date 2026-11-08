@@ -313,6 +313,23 @@ pub struct ConfigUpdateResponse {
     /// Settings that changed but only take effect after a process restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restart_required: Vec<String>,
+    /// HA publication result when this node is a cluster master. Omitted for
+    /// non-HA nodes and slaves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ha_publish: Option<HaPublishStatus>,
+}
+
+/// Outcome of publishing a configuration to HA replica slaves.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct HaPublishStatus {
+    /// `published`, `no_slaves` or `failed`.
+    pub status: String,
+    /// Human-readable failure reason. Never contains secret material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// RFC3339 timestamp of the first background retry, when one is scheduled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<String>,
 }
 
 /// Full configuration response with secrets masked.
