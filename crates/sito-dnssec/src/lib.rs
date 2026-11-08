@@ -1070,6 +1070,29 @@ fn verify_rrsig_covered(response: &Message, owner: &Name, rrsig: &SIG, key: &DNS
         .is_ok()
 }
 
+/// Whether a signature record at `sig_owner` covers the RRset at
+/// `rrset_owner`.
+///
+/// Normally the names are equal. A wildcard-expanded answer may instead carry
+/// the RRSIG at the wildcard owner (`*.example`), with the answer RRset at the
+/// expanded qname (`a.example`). In that case the RRSIG Labels field counts the
+/// labels below the wildcard and the signed name is the wildcard owner.
+fn signature_covers_rrset(sig_owner: &Name, sig: &SIG, rrset_owner: &Name) -> bool {
+    if sig_owner == rrset_owner {
+        return true;
+    }
+    if !sig_owner.is_wildcard() {
+        return false;
+    }
+    let base = sig_owner.base_name();
+    if base == *rrset_owner || !base.zone_of(rrset_owner) {
+        return false;
+    }
+    // A wildcard only synthesizes names exactly one label below its base.
+    rrset_owner.num_labels() == base.num_labels().saturating_add(1)
+        && usize::from(sig.input().num_labels) == usize::from(base.num_labels())
+}
+
 /// Whether every RRset relevant to the question carries an RRSIG.
 ///
 /// The unsigned-delegation probe is driven by this predicate. Presence of one
@@ -1084,21 +1107,26 @@ fn response_has_complete_relevant_signatures(
     qtype: RecordType,
 ) -> bool {
     let negative = is_negative_response(response, qname, qtype);
-    let covered: HashSet<(LowerName, RecordType)> = response
-        .answers
-        .iter()
-        .chain(response.authorities.iter())
-        .filter_map(|record| {
-            let sig: &SIG = match &record.data {
-                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => rrsig,
-                RData::DNSSEC(DNSSECRData::SIG(sig)) => sig,
-                _ => return None,
-            };
-            Some((LowerName::from(&record.name), sig.input().type_covered))
-        })
-        .collect();
-
     let relevant = relevant_answer_keys(response, qname, qtype);
+    let signature_for = |rrset: &Record| {
+        response
+            .answers
+            .iter()
+            .chain(response.authorities.iter())
+            .filter_map(|record| {
+                let sig: &SIG = match &record.data {
+                    RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => rrsig,
+                    RData::DNSSEC(DNSSECRData::SIG(sig)) => sig,
+                    _ => return None,
+                };
+                Some((&record.name, sig))
+            })
+            .any(|(owner, sig)| {
+                sig.input().type_covered == rrset.record_type()
+                    && signature_covers_rrset(owner, sig, &rrset.name)
+            })
+    };
+
     for record in &response.answers {
         if matches!(
             record.data,
@@ -1107,10 +1135,7 @@ fn response_has_complete_relevant_signatures(
             continue;
         }
         let key = (LowerName::from(&record.name), record.record_type());
-        if !relevant.contains(&key) {
-            continue;
-        }
-        if !covered.contains(&key) {
+        if relevant.contains(&key) && !signature_for(record) {
             return false;
         }
     }
@@ -1139,12 +1164,68 @@ fn response_has_complete_relevant_signatures(
                         .iter()
                         .chain(response.authorities.iter())
                         .any(|candidate| {
-                            candidate.name == record.name
-                                && candidate.record_type() == sig.input().type_covered
+                            candidate.record_type() == sig.input().type_covered
+                                && signature_covers_rrset(&record.name, sig, &candidate.name)
                         })
             });
     }
 
+    true
+}
+
+/// Whether the covering signatures for every relevant answer RRset have at
+/// least one candidate key.
+///
+/// A forged RRSIG that covers the answer's owner/type must not suppress the
+/// unsigned-delegation probe merely because a signature record exists. When no
+/// validated/cached key and no response DNSKEY matches the signature, probing
+/// is the only way to tell a stripped unsigned zone from a key-fetch failure;
+/// validation still fails closed afterwards if the probe cannot prove the zone
+/// unsigned.
+fn relevant_signatures_have_key_material(
+    key_cache: &KeyCache,
+    response: &Message,
+    qname: &Name,
+    qtype: RecordType,
+    now: u32,
+) -> bool {
+    let relevant = relevant_answer_keys(response, qname, qtype);
+    for rrset in &response.answers {
+        let key = (LowerName::from(&rrset.name), rrset.record_type());
+        if !relevant.contains(&key) {
+            continue;
+        }
+        let mut saw_signature = false;
+        let mut has_key = false;
+        for record in response.answers.iter().chain(response.authorities.iter()) {
+            let sig: &SIG = match &record.data {
+                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => rrsig,
+                RData::DNSSEC(DNSSECRData::SIG(sig)) => sig,
+                _ => continue,
+            };
+            if sig.input().type_covered != rrset.record_type()
+                || !signature_covers_rrset(&record.name, sig, &rrset.name)
+            {
+                continue;
+            }
+            saw_signature = true;
+            let signer = LowerName::from(&sig.input().signer_name);
+            // Only validated cached keys count. An attacker-supplied DNSKEY
+            // with the same tag/algorithm must not make a forged RRSIG look
+            // verifiable enough to suppress the probe; the chain fetch still
+            // gets a chance to validate real keys before the probe runs.
+            if key_cache
+                .get(&signer, sig.input().key_tag, now)
+                .is_some_and(|cached| cached.algorithm() == sig.input().algorithm)
+            {
+                has_key = true;
+                break;
+            }
+        }
+        if saw_signature && !has_key {
+            return false;
+        }
+    }
     true
 }
 
@@ -1614,6 +1695,9 @@ pub struct DnssecValidator {
     /// Short-lived probe backoff so a network outage cannot cause a DS fetch
     /// storm for names that cannot be classified. Never persisted.
     probe_backoff: DashMap<LowerName, u32>,
+    /// Chain-cache policy generation this validator was built under. Cache
+    /// inserts carrying an older generation are rejected after a hot reload.
+    policy_generation: AtomicU64,
 }
 
 impl DnssecValidator {
@@ -1630,6 +1714,7 @@ impl DnssecValidator {
             chain_cache: Arc::new(ChainCache::new(None)),
             anchor_zones: DashMap::new(),
             probe_backoff: DashMap::new(),
+            policy_generation: AtomicU64::new(0),
         }
     }
 
@@ -1730,6 +1815,11 @@ impl DnssecValidator {
             anchor_zones,
             nta_names,
         );
+        // Bind this validator to the generation it was configured under. An
+        // older validator kept alive by an in-flight query will fail its next
+        // cache insert after a reload changes the policy.
+        self.policy_generation
+            .store(self.chain_cache.policy_generation(), Ordering::Relaxed);
         match &change {
             PolicyChange::None => {}
             PolicyChange::FullClear => {
@@ -1860,8 +1950,16 @@ impl DnssecValidator {
         // Only authenticated evidence reaches this method: either a signer of
         // validated response data or an authenticated DS RRset. Persist it so
         // a restart (or hot reload) does not lose the downgrade protection.
-        self.chain_cache
-            .insert(zone.clone(), ZoneStatus::Signed, expiry, now);
+        // The generation check rejects writes from a validator that was built
+        // under a policy the shared cache has since replaced.
+        let generation = self.policy_generation.load(Ordering::Relaxed);
+        self.chain_cache.insert_for_generation(
+            zone.clone(),
+            ZoneStatus::Signed,
+            expiry,
+            now,
+            generation,
+        );
     }
 
     /// Whether `name` is inside a zone previously proven signed (and not
@@ -1898,8 +1996,14 @@ impl DnssecValidator {
     fn mark_insecure_zone(&self, zone: &LowerName, expiry: u32, now: u32) {
         self.signed_zones.remove(zone);
         self.insecure_zones.insert(zone.clone(), expiry);
-        self.chain_cache
-            .insert(zone.clone(), ZoneStatus::Unsigned, expiry, now);
+        let generation = self.policy_generation.load(Ordering::Relaxed);
+        self.chain_cache.insert_for_generation(
+            zone.clone(),
+            ZoneStatus::Unsigned,
+            expiry,
+            now,
+            generation,
+        );
     }
 
     /// Whether `name` is inside a zone proven to be an unsigned delegation.
@@ -2521,6 +2625,7 @@ impl DnssecValidator {
         let mut probe_failed = false;
         let mut budget_exhausted = false;
         let mut has_rrsigs = true;
+        let mut has_key_material = true;
         let mut query_is_nta = false;
         if self.mode != DnssecMode::Disabled
             && let Some(query) = response.queries.first()
@@ -2529,6 +2634,13 @@ impl DnssecValidator {
                 response,
                 query.name(),
                 query.query_type(),
+            );
+            has_key_material = relevant_signatures_have_key_material(
+                &self.key_cache,
+                response,
+                query.name(),
+                query.query_type(),
+                now,
             );
             query_is_nta = self.is_nta(query.name());
             if !has_rrsigs && !query_is_nta {
@@ -2657,6 +2769,37 @@ impl DnssecValidator {
         // `LogOnly` keeps the response and AD=0 for diagnostics; CD=1 and
         // disabled validation never reach this path.
         if outcome == ValidationOutcome::Indeterminate {
+            // A covering RRSIG with no candidate key may be a forgery over a
+            // legitimately unsigned delegation. The chain fetch above already
+            // had its chance to produce a key; probing now avoids turning that
+            // forgery into a persistent SERVFAIL (DoS) while still failing
+            // closed if no authenticated DS denial is found.
+            if has_rrsigs && !has_key_material && !query_is_nta {
+                let qname = response
+                    .queries
+                    .first()
+                    .map_or_else(Name::root, |query| query.name().clone());
+                let mut probes = 0usize;
+                for name in distinct_cname_chain_names(response, &qname) {
+                    let lower = LowerName::from(&name);
+                    if probes >= MAX_CNAME_PROBES && !self.unsigned_status_known(&lower, now) {
+                        break;
+                    }
+                    match self.prepare_unsigned_response(&lower, fetcher, now).await {
+                        UnsignedProbe::Covered => {}
+                        UnsignedProbe::Probed | UnsignedProbe::Failed => probes += 1,
+                    }
+                }
+                let proven_unsigned = cname_chain_names(response, &qname)
+                    .iter()
+                    .any(|name| self.insecure_zone_covers(&LowerName::from(name), now));
+                if proven_unsigned && !self.signed_chain_contains(response, &qname, now) {
+                    response.metadata.authentic_data = false;
+                    let outcome = ValidationOutcome::Insecure;
+                    self.metrics.record_validation(&outcome);
+                    return outcome;
+                }
+            }
             return self.indeterminate_outcome(response, upstream);
         }
         outcome
@@ -3078,8 +3221,18 @@ impl DnssecValidator {
                 .zip(helper_rrsigs.iter())
                 .any(|((owner, sig), is_helper)| {
                     !is_helper
-                        && relevant_keys
-                            .contains(&(LowerName::from(owner), sig.input().type_covered))
+                        && response
+                            .answers
+                            .iter()
+                            .chain(response.authorities.iter())
+                            .any(|record| {
+                                record.record_type() == sig.input().type_covered
+                                    && relevant_keys.contains(&(
+                                        LowerName::from(&record.name),
+                                        sig.input().type_covered,
+                                    ))
+                                    && signature_covers_rrset(owner, sig, &record.name)
+                            })
                 });
         let mut first_failure: Option<(&'static str, u16)> = key_set.time_failure;
         let mut policy_violation = false;
@@ -3092,13 +3245,32 @@ impl DnssecValidator {
             let inception = rrsig.input().sig_inception.get();
             let expiration = rrsig.input().sig_expiration.get();
             let type_covered = rrsig.input().type_covered;
+            // A normal RRSIG is owned by the RRset. A wildcard-expanded answer
+            // may carry it at `*.example` instead; map it to the expanded
+            // answer name so coverage, verification, and AD accounting use the
+            // actual RRset owner (Hickory reconstructs the wildcard name from
+            // the RRSIG Labels field during verification).
+            let rrset_owner = if rrsig_owner.is_wildcard() {
+                response
+                    .answers
+                    .iter()
+                    .find(|record| {
+                        record.record_type() == type_covered
+                            && signature_covers_rrset(rrsig_owner, rrsig, &record.name)
+                            && relevant_keys
+                                .contains(&(LowerName::from(&record.name), type_covered))
+                    })
+                    .map_or(rrsig_owner, |record| &record.name)
+            } else {
+                rrsig_owner
+            };
 
             // Failures on signatures for RRsets that are not relevant to the
             // question (e.g. stale RRSIGs in the authority section of an
             // otherwise valid answer) must not turn the response Bogus.
             // Chain-helper signatures are never relevant to the query.
             let rrsig_relevant =
-                !is_helper && relevant_keys.contains(&(LowerName::from(rrsig_owner), type_covered));
+                !is_helper && relevant_keys.contains(&(LowerName::from(rrset_owner), type_covered));
 
             // RFC 4035 5.3.1 with a bounded clock skew: a signature is usable
             // within +/- 300 s of its validity window.
@@ -3168,7 +3340,7 @@ impl DnssecValidator {
                 .iter()
                 .chain(response.authorities.iter())
                 .chain(response.additionals.iter())
-                .filter(|r| r.record_type() == type_covered && r.name == *rrsig_owner)
+                .filter(|r| r.record_type() == type_covered && r.name == *rrset_owner)
                 .collect();
 
             // An RRSIG that covers nothing in the response cannot authenticate
@@ -3204,7 +3376,7 @@ impl DnssecValidator {
                 self.metrics.record_signature_verification();
                 if dnskey
                     .verify_rrsig(
-                        rrsig_owner,
+                        rrset_owner,
                         DNSClass::IN,
                         &rrsig_rdata,
                         covered_records.iter().copied(),
@@ -3222,7 +3394,7 @@ impl DnssecValidator {
                 // the RRset owner. Without this containment check, any key
                 // validated for one domain could authenticate records owned by
                 // any other name (cross-zone signature forgery granting AD=1).
-                if !lower_signer.zone_of(&LowerName::from(rrsig_owner)) {
+                if !lower_signer.zone_of(&LowerName::from(rrset_owner)) {
                     candidate_failure.get_or_insert((
                         "RRSIG signer does not contain the RRset owner",
                         EDE_DNSSEC_BOGUS,
@@ -3261,7 +3433,7 @@ impl DnssecValidator {
             }
 
             has_trusted_sig = true;
-            trusted_covered.insert((LowerName::from(rrsig_owner), type_covered));
+            trusted_covered.insert((LowerName::from(rrset_owner), type_covered));
             if lower_signer.zone_of(&qname_lower) {
                 trusted_signer_covers_qname = true;
             }
@@ -3286,7 +3458,7 @@ impl DnssecValidator {
                 self.mark_signed_zone(&lower_signer, expiration, now);
             }
             trusted_sigs.push(TrustedSignature {
-                owner: LowerName::from(rrsig_owner),
+                owner: LowerName::from(rrset_owner),
                 covered: type_covered,
                 signer: lower_signer,
                 signer_name: signer_name.clone(),
@@ -3524,7 +3696,20 @@ impl DnssecValidator {
         // signed-zone evidence: for an otherwise unsigned response the result
         // is Insecure, not Indeterminate. A signed zone with a stripped answer
         // already failed closed in the `signed_zone_evidence` branch above.
-        if !has_relevant_rrsig && !has_denial_rrsig && !has_trusted_sig {
+        let signed_chain_evidence = self.signed_chain_contains(response, &qname, now)
+            || (negative
+                && self.signed_zone_contains(&negative_lower, now)
+                && !self.insecure_zone_covers(&negative_lower, now));
+        // An authenticated DS denial proves the name is legitimately unsigned.
+        // Any covering RRSIG without a trusted signature is then junk, not
+        // evidence of a stripped signed zone.
+        let unsigned_evidence = self.insecure_zone_covers(&qname_lower, now)
+            || (negative && self.insecure_zone_covers(&negative_lower, now));
+        if !has_denial_rrsig
+            && !has_trusted_sig
+            && (!has_relevant_rrsig || unsigned_evidence)
+            && !signed_chain_evidence
+        {
             response.metadata.authentic_data = false;
             let outcome = ValidationOutcome::Insecure;
             self.metrics.record_validation(&outcome);
@@ -4639,8 +4824,9 @@ mod tests {
             matches!(outcome, ValidationOutcome::Bogus { .. }),
             "a failed chain fetch must SERVFAIL in validate mode: {outcome:?}"
         );
-        // One DNSKEY and one DS lookup for the signer zone, then stop.
-        assert_eq!(fetcher.calls(), 2);
+        // One DNSKEY and one DS lookup for the signer zone, then one
+        // unverifiable-signature probe before failing closed.
+        assert_eq!(fetcher.calls(), 3);
         assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
         assert!(
             response.additionals.is_empty(),
@@ -8406,6 +8592,200 @@ mod tests {
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
         assert!(!response.metadata.authentic_data);
         assert!(!response.answers.is_empty(), "log-only keeps the answer");
+    }
+
+    /// Critical regression: an unsigned CNAME from an unsigned qname into a
+    /// target in a known-signed zone must not reach the "junk signature"
+    /// Insecure shortcut. The unrelated RRSIG only makes `rrsigs` non-empty;
+    /// it must not hide the stripped signed-target answer.
+    #[tokio::test]
+    async fn test_unsigned_cname_to_signed_target_with_junk_rrsig_is_bogus() {
+        use hickory_proto::rr::RecordSet;
+
+        let (validator, signed_origin, _key, signer) = signed_zone_validator("signed.example.");
+        let qname = Name::from_str("start.unsigned.example.").expect("qname");
+        let target = Name::from_str("www.signed.example.").expect("target");
+
+        let mut response = stripped_cname_response(&qname, &target);
+        let unrelated = Name::from_str("junk.signed.example.").expect("junk");
+        let mut set = RecordSet::new(unrelated.clone(), RecordType::A, 0);
+        set.insert(
+            Record::from_rdata(unrelated, 300, RData::A(A(Ipv4Addr::new(203, 0, 113, 98)))),
+            0,
+        );
+        response.answers.push(sign_test_rrset(&set, &signer));
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        assert!(
+            validator.signed_zone_contains(&LowerName::from(&signed_origin), now),
+            "the target zone must be seeded as signed"
+        );
+        let offline = OfflineFetcher::new();
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("junk-cname"), now, &offline)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a stripped signed CNAME target must not become Insecure: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+    }
+
+    /// A forged RRSIG that covers the answer owner/type has no usable key. It
+    /// must not suppress the unsigned-delegation probe (DoS/fail-closed), so
+    /// the authenticated DS denial can still prove the zone unsigned.
+    #[tokio::test]
+    async fn test_forged_covering_rrsig_still_probes_unsigned_delegation() {
+        use hickory_proto::rr::RecordSet;
+
+        let (zone, zone_key, zone_signer) = create_test_signer("signed.example.");
+        let cut = Name::from_str("unsigned.signed.example.").expect("cut");
+        let qname = Name::from_str("www.unsigned.signed.example.").expect("qname");
+
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+        validator.add_trust_anchor(&zone_key, LowerName::from(&zone));
+        let ds_message = signed_nsec_response(
+            &zone,
+            &cut,
+            &Name::from_str("z.signed.example.").expect("next"),
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+            &cut,
+            &zone_key,
+            &zone_signer,
+            ResponseCode::NoError,
+        );
+        let fetcher = StaticFetcher::new()
+            .with(
+                &zone,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&zone, &zone_key, &zone_signer),
+            )
+            .with(&cut, RecordType::DS, ds_message);
+
+        let answer = Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 98))),
+        );
+        // A cryptographically valid RRSIG from a completely unrelated signer:
+        // it covers the answer owner/type but the key is not validated. Also
+        // include the matching DNSKEY in the response: an attacker-supplied
+        // key must not make the forged signature look verifiable.
+        let (attacker_origin, attacker_key, attacker) =
+            create_test_signer("unsigned.signed.example.");
+        let mut set = RecordSet::new(qname.clone(), RecordType::A, 0);
+        set.insert(answer.clone(), 0);
+        let forged_sig = sign_test_rrset(&set, &attacker);
+
+        let mut response = Message::new(13, MessageType::Response, OpCode::Query);
+        response.queries.push(Query::query(qname, RecordType::A));
+        response.answers.push(answer);
+        response.answers.push(forged_sig);
+        response.additionals.push(Record::from_rdata(
+            attacker_origin,
+            300,
+            RData::DNSSEC(DNSSECRData::DNSKEY(attacker_key)),
+        ));
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("forged-cover"), now, &fetcher)
+            .await;
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Insecure,
+            "a forged covering RRSIG must not suppress the probe: {outcome:?}"
+        );
+        assert!(!response.metadata.authentic_data);
+        assert!(
+            fetcher.calls() > 0,
+            "the probe must have been attempted despite the signature"
+        );
+    }
+
+    /// A signed wildcard-expanded answer may carry the RRSIG at the wildcard
+    /// owner (`*.wild.example`) while the RRset is owned by the expanded qname.
+    /// Both response shapes must validate as Secure without forcing a probe.
+    #[tokio::test]
+    async fn test_signed_wildcard_answer_with_wildcard_owned_rrsig_is_secure() {
+        use hickory_proto::dnssec::rdata::{RRSIG, SigInput};
+        use hickory_proto::dnssec::{Algorithm, TBS};
+        use hickory_proto::rr::SerialNumber;
+
+        let (origin, dnskey, signer) = create_test_signer("wild.example.");
+        let qname = Name::from_str("www.wild.example.").expect("qname");
+        let wildcard = Name::from_str("*.wild.example.").expect("wildcard");
+        let answer = Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(203, 0, 113, 97))),
+        );
+        let now_utc = time::OffsetDateTime::now_utc();
+        let now = now_utc.unix_timestamp() as u32;
+        let input = SigInput {
+            type_covered: RecordType::A,
+            algorithm: Algorithm::ECDSAP256SHA256,
+            // Wildcard RRSIG labels exclude the `*` label.
+            num_labels: origin.num_labels(),
+            original_ttl: 300,
+            sig_expiration: SerialNumber::new(
+                now_utc
+                    .unix_timestamp()
+                    .saturating_add(300)
+                    .try_into()
+                    .expect("expiration"),
+            ),
+            sig_inception: SerialNumber::new(
+                now_utc
+                    .unix_timestamp()
+                    .saturating_sub(60)
+                    .try_into()
+                    .expect("inception"),
+            ),
+            key_tag: signer.calculate_key_tag().expect("key tag"),
+            signer_name: origin.clone(),
+        };
+        let tbs = TBS::from_input(&qname, DNSClass::IN, &input, std::iter::once(&answer))
+            .expect("wildcard tbs");
+        let signature = signer.sign(&tbs).expect("wildcard signature");
+        let rrsig_data = RRSIG::from_sig(input, signature);
+
+        for rrsig_owner in [wildcard, qname.clone()] {
+            let mut anchors = TrustAnchors::empty();
+            anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+            let validator =
+                DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+            let mut response = Message::new(14, MessageType::Response, OpCode::Query);
+            response
+                .queries
+                .push(Query::query(qname.clone(), RecordType::A));
+            response.answers.push(answer.clone());
+            response.answers.push(Record::from_rdata(
+                rrsig_owner,
+                300,
+                RData::DNSSEC(DNSSECRData::RRSIG(rrsig_data.clone())),
+            ));
+            response.additionals.push(Record::from_rdata(
+                origin.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+            ));
+
+            let offline = OfflineFetcher::new();
+            let outcome = validator
+                .validate_with_key_fetcher(&mut response, Some("wildcard"), now, &offline)
+                .await;
+            assert_eq!(
+                outcome,
+                ValidationOutcome::Secure,
+                "a signed wildcard answer must validate: {outcome:?}"
+            );
+            assert!(response.metadata.authentic_data);
+            assert_eq!(offline.calls(), 0, "a signed answer must not probe");
+        }
     }
 
     #[test]
