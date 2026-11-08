@@ -312,9 +312,29 @@ pub struct MetricsRegistry {
     ha_startup_noop: Arc<Mutex<BTreeMap<(String, String), u64>>>,
     querylog_dropped: Arc<AtomicU64>,
     filter_rules: Arc<AtomicU64>,
+    filter_state: Arc<AtomicU64>,
+    filter_lists_loaded: Arc<AtomicU64>,
+    filter_lists_failed: Arc<AtomicU64>,
+    filter_degraded_groups: Arc<AtomicU64>,
+    filter_dropped_regex: Arc<AtomicU64>,
     filter_compile_seconds: Arc<Mutex<HistogramState>>,
     build_version: String,
     build_commit: String,
+}
+
+/// Filter-engine lifecycle/health values exposed as Prometheus gauges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FilterStatusMetrics {
+    /// `0 = disabled`, `1 = loading`, `2 = ready`, `3 = failed`.
+    pub state: u8,
+    /// Configured lists that loaded successfully.
+    pub loaded_lists: u64,
+    /// Configured lists that failed.
+    pub failed_lists: u64,
+    /// Groups published in a degraded (partial) form.
+    pub degraded_groups: u64,
+    /// Regex/wildcard patterns dropped from the active snapshot.
+    pub dropped_regex_patterns: u64,
 }
 
 impl Default for MetricsRegistry {
@@ -348,6 +368,11 @@ impl MetricsRegistry {
             ha_startup_noop: Arc::new(Mutex::new(BTreeMap::new())),
             querylog_dropped: Arc::new(AtomicU64::new(0)),
             filter_rules: Arc::new(AtomicU64::new(0)),
+            filter_state: Arc::new(AtomicU64::new(0)),
+            filter_lists_loaded: Arc::new(AtomicU64::new(0)),
+            filter_lists_failed: Arc::new(AtomicU64::new(0)),
+            filter_degraded_groups: Arc::new(AtomicU64::new(0)),
+            filter_dropped_regex: Arc::new(AtomicU64::new(0)),
             filter_compile_seconds: Arc::new(Mutex::new(HistogramState::new())),
             build_version: version.into(),
             build_commit: commit.into(),
@@ -506,6 +531,22 @@ impl MetricsRegistry {
     pub fn set_filter_rules(&self, count: usize) {
         self.filter_rules
             .store(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Publishes filter-engine lifecycle/health gauges.
+    ///
+    /// `state` is `0 = disabled`, `1 = loading`, `2 = ready`, `3 = failed`.
+    pub fn set_filter_status(&self, status: FilterStatusMetrics) {
+        self.filter_state
+            .store(u64::from(status.state), Ordering::Relaxed);
+        self.filter_lists_loaded
+            .store(status.loaded_lists, Ordering::Relaxed);
+        self.filter_lists_failed
+            .store(status.failed_lists, Ordering::Relaxed);
+        self.filter_degraded_groups
+            .store(status.degraded_groups, Ordering::Relaxed);
+        self.filter_dropped_regex
+            .store(status.dropped_regex_patterns, Ordering::Relaxed);
     }
 
     /// Records how long the last filter snapshot compilation took.
@@ -975,6 +1016,50 @@ impl MetricsRegistry {
             self.filter_rules.load(Ordering::Relaxed)
         );
 
+        out.push_str(
+            "# HELP sito_filter_state Filter engine lifecycle (0 disabled, 1 loading, 2 ready, 3 failed)\n",
+        );
+        out.push_str("# TYPE sito_filter_state gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_filter_state {}",
+            self.filter_state.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP sito_filter_lists_loaded Configured filter lists loaded in the last reload\n",
+        );
+        out.push_str("# TYPE sito_filter_lists_loaded gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_filter_lists_loaded {}",
+            self.filter_lists_loaded.load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP sito_filter_lists_failed Configured filter lists that failed in the last reload\n");
+        out.push_str("# TYPE sito_filter_lists_failed gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_filter_lists_failed {}",
+            self.filter_lists_failed.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP sito_filter_degraded_groups Groups published with a partial rule class\n",
+        );
+        out.push_str("# TYPE sito_filter_degraded_groups gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_filter_degraded_groups {}",
+            self.filter_degraded_groups.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP sito_filter_dropped_regex_patterns Regex/wildcard patterns dropped from the active snapshot\n",
+        );
+        out.push_str("# TYPE sito_filter_dropped_regex_patterns gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_filter_dropped_regex_patterns {}",
+            self.filter_dropped_regex.load(Ordering::Relaxed)
+        );
+
         // 10. sito_filter_compile_seconds
         out.push_str(
             "# HELP sito_filter_compile_seconds Compilation duration for filter rule trie\n",
@@ -1393,6 +1478,13 @@ mod tests {
         reg.set_ha_diverged("sito-slave-1", true);
         reg.inc_ha_startup_noop("master", "replication_disabled");
         reg.set_querylog_dropped(1);
+        reg.set_filter_status(FilterStatusMetrics {
+            state: 2,
+            loaded_lists: 3,
+            failed_lists: 1,
+            degraded_groups: 1,
+            dropped_regex_patterns: 5,
+        });
 
         let rendered = reg.render_prometheus();
         let expected = r#"# HELP sito_queries_total Total DNS queries processed
@@ -1486,6 +1578,21 @@ sito_cache_stale_served_total 1
 # HELP sito_filter_rules Number of active filter rules per list
 # TYPE sito_filter_rules gauge
 sito_filter_rules{list="total"} 0
+# HELP sito_filter_state Filter engine lifecycle (0 disabled, 1 loading, 2 ready, 3 failed)
+# TYPE sito_filter_state gauge
+sito_filter_state 2
+# HELP sito_filter_lists_loaded Configured filter lists loaded in the last reload
+# TYPE sito_filter_lists_loaded gauge
+sito_filter_lists_loaded 3
+# HELP sito_filter_lists_failed Configured filter lists that failed in the last reload
+# TYPE sito_filter_lists_failed gauge
+sito_filter_lists_failed 1
+# HELP sito_filter_degraded_groups Groups published with a partial rule class
+# TYPE sito_filter_degraded_groups gauge
+sito_filter_degraded_groups 1
+# HELP sito_filter_dropped_regex_patterns Regex/wildcard patterns dropped from the active snapshot
+# TYPE sito_filter_dropped_regex_patterns gauge
+sito_filter_dropped_regex_patterns 5
 # HELP sito_filter_compile_seconds Compilation duration for filter rule trie
 # TYPE sito_filter_compile_seconds histogram
 sito_filter_compile_seconds_bucket{le="0.00025"} 0

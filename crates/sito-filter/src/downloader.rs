@@ -77,6 +77,7 @@ pub(crate) async fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), Fil
 pub struct ListDownloader {
     timeout: Duration,
     max_bytes: usize,
+    allow_empty: bool,
 }
 
 impl Default for ListDownloader {
@@ -88,7 +89,18 @@ impl Default for ListDownloader {
 impl ListDownloader {
     /// Creates a new `ListDownloader` with specified timeout and byte limit.
     pub fn new(timeout: Duration, max_bytes: usize) -> Self {
-        Self { timeout, max_bytes }
+        Self {
+            timeout,
+            max_bytes,
+            allow_empty: false,
+        }
+    }
+
+    /// Accepts empty list bodies (explicit `filtering.allow_empty_list`).
+    #[must_use]
+    pub fn with_allow_empty(mut self, allow_empty: bool) -> Self {
+        self.allow_empty = allow_empty;
+        self
     }
 
     /// Fetches a list from URL or file:// URI, falling back to disk cache if download fails.
@@ -105,7 +117,8 @@ impl ListDownloader {
             3,
             Duration::from_millis(50),
         )
-        .with_file_root(data_dir);
+        .with_file_root(data_dir)
+        .with_allow_empty(self.allow_empty);
         fetcher.fetch_or_cached(list_name, url, data_dir).await
     }
 }

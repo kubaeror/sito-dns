@@ -2,9 +2,12 @@
 
 use crate::downloader::{DEFAULT_DOWNLOAD_TIMEOUT, ListDownloader};
 use crate::error::FilterError;
-use crate::parser::{DnsRewriteRule, Pattern, Rule, RuleKind, parse_rules};
+use crate::parser::{
+    DnsRewriteRule, ParseError, ParseLimits, Pattern, Rule, RuleKind, parse_rules_with_limits,
+};
 use crate::structures::{
-    CompileBudget, CompileBudgetExceeded, CompiledRuleSet, LabelInterner, MAX_REGEX_PATTERN_BYTES,
+    CompileBudget, CompileBudgetExceeded, CompiledRuleSet, LabelInterner, MAX_AC_PATTERN_BYTES,
+    MAX_AC_PATTERNS, MAX_PREFIX_PATTERN_BYTES, MAX_PREFIX_PATTERNS, MAX_REGEX_PATTERN_BYTES,
     MAX_REGEX_PATTERNS, RuleSetBuilder,
 };
 use arc_swap::ArcSwap;
@@ -17,11 +20,15 @@ use sito_core::verdict::{BlockReason, RewriteAction, RuleRef, Verdict};
 use sito_proto::normalize_domain;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 /// Callback receiving the wall-clock duration of each parse+compile attempt.
 pub type CompileObserver = Arc<dyn Fn(f64) + Send + Sync>;
+
+/// Callback receiving every new [`FilterStatus`] snapshot (API/metrics sink).
+pub type StatusObserver = Arc<dyn Fn(&FilterStatus) + Send + Sync>;
 
 /// Lifecycle state of the filter engine's active snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -53,6 +60,19 @@ pub struct FilterStatus {
     /// Wall-clock duration of the last parse+compile attempt in milliseconds,
     /// set on success and failure.
     pub last_compile_ms: Option<u64>,
+    /// True when no usable snapshot is active (fail-closed mode answers
+    /// SERVFAIL). Mirrors [`FilterSnapshot::unavailable`] for observers that
+    /// cannot read the snapshot directly.
+    pub unavailable: bool,
+    /// Regex/wildcard patterns dropped from the active snapshot because they
+    /// could not be compiled.
+    pub dropped_regex_patterns: usize,
+    /// Groups whose snapshot was published without part of its rule class
+    /// (regex/wildcard or substring/prefix) after a budget/limit failure.
+    pub degraded_groups: Vec<String>,
+    /// Lists whose newest content was rejected (parse/limit/empty) while a
+    /// previous snapshot was retained.
+    pub degraded_lists: Vec<String>,
 }
 
 /// In-memory snapshot of compiled filter rules.
@@ -656,35 +676,67 @@ fn refresh_schedule(
     (sleep_for, due)
 }
 
-/// Returns a reason when a parsed list's regex/wildcard load exceeds the
-/// per-set compilation limits; the list must then be rejected instead of
-/// letting a hostile list consume unbounded DFA compile resources.
-fn regex_load_exceeds_limits(rules: &[Rule]) -> Option<String> {
-    let mut count = 0usize;
-    let mut bytes = 0usize;
+/// Returns a reason when a parsed list's Aho-Corasick, prefix or regex load
+/// exceeds the per-set compilation limits; the list must then be rejected
+/// instead of letting a hostile list consume unbounded compile resources.
+fn pattern_load_exceeds_limits(rules: &[Rule]) -> Option<String> {
+    let mut regex_count = 0usize;
+    let mut regex_bytes = 0usize;
+    let mut ac_count = 0usize;
+    let mut ac_bytes = 0usize;
+    let mut prefix_count = 0usize;
+    let mut prefix_bytes = 0usize;
     for rule in rules {
         match &rule.pattern {
             Pattern::Regex(pattern) => {
-                count += 1;
-                bytes += pattern.len();
+                regex_count += 1;
+                regex_bytes += pattern.len();
             }
             Pattern::Wildcard(pattern) => {
-                count += 1;
+                regex_count += 1;
                 // Count the expanded regex size so the engine-side limit
                 // matches what the DFA builder would have to compile.
-                bytes += crate::structures::wildcard_to_regex(pattern).len();
+                regex_bytes += crate::structures::wildcard_to_regex(pattern).len();
+            }
+            Pattern::Substring(pattern) => {
+                ac_count += 1;
+                ac_bytes += pattern.len();
+            }
+            Pattern::Prefix(pattern) => {
+                prefix_count += 1;
+                prefix_bytes += pattern.len();
             }
             _ => {}
         }
     }
-    if count > MAX_REGEX_PATTERNS {
+    if regex_count > MAX_REGEX_PATTERNS {
         return Some(format!(
-            "{count} regex/wildcard patterns exceed the limit of {MAX_REGEX_PATTERNS}"
+            "{regex_count} regex/wildcard patterns exceed the limit of {MAX_REGEX_PATTERNS}"
         ));
     }
-    if bytes > MAX_REGEX_PATTERN_BYTES {
+    if regex_bytes > MAX_REGEX_PATTERN_BYTES {
         return Some(format!(
-            "{bytes} regex/wildcard pattern bytes exceed the limit of {MAX_REGEX_PATTERN_BYTES}"
+            "{regex_bytes} regex/wildcard pattern bytes exceed the limit of {MAX_REGEX_PATTERN_BYTES}"
+        ));
+    }
+    if ac_count > MAX_AC_PATTERNS {
+        return Some(format!(
+            "{ac_count} substring patterns exceed the limit of {MAX_AC_PATTERNS}"
+        ));
+    }
+    if ac_bytes > MAX_AC_PATTERN_BYTES {
+        return Some(format!(
+            "{ac_bytes} substring pattern bytes exceed the limit of {MAX_AC_PATTERN_BYTES}"
+        ));
+    }
+    if prefix_count > MAX_PREFIX_PATTERNS {
+        return Some(format!(
+            "{prefix_count} prefix patterns exceed the limit of {MAX_PREFIX_PATTERNS}"
+        ));
+    }
+    if prefix_bytes > MAX_PREFIX_PATTERN_BYTES {
+        return Some(format!(
+            "{prefix_bytes} prefix pattern bytes exceed the limit of {MAX_PREFIX_PATTERN_BYTES}"
         ));
     }
     None
@@ -747,6 +799,11 @@ pub struct HostsFilterEngine {
     /// Optional sink for compile durations (wired to the metrics registry by
     /// the server binary; the filter crate cannot depend on sito-stats).
     compile_observer: std::sync::RwLock<Option<CompileObserver>>,
+    /// Optional sink for status snapshots (API/metrics observability).
+    status_observer: std::sync::RwLock<Option<StatusObserver>>,
+    /// Incremented whenever `list_rules` changes. A group rebuild that started
+    /// from an older generation must not publish its stale snapshot.
+    list_generation: AtomicU64,
 }
 
 impl HostsFilterEngine {
@@ -770,6 +827,8 @@ impl HostsFilterEngine {
             group_defs: ArcSwap::new(Arc::new(Vec::new())),
             group_snapshots: ArcSwap::new(Arc::new(FnvHashMap::default())),
             compile_observer: std::sync::RwLock::new(None),
+            status_observer: std::sync::RwLock::new(None),
+            list_generation: AtomicU64::new(0),
         }
     }
 
@@ -780,6 +839,17 @@ impl HostsFilterEngine {
     pub fn set_compile_observer(&self, observer: CompileObserver) {
         *self
             .compile_observer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+    }
+
+    /// Installs the status observer (usually the metrics registry adapter).
+    ///
+    /// The observer runs synchronously whenever a new [`FilterStatus`] is
+    /// published, so API- and scheduler-driven reloads both update metrics.
+    pub fn set_status_observer(&self, observer: StatusObserver) {
+        *self
+            .status_observer
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
     }
@@ -805,7 +875,19 @@ impl HostsFilterEngine {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
-        self.rebuild_group_snapshots(&list_rules);
+        if let Some(degraded) = self.rebuild_group_snapshots(&list_rules) {
+            self.update_group_status(degraded);
+        }
+    }
+
+    /// Updates only the group portion of the published status.
+    fn update_group_status(&self, degraded: Vec<String>) {
+        let mut status = self.status();
+        if status.degraded_groups == degraded {
+            return;
+        }
+        status.degraded_groups = degraded;
+        self.set_status(status);
     }
 
     /// Returns the compiled extra rule set for `group`, if the group defines any.
@@ -819,13 +901,29 @@ impl HostsFilterEngine {
     /// Lists a group references but that are not loaded are skipped (the group
     /// still gets its custom rules); a group with no usable rules is removed so
     /// the pipeline does not evaluate an empty set.
-    fn rebuild_group_snapshots(&self, list_rules: &FnvHashMap<String, Vec<Rule>>) {
+    fn rebuild_group_snapshots(
+        &self,
+        list_rules: &FnvHashMap<String, Vec<Rule>>,
+    ) -> Option<Vec<String>> {
+        // Capture the list generation this rebuild is based on. A concurrent
+        // list reload bumps the generation; publishing a snapshot compiled
+        // from the older map must then be discarded.
+        let generation = self.list_generation.load(Ordering::SeqCst);
+        self.rebuild_group_snapshots_at(list_rules, generation)
+    }
+
+    fn rebuild_group_snapshots_at(
+        &self,
+        list_rules: &FnvHashMap<String, Vec<Rule>>,
+        generation: u64,
+    ) -> Option<Vec<String>> {
         let defs = self.group_defs.load();
         let config = self.config.load();
         let max_rules = config.max_rules;
         let compile_budget_ms = config.regex_compile_budget_ms;
         let previous = self.group_snapshots.load();
         let mut compiled = FnvHashMap::default();
+        let mut degraded_groups = Vec::new();
         for def in defs.iter() {
             let mut rules = Vec::new();
             for list_name in &def.lists {
@@ -839,20 +937,35 @@ impl HostsFilterEngine {
                     );
                 }
             }
+            let source = format!("group:{}", def.name);
             for rule_text in &def.custom_rules {
-                let (parsed, rejected) = parse_rules(rule_text, &format!("group:{}", def.name));
-                if rejected > 0 {
-                    warn!(
-                        group = %def.name,
-                        "Rejected {} invalid rule(s) in group custom_rules",
-                        rejected
-                    );
+                let limits =
+                    ParseLimits::new(max_rules.saturating_sub(rules.len()), config.max_list_bytes);
+                match parse_rules_with_limits(rule_text, &source, limits) {
+                    Ok((parsed, rejected)) => {
+                        if rejected > 0 {
+                            warn!(
+                                group = %def.name,
+                                "Rejected {} invalid rule(s) in group custom_rules",
+                                rejected
+                            );
+                        }
+                        rules.extend(parsed);
+                    }
+                    Err(ParseError::TooManyRules { .. } | ParseError::TooManyBytes { .. }) => {
+                        error!(
+                            group = %def.name,
+                            "Group custom_rules exceed the parsing budget; truncating group rules"
+                        );
+                        degraded_groups.push(def.name.clone());
+                        break;
+                    }
                 }
-                rules.extend(parsed);
             }
             if rules.is_empty() {
                 continue;
             }
+            let mut degraded = false;
             if rules.len() > max_rules {
                 error!(
                     group = %def.name,
@@ -861,22 +974,45 @@ impl HostsFilterEngine {
                     "Group filter rule set exceeds filtering.max_rules; truncating to limit"
                 );
                 rules.truncate(max_rules);
+                degraded = true;
             }
-            if let Some(reason) = regex_load_exceeds_limits(&rules) {
+
+            // Never drop a whole group on a compile-limit failure: first
+            // remove only the offending class (regex/wildcard, then
+            // substring/prefix) so exact/domain/custom rules still apply.
+            if let Some(reason) = pattern_load_exceeds_limits(&rules) {
                 error!(
                     group = %def.name,
                     reason = %reason,
-                    "Group filter rule set exceeds regex compilation limits; skipping group regexes"
+                    "Group filter rule set exceeds regex compilation limits; publishing the non-regex subset"
                 );
                 rules.retain(|r| !matches!(r.pattern, Pattern::Regex(_) | Pattern::Wildcard(_)));
+                degraded = true;
+                if let Some(reason) = pattern_load_exceeds_limits(&rules) {
+                    error!(
+                        group = %def.name,
+                        reason = %reason,
+                        "Group substring/prefix load still exceeds limits; publishing only exact/domain rules"
+                    );
+                    rules.retain(|r| {
+                        !matches!(r.pattern, Pattern::Substring(_) | Pattern::Prefix(_))
+                    });
+                }
             }
             if rules.is_empty() {
+                // All rules were in a rejected class. Keep the previous
+                // snapshot when one exists and mark the group degraded so it
+                // never disappears silently.
+                degraded_groups.push(def.name.clone());
+                if let Some(previous) = previous.get(&def.name) {
+                    compiled.insert(def.name.clone(), Arc::clone(previous));
+                }
                 continue;
             }
             let budget = compile_budget_ms
                 .map(Duration::from_millis)
                 .map(CompileBudget::new);
-            match FilterSnapshot::compile_with_budget(rules, budget.as_ref()) {
+            match FilterSnapshot::compile_with_budget(rules.clone(), budget.as_ref()) {
                 Ok(snapshot) => {
                     compiled.insert(def.name.clone(), Arc::new(snapshot));
                 }
@@ -885,15 +1021,51 @@ impl HostsFilterEngine {
                         group = %def.name,
                         elapsed_ms = e.elapsed_ms,
                         limit_ms = e.limit_ms,
-                        "Group snapshot exceeded the regex compile budget; retaining the previous snapshot for this group"
+                        "Group snapshot exceeded the regex compile budget; publishing the non-regex subset"
                     );
-                    if let Some(previous) = previous.get(&def.name) {
-                        compiled.insert(def.name.clone(), Arc::clone(previous));
+                    degraded = true;
+                    rules
+                        .retain(|r| !matches!(r.pattern, Pattern::Regex(_) | Pattern::Wildcard(_)));
+                    if rules.is_empty() {
+                        if let Some(previous) = previous.get(&def.name) {
+                            compiled.insert(def.name.clone(), Arc::clone(previous));
+                        }
+                    } else {
+                        match FilterSnapshot::compile_with_budget(rules, None) {
+                            Ok(snapshot) => {
+                                compiled.insert(def.name.clone(), Arc::new(snapshot));
+                            }
+                            Err(e) => {
+                                error!(
+                                    group = %def.name,
+                                    elapsed_ms = e.elapsed_ms,
+                                    limit_ms = e.limit_ms,
+                                    "Group non-regex fallback compilation failed; retaining the previous snapshot"
+                                );
+                                if let Some(previous) = previous.get(&def.name) {
+                                    compiled.insert(def.name.clone(), Arc::clone(previous));
+                                }
+                            }
+                        }
                     }
                 }
             }
+            if degraded {
+                degraded_groups.push(def.name.clone());
+            }
         }
+
+        if self.list_generation.load(Ordering::SeqCst) != generation {
+            warn!(
+                generation,
+                "Discarding stale group snapshot rebuild; a list reload completed concurrently"
+            );
+            return None;
+        }
+        degraded_groups.sort_unstable();
+        degraded_groups.dedup();
         self.group_snapshots.store(Arc::new(compiled));
+        Some(degraded_groups)
     }
 
     /// Initializes and loads lists immediately (from download or disk cache).
@@ -963,6 +1135,14 @@ impl HostsFilterEngine {
     }
 
     fn set_status(&self, status: FilterStatus) {
+        let observer = self
+            .status_observer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(observer) = observer {
+            observer(&status);
+        }
         self.status.store(Arc::new(status));
     }
 
@@ -1021,12 +1201,54 @@ impl HostsFilterEngine {
             return Ok(0);
         }
 
+        // P2-95: filtering enabled with nothing to load must fail closed, not
+        // advertise an empty `Ready` snapshot. Custom rules count as a source
+        // when at least one non-blank entry is configured.
+        let has_source = config.lists.iter().any(|list| list.enabled)
+            || config
+                .custom_rules
+                .iter()
+                .any(|rule| !rule.trim().is_empty());
+        if !has_source {
+            let prev_count = self.snapshot.load().rule_count;
+            if prev_count > 0 && !self.snapshot.load().unavailable {
+                // A configured-but-now-empty source set must not replace the
+                // last good snapshot; keep protecting with it and surface the
+                // configuration problem.
+                let reason = "filtering.enabled has no configured sources; retained the previous filter snapshot".to_string();
+                warn!("{reason}");
+                self.set_status(FilterStatus {
+                    state: FilterState::Ready,
+                    rule_count: prev_count,
+                    last_error: Some(reason),
+                    unavailable: false,
+                    dropped_regex_patterns: self.snapshot.load().dropped_regex_patterns,
+                    ..FilterStatus::default()
+                });
+                return Ok(prev_count);
+            }
+            self.snapshot.store(Arc::new(FilterSnapshot::unavailable()));
+            self.list_rules.lock().unwrap().clear();
+            self.set_status(FilterStatus {
+                state: FilterState::Failed,
+                rule_count: 0,
+                unavailable: true,
+                last_error: Some(
+                    "filtering.enabled is true but no filter lists or custom rules are configured"
+                        .to_string(),
+                ),
+                ..FilterStatus::default()
+            });
+            return Err(FilterError::NoSourcesConfigured);
+        }
+
         let mut list_contents = Vec::new();
         // Build the downloader from the configuration being applied instead of
         // caching one next to `self.config`: the two would otherwise be
         // independent values that a concurrent reload could observe as a
         // mismatched pair (new cap, old downloader or vice versa).
-        let downloader = ListDownloader::new(DEFAULT_DOWNLOAD_TIMEOUT, config.max_list_bytes);
+        let downloader = ListDownloader::new(DEFAULT_DOWNLOAD_TIMEOUT, config.max_list_bytes)
+            .with_allow_empty(config.allow_empty_list);
         // Names of lists whose content was fetched (from network or cache) in
         // this cycle. `loaded_lists` is derived from this set minus
         // `failed_lists` so a list can never be counted as both.
@@ -1066,6 +1288,8 @@ impl HostsFilterEngine {
 
         let custom_rules = config.custom_rules.clone();
         let max_rules = config.max_rules;
+        let max_list_bytes = config.max_list_bytes;
+        let allow_empty = config.allow_empty_list;
         let base_rules = self.list_rules.lock().unwrap().clone();
         let enabled_names: FnvHashSet<String> = config
             .lists
@@ -1087,30 +1311,96 @@ impl HostsFilterEngine {
             // Drop rules for lists that are no longer enabled/configured.
             map.retain(|name, _| enabled_names.contains(name));
 
+            // A fetched list replaces its previous entry only after parsing
+            // succeeds. Budget accounting therefore starts from the retained
+            // entries and any failures keep the old rules in place.
+            let fetched_names: FnvHashSet<String> =
+                list_contents.iter().map(|(name, _)| name.clone()).collect();
+            let mut candidate_total: usize = map
+                .iter()
+                .filter(|(name, _)| !fetched_names.contains(*name))
+                .map(|(_, rules)| rules.len())
+                .sum();
+
             let mut rejected = Vec::new();
             for (name, content) in list_contents {
-                let (rules, _) = parse_rules(&content, &name);
-                if let Some(reason) = regex_load_exceeds_limits(&rules) {
-                    error!(
+                let remaining = max_rules.saturating_sub(candidate_total);
+                let limits = ParseLimits::new(remaining, max_list_bytes);
+                let rules = match parse_rules_with_limits(&content, &name, limits) {
+                    Ok((rules, _)) => rules,
+                    Err(ParseError::TooManyRules { count, limit }) => {
+                        error!(
+                            list = %name,
+                            count,
+                            limit,
+                            "Rejecting blocklist that exceeds the parsing rule budget"
+                        );
+                        return Err(FilterError::TooManyRules {
+                            count: candidate_total.saturating_add(count),
+                            limit: max_rules,
+                        });
+                    }
+                    Err(e) => {
+                        error!(
+                            list = %name,
+                            error = %e,
+                            limit = max_list_bytes,
+                            "Rejecting blocklist that exceeds the parsing byte budget"
+                        );
+                        return Err(FilterError::CompileTaskFailed(format!("{name}: {e}")));
+                    }
+                };
+                if rules.is_empty() && !allow_empty {
+                    // An empty 200 response, an HTML error page that parsed
+                    // into nothing, or a zero-yield list must not replace the
+                    // previous rules with an empty set.
+                    warn!(
                         list = %name,
-                        reason = %reason,
-                        "Rejecting blocklist with excessive regex pattern load"
+                        bytes = content.len(),
+                        "Rejecting empty/zero-yield blocklist response"
                     );
                     rejected.push(name);
                     continue;
                 }
+                if let Some(reason) = pattern_load_exceeds_limits(&rules) {
+                    error!(
+                        list = %name,
+                        reason = %reason,
+                        "Rejecting blocklist with excessive pattern load"
+                    );
+                    rejected.push(name);
+                    continue;
+                }
+                candidate_total = candidate_total.saturating_add(rules.len());
                 map.insert(name, rules);
             }
 
             let mut parsed_custom = Vec::new();
             for rule_text in &custom_rules {
-                let (rules, _) = parse_rules(rule_text, "custom");
-                parsed_custom.extend(rules);
+                let remaining = max_rules.saturating_sub(candidate_total + parsed_custom.len());
+                match parse_rules_with_limits(
+                    rule_text,
+                    "custom",
+                    ParseLimits::new(remaining, max_list_bytes),
+                ) {
+                    Ok((rules, _)) => parsed_custom.extend(rules),
+                    Err(ParseError::TooManyRules { count, .. }) => {
+                        return Err(FilterError::TooManyRules {
+                            count: candidate_total
+                                .saturating_add(parsed_custom.len())
+                                .saturating_add(count),
+                            limit: max_rules,
+                        });
+                    }
+                    Err(e) => {
+                        return Err(FilterError::CompileTaskFailed(format!("custom: {e}")));
+                    }
+                }
             }
-            if let Some(reason) = regex_load_exceeds_limits(&parsed_custom) {
+            if let Some(reason) = pattern_load_exceeds_limits(&parsed_custom) {
                 error!(
                     reason = %reason,
-                    "Rejecting custom_rules with excessive regex pattern load"
+                    "Rejecting custom_rules with excessive pattern load"
                 );
                 return Err(FilterError::CompileTaskFailed(reason));
             }
@@ -1164,6 +1454,8 @@ impl HostsFilterEngine {
                 last_compile_ms: Some(
                     u64::try_from(compile_started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 ),
+                unavailable: self.snapshot.load().unavailable,
+                ..FilterStatus::default()
             });
             FilterError::CompileTaskFailed(e.to_string())
         })?;
@@ -1189,6 +1481,8 @@ impl HostsFilterEngine {
                         failed_lists: failed_lists.clone(),
                         last_error: Some(e.to_string()),
                         last_compile_ms: Some(compile_elapsed_ms),
+                        unavailable: true,
+                        ..FilterStatus::default()
                     });
                 } else {
                     self.set_status(FilterStatus {
@@ -1198,12 +1492,19 @@ impl HostsFilterEngine {
                         failed_lists: failed_lists.clone(),
                         last_error: Some(e.to_string()),
                         last_compile_ms: Some(compile_elapsed_ms),
+                        unavailable: false,
+                        dropped_regex_patterns: self.snapshot.load().dropped_regex_patterns,
+                        ..FilterStatus::default()
                     });
                 }
                 return Err(e);
             }
         };
 
+        // Lists whose newest content was rejected (empty/HTML/zero-yield or
+        // over the pattern budget) retain their previous rules but are
+        // reported as both failed (not refreshed) and degraded.
+        let degraded_lists = rejected_lists.clone();
         failed_lists.extend(rejected_lists);
         // A list rejected during compilation was already counted as fetched;
         // subtract it here so the status never reports it as both loaded and
@@ -1211,6 +1512,59 @@ impl HostsFilterEngine {
         let loaded_lists = count_loaded_lists(&fetched_lists, &failed_lists);
 
         let prev_count = self.snapshot.load().rule_count;
+        if count == 0 && !allow_empty {
+            // No usable rules were produced. This covers an empty/HTML/zero
+            // list on a reload as well as a comment-only source: never publish
+            // an empty snapshot that would silently disable filtering.
+            if prev_count > 0 {
+                let reason = if failed_lists.is_empty() {
+                    "new configuration yielded no rules; retained the previous filter snapshot"
+                        .to_string()
+                } else {
+                    format!(
+                        "new configuration yielded no usable rules ({} list(s) failed); retained the previous filter snapshot: {}",
+                        failed_lists.len(),
+                        failed_lists.join(", ")
+                    )
+                };
+                warn!("{reason}");
+                self.set_status(FilterStatus {
+                    state: FilterState::Ready,
+                    rule_count: prev_count,
+                    loaded_lists,
+                    failed_lists,
+                    last_error: Some(reason.clone()),
+                    last_compile_ms: Some(compile_elapsed_ms),
+                    unavailable: false,
+                    dropped_regex_patterns: self.snapshot.load().dropped_regex_patterns,
+                    ..FilterStatus::default()
+                });
+                return Err(FilterError::NoUsableRules { details: reason });
+            }
+            let details = if failed_lists.is_empty() {
+                "configured filter sources yielded no usable rules".to_string()
+            } else {
+                format!(
+                    "all {} configured filter source(s) failed to load or yielded no rules: {}",
+                    failed_lists.len(),
+                    failed_lists.join(", ")
+                )
+            };
+            error!(details = %details, "Refusing to advertise an enabled empty filter snapshot");
+            self.snapshot.store(Arc::new(FilterSnapshot::unavailable()));
+            self.set_status(FilterStatus {
+                state: FilterState::Failed,
+                rule_count: 0,
+                loaded_lists,
+                failed_lists: failed_lists.clone(),
+                last_error: Some(details.clone()),
+                last_compile_ms: Some(compile_elapsed_ms),
+                unavailable: true,
+                ..FilterStatus::default()
+            });
+            return Err(FilterError::NoUsableRules { details });
+        }
+
         if apply_drop_guard
             && prev_count > 0
             && (count == 0 || count.saturating_mul(2) < prev_count)
@@ -1232,6 +1586,9 @@ impl HostsFilterEngine {
                 failed_lists,
                 last_error: Some(reason),
                 last_compile_ms: Some(compile_elapsed_ms),
+                unavailable: false,
+                dropped_regex_patterns: self.snapshot.load().dropped_regex_patterns,
+                ..FilterStatus::default()
             });
             return Ok(prev_count);
         }
@@ -1259,6 +1616,8 @@ impl HostsFilterEngine {
                 failed_lists: failed_lists.clone(),
                 last_error: Some(details.clone()),
                 last_compile_ms: Some(compile_elapsed_ms),
+                unavailable: true,
+                ..FilterStatus::default()
             });
             return Err(FilterError::NoSourcesLoaded {
                 failed: failed_lists.len(),
@@ -1274,16 +1633,22 @@ impl HostsFilterEngine {
         }
         self.snapshot.store(Arc::new(new_snapshot));
         *self.list_rules.lock().unwrap() = new_list_rules;
+        // Bump the generation before rebuilding groups. A concurrent
+        // `set_group_rules` that started from the old list map will detect the
+        // change and discard its stale compilation instead of overwriting the
+        // fresh snapshot.
+        self.list_generation.fetch_add(1, Ordering::SeqCst);
         // Group rule sets are selected from the list rules, so they must track
         // the freshly loaded snapshot.
-        {
+        let degraded_groups = {
             let list_rules = self
                 .list_rules
                 .lock()
                 .map(|g| g.clone())
                 .unwrap_or_default();
-            self.rebuild_group_snapshots(&list_rules);
-        }
+            self.rebuild_group_snapshots(&list_rules)
+                .unwrap_or_default()
+        };
         let last_error = if failed_lists.is_empty() {
             None
         } else {
@@ -1300,6 +1665,10 @@ impl HostsFilterEngine {
             failed_lists,
             last_error,
             last_compile_ms: Some(compile_elapsed_ms),
+            unavailable: false,
+            dropped_regex_patterns: self.snapshot.load().dropped_regex_patterns,
+            degraded_groups,
+            degraded_lists,
         });
         info!(rule_count = count, "Filter snapshot compiled and loaded");
         Ok(count)
@@ -1884,6 +2253,257 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
+    /// P2-95: `filtering.enabled` with zero sources must fail closed instead
+    /// of publishing an empty `Ready` snapshot.
+    #[tokio::test]
+    async fn test_zero_sources_fail_closed_not_ready() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_zero_sources_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let config = FilteringConfig {
+            enabled: true,
+            fail_closed: true,
+            lists: Vec::new(),
+            custom_rules: Vec::new(),
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+
+        assert_eq!(engine.state(), FilterState::Failed);
+        let status = engine.status();
+        assert!(status.unavailable, "the status must report unavailability");
+        assert!(
+            status.last_error.is_some(),
+            "the failure reason must be observable"
+        );
+
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let qname = Name::from_str("anything.example.").unwrap();
+        assert_eq!(
+            engine.evaluate(&qname, RecordType::A, &client),
+            Verdict::Block(BlockReason::FilterUnavailable),
+            "zero sources must fail closed"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-8: a list that loads successfully but yields zero rules must not
+    /// replace the previous snapshot when `allow_empty_list` is false.
+    #[tokio::test]
+    async fn test_zero_yield_list_retains_previous_snapshot() {
+        let temp_dir = std::env::temp_dir().join(format!("sito_zero_yield_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let path = temp_dir.join("list.txt");
+        tokio::fs::write(&path, "||keep.example^\n").await.unwrap();
+
+        let config = FilteringConfig {
+            lists: vec![FilterListConfig {
+                name: "source".to_string(),
+                url: format!("file://{}", path.display()),
+                enabled: true,
+                refresh_hours: None,
+            }],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(config.clone(), temp_dir.clone()).await;
+        assert_eq!(engine.rule_count(), 1);
+
+        // Non-empty body that parses to zero rules (comments only).
+        tokio::fs::write(&path, "! comment only\n").await.unwrap();
+        let count = engine.reload_with_config(&config).await.unwrap();
+        assert_eq!(count, 1, "the previous rule must be retained");
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            engine
+                .evaluate(
+                    &Name::from_str("keep.example.").unwrap(),
+                    RecordType::A,
+                    &client
+                )
+                .is_blocked()
+        );
+        assert_eq!(engine.status().failed_lists, vec!["source".to_string()]);
+        assert_eq!(
+            engine.status().degraded_lists,
+            vec!["source".to_string()],
+            "a list that kept its previous rules must be reported as degraded"
+        );
+
+        // The explicit opt-in allows an empty snapshot.
+        let allow_empty = FilteringConfig {
+            allow_empty_list: true,
+            ..config
+        };
+        let count = engine.reload_with_config(&allow_empty).await.unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(engine.state(), FilterState::Ready);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-8/P2-95: a zero-yield response on the initial load must leave the
+    /// engine failed and fail closed rather than advertising an empty `Ready`.
+    #[tokio::test]
+    async fn test_zero_yield_initial_load_fails_closed() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_zero_yield_init_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let path = temp_dir.join("empty.txt");
+        tokio::fs::write(&path, "! comment only\n").await.unwrap();
+
+        let engine = HostsFilterEngine::init(
+            FilteringConfig {
+                lists: vec![FilterListConfig {
+                    name: "empty".to_string(),
+                    url: format!("file://{}", path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                }],
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        )
+        .await;
+
+        assert_eq!(engine.state(), FilterState::Failed);
+        assert!(engine.unavailable_for_fail_closed());
+        assert_eq!(engine.status().failed_lists, vec!["empty".to_string()]);
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert_eq!(
+            engine.evaluate(
+                &Name::from_str("anything.example.").unwrap(),
+                RecordType::A,
+                &client
+            ),
+            Verdict::Block(BlockReason::FilterUnavailable)
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P2-24: a group compile-budget failure publishes the non-regex subset
+    /// instead of dropping the entire group.
+    #[tokio::test]
+    async fn test_group_budget_failure_publishes_non_regex_subset() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_degraded_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let engine = HostsFilterEngine::new(
+            FilteringConfig {
+                regex_compile_budget_ms: Some(1),
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        );
+        let mut custom_rules: Vec<String> = (0..2048)
+            .map(|i| format!("/^group-{i}\\..*\\.example$/"))
+            .collect();
+        custom_rules.push("||keep-group.example^".to_string());
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: Vec::new(),
+            custom_rules,
+        }]);
+
+        let snapshot = engine
+            .group_snapshot("kids")
+            .expect("the non-regex subset must still be published");
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            snapshot
+                .evaluate("keep-group.example", RecordType::A, &client)
+                .is_blocked(),
+            "non-regex/custom rules must survive a group budget failure"
+        );
+        assert!(
+            engine
+                .status()
+                .degraded_groups
+                .contains(&"kids".to_string()),
+            "the group must be reported as degraded"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P2-26: a group rebuild that started before a list reload must not store
+    /// its stale snapshot after the reload publishes a newer generation.
+    #[tokio::test]
+    async fn test_stale_group_rebuild_is_discarded() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_stale_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: vec!["school".to_string()],
+            custom_rules: Vec::new(),
+        }]);
+        let old_generation = engine.list_generation.load(Ordering::SeqCst);
+
+        // Simulate the newer list reload: new list rules + generation bump.
+        let mut newer = FnvHashMap::default();
+        newer.insert(
+            "school".to_string(),
+            vec![parse_line_for_test("||new.example^")],
+        );
+        *engine.list_rules.lock().unwrap() = newer.clone();
+        engine.list_generation.fetch_add(1, Ordering::SeqCst);
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: vec!["school".to_string()],
+            custom_rules: Vec::new(),
+        }]);
+        let current = engine.group_snapshot("kids").expect("current group");
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            current
+                .evaluate("new.example", RecordType::A, &client)
+                .is_blocked()
+        );
+
+        // The stale rebuild (old list map + old generation) must be discarded
+        // and must not overwrite the newer snapshot.
+        let mut stale = FnvHashMap::default();
+        stale.insert(
+            "school".to_string(),
+            vec![parse_line_for_test("||stale.example^")],
+        );
+        assert!(
+            engine
+                .rebuild_group_snapshots_at(&stale, old_generation)
+                .is_none(),
+            "a stale generation must not publish"
+        );
+        let after = engine.group_snapshot("kids").expect("current group");
+        assert!(
+            after
+                .evaluate("new.example", RecordType::A, &client)
+                .is_blocked(),
+            "the newer snapshot must survive"
+        );
+        assert!(
+            after
+                .evaluate("stale.example", RecordType::A, &client)
+                .is_allowed(),
+            "the stale snapshot must not be installed"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    fn parse_line_for_test(line: &str) -> Rule {
+        crate::parser::parse_line(line, "test", 1).expect("valid test rule")
+    }
+
     #[tokio::test]
     async fn test_all_list_failure_is_observable_and_not_advertised_ready() {
         let temp_dir =
@@ -2175,6 +2795,7 @@ mod tests {
         let good = FilteringConfig {
             enabled: true,
             fail_closed: true,
+            custom_rules: vec!["||good.example^".to_string()],
             ..Default::default()
         };
         engine.reload_with_config(&good).await.unwrap();
@@ -2183,14 +2804,20 @@ mod tests {
             engine.reload_with_config(&enabled).await.is_err(),
             "the dead list must still fail"
         );
+        // The rejected reload keeps the last good snapshot instead of
+        // publishing an empty one (P1-8), so the prior rule still applies.
+        assert!(!engine.unavailable_for_fail_closed());
         assert!(
-            engine.unavailable_for_fail_closed(),
-            "a failed load while enabled must still be fail-closed"
+            engine
+                .evaluate(
+                    &Name::from_str("good.example.").unwrap(),
+                    RecordType::A,
+                    &client
+                )
+                .is_blocked(),
+            "the previous snapshot must remain active"
         );
-        assert_eq!(
-            engine.evaluate(&probe, RecordType::A, &client),
-            Verdict::Block(BlockReason::FilterUnavailable)
-        );
+        assert!(engine.evaluate(&probe, RecordType::A, &client).is_allowed());
     }
 
     /// Regression: group `lists`/`custom_rules` must actually be compiled and
@@ -2480,7 +3107,10 @@ mod tests {
         });
 
         let engine = HostsFilterEngine::init_with_observer(
-            FilteringConfig::default(),
+            FilteringConfig {
+                custom_rules: vec!["||observed.example^".to_string()],
+                ..Default::default()
+            },
             temp_dir.clone(),
             Some(observer),
         )

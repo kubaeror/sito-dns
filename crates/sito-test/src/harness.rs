@@ -76,6 +76,25 @@ impl TestServerInstance {
     }
 
     async fn try_spawn(mut config: Config, options: HarnessOptions) -> Result<Self, anyhow::Error> {
+        // An enabled engine with zero sources now fails closed (P2-95). Many
+        // acceptance tests exercise transports/DNSSEC/cache and leave the
+        // filtering section at its defaults; give those instances one
+        // never-matching rule so filtering stays active and unrelated stages
+        // (safe search, CNAME cloaking) behave as before. Tests that assert
+        // zero-source fail-closed behavior do so at the engine level.
+        let has_enabled_list = config.filtering.lists.iter().any(|list| list.enabled);
+        let has_custom_rules = config
+            .filtering
+            .custom_rules
+            .iter()
+            .any(|rule| !rule.trim().is_empty());
+        if config.filtering.enabled && !has_enabled_list && !has_custom_rules {
+            config
+                .filtering
+                .custom_rules
+                .push("||sito-test-harness.invalid^".to_string());
+        }
+
         // Allocate ephemeral ports through the broker so no two instances in
         // this binary can pick the same port.
         let mut reservations = PortReservations::new();

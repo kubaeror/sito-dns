@@ -38,6 +38,15 @@ pub const MAX_REGEX_PATTERN_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_REGEX_PATTERN_LEN: usize = 16 * 1024;
 /// DFA memory ceiling per compiled rule set (10 MB).
 pub const MAX_DFA_SIZE_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum number of substring patterns compiled into one Aho-Corasick
+/// automaton. Bounds automaton construction before it allocates.
+pub const MAX_AC_PATTERNS: usize = 50_000;
+/// Maximum combined source length (bytes) of Aho-Corasick substring patterns.
+pub const MAX_AC_PATTERN_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum number of `|prefix` rules inserted into one prefix trie.
+pub const MAX_PREFIX_PATTERNS: usize = 50_000;
+/// Maximum combined source length (bytes) of prefix rules.
+pub const MAX_PREFIX_PATTERN_BYTES: usize = 2 * 1024 * 1024;
 
 /// Maximum number of regex patterns compiled into a single DFA batch.
 ///
@@ -353,9 +362,24 @@ impl RuleSetBuilder {
         // 2. Prefixes, indexed in a character trie. Candidate precedence is
         // preserved by `lookup_candidates` (matching groups in lowest-rule-id
         // order), so it does not depend on hash iteration order.
+        //
+        // Enforce the prefix budget before inserting: the character trie can
+        // allocate one node per source character, so a hostile prefix class
+        // must be rejected before that allocation.
+        let prefix_bytes: usize = self.prefixes.iter().map(|(prefix, _)| prefix.len()).sum();
         let mut prefix_trie = PrefixTrie::new();
-        for (prefix, rule_id) in self.prefixes {
-            prefix_trie.insert(&prefix, rule_id);
+        if self.prefixes.len() > MAX_PREFIX_PATTERNS || prefix_bytes > MAX_PREFIX_PATTERN_BYTES {
+            error!(
+                patterns = self.prefixes.len(),
+                pattern_bytes = prefix_bytes,
+                max_patterns = MAX_PREFIX_PATTERNS,
+                max_pattern_bytes = MAX_PREFIX_PATTERN_BYTES,
+                "Prefix rule set exceeds compilation limits; skipping prefix rules for this set"
+            );
+        } else {
+            for (prefix, rule_id) in self.prefixes {
+                prefix_trie.insert(&prefix, rule_id);
+            }
         }
 
         // 3. Aho-Corasick for substrings
@@ -368,21 +392,36 @@ impl RuleSetBuilder {
             }
             let mut entries: Vec<(String, Vec<u32>)> = unique_subs.into_iter().collect();
             entries.sort_by_key(|(_, rules)| rules.iter().copied().min().unwrap_or(u32::MAX));
-            let mut pat_strings = Vec::with_capacity(entries.len());
-            let mut pat_to_rules = Vec::with_capacity(entries.len());
-            for (sub, rules) in entries {
-                pat_strings.push(sub);
-                pat_to_rules.push(rules);
-            }
+            let ac_bytes: usize = entries.iter().map(|(sub, _)| sub.len()).sum();
+            if entries.len() > MAX_AC_PATTERNS || ac_bytes > MAX_AC_PATTERN_BYTES {
+                // Bound automaton construction before it allocates: a list
+                // with hundreds of thousands of substrings can otherwise
+                // build a multi-gigabyte automaton despite `max_rules`.
+                error!(
+                    patterns = entries.len(),
+                    pattern_bytes = ac_bytes,
+                    max_patterns = MAX_AC_PATTERNS,
+                    max_pattern_bytes = MAX_AC_PATTERN_BYTES,
+                    "Substring rule set exceeds compilation limits; skipping Aho-Corasick for this set"
+                );
+                (None, Vec::new())
+            } else {
+                let mut pat_strings = Vec::with_capacity(entries.len());
+                let mut pat_to_rules = Vec::with_capacity(entries.len());
+                for (sub, rules) in entries {
+                    pat_strings.push(sub);
+                    pat_to_rules.push(rules);
+                }
 
-            match AhoCorasick::builder()
-                .match_kind(MatchKind::Standard)
-                .build(&pat_strings)
-            {
-                Ok(automaton) => (Some(automaton), pat_to_rules),
-                Err(e) => {
-                    warn!(error = %e, "Failed to build Aho-Corasick automaton for substrings; skipping AC");
-                    (None, Vec::new())
+                match AhoCorasick::builder()
+                    .match_kind(MatchKind::Standard)
+                    .build(&pat_strings)
+                {
+                    Ok(automaton) => (Some(automaton), pat_to_rules),
+                    Err(e) => {
+                        warn!(error = %e, "Failed to build Aho-Corasick automaton for substrings; skipping AC");
+                        (None, Vec::new())
+                    }
                 }
             }
         };
@@ -605,6 +644,35 @@ mod tests {
         candidates.clear();
         compiled.collect_candidates("sub.trie.example", &interner, &mut candidates);
         assert!(candidates.contains(&1));
+    }
+
+    /// P1-7: the Aho-Corasick and prefix tries enforce their own pattern
+    /// budgets before allocating, without disabling other rule classes.
+    #[test]
+    fn test_excessive_ac_and_prefix_patterns_are_capped_before_build() {
+        let mut interner = LabelInterner::new();
+        let mut builder = RuleSetBuilder::new();
+        builder.add_exact("keep.example".to_string(), 0);
+        for i in 0..=MAX_AC_PATTERNS {
+            builder.add_substring(format!("sub-{i}"), i as u32 + 1);
+        }
+        for i in 0..=MAX_PREFIX_PATTERNS {
+            builder.add_prefix(format!("pre-{i}."), i as u32 + 1);
+        }
+
+        let compiled = builder.build(&mut interner);
+        assert!(
+            compiled.ac.is_none(),
+            "an over-limit substring set must not build an automaton"
+        );
+        assert!(
+            compiled.prefix_trie.is_empty(),
+            "an over-limit prefix set must not build a trie"
+        );
+
+        let mut candidates = Vec::new();
+        compiled.collect_candidates("keep.example", &interner, &mut candidates);
+        assert!(candidates.contains(&0));
     }
 
     #[test]

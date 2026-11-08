@@ -1389,6 +1389,11 @@ pub struct FilteringConfig {
     /// exhaust memory. Lowering it can invalidate larger cached lists.
     #[serde(default = "default_filtering_max_list_bytes")]
     pub max_list_bytes: usize,
+    /// Accept an empty list body or a list that yields zero rules instead of
+    /// rejecting it and keeping the previous snapshot. Disabled by default:
+    /// a broken/hostile source must not silently remove all protection.
+    #[serde(default)]
+    pub allow_empty_list: bool,
     #[serde(default)]
     pub lists: Vec<FilterListConfig>,
     #[serde(default)]
@@ -1428,6 +1433,7 @@ impl Default for FilteringConfig {
             anti_doh_bypass: default_filtering_anti_doh_bypass(),
             max_rules: default_filtering_max_rules(),
             max_list_bytes: default_filtering_max_list_bytes(),
+            allow_empty_list: false,
             lists: Vec::new(),
             custom_rules: Vec::new(),
             regex_compile_budget_ms: None,

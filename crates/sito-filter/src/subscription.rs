@@ -83,6 +83,53 @@ pub(crate) fn is_denied_target_ip(ip: IpAddr) -> bool {
     sito_core::is_denied_target_ip(ip)
 }
 
+/// Returns true when a body looks like an HTML/XML error page rather than a
+/// filter list. CDNs commonly serve these with HTTP 200.
+fn looks_like_html(content: &str) -> bool {
+    // Only inspect the prefix; a rule list may legitimately contain the
+    // literal text `<html` much later in a substring rule.
+    let prefix: String = content.trim_start().chars().take(512).collect();
+    looks_like_html_prefix(&prefix)
+}
+
+fn looks_like_html_prefix(prefix: &str) -> bool {
+    let lower = prefix
+        .chars()
+        .take(16)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    lower.starts_with("<!doctype html")
+        || lower.starts_with("<html")
+        || lower.starts_with("<?xml")
+        || lower.starts_with("<head")
+        || lower.starts_with("<body")
+}
+
+/// Rejects empty and HTML/XML list bodies unless the operator explicitly
+/// opted into empty lists.
+fn reject_invalid_content(
+    list_name: &str,
+    content: &str,
+    content_type: Option<&str>,
+    allow_empty: bool,
+) -> Result<(), FilterError> {
+    if content.trim().is_empty() && !allow_empty {
+        return Err(FilterError::EmptyList {
+            list: list_name.to_string(),
+        });
+    }
+    let declared_html = content_type.is_some_and(|value| {
+        let lower = value.to_ascii_lowercase();
+        lower.contains("text/html") || lower.contains("application/xhtml")
+    });
+    if declared_html || looks_like_html(content) {
+        return Err(FilterError::HtmlResponse {
+            list: list_name.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Returns true when `path` (canonical) is inside `root`.
 fn path_is_within(path: &Path, root: &Path) -> bool {
     let absolute_root = if root.is_absolute() {
@@ -159,6 +206,10 @@ pub struct SubscriptionFetcher {
     /// Extra directories (beyond the server data directory) from which
     /// `file://` lists may be read.
     file_allowlist: Vec<PathBuf>,
+    /// When true, an empty list body is accepted instead of rejected. This is
+    /// an explicit operator opt-in (`filtering.allow_empty_list`) for sources
+    /// that legitimately resolve to no rules.
+    allow_empty: bool,
     /// Unit-test hook enabling loopback targets for local mock servers.
     /// Always `false` in production builds.
     #[cfg(test)]
@@ -193,6 +244,7 @@ impl SubscriptionFetcher {
             max_retries,
             initial_backoff,
             file_allowlist: Vec::new(),
+            allow_empty: false,
             #[cfg(test)]
             allow_private_targets: false,
         }
@@ -202,6 +254,13 @@ impl SubscriptionFetcher {
     #[must_use]
     pub fn with_file_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.file_allowlist.push(root.into());
+        self
+    }
+
+    /// Accepts an empty list body instead of rejecting it.
+    #[must_use]
+    pub fn with_allow_empty(mut self, allow_empty: bool) -> Self {
+        self.allow_empty = allow_empty;
         self
     }
 
@@ -409,7 +468,21 @@ impl SubscriptionFetcher {
         if url.trim().to_ascii_lowercase().starts_with("file://") {
             debug!(list = %list_name, url = %url, "Reading blocklist from local file");
             return match self.read_file_list(list_name, url, data_dir).await {
-                Ok(content) => Ok(content),
+                Ok(content) => {
+                    match reject_invalid_content(list_name, &content, None, self.allow_empty) {
+                        Ok(()) => Ok(content),
+                        Err(e) => {
+                            warn!(
+                                list = %list_name,
+                                url = %url,
+                                error = %e,
+                                "Rejecting empty/HTML local blocklist; attempting disk cache fallback"
+                            );
+                            load_cache_or(&cache_path, &meta_path, list_name, self.max_bytes, e)
+                                .await
+                        }
+                    }
+                }
                 Err(e) => {
                     warn!(
                         list = %list_name,
@@ -488,7 +561,29 @@ impl SubscriptionFetcher {
                         )
                         .await
                         {
-                            Ok(content) => return Ok(content),
+                            Ok(content) => {
+                                match reject_invalid_content(
+                                    list_name,
+                                    &content,
+                                    None,
+                                    self.allow_empty,
+                                ) {
+                                    Ok(()) => return Ok(content),
+                                    Err(e) => {
+                                        warn!(
+                                            list = %list_name,
+                                            error = %e,
+                                            "Cached blocklist is empty/HTML despite HTTP 304; retrying without conditional headers"
+                                        );
+                                        last_error = Some(e);
+                                        conditional = None;
+                                        if attempt < self.max_retries {
+                                            continue;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
                             Err(e) => {
                                 // The server claims "not modified" but we have
                                 // no local copy. Retry unconditionally so the
@@ -533,7 +628,13 @@ impl SubscriptionFetcher {
                         });
                     }
 
-                    // Extract ETag and Last-Modified headers before consuming body
+                    // Extract ETag/Last-Modified/Content-Type headers before
+                    // consuming the body.
+                    let content_type = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
                     let new_etag = resp
                         .headers()
                         .get("etag")
@@ -593,6 +694,30 @@ impl SubscriptionFetcher {
                             reason: "Blocklist content is not valid UTF-8".to_string(),
                         });
                     };
+
+                    // A 200 response with an empty body or a CDN HTML error
+                    // page must not replace a previously good list.
+                    if let Err(e) = reject_invalid_content(
+                        list_name,
+                        &content,
+                        content_type.as_deref(),
+                        self.allow_empty,
+                    ) {
+                        warn!(
+                            list = %list_name,
+                            url = %url,
+                            error = %e,
+                            "Rejecting empty/HTML blocklist response; attempting disk cache fallback"
+                        );
+                        return load_cache_or(
+                            &cache_path,
+                            &meta_path,
+                            list_name,
+                            self.max_bytes,
+                            e,
+                        )
+                        .await;
+                    }
 
                     // Save to disk cache. Metadata is only refreshed when the
                     // cache write succeeded: pairing a new ETag/size with an
@@ -1061,6 +1186,94 @@ mod tests {
             requests[1]
         );
 
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// P1-8: an empty HTTP 200 body must not be accepted as a successful list.
+    #[tokio::test]
+    async fn test_empty_200_body_is_rejected() {
+        let data_dir = temp_dir("sito_empty_200");
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+        let (addr, _captured, server) = spawn_http_server(vec![response]).await;
+
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            0,
+            Duration::from_millis(10),
+        );
+        fetcher.allow_private_targets = true;
+
+        let err = fetcher
+            .fetch_or_cached("empty", &format!("http://{addr}/list.txt"), &data_dir)
+            .await
+            .expect_err("an empty 200 response must be rejected");
+        assert!(
+            matches!(err, FilterError::EmptyList { .. }),
+            "unexpected error: {err}"
+        );
+
+        server.await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// P1-8: a CDN HTML error page served with HTTP 200 must be rejected.
+    #[tokio::test]
+    async fn test_html_200_body_is_rejected() {
+        let data_dir = temp_dir("sito_html_200");
+        let body = "<!DOCTYPE html><html><body>error</body></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (addr, _captured, server) = spawn_http_server(vec![response]).await;
+
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            0,
+            Duration::from_millis(10),
+        );
+        fetcher.allow_private_targets = true;
+
+        let err = fetcher
+            .fetch_or_cached("html", &format!("http://{addr}/list.txt"), &data_dir)
+            .await
+            .expect_err("an HTML 200 response must be rejected");
+        assert!(
+            matches!(err, FilterError::HtmlResponse { .. }),
+            "unexpected error: {err}"
+        );
+
+        server.await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// The explicit `allow_empty_list` opt-in permits an empty body.
+    #[tokio::test]
+    async fn test_empty_body_is_accepted_when_explicitly_allowed() {
+        let data_dir = temp_dir("sito_empty_allowed");
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+        let (addr, _captured, server) = spawn_http_server(vec![response]).await;
+
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            0,
+            Duration::from_millis(10),
+        )
+        .with_allow_empty(true);
+        fetcher.allow_private_targets = true;
+
+        let content = fetcher
+            .fetch_or_cached("empty", &format!("http://{addr}/list.txt"), &data_dir)
+            .await
+            .unwrap();
+        assert_eq!(content, "");
+
+        server.await.unwrap();
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 }

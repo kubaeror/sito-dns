@@ -19,6 +19,32 @@ pub struct StatsQuery {
     pub window: Option<String>,
 }
 
+/// Observable filter-engine status (additive, read-only).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FilterStatusDto {
+    /// `disabled`, `loading`, `ready` or `failed`.
+    pub state: String,
+    /// Active compiled rules.
+    pub rule_count: usize,
+    /// Configured lists that loaded in the last reload.
+    pub loaded_lists: usize,
+    /// Configured lists that failed (fetch, parse, empty/zero-yield, limits).
+    pub failed_lists: Vec<String>,
+    /// Lists whose newest content was rejected while an older snapshot stayed.
+    pub degraded_lists: Vec<String>,
+    /// Groups published without their regex/wildcard (or substring/prefix)
+    /// class after a budget/limit failure.
+    pub degraded_groups: Vec<String>,
+    /// Regex/wildcard patterns dropped from the active snapshot.
+    pub dropped_regex_patterns: usize,
+    /// True when no usable snapshot is active and fail-closed answers SERVFAIL.
+    pub unavailable: bool,
+    /// Most recent reload error.
+    pub last_error: Option<String>,
+    /// Wall-clock milliseconds of the last parse+compile attempt.
+    pub last_compile_ms: Option<u64>,
+}
+
 /// Filter list subscription details. `id` is the stable list name (numeric
 /// indices from older clients are still accepted on update/delete).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

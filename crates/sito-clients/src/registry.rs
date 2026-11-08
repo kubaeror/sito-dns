@@ -218,6 +218,10 @@ impl ClientRegistry {
             ctx.group = Some(entry.group.clone());
             if ctx.id.is_none() {
                 ctx.id = Some(ClientId::new(&entry.name));
+                // The registry assigned this id from a resolved entry, so it
+                // is authenticated. A pre-existing id may be a raw DoH path /
+                // SNI value and keeps whatever flag `identify` set.
+                ctx.id_authenticated = true;
             }
             if ctx.mac.is_none() {
                 ctx.mac = self.resolve_known_mac(ctx.ip, entry);
@@ -253,6 +257,10 @@ impl ClientRegistry {
         //    Only secrets configured in `clients.client_id_secrets` count;
         //    display names and arbitrary SNI labels never identify a client.
         if let Some(matched) = self.match_by_client_id_or_sni(ctx) {
+            // The id or SNI label carried a configured shared secret, so the
+            // registry vouches for it. IP/MAC/RouterOS matches below do not
+            // authenticate any pre-existing client-supplied id.
+            ctx.id_authenticated = true;
             return Some(matched);
         }
 
@@ -699,6 +707,10 @@ lists = ["GlobalList"]
         assert!(policy.active_blocked_services.contains("tiktok"));
         assert_eq!(ctx.client_name.as_deref(), Some("Jane's Phone"));
         assert_eq!(ctx.group.as_deref(), Some("kids"));
+        assert!(
+            ctx.id_authenticated,
+            "a configured shared secret authenticates the id"
+        );
     }
 
     #[test]
@@ -735,6 +747,35 @@ lists = ["GlobalList"]
         assert_eq!(policy.client_name.as_deref(), Some("Admin Laptop"));
         assert_eq!(policy.group_name, "admin");
         assert!(policy.trusted);
+        assert!(ctx.id_authenticated);
+    }
+
+    /// P1-9: a client identified by IP keeps its registry identity, but a
+    /// path-supplied id remains unauthenticated and cannot be used by consumers
+    /// that gate on `id_authenticated`.
+    #[test]
+    fn test_ip_identified_client_does_not_authenticate_path_id() {
+        let reg = ClientRegistry::new(sample_config());
+        // 192.168.1.20 belongs to "Jane's Phone".
+        let ip = IpAddr::from_str("192.168.1.20").unwrap();
+        let mut ctx = ClientContext::with_id(ip, "admin-laptop");
+        let policy = reg.resolve(&mut ctx, reg.now());
+        assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
+        assert!(
+            !ctx.id_authenticated,
+            "the path id must not become authenticated just because the IP matched"
+        );
+
+        // When the client sent no id, the registry fills one from the entry
+        // and that id is authenticated.
+        let mut ctx = ClientContext::new(ip);
+        let policy = reg.resolve(&mut ctx, reg.now());
+        assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
+        assert_eq!(
+            ctx.id.as_ref().map(sito_core::ClientId::as_str),
+            Some("Jane's Phone")
+        );
+        assert!(ctx.id_authenticated);
     }
 
     #[test]

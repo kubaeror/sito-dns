@@ -346,8 +346,18 @@ async fn test_m7_anti_doh_bypass_filter_and_pipeline() {
     let querylog_writer = QueryLogWriter::spawn(stats_db, 100);
     let metrics = MetricsRegistry::new("0.1.0", "test");
 
-    let filter_engine =
-        Arc::new(HostsFilterEngine::init(Default::default(), temp_dir.clone()).await);
+    let filter_engine = Arc::new(
+        HostsFilterEngine::init(
+            // Keep filtering active with a never-matching rule: an enabled
+            // engine with zero sources now fails closed (P2-95).
+            sito_core::config::FilteringConfig {
+                custom_rules: vec!["||never-match.invalid^".to_string()],
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        )
+        .await,
+    );
     let cache = Arc::new(DnsCache::new(Default::default()));
     let bootstrap =
         BootstrapResolver::new(vec!["127.0.0.1".parse().unwrap()], Duration::from_secs(1));

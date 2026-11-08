@@ -1663,6 +1663,9 @@ config_version = 1
 [server]
 role = "slave"
 
+[filtering]
+enabled = false
+
 [auth]
 session_ttl_hours = 24
 login_rate_limit = 5
@@ -1776,7 +1779,7 @@ async fn test_m8_push_before_listeners_fails_and_retries_after_ready() {
             version: 2,
             term: 0,
             timestamp: 1,
-            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n\n[upstream]\nservers = [\"9.9.9.9\"]\n".to_string(),
+            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n\n[filtering]\nenabled = false\n\n[upstream]\nservers = [\"9.9.9.9\"]\n".to_string(),
             custom_rules: vec![],
             rewrites: None,
             clients: None,

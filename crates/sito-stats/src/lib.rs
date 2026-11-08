@@ -21,7 +21,7 @@ pub use db::{
 };
 pub use entry::QueryLogEntry;
 pub use error::StatsError;
-pub use metrics::MetricsRegistry;
+pub use metrics::{FilterStatusMetrics, MetricsRegistry};
 pub use writer::{DEFAULT_CHANNEL_CAPACITY, QueryLogSender, QueryLogWriter};
 
 #[cfg(test)]

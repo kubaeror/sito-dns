@@ -540,31 +540,53 @@ struct FilterCandidates {
     block: Vec<u32>,
 }
 
+/// Precedence rank within one rule tier (important or standard).
+///
+/// The table is `Allow > Rewrite > Block`. The per-group overlay wins ties
+/// against the global set, so a group exception/rewrite has the same authority
+/// as any other group rule. Important rules always outrank standard rules
+/// because the caller evaluates that tier first.
+fn verdict_rank(verdict: &Verdict) -> u8 {
+    match verdict {
+        // `Allow(None)` is the "no rule matched" neutral verdict returned by
+        // the standard evaluators; only `Allow(Some(rule))` is a real allow.
+        Verdict::Allow(Some(_)) => 3,
+        Verdict::Rewrite(_) => 2,
+        Verdict::Block(_) => 1,
+        Verdict::Allow(None) => 0,
+    }
+}
+
+/// Combines one tier's global and per-group verdicts using [`verdict_rank`].
+fn combine_tier_verdicts(global: Option<Verdict>, group: Option<Verdict>) -> Option<Verdict> {
+    match (global, group) {
+        (None, None) => None,
+        (Some(global), None) => Some(global),
+        (None, Some(group)) => Some(group),
+        // Ignore a neutral `Allow(None)`; otherwise the group overlay wins
+        // equally-ranked verdicts and the higher-precedence verdict wins
+        // regardless of source.
+        (Some(global), Some(group)) => {
+            let global_rank = verdict_rank(&global);
+            let group_rank = verdict_rank(&group);
+            if group_rank == 0 {
+                Some(global)
+            } else if global_rank == 0 || group_rank >= global_rank {
+                Some(group)
+            } else {
+                Some(global)
+            }
+        }
+    }
+}
+
 /// Combines the global and per-group standard verdicts.
 ///
-/// Allow rules from either set win over block rules from the other set;
-/// rewrites apply when no allow matched; blocks from the global set take
-/// precedence in the returned reason.
+/// Precedence within the standard tier is `Allow > Rewrite > Block`; the
+/// group overlay wins ties. This lets a group `$dnsrewrite` override a global
+/// standard block, consistently with any group allow/block overlay.
 fn combine_standard_verdicts(global: Verdict, group: Option<Verdict>) -> Verdict {
-    let allow_rule_matched = |verdict: &Verdict| matches!(verdict, Verdict::Allow(Some(_)));
-    let global_allowed = allow_rule_matched(&global);
-    let group_allowed = group.as_ref().is_some_and(allow_rule_matched);
-    if global_allowed || group_allowed {
-        return Verdict::Allow(None);
-    }
-    if let Some(Verdict::Rewrite(action)) = group {
-        return Verdict::Rewrite(action);
-    }
-    if let Verdict::Rewrite(action) = global {
-        return Verdict::Rewrite(action);
-    }
-    if let Verdict::Block(_) = global {
-        return global;
-    }
-    if let Some(block @ Verdict::Block(_)) = group {
-        return block;
-    }
-    Verdict::Allow(None)
+    combine_tier_verdicts(Some(global), group).unwrap_or(Verdict::Allow(None))
 }
 
 /// Aggregates all matching `$dnsrewrite` rules from the global and per-group
@@ -1020,26 +1042,29 @@ impl DnsPipeline {
                 candidates
             });
 
-            // 1. $important rules on the CNAME target
-            let mut imp = global_snapshot.evaluate_important_candidates(
+            // 1. $important rules on the CNAME target (same precedence table
+            //    as the main query path: Allow > Rewrite > Block, group wins
+            //    ties).
+            let global_imp = global_snapshot.evaluate_important_candidates(
                 &normalized,
                 qtype,
                 client,
                 &global_candidates.allow,
                 &global_candidates.block,
             );
-            if imp.is_none()
-                && let (Some(gs), Some(gc)) = (group_snapshot.as_ref(), group_candidates.as_ref())
-            {
-                imp = gs.evaluate_important_candidates(
-                    &normalized,
-                    qtype,
-                    client,
-                    &gc.allow,
-                    &gc.block,
-                );
-            }
-            if let Some(verdict) = imp {
+            let group_imp = group_snapshot
+                .as_ref()
+                .zip(group_candidates.as_ref())
+                .and_then(|(gs, gc)| {
+                    gs.evaluate_important_candidates(
+                        &normalized,
+                        qtype,
+                        client,
+                        &gc.allow,
+                        &gc.block,
+                    )
+                });
+            if let Some(verdict) = combine_tier_verdicts(global_imp, group_imp) {
                 if verdict.is_blocked() {
                     return true;
                 }
@@ -1423,7 +1448,7 @@ impl QueryHandler for DnsPipeline {
 
             // ADR-0007 Stage 1: $important filter rules (takes precedence over local rewrites)
             let mut important_allowed = false;
-            let mut important_verdict = filter_snapshot.as_ref().and_then(|snapshot| {
+            let global_important = filter_snapshot.as_ref().and_then(|snapshot| {
                 snapshot.evaluate_important_candidates(
                     &normalized_domain,
                     qtype,
@@ -1432,18 +1457,23 @@ impl QueryHandler for DnsPipeline {
                     &filter_candidates.block,
                 )
             });
-            if important_verdict.is_none()
-                && let (Some(group), Some(candidates)) =
-                    (group_snapshot.as_ref(), group_candidates.as_ref())
-            {
-                important_verdict = group.evaluate_important_candidates(
-                    &normalized_domain,
-                    qtype,
-                    &client,
-                    &candidates.allow,
-                    &candidates.block,
-                );
-            }
+            let group_important = group_snapshot
+                .as_ref()
+                .zip(group_candidates.as_ref())
+                .and_then(|(group, candidates)| {
+                    group.evaluate_important_candidates(
+                        &normalized_domain,
+                        qtype,
+                        &client,
+                        &candidates.allow,
+                        &candidates.block,
+                    )
+                });
+            // Consistent precedence: within the important tier
+            // `Allow > Rewrite > Block`, group wins ties. A group
+            // `@@...$important` therefore overrides a global `$important`
+            // block instead of the global verdict short-circuiting the group.
+            let important_verdict = combine_tier_verdicts(global_important, group_important);
             if let Some(verdict) = important_verdict {
                 match verdict {
                     Verdict::Block(reason) => {
@@ -2696,6 +2726,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.dnssec.validate = false;
         let fail = std::sync::Arc::new(AtomicBool::new(true));
         let (pipeline, server, calls, temp_dir) =
@@ -2768,6 +2799,7 @@ mod tests {
         use sito_upstream::UpstreamManager;
 
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.dnssec.validate = false;
         let upstream = std::sync::Arc::new(UpstreamManager::with_upstreams(
             Vec::new(),
@@ -2863,7 +2895,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_do_client_gets_insecure_cache_hit_with_ad_zero() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.filtering.enabled = false;
         let (pipeline, calls, temp_dir) = test_pipeline(config).await;
         let client = ClientContext::new("127.0.0.1".parse().unwrap());
         let name = Name::from_str("unsigned.example.").unwrap();
@@ -2899,7 +2932,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_do_client_never_served_unchecked_cache_entry() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.filtering.enabled = false;
         let (pipeline, calls, temp_dir) = test_pipeline(config).await;
         let client = ClientContext::new("127.0.0.1".parse().unwrap());
         let name = Name::from_str("unchecked.example.").unwrap();
@@ -2940,6 +2974,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.cache.serve_stale_hours = 1;
         config.dns.cache.min_ttl = 1;
         config.dns.cache.max_ttl = 1;
@@ -2991,6 +3026,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.cache.serve_stale_hours = 1;
         config.dns.cache.min_ttl = 1;
         config.dns.cache.max_ttl = 1;
@@ -3038,6 +3074,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.cache.serve_stale_hours = 1;
         config.dns.cache.min_ttl = 1;
         config.dns.cache.max_ttl = 1;
@@ -3155,6 +3192,7 @@ mod tests {
         });
 
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.upstream.servers = vec![mock_addr.to_string()];
         config.dns.cache.serve_stale_hours = 0;
         let bootstrap =
@@ -3235,6 +3273,7 @@ mod tests {
     #[tokio::test]
     async fn test_do0_response_is_stripped_and_cache_key_stays_do0() {
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.dnssec.mode = "disabled".to_string();
         config.dns.dnssec.validate = false;
         let (pipeline, calls, temp_dir) = test_pipeline(config).await;
@@ -3274,6 +3313,7 @@ mod tests {
     #[tokio::test]
     async fn test_prefetch_clears_ad_when_no_validation_ran() {
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.dnssec.mode = "disabled".to_string();
         config.dns.dnssec.validate = false;
         config.dns.cache.prefetch = true;
@@ -3429,5 +3469,64 @@ mod tests {
             CacheKey::from_query(&sibling_forwarded),
             "clamped ECS must deduplicate cache keys"
         );
+    }
+
+    /// P2-25: the global/group precedence table is consistent across tiers:
+    /// within a tier `Allow > Rewrite > Block`, the group overlay wins ties,
+    /// and `$important` always outranks standard rules.
+    #[test]
+    fn test_group_global_precedence_table() {
+        use sito_core::verdict::{BlockReason, RewriteAction, RuleRef};
+
+        let block = || {
+            Verdict::Block(BlockReason::Rule(RuleRef::new(
+                "||blocked.example^".to_string(),
+            )))
+        };
+        let allow = || Verdict::Allow(Some(RuleRef::new("@@||allowed.example^".to_string())));
+        let no_match = || Verdict::Allow(None);
+        let rewrite = || {
+            Verdict::Rewrite(RewriteAction::DnsRewrite {
+                rcode: "NOERROR".to_string(),
+                rtype: Some("A".to_string()),
+                value: Some("192.0.2.10".to_string()),
+            })
+        };
+
+        // Standard tier: a group rewrite overrides a global standard block.
+        assert!(matches!(
+            combine_standard_verdicts(block(), Some(rewrite())),
+            Verdict::Rewrite(_)
+        ));
+        // A group result with no matching rule must not erase a global block.
+        assert!(matches!(
+            combine_standard_verdicts(block(), Some(no_match())),
+            Verdict::Block(_)
+        ));
+        // Standard allow outranks a group rewrite.
+        assert!(matches!(
+            combine_standard_verdicts(allow(), Some(rewrite())),
+            Verdict::Allow(_)
+        ));
+        // Ties go to the group overlay.
+        assert!(matches!(
+            combine_standard_verdicts(block(), Some(block())),
+            Verdict::Block(_)
+        ));
+
+        // Important tier: a group `@@...$important` overrides a global
+        // `$important` block (the old code returned the global block first).
+        assert!(matches!(
+            combine_tier_verdicts(Some(block()), Some(allow())),
+            Some(Verdict::Allow(_))
+        ));
+        // A global important allow still beats a group important block.
+        assert!(matches!(
+            combine_tier_verdicts(Some(allow()), Some(block())),
+            Some(Verdict::Allow(_))
+        ));
+        // Important outranks standard because callers evaluate it first; the
+        // helper itself only compares within a tier.
+        assert!(combine_tier_verdicts(None, None).is_none());
     }
 }

@@ -399,8 +399,12 @@ async fn apply_and_persist_document_locked(
     let mut report = apply_full_config_locked(ctx, candidate, filter_apply, hooks).await?;
 
     if let Err(e) = save_config_document_atomic(&ctx.config_path, document, candidate).await {
+        // Roll back with the same filter mode that was applied: a Deferred
+        // apply never touched the filter engine, so a Sync rollback could
+        // fail on an unrelated filter-source error and leave the runtime at
+        // the rejected candidate.
         if let Err(rollback_err) =
-            apply_full_config_locked(ctx, &previous, FilterApply::Sync, hooks).await
+            apply_full_config_locked(ctx, &previous, filter_apply, hooks).await
         {
             tracing::error!(
                 error = %rollback_err.detail,
@@ -442,8 +446,7 @@ async fn apply_and_persist_document_locked(
                     );
                 }
             }
-            if let Err(e) = apply_full_config_locked(ctx, &previous, FilterApply::Sync, hooks).await
-            {
+            if let Err(e) = apply_full_config_locked(ctx, &previous, filter_apply, hooks).await {
                 tracing::error!(
                     error = %e.detail,
                     "Failed to roll back in-memory configuration after an oversized HA bundle"
@@ -561,7 +564,7 @@ pub async fn apply_config_document_event(
             match ctx.publish_bundle().await {
                 Ok(sito_ha::PublishOutcome::TooLarge { bytes, limit }) => {
                     if let Err(e) =
-                        apply_full_config_locked(ctx, &previous, FilterApply::Sync, hooks).await
+                        apply_full_config_locked(ctx, &previous, filter_apply, hooks).await
                     {
                         tracing::error!(
                             error = %e.detail,
@@ -608,7 +611,45 @@ async fn apply_inner(
         .await
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid upstream configuration: {e}")))?;
 
-    // 2. Filter engine (unless the caller queues the list fetch).
+    let clients = clients_from_config(cfg)?;
+    let rewrites = rewrites_from_config(cfg)?;
+
+    // Capture the DNSSEC policy before the runtime snapshot is replaced; the
+    // comparison below must be against the live pre-apply configuration.
+    let previous_dnssec = ctx.config.load().dns.dnssec.clone();
+
+    // 2. Publish the coherent runtime snapshot (config/clients/rewrites) and
+    //    cache policy BEFORE the filter engine becomes active. Queries may
+    //    briefly see the new config with the old filter snapshot (safe: the
+    //    filter reload then installs the matching rules), but must never see
+    //    the old config with the new filter snapshot.
+    ctx.cache.update_config(cfg.dns.cache.clone()).await;
+    ctx.querylog_sender
+        .set_anonymize(cfg.privacy.anonymize_querylog);
+    let current_clients = ctx.clients.load();
+    let clients_registry = sito_clients::ClientRegistry::with_stores(
+        clients.clone(),
+        current_clients.routeros_leases_store(),
+        current_clients.unidentified_store(),
+    );
+    drop(current_clients);
+    ctx.runtime.replace(sito_runtime::RuntimeSnapshot {
+        config: Arc::new(cfg.clone()),
+        clients: Arc::new(clients_registry),
+        rewrites: Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
+    });
+
+    // 3. Hook-owned components (DNSSEC, scoped upstreams, rate limiters,
+    //    listener rebind, log level). A failure here is rolled back by the
+    //    caller; the filter engine has not been touched yet.
+    if let Some(hooks) = hooks {
+        hooks.apply(cfg, &clients).await?;
+    }
+
+    // 4. Filter engine last (unless the caller queues the list fetch), so the
+    //    filter snapshot always corresponds to an already-published runtime
+    //    configuration. A reload failure keeps the previous snapshot and
+    //    causes the caller to roll the runtime snapshot back.
     if filter_apply == FilterApply::Sync {
         ctx.filter
             .reload_with_config(&cfg.filtering)
@@ -621,39 +662,14 @@ async fn apply_inner(
         ctx.cache.flush();
     }
 
-    let clients = clients_from_config(cfg)?;
-    let rewrites = rewrites_from_config(cfg)?;
-
-    // 3. Hook-owned components (DNSSEC, scoped upstreams, rate limiters,
-    //    listener rebind, log level).
-    if let Some(hooks) = hooks {
-        hooks.apply(cfg, &clients).await?;
-    }
-
     // A DNSSEC mode/validate/anchor/NTA change invalidates every cached
     // validation decision. Without this, an entry validated under the old
     // policy would keep being served (Secure with AD=1 after an anchor was
     // removed, or Unchecked after validation was enabled).
-    if ctx.config.load().dns.dnssec != cfg.dns.dnssec {
+    if previous_dnssec != cfg.dns.dnssec {
         ctx.cache.flush();
     }
 
-    // 4. Cache policy, query-log privacy and the coherent runtime snapshot.
-    ctx.cache.update_config(cfg.dns.cache.clone()).await;
-    ctx.querylog_sender
-        .set_anonymize(cfg.privacy.anonymize_querylog);
-    let current_clients = ctx.clients.load();
-    let clients_registry = sito_clients::ClientRegistry::with_stores(
-        clients,
-        current_clients.routeros_leases_store(),
-        current_clients.unidentified_store(),
-    );
-    drop(current_clients);
-    ctx.runtime.replace(sito_runtime::RuntimeSnapshot {
-        config: Arc::new(cfg.clone()),
-        clients: Arc::new(clients_registry),
-        rewrites: Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
-    });
     Ok(())
 }
 
@@ -1226,6 +1242,126 @@ acme_enabled = false
             fields.iter().any(|field| field == "auth"),
             "a real [auth] policy change must be reported: {fields:?}"
         );
+    }
+
+    /// Hook used to observe what the runtime snapshot contains at the moment
+    /// hook-owned components are applied.
+    struct RuntimeProbeHook {
+        runtime: Arc<sito_runtime::RuntimeState>,
+        seen_filter_enabled: Arc<std::sync::atomic::AtomicBool>,
+        fail: bool,
+    }
+
+    impl ConfigApplyHooks for RuntimeProbeHook {
+        fn apply<'a>(
+            &'a self,
+            _cfg: &'a Config,
+            _clients: &'a sito_clients::ClientsConfig,
+        ) -> ApplyFuture<'a> {
+            Box::pin(async move {
+                self.seen_filter_enabled.store(
+                    self.runtime.snapshot().config.filtering.enabled,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                if self.fail {
+                    return Err(ProblemDetails::internal_error("injected hook failure"));
+                }
+                Ok(())
+            })
+        }
+    }
+
+    /// P1-26: the runtime config/clients/rewrites snapshot must be published
+    /// BEFORE the filter engine is reloaded. Otherwise enabling filtering runs
+    /// with the new filter snapshot and the old `filtering.enabled=false`
+    /// runtime config.
+    #[tokio::test]
+    async fn test_runtime_snapshot_is_published_before_filter_reload() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_filter_order");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut previous = (**ctx.config.load()).clone();
+        previous.filtering.enabled = false;
+        previous.filtering.lists.clear();
+        previous.filtering.custom_rules.clear();
+        ctx.config.store(Arc::new(previous.clone()));
+
+        let mut candidate = previous.clone();
+        candidate.filtering.enabled = true;
+        candidate.filtering.custom_rules = vec!["||ordered.example^".to_string()];
+
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook = RuntimeProbeHook {
+            runtime: Arc::clone(&ctx.runtime),
+            seen_filter_enabled: Arc::clone(&seen),
+            fail: false,
+        };
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, Some(&hook))
+            .await
+            .unwrap();
+
+        assert!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            "the new runtime config must be published before hooks/filter reload"
+        );
+        assert_eq!(
+            ctx.runtime.snapshot().config.filtering.custom_rules,
+            vec!["||ordered.example^".to_string()]
+        );
+        assert_eq!(ctx.filter.rule_count(), 1);
+        assert_eq!(ctx.filter.status().state, sito_filter::FilterState::Ready);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P1-26: a later hook failure rolls the runtime snapshot back so the old
+    /// config and the old filter snapshot both remain active.
+    #[tokio::test]
+    async fn test_failed_hook_leaves_old_config_and_filter() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_filter_hook_fail");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut previous = (**ctx.config.load()).clone();
+        previous.filtering.enabled = true;
+        previous.filtering.custom_rules = vec!["||old.example^".to_string()];
+        apply_full_config(&ctx, &previous, FilterApply::Sync, None)
+            .await
+            .unwrap();
+        assert_eq!(ctx.filter.rule_count(), 1);
+
+        let mut candidate = previous.clone();
+        candidate.filtering.custom_rules = vec!["||new.example^".to_string()];
+
+        let hook = RuntimeProbeHook {
+            runtime: Arc::clone(&ctx.runtime),
+            seen_filter_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail: true,
+        };
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, Some(&hook))
+            .await
+            .expect_err("the injected hook failure must reject the apply");
+
+        assert_eq!(
+            ctx.runtime.snapshot().config.filtering.custom_rules,
+            vec!["||old.example^".to_string()],
+            "the runtime snapshot must be rolled back"
+        );
+        let snapshot = ctx.filter.snapshot();
+        let client = sito_core::client::ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            snapshot
+                .evaluate("old.example", sito_proto::RecordType::A, &client)
+                .is_blocked(),
+            "the old filter snapshot must remain active"
+        );
+        assert!(
+            snapshot
+                .evaluate("new.example", sito_proto::RecordType::A, &client)
+                .is_allowed(),
+            "the rejected filter snapshot must not remain active"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     mod write_serialization {

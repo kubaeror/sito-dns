@@ -2058,6 +2058,32 @@
         }
       }
     },
+    "/api/v1/filtering/status": {
+      "get": {
+        "tags": [
+          "Filtering"
+        ],
+        "operationId": "get_filtering_status",
+        "responses": {
+          "200": {
+            "description": "Filter engine lifecycle and per-list health",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FilterStatusDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
     "/api/v1/ha/resync": {
       "post": {
         "tags": [
@@ -3582,6 +3608,82 @@
           },
           "url": {
             "type": "string"
+          }
+        }
+      },
+      "FilterStatusDto": {
+        "type": "object",
+        "description": "Observable filter-engine status (additive, read-only).",
+        "required": [
+          "state",
+          "rule_count",
+          "loaded_lists",
+          "failed_lists",
+          "degraded_lists",
+          "degraded_groups",
+          "dropped_regex_patterns",
+          "unavailable"
+        ],
+        "properties": {
+          "degraded_groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Groups published without their regex/wildcard (or substring/prefix)\nclass after a budget/limit failure."
+          },
+          "degraded_lists": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Lists whose newest content was rejected while an older snapshot stayed."
+          },
+          "dropped_regex_patterns": {
+            "type": "integer",
+            "description": "Regex/wildcard patterns dropped from the active snapshot.",
+            "minimum": 0
+          },
+          "failed_lists": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Configured lists that failed (fetch, parse, empty/zero-yield, limits)."
+          },
+          "last_compile_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Wall-clock milliseconds of the last parse+compile attempt.",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Most recent reload error."
+          },
+          "loaded_lists": {
+            "type": "integer",
+            "description": "Configured lists that loaded in the last reload.",
+            "minimum": 0
+          },
+          "rule_count": {
+            "type": "integer",
+            "description": "Active compiled rules.",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "`disabled`, `loading`, `ready` or `failed`."
+          },
+          "unavailable": {
+            "type": "boolean",
+            "description": "True when no usable snapshot is active and fail-closed answers SERVFAIL."
           }
         }
       },

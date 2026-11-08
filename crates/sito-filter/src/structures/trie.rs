@@ -45,6 +45,12 @@ impl PrefixTrie {
         Self::default()
     }
 
+    /// True when no prefix rule has been inserted.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.len() == 1
+    }
+
     /// Inserts a prefix pattern, associating it with `rule_id`.
     pub fn insert(&mut self, prefix: &str, rule_id: u32) {
         if prefix.is_empty() {

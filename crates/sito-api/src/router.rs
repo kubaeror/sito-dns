@@ -312,6 +312,7 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
         .route("/querylog/clear", post(querylog::delete_querylog))
         .route("/querylog/stream", get(querylog::stream_querylog))
         // Filtering
+        .route("/filtering/status", get(filtering::get_filtering_status))
         .route(
             "/filtering/lists",
             get(filtering::get_filter_lists).post(filtering::add_filter_list),

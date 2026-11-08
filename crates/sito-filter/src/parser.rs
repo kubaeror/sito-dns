@@ -3,10 +3,13 @@
 use hickory_proto::rr::RecordType;
 use sito_core::client::ClientContext;
 use sito_proto::normalize_domain;
+use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Standard loopback / broadcast system hostnames to ignore.
@@ -26,6 +29,157 @@ pub const IGNORED_HOSTNAMES: &[&str] = &[
     "::1",
     "::",
 ];
+
+/// Maximum bytes accepted for one raw list line before it is skipped.
+///
+/// A hostile list can otherwise consist of a single 64 MiB line; cloning it
+/// into `Rule::raw` and parsing it would double the memory needed while the
+/// download byte cap has already been satisfied.
+pub const MAX_RULE_LINE_BYTES: usize = 8 * 1024;
+/// Maximum bytes accepted for one parsed pattern (domain, prefix, regex, ...).
+pub const MAX_RULE_PATTERN_BYTES: usize = 16 * 1024;
+/// Default total number of rules accepted by [`parse_rules`].
+pub const DEFAULT_MAX_PARSED_RULES: usize = 2_000_000;
+/// Default total input bytes accepted by [`parse_rules`].
+pub const DEFAULT_MAX_PARSED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum number of parser warnings logged per source in one window.
+const RULE_LOG_MAX_PER_SOURCE: usize = 20;
+/// Window after which a source's warning budget is replenished.
+const RULE_LOG_WINDOW: Duration = Duration::from_secs(60);
+/// Maximum length of a rule/reason excerpt included in a log line.
+const RULE_LOG_EXCERPT_CHARS: usize = 160;
+
+/// Parsing limits enforced while reading a list.
+///
+/// Callers derive `max_rules`/`max_bytes` from `filtering.max_rules` and
+/// `filtering.max_list_bytes`; the per-line and per-pattern caps are internal
+/// hardening constants.
+#[derive(Debug, Clone, Copy)]
+pub struct ParseLimits {
+    /// Maximum number of rules to materialise from this input.
+    pub max_rules: usize,
+    /// Maximum input size in bytes (defensive backstop; downloader caps first).
+    pub max_bytes: usize,
+    /// Maximum bytes in one input line before it is skipped.
+    pub max_line_bytes: usize,
+    /// Maximum bytes in one parsed pattern before it is skipped.
+    pub max_pattern_bytes: usize,
+}
+
+impl ParseLimits {
+    #[must_use]
+    pub const fn new(max_rules: usize, max_bytes: usize) -> Self {
+        Self {
+            max_rules,
+            max_bytes,
+            max_line_bytes: MAX_RULE_LINE_BYTES,
+            max_pattern_bytes: MAX_RULE_PATTERN_BYTES,
+        }
+    }
+}
+
+impl Default for ParseLimits {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_PARSED_RULES, DEFAULT_MAX_PARSED_BYTES)
+    }
+}
+
+/// A hard parse budget was exceeded; the caller must reject the whole input
+/// instead of publishing a partial rule set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseError {
+    /// More rules than the configured limit would be materialised.
+    TooManyRules { count: usize, limit: usize },
+    /// The input is larger than the configured byte budget.
+    TooManyBytes { bytes: usize, limit: usize },
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyRules { count, limit } => {
+                write!(f, "{count} parsed rules exceed the limit of {limit}")
+            }
+            Self::TooManyBytes { bytes, limit } => {
+                write!(f, "{bytes} input bytes exceed the limit of {limit}")
+            }
+        }
+    }
+}
+
+/// Truncates a raw rule/reason excerpt so one hostile line cannot flood logs.
+fn log_excerpt(text: &str) -> String {
+    if text.chars().count() <= RULE_LOG_EXCERPT_CHARS {
+        return text.to_string();
+    }
+    let mut excerpt: String = text.chars().take(RULE_LOG_EXCERPT_CHARS).collect();
+    excerpt.push('…');
+    excerpt
+}
+
+/// Reserves one warning slot for `source`.
+///
+/// Returns `Some(is_last)` when a warning may be logged (`is_last` announces
+/// that this is the final slot), or `None` when the source is rate-limited.
+fn take_warning_slot(source: &str) -> Option<bool> {
+    static LIMITS: OnceLock<Mutex<HashMap<String, (Instant, usize)>>> = OnceLock::new();
+    let limits = LIMITS.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    let mut guard = limits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = guard
+        .entry(source.to_string())
+        .or_insert_with(|| (now, 0usize));
+    if now.duration_since(entry.0) >= RULE_LOG_WINDOW {
+        *entry = (now, 0);
+    }
+    if entry.1 >= RULE_LOG_MAX_PER_SOURCE {
+        return None;
+    }
+    entry.1 += 1;
+    Some(entry.1 == RULE_LOG_MAX_PER_SOURCE)
+}
+
+fn announce_warning_suppression(source: &str, is_last: bool) {
+    if is_last {
+        warn!(
+            source = %source,
+            "Further filter parse warnings for this source are suppressed for 60 seconds"
+        );
+    }
+}
+
+/// Logs an invalid-rule warning at most [`RULE_LOG_MAX_PER_SOURCE`] times per
+/// [`RULE_LOG_WINDOW`] for a given source (list name).
+fn warn_invalid_rule(source: &str, line: u32, rule: &str, reason: &str) {
+    let Some(is_last) = take_warning_slot(source) else {
+        return;
+    };
+    warn!(
+        source = %source,
+        line,
+        rule = %log_excerpt(rule),
+        reason = %log_excerpt(reason),
+        "Skipping filter rule with unparsable modifiers"
+    );
+    announce_warning_suppression(source, is_last);
+}
+
+/// Rate-limited log for lines/patterns rejected by the parsing budgets.
+fn warn_oversized(source: &str, line: u32, reason: &str) {
+    let Some(is_last) = take_warning_slot(source) else {
+        return;
+    };
+    warn!(
+        source = %source,
+        line,
+        reason = %log_excerpt(reason),
+        "Skipping oversized filter input"
+    );
+    announce_warning_suppression(source, is_last);
+}
 
 /// Rule action kind: Allowlist (`@@`) or Blocklist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -577,18 +731,25 @@ fn parse_client_filter(value: &str) -> Option<ClientFilter> {
 /// Parses a `$dnstype` modifier value (e.g. `A|AAAA` or `~HTTPS|65`).
 ///
 /// Values are separated with `|`; the enclosing modifier list uses commas.
+/// An invalid token rejects the whole modifier instead of silently keeping a
+/// valid subset, which could widen the rule beyond the operator's intent.
 fn parse_dnstype_filter(value: &str) -> Option<DnstypeFilter> {
     let mut filter = DnstypeFilter::default();
+    let mut saw_token = false;
     for token in value.split('|') {
         let token = token.trim();
         if token.is_empty() {
             continue;
         }
+        saw_token = true;
         let (is_neg, item) = if let Some(stripped) = token.strip_prefix('~') {
             (true, stripped.trim())
         } else {
             (false, token)
         };
+        if item.is_empty() {
+            return None;
+        }
 
         let code = if let Ok(num) = item.parse::<u16>() {
             num
@@ -597,8 +758,7 @@ fn parse_dnstype_filter(value: &str) -> Option<DnstypeFilter> {
         } else if let Ok(rt) = RecordType::from_str(&item.to_ascii_uppercase()) {
             u16::from(rt)
         } else {
-            warn!(token = %item, "Invalid dnstype in rule modifier; skipping modifier token");
-            continue;
+            return None;
         };
 
         if is_neg {
@@ -608,7 +768,7 @@ fn parse_dnstype_filter(value: &str) -> Option<DnstypeFilter> {
         }
     }
 
-    if filter.positive.is_empty() && filter.negative.is_empty() {
+    if !saw_token || (filter.positive.is_empty() && filter.negative.is_empty()) {
         None
     } else {
         Some(filter)
@@ -618,6 +778,7 @@ fn parse_dnstype_filter(value: &str) -> Option<DnstypeFilter> {
 /// Parses a `$denyallow` modifier value (e.g. `sub.example.com|other.com`).
 ///
 /// Values are separated with `|`; the enclosing modifier list uses commas.
+/// Like `$dnstype`, one invalid token rejects the entire modifier.
 fn parse_denyallow(value: &str) -> Option<Vec<String>> {
     let mut domains = Vec::new();
     for item in value.split('|') {
@@ -625,9 +786,8 @@ fn parse_denyallow(value: &str) -> Option<Vec<String>> {
         if item.is_empty() {
             continue;
         }
-        if let Ok(normalized) = normalize_domain(item) {
-            domains.push(normalized);
-        }
+        let normalized = normalize_domain(item).ok()?;
+        domains.push(normalized);
     }
     if domains.is_empty() {
         None
@@ -959,13 +1119,7 @@ pub fn parse_line(line: &str, source: &str, line_number: u32) -> Option<Rule> {
         match parse_modifiers(opts, kind) {
             Ok(modifiers) => modifiers,
             Err(reason) => {
-                warn!(
-                    source = %source,
-                    line = line_number,
-                    rule = %trimmed,
-                    reason = %reason,
-                    "Skipping filter rule with unparsable modifiers"
-                );
+                warn_invalid_rule(source, line_number, trimmed, &reason);
                 return None;
             }
         }
@@ -1077,12 +1231,57 @@ fn parse_pattern(raw_pattern: &str) -> Option<Pattern> {
     Some(Pattern::Substring(p.to_ascii_lowercase()))
 }
 
+/// Bytes occupied by a parsed pattern's source text.
+fn pattern_bytes(pattern: &Pattern) -> usize {
+    match pattern {
+        Pattern::Exact(value)
+        | Pattern::Domain(value)
+        | Pattern::Prefix(value)
+        | Pattern::Substring(value)
+        | Pattern::Wildcard(value)
+        | Pattern::Regex(value) => value.len(),
+    }
+}
+
 /// Parses multiple rules from a file or network stream.
 ///
 /// Returns a vector of parsed rules along with the number of skipped lines/rules.
+/// Inputs exceeding the internal parse budget are rejected; use
+/// [`parse_rules_with_limits`] when the caller needs to distinguish a budget
+/// abort from an ordinary parse.
 pub fn parse_rules(content: &str, source: &str) -> (Vec<Rule>, usize) {
+    match parse_rules_with_limits(content, source, ParseLimits::default()) {
+        Ok(result) => result,
+        Err(e) => {
+            warn!(
+                source = %source,
+                error = %e,
+                "Filter input exceeds the parsing budget; rejecting input"
+            );
+            (Vec::new(), content.lines().count())
+        }
+    }
+}
+
+/// Parses multiple rules while enforcing hard line/pattern/byte/rule budgets.
+///
+/// Oversized individual lines and patterns are skipped (they cannot be
+/// materialised safely); exceeding the total rule or byte budget aborts the
+/// whole input so the caller can keep its previous snapshot.
+pub fn parse_rules_with_limits(
+    content: &str,
+    source: &str,
+    limits: ParseLimits,
+) -> Result<(Vec<Rule>, usize), ParseError> {
+    if content.len() > limits.max_bytes {
+        return Err(ParseError::TooManyBytes {
+            bytes: content.len(),
+            limit: limits.max_bytes,
+        });
+    }
+
     let mut rules = Vec::new();
-    let mut skipped = 0;
+    let mut skipped = 0usize;
 
     for (idx, line) in content.lines().enumerate() {
         let line_number = (idx + 1) as u32;
@@ -1092,6 +1291,22 @@ pub fn parse_rules(content: &str, source: &str) -> (Vec<Rule>, usize) {
             || trimmed.starts_with('!')
             || trimmed.starts_with("[Adblock")
         {
+            continue;
+        }
+
+        // Check the line cap before any per-rule allocation (`Rule::raw`
+        // clones the line). A 64 MiB single line is skipped without copying.
+        if line.len() > limits.max_line_bytes {
+            skipped += 1;
+            warn_oversized(
+                source,
+                line_number,
+                &format!(
+                    "line is {} bytes, above the {} byte limit",
+                    line.len(),
+                    limits.max_line_bytes
+                ),
+            );
             continue;
         }
 
@@ -1109,6 +1324,16 @@ pub fn parse_rules(content: &str, source: &str) -> (Vec<Rule>, usize) {
                 let stripped = lower.strip_suffix('.').unwrap_or(&lower);
                 if IGNORED_HOSTNAMES.contains(&stripped) {
                     continue;
+                }
+                if domain_token.len() > limits.max_pattern_bytes {
+                    skipped += 1;
+                    continue;
+                }
+                if rules.len() >= limits.max_rules {
+                    return Err(ParseError::TooManyRules {
+                        count: rules.len() + 1,
+                        limit: limits.max_rules,
+                    });
                 }
                 if let Ok(normalized) = normalize_domain(domain_token) {
                     let pattern = Pattern::Exact(normalized);
@@ -1131,13 +1356,32 @@ pub fn parse_rules(content: &str, source: &str) -> (Vec<Rule>, usize) {
         }
 
         if let Some(rule) = parse_line(line, source, line_number) {
+            if pattern_bytes(&rule.pattern) > limits.max_pattern_bytes {
+                skipped += 1;
+                warn_oversized(
+                    source,
+                    line_number,
+                    &format!(
+                        "pattern is {} bytes, above the {} byte limit",
+                        pattern_bytes(&rule.pattern),
+                        limits.max_pattern_bytes
+                    ),
+                );
+                continue;
+            }
+            if rules.len() >= limits.max_rules {
+                return Err(ParseError::TooManyRules {
+                    count: rules.len() + 1,
+                    limit: limits.max_rules,
+                });
+            }
             rules.push(rule);
         } else {
             skipped += 1;
         }
     }
 
-    (rules, skipped)
+    Ok((rules, skipped))
 }
 
 #[cfg(test)]
@@ -1380,6 +1624,54 @@ mod tests {
         // unknown fragment must make the whole rule fail safe (skip), never
         // silently drop only the client restriction.
         assert!(parse_line("||ad.com^$client=1.2.3.4,8.8.8.8", "test", 3).is_none());
+    }
+
+    /// P1-9: one invalid `$dnstype` / `$denyallow` token must reject the whole
+    /// modifier instead of silently keeping the valid subset.
+    #[test]
+    fn test_partial_invalid_dnstype_and_denyallow_tokens_reject_rule() {
+        assert!(parse_line("||ad.com^$dnstype=A|BOGUS", "test", 1).is_none());
+        assert!(parse_line("||ad.com^$dnstype=A|~BOGUS", "test", 2).is_none());
+        assert!(parse_line("||ad.com^$denyallow=good.example|not a domain", "test", 3).is_none());
+        assert!(parse_line("||ad.com^$denyallow=good.example|", "test", 4).is_some());
+    }
+
+    /// P1-7: per-line and total rule budgets are enforced while parsing.
+    #[test]
+    fn test_hostile_line_and_rule_count_hit_parse_budget() {
+        // A single 64 MiB line must be skipped without cloning it into a Rule.
+        let hostile_line = "a".repeat(64 * 1024 * 1024);
+        let limits = ParseLimits::new(10, 64 * 1024 * 1024);
+        let (rules, skipped) =
+            parse_rules_with_limits(&hostile_line, "hostile", limits).expect("line is skipped");
+        assert_eq!(rules.len(), 0);
+        assert_eq!(skipped, 1);
+
+        // A 10M-rule list stops at the configured rule budget instead of
+        // materialising every rule.
+        let many_rules = "a\n".repeat(10_000_000);
+        let err = parse_rules_with_limits(
+            &many_rules,
+            "many",
+            ParseLimits::new(1_000, 64 * 1024 * 1024),
+        )
+        .expect_err("the rule budget must abort parsing");
+        assert!(matches!(
+            err,
+            ParseError::TooManyRules {
+                count: 1_001,
+                limit: 1_000
+            }
+        ));
+    }
+
+    /// P2-96: logged rule excerpts are bounded.
+    #[test]
+    fn test_log_excerpt_is_bounded() {
+        let huge = "x".repeat(10_000);
+        let excerpt = log_excerpt(&huge);
+        assert!(excerpt.chars().count() <= RULE_LOG_EXCERPT_CHARS + 1);
+        assert!(excerpt.chars().count() < huge.chars().count());
     }
 
     #[test]

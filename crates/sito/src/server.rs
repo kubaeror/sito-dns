@@ -517,6 +517,23 @@ struct RuntimeComponents {
 
 /// Opens the stats database and initializes metrics, query logging, upstreams,
 /// cache and the filter engine together with their background tasks.
+/// Maps the filter crate's status into the metrics crate's primitive view
+/// (the filter crate cannot depend on `sito-stats`).
+fn filter_status_metrics(status: &sito_filter::FilterStatus) -> sito_stats::FilterStatusMetrics {
+    sito_stats::FilterStatusMetrics {
+        state: match status.state {
+            sito_filter::FilterState::Disabled => 0,
+            sito_filter::FilterState::Loading => 1,
+            sito_filter::FilterState::Ready => 2,
+            sito_filter::FilterState::Failed => 3,
+        },
+        loaded_lists: u64::try_from(status.loaded_lists).unwrap_or(u64::MAX),
+        failed_lists: u64::try_from(status.failed_lists.len()).unwrap_or(u64::MAX),
+        degraded_groups: u64::try_from(status.degraded_groups.len()).unwrap_or(u64::MAX),
+        dropped_regex_patterns: u64::try_from(status.dropped_regex_patterns).unwrap_or(u64::MAX),
+    }
+}
+
 async fn init_runtime_components(
     config: &Config,
     shutdown_rx: &watch::Receiver<bool>,
@@ -589,6 +606,15 @@ async fn init_runtime_components(
         )
         .await,
     );
+    // Publish the initial load result and then keep the gauges in sync with
+    // every API/scheduled reload.
+    metrics.set_filter_status(filter_status_metrics(&filter_engine.status()));
+    {
+        let metrics = metrics.clone();
+        filter_engine.set_status_observer(Arc::new(move |status| {
+            metrics.set_filter_status(filter_status_metrics(status));
+        }));
+    }
     let _refresh_handle = filter_engine
         .clone()
         .spawn_refresh_task(shutdown_rx.clone());

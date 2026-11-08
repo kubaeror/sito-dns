@@ -82,6 +82,11 @@ anti_doh_bypass = "off"
 # and no network answers SERVFAIL until a fetch under the new cap succeeds; a
 # live reload keeps the previous snapshot and records the list in failed_lists.
 max_list_bytes = 67108864
+# Reject (default) an empty list body or a list that parses to zero rules,
+# keeping the previous snapshot and marking the list failed. Set to true only
+# for sources that legitimately return an empty list; false keeps filtering
+# fail-closed against a broken/hostile source.
+allow_empty_list = false
 lists = []
 custom_rules = [
     "0.0.0.0 ads.example.com",

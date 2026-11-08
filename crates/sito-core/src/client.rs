@@ -43,6 +43,14 @@ pub struct ClientContext {
     pub client_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// True only when `id` was resolved by the client registry (a configured
+    /// shared secret, or an entry selected by IP/CIDR/MAC/RouterOS).
+    ///
+    /// Raw DoH path / SNI identifiers are client-controlled and leave this
+    /// `false`; consumers such as rewrite exceptions must not trust `id`
+    /// without it. Defaults to `false` for older serialized contexts.
+    #[serde(default)]
+    pub id_authenticated: bool,
 }
 
 impl ClientContext {
@@ -55,6 +63,7 @@ impl ClientContext {
             mac: None,
             client_name: None,
             group: None,
+            id_authenticated: false,
         }
     }
 
@@ -67,6 +76,7 @@ impl ClientContext {
             mac: None,
             client_name: None,
             group: None,
+            id_authenticated: false,
         }
     }
 
@@ -80,7 +90,15 @@ impl ClientContext {
             mac: None,
             client_name: None,
             group: None,
+            id_authenticated: false,
         }
+    }
+
+    /// Marks the current `id` as registry-authenticated.
+    #[must_use]
+    pub fn with_authenticated_id(mut self) -> Self {
+        self.id_authenticated = true;
+        self
     }
 
     #[must_use]
