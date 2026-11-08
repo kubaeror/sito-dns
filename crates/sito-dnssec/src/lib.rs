@@ -1088,8 +1088,11 @@ fn signature_covers_rrset(sig_owner: &Name, sig: &SIG, rrset_owner: &Name) -> bo
     if base == *rrset_owner || !base.zone_of(rrset_owner) {
         return false;
     }
-    // A wildcard only synthesizes names exactly one label below its base.
-    rrset_owner.num_labels() == base.num_labels().saturating_add(1)
+    // RFC 4592: a wildcard may synthesize a name at any depth below the
+    // wildcard base when no closer encloser exists. The RRSIG Labels field
+    // counts the labels of the wildcard base, and Hickory's `determine_name`
+    // reconstructs `*.<base>` from the expanded name for any number of labels.
+    rrset_owner.num_labels() > base.num_labels()
         && usize::from(sig.input().num_labels) == usize::from(base.num_labels())
 }
 
@@ -1189,41 +1192,61 @@ fn relevant_signatures_have_key_material(
     qtype: RecordType,
     now: u32,
 ) -> bool {
+    // Only validated cached keys count. An attacker-supplied DNSKEY with the
+    // same tag/algorithm must not make a forged RRSIG look verifiable enough to
+    // suppress the probe; the chain fetch still gets a chance to validate real
+    // keys before the probe runs.
+    let signature_has_key = |sig: &SIG| {
+        let signer = LowerName::from(&sig.input().signer_name);
+        key_cache
+            .get_validated(&signer, sig.input().key_tag, now)
+            .is_some_and(|cached| cached.algorithm() == sig.input().algorithm)
+    };
+    let signatures_for = |rrset: &Record, signer_must_cover: Option<&LowerName>| {
+        response
+            .answers
+            .iter()
+            .chain(response.authorities.iter())
+            .filter_map(|record| match &record.data {
+                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => Some((&record.name, &**rrsig)),
+                RData::DNSSEC(DNSSECRData::SIG(sig)) => Some((&record.name, sig)),
+                _ => None,
+            })
+            .filter(|(owner, sig)| {
+                sig.input().type_covered == rrset.record_type()
+                    && signature_covers_rrset(owner, sig, &rrset.name)
+                    && signer_must_cover
+                        .is_none_or(|zone| LowerName::from(&sig.input().signer_name).zone_of(zone))
+            })
+            .map(|(_, sig)| sig)
+            .collect::<Vec<_>>()
+    };
+
     let relevant = relevant_answer_keys(response, qname, qtype);
     for rrset in &response.answers {
         let key = (LowerName::from(&rrset.name), rrset.record_type());
         if !relevant.contains(&key) {
             continue;
         }
-        let mut saw_signature = false;
-        let mut has_key = false;
-        for record in response.answers.iter().chain(response.authorities.iter()) {
-            let sig: &SIG = match &record.data {
-                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => rrsig,
-                RData::DNSSEC(DNSSECRData::SIG(sig)) => sig,
-                _ => continue,
-            };
-            if sig.input().type_covered != rrset.record_type()
-                || !signature_covers_rrset(&record.name, sig, &rrset.name)
-            {
+        let signatures = signatures_for(rrset, None);
+        if !signatures.is_empty() && !signatures.iter().any(|sig| signature_has_key(sig)) {
+            return false;
+        }
+    }
+
+    // A forged denial RRSIG with no validated key must also be able to fall
+    // through to the post-fetch probe; otherwise an unsigned delegation can be
+    // forced into SERVFAIL by attaching a fake NSEC/NSEC3 signature.
+    if is_negative_response(response, qname, qtype) {
+        let negative_lower = LowerName::from(&negative_answer_name(response, qname));
+        for rrset in &response.authorities {
+            if !matches!(rrset.record_type(), RecordType::NSEC | RecordType::NSEC3) {
                 continue;
             }
-            saw_signature = true;
-            let signer = LowerName::from(&sig.input().signer_name);
-            // Only validated cached keys count. An attacker-supplied DNSKEY
-            // with the same tag/algorithm must not make a forged RRSIG look
-            // verifiable enough to suppress the probe; the chain fetch still
-            // gets a chance to validate real keys before the probe runs.
-            if key_cache
-                .get(&signer, sig.input().key_tag, now)
-                .is_some_and(|cached| cached.algorithm() == sig.input().algorithm)
-            {
-                has_key = true;
-                break;
+            let signatures = signatures_for(rrset, Some(&negative_lower));
+            if !signatures.is_empty() && !signatures.iter().any(|sig| signature_has_key(sig)) {
+                return false;
             }
-        }
-        if saw_signature && !has_key {
-            return false;
         }
     }
     true
@@ -1977,7 +2000,7 @@ impl DnssecValidator {
                 // Defensive: entries restored from an old cache may still
                 // contain the root. It only covers the root name itself.
                 && (!entry.key().is_root() || name.is_root())
-        })
+        }) || self.chain_cache.closest_signed(name, now).is_some()
     }
 
     /// Whether any name in the response's CNAME chain (starting at `qname`) is
@@ -2780,20 +2803,35 @@ impl DnssecValidator {
                     .first()
                     .map_or_else(Name::root, |query| query.name().clone());
                 let mut probes = 0usize;
+                let mut post_probe_failed = false;
+                let mut post_budget_exhausted = false;
                 for name in distinct_cname_chain_names(response, &qname) {
                     let lower = LowerName::from(&name);
                     if probes >= MAX_CNAME_PROBES && !self.unsigned_status_known(&lower, now) {
+                        post_budget_exhausted = true;
                         break;
                     }
                     match self.prepare_unsigned_response(&lower, fetcher, now).await {
                         UnsignedProbe::Covered => {}
-                        UnsignedProbe::Probed | UnsignedProbe::Failed => probes += 1,
+                        UnsignedProbe::Probed => probes += 1,
+                        UnsignedProbe::Failed => {
+                            probes += 1;
+                            post_probe_failed = true;
+                        }
                     }
                 }
-                let proven_unsigned = cname_chain_names(response, &qname)
-                    .iter()
-                    .any(|name| self.insecure_zone_covers(&LowerName::from(name), now));
-                if proven_unsigned && !self.signed_chain_contains(response, &qname, now) {
+                // Only an authenticated unsigned delegation covering the
+                // final target, with no failed probe anywhere in the chain,
+                // may downgrade. Any failed hop is indistinguishable from a
+                // blocked DS/DNSKEY fetch for a stripped signed target and
+                // must fail closed.
+                let target = negative_answer_name(response, &qname);
+                let target_unsigned = self.insecure_zone_covers(&LowerName::from(&target), now);
+                if !post_probe_failed
+                    && !post_budget_exhausted
+                    && target_unsigned
+                    && !self.signed_chain_contains(response, &qname, now)
+                {
                     response.metadata.authentic_data = false;
                     let outcome = ValidationOutcome::Insecure;
                     self.metrics.record_validation(&outcome);
@@ -3700,16 +3738,7 @@ impl DnssecValidator {
             || (negative
                 && self.signed_zone_contains(&negative_lower, now)
                 && !self.insecure_zone_covers(&negative_lower, now));
-        // An authenticated DS denial proves the name is legitimately unsigned.
-        // Any covering RRSIG without a trusted signature is then junk, not
-        // evidence of a stripped signed zone.
-        let unsigned_evidence = self.insecure_zone_covers(&qname_lower, now)
-            || (negative && self.insecure_zone_covers(&negative_lower, now));
-        if !has_denial_rrsig
-            && !has_trusted_sig
-            && (!has_relevant_rrsig || unsigned_evidence)
-            && !signed_chain_evidence
-        {
+        if !has_relevant_rrsig && !has_denial_rrsig && !has_trusted_sig && !signed_chain_evidence {
             response.metadata.authentic_data = false;
             let outcome = ValidationOutcome::Insecure;
             self.metrics.record_validation(&outcome);
@@ -8705,6 +8734,150 @@ mod tests {
         );
     }
 
+    /// CNAME chain response whose CNAME and target A RRset both carry covering
+    /// RRSIGs from `signer`, with no DNSKEY in the response.
+    fn covering_fake_cname_response(
+        qname: &Name,
+        target: &Name,
+        signer: &hickory_proto::dnssec::DnssecSigner,
+    ) -> Message {
+        use hickory_proto::rr::RecordSet;
+        use hickory_proto::rr::rdata::CNAME;
+
+        let cname = Record::from_rdata(qname.clone(), 300, RData::CNAME(CNAME(target.clone())));
+        let mut cname_set = RecordSet::new(qname.clone(), RecordType::CNAME, 0);
+        cname_set.insert(cname.clone(), 0);
+        let cname_sig = sign_test_rrset(&cname_set, signer);
+
+        let answer = Record::from_rdata(
+            target.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(198, 51, 100, 77))),
+        );
+        let mut answer_set = RecordSet::new(target.clone(), RecordType::A, 0);
+        answer_set.insert(answer.clone(), 0);
+        let answer_sig = sign_test_rrset(&answer_set, signer);
+
+        let mut response = Message::new(15, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+        response.answers.push(cname);
+        response.answers.push(cname_sig);
+        response.answers.push(answer);
+        response.answers.push(answer_sig);
+        response
+    }
+
+    /// Critical 1: a target proven signed only in the shared chain cache must
+    /// not be re-admitted to `Insecure` by the qname's authenticated unsigned
+    /// delegation when covering (fake) RRSIGs are present.
+    #[tokio::test]
+    async fn test_chain_cache_only_signed_target_with_covering_fake_rrsigs_is_bogus() {
+        let (_, _, fake_signer) = create_test_signer("signed.example.");
+        let qname = Name::from_str("start.unsigned.example.").expect("qname");
+        let target = Name::from_str("www.signed.example.").expect("target");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+        validator.insecure_zones.insert(
+            LowerName::from(&Name::from_str("unsigned.example.").unwrap()),
+            now + 600,
+        );
+        validator.chain_cache().insert(
+            LowerName::from(&Name::from_str("signed.example.").unwrap()),
+            ZoneStatus::Signed,
+            now + 600,
+            now,
+        );
+        assert!(
+            validator.signed_zones.is_empty(),
+            "the target must be signed only in the chain cache"
+        );
+        assert!(
+            validator.signed_zone_contains(&LowerName::from(&target), now),
+            "signed-chain evidence must consult the shared chain cache"
+        );
+
+        let mut response = covering_fake_cname_response(&qname, &target, &fake_signer);
+        let offline = OfflineFetcher::new();
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("cache-signed"), now, &offline)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a chain-cache-signed target must fail closed: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+    }
+
+    /// Critical 1 companion: a fully stripped CNAME chain into a target that
+    /// is proven signed only in the shared chain cache must be Bogus, not
+    /// Insecure from the unsigned qname.
+    #[tokio::test]
+    async fn test_stripped_cname_to_chain_cache_signed_target_is_bogus() {
+        let qname = Name::from_str("plain.unsigned.example.").expect("qname");
+        let target = Name::from_str("www.signed.example.").expect("target");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+        validator.insecure_zones.insert(
+            LowerName::from(&Name::from_str("unsigned.example.").unwrap()),
+            now + 600,
+        );
+        validator.chain_cache().insert(
+            LowerName::from(&Name::from_str("signed.example.").unwrap()),
+            ZoneStatus::Signed,
+            now + 600,
+            now,
+        );
+        assert!(validator.signed_zones.is_empty());
+
+        let mut response = stripped_cname_response(&qname, &target);
+        let offline = OfflineFetcher::new();
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("stripped-cache-signed"), now, &offline)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a chain-cache-signed stripped target must fail closed: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    }
+
+    /// Critical 2: the post-fetch probe must fail closed when the target probe
+    /// is blocked, even though the qname is a proven unsigned delegation.
+    #[tokio::test]
+    async fn test_blocked_target_probe_after_fake_covering_rrsigs_is_bogus() {
+        let (_, _, fake_signer) = create_test_signer("signed.example.");
+        let qname = Name::from_str("start.unsigned.example.").expect("qname");
+        let target = Name::from_str("www.signed.example.").expect("target");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+        validator.insecure_zones.insert(
+            LowerName::from(&Name::from_str("unsigned.example.").unwrap()),
+            now + 600,
+        );
+
+        let mut response = covering_fake_cname_response(&qname, &target, &fake_signer);
+        let offline = OfflineFetcher::new();
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("blocked-target"), now, &offline)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a failed target probe must not become Insecure: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+        assert!(
+            offline.calls() > 0,
+            "the blocked target probe must have been attempted"
+        );
+    }
+
     /// A signed wildcard-expanded answer may carry the RRSIG at the wildcard
     /// owner (`*.wild.example`) while the RRset is owned by the expanded qname.
     /// Both response shapes must validate as Secure without forcing a probe.
@@ -8715,76 +8888,91 @@ mod tests {
         use hickory_proto::rr::SerialNumber;
 
         let (origin, dnskey, signer) = create_test_signer("wild.example.");
-        let qname = Name::from_str("www.wild.example.").expect("qname");
         let wildcard = Name::from_str("*.wild.example.").expect("wildcard");
-        let answer = Record::from_rdata(
-            qname.clone(),
-            300,
-            RData::A(A(Ipv4Addr::new(203, 0, 113, 97))),
-        );
         let now_utc = time::OffsetDateTime::now_utc();
         let now = now_utc.unix_timestamp() as u32;
-        let input = SigInput {
-            type_covered: RecordType::A,
-            algorithm: Algorithm::ECDSAP256SHA256,
-            // Wildcard RRSIG labels exclude the `*` label.
-            num_labels: origin.num_labels(),
-            original_ttl: 300,
-            sig_expiration: SerialNumber::new(
-                now_utc
-                    .unix_timestamp()
-                    .saturating_add(300)
-                    .try_into()
-                    .expect("expiration"),
+
+        for (qname, expect_probe) in [
+            (
+                Name::from_str("www.wild.example.").expect("single-label qname"),
+                false,
             ),
-            sig_inception: SerialNumber::new(
-                now_utc
-                    .unix_timestamp()
-                    .saturating_sub(60)
-                    .try_into()
-                    .expect("inception"),
+            (
+                Name::from_str("foo.bar.wild.example.").expect("multi-label qname"),
+                false,
             ),
-            key_tag: signer.calculate_key_tag().expect("key tag"),
-            signer_name: origin.clone(),
-        };
-        let tbs = TBS::from_input(&qname, DNSClass::IN, &input, std::iter::once(&answer))
-            .expect("wildcard tbs");
-        let signature = signer.sign(&tbs).expect("wildcard signature");
-        let rrsig_data = RRSIG::from_sig(input, signature);
-
-        for rrsig_owner in [wildcard, qname.clone()] {
-            let mut anchors = TrustAnchors::empty();
-            anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
-            let validator =
-                DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
-
-            let mut response = Message::new(14, MessageType::Response, OpCode::Query);
-            response
-                .queries
-                .push(Query::query(qname.clone(), RecordType::A));
-            response.answers.push(answer.clone());
-            response.answers.push(Record::from_rdata(
-                rrsig_owner,
+        ] {
+            let answer = Record::from_rdata(
+                qname.clone(),
                 300,
-                RData::DNSSEC(DNSSECRData::RRSIG(rrsig_data.clone())),
-            ));
-            response.additionals.push(Record::from_rdata(
-                origin.clone(),
-                300,
-                RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
-            ));
-
-            let offline = OfflineFetcher::new();
-            let outcome = validator
-                .validate_with_key_fetcher(&mut response, Some("wildcard"), now, &offline)
-                .await;
-            assert_eq!(
-                outcome,
-                ValidationOutcome::Secure,
-                "a signed wildcard answer must validate: {outcome:?}"
+                RData::A(A(Ipv4Addr::new(203, 0, 113, 97))),
             );
-            assert!(response.metadata.authentic_data);
-            assert_eq!(offline.calls(), 0, "a signed answer must not probe");
+            let input = SigInput {
+                type_covered: RecordType::A,
+                algorithm: Algorithm::ECDSAP256SHA256,
+                // Wildcard RRSIG labels exclude the `*` label.
+                num_labels: origin.num_labels(),
+                original_ttl: 300,
+                sig_expiration: SerialNumber::new(
+                    now_utc
+                        .unix_timestamp()
+                        .saturating_add(300)
+                        .try_into()
+                        .expect("expiration"),
+                ),
+                sig_inception: SerialNumber::new(
+                    now_utc
+                        .unix_timestamp()
+                        .saturating_sub(60)
+                        .try_into()
+                        .expect("inception"),
+                ),
+                key_tag: signer.calculate_key_tag().expect("key tag"),
+                signer_name: origin.clone(),
+            };
+            let tbs = TBS::from_input(&qname, DNSClass::IN, &input, std::iter::once(&answer))
+                .expect("wildcard tbs");
+            let signature = signer.sign(&tbs).expect("wildcard signature");
+            let rrsig_data = RRSIG::from_sig(input, signature);
+
+            for rrsig_owner in [wildcard.clone(), qname.clone()] {
+                let mut anchors = TrustAnchors::empty();
+                anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+                let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new())
+                    .with_trust_anchors(anchors);
+
+                let mut response = Message::new(14, MessageType::Response, OpCode::Query);
+                response
+                    .queries
+                    .push(Query::query(qname.clone(), RecordType::A));
+                response.answers.push(answer.clone());
+                response.answers.push(Record::from_rdata(
+                    rrsig_owner,
+                    300,
+                    RData::DNSSEC(DNSSECRData::RRSIG(rrsig_data.clone())),
+                ));
+                response.additionals.push(Record::from_rdata(
+                    origin.clone(),
+                    300,
+                    RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+                ));
+
+                let offline = OfflineFetcher::new();
+                let outcome = validator
+                    .validate_with_key_fetcher(&mut response, Some("wildcard"), now, &offline)
+                    .await;
+                assert_eq!(
+                    outcome,
+                    ValidationOutcome::Secure,
+                    "a signed wildcard answer must validate for {qname}: {outcome:?}"
+                );
+                assert!(response.metadata.authentic_data);
+                assert_eq!(
+                    offline.calls() > 0,
+                    expect_probe,
+                    "a signed wildcard answer must not probe for {qname}"
+                );
+            }
         }
     }
 
