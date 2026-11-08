@@ -171,10 +171,34 @@ async fn load_cache_or(
     meta_path: &Path,
     list_name: &str,
     max_bytes: usize,
+    allow_empty: bool,
     error: FilterError,
 ) -> Result<String, FilterError> {
     match read_cache_verified(cache_path, meta_path, list_name, max_bytes).await {
         Ok(cached) => {
+            // Older versions could cache an HTML error page or an empty body
+            // as a successful list. Never hand that to the engine: HTML lines
+            // often parse into non-zero substring rules and would replace a
+            // good list.
+            if let Err(rejected) = reject_invalid_content(list_name, &cached, None, allow_empty) {
+                warn!(
+                    list = %list_name,
+                    path = %cache_path.display(),
+                    error = %rejected,
+                    "Cached blocklist is empty/HTML; quarantining cache"
+                );
+                if let Err(e) = tokio::fs::remove_file(cache_path).await
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(list = %list_name, error = %e, "Failed to remove rejected list cache");
+                }
+                if let Err(e) = tokio::fs::remove_file(meta_path).await
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(list = %list_name, error = %e, "Failed to remove rejected list metadata");
+                }
+                return Err(rejected);
+            }
             info!(
                 list = %list_name,
                 path = %cache_path.display(),
@@ -478,8 +502,15 @@ impl SubscriptionFetcher {
                                 error = %e,
                                 "Rejecting empty/HTML local blocklist; attempting disk cache fallback"
                             );
-                            load_cache_or(&cache_path, &meta_path, list_name, self.max_bytes, e)
-                                .await
+                            load_cache_or(
+                                &cache_path,
+                                &meta_path,
+                                list_name,
+                                self.max_bytes,
+                                self.allow_empty,
+                                e,
+                            )
+                            .await
                         }
                     }
                 }
@@ -490,7 +521,15 @@ impl SubscriptionFetcher {
                         error = %e,
                         "Refusing local blocklist; attempting disk cache fallback"
                     );
-                    load_cache_or(&cache_path, &meta_path, list_name, self.max_bytes, e).await
+                    load_cache_or(
+                        &cache_path,
+                        &meta_path,
+                        list_name,
+                        self.max_bytes,
+                        self.allow_empty,
+                        e,
+                    )
+                    .await
                 }
             };
         }
@@ -516,7 +555,15 @@ impl SubscriptionFetcher {
                     error = %e,
                     "Refusing blocklist URL target; attempting disk cache fallback"
                 );
-                return load_cache_or(&cache_path, &meta_path, list_name, self.max_bytes, e).await;
+                return load_cache_or(
+                    &cache_path,
+                    &meta_path,
+                    list_name,
+                    self.max_bytes,
+                    self.allow_empty,
+                    e,
+                )
+                .await;
             }
         };
         let client = match pinned.as_ref() {
@@ -714,6 +761,7 @@ impl SubscriptionFetcher {
                             &meta_path,
                             list_name,
                             self.max_bytes,
+                            self.allow_empty,
                             e,
                         )
                         .await;
@@ -780,6 +828,7 @@ impl SubscriptionFetcher {
             &meta_path,
             list_name,
             self.max_bytes,
+            self.allow_empty,
             fallback_error,
         )
         .await
@@ -1244,6 +1293,63 @@ mod tests {
         assert!(
             matches!(err, FilterError::HtmlResponse { .. }),
             "unexpected error: {err}"
+        );
+
+        server.await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// A legacy disk cache containing an HTML error page must not be served as
+    /// a fallback after the fresh response is rejected; it is quarantined.
+    #[tokio::test]
+    async fn test_html_cache_fallback_is_rejected_and_quarantined() {
+        let data_dir = temp_dir("sito_html_cache");
+        let list_name = "html-cache";
+        let cache_path = cache_path_for_list(&data_dir, list_name);
+        let meta_path = meta_path_for_list(&data_dir, list_name);
+        let cached_html = "<html><body>CDN error</body></html>\n";
+        save_to_cache(&cache_path, cached_html).await.unwrap();
+        save_metadata(
+            &meta_path,
+            &ListMetadata {
+                content_len: Some(cached_html.len() as u64),
+                line_count: Some(cached_html.lines().count()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let body = "<!DOCTYPE html><html><body>fresh error</body></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (addr, _captured, server) = spawn_http_server(vec![response]).await;
+
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            0,
+            Duration::from_millis(10),
+        );
+        fetcher.allow_private_targets = true;
+
+        let err = fetcher
+            .fetch_or_cached(list_name, &format!("http://{addr}/list.txt"), &data_dir)
+            .await
+            .expect_err("the HTML cache fallback must be rejected");
+        assert!(
+            matches!(err, FilterError::HtmlResponse { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !cache_path.exists(),
+            "the rejected HTML cache must be quarantined"
+        );
+        assert!(
+            !meta_path.exists(),
+            "the rejected cache metadata must be quarantined"
         );
 
         server.await.unwrap();

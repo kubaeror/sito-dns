@@ -38,9 +38,12 @@ pub enum FilterState {
     /// The initial (or first) rule load has not produced a snapshot yet.
     #[default]
     Loading,
-    /// A snapshot is active (possibly empty when nothing is configured).
+    /// A snapshot is active. It is empty only when the operator explicitly
+    /// opted into empty lists (`allow_empty_list`).
     Ready,
-    /// Every configured source failed and no rules are active.
+    /// No usable snapshot is active, or a live apply was rejected while an
+    /// older snapshot was retained. Callers distinguish the two with
+    /// [`FilterStatus::unavailable`].
     Failed,
 }
 
@@ -53,7 +56,8 @@ pub struct FilterStatus {
     pub rule_count: usize,
     /// Number of configured lists that loaded successfully in the last reload.
     pub loaded_lists: usize,
-    /// Names of configured lists that failed to load in the last reload.
+    /// Names of configured lists that failed to load, yielded no rules, or
+    /// were rejected by the parse/pattern budgets in the last reload.
     pub failed_lists: Vec<String>,
     /// Most recent reload error, if any.
     pub last_error: Option<String>,
@@ -958,6 +962,14 @@ impl HostsFilterEngine {
                             "Group custom_rules exceed the parsing budget; truncating group rules"
                         );
                         degraded_groups.push(def.name.clone());
+                        if rules.is_empty() {
+                            // The group's only rules were the over-budget
+                            // custom rules. Carry over its previous snapshot
+                            // so a degraded group never disappears.
+                            if let Some(previous) = previous.get(&def.name) {
+                                compiled.insert(def.name.clone(), Arc::clone(previous));
+                            }
+                        }
                         break;
                     }
                 }
@@ -1213,19 +1225,21 @@ impl HostsFilterEngine {
             let prev_count = self.snapshot.load().rule_count;
             if prev_count > 0 && !self.snapshot.load().unavailable {
                 // A configured-but-now-empty source set must not replace the
-                // last good snapshot; keep protecting with it and surface the
-                // configuration problem.
+                // last good snapshot, but it must not look healthy either:
+                // publish Failed (the snapshot stays usable, so `unavailable`
+                // remains false) and reject the config so a live apply does
+                // not commit a zero-source configuration.
                 let reason = "filtering.enabled has no configured sources; retained the previous filter snapshot".to_string();
-                warn!("{reason}");
+                error!("{reason}");
                 self.set_status(FilterStatus {
-                    state: FilterState::Ready,
+                    state: FilterState::Failed,
                     rule_count: prev_count,
                     last_error: Some(reason),
                     unavailable: false,
                     dropped_regex_patterns: self.snapshot.load().dropped_regex_patterns,
                     ..FilterStatus::default()
                 });
-                return Ok(prev_count);
+                return Err(FilterError::NoSourcesConfigured);
             }
             self.snapshot.store(Arc::new(FilterSnapshot::unavailable()));
             self.list_rules.lock().unwrap().clear();
@@ -1433,6 +1447,17 @@ impl HostsFilterEngine {
                 all_rules.extend(map[name].iter().cloned());
             }
             all_rules.extend(parsed_custom);
+            // Per-list checks cannot see two individually valid lists whose
+            // combined Aho-Corasick/prefix/regex load exceeds the budget. The
+            // builder would silently skip the whole class, so reject the
+            // reload instead and keep the previous snapshot.
+            if let Some(reason) = pattern_load_exceeds_limits(&all_rules) {
+                error!(
+                    reason = %reason,
+                    "Combined filter rule set exceeds pattern compilation limits"
+                );
+                return Err(FilterError::CompileTaskFailed(reason));
+            }
             let snapshot = FilterSnapshot::compile_with_budget(all_rules, budget.as_ref())
                 .map_err(|e| FilterError::CompileBudgetExceeded {
                     elapsed_ms: e.elapsed_ms,
@@ -2232,23 +2257,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drop_guard_keeps_last_remaining_rule() {
+    async fn test_warm_zero_source_transition_is_failed_and_retains_snapshot() {
         let temp_dir =
-            std::env::temp_dir().join(format!("sito_drop_single_test_{}", std::process::id()));
+            std::env::temp_dir().join(format!("sito_warm_zero_source_{}", std::process::id()));
         let config = FilteringConfig {
             custom_rules: vec!["0.0.0.0 only.com".to_string()],
             ..Default::default()
         };
         let engine = HostsFilterEngine::init(config.clone(), temp_dir.clone()).await;
         assert_eq!(engine.rule_count(), 1);
+        assert_eq!(engine.state(), FilterState::Ready);
 
-        // Dropping the last rule is a 100% loss and must be guarded.
-        let mut dropped = config;
-        dropped.custom_rules.clear();
-        engine.config.store(Arc::new(dropped));
-        let count = engine.reload().await.unwrap();
-        assert_eq!(count, 1, "the last rule must survive the drop guard");
-        assert_eq!(engine.rule_count(), 1);
+        // A live (warm) apply that removes every source must be rejected and
+        // published as Failed while the last good snapshot stays active.
+        let zero_sources = FilteringConfig {
+            custom_rules: Vec::new(),
+            lists: Vec::new(),
+            ..config.clone()
+        };
+        let err = engine
+            .reload_with_config(&zero_sources)
+            .await
+            .expect_err("zero sources must reject a warm apply");
+        assert!(matches!(err, FilterError::NoSourcesConfigured));
+        assert_eq!(engine.rule_count(), 1, "the last rule must be retained");
+        assert_eq!(engine.state(), FilterState::Failed);
+        assert!(!engine.unavailable_for_fail_closed());
+        assert_eq!(
+            engine.config.load_full().custom_rules,
+            config.custom_rules,
+            "the rejected zero-source config must not be committed"
+        );
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            engine
+                .evaluate(
+                    &Name::from_str("only.com.").unwrap(),
+                    RecordType::A,
+                    &client
+                )
+                .is_blocked()
+        );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
@@ -2427,6 +2476,63 @@ mod tests {
                 .degraded_groups
                 .contains(&"kids".to_string()),
             "the group must be reported as degraded"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Important 1: an over-budget group custom-rules reload must retain the
+    /// previous group snapshot, not silently remove the group.
+    #[tokio::test]
+    async fn test_group_parse_budget_failure_retains_previous_snapshot() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_parse_budget_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let engine = HostsFilterEngine::new(
+            FilteringConfig {
+                max_rules: 2,
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        );
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: Vec::new(),
+            custom_rules: vec!["||keep-group.example^".to_string()],
+        }]);
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            engine
+                .group_snapshot("kids")
+                .expect("initial group snapshot")
+                .evaluate("keep-group.example", RecordType::A, &client)
+                .is_blocked()
+        );
+
+        // Three rules exceed max_rules = 2; the group has no list rules, so
+        // the parse-budget arm leaves `rules` empty.
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: Vec::new(),
+            custom_rules: vec!["||a.example^\n||b.example^\n||c.example^".to_string()],
+        }]);
+        let snapshot = engine
+            .group_snapshot("kids")
+            .expect("the previous group snapshot must survive");
+        assert!(
+            snapshot
+                .evaluate("keep-group.example", RecordType::A, &client)
+                .is_blocked(),
+            "the retained group snapshot must stay active"
+        );
+        assert!(
+            engine
+                .status()
+                .degraded_groups
+                .contains(&"kids".to_string()),
+            "the retained group must still be reported degraded"
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
@@ -2742,6 +2848,83 @@ mod tests {
                     &client
                 )
                 .is_blocked()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Two lists each below the per-list substring budget can jointly exceed
+    /// it. The reload must be rejected before the builder silently drops the
+    /// whole Aho-Corasick class, retaining the previous snapshot.
+    #[tokio::test]
+    async fn test_combined_multi_list_substring_budget_is_rejected() {
+        use std::fmt::Write as _;
+        let temp_dir = std::env::temp_dir().join(format!("sito_ac_combo_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let a_path = temp_dir.join("a.txt");
+        let b_path = temp_dir.join("b.txt");
+        let per_list = MAX_AC_PATTERNS / 2 + 1;
+        for (path, prefix) in [(&a_path, "a"), (&b_path, "b")] {
+            let mut body = String::new();
+            for i in 0..per_list {
+                let _ = writeln!(body, "{prefix}-sub-{i}");
+            }
+            tokio::fs::write(path, body).await.unwrap();
+        }
+
+        let engine = HostsFilterEngine::init(
+            FilteringConfig {
+                custom_rules: vec!["||keep.example^".to_string()],
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        )
+        .await;
+        assert_eq!(engine.rule_count(), 1);
+
+        let lists = vec![
+            FilterListConfig {
+                name: "a".to_string(),
+                url: format!("file://{}", a_path.display()),
+                enabled: true,
+                refresh_hours: None,
+            },
+            FilterListConfig {
+                name: "b".to_string(),
+                url: format!("file://{}", b_path.display()),
+                enabled: true,
+                refresh_hours: None,
+            },
+        ];
+        let err = engine
+            .reload_with_config(&FilteringConfig {
+                custom_rules: vec!["||keep.example^".to_string()],
+                lists,
+                ..Default::default()
+            })
+            .await
+            .expect_err("the combined substring budget must reject the reload");
+        assert!(matches!(err, FilterError::CompileTaskFailed(_)));
+        assert_eq!(engine.rule_count(), 1, "previous snapshot retained");
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            engine
+                .evaluate(
+                    &Name::from_str("keep.example.").unwrap(),
+                    RecordType::A,
+                    &client
+                )
+                .is_blocked()
+        );
+        assert!(
+            engine
+                .status()
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("substring patterns exceed")),
+            "unexpected status: {:?}",
+            engine.status().last_error
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;

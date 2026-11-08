@@ -52,9 +52,6 @@ pub enum FilterError {
     #[error("Blocklist '{list}' returned an HTML/XML document instead of a rule list")]
     HtmlResponse { list: String },
 
-    #[error("Blocklist '{list}' yielded no rules after parsing")]
-    NoRulesYielded { list: String },
-
     #[error("Filter rule set exceeds the configured limit of {limit} rules (parsed: {count})")]
     TooManyRules { count: usize, limit: usize },
 

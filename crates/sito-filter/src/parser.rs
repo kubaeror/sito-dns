@@ -858,7 +858,7 @@ fn validate_rewrite(
             }
             if !SUPPORTED_DNSREWRITE_TYPES.contains(&rtype.as_str()) {
                 warn!(
-                    record_type = %rtype,
+                    record_type = %log_excerpt(&rtype),
                     "Unsupported $dnsrewrite record type; skipping rule"
                 );
                 return None;
@@ -1672,6 +1672,21 @@ mod tests {
         let excerpt = log_excerpt(&huge);
         assert!(excerpt.chars().count() <= RULE_LOG_EXCERPT_CHARS + 1);
         assert!(excerpt.chars().count() < huge.chars().count());
+    }
+
+    /// P2-96: per-source warning slots are exhausted and then suppressed.
+    #[test]
+    fn test_warning_rate_limit_suppresses_after_budget() {
+        let source = format!("rate-limit-test-{}", std::process::id());
+        let mut last = false;
+        for _ in 0..RULE_LOG_MAX_PER_SOURCE {
+            last = take_warning_slot(&source).expect("slot within budget");
+        }
+        assert!(last, "the final slot must announce suppression");
+        assert!(
+            take_warning_slot(&source).is_none(),
+            "further warnings must be suppressed"
+        );
     }
 
     #[test]

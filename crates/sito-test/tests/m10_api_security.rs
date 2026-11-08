@@ -428,6 +428,17 @@ async fn test_acceptance_m10_concurrent_writes_preserve_both() {
         std::env::temp_dir().join(format!("sito_m10_concurrent_{}", rand::random::<u64>()));
     tokio::fs::create_dir_all(&temp_dir).await.unwrap();
     let ctx = create_test_context(&temp_dir, false).await;
+    // Keep one non-list source so toggling the only list off does not make the
+    // live configuration source-less (which is now rejected fail-closed).
+    let mut seeded = (**ctx.config.load()).clone();
+    seeded
+        .filtering
+        .custom_rules
+        .push("||m10-keep.invalid^".to_string());
+    tokio::fs::write(&ctx.config_path, toml::to_string_pretty(&seeded).unwrap())
+        .await
+        .unwrap();
+    ctx.set_config(seeded);
     let app = sito_api::create_router(ctx.clone());
     let token = ctx
         .auth_mgr

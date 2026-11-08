@@ -297,8 +297,9 @@ async fn apply_full_config_locked(
         }),
         Err(e) => {
             // Roll the components applied so far back to the previous
-            // configuration. Best effort: a failed rollback is logged loudly.
-            if let Err(rollback_err) = apply_inner(ctx, &previous, FilterApply::Sync, hooks).await {
+            // configuration, using the same filter mode as the failed apply.
+            // Best effort: a failed rollback is logged loudly.
+            if let Err(rollback_err) = apply_inner(ctx, &previous, filter_apply, hooks).await {
                 tracing::error!(
                     error = %rollback_err.detail,
                     "Failed to roll back configuration apply; runtime may be partially updated"
