@@ -45,9 +45,14 @@ use tower::ServiceExt;
 const TEST_ADMIN_PASSWORD: &str = "TestAdminPassword123!";
 
 /// Reserves a free loopback TCP port for HA replication listeners.
-fn reserve_tcp_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve tcp port");
-    listener.local_addr().expect("local addr").port()
+///
+/// The returned lease must stay alive for the test so the port cannot be
+/// selected by another test in this binary.
+fn reserve_tcp_port() -> (u16, sito_test::harness::ReservedPort) {
+    let mut lease = sito_test::harness::reserve_port().expect("reserve tcp port");
+    let port = lease.port();
+    lease.release_listener();
+    (port, lease)
 }
 
 /// Minimal applier for tests that only need the push to update the filter and
@@ -265,7 +270,7 @@ async fn test_m8_mtls_handshake_rejects_foreign_cert() {
     let coordinator =
         MasterCoordinator::new("master-mtls".to_string(), 1, signing_key, metrics.clone());
 
-    let replication_port = reserve_tcp_port();
+    let (replication_port, _replication_port_lease) = reserve_tcp_port();
     let master_ha_cfg = HaConfig {
         replication_port,
         listen_addr: "127.0.0.1".to_string(),
@@ -1074,7 +1079,7 @@ async fn test_m8_ha_runtime_child_probe() {
             let coordinator =
                 MasterCoordinator::new("child-master".to_string(), 1, signing_key, metrics);
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let replication_port = reserve_tcp_port();
+            let (replication_port, _replication_port_lease) = reserve_tcp_port();
             let handle = spawn_master_server(
                 HaConfig {
                     replication_port,
@@ -1163,7 +1168,7 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
         metrics.clone(),
     );
 
-    let replication_port = reserve_tcp_port();
+    let (replication_port, _replication_port_lease) = reserve_tcp_port();
     let master_ha_cfg = HaConfig {
         replication_port,
         listen_addr: "127.0.0.1".to_string(),
@@ -1842,7 +1847,7 @@ async fn test_m8_chaos_master_mid_push_kill() {
         metrics.clone(),
     );
 
-    let replication_port = reserve_tcp_port();
+    let (replication_port, _replication_port_lease) = reserve_tcp_port();
     let master_ha_cfg = HaConfig {
         replication_port,
         listen_addr: "127.0.0.1".to_string(),

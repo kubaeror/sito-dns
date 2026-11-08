@@ -32,6 +32,9 @@ jobs:
       - name: Run full test suite in release mode
         env:
           SITO_BENCH_TESTS: "1"
+          # Enforce the opt-in 50k query-log insertion timing gate on the
+          # dedicated weekly runner, where scheduling noise is lower.
+          SITO_PERF_TESTS: "1"
         run: cargo test --workspace --release --all-features --locked
 
   perf:

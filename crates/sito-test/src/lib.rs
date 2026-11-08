@@ -5,7 +5,10 @@ pub mod harness;
 pub mod mock;
 
 pub use client::{DotConnection, TestDnsClient};
-pub use harness::{TestServerInstance, generate_expired_test_cert, generate_test_cert, wait_until};
+pub use harness::{
+    ReservedPort, ReservedUdpPort, TestServerInstance, generate_expired_test_cert,
+    generate_test_cert, reserve_port, reserve_udp_port, wait_until,
+};
 pub use mock::MockDnsServer;
 
 #[cfg(test)]

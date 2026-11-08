@@ -62,9 +62,9 @@ async fn test_m7_doq_query_and_early_data_disabled() {
 
     let acceptor_mgr = TlsAcceptorManager::new(server_cfg);
 
-    let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let port = udp_socket.local_addr().unwrap().port();
-    drop(udp_socket);
+    let mut port_lease = sito_test::harness::reserve_udp_port().expect("reserve DoQ UDP port");
+    let port = port_lease.port();
+    port_lease.release_socket();
 
     let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
     let doq_config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
@@ -160,9 +160,9 @@ async fn test_m7_doh3_post_and_get_queries() {
         .expect("load server config");
     let acceptor_mgr = TlsAcceptorManager::new(server_cfg);
 
-    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let mut port_lease = sito_test::harness::reserve_udp_port().expect("reserve DoH3 UDP port");
+    let port = port_lease.port();
+    port_lease.release_socket();
 
     let bound_addr = SocketAddr::from(([127, 0, 0, 1], port));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);

@@ -66,12 +66,150 @@ where
 static RESERVED_PORTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
     std::sync::OnceLock::new();
 
-fn reserve_port(port: u16) -> bool {
+fn try_reserve_port(port: u16) -> bool {
     RESERVED_PORTS
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
         .lock()
         .unwrap()
         .insert(port)
+}
+
+/// A loopback TCP port reserved for the lifetime of a test.
+///
+/// The port is bound on `127.0.0.1:0` so the OS picks a free ephemeral port.
+/// Keep the lease alive for the whole test. When the code under test must bind
+/// the port itself, call [`ReservedPort::release_listener`] immediately before
+/// starting it; the port stays registered in the process-wide reservation set
+/// until the lease is dropped, so other harness instances cannot choose it.
+#[derive(Debug)]
+pub struct ReservedPort {
+    port: u16,
+    listener: Option<std::net::TcpListener>,
+}
+
+impl ReservedPort {
+    /// The reserved port.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The reserved loopback socket address.
+    pub fn addr(&self) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), self.port)
+    }
+
+    /// The probe listener while it is still held, if any.
+    pub fn listener(&self) -> Option<&std::net::TcpListener> {
+        self.listener.as_ref()
+    }
+
+    /// Drops the probe listener so the code under test can bind the port.
+    ///
+    /// The reservation itself is kept until the lease is dropped.
+    pub fn release_listener(&mut self) {
+        self.listener = None;
+    }
+}
+
+impl Drop for ReservedPort {
+    fn drop(&mut self) {
+        // Close the probe socket before returning the port to the pool so a
+        // concurrent reservation cannot pick a port that is still bound.
+        drop(self.listener.take());
+        release_reserved_ports(std::slice::from_ref(&self.port));
+    }
+}
+
+/// Reserves an ephemeral loopback TCP port for tests that probe a port and then
+/// hand it to code which binds it later (for example HA replication listeners).
+///
+/// The returned lease keeps the port out of the harness-wide reservation pool
+/// until it is dropped. See [`ReservedPort`] for the listener lifecycle.
+#[must_use = "the lease must be held for the port to stay reserved"]
+pub fn reserve_port() -> std::io::Result<ReservedPort> {
+    for _ in 0..20 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        if try_reserve_port(port) {
+            return Ok(ReservedPort {
+                port,
+                listener: Some(listener),
+            });
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        "no unreserved ephemeral TCP port after 20 attempts",
+    ))
+}
+
+/// A loopback UDP port reserved for the lifetime of a test.
+///
+/// The socket is bound on `127.0.0.1:0` so the OS picks a free ephemeral port.
+/// Keep the lease alive for the whole test. When the code under test must bind
+/// the port itself, call [`ReservedUdpPort::release_socket`] immediately before
+/// starting it; the port stays registered in the process-wide reservation set
+/// until the lease is dropped.
+#[derive(Debug)]
+pub struct ReservedUdpPort {
+    port: u16,
+    socket: Option<std::net::UdpSocket>,
+}
+
+impl ReservedUdpPort {
+    /// The reserved port.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The reserved loopback socket address.
+    pub fn addr(&self) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), self.port)
+    }
+
+    /// The probe socket while it is still held, if any.
+    pub fn socket(&self) -> Option<&std::net::UdpSocket> {
+        self.socket.as_ref()
+    }
+
+    /// Drops the probe socket so the code under test can bind the port.
+    ///
+    /// The reservation itself is kept until the lease is dropped.
+    pub fn release_socket(&mut self) {
+        self.socket = None;
+    }
+}
+
+impl Drop for ReservedUdpPort {
+    fn drop(&mut self) {
+        // Close the probe socket before returning the port to the pool so a
+        // concurrent reservation cannot pick a port that is still bound.
+        drop(self.socket.take());
+        release_reserved_ports(std::slice::from_ref(&self.port));
+    }
+}
+
+/// Reserves an ephemeral loopback UDP port for tests that probe a port and then
+/// hand it to code which binds it later (for example DoQ/DoH3 listeners).
+///
+/// The returned lease keeps the port out of the harness-wide reservation pool
+/// until it is dropped. See [`ReservedUdpPort`] for the socket lifecycle.
+#[must_use = "the lease must be held for the port to stay reserved"]
+pub fn reserve_udp_port() -> std::io::Result<ReservedUdpPort> {
+    for _ in 0..20 {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let port = socket.local_addr()?.port();
+        if try_reserve_port(port) {
+            return Ok(ReservedUdpPort {
+                port,
+                socket: Some(socket),
+            });
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        "no unreserved ephemeral UDP port after 20 attempts",
+    ))
 }
 
 fn release_reserved_ports(ports: &[u16]) {
@@ -102,7 +240,7 @@ impl PortReservations {
         for _ in 0..20 {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
             let port = listener.local_addr()?.port();
-            if reserve_port(port) {
+            if try_reserve_port(port) {
                 self.ports.push(port);
                 return Ok((listener, port));
             }
@@ -117,7 +255,7 @@ impl PortReservations {
         for _ in 0..20 {
             let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
             let port = socket.local_addr()?.port();
-            if reserve_port(port) {
+            if try_reserve_port(port) {
                 self.ports.push(port);
                 return Ok((socket, port));
             }
@@ -495,5 +633,77 @@ impl Drop for TestServerInstance {
         tokio::spawn(async move {
             let _ = tokio::fs::remove_dir_all(&dir).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{release_reserved_ports, reserve_port, reserve_udp_port, try_reserve_port};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn reserve_port_holds_the_port_until_the_lease_is_dropped() {
+        let mut lease = reserve_port().expect("reserve an ephemeral TCP port");
+        let port = lease.port();
+
+        assert_ne!(port, 0, "an ephemeral port must be nonzero");
+        assert_eq!(lease.addr().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(lease.addr().port(), port);
+
+        let listener = lease.listener().expect("the probe listener must be held");
+        assert_eq!(
+            listener.local_addr().expect("probe local addr").port(),
+            port
+        );
+
+        // The listener is released so the code under test can bind the port,
+        // but the port stays reserved until the lease itself is dropped.
+        lease.release_listener();
+        assert!(lease.listener().is_none(), "listener must be released");
+        assert!(
+            !try_reserve_port(port),
+            "a released listener must remain reserved by the lease"
+        );
+
+        drop(lease);
+        assert!(
+            try_reserve_port(port),
+            "dropping the lease must release the port"
+        );
+        release_reserved_ports(&[port]);
+    }
+
+    #[test]
+    fn reserve_port_returns_distinct_ports_for_live_leases() {
+        let first = reserve_port().expect("first reservation");
+        let second = reserve_port().expect("second reservation");
+        assert_ne!(first.port(), second.port());
+    }
+
+    #[test]
+    fn reserve_udp_port_holds_the_port_until_the_lease_is_dropped() {
+        let mut lease = reserve_udp_port().expect("reserve an ephemeral UDP port");
+        let port = lease.port();
+
+        assert_ne!(port, 0, "an ephemeral port must be nonzero");
+        assert_eq!(lease.addr().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(lease.addr().port(), port);
+
+        let socket = lease.socket().expect("the probe socket must be held");
+        assert_eq!(socket.local_addr().expect("probe local addr").port(), port);
+
+        lease.release_socket();
+        assert!(lease.socket().is_none(), "socket must be released");
+        assert!(
+            !try_reserve_port(port),
+            "a released socket must remain reserved by the lease"
+        );
+
+        drop(lease);
+        assert!(
+            try_reserve_port(port),
+            "dropping the lease must release the port"
+        );
+        release_reserved_ports(&[port]);
     }
 }
