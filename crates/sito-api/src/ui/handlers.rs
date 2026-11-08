@@ -17,7 +17,8 @@ use crate::auth::session::{
 };
 use crate::auth::token::Role;
 use crate::config_apply::{
-    ApplyHooks, FilterApply, apply_and_persist_config_locked, apply_full_config,
+    ApplyHooks, ConfigFileApplyOutcome, FilterApply, apply_and_persist_config_locked,
+    apply_config_document_event,
 };
 use crate::error::ProblemDetails;
 use crate::handlers::auth_handlers::{
@@ -1563,28 +1564,21 @@ pub async fn system_reload_handler(
             );
         }
     };
-    let cfg = match Config::from_toml_str(&toml_str) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                &format!("Invalid configuration on disk: {e}"),
-            );
+    // One shared apply/publish path with the REST reload and file watcher:
+    // deep validation, rollback on failure, D8 HA semantics, and oversized
+    // bundle rollback all behave identically here.
+    match apply_config_document_event(&ctx, &toml_str, FilterApply::Sync, hooks.as_dyn()).await {
+        ConfigFileApplyOutcome::SelfWriteIgnored | ConfigFileApplyOutcome::Applied(_) => {
+            Redirect::to("/system").into_response()
         }
-    };
-    // One shared apply routine: no more partial apply that drops the clients
-    // section or skips DNSSEC/rate-limit changes.
-    if let Err(e) = apply_full_config(&ctx, &cfg, FilterApply::Sync, hooks.as_dyn()).await {
-        tracing::error!("Failed to apply configuration on reload: {e:?}");
-        return error_response(
-            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            &format!("Failed to apply configuration: {}", e.detail),
-        );
+        ConfigFileApplyOutcome::Rejected(e) => {
+            tracing::error!("Failed to apply configuration on reload: {e:?}");
+            error_response(
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                &format!("Failed to apply configuration: {}", e.detail),
+            )
+        }
     }
-    if let Err(e) = crate::publish_bundle(&ctx).await {
-        tracing::error!(error = %e, "HA publication failed after a UI config reload");
-    }
-    Redirect::to("/system").into_response()
 }
 
 /// Renders the update action row for the system page.

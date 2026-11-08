@@ -169,7 +169,13 @@ impl ServerContext {
     /// a bounded background retry is scheduled.
     pub async fn publish_bundle(&self) -> Result<sito_ha::PublishOutcome, sito_ha::HaError> {
         let result = self.publish_bundle_inner().await;
-        if result.is_err() {
+        if let Err(e) = &result {
+            // Some failures happen before the coordinator sees a bundle
+            // (unreadable/empty/sanitize/secret/version errors). They must
+            // still make HA readiness false, not only return an API error.
+            if let Some(ref coordinator) = self.master_coordinator {
+                coordinator.mark_publish_failed(e.to_string());
+            }
             self.schedule_publish_retry();
         }
         result

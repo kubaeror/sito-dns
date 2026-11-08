@@ -430,6 +430,17 @@ async fn apply_and_persist_document_locked(
                     error = %e.detail,
                     "Failed to restore the previous configuration document after an oversized HA bundle"
                 );
+            } else if previous_document.is_none() {
+                // There was no previous document: remove the newly written one
+                // so a restart cannot load the rejected configuration.
+                if let Err(e) = tokio::fs::remove_file(&ctx.config_path).await
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::error!(
+                        error = %e,
+                        "Failed to remove the rejected configuration document after an oversized HA bundle"
+                    );
+                }
             }
             if let Err(e) = apply_full_config_locked(ctx, &previous, FilterApply::Sync, hooks).await
             {
@@ -531,6 +542,11 @@ pub async fn apply_config_document_event(
         return ConfigFileApplyOutcome::SelfWriteIgnored;
     }
 
+    // Capture the live configuration before applying so an unreplicable
+    // (oversized) document can be rolled back. The file itself is the
+    // operator's external edit and is left in place; only the running
+    // configuration must not adopt it.
+    let previous = (**ctx.config.load()).clone();
     match apply_full_config_locked(ctx, &new_cfg, filter_apply, hooks).await {
         Ok(report) => {
             // A slave's shared configuration is master-owned. If an external
@@ -542,10 +558,34 @@ pub async fn apply_config_document_event(
             {
                 tracing::warn!(error = %e, "Failed to verify the applied HA configuration digest");
             }
-            if let Err(e) = ctx.publish_bundle().await {
-                tracing::warn!(error = %e, "HA publication failed after a file-watcher apply");
+            match ctx.publish_bundle().await {
+                Ok(sito_ha::PublishOutcome::TooLarge { bytes, limit }) => {
+                    if let Err(e) =
+                        apply_full_config_locked(ctx, &previous, FilterApply::Sync, hooks).await
+                    {
+                        tracing::error!(
+                            error = %e.detail,
+                            "Failed to roll back an oversized file-watcher apply"
+                        );
+                    }
+                    if let Err(e) = ctx.publish_bundle().await {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to republish the restored configuration after an oversized file-watcher apply"
+                        );
+                    }
+                    ConfigFileApplyOutcome::Rejected(ProblemDetails::bad_request(format!(
+                        "The configuration produces a {bytes}-byte HA bundle, above the {limit}-byte replication limit; the previous configuration remains active and the file was not rolled back"
+                    )))
+                }
+                Ok(_) => ConfigFileApplyOutcome::Applied(report),
+                Err(e) => {
+                    // D8: a persisted local edit is not rolled back because HA
+                    // publication failed; readiness and retry handle recovery.
+                    tracing::warn!(error = %e, "HA publication failed after a file-watcher apply");
+                    ConfigFileApplyOutcome::Applied(report)
+                }
             }
-            ConfigFileApplyOutcome::Applied(report)
         }
         Err(e) => ConfigFileApplyOutcome::Rejected(e),
     }

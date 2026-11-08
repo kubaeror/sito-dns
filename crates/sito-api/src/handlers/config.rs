@@ -558,7 +558,12 @@ pub async fn reload_config(
                     "Failed to roll back an oversized HA reload"
                 );
             }
-            let _ = ctx.publish_bundle().await;
+            if let Err(e) = ctx.publish_bundle().await {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to republish the restored configuration after an oversized HA reload"
+                );
+            }
             return Err(ProblemDetails::bad_request(format!(
                 "The configuration produces a {bytes}-byte HA bundle, above the {limit}-byte WebSocket replication limit; the previous configuration remains active"
             )));

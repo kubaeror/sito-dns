@@ -123,12 +123,13 @@ pub async fn apply_config_push(
     // An identical re-delivery of the already-applied bundle needs no work and
     // must not rewrite local configuration; acknowledge it as synced. A newer
     // term with the same payload only records the promoted epoch. A locally
-    // drifted configuration must not take this shortcut: it has to apply the
-    // bundle so the on-disk document matches the shared state again.
+    // drifted configuration (or a legacy watermark without a digest) must not
+    // take this shortcut: it has to apply the bundle so the on-disk document
+    // matches the shared state and a digest is recorded.
     if let Some(ref applied) = watermark
         && bundle.version == applied.version
         && payload_hash == applied.normalized_hash()
-        && !tracker.has_local_config_drift()
+        && !tracker.requires_full_apply()
     {
         if bundle.term > applied.term {
             tracker.persist_watermark_with_config_digest(
@@ -1310,7 +1311,7 @@ where
                         send_ack!(ack);
                         return Ok(());
                     }
-                    if target_version == watermark.version && !tracker.has_local_config_drift() {
+                    if target_version == watermark.version && !tracker.requires_full_apply() {
                         if !watermark_covers(
                             &watermark,
                             push_term,
@@ -1388,12 +1389,12 @@ where
 
             // Already at (or ahead of) this version in the same term:
             // acknowledge without re-applying. The master always pushes on
-            // connect. A locally drifted configuration must not take this
-            // early-ACK path: it has to apply the bundle and persist a fresh
-            // digest first.
+            // connect. A locally drifted configuration or an unverified legacy
+            // watermark must not take this early-ACK path: it has to apply the
+            // bundle and persist a fresh digest first.
             if push_term == tracker.get_term()
                 && target_version <= tracker.get_version()
-                && !tracker.has_local_config_drift()
+                && !tracker.requires_full_apply()
             {
                 let ack = HaMessage::Ack {
                     version: tracker.get_version(),

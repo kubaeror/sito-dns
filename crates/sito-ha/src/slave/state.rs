@@ -300,6 +300,22 @@ impl SlaveStatusTracker {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Whether the next identical same-version push must be fully applied
+    /// instead of early-ACKed.
+    ///
+    /// This is true for detected local drift **and** for a watermark written
+    /// by 1.9.3 (or earlier) that has no applied-config digest. A legacy
+    /// watermark cannot prove the on-disk configuration still matches what was
+    /// applied, so the protection must not stay fail-open after an upgrade;
+    /// the first full apply records the digest and clears this condition.
+    #[must_use]
+    pub fn requires_full_apply(&self) -> bool {
+        self.has_local_config_drift()
+            || self
+                .get_watermark()
+                .is_some_and(|watermark| watermark.applied_config_digest.is_none())
+    }
+
     /// Writes `payload` to `path` atomically (0600 temp file, fsync, rename).
     fn write_private_atomic(path: &std::path::Path, payload: &[u8]) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {

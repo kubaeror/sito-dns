@@ -31,9 +31,9 @@ use crate::transport::{MAX_WS_MESSAGE_SIZE, WS_SEND_TIMEOUT, build_server_tls_co
 /// Maximum number of published envelopes kept for delayed ACK binding.
 ///
 /// A slave may acknowledge a bundle after the master has published newer
-/// ones. The history is what lets a delayed same-version fork ACK still be
-/// attributed to a push the master actually sent; acknowledging an envelope
-/// removes it from this bounded window.
+/// ones, and multiple slaves may report a fork for the same envelope. The
+/// history is coordinator-wide and pruned only by this bound, never by an
+/// individual slave's ACK.
 pub const MAX_PUBLISH_HISTORY: usize = 64;
 
 /// Maximum bytes queued for one slave before the master falls back to
@@ -58,7 +58,11 @@ pub enum PublishOutcome {
     TooLarge { bytes: usize, limit: usize },
 }
 
-/// A published envelope retained until a slave acknowledges it.
+/// A published envelope retained for delayed ACK binding.
+///
+/// Entries are shared by all slaves and pruned only in publish order by
+/// [`MAX_PUBLISH_HISTORY`]; an individual ACK must not remove an entry because
+/// another slave may still report a fork for the same envelope.
 #[derive(Debug, Clone)]
 struct PublishedEnvelope {
     term: u64,
@@ -209,7 +213,8 @@ pub struct MasterCoordinator {
     /// that slave's applied ACK for the current term/version or a disconnect
     /// removes them, never an unrelated version advance or a global resync.
     diverged: Arc<Mutex<HashMap<String, Divergence>>>,
-    /// Bounded history of published envelopes retained until acknowledged.
+    /// Bounded, coordinator-wide history of published envelopes used to bind
+    /// delayed ACKs (including forks reported by multiple slaves).
     active_push_history: Arc<Mutex<VecDeque<PublishedEnvelope>>>,
     /// Bytes currently queued per slave.
     queued_bytes: Arc<Mutex<HashMap<String, usize>>>,
@@ -286,6 +291,15 @@ impl MasterCoordinator {
 
     fn set_publish_error(&self, error: Option<String>) {
         *self.last_publish_error.lock().unwrap() = error;
+    }
+
+    /// Records a publish failure detected before the bundle reaches the
+    /// coordinator (read/serialize/sanitize/empty/secret-scan errors).
+    ///
+    /// Keeps HA readiness false so `/health` cannot stay green while the API
+    /// cannot build a replicable bundle.
+    pub fn mark_publish_failed(&self, reason: impl Into<String>) {
+        self.set_publish_error(Some(reason.into()));
     }
 
     /// Starts a publish retry if one is not already running.
@@ -709,13 +723,6 @@ impl MasterCoordinator {
         while history.len() > MAX_PUBLISH_HISTORY {
             history.pop_front();
         }
-    }
-
-    fn remove_published_envelope(&self, term: u64, version: u64) {
-        self.active_push_history
-            .lock()
-            .unwrap()
-            .retain(|envelope| !(envelope.term == term && envelope.version == version));
     }
 
     /// Publishes a prepared bundle. The caller must hold
@@ -1284,6 +1291,9 @@ impl MasterCoordinator {
         // that it no longer owns the entry.
         {
             let mut slaves = self.slaves.lock().unwrap();
+            // A reconnecting instance starts with an empty queue; accounting
+            // from the superseded session must not leak into the new one.
+            self.queued_bytes.lock().unwrap().remove(&slave_instance);
             slaves.insert(
                 slave_instance.clone(),
                 ActiveSlave {
@@ -1456,7 +1466,7 @@ impl MasterCoordinator {
         owned
     }
 
-    /// Returns the payload hash of a still-unacknowledged published envelope.
+    /// Returns the payload hash of a still-retained published envelope.
     fn published_envelope_hash(&self, term: u64, version: u64) -> Option<String> {
         self.active_push_history
             .lock()
@@ -1575,7 +1585,6 @@ impl MasterCoordinator {
                             term,
                             reason,
                         );
-                        self.remove_published_envelope(term, version);
                         if let Some(slave) = self.slaves.lock().unwrap().get_mut(slave_instance)
                             && slave.connection_id == connection_id
                         {
@@ -1590,13 +1599,8 @@ impl MasterCoordinator {
                         error = ?error,
                         "Slave failed to apply configuration bundle"
                     );
-                    self.remove_published_envelope(term, version);
                     return true;
                 }
-
-                // The envelope has been acknowledged (applied or rejected via
-                // the fork path above); drop it from the bounded history.
-                self.remove_published_envelope(term, version);
 
                 if term < current_term {
                     // Our epoch is newer; the replica is stale even if its
@@ -3075,6 +3079,63 @@ mod tests {
             0,
             "a rejected fork push must not leave the slave reported as synced"
         );
+    }
+
+    /// Important 1 regression: the published-envelope history is shared by all
+    /// slaves. One slave's ACK must not remove the envelope before another
+    /// slave reports the same-version fork for it.
+    #[tokio::test]
+    async fn test_two_slaves_both_record_fork_for_same_published_envelope() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        for (instance, connection_id) in [("fork-a", 1), ("fork-b", 2)] {
+            let (tx, _rx) = mpsc::channel::<HaMessage>(8);
+            coordinator.slaves.lock().unwrap().insert(
+                instance.to_string(),
+                ActiveSlave {
+                    instance: instance.to_string(),
+                    remote_addr: format!("127.0.0.1:{connection_id}").parse().unwrap(),
+                    synced_version: 2,
+                    last_ping: Instant::now(),
+                    connected_at: Utc::now(),
+                    last_stats: None,
+                    sender: tx,
+                    capabilities: vec![],
+                    connection_id,
+                },
+            );
+        }
+
+        let ack = HaMessage::Ack {
+            version: 2,
+            term: 0,
+            applied: false,
+            conflict: Some(AckConflict::SameVersionFork),
+            error: Some("same-version payload fork".to_string()),
+        }
+        .to_json()
+        .unwrap();
+
+        assert!(coordinator.process_slave_msg("fork-a", 1, &ack));
+        assert!(coordinator.process_slave_msg("fork-b", 2, &ack));
+
+        let summaries = coordinator.list_slaves();
+        for instance in ["fork-a", "fork-b"] {
+            let summary = summaries
+                .iter()
+                .find(|s| s.instance == instance)
+                .expect("tracked slave");
+            assert!(
+                summary.diverged,
+                "{instance} must be reported diverged for the shared envelope: {summaries:?}"
+            );
+            assert_eq!(
+                summary.synced_version, 0,
+                "{instance} must be marked unsynced after its fork ACK"
+            );
+        }
+        assert!(coordinator.is_diverged());
     }
 
     #[tokio::test]

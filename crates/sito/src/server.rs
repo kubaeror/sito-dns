@@ -482,10 +482,11 @@ fn init_ha(
             tracker
                 .verify_applied_config(&document)
                 .map_err(|e| anyhow::anyhow!("Failed to verify applied HA configuration: {e}"))?;
-            if tracker.has_local_config_drift() {
+            if tracker.requires_full_apply() {
                 tracing::warn!(
                     path = %config_path.display(),
-                    "Local configuration drifted from the last applied HA bundle; waiting for the master to re-apply it"
+                    local_drift = tracker.has_local_config_drift(),
+                    "Local HA configuration is unverified or drifted from the last applied bundle; a full apply is required before an early Synced ACK"
                 );
             }
         }

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use futures_util::{SinkExt, StreamExt};
+use sito_api::config_apply::{ConfigFileApplyOutcome, FilterApply};
 use sito_api::state::ServerContext;
 use sito_cache::DnsCache;
 use sito_clients::ClientRegistry;
@@ -314,6 +315,116 @@ servers = ["9.9.9.9"]
 }
 
 // ---------------------------------------------------------------------------
+// 2b. Legacy watermarks without a digest must force one full apply.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_legacy_watermark_without_digest_forces_full_apply() {
+    let dir = temp_dir("legacy-digest");
+    let config_path = dir.join("config.toml");
+    let watermark_path = dir.join("ha_watermark.toml");
+    let key = Ed25519SigningKey::generate().unwrap();
+
+    let applied_doc = r#"config_version = 1
+[server]
+role = "slave"
+instance_name = "legacy-slave"
+
+[upstream]
+servers = ["9.9.9.9"]
+"#;
+    std::fs::write(&config_path, applied_doc).unwrap();
+    let push = signed_push(5, 0, applied_doc, vec![], &key);
+    let payload_hash = push_payload_hash(&push).unwrap();
+    // A 1.9.3 watermark: no `applied_config_digest`.
+    std::fs::write(
+        &watermark_path,
+        format!(
+            r#"{{"version":5,"term":0,"payload_hash":"{payload_hash}","timestamp":1,"forked":false,"forked_at_version":0}}"#
+        ),
+    )
+    .unwrap();
+
+    let restarted = SlaveStatusTracker::new("legacy-slave".to_string(), 0, None)
+        .with_watermark_path(watermark_path.clone())
+        .unwrap();
+    assert!(
+        !restarted
+            .verify_applied_config(applied_doc)
+            .expect("legacy digest check")
+    );
+    assert!(
+        !restarted.has_local_config_drift(),
+        "a legacy watermark is unverified, not proven drift"
+    );
+    assert!(
+        restarted.requires_full_apply(),
+        "an unverified legacy watermark must force a full apply"
+    );
+    assert_ne!(
+        restarted.get_state(),
+        SlaveState::Degraded,
+        "a legacy watermark must not be marked degraded before it reconnects"
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let fake_master = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let _ = ws.next().await;
+        ws.send(WsMessage::Text(push.to_json().unwrap().into()))
+            .await
+            .unwrap();
+        let _ = ws.next().await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let ha_config = HaConfig {
+        master_url: Some(format!("ws://127.0.0.1:{port}")),
+        master_pubkey: Some(key.public_key_hex()),
+        allow_insecure_ws: true,
+        ping_interval_secs: 60,
+        stats_interval_secs: 60,
+        ..Default::default()
+    };
+    let handles = slave_handles(Config::default(), Some(config_path.clone())).await;
+    let (_resync_tx, resync_rx) = mpsc::channel(1);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let worker = spawn_slave_worker(
+        ha_config,
+        restarted.clone(),
+        handles,
+        resync_rx,
+        shutdown_rx,
+    );
+
+    // The watermark only gains a digest when the slave actually applies the
+    // same-version push; an early ACK leaves it absent.
+    let applied = wait_until(
+        || {
+            std::fs::read_to_string(&watermark_path)
+                .is_ok_and(|raw| raw.contains("applied_config_digest"))
+                && restarted.get_state() == SlaveState::Synced
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        applied,
+        "a legacy watermark must be upgraded by a full apply, not an early ACK (state: {:?}, watermark: {:?})",
+        restarted.get_state(),
+        std::fs::read_to_string(&watermark_path).unwrap_or_default()
+    );
+    assert!(!restarted.requires_full_apply());
+
+    let _ = shutdown_tx.send(true);
+    worker.abort();
+    fake_master.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
 // 3. Delayed same-version fork ACK after a newer publish.
 // ---------------------------------------------------------------------------
 
@@ -445,6 +556,19 @@ async fn test_publish_bundle_propagates_sanitize_failure_and_rejects_oversize() 
         !err.to_string().is_empty(),
         "the publish error must be actionable"
     );
+    let live_config = (**ctx.config.load()).clone();
+    let readiness = ctx.ha_readiness(&live_config);
+    assert!(
+        !readiness.ready,
+        "a pre-coordinator publish failure must make HA not-ready"
+    );
+    assert!(
+        readiness
+            .reason
+            .unwrap_or_default()
+            .contains("publish failed"),
+        "the readiness reason must explain the publish failure"
+    );
 
     // An empty document must be rejected instead of being broadcast as an
     // empty configuration.
@@ -457,6 +581,7 @@ async fn test_publish_bundle_propagates_sanitize_failure_and_rejects_oversize() 
         err.to_string().contains("empty"),
         "the empty-bundle error must be explicit: {err}"
     );
+    assert!(!ctx.ha_readiness(&live_config).ready);
 
     // A bundle whose signed WebSocket envelope exceeds the 1 MiB protocol cap
     // must be rejected before persist/broadcast.
@@ -505,11 +630,66 @@ async fn test_publish_bundle_propagates_sanitize_failure_and_rejects_oversize() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn test_file_watcher_rejects_oversized_bundle_and_rolls_back() {
+    let dir = temp_dir("watcher-oversize");
+    let config_path = dir.join("config.toml");
+    // The watcher reads this file, so write a valid baseline first.
+    std::fs::write(&config_path, "config_version = 1\n").unwrap();
+    let ctx = publish_context(&dir, &config_path).await;
+    let original_ttl = ctx.config.load().dns.cache.min_ttl;
+
+    // A real small shared change plus a large unknown section: Config ignores
+    // the unknown table, but the sanitized source document (and therefore the
+    // signed bundle) keeps it and exceeds the 1 MiB WebSocket limit.
+    let oversized_document = format!(
+        "config_version = 1\n[server]\nrole = \"master\"\n[ha]\nreplication_port = 8953\nallow_insecure_ws = true\nslave_token = \"test-token\"\n[dns.cache]\nmin_ttl = {}\n[padding]\nblob = \"{}\"\n",
+        original_ttl.saturating_add(7),
+        "x".repeat(1_100_000)
+    );
+    std::fs::write(&config_path, &oversized_document).unwrap();
+
+    let outcome = sito_api::config_apply::apply_config_document_event(
+        &ctx,
+        &oversized_document,
+        FilterApply::Deferred,
+        None,
+    )
+    .await;
+    match outcome {
+        ConfigFileApplyOutcome::Rejected(e) => {
+            assert!(
+                e.detail.contains("replication limit"),
+                "the oversized watcher apply must be rejected explicitly: {}",
+                e.detail
+            );
+        }
+        other => panic!("oversized watcher apply must be rejected, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.config.load().dns.cache.min_ttl,
+        original_ttl,
+        "the live configuration must be rolled back after an oversized watcher apply"
+    );
+    // The file is the operator's external edit and is intentionally left in
+    // place; only the running configuration rolls back.
+    assert!(std::fs::read_to_string(&config_path).is_ok());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 async fn publish_context(dir: &Path, config_path: &Path) -> ServerContext {
     let stats_db = StatsDb::open(&dir.join("stats.db")).await.unwrap();
     let querylog_writer = QueryLogWriter::spawn(stats_db.clone(), 100);
     let metrics = MetricsRegistry::new("0.1.0", "m11-ha");
-    let config = Config::default();
+    let mut config = Config::default();
+    config.server.role = "master".to_string();
+    config.ha = Some(
+        toml::from_str(
+            "replication_port = 8953\nallow_insecure_ws = true\nslave_token = \"test-token\"",
+        )
+        .expect("valid [ha] test config"),
+    );
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config.clone())));
     let cache = Arc::new(DnsCache::new(config.dns.cache.clone()));
     let filter =
@@ -545,6 +725,7 @@ async fn publish_context(dir: &Path, config_path: &Path) -> ServerContext {
         signing_key,
         metrics.clone(),
     );
+    coordinator.mark_replication_ready();
     ServerContext {
         config: config_arc,
         runtime,
