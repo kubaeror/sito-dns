@@ -25,6 +25,10 @@ fn build_cache(size_mb: u64) -> Cache<CacheKey, Arc<CacheEntry>> {
     Cache::builder()
         .weigher(|_key: &CacheKey, value: &Arc<CacheEntry>| -> u32 { value.estimated_bytes })
         .max_capacity(size_mb.saturating_mul(1024 * 1024))
+        // `invalidate_domain` removes entries with a predicate. Moka refuses
+        // `invalidate_entries_if` at runtime unless this is enabled at build
+        // time; without it a domain invalidation silently does nothing.
+        .support_invalidation_closures()
         .build()
 }
 
@@ -611,10 +615,21 @@ impl DnsCache {
         let normalized = sito_proto::normalize_domain(trimmed)
             .unwrap_or_else(|_| trimmed.trim_end_matches('.').to_ascii_lowercase());
         let subdomain_suffix = format!(".{normalized}");
+        let match_name = normalized.clone();
         let cache = self.cache.load();
-        let _ = cache.invalidate_entries_if(move |k, _v| {
-            k.qname == normalized || k.qname.ends_with(&subdomain_suffix)
-        });
+        if let Err(error) = cache.invalidate_entries_if(move |k, _v| {
+            k.qname == match_name || k.qname.ends_with(&subdomain_suffix)
+        }) {
+            // This should be unreachable because `build_cache` enables
+            // invalidation closures. Flush instead of silently claiming the
+            // domain was invalidated while stale entries remain.
+            warn!(
+                domain = %normalized,
+                %error,
+                "Cache invalidation predicate failed; flushing the whole cache"
+            );
+            cache.invalidate_all();
+        }
     }
 
     /// Approximate memory weight of cached items in bytes.

@@ -250,7 +250,7 @@ sudo sito update
 sudo systemctl start sito
 
 # Option B: re-run the installer (SITO_VERSION pins a release)
-sudo systemctl stop sito
+# The installer stops the service, replaces the binary atomically, and starts it.
 sudo SITO_VERSION=1.9.3 bash contrib/install.sh
 ```
 
@@ -276,8 +276,13 @@ The web UI's update button uses the same updater and signature policy. Under
 the hardened systemd unit the unprivileged service still cannot replace the
 root-owned binary, so use the CLI path above for system installs.
 
-The installer backs up the previous binary to `/usr/local/bin/sito.bak` and
-restores it automatically if the post-install health check fails. If you manage
+The installer stops the service, writes the replacement binary to a temporary
+file in the destination directory, flushes it, and renames it over
+`/usr/local/bin/sito` (so a live upgrade cannot fail with `ETXTBSY`), then
+restores file capabilities and starts the service. It backs up the previous
+binary to `/usr/local/bin/sito.bak` and `/etc/sito/config.toml` to
+`/etc/sito/config.toml.bak`, and restores both automatically if the post-install
+health check fails. If you manage
 the binary manually, stop the service, replace `/usr/local/bin/sito`, re-apply
 the bind capability (`sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito`),
 then start the service again. Docker deployments are updated by pulling the new
@@ -504,11 +509,16 @@ cosign verify-blob \
 ```
 
 The identity pins the artifact to this repository's release workflow and the
-OIDC issuer pins it to GitHub Actions. `SITO_REQUIRE_SIGNATURE=1|0` controls
-whether `install.sh` enforces signature verification. The installer also
-installs cosign itself (checksum-verified, `COSIGN_VERSION` defaults to
-`v2.6.5`) so the default `sito update` signature policy works after a fresh
-install; set `SITO_INSTALL_COSIGN=0` to manage cosign externally.
+OIDC issuer pins it to GitHub Actions. `install.sh` requires a valid cosign
+signature by default: if cosign or the `.sig`/`.pem` assets are missing, the
+install fails instead of falling back to a SHA-256 checksum from the same
+release channel. Set `SITO_REQUIRE_SIGNATURE=0` only for an intentional
+SHA-256-only installation. The installer also installs cosign itself
+(checksum-verified, `COSIGN_VERSION` defaults to `v2.6.5`) so the default
+`sito update` signature policy works after a fresh install; set
+`SITO_INSTALL_COSIGN=0` to manage cosign externally (the installer then refuses
+to continue unless unauthenticated installs are explicitly allowed with
+`SITO_REQUIRE_SIGNATURE=0`).
 
 ### 6.3 SBOM
 

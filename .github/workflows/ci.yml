@@ -2,9 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Release branches are tested too: the release gate refuses to publish a
+    # tag unless its commit has a green `ci-gate` check run.
+    branches: [main, release/1.9.x]
   pull_request:
-    branches: [main]
+    branches: [main, release/1.9.x]
   merge_group:
   workflow_dispatch:
     inputs:
@@ -112,7 +114,7 @@ jobs:
   fmt:
     name: fmt
     needs: changes
-    if: (needs.changes.outputs.code == 'true' || needs.changes.outputs.force == 'true') && (github.event_name != 'push' || github.ref != 'refs/heads/main')
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.force == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -127,7 +129,7 @@ jobs:
   clippy:
     name: clippy
     needs: changes
-    if: (needs.changes.outputs.code == 'true' || needs.changes.outputs.force == 'true') && (github.event_name != 'push' || github.ref != 'refs/heads/main')
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.force == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -143,7 +145,7 @@ jobs:
   test:
     name: test
     needs: changes
-    if: (needs.changes.outputs.code == 'true' || needs.changes.outputs.force == 'true') && (github.event_name != 'push' || github.ref != 'refs/heads/main')
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.force == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -169,7 +171,7 @@ jobs:
     # Only needed when the spec changed without touching crate code; crate
     # changes are already covered by the `test` job. `force` keeps `ci:full`
     # and `full=true` able to run every lane.
-    if: ((needs.changes.outputs.api == 'true' && needs.changes.outputs.code == 'false') || needs.changes.outputs.force == 'true') && (github.event_name != 'push' || github.ref != 'refs/heads/main')
+    if: ((needs.changes.outputs.api == 'true' && needs.changes.outputs.code == 'false') || needs.changes.outputs.force == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -186,7 +188,7 @@ jobs:
   contrib:
     name: contrib
     needs: changes
-    if: (needs.changes.outputs.contrib == 'true' || needs.changes.outputs.force == 'true') && (github.event_name != 'push' || github.ref != 'refs/heads/main')
+    if: (needs.changes.outputs.contrib == 'true' || needs.changes.outputs.force == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -194,22 +196,31 @@ jobs:
       - name: Run shellcheck
         run: |
           command -v shellcheck >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y shellcheck)
-          shellcheck -S warning contrib/install.sh
+          shellcheck -S warning \
+            contrib/install.sh \
+            contrib/tests/test-installer.sh \
+            scripts/verify-release-gate.sh \
+            scripts/test-verify-release-gate.sh \
+            scripts/test-release-workflow.sh
       - name: Test AdGuard converter against the fixture
         run: |
           python3 -c "import yaml" >/dev/null 2>&1 || python3 -m pip install --quiet --break-system-packages pyyaml
           python3 contrib/tests/test_adguard_to_sito.py
+      - name: Test the installer end to end
+        run: bash contrib/tests/test-installer.sh
       - name: Test release verification helpers
         run: |
           bash scripts/test-check-release-platforms.sh
           bash scripts/test-release-attestation-gate.sh
+          bash scripts/test-verify-release-gate.sh
+          bash scripts/test-release-workflow.sh
       - name: Compile the CI usage helper
         run: python3 -m py_compile scripts/ci_usage.py
 
   docs-check:
     name: docs-check
     needs: changes
-    if: (needs.changes.outputs.docs == 'true' || needs.changes.outputs.config_docs == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.force == 'true') && (github.event_name != 'push' || github.ref != 'refs/heads/main')
+    if: (needs.changes.outputs.docs == 'true' || needs.changes.outputs.config_docs == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.force == 'true')
     permissions:
       contents: read
     uses: ./.github/workflows/docs.yml
@@ -217,7 +228,7 @@ jobs:
   container-check:
     name: container-check
     needs: changes
-    if: (needs.changes.outputs.container == 'true' || needs.changes.outputs.force == 'true') && (github.event_name != 'push' || github.ref != 'refs/heads/main')
+    if: (needs.changes.outputs.container == 'true' || needs.changes.outputs.force == 'true')
     permissions:
       contents: read
     uses: ./.github/workflows/container.yml
@@ -225,7 +236,11 @@ jobs:
   security-check:
     name: security-check
     needs: changes
-    if: (needs.changes.outputs.deps == 'true' || needs.changes.outputs.force == 'true') && (github.event_name != 'push' || github.ref != 'refs/heads/main')
+    # On pushes, security.yml runs from its own push trigger (unfiltered) so
+    # every release-branch commit has a `cargo-deny` check run for the release
+    # gate. The reusable call is only needed for pull requests, where the
+    # standalone workflow does not run, and it keeps the dependency path filter.
+    if: (needs.changes.outputs.deps == 'true' || needs.changes.outputs.force == 'true') && github.event_name != 'push'
     permissions:
       contents: read
     uses: ./.github/workflows/security.yml
@@ -233,7 +248,7 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     needs: changes
-    if: (needs.changes.outputs.code == 'true' || needs.changes.outputs.force == 'true') && (github.event_name != 'push' || github.ref != 'refs/heads/main')
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.force == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:

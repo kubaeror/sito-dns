@@ -379,6 +379,49 @@ mod tests {
         );
     }
 
+    /// Domain invalidation must remove the exact name and its strict
+    /// subdomains, but not a name that merely shares the suffix
+    /// (`notexample.com`). This regressed because moka needs
+    /// `support_invalidation_closures()` at build time; without it the
+    /// predicate registration failed and was ignored.
+    #[tokio::test]
+    async fn test_invalidate_domain_removes_exact_and_subdomains_only() {
+        let config = make_test_config(10, 3600, 1800);
+        let cache = DnsCache::new(config);
+
+        for (id, name) in [
+            (41, "example.com."),
+            (42, "www.example.com."),
+            (43, "other.com."),
+            (44, "notexample.com."),
+        ] {
+            insert_answer(&cache, id, name).await;
+        }
+
+        cache.invalidate_domain("example.com");
+
+        for name in ["example.com.", "www.example.com."] {
+            let qname = Name::from_str(name).unwrap();
+            assert!(
+                cache
+                    .get(&qname, RecordType::A, DNSClass::IN)
+                    .await
+                    .is_none(),
+                "{name} must be invalidated"
+            );
+        }
+        for name in ["other.com.", "notexample.com."] {
+            let qname = Name::from_str(name).unwrap();
+            assert!(
+                cache
+                    .get(&qname, RecordType::A, DNSClass::IN)
+                    .await
+                    .is_some(),
+                "{name} must survive invalidation of example.com"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_validation_status_round_trips_through_cache() {
         let config = make_test_config(10, 3600, 1800);

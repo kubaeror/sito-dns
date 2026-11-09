@@ -57,9 +57,32 @@ jobs:
             exit 1
           fi
 
+  release-gate:
+    name: Verify release branch and green checks
+    needs: [verify-tag]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # `gh api` reads the check-run and commit-status records for the tagged
+    # commit.  No write access is granted here.
+    permissions:
+      contents: read
+      checks: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The gate needs the tag object and the release branch to run
+          # `git merge-base --is-ancestor`.
+          fetch-depth: 0
+      - name: Verify the tag is on the required branch with green CI/security
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/verify-release-gate.sh
+
   build-binaries:
     name: build (${{ matrix.target }})
-    needs: [verify-tag]
+    needs: [verify-tag, release-gate]
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
@@ -134,7 +157,7 @@ jobs:
 
   sbom-and-release:
     name: Generate SBOM & Publish Release
-    needs: [verify-tag, build-binaries]
+    needs: [verify-tag, release-gate, build-binaries]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -214,10 +237,12 @@ jobs:
           body: |
             ## Container image
 
-            The image is published only after the tag/version check, the signed
-            release assets, the SBOM, and the artifact E2E verification pass.
-            Stable tags also update `latest`; prerelease tags (the tag contains
-            `-`) never do.
+            The image is published only after the tag/version check, the
+            release-branch/CI gate, the signed release assets, the SBOM, and
+            the artifact E2E verification pass. It is then scanned for
+            HIGH/CRITICAL vulnerabilities and its digest is signed with cosign
+            keyless signing. Stable tags also update `latest`; prerelease tags
+            (the tag contains `-`) never do.
 
             Verify the image (Docker tags omit the leading `v`):
 
@@ -245,12 +270,17 @@ jobs:
     # Publishing is the last step of the release gate: the image is only built
     # after the tag/version check, the binaries, the signed release/SBOM job and
     # the artifact E2E verification have all succeeded.
-    needs: [verify-tag, build-binaries, sbom-and-release, artifact-e2e]
+    needs: [verify-tag, release-gate, build-binaries, sbom-and-release, artifact-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
       contents: read
       packages: write # push the image to GHCR
+      id-token: write # cosign keyless signature over the image digest
+    env:
+      # Pin the scanner by digest so the vulnerability gate cannot change
+      # underneath a release.
+      TRIVY_IMAGE: aquasec/trivy:0.67.0@sha256:94711c60051c6cab848a292e3a67f62623fcee361b2bb661f43b17184f4afdac
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -418,6 +448,42 @@ jobs:
           echo "platforms: ${platforms}"
           echo "tags:"
           printf '%s\n' "${TAGS}"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          # Pinned to a v2 release: the v3 CLI changed its flag surface.
+          cosign-release: 'v2.6.5'
+
+      - name: Scan the published image for vulnerabilities
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # `docker/login-action` stored the GHCR credential in the runner's
+          # Docker config. Mount it read-only so Trivy can pull the digest.
+          docker run --rm \
+            -v "${HOME}/.docker:/root/.docker:ro" \
+            "${TRIVY_IMAGE}" image \
+            --platform linux/amd64 \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 1 \
+            --no-progress \
+            "${IMAGE}@${DIGEST}"
+
+      - name: Sign and verify the image digest (cosign keyless)
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/tags/.*$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${IMAGE}@${DIGEST}"
 
       - name: Smoke-test the published image
         env:
