@@ -382,6 +382,7 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
         .route("/auth/login", post(auth_handlers::login))
         .route("/auth/totp/verify", post(auth_handlers::verify_totp))
         .route("/auth/logout", post(auth_handlers::logout))
+        .route("/auth/reauth", post(auth_handlers::reauth))
         .route("/auth/totp/setup", get(auth_handlers::get_totp_setup))
         .route("/auth/totp/enable", post(auth_handlers::enable_totp))
         .route("/auth/totp/disable", post(auth_handlers::disable_totp))

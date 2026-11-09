@@ -417,6 +417,23 @@ pub struct LoginResponse {
     pub partial_token: Option<String>,
 }
 
+/// Re-authentication request for a sensitive operation.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReauthRequest {
+    pub password: String,
+    /// Current TOTP or backup code; required when TOTP is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+/// Short-lived, session-bound re-authentication ticket.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReauthResponse {
+    pub reauth_token: String,
+    /// Remaining lifetime in seconds.
+    pub expires_in: u64,
+}
+
 /// TOTP verification request.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TotpVerifyRequest {

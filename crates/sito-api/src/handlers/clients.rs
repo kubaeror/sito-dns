@@ -683,7 +683,7 @@ pub async fn update_client_group(
     request_body = ClientGroupDto,
     responses(
         (status = 200, description = "Client group added", body = ClientGroupDto),
-        (status = 400, description = "Group already exists"),
+        (status = 409, description = "Group already exists", body = ProblemDetails),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
@@ -698,7 +698,7 @@ pub async fn add_client_group(
     let _apply_guard = ctx.lock_config_apply().await;
     let mut cfg = load_clients_config(&ctx);
     if cfg.groups.contains_key(&payload.name) {
-        return Err(ProblemDetails::bad_request(format!(
+        return Err(ProblemDetails::conflict(format!(
             "Group '{}' already exists",
             payload.name
         )));
@@ -1342,6 +1342,51 @@ mod tests {
         );
         assert_eq!(group.blocked_services.len(), 1);
         assert_eq!(group.blocked_services[0].service, "tiktok");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-0.7 (P2-54): re-creating an existing group is a conflict, not a
+    /// malformed request.
+    #[tokio::test]
+    async fn test_add_duplicate_client_group_returns_conflict() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_dup_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+        let group = ClientGroupDto {
+            name: "kids".to_string(),
+            description: None,
+            filtering_enabled: true,
+            parental_control: false,
+            safe_search: false,
+            blocked_services: Vec::new(),
+            parental_categories: Vec::new(),
+        };
+
+        let _ = add_client_group(
+            operator(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(group.clone()),
+        )
+        .await
+        .expect("first group creation succeeds");
+
+        let err = add_client_group(
+            operator(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(group),
+        )
+        .await
+        .expect_err("duplicate group must be rejected");
+        assert_eq!(err.status, 409);
+        assert_eq!(
+            load_clients_config(&ctx).groups.len(),
+            1,
+            "the duplicate must not alter the stored groups"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

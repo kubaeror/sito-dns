@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use crate::auth::manager::{LoginResult, TotpMutationError, UserMutationError};
+use crate::auth::manager::{LoginResult, ReauthError, TotpMutationError, UserMutationError};
 use crate::auth::rbac::AuthUser;
 use crate::auth::resolve_client_ip;
 use crate::auth::session::{
@@ -31,8 +31,8 @@ use crate::ui::templates::{
     AccountTemplate, ClientDiscoveryViewItem, ClientViewItem, ClientsTemplate,
     DashboardStatsPartialTemplate, DashboardTemplate, FilteringTemplate, HtmlTemplate,
     LoginTemplate, QueryLogRowItem, QueryLogRowsPartialTemplate, QueryLogTemplate, RewriteViewItem,
-    RewritesTemplate, SettingsTemplate, SystemTemplate, TokenViewItem, UpstreamViewItem,
-    UpstreamsTemplate, UserViewItem, UsersTemplate, WizardTemplate,
+    RewritesTemplate, SettingsTemplate, SystemTemplate, TokenViewItem, TotpSetupView,
+    UpstreamViewItem, UpstreamsTemplate, UserViewItem, UsersTemplate, WizardTemplate,
 };
 use sito_core::FilterEngine;
 use sito_core::config::{BlockingMode, Config, FilterListConfig, UpstreamStrategy};
@@ -1730,15 +1730,16 @@ pub async fn wizard_page(
     Query(params): Query<SetupTokenQuery>,
 ) -> Response {
     let auth_user = get_session_user(&ctx, &headers);
-    let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
     let setup_required = ctx.auth_mgr.setup_token_required();
 
-    // Once user accounts exist (even if `config.toml` is missing) the wizard
-    // is an admin-only configuration surface, not an unauthenticated bootstrap.
-    // A deployment with no usable Admin (for example only non-admin accounts)
-    // is still recoverable with the provisioned setup token.
-    if !ctx.auth_mgr.is_first_run() && !setup_required && !is_admin {
-        return Redirect::to("/login").into_response();
+    // WP-0.7 (P1-16): the wizard is a first-boot surface only. After setup an
+    // Admin (or a stolen Admin session) must use the account/settings flows,
+    // which require re-authentication, instead of resetting the password here.
+    if !ctx.auth_mgr.is_first_run() && !setup_required {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "Setup wizard is only available during first-boot setup.",
+        );
     }
 
     let csrf = get_csrf_token(&ctx, &headers);
@@ -2170,10 +2171,13 @@ pub async fn wizard_complete_handler(
     let auth_user = get_session_user(&ctx, &headers);
     let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
 
-    if !bootstrapping && !is_admin {
+    // WP-0.7 (P1-16): completing the wizard mutates the administrator password.
+    // It must never be reachable after setup, even for a valid Admin session;
+    // password changes then go through the re-authenticated account flow.
+    if !bootstrapping {
         return error_response(
             StatusCode::FORBIDDEN,
-            "Setup wizard is disabled. Admin session required.",
+            "Setup wizard is only available during first-boot setup.",
         );
     }
 
@@ -2520,6 +2524,7 @@ fn render_users_page(
     response
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_account_page(
     ctx: &ServerContext,
     user: &AuthUser,
@@ -2527,6 +2532,7 @@ fn render_account_page(
     error_message: &str,
     notice_message: &str,
     new_token: Option<&crate::auth::token::CreateTokenResponse>,
+    totp_setup: Option<TotpSetupView>,
     status: StatusCode,
 ) -> Response {
     let tokens = token_view_items(ctx, user);
@@ -2548,6 +2554,7 @@ fn render_account_page(
         version: env!("CARGO_PKG_VERSION"),
         tokens,
         totp_enabled,
+        totp_setup,
         can_create_operator_token: user.role >= Role::Operator,
         can_create_admin_token: user.role >= Role::Admin,
         error_message,
@@ -2569,6 +2576,15 @@ fn session_or_redirect(
         Some(user) => Ok((user, get_csrf_token(ctx, headers))),
         None => Err(Box::new(Redirect::to("/login").into_response())),
     }
+}
+
+/// Session id backing the request cookie, validated against the manager.
+fn current_session_id(ctx: &ServerContext, headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("cookie")
+        .and_then(|value| value.to_str().ok())
+        .and_then(extract_session_cookie)
+        .filter(|session_id| ctx.auth_mgr.validate_session(session_id).is_some())
 }
 
 fn admin_or_forbidden(
@@ -2601,7 +2617,7 @@ fn account_problem_page(
 ) -> Response {
     let status = StatusCode::from_u16(problem.status).unwrap_or(StatusCode::BAD_REQUEST);
     let detail = problem.detail;
-    render_account_page(ctx, user, csrf, &detail, "", None, status)
+    render_account_page(ctx, user, csrf, &detail, "", None, None, status)
 }
 
 pub async fn users_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
@@ -2737,7 +2753,7 @@ pub async fn account_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
         Ok(value) => value,
         Err(response) => return *response,
     };
-    render_account_page(&ctx, &user, &csrf, "", "", None, StatusCode::OK)
+    render_account_page(&ctx, &user, &csrf, "", "", None, None, StatusCode::OK)
 }
 
 #[derive(Deserialize)]
@@ -2873,7 +2889,16 @@ pub async fn account_token_create_handler(
     tracing::info!(user = %user.username, token = %token.id, "User created an API token from the web UI");
     // The plaintext token is shown only in this response and is never stored
     // or logged; reloading the page lists metadata only.
-    render_account_page(&ctx, &user, &csrf, "", "", Some(&token), StatusCode::OK)
+    render_account_page(
+        &ctx,
+        &user,
+        &csrf,
+        "",
+        "",
+        Some(&token),
+        None,
+        StatusCode::OK,
+    )
 }
 
 pub async fn account_token_delete_handler(
@@ -2926,6 +2951,169 @@ pub async fn account_token_delete_handler(
 }
 
 #[derive(Deserialize)]
+pub struct AccountTotpSetupForm {
+    pub password: String,
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+/// Re-authenticate and begin TOTP enrollment (self-service for every role).
+pub async fn account_totp_setup_handler(
+    State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
+    headers: HeaderMap,
+    Form(form): Form<AccountTotpSetupForm>,
+) -> Response {
+    let (user, csrf) = match session_or_redirect(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let Some(session_id) = current_session_id(&ctx, &headers) else {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::forbidden("TOTP enrollment requires an authenticated user session"),
+        );
+    };
+    let client_ip = {
+        let config = ctx.config.load();
+        let trusted_proxies = config.get_web_config().trusted_proxies;
+        resolve_client_ip(peer_addr, &headers, &trusted_proxies)
+    };
+
+    let ticket = match ctx
+        .auth_mgr
+        .reauth(
+            &user.username,
+            &form.password,
+            form.code.as_deref(),
+            &session_id,
+            &client_ip,
+        )
+        .await
+    {
+        Ok(ticket) => ticket,
+        Err(ReauthError::InvalidCredentials) => {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request(
+                    "Re-authentication failed: invalid password or second factor",
+                ),
+            );
+        }
+        Err(ReauthError::SecondFactorRequired) => {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request(
+                    "A current TOTP or backup code is required to replace 2FA",
+                ),
+            );
+        }
+        Err(ReauthError::RateLimited) => {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::too_many_requests("Too many attempts. Please wait."),
+            );
+        }
+        Err(ReauthError::LockedOut { remaining_seconds }) => {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::too_many_requests(format!(
+                    "Account locked out due to repeated failures. Try again in {remaining_seconds}s."
+                )),
+            );
+        }
+    };
+
+    let Some(setup) = ctx.auth_mgr.begin_totp_enrollment(&user.username).await else {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::internal_error("Failed to generate TOTP credentials"),
+        );
+    };
+    let view = TotpSetupView {
+        secret: setup.secret,
+        otpauth_url: setup.otpauth_url,
+        qr_code: setup.qr_code,
+        backup_codes: setup.backup_codes,
+        reauth_token: ticket.token,
+    };
+    render_account_page(&ctx, &user, &csrf, "", "", None, Some(view), StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+pub struct AccountTotpEnableForm {
+    pub reauth_token: String,
+    pub code: String,
+}
+
+/// Confirm a pending TOTP enrollment using a re-auth ticket.
+pub async fn account_totp_enable_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Form(form): Form<AccountTotpEnableForm>,
+) -> Response {
+    let (user, csrf) = match session_or_redirect(&ctx, &headers) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let Some(session_id) = current_session_id(&ctx, &headers) else {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::forbidden("TOTP enrollment requires an authenticated user session"),
+        );
+    };
+    if !ctx
+        .auth_mgr
+        .check_reauth_token(&form.reauth_token, &user.username, &session_id)
+    {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::unauthorized(
+                "Re-authentication is missing or expired. Start the enrollment again.",
+            ),
+        );
+    }
+    if let Err(err) = ctx
+        .auth_mgr
+        .try_confirm_totp_setup(&user.username, &form.code)
+        .await
+    {
+        let problem = match err {
+            TotpMutationError::NotFound => ProblemDetails::not_found("User account not found"),
+            TotpMutationError::InvalidCode => {
+                ProblemDetails::bad_request("Invalid TOTP verification code")
+            }
+            TotpMutationError::Persistence(detail) => ProblemDetails::internal_error(format!(
+                "Failed to persist the user store while enabling TOTP: {detail}"
+            )),
+        };
+        return account_problem_page(&ctx, &user, &csrf, problem);
+    }
+    let _ = ctx
+        .auth_mgr
+        .consume_reauth_token(&form.reauth_token, &user.username, &session_id);
+    tracing::info!(user = %user.username, "User enabled TOTP 2FA from the web UI");
+    // Enabling TOTP revokes every session for the account by design.
+    Redirect::to("/login").into_response()
+}
+
+#[derive(Deserialize)]
 pub struct DisableAccountTotpForm {
     pub password: String,
     #[serde(default)]
@@ -2934,6 +3122,7 @@ pub struct DisableAccountTotpForm {
 
 pub async fn account_totp_disable_handler(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Form(form): Form<DisableAccountTotpForm>,
 ) -> Response {
@@ -2941,48 +3130,72 @@ pub async fn account_totp_disable_handler(
         Ok(value) => value,
         Err(response) => return *response,
     };
-
-    // Mirror the REST disable handler: the current password is always
-    // required, and when TOTP is enabled a valid TOTP or backup code must
-    // accompany it.
-    if !ctx
-        .auth_mgr
-        .verify_user_password(&user.username, &form.password)
-        .await
-    {
+    let Some(session_id) = current_session_id(&ctx, &headers) else {
         return account_problem_page(
             &ctx,
             &user,
             &csrf,
-            ProblemDetails::bad_request("Re-authentication failed: invalid password"),
+            ProblemDetails::forbidden("TOTP management requires an authenticated user session"),
         );
-    }
-    if ctx.auth_mgr.totp_enabled(&user.username) {
-        let Some(code) = form
-            .code
-            .as_deref()
-            .map(str::trim)
-            .filter(|code| !code.is_empty())
-        else {
+    };
+    let client_ip = {
+        let config = ctx.config.load();
+        let trusted_proxies = config.get_web_config().trusted_proxies;
+        resolve_client_ip(peer_addr, &headers, &trusted_proxies)
+    };
+
+    // Mirror the REST disable handler: a fresh re-authentication proves the
+    // current password and, when TOTP is enabled, a current TOTP/backup code.
+    match ctx
+        .auth_mgr
+        .reauth(
+            &user.username,
+            &form.password,
+            form.code.as_deref(),
+            &session_id,
+            &client_ip,
+        )
+        .await
+    {
+        Ok(ticket) => {
+            let _ = ctx
+                .auth_mgr
+                .consume_reauth_token(&ticket.token, &user.username, &session_id);
+        }
+        Err(ReauthError::InvalidCredentials) => {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request(
+                    "Re-authentication failed: invalid password or second factor",
+                ),
+            );
+        }
+        Err(ReauthError::SecondFactorRequired) => {
             return account_problem_page(
                 &ctx,
                 &user,
                 &csrf,
                 ProblemDetails::bad_request("A TOTP or backup code is required to disable 2FA"),
             );
-        };
-        if !ctx
-            .auth_mgr
-            .verify_second_factor(&user.username, code)
-            .await
-        {
+        }
+        Err(ReauthError::RateLimited) => {
             return account_problem_page(
                 &ctx,
                 &user,
                 &csrf,
-                ProblemDetails::bad_request(
-                    "Re-authentication failed: invalid TOTP or backup code",
-                ),
+                ProblemDetails::too_many_requests("Too many attempts. Please wait."),
+            );
+        }
+        Err(ReauthError::LockedOut { remaining_seconds }) => {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::too_many_requests(format!(
+                    "Account locked out due to repeated failures. Try again in {remaining_seconds}s."
+                )),
             );
         }
     }
@@ -3905,11 +4118,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    /// WP-0.7 (P1-15): disabling 2FA requires a fresh re-authentication ticket.
+    /// The ticket proves the current password and second factor; a stolen
+    /// session alone cannot turn the factor off.
     #[tokio::test]
-    async fn test_disable_totp_requires_password_and_second_factor() {
-        use crate::auth::rbac::RequireAdmin;
-        use crate::handlers::auth_handlers::disable_totp;
-        use crate::models::DisableTotpRequest;
+    async fn test_disable_totp_requires_reauth_token() {
+        use crate::auth::rbac::RequireViewer;
+        use crate::handlers::auth_handlers::{REAUTH_TOKEN_HEADER, disable_totp, reauth};
+        use crate::models::{DisableTotpRequest, ReauthRequest};
 
         let temp_dir =
             std::env::temp_dir().join(format!("sito_ui_totp_off_{}", rand::random::<u64>()));
@@ -3924,54 +4140,80 @@ mod tests {
         );
         assert!(ctx.auth_mgr.totp_enabled("admin"));
 
-        let admin = RequireAdmin(crate::auth::AuthUser {
-            username: "admin".to_string(),
-            role: Role::Admin,
-            token_id: None,
-        });
-
-        // Wrong password rejected even with a valid code.
-        let err = disable_totp(
-            admin.clone(),
-            State(ctx.clone()),
+        let LoginResult::TotpRequired { partial_token } =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("TOTP login should require a second factor");
+        };
+        let crate::auth::manager::TotpVerifyResult::Success(session) = ctx
+            .auth_mgr
+            .verify_totp(&partial_token, &setup.backup_codes[1], "127.0.0.1")
+            .await
+        else {
+            panic!("TOTP verification failed");
+        };
+        let headers = session_headers(&session);
+        let admin = RequireViewer(session_to_user(&session));
+        let body = || {
             axum::Json(DisableTotpRequest {
-                password: "wrong-password".to_string(),
-                code: Some(setup.backup_codes[1].clone()),
-            }),
-        )
-        .await
-        .unwrap_err();
+                password: "adminadmin".to_string(),
+                code: Some(setup.backup_codes[2].clone()),
+            })
+        };
+
+        // A stolen session without a re-auth ticket cannot disable 2FA.
+        let err = disable_totp(admin.clone(), State(ctx.clone()), headers.clone(), body())
+            .await
+            .unwrap_err();
         assert_eq!(err.status, 401);
         assert!(ctx.auth_mgr.totp_enabled("admin"));
 
-        // Correct password but missing second factor rejected.
-        let err = disable_totp(
-            admin.clone(),
+        // An invalid ticket is rejected too.
+        let mut invalid_headers = headers.clone();
+        invalid_headers.insert(
+            REAUTH_TOKEN_HEADER,
+            axum::http::HeaderValue::from_static("not-a-real-ticket"),
+        );
+        let err = disable_totp(admin.clone(), State(ctx.clone()), invalid_headers, body())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, 401);
+        assert!(ctx.auth_mgr.totp_enabled("admin"));
+
+        // Re-authenticate with the current backup code, then disable with the
+        // session-bound ticket. The ticket, not the request body, authorizes
+        // the operation, so the same backup code is not consumed twice.
+        let ticket = reauth(
             State(ctx.clone()),
-            axum::Json(DisableTotpRequest {
+            crate::auth::MaybeConnectInfo(None),
+            admin.clone(),
+            headers.clone(),
+            axum::Json(ReauthRequest {
                 password: "adminadmin".to_string(),
-                code: None,
+                code: Some(setup.backup_codes[2].clone()),
             }),
         )
         .await
-        .unwrap_err();
-        assert_eq!(err.status, 400);
-        assert!(ctx.auth_mgr.totp_enabled("admin"));
-
-        // Correct password + valid backup code disables 2FA.
-        let ok = disable_totp(
-            admin,
-            State(ctx.clone()),
-            axum::Json(DisableTotpRequest {
-                password: "adminadmin".to_string(),
-                code: Some(setup.backup_codes[1].clone()),
-            }),
-        )
-        .await;
+        .expect("re-authentication succeeds")
+        .0;
+        let mut ticket_headers = headers;
+        ticket_headers.insert(
+            REAUTH_TOKEN_HEADER,
+            axum::http::HeaderValue::from_str(&ticket.reauth_token).unwrap(),
+        );
+        let ok = disable_totp(admin, State(ctx.clone()), ticket_headers, body()).await;
         assert!(ok.is_ok());
         assert!(!ctx.auth_mgr.totp_enabled("admin"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn session_to_user(session: &crate::auth::session::Session) -> crate::auth::AuthUser {
+        crate::auth::AuthUser {
+            username: session.username.clone(),
+            role: session.role,
+            token_id: None,
+        }
     }
 
     #[tokio::test]
@@ -4016,6 +4258,77 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert!(!ctx.auth_mgr.setup_token_required());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-0.7 (P1-16): after first boot the wizard is closed to everyone,
+    /// including an Admin session, so it cannot reset the password.
+    #[tokio::test]
+    async fn test_wizard_forbidden_after_setup_even_for_admin() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_ui_wiz_closed_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+        assert!(
+            ctx.auth_mgr
+                .update_user_password("admin", "NewAdminPassword1")
+                .await
+        );
+        assert!(!ctx.auth_mgr.is_first_run());
+        assert!(!ctx.auth_mgr.setup_token_required());
+
+        let LoginResult::Success(session) = ctx
+            .auth_mgr
+            .login("admin", "NewAdminPassword1", "127.0.0.1")
+            .await
+        else {
+            panic!("admin login failed");
+        };
+        let headers = session_headers(&session);
+
+        let resp = wizard_page(
+            State(ctx.clone()),
+            headers.clone(),
+            Query(SetupTokenQuery::default()),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "the wizard page must be bootstrap-only"
+        );
+
+        let resp = wizard_complete_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            crate::auth::MaybeConnectInfo(None),
+            headers,
+            Form(WizardCompleteForm {
+                admin_user: Some("admin".to_string()),
+                admin_password: Some("AttackerKnownPassword1".to_string()),
+                confirm_password: Some("AttackerKnownPassword1".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "an Admin must not reset the password through the closed wizard"
+        );
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("admin", "NewAdminPassword1")
+                .await,
+            "the wizard must not have changed the password"
+        );
+        assert!(
+            !ctx.auth_mgr
+                .verify_user_password("admin", "AttackerKnownPassword1")
+                .await,
+            "the attacker-supplied password must not be active"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -5386,6 +5699,7 @@ mod tests {
 
         let resp = account_totp_disable_handler(
             State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
             headers.clone(),
             Form(DisableAccountTotpForm {
                 password: "wrong-password".to_string(),
@@ -5398,6 +5712,7 @@ mod tests {
 
         let resp = account_totp_disable_handler(
             State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
             headers.clone(),
             Form(DisableAccountTotpForm {
                 password: "adminadmin".to_string(),
@@ -5412,6 +5727,7 @@ mod tests {
 
         let resp = account_totp_disable_handler(
             State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
             headers,
             Form(DisableAccountTotpForm {
                 password: "adminadmin".to_string(),
@@ -5426,5 +5742,100 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn extract_attr(body: &str, needle: &str) -> String {
+        let start = body
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle} in {body}"))
+            + needle.len();
+        let end = body[start..].find('"').expect("attribute terminator");
+        body[start..start + end].to_string()
+    }
+
+    fn extract_first_backup_code(body: &str) -> String {
+        let marker = "class=\"totp-backup-code\"";
+        let start = body.find(marker).expect("backup code marker") + marker.len();
+        let start = body[start..].find('>').expect("backup code start") + start + 1;
+        let end = body[start..].find("</code>").expect("backup code end") + start;
+        body[start..end].trim().to_string()
+    }
+
+    /// WP-0.7 (P2-52): TOTP enrollment works in the Account UI for Viewer,
+    /// Operator, and Admin, and requires the current password.
+    #[tokio::test]
+    async fn test_self_service_totp_enrollment_for_all_roles() {
+        for (username, role, password) in [
+            ("admin", Role::Admin, "adminadmin"),
+            ("oper_user", Role::Operator, "OperPass1"),
+            ("view_user", Role::Viewer, "ViewPass1"),
+        ] {
+            let temp_dir = std::env::temp_dir().join(format!(
+                "sito_ui_totp_enroll_{}_{}",
+                username,
+                rand::random::<u64>()
+            ));
+            let _ = std::fs::create_dir_all(&temp_dir);
+            let ctx = mock_context(&temp_dir).await;
+            if role != Role::Admin {
+                ctx.auth_mgr.create_user(username, password, role).await;
+            }
+            let LoginResult::Success(session) =
+                ctx.auth_mgr.login(username, password, "127.0.0.1").await
+            else {
+                panic!("{username} login failed");
+            };
+            let headers = session_headers(&session);
+
+            // A stolen session without the password cannot enroll.
+            let resp = account_totp_setup_handler(
+                State(ctx.clone()),
+                crate::auth::MaybeConnectInfo(None),
+                headers.clone(),
+                Form(AccountTotpSetupForm {
+                    password: "wrong-password".to_string(),
+                    code: None,
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(!ctx.auth_mgr.totp_enabled(username));
+
+            let resp = account_totp_setup_handler(
+                State(ctx.clone()),
+                crate::auth::MaybeConnectInfo(None),
+                headers.clone(),
+                Form(AccountTotpSetupForm {
+                    password: password.to_string(),
+                    code: None,
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = response_body(resp).await;
+            assert!(
+                body.contains("Confirm TOTP Enrollment"),
+                "{username} must see the enrollment form: {body}"
+            );
+            let reauth_token = extract_attr(&body, "name=\"reauth_token\" value=\"");
+            let backup_code = extract_first_backup_code(&body);
+
+            let resp = account_totp_enable_handler(
+                State(ctx.clone()),
+                headers,
+                Form(AccountTotpEnableForm {
+                    reauth_token,
+                    code: backup_code,
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert!(
+                ctx.auth_mgr.totp_enabled(username),
+                "{username} must be able to enable TOTP self-service"
+            );
+
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        }
     }
 }

@@ -73,6 +73,18 @@ pub struct UserViewItem {
     pub is_current: bool,
 }
 
+/// Pending TOTP enrollment material shown once on the account page.
+#[derive(Debug, Clone)]
+pub struct TotpSetupView {
+    pub secret: String,
+    pub otpauth_url: String,
+    /// Base64 PNG (without the data-URI prefix), empty when generation failed.
+    pub qr_code: String,
+    pub backup_codes: Vec<String>,
+    /// Short-lived, session-bound ticket required to confirm the enrollment.
+    pub reauth_token: String,
+}
+
 /// One API-token row on the account page.
 #[derive(Debug, Clone)]
 pub struct TokenViewItem {
@@ -289,6 +301,8 @@ pub struct AccountTemplate<'a> {
     pub version: &'a str,
     pub tokens: Vec<TokenViewItem>,
     pub totp_enabled: bool,
+    /// Pending enrollment to render once, with its re-auth ticket.
+    pub totp_setup: Option<TotpSetupView>,
     /// Scope options the signed-in role is allowed to mint. Tokens are global
     /// in the current auth model, so a role must never create a token above
     /// its own privilege level.

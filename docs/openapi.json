@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "sito DNS Administrative API",
-    "description": "Administrative REST API and OpenAPI 3.1 specification for the sito DNS server. Account, role, and API-token management plus TOTP status/disabling are available in the web UI (/users and /account); TOTP enrollment/setup remains REST-only. See docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
+    "description": "Administrative REST API and OpenAPI 3.1 specification for the sito DNS server. Account, role, API-token management, and self-service TOTP enrollment are available in the web UI (/users and /account); sensitive TOTP changes require a fresh re-authentication ticket from POST /api/v1/auth/reauth. See docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
     "license": {
       "name": "GPL-3.0-only"
     },
@@ -97,7 +97,17 @@
         },
         "responses": {
           "200": {
-            "description": "Login successful or TOTP required",
+            "description": "Login successful",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Password accepted; TOTP verification required",
             "content": {
               "application/json": {
                 "schema": {
@@ -148,6 +158,72 @@
             }
           }
         }
+      }
+    },
+    "/api/v1/auth/reauth": {
+      "post": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "Re-authenticate a live session and issue a short-lived ticket for a\nsensitive operation (TOTP enrollment/change).",
+        "operationId": "reauth",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReauthRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Re-authentication accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReauthResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid password or second factor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A user session is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Locked out or rate limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/auth/tokens": {
@@ -218,7 +294,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "API token created",
             "content": {
               "application/json": {
@@ -343,8 +419,20 @@
         "tags": [
           "crate::handlers::auth_handlers"
         ],
-        "summary": "Disable TOTP 2FA. Requires the account password and, when TOTP is enabled,\na valid TOTP or backup code.",
+        "summary": "Disable TOTP 2FA.",
+        "description": "Requires a fresh re-authentication ticket (`X-Reauth-Token`) from\n`POST /api/v1/auth/reauth`; that call proves the account password and, when\nTOTP is enabled, the current TOTP or backup code. The legacy request-body\ncredentials remain accepted for client compatibility but are superseded by\nthe re-authentication ticket.",
         "operationId": "disable_totp",
+        "parameters": [
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Short-lived re-authentication ticket from POST /api/v1/auth/reauth",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -366,18 +454,8 @@
               }
             }
           },
-          "400": {
-            "description": "Missing second-factor code",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            }
-          },
           "401": {
-            "description": "Invalid password or code",
+            "description": "Missing, invalid, or expired re-authentication ticket",
             "content": {
               "application/json": {
                 "schema": {
@@ -395,12 +473,19 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "User account not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
-          {
-            "bearer_auth": []
-          },
           {
             "cookie_auth": []
           }
@@ -414,6 +499,17 @@
         ],
         "summary": "Enable TOTP 2FA by verifying setup code.",
         "operationId": "enable_totp",
+        "parameters": [
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Short-lived re-authentication ticket from POST /api/v1/auth/reauth",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -446,7 +542,7 @@
             }
           },
           "401": {
-            "description": "Unauthorized",
+            "description": "Missing, invalid, or expired re-authentication ticket",
             "content": {
               "application/json": {
                 "schema": {
@@ -467,9 +563,6 @@
           }
         },
         "security": [
-          {
-            "bearer_auth": []
-          },
           {
             "cookie_auth": []
           }
@@ -483,6 +576,17 @@
         ],
         "summary": "Initiate TOTP 2FA setup.",
         "operationId": "get_totp_setup",
+        "parameters": [
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Short-lived re-authentication ticket from POST /api/v1/auth/reauth",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "TOTP setup credentials generated",
@@ -495,7 +599,7 @@
             }
           },
           "401": {
-            "description": "Unauthorized",
+            "description": "Missing, invalid, or expired re-authentication ticket",
             "content": {
               "application/json": {
                 "schema": {
@@ -516,9 +620,6 @@
           }
         },
         "security": [
-          {
-            "bearer_auth": []
-          },
           {
             "cookie_auth": []
           }
@@ -634,7 +735,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "User created",
             "content": {
               "application/json": {
@@ -1101,14 +1202,21 @@
               }
             }
           },
-          "400": {
-            "description": "Group already exists"
-          },
           "401": {
             "description": "Unauthorized"
           },
           "403": {
             "description": "Forbidden"
+          },
+          "409": {
+            "description": "Group already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         }
       }
@@ -4280,6 +4388,44 @@
               "null"
             ],
             "format": "int64"
+          }
+        }
+      },
+      "ReauthRequest": {
+        "type": "object",
+        "description": "Re-authentication request for a sensitive operation.",
+        "required": [
+          "password"
+        ],
+        "properties": {
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Current TOTP or backup code; required when TOTP is enabled."
+          },
+          "password": {
+            "type": "string"
+          }
+        }
+      },
+      "ReauthResponse": {
+        "type": "object",
+        "description": "Short-lived, session-bound re-authentication ticket.",
+        "required": [
+          "reauth_token",
+          "expires_in"
+        ],
+        "properties": {
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Remaining lifetime in seconds.",
+            "minimum": 0
+          },
+          "reauth_token": {
+            "type": "string"
           }
         }
       },

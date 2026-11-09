@@ -59,6 +59,38 @@ pub enum TotpVerifyResult {
     RateLimited,
 }
 
+/// A short-lived proof that the caller re-authenticated for a sensitive
+/// operation. Bound to the account, its credential epoch, and the session that
+/// requested it.
+#[derive(Debug, Clone)]
+struct ReauthGrant {
+    username: String,
+    session_id: String,
+    credential_epoch: u64,
+    expires_at: Instant,
+}
+
+/// Successful re-authentication ticket.
+#[derive(Debug, Clone)]
+pub struct ReauthToken {
+    pub token: String,
+    /// Remaining lifetime in seconds.
+    pub expires_in: u64,
+}
+
+/// Failure modes for [`AuthManager::reauth`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReauthError {
+    /// Wrong password or second factor.
+    InvalidCredentials,
+    /// The account has TOTP enabled but no code was supplied.
+    SecondFactorRequired,
+    /// Too many attempts from this IP address.
+    RateLimited,
+    /// The account is currently locked out.
+    LockedOut { remaining_seconds: u64 },
+}
+
 /// Result of validating a first-boot setup token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupTokenStatus {
@@ -90,6 +122,20 @@ pub struct UserAccount {
 pub const MAX_SESSIONS: usize = 10_000;
 pub const MAX_PENDING_TOTP: usize = 10_000;
 pub const MAX_PARTIAL_TOKENS: usize = 10_000;
+/// Maximum accepted login username length (bytes) before lockout/Argon2.
+pub const MAX_LOGIN_USERNAME_BYTES: usize = 64;
+/// Maximum accepted login password length (bytes) before lockout/Argon2.
+pub const MAX_LOGIN_PASSWORD_BYTES: usize = 1024;
+
+/// Digest key used for account lockout bookkeeping. Hashing bounds the key
+/// size and prevents the raw (attacker-controlled) username from being stored.
+pub(crate) fn lockout_key(username: &str) -> String {
+    format!("user:{}", blake3::hash(username.as_bytes()).to_hex())
+}
+
+fn record_reauth_failure(lockout: &LockoutTracker, key: &str) {
+    let _ = lockout.record_failure(key);
+}
 /// Maximum number of API tokens kept in memory/on disk.
 pub const MAX_API_TOKENS: usize = 256;
 /// Maximum number of API tokens a single owner may hold. When the limit is
@@ -97,6 +143,10 @@ pub const MAX_API_TOKENS: usize = 256;
 /// owners' tokens are never touched.
 pub const MAX_API_TOKENS_PER_OWNER: usize = 16;
 pub const PENDING_TOTP_TTL: Duration = Duration::from_secs(600); // 10 minutes
+/// Lifetime of a re-authentication ticket for a sensitive operation.
+pub const REAUTH_TOKEN_TTL: Duration = Duration::from_secs(300);
+/// Maximum number of live re-authentication tickets.
+pub const MAX_REAUTH_TOKENS: usize = 10_000;
 /// Maximum wrong TOTP codes per partial token before it is invalidated.
 pub const MAX_TOTP_ATTEMPTS: u32 = 5;
 /// Maximum failed first-boot setup-token attempts per client within the window.
@@ -517,6 +567,8 @@ pub struct AuthManager {
     tokens: Arc<Mutex<HashMap<String, ApiTokenMeta>>>, // Keyed by token hash
     pending_totp_setups: Arc<Mutex<HashMap<String, PendingTotp>>>,
     partial_tokens: Arc<Mutex<HashMap<String, PartialAuth>>>,
+    /// Short-lived re-authentication tickets for sensitive operations.
+    reauth_tokens: Arc<Mutex<HashMap<String, ReauthGrant>>>,
     lockout: LockoutTracker,
     session_ttl_secs: i64,
     login_rate_limit: usize,
@@ -696,6 +748,7 @@ impl AuthManager {
             tokens: Arc::new(Mutex::new(HashMap::new())),
             pending_totp_setups: Arc::new(Mutex::new(HashMap::new())),
             partial_tokens: Arc::new(Mutex::new(HashMap::new())),
+            reauth_tokens: Arc::new(Mutex::new(HashMap::new())),
             lockout: LockoutTracker::new(),
             session_ttl_secs,
             login_rate_limit,
@@ -1031,6 +1084,7 @@ impl AuthManager {
             tokens: Arc::new(Mutex::new(HashMap::new())),
             pending_totp_setups: Arc::new(Mutex::new(HashMap::new())),
             partial_tokens: Arc::new(Mutex::new(HashMap::new())),
+            reauth_tokens: Arc::new(Mutex::new(HashMap::new())),
             lockout: LockoutTracker::new(),
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
             login_rate_limit: 5,
@@ -2071,8 +2125,19 @@ impl AuthManager {
             return LoginResult::RateLimited;
         }
 
-        // 2. Check user lockout
-        if let Some(secs) = self.lockout.check_lockout(username) {
+        // 2. Bound pre-auth input before it reaches lockout bookkeeping or the
+        //    memory-hard password hash. Unbounded values are a cheap pre-auth
+        //    DoS and were previously stored verbatim as lockout-map keys.
+        if username.len() > MAX_LOGIN_USERNAME_BYTES || password.len() > MAX_LOGIN_PASSWORD_BYTES {
+            return LoginResult::InvalidCredentials {
+                remaining_attempts: crate::auth::lockout::MAX_FAILED_ATTEMPTS,
+            };
+        }
+
+        let key = lockout_key(username);
+
+        // 3. Check user lockout
+        if let Some(secs) = self.lockout.check_lockout(&key) {
             return LoginResult::LockedOut {
                 remaining_seconds: secs,
             };
@@ -2098,7 +2163,7 @@ impl AuthManager {
             let _ =
                 verify_password_blocking(password.to_string(), dummy_password_hash().to_string())
                     .await;
-            let (locked, rem) = self.lockout.record_failure(username);
+            let (locked, rem) = self.lockout.record_failure(&key);
             return if locked {
                 LoginResult::LockedOut {
                     remaining_seconds: 15 * 60,
@@ -2112,7 +2177,7 @@ impl AuthManager {
 
         let password_valid = verify_password_blocking(password.to_string(), hash.clone()).await;
         if !password_valid {
-            let (locked, rem) = self.lockout.record_failure(username);
+            let (locked, rem) = self.lockout.record_failure(&key);
             return if locked {
                 LoginResult::LockedOut {
                     remaining_seconds: 15 * 60,
@@ -2168,7 +2233,7 @@ impl AuthManager {
         let Some(session) = self.insert_session(session, credential_epoch).await else {
             return LoginResult::StaleCredentials;
         };
-        self.lockout.record_success(username);
+        self.lockout.record_success(&key);
         LoginResult::Success(session)
     }
 
@@ -2206,8 +2271,9 @@ impl AuthManager {
             return TotpVerifyResult::TokenExpired;
         }
 
-        // 3. Account lockout check
-        if let Some(secs) = self.lockout.check_lockout(&username) {
+        // 3. Account lockout check (digest key shared with the first phase).
+        let key = lockout_key(&username);
+        if let Some(secs) = self.lockout.check_lockout(&key) {
             return TotpVerifyResult::LockedOut {
                 remaining_seconds: secs,
             };
@@ -2287,12 +2353,12 @@ impl AuthManager {
             let Some(session) = self.insert_session(session, credential_epoch).await else {
                 return TotpVerifyResult::TokenExpired;
             };
-            self.lockout.record_success(&username);
+            self.lockout.record_success(&key);
             return TotpVerifyResult::Success(session);
         }
 
         // Failure: count it against both the partial token and the account lockout.
-        let (locked, _rem) = self.lockout.record_failure(&username);
+        let (locked, _rem) = self.lockout.record_failure(&key);
         let remaining_attempts = {
             let mut partials = lock(&self.partial_tokens);
             if let Some(auth) = partials.get_mut(partial_token) {
@@ -2313,6 +2379,142 @@ impl AuthManager {
             lock(&self.partial_tokens).remove(partial_token);
         }
         TotpVerifyResult::Invalid
+    }
+
+    /// Re-authenticates a live session for a sensitive operation and returns a
+    /// short-lived ticket bound to that session and credential epoch.
+    ///
+    /// The current password is always required; when TOTP is enabled a current
+    /// TOTP or backup code is required too. Failures share the login lockout
+    /// so a stolen session cannot brute-force the password cheaply.
+    pub async fn reauth(
+        &self,
+        username: &str,
+        password: &str,
+        code: Option<&str>,
+        session_id: &str,
+        client_ip: &str,
+    ) -> Result<ReauthToken, ReauthError> {
+        if !client_ip.is_empty()
+            && !self
+                .lockout
+                .check_ip_rate_limit(client_ip, self.login_rate_limit)
+        {
+            return Err(ReauthError::RateLimited);
+        }
+
+        let key = lockout_key(username);
+        if let Some(remaining_seconds) = self.lockout.check_lockout(&key) {
+            return Err(ReauthError::LockedOut { remaining_seconds });
+        }
+
+        if username.len() > MAX_LOGIN_USERNAME_BYTES || password.len() > MAX_LOGIN_PASSWORD_BYTES {
+            return Err(ReauthError::InvalidCredentials);
+        }
+
+        if !self.verify_user_password(username, password).await {
+            record_reauth_failure(&self.lockout, &key);
+            return Err(ReauthError::InvalidCredentials);
+        }
+
+        let Some((credential_epoch, totp_enabled)) = lock(&self.users).get(username).map(|user| {
+            (
+                user.credential_epoch,
+                user.totp.as_ref().is_some_and(|totp| totp.enabled),
+            )
+        }) else {
+            record_reauth_failure(&self.lockout, &key);
+            return Err(ReauthError::InvalidCredentials);
+        };
+
+        if totp_enabled {
+            let Some(code) = code.map(str::trim).filter(|code| !code.is_empty()) else {
+                record_reauth_failure(&self.lockout, &key);
+                return Err(ReauthError::SecondFactorRequired);
+            };
+            if !self.verify_second_factor(username, code).await {
+                record_reauth_failure(&self.lockout, &key);
+                return Err(ReauthError::InvalidCredentials);
+            }
+        }
+
+        self.lockout.record_success(&key);
+
+        let mut bytes = [0u8; 32];
+        rand::rng().fill(&mut bytes);
+        let token = hex::encode(bytes);
+        let now = Instant::now();
+        let expires_at = now + REAUTH_TOKEN_TTL;
+
+        let mut tokens = lock(&self.reauth_tokens);
+        if !tokens.contains_key(&token) && tokens.len() >= MAX_REAUTH_TOKENS {
+            tokens.retain(|_, grant| now < grant.expires_at);
+            while tokens.len() >= MAX_REAUTH_TOKENS {
+                let Some(oldest_key) = tokens
+                    .iter()
+                    .min_by_key(|(_, grant)| grant.expires_at)
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                tokens.remove(&oldest_key);
+            }
+        }
+        tokens.insert(
+            token.clone(),
+            ReauthGrant {
+                username: username.to_string(),
+                session_id: session_id.to_string(),
+                credential_epoch,
+                expires_at,
+            },
+        );
+
+        Ok(ReauthToken {
+            token,
+            expires_in: REAUTH_TOKEN_TTL.as_secs(),
+        })
+    }
+
+    /// Returns true when `token` is a live re-authentication ticket for this
+    /// account, session, and credential state.
+    pub fn check_reauth_token(&self, token: &str, username: &str, session_id: &str) -> bool {
+        let credential_epoch = lock(&self.users)
+            .get(username)
+            .map(|user| user.credential_epoch);
+        let now = Instant::now();
+        let mut tokens = lock(&self.reauth_tokens);
+        tokens.retain(|_, grant| now < grant.expires_at);
+        let Some(grant) = tokens.get(token) else {
+            return false;
+        };
+        grant.username == username
+            && grant.session_id == session_id
+            && Some(grant.credential_epoch) == credential_epoch
+    }
+
+    /// Consumes a re-authentication ticket (single-use for an operation).
+    ///
+    /// The credential epoch is deliberately not re-checked here: the caller
+    /// has already validated the ticket before performing the operation, and
+    /// TOTP enable/disable bumps the epoch and revokes sessions as part of that
+    /// operation. Matching the account and session is enough to retire it.
+    pub fn consume_reauth_token(&self, token: &str, username: &str, session_id: &str) -> bool {
+        let now = Instant::now();
+        let mut tokens = lock(&self.reauth_tokens);
+        tokens.retain(|_, grant| now < grant.expires_at);
+        let matches = tokens
+            .get(token)
+            .is_some_and(|grant| grant.username == username && grant.session_id == session_id);
+        if matches {
+            tokens.remove(token);
+        }
+        matches
+    }
+
+    /// Starts a TOTP enrollment (secret + backup codes) for `username`.
+    pub async fn begin_totp_enrollment(&self, username: &str) -> Option<TotpSetupResponse> {
+        self.init_totp_setup(username).await
     }
 
     /// Initiates TOTP setup for a user (`GET /auth/totp/setup`). Backup-code
@@ -2825,6 +3027,11 @@ impl AuthManager {
         }
         {
             let now = Instant::now();
+            let mut reauth = lock(&self.reauth_tokens);
+            reauth.retain(|_, grant| now < grant.expires_at);
+        }
+        {
+            let now = Instant::now();
             let mut windows = lock(&self.setup_token_failures);
             windows.retain(|_, w| now.duration_since(w.window_start) <= SETUP_TOKEN_RATE_WINDOW);
         }
@@ -2898,6 +3105,11 @@ impl AuthManager {
     #[cfg(test)]
     pub fn pending_totp_len(&self) -> usize {
         lock(&self.pending_totp_setups).len()
+    }
+
+    #[cfg(test)]
+    pub fn reauth_tokens_len(&self) -> usize {
+        lock(&self.reauth_tokens).len()
     }
 
     #[cfg(test)]
@@ -2982,6 +3194,50 @@ mod tests {
             mgr.login("admin", "wrongpassword", "127.0.0.1").await,
             LoginResult::InvalidCredentials { .. }
         ));
+    }
+
+    /// WP-0.7 (P1-20): pre-auth inputs are bounded before lockout bookkeeping
+    /// and Argon2, and the lockout map never stores the raw username.
+    #[tokio::test]
+    async fn test_login_rejects_oversized_credentials_before_lockout() {
+        let mgr = AuthManager::new();
+
+        let long_username = "u".repeat(MAX_LOGIN_USERNAME_BYTES + 1);
+        assert!(matches!(
+            mgr.login(&long_username, "whatever", "127.0.0.1").await,
+            LoginResult::InvalidCredentials { .. }
+        ));
+        assert_eq!(
+            mgr.lockout.attempts_len(),
+            0,
+            "oversized usernames must not create lockout entries"
+        );
+
+        let long_password = "p".repeat(MAX_LOGIN_PASSWORD_BYTES + 1);
+        assert!(matches!(
+            mgr.login("admin", &long_password, "127.0.0.1").await,
+            LoginResult::InvalidCredentials { .. }
+        ));
+        assert_eq!(
+            mgr.lockout.attempts_len(),
+            0,
+            "oversized passwords must be rejected before the lockout/Argon2 path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_lockout_key_is_a_digest() {
+        let mgr = AuthManager::new();
+        for _ in 0..5 {
+            let _ = mgr.login("admin", "wrongpassword", "127.0.0.1").await;
+        }
+        let keys = mgr.lockout.attempt_keys();
+        assert_eq!(keys.len(), 1);
+        assert!(
+            !keys[0].contains("admin"),
+            "the raw username must never be a lockout-map key: {keys:?}"
+        );
+        assert_eq!(keys[0], lockout_key("admin"));
     }
 
     #[tokio::test]

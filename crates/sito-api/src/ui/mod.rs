@@ -47,6 +47,14 @@ pub fn ui_router() -> Router<ServerContext> {
             post(handlers::account_token_delete_handler),
         )
         .route(
+            "/ui/account/totp/setup",
+            post(handlers::account_totp_setup_handler),
+        )
+        .route(
+            "/ui/account/totp/enable",
+            post(handlers::account_totp_enable_handler),
+        )
+        .route(
             "/ui/account/totp/disable",
             post(handlers::account_totp_disable_handler),
         )
@@ -425,6 +433,7 @@ mod tests {
                 expires_at: "—".to_string(),
             }],
             totp_enabled: true,
+            totp_setup: None,
             can_create_operator_token: false,
             can_create_admin_token: false,
             error_message: "",

@@ -2,15 +2,18 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::http::header::{HeaderMap, SET_COOKIE};
 use axum::response::{IntoResponse, Response};
 use std::str::FromStr;
 
-use crate::auth::manager::{LoginResult, TotpMutationError, TotpVerifyResult, UserMutationError};
-use crate::auth::rbac::RequireAdmin;
+use crate::auth::manager::{
+    LoginResult, ReauthError, TotpMutationError, TotpVerifyResult, UserMutationError,
+};
+use crate::auth::rbac::{RequireAdmin, RequireViewer};
 use crate::auth::session::{
     Session, build_clear_csrf_cookie, build_clear_partial_cookie, build_clear_session_cookie,
-    build_csrf_cookie, build_partial_cookie, extract_partial_cookie,
+    build_csrf_cookie, build_partial_cookie, extract_partial_cookie, extract_session_cookie,
 };
 use crate::auth::token::{CreateTokenResponse, Role};
 use crate::auth::totp::TotpSetupResponse;
@@ -20,14 +23,58 @@ use crate::auth::{
 use crate::error::ProblemDetails;
 use crate::models::{
     ApiTokenDto, ChangePasswordRequest, CreateTokenRequest, CreateUserRequest, DisableTotpRequest,
-    GenericMessageResponse, LoginRequest, LoginResponse, TotpConfirmRequest, TotpVerifyRequest,
-    UpdateUserRequest, UserDto,
+    GenericMessageResponse, LoginRequest, LoginResponse, ReauthRequest, ReauthResponse,
+    TotpConfirmRequest, TotpVerifyRequest, UpdateUserRequest, UserDto,
 };
 use crate::state::ServerContext;
 
 /// Header that opts a non-browser client into receiving the TOTP partial token
 /// in the JSON body instead of an HttpOnly cookie.
 pub const TOKEN_DELIVERY_HEADER: &str = "x-sito-token-delivery";
+
+/// Header carrying a short-lived re-authentication ticket for sensitive
+/// TOTP operations.
+pub const REAUTH_TOKEN_HEADER: &str = "x-reauth-token";
+
+/// Extracts the validated session id from the request cookie. Used to bind
+/// re-authentication tickets to a specific session.
+fn current_session_id(ctx: &ServerContext, headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("cookie")
+        .and_then(|value| value.to_str().ok())
+        .and_then(extract_session_cookie)
+        .filter(|session_id| ctx.auth_mgr.validate_session(session_id).is_some())
+}
+
+/// Validates the `X-Reauth-Token` header for a sensitive TOTP operation.
+fn require_reauth_token(
+    ctx: &ServerContext,
+    headers: &HeaderMap,
+    username: &str,
+) -> Result<String, ProblemDetails> {
+    let token = headers
+        .get(REAUTH_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            ProblemDetails::unauthorized(
+                "Re-authentication required: provide a fresh X-Reauth-Token from POST /api/v1/auth/reauth",
+            )
+        })?;
+    let session_id = current_session_id(ctx, headers).ok_or_else(|| {
+        ProblemDetails::forbidden("Re-authentication requires an authenticated user session")
+    })?;
+    if !ctx
+        .auth_mgr
+        .check_reauth_token(token, username, &session_id)
+    {
+        return Err(ProblemDetails::unauthorized(
+            "Re-authentication token is invalid, expired, or bound to another session",
+        ));
+    }
+    Ok(token.to_string())
+}
 
 /// True when the request asked for the partial token in the JSON body.
 fn wants_partial_token_in_body(headers: &HeaderMap) -> bool {
@@ -66,7 +113,8 @@ fn append_session_cookies(response: &mut Response, session: &Session, secure: bo
     path = "/api/v1/auth/login",
     request_body = LoginRequest,
     responses(
-        (status = 200, description = "Login successful or TOTP required", body = LoginResponse),
+        (status = 200, description = "Login successful", body = LoginResponse),
+        (status = 202, description = "Password accepted; TOTP verification required", body = LoginResponse),
         (status = 401, description = "Invalid credentials", body = ProblemDetails),
         (status = 429, description = "Locked out or rate limited", body = ProblemDetails)
     )
@@ -107,7 +155,8 @@ pub async fn login(
                 totp_required: true,
                 partial_token: deliver_in_body.then(|| partial_token.clone()),
             });
-            let mut response = body.into_response();
+            // Documented challenge contract: 202 Accepted.
+            let mut response = (StatusCode::ACCEPTED, body).into_response();
             // Browser clients get the partial token as an HttpOnly cookie; it
             // is a short-lived credential and must not be readable from JS.
             append_set_cookie(
@@ -251,25 +300,94 @@ pub async fn logout(
     resp
 }
 
+/// Re-authenticate a live session and issue a short-lived ticket for a
+/// sensitive operation (TOTP enrollment/change).
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/reauth",
+    request_body = ReauthRequest,
+    responses(
+        (status = 200, description = "Re-authentication accepted", body = ReauthResponse),
+        (status = 401, description = "Invalid password or second factor", body = ProblemDetails),
+        (status = 403, description = "A user session is required", body = ProblemDetails),
+        (status = 429, description = "Locked out or rate limited", body = ProblemDetails)
+    ),
+    security(("cookie_auth" = []))
+)]
+pub async fn reauth(
+    State(ctx): State<ServerContext>,
+    MaybeConnectInfo(peer_addr): MaybeConnectInfo,
+    viewer: RequireViewer,
+    headers: HeaderMap,
+    Json(req): Json<ReauthRequest>,
+) -> Result<Json<ReauthResponse>, ProblemDetails> {
+    if viewer.token_id.is_some() {
+        return Err(ProblemDetails::forbidden(
+            "Re-authentication requires an authenticated user session, not an API token",
+        ));
+    }
+    let session_id = current_session_id(&ctx, &headers).ok_or_else(|| {
+        ProblemDetails::forbidden("Re-authentication requires an authenticated user session")
+    })?;
+    let client_ip = {
+        let config = ctx.config.load();
+        let trusted_proxies = config.get_web_config().trusted_proxies;
+        resolve_client_ip(peer_addr, &headers, &trusted_proxies)
+    };
+
+    let ticket = ctx
+        .auth_mgr
+        .reauth(
+            &viewer.username,
+            &req.password,
+            req.code.as_deref(),
+            &session_id,
+            &client_ip,
+        )
+        .await
+        .map_err(|err| match err {
+            ReauthError::InvalidCredentials => {
+                ProblemDetails::unauthorized("Re-authentication failed: invalid password or code")
+            }
+            ReauthError::SecondFactorRequired => ProblemDetails::unauthorized(
+                "A current TOTP or backup code is required to re-authenticate",
+            ),
+            ReauthError::RateLimited => ProblemDetails::too_many_requests(
+                "Too many re-authentication attempts from this IP address. Please wait.",
+            ),
+            ReauthError::LockedOut { remaining_seconds } => ProblemDetails::too_many_requests(
+                format!("Account locked out due to repeated failures. Try again in {remaining_seconds}s."),
+            ),
+        })?;
+
+    Ok(Json(ReauthResponse {
+        reauth_token: ticket.token,
+        expires_in: ticket.expires_in,
+    }))
+}
+
 /// Initiate TOTP 2FA setup.
 #[utoipa::path(
     get,
     path = "/api/v1/auth/totp/setup",
+    params(("X-Reauth-Token" = String, Header, description = "Short-lived re-authentication ticket from POST /api/v1/auth/reauth")),
     responses(
         (status = 200, description = "TOTP setup credentials generated", body = TotpSetupResponse),
-        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 401, description = "Missing, invalid, or expired re-authentication ticket", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("cookie_auth" = []))
 )]
 pub async fn get_totp_setup(
-    admin: RequireAdmin,
+    viewer: RequireViewer,
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
 ) -> Result<Json<TotpSetupResponse>, ProblemDetails> {
-    let username = session_username(&admin)?;
+    let username = session_username(&viewer)?;
+    require_reauth_token(&ctx, &headers, username)?;
     let setup = ctx
         .auth_mgr
-        .init_totp_setup(username)
+        .begin_totp_enrollment(username)
         .await
         .ok_or_else(|| ProblemDetails::internal_error("Failed to generate TOTP credentials"))?;
 
@@ -281,22 +399,26 @@ pub async fn get_totp_setup(
     post,
     path = "/api/v1/auth/totp/enable",
     request_body = TotpConfirmRequest,
+    params(("X-Reauth-Token" = String, Header, description = "Short-lived re-authentication ticket from POST /api/v1/auth/reauth")),
     responses(
         (status = 200, description = "TOTP enabled successfully", body = GenericMessageResponse),
         (status = 400, description = "Invalid code", body = ProblemDetails),
-        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 401, description = "Missing, invalid, or expired re-authentication ticket", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("cookie_auth" = []))
 )]
 pub async fn enable_totp(
-    admin: RequireAdmin,
+    viewer: RequireViewer,
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
     Json(req): Json<TotpConfirmRequest>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
-    let username = session_username(&admin)?;
+    let username = session_username(&viewer)?.to_string();
+    let reauth_token = require_reauth_token(&ctx, &headers, &username)?;
+    let session_id = current_session_id(&ctx, &headers);
     ctx.auth_mgr
-        .try_confirm_totp_setup(username, &req.code)
+        .try_confirm_totp_setup(&username, &req.code)
         .await
         .map_err(|err| match err {
             TotpMutationError::InvalidCode => {
@@ -307,57 +429,47 @@ pub async fn enable_totp(
                 "Failed to persist the user store while enabling TOTP: {detail}"
             )),
         })?;
+    // Enabling/replacing TOTP revokes the session that authorized it, so the
+    // ticket is consumed explicitly as well.
+    if let Some(session_id) = session_id {
+        let _ = ctx
+            .auth_mgr
+            .consume_reauth_token(&reauth_token, &username, &session_id);
+    }
     Ok(Json(GenericMessageResponse {
         message: "TOTP 2FA enabled successfully".to_string(),
     }))
 }
 
-/// Disable TOTP 2FA. Requires the account password and, when TOTP is enabled,
-/// a valid TOTP or backup code.
+/// Disable TOTP 2FA.
+///
+/// Requires a fresh re-authentication ticket (`X-Reauth-Token`) from
+/// `POST /api/v1/auth/reauth`; that call proves the account password and, when
+/// TOTP is enabled, the current TOTP or backup code. The legacy request-body
+/// credentials remain accepted for client compatibility but are superseded by
+/// the re-authentication ticket.
 #[utoipa::path(
     post,
     path = "/api/v1/auth/totp/disable",
     request_body = DisableTotpRequest,
+    params(("X-Reauth-Token" = String, Header, description = "Short-lived re-authentication ticket from POST /api/v1/auth/reauth")),
     responses(
         (status = 200, description = "TOTP disabled successfully", body = GenericMessageResponse),
-        (status = 400, description = "Missing second-factor code", body = ProblemDetails),
-        (status = 401, description = "Invalid password or code", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 401, description = "Missing, invalid, or expired re-authentication ticket", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 404, description = "User account not found", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("cookie_auth" = []))
 )]
 pub async fn disable_totp(
-    admin: RequireAdmin,
+    viewer: RequireViewer,
     State(ctx): State<ServerContext>,
-    Json(req): Json<DisableTotpRequest>,
+    headers: HeaderMap,
+    Json(_req): Json<DisableTotpRequest>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
-    let username = session_username(&admin)?.to_string();
-
-    if !ctx
-        .auth_mgr
-        .verify_user_password(&username, &req.password)
-        .await
-    {
-        return Err(ProblemDetails::unauthorized(
-            "Re-authentication failed: invalid password",
-        ));
-    }
-
-    if ctx.auth_mgr.totp_enabled(&username) {
-        let code = req
-            .code
-            .as_deref()
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .ok_or_else(|| {
-                ProblemDetails::bad_request("A TOTP or backup code is required to disable 2FA")
-            })?;
-        if !ctx.auth_mgr.verify_second_factor(&username, code).await {
-            return Err(ProblemDetails::unauthorized(
-                "Re-authentication failed: invalid TOTP or backup code",
-            ));
-        }
-    }
+    let username = session_username(&viewer)?.to_string();
+    let reauth_token = require_reauth_token(&ctx, &headers, &username)?;
+    let session_id = current_session_id(&ctx, &headers);
 
     ctx.auth_mgr
         .try_disable_totp(&username)
@@ -371,19 +483,25 @@ pub async fn disable_totp(
                 "Failed to persist the user store while disabling TOTP: {detail}"
             )),
         })?;
+    if let Some(session_id) = session_id {
+        let _ = ctx
+            .auth_mgr
+            .consume_reauth_token(&reauth_token, &username, &session_id);
+    }
     Ok(Json(GenericMessageResponse {
         message: "TOTP 2FA disabled successfully".to_string(),
     }))
 }
 
 /// TOTP management is only meaningful for real user sessions, not API tokens.
-fn session_username(admin: &RequireAdmin) -> Result<&str, ProblemDetails> {
-    if admin.token_id.is_some() {
+/// Self-service is available to every authenticated role.
+fn session_username(user: &crate::auth::rbac::AuthUser) -> Result<&str, ProblemDetails> {
+    if user.token_id.is_some() {
         return Err(ProblemDetails::forbidden(
             "TOTP management requires an authenticated user session, not an API token",
         ));
     }
-    Ok(&admin.username)
+    Ok(&user.username)
 }
 
 /// List all API tokens.
@@ -416,7 +534,7 @@ pub async fn list_tokens(
     path = "/api/v1/auth/tokens",
     request_body = CreateTokenRequest,
     responses(
-        (status = 200, description = "API token created", body = CreateTokenResponse),
+        (status = 201, description = "API token created", body = CreateTokenResponse),
         (status = 400, description = "Invalid scope", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
@@ -427,7 +545,7 @@ pub async fn create_token(
     admin: RequireAdmin,
     State(ctx): State<ServerContext>,
     Json(req): Json<CreateTokenRequest>,
-) -> Result<Json<CreateTokenResponse>, ProblemDetails> {
+) -> Result<Response, ProblemDetails> {
     let scope = Role::from_str(&req.scope)
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid token scope: {e}")))?;
     let name = req.name.trim();
@@ -464,7 +582,7 @@ pub async fn create_token(
         .create_token(name, scope, owner.as_deref())
         .await
         .map_err(|e| ProblemDetails::bad_request(e.to_string()))?;
-    Ok(Json(resp))
+    Ok((StatusCode::CREATED, Json(resp)).into_response())
 }
 
 /// Revoke an API token by ID.
@@ -591,7 +709,7 @@ pub async fn list_users(
     path = "/api/v1/auth/users",
     request_body = CreateUserRequest,
     responses(
-        (status = 200, description = "User created", body = UserDto),
+        (status = 201, description = "User created", body = UserDto),
         (status = 400, description = "Invalid username, password or role", body = ProblemDetails),
         (status = 409, description = "Username already exists", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -603,7 +721,7 @@ pub async fn create_user(
     _admin: RequireAdmin,
     State(ctx): State<ServerContext>,
     Json(req): Json<CreateUserRequest>,
-) -> Result<Json<UserDto>, ProblemDetails> {
+) -> Result<Response, ProblemDetails> {
     validate_username(&req.username)?;
     validate_password_policy(&req.password)?;
     let role = Role::from_str(req.role.trim())
@@ -623,11 +741,15 @@ pub async fn create_user(
         .map_err(|e| {
             ProblemDetails::internal_error(format!("Failed to persist the user store: {e}"))
         })?;
-    Ok(Json(UserDto {
-        username: username.to_string(),
-        role: role.to_string(),
-        totp_enabled: false,
-    }))
+    Ok((
+        StatusCode::CREATED,
+        Json(UserDto {
+            username: username.to_string(),
+            role: role.to_string(),
+            totp_enabled: false,
+        }),
+    )
+        .into_response())
 }
 
 /// Update a user's role.
@@ -667,9 +789,9 @@ pub async fn update_user(
         "Administrator changed a user role"
     );
     Ok(Json(UserDto {
-        username,
+        username: username.clone(),
         role: role.to_string(),
-        totp_enabled: false,
+        totp_enabled: ctx.auth_mgr.totp_enabled(&username),
     }))
 }
 
@@ -793,6 +915,40 @@ mod tests {
             role: Role::Admin,
             token_id: None,
         })
+    }
+
+    fn viewer(username: &str, role: Role) -> RequireViewer {
+        RequireViewer(AuthUser {
+            username: username.to_string(),
+            role,
+            token_id: None,
+        })
+    }
+
+    async fn login_session(
+        ctx: &ServerContext,
+        username: &str,
+        password: &str,
+    ) -> (RequireViewer, HeaderMap) {
+        let LoginResult::Success(session) =
+            ctx.auth_mgr.login(username, password, "127.0.0.1").await
+        else {
+            panic!("login failed for {username}");
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            session.to_cookie_header().parse().unwrap(),
+        );
+        (viewer(username, session.role), headers)
+    }
+
+    fn with_reauth_token(mut headers: HeaderMap, token: &str) -> HeaderMap {
+        headers.insert(
+            HeaderName::from_static(REAUTH_TOKEN_HEADER),
+            HeaderValue::from_str(token).unwrap(),
+        );
+        headers
     }
 
     async fn body_json(response: Response) -> serde_json::Value {
@@ -1011,7 +1167,9 @@ mod tests {
         )
         .await
         .expect("user created");
-        assert_eq!(created.0.role, "operator");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = body_json(created).await;
+        assert_eq!(created["role"], "operator");
 
         let conflict = create_user(
             admin(),
@@ -1132,6 +1290,298 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    /// WP-0.7 (P1-15): a stolen Admin session alone cannot start or enable a
+    /// new TOTP enrollment.
+    #[tokio::test]
+    async fn test_totp_setup_and_enable_require_reauth_token() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_reauth_missing");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let (user, headers) = login_session(&ctx, "admin", "adminadmin").await;
+
+        let err = get_totp_setup(user.clone(), State(ctx.clone()), headers.clone())
+            .await
+            .expect_err("setup without re-auth must fail");
+        assert_eq!(err.status, 401);
+
+        let err = enable_totp(
+            user,
+            State(ctx.clone()),
+            headers,
+            Json(TotpConfirmRequest {
+                code: "123456".to_string(),
+            }),
+        )
+        .await
+        .expect_err("enable without re-auth must fail");
+        assert_eq!(err.status, 401);
+        assert!(!ctx.auth_mgr.totp_enabled("admin"));
+        assert_eq!(ctx.auth_mgr.pending_totp_len(), 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-0.7 (P1-15/P2-52): a fresh re-auth ticket allows self-service
+    /// enrollment, even for a non-Admin account.
+    #[tokio::test]
+    async fn test_reauth_allows_totp_enrollment_for_non_admin() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_reauth_ok");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("alice", "AlicePassword1", Role::Viewer)
+            .await;
+        let (user, headers) = login_session(&ctx, "alice", "AlicePassword1").await;
+
+        let Json(ticket) = reauth(
+            State(ctx.clone()),
+            MaybeConnectInfo(None),
+            user.clone(),
+            headers.clone(),
+            Json(ReauthRequest {
+                password: "AlicePassword1".to_string(),
+                code: None,
+            }),
+        )
+        .await
+        .expect("re-auth succeeds");
+        let headers = with_reauth_token(headers, &ticket.reauth_token);
+
+        let Json(setup) = get_totp_setup(user.clone(), State(ctx.clone()), headers.clone())
+            .await
+            .expect("setup with re-auth succeeds");
+        let Json(enabled) = enable_totp(
+            user,
+            State(ctx.clone()),
+            headers,
+            Json(TotpConfirmRequest {
+                code: setup.backup_codes[0].clone(),
+            }),
+        )
+        .await
+        .expect("enable with re-auth succeeds");
+        assert!(enabled.message.contains("enabled"));
+        assert!(ctx.auth_mgr.totp_enabled("alice"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-0.7 (P1-15): replacing an existing TOTP secret still requires the
+    /// current password and second factor, and does not happen by accident.
+    #[tokio::test]
+    async fn test_existing_totp_cannot_be_replaced_without_reauth() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_totp_replace");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let old_setup = ctx.auth_mgr.init_totp_setup("admin").await.expect("setup");
+        assert!(
+            ctx.auth_mgr
+                .confirm_totp_setup("admin", &old_setup.backup_codes[0])
+                .await
+        );
+        assert!(ctx.auth_mgr.totp_enabled("admin"));
+
+        // A stolen session obtained before the factor was enabled cannot
+        // re-enroll now.
+        let LoginResult::TotpRequired { partial_token } =
+            ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("expected TOTP challenge");
+        };
+        let TotpVerifyResult::Success(session) = ctx
+            .auth_mgr
+            .verify_totp(&partial_token, &old_setup.backup_codes[1], "127.0.0.1")
+            .await
+        else {
+            panic!("TOTP verification failed");
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            session.to_cookie_header().parse().unwrap(),
+        );
+        let user = viewer("admin", Role::Admin);
+
+        let err = get_totp_setup(user.clone(), State(ctx.clone()), headers.clone())
+            .await
+            .expect_err("replacement without re-auth must fail");
+        assert_eq!(err.status, 401);
+        assert_eq!(ctx.auth_mgr.pending_totp_len(), 0);
+
+        // Re-auth without the current second factor also fails.
+        let err = reauth(
+            State(ctx.clone()),
+            MaybeConnectInfo(None),
+            user.clone(),
+            headers.clone(),
+            Json(ReauthRequest {
+                password: "adminadmin".to_string(),
+                code: None,
+            }),
+        )
+        .await
+        .expect_err("missing second factor must fail");
+        assert_eq!(err.status, 401);
+
+        // With password + current backup code, re-auth succeeds and the old
+        // factor is only replaced after a new code is confirmed.
+        let Json(ticket) = reauth(
+            State(ctx.clone()),
+            MaybeConnectInfo(None),
+            user.clone(),
+            headers.clone(),
+            Json(ReauthRequest {
+                password: "adminadmin".to_string(),
+                code: Some(old_setup.backup_codes[2].clone()),
+            }),
+        )
+        .await
+        .expect("re-auth with second factor succeeds");
+        let headers = with_reauth_token(headers, &ticket.reauth_token);
+        let Json(new_setup) = get_totp_setup(user, State(ctx.clone()), headers)
+            .await
+            .expect("replacement setup allowed after re-auth");
+        assert_ne!(new_setup.secret, old_setup.secret);
+        assert!(
+            ctx.auth_mgr.totp_enabled("admin"),
+            "starting a replacement must not disable the current factor"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// TOTP management rejects API bearer tokens for every role.
+    #[tokio::test]
+    async fn test_totp_management_rejects_api_token_auth() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_totp_token");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let token_user = RequireViewer(AuthUser {
+            username: "ci".to_string(),
+            role: Role::Admin,
+            token_id: Some("tok_123".to_string()),
+        });
+        let err = get_totp_setup(token_user.clone(), State(ctx.clone()), HeaderMap::new())
+            .await
+            .expect_err("API tokens must not manage TOTP");
+        assert_eq!(err.status, 403);
+
+        let err = disable_totp(
+            token_user,
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Json(DisableTotpRequest {
+                password: "adminadmin".to_string(),
+                code: None,
+            }),
+        )
+        .await
+        .expect_err("API tokens must not disable TOTP");
+        assert_eq!(err.status, 403);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Re-auth is session-only and bound to the session that requested it.
+    #[tokio::test]
+    async fn test_reauth_rejects_api_tokens_and_other_sessions() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_reauth_bind");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let (user, headers) = login_session(&ctx, "admin", "adminadmin").await;
+
+        let Json(ticket) = reauth(
+            State(ctx.clone()),
+            MaybeConnectInfo(None),
+            user,
+            headers,
+            Json(ReauthRequest {
+                password: "adminadmin".to_string(),
+                code: None,
+            }),
+        )
+        .await
+        .expect("re-auth succeeds");
+        assert_ne!(ticket.reauth_token, "");
+        assert_eq!(ticket.expires_in, 300);
+
+        // A different session cannot use the ticket.
+        let (_, other_headers) = login_session(&ctx, "admin", "adminadmin").await;
+        let other_headers = with_reauth_token(other_headers, &ticket.reauth_token);
+        let err = get_totp_setup(
+            viewer("admin", Role::Admin),
+            State(ctx.clone()),
+            other_headers,
+        )
+        .await
+        .expect_err("ticket must be bound to its session");
+        assert_eq!(err.status, 401);
+
+        // Bearer tokens may not re-authenticate.
+        let token_user = RequireViewer(AuthUser {
+            username: "ci".to_string(),
+            role: Role::Admin,
+            token_id: Some("tok_123".to_string()),
+        });
+        let err = reauth(
+            State(ctx.clone()),
+            MaybeConnectInfo(None),
+            token_user,
+            HeaderMap::new(),
+            Json(ReauthRequest {
+                password: "adminadmin".to_string(),
+                code: None,
+            }),
+        )
+        .await
+        .expect_err("API tokens cannot re-authenticate");
+        assert_eq!(err.status, 403);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-0.7 (P2-54): the TOTP challenge is 202 and `update_user` reports the
+    /// account's real TOTP state.
+    #[tokio::test]
+    async fn test_totp_challenge_status_and_update_user_reports_totp() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_status");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        let setup = ctx.auth_mgr.init_totp_setup("alice").await.expect("setup");
+        assert!(
+            ctx.auth_mgr
+                .confirm_totp_setup("alice", &setup.backup_codes[0])
+                .await
+        );
+
+        let response = login(
+            State(ctx.clone()),
+            MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Json(LoginRequest {
+                user: "alice".to_string(),
+                pass: "AlicePassword1".to_string(),
+            }),
+        )
+        .await
+        .expect("challenge");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let updated = update_user(
+            admin(),
+            State(ctx.clone()),
+            AxumPath("alice".to_string()),
+            Json(UpdateUserRequest {
+                role: "operator".to_string(),
+            }),
+        )
+        .await
+        .expect("role updated");
+        assert!(
+            updated.0.totp_enabled,
+            "update_user must report the real TOTP state"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     /// Tokens cannot be used to change passwords (session-only operation).
     #[tokio::test]
     async fn test_change_password_rejects_api_tokens() {
@@ -1198,7 +1648,8 @@ mod tests {
         )
         .await
         .expect("user created");
-        assert_eq!(created.0.username, "alice");
+        let created = body_json(created).await;
+        assert_eq!(created["username"], "alice");
         assert!(ctx.auth_mgr.has_user("alice"));
         assert!(
             !ctx.auth_mgr.has_user("  alice  "),
@@ -1228,7 +1679,7 @@ mod tests {
         let temp_dir = crate::test_support::temp_dir("sito_auth_token_name");
         let ctx = crate::test_support::mock_context(&temp_dir).await;
 
-        let Json(resp) = create_token(
+        let resp = create_token(
             admin(),
             State(ctx.clone()),
             Json(CreateTokenRequest {
@@ -1238,13 +1689,15 @@ mod tests {
         )
         .await
         .expect("token created");
-        assert_eq!(resp.name, "ci-deploy");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = body_json(resp).await;
+        assert_eq!(resp["name"], "ci-deploy");
 
         let token = ctx
             .auth_mgr
             .list_tokens()
             .into_iter()
-            .find(|token| token.id == resp.id)
+            .find(|token| resp["id"].as_str() == Some(token.id.as_str()))
             .expect("token listed");
         assert_eq!(token.name, "ci-deploy");
         assert_eq!(token.owner.as_deref(), Some("admin"));
@@ -1270,7 +1723,7 @@ mod tests {
             token_id: Some(parent.id.clone()),
         });
 
-        let Json(resp) = create_token(
+        let resp = create_token(
             bearer,
             State(ctx.clone()),
             Json(CreateTokenRequest {
@@ -1280,12 +1733,13 @@ mod tests {
         )
         .await
         .expect("child token created");
+        let resp = body_json(resp).await;
 
         let child = ctx
             .auth_mgr
             .list_tokens()
             .into_iter()
-            .find(|token| token.id == resp.id)
+            .find(|token| resp["id"].as_str() == Some(token.id.as_str()))
             .expect("child token listed");
         assert_eq!(child.owner.as_deref(), Some("admin"));
         assert_ne!(

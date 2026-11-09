@@ -329,14 +329,31 @@ session.
 
 ## 7. TOTP Two-Factor Authentication
 
-TOTP is per-account and managed by the signed-in user. Initial setup/enable is
-an API workflow (Admin session required by the current API guards); the
-**Account** page at `/account` can show the current status and disable TOTP.
+TOTP is per-account and self-service for every role (Viewer, Operator, and
+Admin). The **Account** page at `/account` provides a password-confirmed
+enrollment flow (QR code, secret, and one-time backup codes); the REST API can
+be used instead. API bearer tokens cannot manage TOTP — a real user session is
+required.
 
-1. Start setup:
+1. Re-authenticate for a short-lived ticket (5 minutes). The current password is
+   required; when TOTP is already enabled, a current TOTP or backup code is
+   required too:
+
+   ```bash
+   curl -sS -X POST "$SITO/api/v1/auth/reauth" \
+     -H "Cookie: sito_session=<session-id>" \
+     -H 'Content-Type: application/json' \
+     -d '{"password":"NewCorrectHorse2","code":"123456"}'
+   ```
+
+   The response contains `reauth_token` and `expires_in`. The ticket is bound to
+   the session and credential state that requested it.
+
+2. Start setup with the ticket in `X-Reauth-Token`:
 
    ```bash
    curl -sS -H "Cookie: sito_session=<session-id>" \
+     -H "X-Reauth-Token: <reauth-token>" \
      "$SITO/api/v1/auth/totp/setup"
    ```
 
@@ -344,31 +361,41 @@ an API workflow (Admin session required by the current API guards); the
    URL for authenticator apps, and single-use backup codes. The pending setup
    expires after 10 minutes.
 
-2. Confirm with a current code (or a backup code):
+3. Confirm with a current code (or a backup code) and the same ticket:
 
    ```bash
    curl -sS -X POST "$SITO/api/v1/auth/totp/enable" \
      -H "Cookie: sito_session=<session-id>" \
+     -H "X-Reauth-Token: <reauth-token>" \
      -H 'Content-Type: application/json' \
      -d '{"code":"123456"}'
    ```
 
-3. Subsequent logins return `200 OK` with `"totp_required": true` and a
+   An absent, expired, or differently-bound ticket returns `401`. Replacing an
+   existing authenticator requires a fresh re-auth that proves the current
+   password and second factor.
+
+4. Subsequent logins return `202 Accepted` with `"totp_required": true` and a
    short-lived partial token. Browser clients receive it as an HttpOnly cookie;
    API clients can send `X-Sito-Token-Delivery: body` to receive it in the JSON
    response. Finish the login with `POST /api/v1/auth/totp/verify`. Partial
    tokens expire after 5 minutes and allow at most 5 wrong codes before the
    account is locked.
 
-4. Disable TOTP by re-authenticating with the password and a valid TOTP or
-   backup code:
+5. Disable TOTP with a fresh re-authentication ticket (the same
+   password + current TOTP/backup-code proof as step 1):
 
    ```bash
    curl -sS -X POST "$SITO/api/v1/auth/totp/disable" \
      -H "Cookie: sito_session=<session-id>" \
+     -H "X-Reauth-Token: <reauth-token>" \
      -H 'Content-Type: application/json' \
      -d '{"password":"NewCorrectHorse2","code":"123456"}'
    ```
+
+   The body credentials are retained for compatibility but are not trusted; the
+   re-authentication ticket is what authorizes the change. An absent, expired,
+   or differently-bound ticket returns `401`.
 
 Enabling or disabling TOTP revokes all sessions of the account **and every API
 token it owns**, because either change to the second factor is a credential
@@ -394,7 +421,10 @@ on the next start (see section 1).
   up and start empty.
 * Login attempts are rate-limited per IP (`auth.login_rate_limit`, default 5
   per minute). After five failed attempts for one account, that account is
-  locked for 15 minutes.
+  locked for 15 minutes. Usernames over 64 bytes and passwords over 1024 bytes
+  are rejected before lockout bookkeeping or password hashing. Lockout keys are
+  BLAKE3 digests (the raw username is never retained), and username spraying
+  cannot evict an account whose lockout is still active.
 * Expired tokens are rejected immediately and removed from memory; their
   on-disk snapshot is rewritten by the background pruner within 60 seconds.
 

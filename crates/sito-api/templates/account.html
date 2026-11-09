@@ -24,6 +24,50 @@
 </div>
 {% endif %}
 
+{% if let Some(setup) = totp_setup %}
+<div class="card" style="margin-bottom: 20px; max-width: 720px;">
+  <div class="card-header">
+    <div class="card-title">Confirm TOTP Enrollment</div>
+  </div>
+  <div class="form-help" style="margin-bottom: 12px;">
+    Scan the QR code or enter the secret in your authenticator app, then confirm with a generated code.
+    These backup codes are shown once; store them somewhere safe.
+  </div>
+  {% if !setup.qr_code.is_empty() %}
+  <div style="margin-bottom: 12px;">
+    <img alt="TOTP QR code" width="220" height="220" src="data:image/png;base64,{{ setup.qr_code }}">
+  </div>
+  {% endif %}
+  <div class="form-group">
+    <div class="form-label">Secret</div>
+    <code style="display: block; word-break: break-all; padding: 8px 10px; background: var(--bg-base); border-radius: 4px;">{{ setup.secret }}</code>
+  </div>
+  <div class="form-group">
+    <div class="form-label">otpauth URL</div>
+    <code style="display: block; word-break: break-all; padding: 8px 10px; background: var(--bg-base); border-radius: 4px;">{{ setup.otpauth_url }}</code>
+  </div>
+  <div class="form-group">
+    <div class="form-label">Backup Codes</div>
+    <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px;">
+      {% for code in setup.backup_codes %}
+      <code class="totp-backup-code" style="padding: 4px 8px; background: var(--bg-base); border-radius: 4px;">{{ code }}</code>
+      {% endfor %}
+    </div>
+  </div>
+  <form action="/ui/account/totp/enable" method="POST">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="reauth_token" value="{{ setup.reauth_token }}">
+    <div class="form-group">
+      <label class="form-label" for="totp-enable-code">Authenticator Code</label>
+      <input type="text" id="totp-enable-code" name="code" class="form-input" required autocomplete="one-time-code" inputmode="numeric">
+    </div>
+    <div style="display: flex; justify-content: flex-end;">
+      <button type="submit" class="btn btn-primary">Enable TOTP</button>
+    </div>
+  </form>
+</div>
+{% endif %}
+
 <div class="grid-2">
   <div class="card">
     <div class="card-header">
@@ -140,6 +184,29 @@
 {% if totp_enabled %}
 <div class="card" style="margin-top: 20px; max-width: 720px;">
   <div class="card-header">
+    <div class="card-title">Replace TOTP 2FA</div>
+  </div>
+  <form action="/ui/account/totp/setup" method="POST">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="form-help" style="margin-bottom: 12px;">Re-authenticate with your current password and a current code before enrolling a new authenticator.</div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label" for="replace-totp-password">Current Password</label>
+        <input type="password" id="replace-totp-password" name="password" class="form-input" required autocomplete="current-password">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="replace-totp-code">Current TOTP or Backup Code</label>
+        <input type="text" id="replace-totp-code" name="code" class="form-input" required autocomplete="one-time-code">
+      </div>
+    </div>
+    <div style="display: flex; justify-content: flex-end;">
+      <button type="submit" class="btn btn-primary">Replace TOTP</button>
+    </div>
+  </form>
+</div>
+
+<div class="card" style="margin-top: 20px; max-width: 720px;">
+  <div class="card-header">
     <div class="card-title">Disable TOTP 2FA</div>
   </div>
   <form action="/ui/account/totp/disable" method="POST">
@@ -157,6 +224,23 @@
     </div>
     <div style="display: flex; justify-content: flex-end;">
       <button type="submit" class="btn btn-danger">Disable TOTP</button>
+    </div>
+  </form>
+</div>
+{% else %}
+<div class="card" style="margin-top: 20px; max-width: 720px;">
+  <div class="card-header">
+    <div class="card-title">Enable TOTP 2FA</div>
+  </div>
+  <form action="/ui/account/totp/setup" method="POST">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="form-help" style="margin-bottom: 12px;">Confirm your password to generate an authenticator secret and backup codes. You will verify a code before 2FA becomes active.</div>
+    <div class="form-group">
+      <label class="form-label" for="enable-totp-password">Current Password</label>
+      <input type="password" id="enable-totp-password" name="password" class="form-input" required autocomplete="current-password">
+    </div>
+    <div style="display: flex; justify-content: flex-end;">
+      <button type="submit" class="btn btn-primary">Begin TOTP Setup</button>
     </div>
   </form>
 </div>
