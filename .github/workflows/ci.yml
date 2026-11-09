@@ -188,7 +188,9 @@ jobs:
   contrib:
     name: contrib
     needs: changes
-    if: (needs.changes.outputs.contrib == 'true' || needs.changes.outputs.force == 'true')
+    # `workflows` is included so the release-workflow policy test also runs
+    # when only .github/workflows/** changes.
+    if: (needs.changes.outputs.contrib == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.force == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -201,7 +203,8 @@ jobs:
             contrib/tests/test-installer.sh \
             scripts/verify-release-gate.sh \
             scripts/test-verify-release-gate.sh \
-            scripts/test-release-workflow.sh
+            scripts/test-release-workflow.sh \
+            scripts/test-sqlite-advisory-pin.sh
       - name: Test AdGuard converter against the fixture
         run: |
           python3 -c "import yaml" >/dev/null 2>&1 || python3 -m pip install --quiet --break-system-packages pyyaml
@@ -214,6 +217,7 @@ jobs:
           bash scripts/test-release-attestation-gate.sh
           bash scripts/test-verify-release-gate.sh
           bash scripts/test-release-workflow.sh
+          bash scripts/test-sqlite-advisory-pin.sh
       - name: Compile the CI usage helper
         run: python3 -m py_compile scripts/ci_usage.py
 

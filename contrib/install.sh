@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # sito automated installer for Linux (x86_64, aarch64, armv7)
-set -euo pipefail
+set -Eeuo pipefail
 
 REPO="kubaeror/sito-dns"
 SITO_VERSION="${SITO_VERSION:-latest}"
@@ -9,6 +9,13 @@ COSIGN_VERSION="${COSIGN_VERSION:-v2.6.5}"
 # when a SHA-256-only install is explicitly intended (for example in an offline
 # mirror that cannot publish cosign assets).
 SITO_REQUIRE_SIGNATURE="${SITO_REQUIRE_SIGNATURE:-1}"
+case "${SITO_REQUIRE_SIGNATURE}" in
+    0 | 1) ;;
+    *)
+        echo "Error: SITO_REQUIRE_SIGNATURE must be 0 or 1 (got '${SITO_REQUIRE_SIGNATURE}')." >&2
+        exit 1
+        ;;
+esac
 # Production defaults. Tests override these paths and the systemctl binary so
 # the installer E2E can run unprivileged without touching the real system.
 INSTALL_BIN="${SITO_INSTALL_BIN:-/usr/local/bin/sito}"
@@ -20,6 +27,8 @@ SYSTEMCTL="${SITO_SYSTEMCTL:-systemctl}"
 CONFIG_FILE="${CONFIG_DIR}/config.toml"
 BACKUP_BIN="${INSTALL_BIN}.bak"
 CONFIG_BACKUP="${CONFIG_FILE}.bak"
+SERVICE_STOPPED=0
+INSTALL_COMMITTED=0
 
 UNINSTALL=0
 for arg in "$@"; do
@@ -48,6 +57,16 @@ have_systemctl() {
 run_systemctl() {
     "${SYSTEMCTL}" "$@"
 }
+
+# If an unexpected failure happens after the service was stopped but before a
+# successful install is committed, put the existing service back into service.
+restart_after_failed_install() {
+    if [ "${SERVICE_STOPPED}" -eq 1 ] && [ "${INSTALL_COMMITTED}" -eq 0 ] && have_systemctl; then
+        echo "Warning: install failed after stopping sito; restarting the existing service." >&2
+        run_systemctl restart sito || true
+    fi
+}
+trap restart_after_failed_install ERR
 
 # 1. Root check. SITO_ALLOW_NON_ROOT exists only for the behavioral installer
 # tests; production installs still require root.
@@ -165,6 +184,10 @@ install_binary_atomic() {
         rm -f "${tmp}"
         return 1
     fi
+    # Persist the directory-entry replacement as well as the file contents.
+    if command -v sync >/dev/null 2>&1; then
+        sync -- "${dir}" 2>/dev/null || sync || true
+    fi
 }
 
 # Stops the service (best effort) before the binary is replaced. If systemd is
@@ -173,12 +196,16 @@ install_binary_atomic() {
 stop_service_for_install() {
     if have_systemctl; then
         run_systemctl stop sito >/dev/null 2>&1 || true
+        SERVICE_STOPPED=1
     fi
 }
 
 backup_config_if_present() {
     if [ -f "${CONFIG_FILE}" ]; then
-        cp -pf "${CONFIG_FILE}" "${CONFIG_BACKUP}" || true
+        if ! cp -pf "${CONFIG_FILE}" "${CONFIG_BACKUP}"; then
+            echo "Error: failed to back up ${CONFIG_FILE} to ${CONFIG_BACKUP}." >&2
+            return 1
+        fi
     fi
 }
 
@@ -196,7 +223,10 @@ rollback_install() {
     fi
     if [ -f "${CONFIG_BACKUP}" ]; then
         echo "Restoring previous configuration from ${CONFIG_BACKUP}..." >&2
-        cp -pf "${CONFIG_BACKUP}" "${CONFIG_FILE}" || true
+        if ! cp -pf "${CONFIG_BACKUP}" "${CONFIG_FILE}"; then
+            echo "Error: failed to restore ${CONFIG_FILE} from ${CONFIG_BACKUP}." >&2
+            return 1
+        fi
     fi
     if have_systemctl; then
         run_systemctl restart sito || true
@@ -688,12 +718,16 @@ EOF
         echo " - Check if port ${DNS_PORT} or port ${WEB_PORT} is already in use: ss -tulpn | grep -E ':(${DNS_PORT}|${WEB_PORT})'" >&2
         echo " - Check system logs: journalctl -u sito -e" >&2
         echo " - Restoring previous binary and configuration backup (if present)..." >&2
-        rollback_install
+        if ! rollback_install; then
+            echo "Error: rollback did not complete cleanly; inspect the service manually." >&2
+        fi
         exit 1
     else
         echo "sito service is active and responding."
     fi
 fi
+
+INSTALL_COMMITTED=1
 
 HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")"
 if [ -z "${HOST_IP}" ]; then

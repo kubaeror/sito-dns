@@ -71,7 +71,22 @@ write_fake_systemctl() {
 #!/usr/bin/env bash
 echo "$*" >>"${FAKE_SYSTEMCTL_LOG}"
 case "${1:-}" in
-    is-active) [ "${FAKE_SYSTEMCTL_ACTIVE:-1}" = "1" ] ;;
+    is-active)
+        [ "${FAKE_SYSTEMCTL_ACTIVE:-1}" = "1" ]
+        ;;
+    start)
+        # Simulate the real service by executing the installed binary, so the
+        # rollback test can hold the new inode open and reproduce ETXTBSY.
+        if [ "${FAKE_SYSTEMCTL_START_EXEC:-0}" = "1" ]; then
+            "${FAKE_INSTALL_BIN}" &
+            echo "$!" >"${FAKE_START_PID_FILE}"
+        fi
+        # Simulate a startup migration writing to the live config. Rollback
+        # must restore /etc/sito/config.toml from config.toml.bak.
+        if [ "${FAKE_SYSTEMCTL_START_MUTATES_CONFIG:-0}" = "1" ] && [ -f "${FAKE_CONFIG_FILE}" ]; then
+            printf '\n# mutated by simulated startup migration\n' >>"${FAKE_CONFIG_FILE}"
+        fi
+        ;;
     *) exit 0 ;;
 esac
 SH
@@ -82,6 +97,22 @@ SH
 # when `cp -f` tries to replace a running executable instead of unlinking it.
 # GNU coreutils happens to unlink and succeed; the test injects the strict
 # behaviour so a regression back to `cp -f` over ${INSTALL_BIN} fails.
+write_fake_install() {
+    cat >"${SANDBOX}/bin/install" <<'SH'
+#!/usr/bin/env bash
+if [ "${FAKE_INSTALL_FAIL:-0}" = "1" ]; then
+    case "$*" in
+        *target/release/sito*)
+            echo "install: simulated failure" >&2
+            exit 1
+            ;;
+    esac
+fi
+exec /usr/bin/install "$@"
+SH
+    chmod +x "${SANDBOX}/bin/install"
+}
+
 write_fake_cp() {
     cat >"${SANDBOX}/bin/cp" <<'SH'
 #!/usr/bin/env bash
@@ -114,11 +145,17 @@ reset_sandbox() {
     : >"${SANDBOX}/logs/systemctl.log"
     write_fake_systemctl
     write_fake_cp
+    write_fake_install
 }
 
 run_installer() {
     (
         cd "${SANDBOX}/work"
+        if [ "${SIGNATURE_POLICY+x}" = "x" ]; then
+            export SITO_REQUIRE_SIGNATURE="${SIGNATURE_POLICY}"
+        else
+            unset SITO_REQUIRE_SIGNATURE
+        fi
         PATH="${SANDBOX}/bin:/usr/bin:/bin" \
             SITO_VERSION="${SITO_VERSION_FOR_TEST:-1.9.3}" \
             SITO_INSTALL_LOCAL_BINARY="${SITO_INSTALL_LOCAL_BINARY_FOR_TEST:-1}" \
@@ -129,11 +166,16 @@ run_installer() {
             SITO_CONFIG_DIR="${SANDBOX}/etc/sito" \
             SITO_DATA_DIR="${SANDBOX}/var/lib/sito" \
             SITO_INSTALL_COSIGN="${SITO_INSTALL_COSIGN_FOR_TEST:-0}" \
-            SITO_REQUIRE_SIGNATURE="${SIGNATURE_POLICY:-1}" \
             FAKE_SYSTEMCTL_LOG="${SANDBOX}/logs/systemctl.log" \
             FAKE_SYSTEMCTL_ACTIVE="${FAKE_SYSTEMCTL_ACTIVE:-1}" \
+            FAKE_SYSTEMCTL_START_EXEC="${FAKE_SYSTEMCTL_START_EXEC:-0}" \
+            FAKE_SYSTEMCTL_START_MUTATES_CONFIG="${FAKE_SYSTEMCTL_START_MUTATES_CONFIG:-0}" \
+            FAKE_INSTALL_BIN="${SANDBOX}/install/sito" \
+            FAKE_START_PID_FILE="${SANDBOX}/logs/start.pid" \
+            FAKE_CONFIG_FILE="${SANDBOX}/etc/sito/config.toml" \
             FAKE_CP_EXECUTABLE="${SANDBOX}/install/sito" \
             FAKE_CP_ETXTBSY="${FAKE_CP_ETXTBSY:-0}" \
+            FAKE_INSTALL_FAIL="${FAKE_INSTALL_FAIL:-0}" \
             bash "${INSTALLER}" "$@"
     )
 }
@@ -164,9 +206,11 @@ sleep 0.3
 kill -0 "${HOLD_PID}" 2>/dev/null || fail "could not start the held binary"
 
 write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.4"
+: >"${SANDBOX}/logs/systemctl.log"
 FAKE_CP_ETXTBSY=1 SITO_VERSION_FOR_TEST=1.9.4 run_installer >"${INSTALLER_OUT}" 2>&1 || \
     fail "live upgrade failed while the old binary was executing"
 assert_eq "sito 1.9.4" "$(installed_version)" "upgraded binary version"
+grep -q 'stop sito' "${SANDBOX}/logs/systemctl.log" || fail "upgrade did not stop the service before replacing the binary"
 kill -0 "${HOLD_PID}" 2>/dev/null || fail "upgrade killed the previously executing process"
 kill "${HOLD_PID}" 2>/dev/null || true
 HOLD_PID=""
@@ -182,13 +226,42 @@ printf '[dns]\nport = 0\n[web]\nenabled = false\n' >"${SANDBOX}/etc/sito/config.
 cp "${SANDBOX}/etc/sito/config.toml" "${TMP}/config.before"
 
 write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.4"
-if FAKE_SYSTEMCTL_ACTIVE=0 SITO_VERSION_FOR_TEST=1.9.4 run_installer >"${INSTALLER_OUT}" 2>&1; then
+if FAKE_SYSTEMCTL_ACTIVE=0 \
+    FAKE_SYSTEMCTL_START_EXEC=1 \
+    FAKE_SYSTEMCTL_START_MUTATES_CONFIG=1 \
+    FAKE_CP_ETXTBSY=1 \
+    SITO_VERSION_FOR_TEST=1.9.4 run_installer >"${INSTALLER_OUT}" 2>&1; then
     fail "installer succeeded despite a failed health check"
 fi
 
+# The fake `systemctl start` executed the new binary and appended a migration
+# marker to the live config; the rollback must replace both despite ETXTBSY.
+assert_file_exists "${SANDBOX}/logs/start.pid"
+HOLD_PID="$(cat "${SANDBOX}/logs/start.pid")"
+kill -0 "${HOLD_PID}" 2>/dev/null || fail "fake systemctl start did not hold the new binary open"
 assert_eq "sito 1.9.3" "$(installed_version)" "rollback restored the previous binary"
 assert_file_exists "${SANDBOX}/install/sito.bak"
+assert_file_exists "${SANDBOX}/etc/sito/config.toml.bak"
 cmp -s "${TMP}/config.before" "${SANDBOX}/etc/sito/config.toml" || fail "rollback did not restore the config backup"
+if grep -q 'mutated by simulated startup migration' "${SANDBOX}/etc/sito/config.toml"; then
+    fail "rollback left the startup-migration marker in the live config"
+fi
+kill "${HOLD_PID}" 2>/dev/null || true
+HOLD_PID=""
+
+# ---------------------------------------------------------------------------
+# An unexpected install failure after stop restarts the existing service
+# ---------------------------------------------------------------------------
+reset_sandbox
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.3"
+SITO_VERSION_FOR_TEST=1.9.3 run_installer >"${INSTALLER_OUT}" 2>&1 || fail "trap setup install failed"
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.4"
+: >"${SANDBOX}/logs/systemctl.log"
+if FAKE_INSTALL_FAIL=1 SITO_VERSION_FOR_TEST=1.9.4 run_installer >"${INSTALLER_OUT}" 2>&1; then
+    fail "installer succeeded despite a simulated atomic-install failure"
+fi
+grep -q 'restart sito' "${SANDBOX}/logs/systemctl.log" || fail "failed install did not restart the existing service"
+assert_eq "sito 1.9.3" "$(installed_version)" "failed install left the previous binary in place"
 
 # ---------------------------------------------------------------------------
 # Uninstall keeps config and data
@@ -308,6 +381,41 @@ if FAKE_CURL_MISSING_SIG=1 SIGNATURE_POLICY=1 run_installer >"${INSTALLER_OUT}" 
     fail "installer accepted a required signature with missing .sig/.pem assets"
 fi
 grep -qi 'signature' "${INSTALLER_OUT}" || fail "missing-signature failure did not mention signatures"
+assert_file_missing "${SANDBOX}/install/sito"
+
+# The default is required even when SITO_REQUIRE_SIGNATURE is not set at all.
+reset_sandbox
+make_release_assets
+write_fake_curl
+write_fake_cosign
+release_install_env
+if FAKE_CURL_MISSING_SIG=1 run_installer >"${INSTALLER_OUT}" 2>&1; then
+    fail "unset SITO_REQUIRE_SIGNATURE did not default to required"
+fi
+assert_file_missing "${SANDBOX}/install/sito"
+
+# A missing certificate (.pem) with a present .sig must also fail closed.
+reset_sandbox
+make_release_assets
+write_fake_curl
+write_fake_cosign
+release_install_env
+if FAKE_CURL_MISSING_PEM=1 SIGNATURE_POLICY=1 run_installer >"${INSTALLER_OUT}" 2>&1; then
+    fail "installer accepted a required signature with missing .pem"
+fi
+grep -qi 'signature' "${INSTALLER_OUT}" || fail "missing-PEM failure did not mention signatures"
+assert_file_missing "${SANDBOX}/install/sito"
+
+# Invalid policy values are rejected instead of being treated as truthy.
+reset_sandbox
+make_release_assets
+write_fake_curl
+write_fake_cosign
+release_install_env
+if SIGNATURE_POLICY=yes run_installer >"${INSTALLER_OUT}" 2>&1; then
+    fail "invalid SITO_REQUIRE_SIGNATURE value was accepted"
+fi
+grep -qi 'must be 0 or 1' "${INSTALLER_OUT}" || fail "invalid signature policy did not report the accepted values"
 assert_file_missing "${SANDBOX}/install/sito"
 
 # Required by default: signed release with cosign succeeds.

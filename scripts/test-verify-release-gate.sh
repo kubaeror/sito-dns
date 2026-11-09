@@ -21,8 +21,17 @@ printf 'base\n' >"${repo}/VERSION"
 git -C "${repo}" add VERSION
 git -C "${repo}" commit -q -m base
 git -C "${repo}" branch -M release/1.9.x
-git -C "${repo}" branch main release/1.9.x
 git -C "${repo}" tag v1.9.4
+# A different branch that does contain the tag commit, used to prove the
+# RELEASE_REQUIRED_BRANCH override is actually consulted.
+git -C "${repo}" branch stable release/1.9.x
+# A different branch that does not contain the tag commit.
+git -C "${repo}" checkout -q --orphan main
+git -C "${repo}" rm -rf . >/dev/null 2>&1 || true
+printf 'main-only\n' >"${repo}/MAIN"
+git -C "${repo}" add MAIN
+git -C "${repo}" commit -q -m main-only
+git -C "${repo}" checkout -q release/1.9.x
 
 # A tag from a side branch that is not an ancestor of the release branch.
 git -C "${repo}" checkout -q -b side
@@ -126,8 +135,12 @@ case_tag="v1.9.4-side"; case_checks="${green_checks}"; case_status="${green_stat
 check_case "rejects a tag from a non-required branch" 1
 
 case_tag="v1.9.4"; case_checks="${green_checks}"; case_status="${green_status}"
-case_branch="release/1.9.x"
-check_case "accepts an explicit branch override" 0
+case_branch="stable"
+check_case "accepts a different branch override that contains the tag" 0
+
+case_tag="v1.9.4"; case_checks="${green_checks}"; case_status="${green_status}"
+case_branch="main"
+check_case "rejects a different branch override that does not contain the tag" 1
 unset case_branch
 
 echo "${cases} cases, ${failures} failure(s)"

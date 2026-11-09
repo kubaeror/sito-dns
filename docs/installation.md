@@ -239,8 +239,9 @@ sudo systemctl enable --now sito
 The hardened unit runs as the unprivileged `sito` user with
 `ProtectSystem=strict`, and `/usr/local/bin/sito` is root-owned. The in-process
 self-update therefore cannot replace its own binary while the service is
-running (the write returns `EACCES`). Apply updates as root with the service
-stopped:
+running (the write returns `EACCES`). The built-in updater must be run as root
+with the service stopped; the installer performs the stop/replace/start
+sequence itself:
 
 ```bash
 # Option A: built-in updater
@@ -255,7 +256,7 @@ sudo SITO_VERSION=1.9.3 bash contrib/install.sh
 ```
 
 Without `--config`, the CLI prefers an existing `/etc/sito/config.toml` and
-otherwise uses `./config.toml`, so the commands above work from `/root`
+otherwise uses `./config.toml`, so the updater commands above work from `/root`
 after the service is stopped. Pass `sito update --config <path>` (or
 `sito --config <path> update`) when the configuration lives somewhere else. If
 neither location exists, `sito update` refuses to run instead of guessing the

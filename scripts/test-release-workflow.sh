@@ -21,26 +21,78 @@ expect_match() {
     fi
 }
 
+expect_absent() {
+    local file="$1" pattern="$2" message="$3"
+    if grep -Eq -- "${pattern}" "${file}"; then
+        echo "not ok - ${message}" >&2
+        failures=$((failures + 1))
+    else
+        echo "ok - ${message}"
+    fi
+}
+
+# Prints one top-level job body so a policy check cannot be satisfied by an
+# unrelated job elsewhere in the same workflow.
+job_section() {
+    local job="$1" file="$2"
+    awk -v header="  ${job}:" '
+        $0 == header { in_job = 1; next }
+        in_job && /^  [A-Za-z0-9_-]+:$/ { exit }
+        in_job { print }
+    ' "${file}"
+}
+
+expect_job_match() {
+    local file="$1" job="$2" pattern="$3" message="$4"
+    # No `grep -q`: under pipefail an early exit can SIGPIPE the producer and
+    # turn a match into a false failure.
+    if ! job_section "${job}" "${file}" | grep -E -- "${pattern}" >/dev/null; then
+        echo "not ok - ${message}" >&2
+        failures=$((failures + 1))
+    else
+        echo "ok - ${message}"
+    fi
+}
+
+expect_job_absent() {
+    local file="$1" job="$2" pattern="$3" message="$4"
+    if job_section "${job}" "${file}" | grep -E -- "${pattern}" >/dev/null; then
+        echo "not ok - ${message}" >&2
+        failures=$((failures + 1))
+    else
+        echo "ok - ${message}"
+    fi
+}
+
 expect_match "${RELEASE}" '^  release-gate:' "release workflow has a release-gate job"
-expect_match "${RELEASE}" 'scripts/verify-release-gate\.sh' "release workflow invokes the release gate"
+expect_job_match "${RELEASE}" "release-gate" 'scripts/verify-release-gate\.sh' "release-gate job invokes the gate script"
+expect_job_match "${RELEASE}" "release-gate" 'checks: read' "release-gate job can read check runs"
+expect_job_match "${RELEASE}" "release-gate" 'statuses: read' "release-gate job can read legacy statuses"
+expect_job_absent "${RELEASE}" "release-gate" 'continue-on-error' "release-gate cannot continue on error"
 expect_match "${RELEASE}" 'needs: \[verify-tag, release-gate\]' "build job depends on the release gate"
 expect_match "${RELEASE}" 'needs: \[verify-tag, release-gate, build-binaries\]' "publish job depends on the release gate"
 expect_match "${RELEASE}" 'needs: \[verify-tag, release-gate, build-binaries, sbom-and-release, artifact-e2e\]' "image job depends on the release gate"
-expect_match "${RELEASE}" 'aquasec/trivy:[0-9.]+@sha256:[0-9a-f]{64}' "image scanner is pinned by digest"
-expect_match "${RELEASE}" 'severity HIGH,CRITICAL' "image scan gates on HIGH/CRITICAL"
-expect_match "${RELEASE}" 'exit-code 1' "image scan fails the release"
-expect_match "${RELEASE}" 'cosign sign --yes' "image digest is signed with cosign"
-expect_match "${RELEASE}" 'cosign verify' "image signature is verified"
-expect_match "${RELEASE}" 'provenance: true' "image provenance is retained"
-expect_match "${RELEASE}" 'sbom: true' "image SBOM attestation is retained"
+
+expect_job_match "${RELEASE}" "docker-build-push" 'aquasec/trivy:[0-9.]+@sha256:[0-9a-f]{64}' "image scanner is pinned by digest"
+expect_job_match "${RELEASE}" "docker-build-push" 'severity HIGH,CRITICAL' "image scan gates on HIGH/CRITICAL"
+expect_job_match "${RELEASE}" "docker-build-push" 'exit-code 1' "image scan fails the release"
+expect_job_match "${RELEASE}" "docker-build-push" 'cosign sign --yes' "image digest is signed with cosign"
+expect_job_match "${RELEASE}" "docker-build-push" 'cosign verify' "image signature is verified"
+expect_job_match "${RELEASE}" "docker-build-push" 'provenance: true' "image provenance is retained"
+expect_job_match "${RELEASE}" "docker-build-push" 'sbom: true' "image SBOM attestation is retained"
+expect_job_match "${RELEASE}" "docker-build-push" 'id-token: write' "image signing can use GitHub OIDC"
+expect_job_absent "${RELEASE}" "docker-build-push" 'continue-on-error' "image scanning/signing cannot continue on error"
 
 expect_match "${CI}" 'branches: \[main, release/1\.9\.x\]' "CI runs on the release branch"
 expect_match "${SECURITY}" 'branches: \[main, release/1\.9\.x\]' "security runs on the release branch"
 expect_match "${CI}" 'bash contrib/tests/test-installer\.sh' "CI runs the installer E2E"
+expect_match "${CI}" "needs.changes.outputs.workflows == 'true'" "contrib job runs when workflows change"
 
 expect_match "${INSTALLER}" 'SITO_REQUIRE_SIGNATURE:-1' "release signatures are required by default"
+expect_match "${INSTALLER}" 'must be 0 or 1' "signature policy values are validated"
 expect_match "${INSTALLER}" 'install_binary_atomic "\$\{TMP_DIR\}/sito"' "release binary uses the atomic installer"
 expect_match "${INSTALLER}" 'install_binary_atomic "target/release/sito"' "local binary uses the atomic installer"
+expect_absent "${INSTALLER}" '^[[:space:]]*cp[[:space:]].*"\$\{INSTALL_BIN\}"[[:space:]]*$' "installer never copies over the live binary"
 
 # Every third-party action must be pinned to a full commit SHA. Local reusable
 # workflows (`uses: ./...`) are exempt.
