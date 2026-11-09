@@ -1139,6 +1139,16 @@ pub struct UpstreamConfig {
     pub probe_domain: String,
     #[serde(default = "default_upstream_pool_size")]
     pub pool_size: usize,
+    /// Allow hostname-configured upstreams to resolve to private, loopback,
+    /// link-local or otherwise reserved addresses.
+    ///
+    /// Disabled by default to prevent a compromised/spoofed bootstrap answer
+    /// from redirecting an upstream into the local network or a cloud metadata
+    /// endpoint. IP literals in `servers` are always accepted because they are
+    /// an explicit operator choice. Set this to `true` only when an internal
+    /// resolver is intentionally reached via a hostname.
+    #[serde(default)]
+    pub allow_private_targets: bool,
     /// EDNS Client Subnet (ECS) forwarding policy.
     ///
     /// `"off"` (default) strips client ECS options, so upstream resolvers only
@@ -1184,6 +1194,7 @@ impl Default for UpstreamConfig {
             timeout_ms: default_upstream_timeout_ms(),
             probe_domain: default_upstream_probe_domain(),
             pool_size: default_upstream_pool_size(),
+            allow_private_targets: false,
             ecs: UpstreamEcs::default(),
             per_domain: Vec::new(),
         }
@@ -2068,6 +2079,21 @@ key = "/path/to/key.pem"
         ))
         .expect("a positive compile budget must be accepted");
         assert_eq!(custom.filtering.regex_compile_budget_ms, Some(250));
+    }
+
+    /// P1-25: private bootstrap targets are opt-in and default to false.
+    #[test]
+    fn test_upstream_allow_private_targets_defaults_false_and_parses() {
+        let default = Config::from_toml_str(TEST_BASE).expect("minimal config must parse");
+        assert!(
+            !default.upstream.allow_private_targets,
+            "private bootstrap targets must be denied by default"
+        );
+
+        let opted_in =
+            Config::from_toml_str("config_version = 1\n[upstream]\nallow_private_targets = true\n")
+                .expect("the additive opt-in must parse");
+        assert!(opted_in.upstream.allow_private_targets);
     }
 
     /// Audit 6 / WP-6.5: an empty or malformed probe domain made every

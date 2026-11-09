@@ -19,6 +19,31 @@ use sito_proto::{Message, decode_message, encode_message};
 /// Maximum accepted DoH response body (DNS-over-TCP size ceiling).
 const MAX_DOH_RESPONSE_BYTES: usize = 65_535;
 
+/// Parses and normalizes a DoH URL.
+///
+/// A bare `https://host` (or `https://host/`) is completed to
+/// `https://host/dns-query`. Without this the manager's parsed default path
+/// would be discarded and POSTs would be sent to `/`.
+fn normalize_doh_url(url: &str) -> Result<reqwest::Url, UpstreamError> {
+    let mut parsed = reqwest::Url::parse(url)
+        .map_err(|e| UpstreamError::BadResponse(format!("invalid DoH URL '{url}': {e}")))?;
+    if parsed.scheme() != "https" {
+        return Err(UpstreamError::BadResponse(format!(
+            "DoH upstream URL must use https:// (got '{}')",
+            parsed.scheme()
+        )));
+    }
+    if parsed.host_str().is_none() {
+        return Err(UpstreamError::BadResponse(format!(
+            "DoH URL '{url}' has no host"
+        )));
+    }
+    if parsed.path().is_empty() || parsed.path() == "/" {
+        parsed.set_path("/dns-query");
+    }
+    Ok(parsed)
+}
+
 /// A DNS-over-HTTPS upstream (RFC 8484).
 pub struct HttpsUpstream {
     url: reqwest::Url,
@@ -41,14 +66,7 @@ impl HttpsUpstream {
         resolved_ips: &[IpAddr],
         timeout_duration: Duration,
     ) -> Result<Self, UpstreamError> {
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|e| UpstreamError::BadResponse(format!("invalid DoH URL '{url}': {e}")))?;
-        if parsed.scheme() != "https" {
-            return Err(UpstreamError::BadResponse(format!(
-                "DoH upstream URL must use https:// (got '{}')",
-                parsed.scheme()
-            )));
-        }
+        let parsed = normalize_doh_url(url)?;
         let host = parsed
             .host_str()
             .ok_or_else(|| UpstreamError::BadResponse(format!("DoH URL '{url}' has no host")))?
@@ -61,6 +79,9 @@ impl HttpsUpstream {
             // Never follow redirects: a malicious/compromised upstream must not
             // be able to exfiltrate DNS queries to arbitrary hosts.
             .redirect(reqwest::redirect::Policy::none())
+            // Do not use ambient HTTP(S)_PROXY settings: a system proxy would
+            // bypass `resolve_to_addrs` pinning and could see every DNS query.
+            .no_proxy()
             .pool_max_idle_per_host(4);
         if !resolved_ips.is_empty() {
             let addrs: Vec<SocketAddr> = resolved_ips
@@ -375,6 +396,16 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[tokio::test]
+    async fn test_doh_bare_host_uses_default_dns_query_path() {
+        let upstream = HttpsUpstream::new("https://dns.example", &[], Duration::from_secs(1))
+            .expect("bare DoH URL must be accepted");
+        assert!(
+            format!("{upstream:?}").contains("https://dns.example/dns-query"),
+            "pathless DoH targets must use /dns-query: {upstream:?}"
+        );
     }
 
     #[tokio::test]

@@ -63,6 +63,9 @@ strategy = "failover"
 timeout_ms = 5000
 probe_domain = "example.com"
 pool_size = 4
+# Hostname-configured upstreams may not resolve to private/reserved addresses
+# unless this is true. IP literals are always accepted.
+allow_private_targets = false
 
 [filtering]
 enabled = true

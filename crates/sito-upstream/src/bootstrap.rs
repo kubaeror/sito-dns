@@ -11,6 +11,7 @@ use tracing::{debug, warn};
 use crate::plain::PlainUpstream;
 use crate::upstream::Upstream;
 use sito_core::error::UpstreamError;
+use sito_core::ssrf::is_denied_target_ip;
 use sito_proto::rdata::{A, AAAA};
 use sito_proto::{Message, MessageType, Name, OpCode, Query, RData, RecordType};
 
@@ -28,6 +29,7 @@ pub struct BootstrapResolver {
     bootstrap_ips: Vec<IpAddr>,
     bootstrap_port: u16,
     query_timeout: Duration,
+    allow_private_targets: bool,
     cache: Arc<RwLock<HashMap<String, CachedEntry>>>,
     inflight: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
@@ -39,6 +41,7 @@ impl BootstrapResolver {
             bootstrap_ips,
             bootstrap_port: 53,
             query_timeout,
+            allow_private_targets: false,
             cache: Arc::new(RwLock::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -51,16 +54,50 @@ impl BootstrapResolver {
         self
     }
 
+    /// Allow bootstrap-resolved hostnames to point at private, loopback,
+    /// link-local or otherwise reserved addresses.
+    ///
+    /// Disabled by default: a compromised or spoofed bootstrap answer must not
+    /// be able to redirect a hostname-configured upstream into the local
+    /// network. IP literals in the upstream configuration remain an explicit
+    /// operator choice and bypass this check.
+    #[must_use]
+    pub fn with_allow_private_targets(mut self, allow: bool) -> Self {
+        self.allow_private_targets = allow;
+        self
+    }
+
     /// Resolve a hostname or return the IP directly if it's already an IP literal.
     pub async fn resolve_hostname(&self, hostname: &str) -> Result<Vec<IpAddr>, UpstreamError> {
+        self.resolve_hostname_inner(hostname, false).await
+    }
+
+    /// Resolve a hostname while bypassing the bootstrap cache.
+    ///
+    /// Used when every known address for an upstream has failed: the cached
+    /// entry may still be unexpired (minimum TTL 300s) even though the records
+    /// have rotated. The fresh answer is cached again on success.
+    pub async fn resolve_hostname_forced(
+        &self,
+        hostname: &str,
+    ) -> Result<Vec<IpAddr>, UpstreamError> {
+        self.resolve_hostname_inner(hostname, true).await
+    }
+
+    async fn resolve_hostname_inner(
+        &self,
+        hostname: &str,
+        force_refresh: bool,
+    ) -> Result<Vec<IpAddr>, UpstreamError> {
         let trimmed = hostname.trim();
 
-        // Check if hostname is already an IP address
+        // Check if hostname is already an IP address. A literal is an explicit
+        // operator choice, so it is not subject to the SSRF denylist.
         if let Ok(ip) = IpAddr::from_str(trimmed) {
             return Ok(vec![ip]);
         }
 
-        if let Some(ips) = self.cached(trimmed).await {
+        if !force_refresh && let Some(ips) = self.cached(trimmed).await {
             debug!("Bootstrap cache hit for '{}': {:?}", trimmed, ips);
             return Ok(ips);
         }
@@ -77,8 +114,10 @@ impl BootstrapResolver {
         };
         let guard = host_lock.lock().await;
 
-        // Another task may have completed the resolution while we waited.
-        if let Some(ips) = self.cached(trimmed).await {
+        // Another task may have completed the resolution while we waited. A
+        // forced refresh must not accept this cache hit, otherwise a failed
+        // candidate set cannot pick up rotated records.
+        if !force_refresh && let Some(ips) = self.cached(trimmed).await {
             drop(guard);
             self.finish_inflight(trimmed, &host_lock).await;
             return Ok(ips);
@@ -123,6 +162,7 @@ impl BootstrapResolver {
         })?;
 
         let mut errors = Vec::new();
+        let mut denied_any = false;
 
         // Query bootstrap resolvers
         for &ip in &self.bootstrap_ips {
@@ -132,10 +172,12 @@ impl BootstrapResolver {
             // An IPv6-only upstream host has no A record, so ask for both
             // families concurrently and accept either.
             let mut query_a = Message::new(rand::random(), MessageType::Query, OpCode::Query);
+            query_a.metadata.recursion_desired = true;
             query_a
                 .queries
                 .push(Query::query(qname.clone(), RecordType::A));
             let mut query_aaaa = Message::new(rand::random(), MessageType::Query, OpCode::Query);
+            query_aaaa.metadata.recursion_desired = true;
             query_aaaa
                 .queries
                 .push(Query::query(qname.clone(), RecordType::AAAA));
@@ -176,6 +218,22 @@ impl BootstrapResolver {
                 }
             }
 
+            // P1-25: a hostname-resolved upstream must not be redirected into
+            // loopback/private/link-local/metadata space by a compromised or
+            // spoofed bootstrap answer. IP literals remain an explicit
+            // operator choice (handled before resolution).
+            if !self.allow_private_targets {
+                let before = resolved_ips.len();
+                resolved_ips.retain(|candidate| !is_denied_target_ip(*candidate));
+                if resolved_ips.len() != before {
+                    denied_any = true;
+                    warn!(
+                        "Bootstrap answer for '{}' via {} included denied private/reserved addresses; ignoring them",
+                        trimmed, ip
+                    );
+                }
+            }
+
             if !resolved_ips.is_empty() {
                 resolved_ips.sort();
                 resolved_ips.dedup();
@@ -194,6 +252,13 @@ impl BootstrapResolver {
                 );
                 return Ok(resolved_ips);
             }
+        }
+
+        if denied_any {
+            return Err(UpstreamError::BadResponse(format!(
+                "Bootstrap resolution for '{trimmed}' returned only private/reserved addresses; \
+                 refusing to use them (set upstream.allow_private_targets = true to opt in)"
+            )));
         }
 
         Err(UpstreamError::BadResponse(format!(

@@ -606,7 +606,8 @@ async fn apply_inner(
     let bootstrap = BootstrapResolver::new(
         cfg.upstream.bootstrap.clone(),
         Duration::from_millis(cfg.upstream.timeout_ms),
-    );
+    )
+    .with_allow_private_targets(cfg.upstream.allow_private_targets);
     ctx.upstream
         .reload(&cfg.upstream, &bootstrap)
         .await

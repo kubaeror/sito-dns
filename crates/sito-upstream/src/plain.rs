@@ -134,30 +134,51 @@ impl Upstream for PlainUpstream {
         // (512..4096) instead of a fixed 4096.
         let buffer_size = udp_recv_buffer_size(msg);
         let mut buf = vec![0u8; buffer_size];
-        let recv_res = timeout_at(deadline, socket.recv(&mut buf)).await;
-        let bytes_read = match recv_res {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(classify_io_error(&e)),
-            Err(_) => return Err(UpstreamError::Timeout),
-        };
+        // P2-9: keep receiving until the deadline. An off-path attacker can
+        // inject malformed or mismatched datagrams; those must be ignored rather
+        // than aborting a query whose genuine response is still in flight.
+        let response = loop {
+            let bytes_read = match timeout_at(deadline, socket.recv(&mut buf)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(classify_io_error(&e)),
+                Err(_) => return Err(UpstreamError::Timeout),
+            };
 
-        let mut response = match decode_message(&buf[..bytes_read]) {
-            Ok(response) => response,
-            // A full buffer combined with a decode failure usually means the
-            // datagram did not fit; retry over TCP before giving up.
-            Err(e) if bytes_read == buf.len() => {
-                debug!(
-                    "Upstream {} response may have been truncated at {} bytes ({}); retrying over TCP",
-                    self.server_addr, buffer_size, e
-                );
-                return self
-                    .resolve_tcp(&wire_msg, &encoded, deadline, original_id)
-                    .await;
+            let mut candidate = match decode_message(&buf[..bytes_read]) {
+                Ok(response) => response,
+                // A full buffer combined with a decode failure usually means
+                // the datagram did not fit; retry over TCP before giving up.
+                Err(e) if bytes_read == buf.len() => {
+                    debug!(
+                        "Upstream {} response may have been truncated at {} bytes ({}); retrying over TCP",
+                        self.server_addr, buffer_size, e
+                    );
+                    return self
+                        .resolve_tcp(&wire_msg, &encoded, deadline, original_id)
+                        .await;
+                }
+                Err(e) => {
+                    trace!(
+                        "Ignoring malformed datagram from upstream {}: {}",
+                        self.server_addr, e
+                    );
+                    continue;
+                }
+            };
+
+            match validate_response(&wire_msg, &candidate) {
+                Ok(()) => {
+                    candidate.metadata.id = original_id;
+                    break candidate;
+                }
+                Err(e) => {
+                    trace!(
+                        "Ignoring mismatched datagram from upstream {}: {}",
+                        self.server_addr, e
+                    );
+                }
             }
-            Err(e) => return Err(UpstreamError::BadResponse(e.to_string())),
         };
-        validate_response(&wire_msg, &response)?;
-        response.metadata.id = original_id;
 
         // Fallback to TCP if UDP response was truncated
         if response.metadata.truncation {
@@ -171,8 +192,8 @@ impl Upstream for PlainUpstream {
         }
 
         trace!(
-            "Received {} bytes from upstream {} over UDP",
-            bytes_read, self.server_addr
+            "Received response from upstream {} over UDP",
+            self.server_addr
         );
         Ok(response)
     }
@@ -192,8 +213,9 @@ pub fn classify_io_error(err: &std::io::Error) -> UpstreamError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sito_proto::rdata::A;
     use sito_proto::set_edns_payload_size;
-    use sito_proto::{MessageType, OpCode, Query, RecordType, ResponseCode};
+    use sito_proto::{MessageType, OpCode, Query, RData, Record, RecordType, ResponseCode};
     use std::str::FromStr;
 
     fn make_query() -> Message {
@@ -228,6 +250,58 @@ mod tests {
             udp_recv_buffer_size(&query),
             MAX_UDP_BUFFER_SIZE,
             "buffer must not exceed the UDP ceiling"
+        );
+    }
+
+    /// P2-9: structurally invalid and mismatched datagrams must be ignored
+    /// until the deadline, not abort the query.
+    #[tokio::test]
+    async fn test_plain_udp_ignores_malformed_and_mismatched_datagrams() {
+        use std::time::Duration;
+
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let query = decode_message(&buf[..n]).unwrap();
+
+            // 1. Garbage that is not a DNS message.
+            server.send_to(b"not a dns message", peer).await.unwrap();
+
+            // 2. Structurally valid but answering a different ID/question.
+            let mut spoofed = Message::response(query.metadata.id ^ 0xffff, query.metadata.op_code);
+            spoofed.queries = query.queries.clone();
+            spoofed.metadata.response_code = ResponseCode::NoError;
+            let spoofed = encode_message(&spoofed).unwrap();
+            server.send_to(&spoofed, peer).await.unwrap();
+
+            // 3. The genuine response.
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::NoError;
+            resp.answers.push(Record::from_rdata(
+                query.queries[0].name().clone(),
+                300,
+                RData::A(A(std::net::Ipv4Addr::new(1, 2, 3, 4))),
+            ));
+            let bytes = encode_message(&resp).unwrap();
+            server.send_to(&bytes, peer).await.unwrap();
+        });
+
+        let upstream = PlainUpstream::new(addr, Duration::from_secs(2));
+        let response = upstream
+            .resolve(&make_query())
+            .await
+            .expect("valid response after junk must be accepted");
+        server_task.await.unwrap();
+
+        assert_eq!(response.metadata.id, 7);
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(
+            response.answers[0].data,
+            RData::A(A(std::net::Ipv4Addr::new(1, 2, 3, 4)))
         );
     }
 

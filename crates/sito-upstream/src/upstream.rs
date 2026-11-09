@@ -63,13 +63,19 @@ pub fn validate_response(query: &Message, response: &Message) -> Result<(), Upst
 ///
 /// `SERVFAIL` (RFC 1035 §4.1.1) means the server failed to process the query,
 /// `REFUSED` means a policy/ACL rejection and `NOTIMP` means the server does
-/// not implement the requested operation. In all three cases the upstream
-/// answered but is not usable for this query, while `NOERROR`/`NXDOMAIN` (and
-/// DNSSEC-delegation codes such as `NOTAUTH`) are real answers.
+/// not implement the requested operation. `FORMERR` and `BADVERS` are also
+/// retryable: they usually indicate the upstream cannot parse the EDNS OPT
+/// record, so the manager retries once without EDNS before failing over. While
+/// `NOERROR`/`NXDOMAIN` (and DNSSEC-delegation codes such as `NOTAUTH`) are real
+/// answers.
 pub fn is_retryable_response(response: &Message) -> bool {
     matches!(
         response.metadata.response_code,
-        ResponseCode::ServFail | ResponseCode::Refused | ResponseCode::NotImp
+        ResponseCode::ServFail
+            | ResponseCode::Refused
+            | ResponseCode::NotImp
+            | ResponseCode::FormErr
+            | ResponseCode::BADVERS
     )
 }
 
@@ -125,9 +131,10 @@ mod tests {
             (ResponseCode::ServFail, true),
             (ResponseCode::Refused, true),
             (ResponseCode::NotImp, true),
+            (ResponseCode::FormErr, true),
+            (ResponseCode::BADVERS, true),
             (ResponseCode::NoError, false),
             (ResponseCode::NXDomain, false),
-            (ResponseCode::FormErr, false),
         ] {
             let mut response = Message::response(0x1234, OpCode::Query);
             response.queries = query.queries.clone();

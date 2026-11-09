@@ -92,6 +92,40 @@ fn retryable_status_error(code: ResponseCode) -> UpstreamError {
     UpstreamError::BadResponse(format!("upstream returned {code}, treated as retryable"))
 }
 
+/// Whether a reply indicates the upstream could not process the query's EDNS
+/// OPT record (FORMERR/BADVERS). These are retried once without EDNS before the
+/// candidate is considered failed.
+fn is_edns_failure(response: &Message) -> bool {
+    matches!(
+        response.metadata.response_code,
+        ResponseCode::FormErr | ResponseCode::BADVERS
+    )
+}
+
+/// Send one query to a candidate, retrying once without EDNS when the reply is
+/// FORMERR/BADVERS.
+///
+/// Some recursive resolvers refuse the OPT record entirely (especially older or
+/// middlebox-fronted servers). Dropping EDNS for the retry keeps the upstream
+/// usable while still allowing us to fail over if it rejects the bare query
+/// too.
+async fn resolve_with_edns_fallback(
+    upstream: &dyn Upstream,
+    msg: &Message,
+) -> Result<Message, UpstreamError> {
+    let response = upstream.resolve(msg).await?;
+    if msg.edns.is_some() && is_edns_failure(&response) {
+        debug!(
+            "Upstream returned {} for an EDNS query; retrying without EDNS",
+            response.metadata.response_code
+        );
+        let mut fallback = msg.clone();
+        fallback.edns = None;
+        return upstream.resolve(&fallback).await;
+    }
+    Ok(response)
+}
+
 /// Overall deadline for one logical resolve. Retries share this budget so a
 /// failover chain cannot take `timeout_duration × candidates`.
 fn resolve_deadline(timeout_duration: Duration) -> Instant {
@@ -243,13 +277,20 @@ impl FailoverUpstream {
             last_resolve: Mutex::new(Instant::now()),
             re_resolve_interval,
         };
-        let candidates = upstream.build_candidates().await?;
+        let candidates = upstream.build_candidates(false).await?;
         *upstream.candidates.write().await = candidates;
         Ok(upstream)
     }
 
-    async fn build_candidates(&self) -> Result<Vec<Arc<dyn Upstream>>, UpstreamError> {
-        let ips = self.bootstrap.resolve_hostname(&self.host).await?;
+    async fn build_candidates(
+        &self,
+        force_refresh: bool,
+    ) -> Result<Vec<Arc<dyn Upstream>>, UpstreamError> {
+        let ips = if force_refresh {
+            self.bootstrap.resolve_hostname_forced(&self.host).await?
+        } else {
+            self.bootstrap.resolve_hostname(&self.host).await?
+        };
         if ips.is_empty() {
             return Err(UpstreamError::BadResponse(format!(
                 "no IP addresses resolved for '{}'",
@@ -296,15 +337,47 @@ impl FailoverUpstream {
         if last.elapsed() < self.re_resolve_interval {
             return false;
         }
-        *last = Instant::now();
-        match self.build_candidates().await {
+        match self.build_candidates(false).await {
             Ok(candidates) => {
                 *self.candidates.write().await = candidates;
+                // Only advance the timestamp on success. A failed lookup must
+                // not delay the next attempt for a full interval.
+                *last = Instant::now();
                 debug!("Re-resolved upstream '{}' candidate addresses", self.host);
                 true
             }
             Err(e) => {
                 debug!("Failed to re-resolve upstream '{}': {}", self.host, e);
+                false
+            }
+        }
+    }
+
+    /// Force a cache-bypassing bootstrap refresh after every known candidate
+    /// failed. Returns `true` when the candidate set was replaced.
+    ///
+    /// This ignores both the periodic interval and the bootstrap resolver's
+    /// positive cache (minimum TTL 300s), so rotated records can be picked up
+    /// as soon as the old addresses stop answering.
+    async fn force_re_resolve(&self) -> bool {
+        // A literal address cannot rotate; retrying the same candidate after a
+        // failure only doubles load and latency.
+        if self.host.parse::<std::net::IpAddr>().is_ok() {
+            return false;
+        }
+        let mut last = self.last_resolve.lock().await;
+        match self.build_candidates(true).await {
+            Ok(candidates) => {
+                *self.candidates.write().await = candidates;
+                *last = Instant::now();
+                debug!(
+                    "Force-refreshed upstream '{}' candidate addresses",
+                    self.host
+                );
+                true
+            }
+            Err(e) => {
+                debug!("Failed to force-refresh upstream '{}': {}", self.host, e);
                 false
             }
         }
@@ -329,7 +402,7 @@ impl FailoverUpstream {
             };
             remaining -= 1;
 
-            match timeout(budget, candidate.resolve(msg)).await {
+            match timeout(budget, resolve_with_edns_fallback(candidate.as_ref(), msg)).await {
                 Ok(Ok(response)) if !is_retryable_response(&response) => return Ok(response),
                 Ok(Ok(response)) => {
                     debug!(
@@ -353,19 +426,33 @@ impl FailoverUpstream {
 
     async fn resolve_candidates(&self, msg: &Message) -> Result<Message, UpstreamError> {
         let deadline = resolve_deadline(self.timeout);
+        // Hostname-based upstreams can only rotate by re-resolving, so keep
+        // part of the overall budget for the forced refresh + retry after a
+        // timeout. Literal addresses have nothing to refresh and keep the full
+        // budget for their single attempt.
+        let refreshable = self.host.parse::<std::net::IpAddr>().is_err();
+        let first_phase_deadline = if refreshable {
+            Instant::now() + self.timeout.mul_f64(0.7)
+        } else {
+            deadline
+        };
 
         let candidates = self.candidates.read().await.clone();
-        let mut last_error = match self.try_candidates(&candidates, msg, deadline).await {
+        let mut last_error = match self
+            .try_candidates(&candidates, msg, first_phase_deadline)
+            .await
+        {
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
 
-        // Every known address failed: refresh (bounded) and retry once so
-        // rotated DNS records can be picked up without a restart. The refresh
-        // and the retry stay inside the same overall deadline.
+        // Every known address failed: force a cache-bypassing refresh and retry
+        // once so rotated DNS records can be picked up without a restart or
+        // waiting for the 300s cache TTL to expire. The refresh and the retry
+        // stay inside the same overall deadline.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !remaining.is_zero()
-            && let Ok(true) = timeout(remaining, self.try_re_resolve()).await
+            && let Ok(true) = timeout(remaining, self.force_re_resolve()).await
         {
             let candidates = self.candidates.read().await.clone();
             match self.try_candidates(&candidates, msg, deadline).await {
@@ -421,15 +508,15 @@ async fn create_managed_entry(
             .await?,
         )
     } else if server_str.starts_with("https://") {
-        let (host, port, _path) = parse_scheme_target(server_str, "https", 443)?;
+        let (host, port, path) = parse_scheme_target(server_str, "https", 443)?;
         Arc::new(
             FailoverUpstream::new(
                 bootstrap,
-                host,
+                host.clone(),
                 port,
                 timeout_duration,
                 CandidateKind::Https {
-                    url: server_str.to_string(),
+                    url: build_https_url(&host, port, &path),
                 },
             )
             .await?,
@@ -492,6 +579,23 @@ fn parse_scheme_target(
         )));
     }
     Ok((host, port, path))
+}
+
+/// Builds the effective DoH URL from the parsed target pieces, including the
+/// default `/dns-query` path when the operator omitted one.
+fn build_https_url(host: &str, port: u16, path: &str) -> String {
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let port_suffix = if port == 443 {
+        String::new()
+    } else {
+        format!(":{port}")
+    };
+    let path = if path.is_empty() { "/dns-query" } else { path };
+    format!("https://{authority}{port_suffix}{path}")
 }
 
 /// Returns the scheme of an upstream string if it uses an unsupported `xxx://` prefix.
@@ -799,7 +903,7 @@ impl UpstreamManager {
                     let m = msg.clone();
                     let name = entry.name.clone();
                     futs.push(Box::pin(async move {
-                        match u.resolve(&m).await {
+                        match resolve_with_edns_fallback(u.as_ref(), &m).await {
                             Ok(resp) if !is_retryable_response(&resp) => {
                                 h.write().await.record_success();
                                 Ok((resp, name))
@@ -925,7 +1029,12 @@ async fn attempt_entry(
     msg: &Message,
     budget: Duration,
 ) -> Result<Message, UpstreamError> {
-    match timeout(budget, entry.upstream.resolve(msg)).await {
+    match timeout(
+        budget,
+        resolve_with_edns_fallback(entry.upstream.as_ref(), msg),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(_) => Err(UpstreamError::Timeout),
     }
@@ -983,6 +1092,9 @@ async fn probe_all(entries: Vec<ManagedEntry>, probe_qname: Name, probe_timeout:
 async fn probe_one(entry: ManagedEntry, qname: Name, probe_timeout: Duration) {
     let name = entry.name.clone();
     let mut query = Message::new(rand::random(), MessageType::Query, OpCode::Query);
+    // Many recursive resolvers refuse RD=0 (they are not authoritative for the
+    // probe domain), so health probes must explicitly request recursion.
+    query.metadata.recursion_desired = true;
     query.queries.push(Query::query(qname, RecordType::A));
 
     match tokio::time::timeout(probe_timeout, entry.upstream.resolve(&query)).await {
@@ -1581,6 +1693,216 @@ mod tests {
         assert_eq!(calls_b.load(Ordering::SeqCst), 1);
     }
 
+    /// P1-25: bootstrap/health probes must set RD=1. A recursive resolver that
+    /// refuses RD=0 must not be treated as down.
+    struct RdRequiredUpstream {
+        calls: Arc<AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl Upstream for RdRequiredUpstream {
+        async fn resolve(&self, msg: &Message) -> Result<Message, UpstreamError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !msg.metadata.recursion_desired {
+                return Err(UpstreamError::Refused);
+            }
+            let mut resp = Message::response(msg.metadata.id, msg.metadata.op_code);
+            resp.queries = msg.queries.clone();
+            resp.metadata.response_code = ResponseCode::NoError;
+            resp.answers.push(Record::from_rdata(
+                msg.queries[0].name().clone(),
+                300,
+                RData::A(A(std::net::Ipv4Addr::new(8, 8, 4, 4))),
+            ));
+            Ok(resp)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_health_probe_sets_recursion_desired() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let entry = ManagedEntry {
+            name: "rd-required.dns".to_string(),
+            upstream: Arc::new(RdRequiredUpstream {
+                calls: Arc::clone(&calls),
+            }),
+            health: Arc::new(RwLock::new(UpstreamHealth::new())),
+        };
+        {
+            let mut health = entry.health.write().await;
+            for _ in 0..3 {
+                health.record_error(&UpstreamError::Timeout);
+            }
+            assert_eq!(health.status(), HealthStatus::Suspect);
+        }
+
+        probe_one(
+            entry.clone(),
+            Name::from_str("example.com.").unwrap(),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            entry.health.read().await.status(),
+            HealthStatus::Healthy,
+            "an RD=1 probe must revive a Suspect resolver that refuses RD=0"
+        );
+    }
+
+    /// P2-10: a FORMERR/BADVERS reply to an EDNS query must be retried once
+    /// against the same candidate without EDNS instead of being returned.
+    struct EdnsIntolerantUpstream {
+        calls: Arc<AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl Upstream for EdnsIntolerantUpstream {
+        async fn resolve(&self, msg: &Message) -> Result<Message, UpstreamError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut resp = Message::response(msg.metadata.id, msg.metadata.op_code);
+            resp.queries = msg.queries.clone();
+            if msg.edns.is_some() {
+                resp.metadata.response_code = ResponseCode::FormErr;
+                return Ok(resp);
+            }
+            resp.metadata.response_code = ResponseCode::NoError;
+            resp.answers.push(Record::from_rdata(
+                msg.queries[0].name().clone(),
+                300,
+                RData::A(A(std::net::Ipv4Addr::new(6, 6, 6, 6))),
+            ));
+            Ok(resp)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_formerr_triggers_one_no_edns_retry() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let manager = UpstreamManager::with_upstreams(
+            vec![(
+                "edns-intolerant.dns".to_string(),
+                Arc::new(EdnsIntolerantUpstream {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            UpstreamStrategy::Failover,
+            Duration::from_secs(1),
+        );
+
+        let mut query = test_query();
+        query.metadata.recursion_desired = true;
+        query.set_edns(sito_proto::Edns::new());
+
+        let resp = manager
+            .resolve(&query)
+            .await
+            .expect("FORMERR must be retried without EDNS");
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly one retry");
+    }
+
+    #[tokio::test]
+    async fn test_forced_refresh_picks_up_rotated_address() {
+        // First bootstrap answer is a black-hole address that receives but never
+        // answers; the forced refresh must bypass the 300s cache and pick up the
+        // live rotated address within the remaining budget.
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.3:0").await.unwrap();
+        let live_port = blackhole.local_addr().unwrap().port();
+        let live = tokio::net::UdpSocket::bind(format!("127.0.0.2:{live_port}"))
+            .await
+            .unwrap();
+        let live_calls = Arc::new(AtomicU32::new(0));
+        let calls = Arc::clone(&live_calls);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while let Ok((len, peer)) = live.recv_from(&mut buf).await {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let Ok(query) = decode_message(&buf[..len]) else {
+                    continue;
+                };
+                let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                resp.queries = query.queries.clone();
+                resp.answers.push(Record::from_rdata(
+                    query.queries[0].name().clone(),
+                    300,
+                    RData::A(A(std::net::Ipv4Addr::new(5, 5, 5, 5))),
+                ));
+                if let Ok(encoded) = encode_message(&resp) {
+                    let _ = live.send_to(&encoded, peer).await;
+                }
+            }
+        });
+        // Keep the black-hole socket alive and drain datagrams without replying.
+        let _blackhole_task = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while blackhole.recv_from(&mut buf).await.is_ok() {}
+        });
+
+        let bootstrap_addr = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bootstrap = bootstrap_addr.local_addr().unwrap();
+        let a_queries = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&a_queries);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while let Ok((len, peer)) = bootstrap_addr.recv_from(&mut buf).await {
+                let Ok(query) = decode_message(&buf[..len]) else {
+                    continue;
+                };
+                if query.queries.first().map(Query::query_type) != Some(RecordType::A) {
+                    let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                    resp.queries = query.queries.clone();
+                    if let Ok(encoded) = encode_message(&resp) {
+                        let _ = bootstrap_addr.send_to(&encoded, peer).await;
+                    }
+                    continue;
+                }
+                let index = counter.fetch_add(1, Ordering::SeqCst);
+                let ip = if index == 0 {
+                    std::net::Ipv4Addr::new(127, 0, 0, 3)
+                } else {
+                    std::net::Ipv4Addr::new(127, 0, 0, 2)
+                };
+                let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                resp.queries = query.queries.clone();
+                resp.answers.push(Record::from_rdata(
+                    query.queries[0].name().clone(),
+                    300,
+                    RData::A(A(ip)),
+                ));
+                if let Ok(encoded) = encode_message(&resp) {
+                    let _ = bootstrap_addr.send_to(&encoded, peer).await;
+                }
+            }
+        });
+
+        let resolver = BootstrapResolver::new(vec![bootstrap.ip()], Duration::from_secs(1))
+            .with_port(bootstrap.port())
+            .with_allow_private_targets(true);
+        let upstream = FailoverUpstream::with_interval(
+            resolver,
+            "rotate.test".to_string(),
+            live_port,
+            Duration::from_secs(2),
+            CandidateKind::Plain,
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("construct failover upstream");
+
+        let resp = upstream
+            .resolve(&test_query())
+            .await
+            .expect("forced refresh must reach the rotated address");
+        assert_eq!(
+            resp.answers[0].data,
+            RData::A(A(std::net::Ipv4Addr::new(5, 5, 5, 5)))
+        );
+        assert_eq!(live_calls.load(Ordering::SeqCst), 1);
+        assert!(a_queries.load(Ordering::SeqCst) >= 2);
+    }
+
     #[tokio::test]
     async fn test_per_domain_routing() {
         let calls_default = Arc::new(AtomicU32::new(0));
@@ -1672,6 +1994,7 @@ mod tests {
             timeout_ms: 2500,
             probe_domain: "cloudflare.com".to_string(),
             pool_size: 2,
+            allow_private_targets: false,
             per_domain: vec![],
             ecs: Default::default(),
         };
@@ -1697,6 +2020,7 @@ mod tests {
             timeout_ms: 1000,
             probe_domain: "cloudflare.com".to_string(),
             pool_size: 2,
+            allow_private_targets: false,
             per_domain: vec![],
             ecs: Default::default(),
         };
@@ -1805,6 +2129,26 @@ mod tests {
         addr
     }
 
+    #[test]
+    fn test_build_https_url_keeps_path_and_defaults_bare_hosts() {
+        assert_eq!(
+            build_https_url("dns.example", 443, "/dns-query"),
+            "https://dns.example/dns-query"
+        );
+        assert_eq!(
+            build_https_url("dns.example", 8443, "/custom"),
+            "https://dns.example:8443/custom"
+        );
+        assert_eq!(
+            build_https_url("2606:4700:4700::1111", 443, "/dns-query"),
+            "https://[2606:4700:4700::1111]/dns-query"
+        );
+        assert_eq!(
+            build_https_url("dns.example", 443, ""),
+            "https://dns.example/dns-query"
+        );
+    }
+
     #[tokio::test]
     async fn test_managed_entry_fails_over_across_resolved_addresses() {
         // Live plain DNS server on 127.0.0.2; 127.0.0.1:<same port> is dead.
@@ -1838,7 +2182,8 @@ mod tests {
         ])
         .await;
         let bootstrap = BootstrapResolver::new(vec![bootstrap_addr.ip()], Duration::from_secs(1))
-            .with_port(bootstrap_addr.port());
+            .with_port(bootstrap_addr.port())
+            .with_allow_private_targets(true);
 
         let entry = create_managed_entry(
             &format!("multi-address.test:{live_port}"),
@@ -1910,6 +2255,7 @@ mod tests {
             timeout_ms: 1000,
             probe_domain: "example.com".to_string(),
             pool_size: 1,
+            allow_private_targets: false,
             per_domain: vec![],
             ecs: Default::default(),
         };

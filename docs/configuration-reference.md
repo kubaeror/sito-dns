@@ -179,6 +179,9 @@ strategy = "parallel"                  # "parallel" | "failover" | "load_balance
 timeout_ms = 5000
 probe_domain = "example.com"
 pool_size = 4
+# false (default): hostname-configured upstreams must resolve to public
+# addresses. IP literals are always accepted as an explicit choice.
+allow_private_targets = false
 
 [[upstream.per_domain]]
 domains = ["*.lan", "168.192.in-addr.arpa"]
@@ -194,6 +197,7 @@ servers = ["udp://192.168.1.1:53"]
 | `probe_domain` | string | `"example.com"` | Test domain used for periodic health-checking of upstreams. |
 | `ecs` | string | `"off"` | EDNS Client Subnet policy: `"off"` strips client ECS before forwarding and deduplicates cache keys; `"forward"` forwards ECS after clamping IPv4 to /24 and IPv6 to /56 (zero source prefixes dropped). Forwarding can improve CDN locality but discloses a coarse client-location hint and splits cache entries by subnet. |
 | `pool_size` | integer | `4` | Number of persistent TCP/TLS connections maintained per upstream endpoint. |
+| `allow_private_targets` | boolean | `false` | Allow hostname-configured upstreams to resolve to private/loopback/link-local/reserved addresses. Disabled by default so a compromised or spoofed bootstrap cannot redirect an upstream into the local network or cloud metadata. IP literals in `servers` are always accepted as an explicit operator choice. |
 | `per_domain` | array of tables | `[]` | Domain-specific upstream forwarder rules (e.g., routing LAN domains to internal router). |
 
 ---

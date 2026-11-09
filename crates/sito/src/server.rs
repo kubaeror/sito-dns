@@ -588,7 +588,8 @@ async fn init_runtime_components(
     let bootstrap = BootstrapResolver::new(
         config.upstream.bootstrap.clone(),
         Duration::from_millis(config.upstream.timeout_ms),
-    );
+    )
+    .with_allow_private_targets(config.upstream.allow_private_targets);
     let upstream_manager =
         Arc::new(UpstreamManager::from_config(&config.upstream, &bootstrap).await?);
     let _health_handle = upstream_manager.start_health_prober(shutdown_rx.clone());
