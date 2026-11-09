@@ -151,12 +151,14 @@ impl Upstream for QuicUpstream {
         };
 
         let conn = self.get_connection().await?;
-        let result = async {
-            let (mut send, mut recv) = tokio::time::timeout(self.timeout, conn.open_bi())
-                .await
-                .map_err(|_| UpstreamError::Timeout)?
-                .map_err(|e| UpstreamError::Io(format!("failed to open DoQ stream: {e}")))?;
+        // A stream-slot timeout/open error must not invalidate the connection:
+        // the connection itself may be healthy and merely at its stream limit.
+        let (mut send, mut recv) = tokio::time::timeout(self.timeout, conn.open_bi())
+            .await
+            .map_err(|_| UpstreamError::Timeout)?
+            .map_err(|e| UpstreamError::Io(format!("failed to open DoQ stream: {e}")))?;
 
+        let result = async {
             let write = async {
                 send.write_all(&encoded_len.to_be_bytes())
                     .await

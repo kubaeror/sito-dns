@@ -246,10 +246,13 @@ fn record_doh_listener_binding(
 /// hot reload does not re-resolve unchanged upstream scopes.
 async fn build_scoped_upstreams(
     config: &Config,
-    bootstrap: &BootstrapResolver,
     clients: &sito_clients::ClientsConfig,
     existing: &HashMap<String, Arc<UpstreamManager>>,
 ) -> HashMap<String, Arc<UpstreamManager>> {
+    // Build from the current config on every call. Capturing a startup resolver
+    // here would leave scoped upstreams on old bootstrap/allow_private_targets
+    // settings after a hot reload.
+    let bootstrap = BootstrapResolver::from_config(&config.upstream);
     let mut scoped: HashMap<String, Arc<UpstreamManager>> = HashMap::new();
     for entry in &clients.entries {
         if entry.use_global_upstreams {
@@ -261,7 +264,7 @@ async fn build_scoped_upstreams(
         if servers.is_empty() {
             continue;
         }
-        let key = servers.join(",");
+        let key = scoped_upstream_key(config, servers);
         if scoped.contains_key(&key) {
             continue;
         }
@@ -272,7 +275,7 @@ async fn build_scoped_upstreams(
         let mut upstream_cfg = config.upstream.clone();
         upstream_cfg.servers.clone_from(servers);
         upstream_cfg.per_domain.clear();
-        match UpstreamManager::from_config(&upstream_cfg, bootstrap).await {
+        match UpstreamManager::from_config(&upstream_cfg, &bootstrap).await {
             Ok(manager) => {
                 info!(
                     client = %entry.name,
@@ -289,6 +292,25 @@ async fn build_scoped_upstreams(
         }
     }
     scoped
+}
+
+/// Reuse key for a per-client upstream scope.
+///
+/// Includes every inherited `[upstream]` setting that affects manager
+/// construction, not just the server list. Otherwise a reload that only changes
+/// the bootstrap, timeout, strategy, pool size or `allow_private_targets` would
+/// keep the stale manager (and its old SSRF policy) alive.
+fn scoped_upstream_key(config: &Config, servers: &[String]) -> String {
+    let up = &config.upstream;
+    format!(
+        "{}|bootstrap={:?}|timeout_ms={}|strategy={:?}|pool_size={}|allow_private_targets={}",
+        servers.join(","),
+        up.bootstrap,
+        up.timeout_ms,
+        up.strategy,
+        up.pool_size,
+        up.allow_private_targets
+    )
 }
 
 /// High-availability role setup produced by [`init_ha`].
@@ -509,7 +531,6 @@ struct RuntimeComponents {
     metrics: MetricsRegistry,
     querylog_writer: QueryLogWriter,
     querylog_sender: sito_stats::QueryLogSender,
-    bootstrap: BootstrapResolver,
     upstream_manager: Arc<UpstreamManager>,
     cache: Arc<DnsCache>,
     filter_engine: Arc<HostsFilterEngine>,
@@ -585,11 +606,7 @@ async fn init_runtime_components(
     }
 
     // Initialize upstream manager with bootstrap resolver
-    let bootstrap = BootstrapResolver::new(
-        config.upstream.bootstrap.clone(),
-        Duration::from_millis(config.upstream.timeout_ms),
-    )
-    .with_allow_private_targets(config.upstream.allow_private_targets);
+    let bootstrap = BootstrapResolver::from_config(&config.upstream);
     let upstream_manager =
         Arc::new(UpstreamManager::from_config(&config.upstream, &bootstrap).await?);
     let _health_handle = upstream_manager.start_health_prober(shutdown_rx.clone());
@@ -625,7 +642,6 @@ async fn init_runtime_components(
         metrics,
         querylog_writer,
         querylog_sender,
-        bootstrap,
         upstream_manager,
         cache,
         filter_engine,
@@ -651,7 +667,6 @@ struct ServerApplyHooks {
     /// hot reload must not forget that a zone was proven signed/unsigned.
     dnssec_chain_cache: Arc<sito_dnssec::ChainCache>,
     scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>>,
-    bootstrap: BootstrapResolver,
     rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
     listener_manager: Arc<tokio::sync::Mutex<Option<DnsListenerManager>>>,
     listener_acceptors: Arc<tokio::sync::Mutex<Option<ListenerAcceptors>>>,
@@ -689,7 +704,7 @@ impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
             // upstream set is unchanged.
             let rebuilt_scoped = {
                 let existing = self.scoped_upstreams.load_full();
-                build_scoped_upstreams(cfg, &self.bootstrap, clients, &existing).await
+                build_scoped_upstreams(cfg, clients, &existing).await
             };
             self.scoped_upstreams.store(Arc::new(rebuilt_scoped));
 
@@ -1075,7 +1090,6 @@ pub async fn run_server_full(
     let metrics = components.metrics;
     let querylog_writer = components.querylog_writer;
     let querylog_sender = components.querylog_sender;
-    let bootstrap = components.bootstrap;
     let upstream_manager = components.upstream_manager;
     let cache = components.cache;
     let filter_engine = components.filter_engine;
@@ -1104,7 +1118,7 @@ pub async fn run_server_full(
     // Build per-client upstream managers for entries that opt out of the globals.
     let scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>> =
         Arc::new(ArcSwap::from(Arc::new(
-            build_scoped_upstreams(&config, &bootstrap, &clients_config, &HashMap::new()).await,
+            build_scoped_upstreams(&config, &clients_config, &HashMap::new()).await,
         )));
 
     let client_registry = Arc::new(sito_clients::ClientRegistry::new(clients_config));
@@ -1227,7 +1241,6 @@ pub async fn run_server_full(
         dnssec: dnssec_swap.clone(),
         dnssec_chain_cache: dnssec_chain_cache.clone(),
         scoped_upstreams: scoped_upstreams.clone(),
-        bootstrap: bootstrap.clone(),
         rate_limiters: rate_limiters.clone(),
         listener_manager: listener_manager.clone(),
         listener_acceptors: listener_acceptors.clone(),
@@ -2226,6 +2239,79 @@ mod tests {
             Some(std::ffi::OsStr::new("config.toml"))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scoped_clients(servers: &[&str]) -> sito_clients::ClientsConfig {
+        let mut clients = sito_clients::ClientsConfig::default();
+        clients.entries.push(sito_clients::ClientEntryConfig {
+            name: "corp".to_string(),
+            ids: Vec::new(),
+            group: "default".to_string(),
+            ignore_query_log: false,
+            ignore_stats: false,
+            use_global_upstreams: false,
+            upstreams: Some(servers.iter().map(|server| (*server).to_string()).collect()),
+            trusted: false,
+        });
+        clients
+    }
+
+    /// Important 3: changing a global upstream setting such as
+    /// `allow_private_targets` must rebuild per-client scoped managers on a hot
+    /// reload instead of reusing the old SSRF policy.
+    #[tokio::test]
+    async fn test_scoped_upstream_reload_rebuilds_on_allow_private_targets_change() {
+        let mut config = Config::default();
+        config.upstream.servers = vec!["1.1.1.1".to_string()];
+        let clients = scoped_clients(&["udp://127.0.0.1:53"]);
+
+        let first = build_scoped_upstreams(&config, &clients, &HashMap::new()).await;
+        assert_eq!(first.len(), 1);
+        let first_key = first.keys().next().unwrap().clone();
+        let first_manager = first.values().next().unwrap().clone();
+
+        config.upstream.allow_private_targets = true;
+        let second = build_scoped_upstreams(&config, &clients, &first).await;
+        assert_eq!(second.len(), 1);
+        let second_key = second.keys().next().unwrap().clone();
+        let second_manager = second.values().next().unwrap().clone();
+
+        assert_ne!(
+            first_key, second_key,
+            "the reuse key must include allow_private_targets"
+        );
+        assert!(
+            !Arc::ptr_eq(&first_manager, &second_manager),
+            "a changed SSRF policy must not reuse the stale scoped manager"
+        );
+    }
+
+    /// The reuse key must also change when inherited connection settings change,
+    /// not only when the server list changes.
+    #[test]
+    fn test_scoped_upstream_key_includes_inherited_settings() {
+        let mut config = Config::default();
+        let servers = vec!["tls://dns.example".to_string()];
+        let base = scoped_upstream_key(&config, &servers);
+
+        config.upstream.bootstrap = vec!["1.1.1.1".parse().unwrap()];
+        assert_ne!(base, scoped_upstream_key(&config, &servers));
+
+        let mut config = Config::default();
+        config.upstream.timeout_ms += 1;
+        assert_ne!(base, scoped_upstream_key(&config, &servers));
+
+        let mut config = Config::default();
+        config.upstream.strategy = sito_core::config::UpstreamStrategy::Parallel;
+        assert_ne!(base, scoped_upstream_key(&config, &servers));
+
+        let mut config = Config::default();
+        config.upstream.pool_size += 1;
+        assert_ne!(base, scoped_upstream_key(&config, &servers));
+
+        let mut config = Config::default();
+        config.upstream.allow_private_targets = true;
+        assert_ne!(base, scoped_upstream_key(&config, &servers));
     }
 
     /// I5 regression: the production `init_ha` call site records the

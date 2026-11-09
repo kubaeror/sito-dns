@@ -14,12 +14,12 @@ use sito_core::error::UpstreamError;
 use sito_proto::{Message, MessageType, Name, OpCode, Query, RecordType, ResponseCode};
 
 use crate::bootstrap::BootstrapResolver;
-use crate::doh::HttpsUpstream;
+use crate::doh::{DEFAULT_DOH_PATH, HttpsUpstream};
 use crate::doq::QuicUpstream;
 use crate::dot::DotUpstream;
 use crate::health::{HealthStatus, UpstreamHealth};
 use crate::plain::PlainUpstream;
-use crate::upstream::{Upstream, is_retryable_response};
+use crate::upstream::{Upstream, is_edns_failure_code, is_retryable_response};
 
 pub type NamedUpstream = (String, Arc<dyn Upstream>);
 pub type PerDomainRule = (Vec<String>, Vec<NamedUpstream>);
@@ -96,10 +96,7 @@ fn retryable_status_error(code: ResponseCode) -> UpstreamError {
 /// OPT record (FORMERR/BADVERS). These are retried once without EDNS before the
 /// candidate is considered failed.
 fn is_edns_failure(response: &Message) -> bool {
-    matches!(
-        response.metadata.response_code,
-        ResponseCode::FormErr | ResponseCode::BADVERS
-    )
+    is_edns_failure_code(response.metadata.response_code)
 }
 
 /// Send one query to a candidate, retrying once without EDNS when the reply is
@@ -211,6 +208,11 @@ pub struct UpstreamManager {
 /// How often a multi-address upstream re-resolves its hostname.
 const UPSTREAM_RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Minimum spacing between cache-bypassing forced refreshes for one hostname.
+/// Prevents a flapping upstream (or a query burst) from stampeding the
+/// bootstrap servers.
+const FORCED_REFRESH_BACKOFF: Duration = Duration::from_secs(5);
+
 /// Transport used for every address a hostname resolves to.
 enum CandidateKind {
     Plain,
@@ -237,6 +239,7 @@ struct FailoverUpstream {
     kind: CandidateKind,
     candidates: RwLock<Vec<Arc<dyn Upstream>>>,
     last_resolve: Mutex<Instant>,
+    last_forced_refresh: Mutex<Option<Instant>>,
     re_resolve_interval: Duration,
 }
 
@@ -275,6 +278,7 @@ impl FailoverUpstream {
             kind,
             candidates: RwLock::new(Vec::new()),
             last_resolve: Mutex::new(Instant::now()),
+            last_forced_refresh: Mutex::new(None),
             re_resolve_interval,
         };
         let candidates = upstream.build_candidates(false).await?;
@@ -357,7 +361,7 @@ impl FailoverUpstream {
     /// failed. Returns `true` when the candidate set was replaced.
     ///
     /// This ignores both the periodic interval and the bootstrap resolver's
-    /// positive cache (minimum TTL 300s), so rotated records can be picked up
+    /// positive cache (TTLs are clamped to 60s..86400s), so rotated records can be picked up
     /// as soon as the old addresses stop answering.
     async fn force_re_resolve(&self) -> bool {
         // A literal address cannot rotate; retrying the same candidate after a
@@ -365,6 +369,15 @@ impl FailoverUpstream {
         if self.host.parse::<std::net::IpAddr>().is_ok() {
             return false;
         }
+        let mut last_forced = self.last_forced_refresh.lock().await;
+        if last_forced.is_some_and(|last| last.elapsed() < FORCED_REFRESH_BACKOFF) {
+            return false;
+        }
+        // Timestamp the attempt, not just success: a hostname whose bootstrap
+        // also fails must not be retried on every query.
+        *last_forced = Some(Instant::now());
+        drop(last_forced);
+
         let mut last = self.last_resolve.lock().await;
         match self.build_candidates(true).await {
             Ok(candidates) => {
@@ -448,7 +461,7 @@ impl FailoverUpstream {
 
         // Every known address failed: force a cache-bypassing refresh and retry
         // once so rotated DNS records can be picked up without a restart or
-        // waiting for the 300s cache TTL to expire. The refresh and the retry
+        // waiting for the bootstrap cache TTL to expire. The refresh and the retry
         // stay inside the same overall deadline.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !remaining.is_zero()
@@ -570,7 +583,7 @@ fn parse_scheme_target(
     let rest = url.strip_prefix(prefix.as_str()).unwrap_or(url);
     let (authority, path) = match rest.split_once('/') {
         Some((authority, path)) => (authority, format!("/{path}")),
-        None => (rest, "/dns-query".to_string()),
+        None => (rest, DEFAULT_DOH_PATH.to_string()),
     };
     let (host, port) = split_host_port(authority, default_port);
     if host.is_empty() {
@@ -594,7 +607,11 @@ fn build_https_url(host: &str, port: u16, path: &str) -> String {
     } else {
         format!(":{port}")
     };
-    let path = if path.is_empty() { "/dns-query" } else { path };
+    let path = if path.is_empty() {
+        DEFAULT_DOH_PATH
+    } else {
+        path
+    };
     format!("https://{authority}{port_suffix}{path}")
 }
 
@@ -1806,7 +1823,7 @@ mod tests {
     #[tokio::test]
     async fn test_forced_refresh_picks_up_rotated_address() {
         // First bootstrap answer is a black-hole address that receives but never
-        // answers; the forced refresh must bypass the 300s cache and pick up the
+        // answers; the forced refresh must bypass the bootstrap cache and pick up the
         // live rotated address within the remaining budget.
         let blackhole = tokio::net::UdpSocket::bind("127.0.0.3:0").await.unwrap();
         let live_port = blackhole.local_addr().unwrap().port();
@@ -1901,6 +1918,10 @@ mod tests {
         );
         assert_eq!(live_calls.load(Ordering::SeqCst), 1);
         assert!(a_queries.load(Ordering::SeqCst) >= 2);
+        assert!(
+            !upstream.force_re_resolve().await,
+            "a second forced refresh within the backoff window must be skipped"
+        );
     }
 
     #[tokio::test]

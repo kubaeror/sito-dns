@@ -47,6 +47,19 @@ impl BootstrapResolver {
         }
     }
 
+    /// Create a resolver from the `[upstream]` configuration section.
+    ///
+    /// Uses the configured bootstrap IPs, query timeout and
+    /// `allow_private_targets` policy.
+    #[must_use]
+    pub fn from_config(config: &sito_core::config::UpstreamConfig) -> Self {
+        Self::new(
+            config.bootstrap.clone(),
+            Duration::from_millis(config.timeout_ms),
+        )
+        .with_allow_private_targets(config.allow_private_targets)
+    }
+
     /// Set a custom port for bootstrap DNS queries (useful in testing).
     #[must_use]
     pub fn with_port(mut self, port: u16) -> Self {
@@ -75,8 +88,9 @@ impl BootstrapResolver {
     /// Resolve a hostname while bypassing the bootstrap cache.
     ///
     /// Used when every known address for an upstream has failed: the cached
-    /// entry may still be unexpired (minimum TTL 300s) even though the records
-    /// have rotated. The fresh answer is cached again on success.
+    /// entry may still be unexpired (bootstrap TTLs are clamped to 60s..86400s)
+    /// even though the records have rotated. The fresh answer is cached again on
+    /// success.
     pub async fn resolve_hostname_forced(
         &self,
         hostname: &str,

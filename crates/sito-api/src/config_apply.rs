@@ -23,7 +23,6 @@ use crate::state::ServerContext;
 use sito_core::config::Config;
 use sito_upstream::BootstrapResolver;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Future returned by [`ConfigApplyHooks::apply`] (boxed so the trait stays
 /// object-safe without an extra macro dependency in the server binary).
@@ -603,11 +602,7 @@ async fn apply_inner(
 ) -> Result<(), ProblemDetails> {
     // 1. Upstream manager: constructing it validates every configured server
     //    (including per-domain scopes) before anything is swapped.
-    let bootstrap = BootstrapResolver::new(
-        cfg.upstream.bootstrap.clone(),
-        Duration::from_millis(cfg.upstream.timeout_ms),
-    )
-    .with_allow_private_targets(cfg.upstream.allow_private_targets);
+    let bootstrap = BootstrapResolver::from_config(&cfg.upstream);
     ctx.upstream
         .reload(&cfg.upstream, &bootstrap)
         .await

@@ -22,6 +22,17 @@ fn udp_recv_buffer_size(query: &Message) -> usize {
     usize::from(client_edns_payload_size(query)).clamp(MIN_UDP_BUFFER_SIZE, MAX_UDP_BUFFER_SIZE)
 }
 
+/// Whether a full-buffer datagram that failed to decode plausibly belongs to
+/// this query and may have been truncated.
+///
+/// Requiring the matching wire ID and the QR bit prevents an off-path attacker
+/// from forcing a TCP fallback with a full-size garbage datagram.
+fn looks_like_truncated_response(bytes: &[u8], query_id: u16) -> bool {
+    bytes.len() >= 12
+        && u16::from_be_bytes([bytes[0], bytes[1]]) == query_id
+        && bytes[2] & 0x80 != 0
+}
+
 /// A plain DNS upstream resolver speaking UDP and TCP.
 pub struct PlainUpstream {
     server_addr: SocketAddr,
@@ -148,7 +159,13 @@ impl Upstream for PlainUpstream {
                 Ok(response) => response,
                 // A full buffer combined with a decode failure usually means
                 // the datagram did not fit; retry over TCP before giving up.
-                Err(e) if bytes_read == buf.len() => {
+                Err(e)
+                    if bytes_read == buf.len()
+                        && looks_like_truncated_response(
+                            &buf[..bytes_read],
+                            wire_msg.metadata.id,
+                        ) =>
+                {
                     debug!(
                         "Upstream {} response may have been truncated at {} bytes ({}); retrying over TCP",
                         self.server_addr, buffer_size, e
@@ -302,6 +319,54 @@ mod tests {
         assert_eq!(
             response.answers[0].data,
             RData::A(A(std::net::Ipv4Addr::new(1, 2, 3, 4)))
+        );
+    }
+
+    /// P2-9 Important 2: an attacker who knows the port must not be able to
+    /// force a TCP fallback (and fail the query) with a full-buffer garbage
+    /// datagram whose header does not match the query.
+    #[tokio::test]
+    async fn test_plain_udp_ignores_full_buffer_junk() {
+        use std::time::Duration;
+
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let query = decode_message(&buf[..n]).unwrap();
+
+            // Full 512-byte garbage with a deliberately wrong ID and no QR bit.
+            // There is no TCP listener, so treating this as truncation would
+            // fail the query instead of ignoring it.
+            let mut junk = vec![0xffu8; MIN_UDP_BUFFER_SIZE];
+            junk[0..2].copy_from_slice(&(query.metadata.id ^ 0xffff).to_be_bytes());
+            junk[2] = 0x00;
+            server.send_to(&junk, peer).await.unwrap();
+
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::NoError;
+            resp.answers.push(Record::from_rdata(
+                query.queries[0].name().clone(),
+                300,
+                RData::A(A(std::net::Ipv4Addr::new(4, 3, 2, 1))),
+            ));
+            let bytes = encode_message(&resp).unwrap();
+            server.send_to(&bytes, peer).await.unwrap();
+        });
+
+        let upstream = PlainUpstream::new(addr, Duration::from_secs(2));
+        let response = upstream
+            .resolve(&make_query())
+            .await
+            .expect("genuine response after full-buffer junk must be accepted");
+        server_task.await.unwrap();
+
+        assert_eq!(
+            response.answers[0].data,
+            RData::A(A(std::net::Ipv4Addr::new(4, 3, 2, 1)))
         );
     }
 

@@ -47,6 +47,10 @@ pub fn validate_response(query: &Message, response: &Message) -> Result<(), Upst
                     ));
                 }
             }
+            // FORMERR/BADVERS often means the server could not parse the
+            // question/OPT record and therefore cannot echo it. Let a matching-ID
+            // error reply through so the manager can retry without EDNS.
+            None if is_edns_failure_code(response.metadata.response_code) => {}
             None => {
                 return Err(UpstreamError::BadResponse(
                     "upstream reply is missing the question section".to_string(),
@@ -56,6 +60,15 @@ pub fn validate_response(query: &Message, response: &Message) -> Result<(), Upst
     }
 
     Ok(())
+}
+
+/// Whether a response code indicates the upstream could not process the EDNS
+/// OPT record (`FORMERR`/`BADVERS`).
+///
+/// Shared by response validation (a FORMERR/BADVERS reply may omit the echoed
+/// question), the retryability decision, and the manager's no-EDNS retry.
+pub fn is_edns_failure_code(code: ResponseCode) -> bool {
+    matches!(code, ResponseCode::FormErr | ResponseCode::BADVERS)
 }
 
 /// Whether a structurally valid reply carries a response code that should be
@@ -71,12 +84,8 @@ pub fn validate_response(query: &Message, response: &Message) -> Result<(), Upst
 pub fn is_retryable_response(response: &Message) -> bool {
     matches!(
         response.metadata.response_code,
-        ResponseCode::ServFail
-            | ResponseCode::Refused
-            | ResponseCode::NotImp
-            | ResponseCode::FormErr
-            | ResponseCode::BADVERS
-    )
+        ResponseCode::ServFail | ResponseCode::Refused | ResponseCode::NotImp
+    ) || is_edns_failure_code(response.metadata.response_code)
 }
 
 #[cfg(test)]
@@ -122,6 +131,26 @@ mod tests {
 
         let missing_question = Message::response(0x1234, OpCode::Query);
         assert!(validate_response(&query, &missing_question).is_err());
+    }
+
+    #[test]
+    fn test_validate_response_allows_edns_failure_without_question() {
+        let query = make_query();
+        for code in [ResponseCode::FormErr, ResponseCode::BADVERS] {
+            let mut response = Message::response(0x1234, OpCode::Query);
+            response.metadata.response_code = code;
+            assert!(
+                validate_response(&query, &response).is_ok(),
+                "a matching-ID {code} reply without a question must reach the EDNS retry"
+            );
+        }
+
+        let mut no_error = Message::response(0x1234, OpCode::Query);
+        no_error.metadata.response_code = ResponseCode::NoError;
+        assert!(
+            validate_response(&query, &no_error).is_err(),
+            "NOERROR without a question is still invalid"
+        );
     }
 
     #[test]

@@ -190,14 +190,14 @@ servers = ["udp://192.168.1.1:53"]
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `servers` | array of strings | `["1.1.1.1", "1.0.0.1"]` | Upstream resolvers. Schemes: `udp://` or `host:port` (UDP with TCP fallback), `tls://` (DoT), `https://host[:port]/dns-query` (DoH, RFC 8484 with GET fallback), `quic://host[:port]` (DoQ, RFC 9250, default port 853). |
+| `servers` | array of strings | `["1.1.1.1", "1.0.0.1"]` | Upstream resolvers. Schemes: `udp://` or `host:port` (UDP with TCP fallback), `tls://` (DoT), `https://host[:port][/path]` (DoH, RFC 8484 with GET fallback; a bare `https://host` uses `/dns-query`), `quic://host[:port]` (DoQ, RFC 9250, default port 853). |
 | `bootstrap` | array of IPs | `["9.9.9.9", "149.112.112.112"]` | Plain IP addresses used to bootstrap resolution of encrypted upstream domain names. |
 | `strategy` | string | `"failover"` | Forwarding strategy: `"parallel"` (fastest answer wins), `"failover"` (sequential fallback), or `"load_balance"`. |
 | `timeout_ms` | integer | `5000` | Overall per-query budget in milliseconds, shared across failover/load-balance retries (each sequential attempt gets an equal share of the remaining budget; parallel races use the full budget). |
 | `probe_domain` | string | `"example.com"` | Test domain used for periodic health-checking of upstreams. |
 | `ecs` | string | `"off"` | EDNS Client Subnet policy: `"off"` strips client ECS before forwarding and deduplicates cache keys; `"forward"` forwards ECS after clamping IPv4 to /24 and IPv6 to /56 (zero source prefixes dropped). Forwarding can improve CDN locality but discloses a coarse client-location hint and splits cache entries by subnet. |
 | `pool_size` | integer | `4` | Number of persistent TCP/TLS connections maintained per upstream endpoint. |
-| `allow_private_targets` | boolean | `false` | Allow hostname-configured upstreams to resolve to private/loopback/link-local/reserved addresses. Disabled by default so a compromised or spoofed bootstrap cannot redirect an upstream into the local network or cloud metadata. IP literals in `servers` are always accepted as an explicit operator choice. |
+| `allow_private_targets` | boolean | `false` | Allow hostname-configured upstreams to resolve to private/loopback/link-local/reserved addresses. Disabled by default so a compromised or spoofed bootstrap cannot redirect an upstream into the local network or cloud metadata. IP literals in `servers` are always accepted as an explicit operator choice. This is a config-file-only key: the REST/UI upstream update preserves the current value rather than accepting it in the DTO. |
 | `per_domain` | array of tables | `[]` | Domain-specific upstream forwarder rules (e.g., routing LAN domains to internal router). |
 
 ---
