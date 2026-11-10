@@ -90,10 +90,10 @@ Scheduled fuzzing was intentionally removed and is not part of CI; there is no
   downgraded to `Insecure`.
 * Self-update under systemd requires running `sito update` as root with the
   service stopped (the unit keeps `ProtectSystem=strict`).
-* Statistics retention and rollup privacy (`stats_hourly` permanently retains
-  client IPs, names, and full domains; query-log polling cost; retention lock
-  duration) are the P1-19/P1-23/P1-24 residual risks deferred to Phase 2. See
-  the [1.9.4 release notes](release-notes-1.9.4.md#deferred-to-phase-2).
+* Statistics retention and rollup privacy (P1-19/P1-23/P1-24) now use keyed
+  rollup hashes, rollup retention, clear/vacuum, optional query-log totals,
+  cached dashboard aggregates, and bounded retention chunks. See the
+  [1.9.4 release notes](release-notes-1.9.4.md#stats-privacy-retention-and-polling).
 * RouterOS integration remains experimental/niche and is not part of the core
   security posture; it is planned to move behind an optional feature in 2.0.
 * The weekly benchmark workflow records estimates but does not enforce a

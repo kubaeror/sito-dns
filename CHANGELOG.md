@@ -93,10 +93,17 @@ guidance and residual risks.
 - `config.example.toml` uses the actual default cache/log values and current
   version text.
 
+### Stats privacy, retention, and polling
+- **P1-19:** rollup client IPs are keyed BLAKE3 hashes (`stats-salt`, 0600);
+  client names are opt-in; rollups expire after `rollup_retention_days`;
+  clearing the log deletes rollups by default (`keep_aggregates` opts out);
+  large clears vacuum and `secure_delete=ON`; stats files are repaired to 0600.
+- **P1-23:** `include_total=false` for live query-log refresh; 45 s dashboard
+  cache with invalidation; stats endpoints rate-limited.
+- **P1-24:** retention runs in bounded hour chunks, startup catch-up with
+  jitter, and success/failure/duration/deleted-row metrics.
+
 ### Deferred
-- **P1-19, P1-23, P1-24** (stats rollup privacy, query-log/dashboard polling
-  cost, retention lock duration) are deferred to Phase 2 and documented as
-  residual risks.
 - RouterOS remains experimental; moving it behind an optional feature is a 2.0
   item. Fuzzing remains removed; the old `fuzz/Cargo.toml` commands in the
   1.9.2/1.9.3 notes are marked historical. Weekly benchmarks upload estimates

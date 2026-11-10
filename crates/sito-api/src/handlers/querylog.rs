@@ -41,6 +41,19 @@ pub struct QueryLogQueryParams {
     pub to: Option<i64>,
     pub cursor: Option<i64>,
     pub limit: Option<usize>,
+    /// Defaults to `true` for API compatibility. The live UI refresh passes
+    /// `false` so the 3 s poll does not run a whole-table `COUNT(*)`.
+    pub include_total: Option<bool>,
+}
+
+/// Query parameters for clearing the log.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+pub struct ClearQueryLogParams {
+    /// Preserve `stats_hourly` rollups (the old “fold into aggregates”
+    /// behavior). Defaults to `false`: both detailed rows and rollups are
+    /// erased.
+    #[serde(default)]
+    pub keep_aggregates: bool,
 }
 
 fn rest_rate_limiter() -> &'static Mutex<HashMap<String, (Instant, u32)>> {
@@ -111,6 +124,7 @@ pub async fn get_querylog(
         to: params.to,
         cursor: params.cursor,
         limit: Some(limit),
+        include_total: params.include_total,
     };
 
     let page = ctx
@@ -124,6 +138,7 @@ pub async fn get_querylog(
 #[utoipa::path(
     delete,
     path = "/api/v1/querylog",
+    params(ClearQueryLogParams),
     responses(
         (status = 200, description = "Query log cleared successfully", body = GenericMessageResponse),
         (status = 401, description = "Unauthorized"),
@@ -135,10 +150,12 @@ pub async fn delete_querylog(
     _operator: RequireOperator,
     headers: HeaderMap,
     State(ctx): State<ServerContext>,
+    Query(params): Query<ClearQueryLogParams>,
 ) -> Result<Response, ProblemDetails> {
+    let rollup_client_names = ctx.config.load().get_stats_config().rollup_client_names;
     let affected = ctx
         .stats_db
-        .delete_query_logs()
+        .delete_query_logs_with_policy(params.keep_aggregates, rollup_client_names)
         .await
         .map_err(|e| ProblemDetails::internal_error(e.to_string()))?;
 

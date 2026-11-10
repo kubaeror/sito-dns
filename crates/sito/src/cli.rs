@@ -5,6 +5,7 @@ use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 use rand::RngExt;
 use sito_core::config::Config;
+use sito_stats::StatsDb;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -199,6 +200,17 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Clear the persisted query log
+    ClearQueryLog {
+        /// Optional path to configuration file (defaults to main --config)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Preserve hourly rollups (aggregate totals, top domains, hashed
+        /// client identifiers). By default both query_log and stats_hourly are
+        /// erased.
+        #[arg(long)]
+        keep_aggregates: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -324,6 +336,45 @@ pub fn run_check_config(path: &Path) -> Result<(), anyhow::Error> {
     );
 
     Ok(())
+}
+
+/// Executes the `clear-query-log` subcommand.
+///
+/// Opens the configured stats database directly. The server must be stopped
+/// (the CLI does not take the service lease), matching the other offline
+/// database maintenance commands.
+pub async fn run_clear_query_log(
+    config_path: &Path,
+    keep_aggregates: bool,
+) -> Result<u64, anyhow::Error> {
+    let content = std::fs::read_to_string(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read configuration file '{}': {}",
+            config_path.display(),
+            e
+        )
+    })?;
+    let config = Config::from_toml_str(&content)
+        .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    let db_path = config.server.data_dir.join("stats.db");
+    if !db_path.is_file() {
+        anyhow::bail!(
+            "Stats database '{}' does not exist (nothing to clear)",
+            db_path.display()
+        );
+    }
+
+    let stats = config.get_stats_config();
+    let db = StatsDb::open_with_rollup_client_names(&db_path, stats.rollup_client_names).await?;
+    let deleted = db
+        .delete_query_logs_with_policy(keep_aggregates, stats.rollup_client_names)
+        .await?;
+    if keep_aggregates {
+        println!("Deleted {deleted} query log entries; hourly rollups were preserved.");
+    } else {
+        println!("Deleted {deleted} query log entries and all hourly rollups.");
+    }
+    Ok(deleted)
 }
 
 /// Executes the `healthcheck` subcommand by sending a test DNS query.
@@ -1247,6 +1298,27 @@ mod tests {
             cli_custom.config,
             Some(PathBuf::from("/etc/sito/custom.toml"))
         );
+    }
+
+    #[test]
+    fn test_cli_clear_query_log_keep_aggregates_flag() {
+        let cli = Cli::try_parse_from(["sito", "clear-query-log", "--keep-aggregates"])
+            .expect("parse clear-query-log");
+        match cli.command {
+            Some(Commands::ClearQueryLog {
+                keep_aggregates, ..
+            }) => assert!(keep_aggregates),
+            other => panic!("expected clear-query-log, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["sito", "clear-query-log"])
+            .expect("parse clear-query-log default");
+        match cli.command {
+            Some(Commands::ClearQueryLog {
+                keep_aggregates, ..
+            }) => assert!(!keep_aggregates),
+            other => panic!("expected clear-query-log, got {other:?}"),
+        }
     }
 
     #[test]

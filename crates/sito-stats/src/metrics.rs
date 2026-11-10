@@ -311,6 +311,13 @@ pub struct MetricsRegistry {
     /// HA startup paths that left replication inactive, keyed by (role, reason).
     ha_startup_noop: Arc<Mutex<BTreeMap<(String, String), u64>>>,
     querylog_dropped: Arc<AtomicU64>,
+    stats_retention_last_success_seconds: Arc<AtomicU64>,
+    stats_retention_last_failure_seconds: Arc<AtomicU64>,
+    stats_retention_last_duration_millis: Arc<AtomicU64>,
+    stats_retention_deleted_rows_total: Arc<AtomicU64>,
+    stats_retention_rollup_deleted_rows_total: Arc<AtomicU64>,
+    stats_retention_failures_total: Arc<AtomicU64>,
+    stats_rollup_retention_days: Arc<AtomicU64>,
     filter_rules: Arc<AtomicU64>,
     filter_state: Arc<AtomicU64>,
     filter_lists_loaded: Arc<AtomicU64>,
@@ -370,6 +377,13 @@ impl MetricsRegistry {
             ha_diverged: Arc::new(Mutex::new(BTreeMap::new())),
             ha_startup_noop: Arc::new(Mutex::new(BTreeMap::new())),
             querylog_dropped: Arc::new(AtomicU64::new(0)),
+            stats_retention_last_success_seconds: Arc::new(AtomicU64::new(0)),
+            stats_retention_last_failure_seconds: Arc::new(AtomicU64::new(0)),
+            stats_retention_last_duration_millis: Arc::new(AtomicU64::new(0)),
+            stats_retention_deleted_rows_total: Arc::new(AtomicU64::new(0)),
+            stats_retention_rollup_deleted_rows_total: Arc::new(AtomicU64::new(0)),
+            stats_retention_failures_total: Arc::new(AtomicU64::new(0)),
+            stats_rollup_retention_days: Arc::new(AtomicU64::new(0)),
             filter_rules: Arc::new(AtomicU64::new(0)),
             filter_state: Arc::new(AtomicU64::new(0)),
             filter_lists_loaded: Arc::new(AtomicU64::new(0)),
@@ -529,6 +543,45 @@ impl MetricsRegistry {
 
     pub fn set_querylog_dropped(&self, dropped: u64) {
         self.querylog_dropped.store(dropped, Ordering::Relaxed);
+    }
+
+    /// Records a successful retention sweep. Timestamps are unix seconds;
+    /// `duration_millis` is wall-clock duration of the whole sweep.
+    pub fn record_retention_success(
+        &self,
+        duration_millis: u64,
+        deleted_rows: u64,
+        rollup_deleted_rows: u64,
+        rollup_retention_days: u32,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.stats_retention_last_success_seconds
+            .store(now, Ordering::Relaxed);
+        self.stats_retention_last_duration_millis
+            .store(duration_millis, Ordering::Relaxed);
+        self.stats_retention_deleted_rows_total
+            .fetch_add(deleted_rows, Ordering::Relaxed);
+        self.stats_retention_rollup_deleted_rows_total
+            .fetch_add(rollup_deleted_rows, Ordering::Relaxed);
+        self.stats_rollup_retention_days
+            .store(u64::from(rollup_retention_days), Ordering::Relaxed);
+    }
+
+    /// Records a failed retention sweep.
+    pub fn record_retention_failure(&self, duration_millis: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.stats_retention_last_failure_seconds
+            .store(now, Ordering::Relaxed);
+        self.stats_retention_last_duration_millis
+            .store(duration_millis, Ordering::Relaxed);
+        self.stats_retention_failures_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Publishes the number of active compiled filter rules.
@@ -1239,7 +1292,65 @@ impl MetricsRegistry {
             self.querylog_dropped.load(Ordering::Relaxed)
         );
 
-        // 19. sito_build_info
+        // 19. Stats retention / rollup cleanup
+        out.push_str("# HELP sito_stats_retention_last_success_seconds Unix timestamp of the last successful stats retention sweep\n");
+        out.push_str("# TYPE sito_stats_retention_last_success_seconds gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_retention_last_success_seconds {}",
+            self.stats_retention_last_success_seconds
+                .load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP sito_stats_retention_last_failure_seconds Unix timestamp of the last failed stats retention sweep\n");
+        out.push_str("# TYPE sito_stats_retention_last_failure_seconds gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_retention_last_failure_seconds {}",
+            self.stats_retention_last_failure_seconds
+                .load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP sito_stats_retention_last_duration_millis Duration of the last stats retention sweep\n");
+        out.push_str("# TYPE sito_stats_retention_last_duration_millis gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_retention_last_duration_millis {}",
+            self.stats_retention_last_duration_millis
+                .load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP sito_stats_retention_deleted_rows_total Detailed query-log rows deleted by retention\n");
+        out.push_str("# TYPE sito_stats_retention_deleted_rows_total counter\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_retention_deleted_rows_total {}",
+            self.stats_retention_deleted_rows_total
+                .load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP sito_stats_retention_rollup_deleted_rows_total Expired hourly rollup rows deleted by retention\n");
+        out.push_str("# TYPE sito_stats_retention_rollup_deleted_rows_total counter\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_retention_rollup_deleted_rows_total {}",
+            self.stats_retention_rollup_deleted_rows_total
+                .load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP sito_stats_retention_failures_total Failed stats retention sweeps\n");
+        out.push_str("# TYPE sito_stats_retention_failures_total counter\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_retention_failures_total {}",
+            self.stats_retention_failures_total.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP sito_stats_rollup_retention_days Configured hourly rollup retention in days\n",
+        );
+        out.push_str("# TYPE sito_stats_rollup_retention_days gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_rollup_retention_days {}",
+            self.stats_rollup_retention_days.load(Ordering::Relaxed)
+        );
+
+        // 20. sito_build_info
         out.push_str("# HELP sito_build_info Build and version metadata\n");
         out.push_str("# TYPE sito_build_info gauge\n");
         let _ = writeln!(
@@ -1655,6 +1766,27 @@ sito_ha_startup_noop_total{role="master",reason="replication_disabled"} 1
 # HELP sito_querylog_dropped_total Total query log entries dropped due to buffer overflow
 # TYPE sito_querylog_dropped_total counter
 sito_querylog_dropped_total 1
+# HELP sito_stats_retention_last_success_seconds Unix timestamp of the last successful stats retention sweep
+# TYPE sito_stats_retention_last_success_seconds gauge
+sito_stats_retention_last_success_seconds 0
+# HELP sito_stats_retention_last_failure_seconds Unix timestamp of the last failed stats retention sweep
+# TYPE sito_stats_retention_last_failure_seconds gauge
+sito_stats_retention_last_failure_seconds 0
+# HELP sito_stats_retention_last_duration_millis Duration of the last stats retention sweep
+# TYPE sito_stats_retention_last_duration_millis gauge
+sito_stats_retention_last_duration_millis 0
+# HELP sito_stats_retention_deleted_rows_total Detailed query-log rows deleted by retention
+# TYPE sito_stats_retention_deleted_rows_total counter
+sito_stats_retention_deleted_rows_total 0
+# HELP sito_stats_retention_rollup_deleted_rows_total Expired hourly rollup rows deleted by retention
+# TYPE sito_stats_retention_rollup_deleted_rows_total counter
+sito_stats_retention_rollup_deleted_rows_total 0
+# HELP sito_stats_retention_failures_total Failed stats retention sweeps
+# TYPE sito_stats_retention_failures_total counter
+sito_stats_retention_failures_total 0
+# HELP sito_stats_rollup_retention_days Configured hourly rollup retention in days
+# TYPE sito_stats_rollup_retention_days gauge
+sito_stats_rollup_retention_days 0
 # HELP sito_build_info Build and version metadata
 # TYPE sito_build_info gauge
 sito_build_info{version="1.0.0",commit="abc1234"} 1

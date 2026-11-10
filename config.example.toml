@@ -107,6 +107,10 @@ token_default_ttl_days = 90
 
 [stats]
 retention_days = 90
+# Hourly rollups keep aggregate totals and top domains; client IPs are stored
+# as keyed BLAKE3 hashes and names are omitted unless explicitly enabled.
+rollup_retention_days = 365
+rollup_client_names = false
 
 [privacy]
 anonymize_querylog = false

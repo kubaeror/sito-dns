@@ -346,7 +346,7 @@ async fn get_upstreams_list(ctx: &ServerContext) -> Vec<UpstreamViewItem> {
     let statuses = ctx.upstream.statuses().await;
     let stats = ctx
         .stats_db
-        .get_upstream_stats(86_400_000)
+        .get_upstream_stats_cached(86_400_000)
         .await
         .unwrap_or_default();
 
@@ -395,7 +395,7 @@ pub async fn dashboard_page(State(ctx): State<ServerContext>, headers: HeaderMap
 
     let stats = ctx
         .stats_db
-        .get_global_stats(86_400_000)
+        .get_global_stats_cached(86_400_000)
         .await
         .unwrap_or_default();
     let status = get_status_response(&ctx);
@@ -405,7 +405,7 @@ pub async fn dashboard_page(State(ctx): State<ServerContext>, headers: HeaderMap
 
     let hourly = ctx
         .stats_db
-        .get_hourly_activity(24)
+        .get_hourly_activity_cached(24)
         .await
         .unwrap_or_default();
     let times: Vec<i64> = hourly.iter().map(|h| h.timestamp_sec).collect();
@@ -445,7 +445,7 @@ pub async fn dashboard_stats_partial(
 
     let stats = ctx
         .stats_db
-        .get_global_stats(86_400_000)
+        .get_global_stats_cached(86_400_000)
         .await
         .unwrap_or_default();
     let status = get_status_response(&ctx);
@@ -499,6 +499,8 @@ async fn fetch_query_rows(ctx: &ServerContext, p: &QueryLogParams) -> Vec<QueryL
         to: None,
         cursor: None,
         limit: Some(50),
+        // Live 3 s polling must not run a filtered COUNT(*) over query_log.
+        include_total: Some(false),
     };
 
     let page_res = ctx.stats_db.query_logs(&filter).await;

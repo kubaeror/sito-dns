@@ -2462,6 +2462,18 @@
               ],
               "minimum": 0
             }
+          },
+          {
+            "name": "include_total",
+            "in": "query",
+            "description": "Defaults to `true` for API compatibility. The live UI refresh passes\n`false` so the 3 s poll does not run a whole-table `COUNT(*)`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -2498,6 +2510,17 @@
           "QueryLog"
         ],
         "operationId": "delete_querylog",
+        "parameters": [
+          {
+            "name": "keep_aggregates",
+            "in": "query",
+            "description": "Preserve `stats_hourly` rollups (the old “fold into aggregates”\nbehavior). Defaults to `false`: both detailed rows and rollups are\nerased.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Query log cleared successfully",
@@ -4372,6 +4395,13 @@
               "null"
             ],
             "format": "int64"
+          },
+          "include_total": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether to run the `COUNT(*)` used for `total_count`. Defaults to\n`true` for API compatibility; the live UI refresh sets it to `false`\nso the 3 s poll does not scan the filtered table."
           },
           "limit": {
             "type": [

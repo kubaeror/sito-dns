@@ -2,13 +2,15 @@
 
 use crate::entry::QueryLogEntry;
 use crate::error::StatsError;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Pool, Row, Sqlite, SqliteConnection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use utoipa::ToSchema;
 
@@ -26,6 +28,24 @@ const ROLLUP_TOP_N: usize = 100;
 /// vacuumed. `VACUUM` rewrites the whole file, so it is only worth running
 /// after a meaningful amount of data was freed.
 const VACUUM_MIN_DELETED_ROWS: u64 = 1_000;
+
+/// Number of hour buckets processed per retention batch. Each hour is folded
+/// into `stats_hourly` and deleted in its own short transaction, so a large
+/// first sweep never holds the SQLite write lock for the whole backlog.
+const RETENTION_HOURS_PER_BATCH: usize = 24;
+
+/// Prefix for keyed BLAKE3 client identifiers stored in `stats_hourly`.
+const ROLLUP_HASH_PREFIX: &str = "b3:";
+
+/// Per-install salt file name under the stats data directory.
+const SALT_FILE_NAME: &str = "stats-salt";
+
+/// How long dashboard aggregates may be served from memory before a fresh
+/// scan is allowed. Keeps 5 s UI polling from repeatedly scanning SQLite.
+const DASHBOARD_CACHE_TTL: Duration = Duration::from_secs(45);
+
+/// Rows per transaction in the one-time legacy rollup PII backfill.
+const ROLLUP_PII_BACKFILL_BATCH: i64 = 1_000;
 
 /// Bounded per-hour rollup payloads extracted from rows about to be pruned.
 #[derive(Default)]
@@ -153,6 +173,10 @@ pub struct QueryLogFilter {
     pub to: Option<i64>,
     pub cursor: Option<i64>,
     pub limit: Option<usize>,
+    /// Whether to run the `COUNT(*)` used for `total_count`. Defaults to
+    /// `true` for API compatibility; the live UI refresh sets it to `false`
+    /// so the 3 s poll does not scan the filtered table.
+    pub include_total: Option<bool>,
 }
 
 /// Paginated page of query logs.
@@ -198,8 +222,43 @@ pub struct UpstreamStats {
 /// Retention pruning report.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct RetentionReport {
+    /// Hourly buckets folded into `stats_hourly` by this sweep.
     pub aggregated_hours: usize,
+    /// Detailed query-log rows deleted by this sweep.
     pub deleted_records: u64,
+    /// Expired `stats_hourly` rows deleted by rollup retention.
+    #[serde(default)]
+    pub rollup_deleted_records: u64,
+    /// Number of short retention transactions/batches committed.
+    #[serde(default)]
+    pub chunks: usize,
+}
+
+/// Cached dashboard aggregates. Each entry is keyed by the requested window
+/// and expires after [`DASHBOARD_CACHE_TTL`].
+#[derive(Default)]
+struct StatsCache {
+    global: Mutex<Option<CachedGlobal>>,
+    hourly: Mutex<Option<CachedHourly>>,
+    upstream: Mutex<Option<CachedUpstream>>,
+}
+
+struct CachedGlobal {
+    window_ms: i64,
+    at: Instant,
+    value: GlobalStats,
+}
+
+struct CachedHourly {
+    hours: u32,
+    at: Instant,
+    value: Vec<HourlyActivity>,
+}
+
+struct CachedUpstream {
+    window_ms: i64,
+    at: Instant,
+    value: Vec<UpstreamStats>,
 }
 
 /// SQLite database client managing WAL connections, migrations, and queries.
@@ -207,6 +266,12 @@ pub struct RetentionReport {
 pub struct StatsDb {
     pool: Pool<Sqlite>,
     db_path: Option<PathBuf>,
+    /// Per-install key for hashing rollup client identifiers.
+    salt: Arc<[u8; 32]>,
+    /// Default policy used by the compatibility retention wrapper and
+    /// one-time rollup backfill.
+    rollup_client_names: bool,
+    cache: Arc<StatsCache>,
 }
 
 /// Builds the shared `query_log` filter predicate used by both the page query
@@ -256,11 +321,12 @@ fn filtered_query(base: &str, filter: &QueryLogFilter) -> sqlx::QueryBuilder<Sql
 /// `hour -> (top_domains, top_clients, top_upstreams)`.
 type ExistingRollups = HashMap<i64, (Option<String>, Option<String>, Option<String>)>;
 
-/// Extracts bounded per-hour top lists for the rows below `cutoff` inside the
-/// retention transaction.
+/// Extracts bounded per-hour top lists for the rows in `[start, end)` inside
+/// the retention transaction.
 async fn collect_hour_rollups(
     conn: &mut SqliteConnection,
-    cutoff: i64,
+    start: i64,
+    end: i64,
     rollups: &mut HashMap<i64, HourRollup>,
 ) -> Result<(), StatsError> {
     let limit = i64::try_from(ROLLUP_TOP_N).unwrap_or(100);
@@ -285,13 +351,14 @@ async fn collect_hour_rollups(
                     ORDER BY SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) DESC, qname ASC
                 ) AS rn_blocked
             FROM query_log
-            WHERE ts < ?
+            WHERE ts >= ? AND ts < ?
             GROUP BY (ts / 3600000) * 3600000, qname
         )
         WHERE rn_total <= ? OR rn_blocked <= ?
         ",
     )
-    .bind(cutoff)
+    .bind(start)
+    .bind(end)
     .bind(limit)
     .bind(limit)
     .fetch_all(&mut *conn)
@@ -322,13 +389,14 @@ async fn collect_hour_rollups(
                     ORDER BY COUNT(*) DESC, client_ip ASC
                 ) AS rn
             FROM query_log
-            WHERE ts < ?
+            WHERE ts >= ? AND ts < ?
             GROUP BY (ts / 3600000) * 3600000, client_ip
         )
         WHERE rn <= ?
         ",
     )
-    .bind(cutoff)
+    .bind(start)
+    .bind(end)
     .bind(limit)
     .fetch_all(&mut *conn)
     .await?;
@@ -359,13 +427,14 @@ async fn collect_hour_rollups(
                     ORDER BY COUNT(*) DESC, upstream ASC
                 ) AS rn
             FROM query_log
-            WHERE ts < ? AND upstream IS NOT NULL
+            WHERE ts >= ? AND ts < ? AND upstream IS NOT NULL
             GROUP BY (ts / 3600000) * 3600000, upstream
         )
         WHERE rn <= ?
         ",
     )
-    .bind(cutoff)
+    .bind(start)
+    .bind(end)
     .bind(limit)
     .fetch_all(&mut *conn)
     .await?;
@@ -421,18 +490,110 @@ async fn load_existing_rollups(
     Ok(existing)
 }
 
+fn random_salt() -> [u8; 32] {
+    let mut salt = [0u8; 32];
+    rand::rng().fill(&mut salt);
+    salt
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path) -> Result<(), StatsError> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(_) => {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path) -> Result<(), StatsError> {
+    Ok(())
+}
+
+/// Loads the per-install 32-byte salt, creating it atomically with mode 0600
+/// when it does not exist. A short/corrupt salt is a hard error: regenerating
+/// it would silently change every stored rollup hash.
+fn load_or_create_salt(directory: &Path) -> Result<[u8; 32], StatsError> {
+    use std::io::Write;
+
+    let path = directory.join(SALT_FILE_NAME);
+    std::fs::create_dir_all(directory)?;
+
+    #[cfg(unix)]
+    let mut options = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.mode(0o600);
+        options
+    };
+    #[cfg(not(unix))]
+    let mut options = std::fs::OpenOptions::new();
+
+    match options.write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            let salt = random_salt();
+            file.write_all(&salt)?;
+            file.sync_all()?;
+            set_private_permissions(&path)?;
+            Ok(salt)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Repair permissions on an existing file before reading it.
+            set_private_permissions(&path)?;
+            let bytes = std::fs::read(&path)?;
+            let salt: [u8; 32] = bytes.try_into().map_err(|_| {
+                StatsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "stats salt '{}' must contain exactly 32 bytes",
+                        path.display()
+                    ),
+                ))
+            })?;
+            Ok(salt)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl StatsDb {
     /// Returns a reference to the underlying SQLite connection pool.
     pub fn pool(&self) -> &Pool<Sqlite> {
         &self.pool
     }
 
+    /// Hashes a client identifier for storage in `stats_hourly`.
+    ///
+    /// Already-hashed values are returned unchanged so re-merging a rollup does
+    /// not hash twice. The keyed BLAKE3 digest is not reversible without the
+    /// per-install salt.
+    fn hash_client_ip(&self, client_ip: &str) -> String {
+        if client_ip.starts_with(ROLLUP_HASH_PREFIX) {
+            return client_ip.to_string();
+        }
+        let mut hasher = blake3::Hasher::new_keyed(self.salt.as_ref());
+        hasher.update(client_ip.as_bytes());
+        format!("{ROLLUP_HASH_PREFIX}{}", hasher.finalize().to_hex())
+    }
+
     /// Opens or creates an in-memory SQLite database (primarily for testing).
     pub async fn in_memory() -> Result<Self, StatsError> {
+        Self::in_memory_with_rollup_client_names(false).await
+    }
+
+    /// In-memory database with an explicit rollup client-name policy.
+    pub async fn in_memory_with_rollup_client_names(
+        rollup_client_names: bool,
+    ) -> Result<Self, StatsError> {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")?
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(Duration::from_secs(5))
+            .pragma("secure_delete", "ON");
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -442,24 +603,41 @@ impl StatsDb {
         let db = Self {
             pool,
             db_path: None,
+            salt: Arc::new(random_salt()),
+            rollup_client_names,
+            cache: Arc::new(StatsCache::default()),
         };
         db.run_migrations().await?;
+        db.backfill_rollup_pii().await?;
         Ok(db)
     }
 
     /// Opens or creates a SQLite database on disk in WAL mode.
     pub async fn open(db_path: impl AsRef<Path>) -> Result<Self, StatsError> {
+        Self::open_with_rollup_client_names(db_path, false).await
+    }
+
+    /// Opens or creates a SQLite database on disk with an explicit rollup
+    /// client-name policy. The per-install salt lives next to the database as
+    /// `<data_dir>/stats-salt`.
+    pub async fn open_with_rollup_client_names(
+        db_path: impl AsRef<Path>,
+        rollup_client_names: bool,
+    ) -> Result<Self, StatsError> {
         let path = db_path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
+        let directory = path
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        tokio::fs::create_dir_all(&directory).await?;
+        let salt = load_or_create_salt(&directory)?;
 
         let options = SqliteConnectOptions::new()
             .filename(&path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(Duration::from_secs(10));
+            .busy_timeout(Duration::from_secs(10))
+            .pragma("secure_delete", "ON");
 
         let pool = SqlitePoolOptions::new()
             .max_connections(10)
@@ -469,17 +647,153 @@ impl StatsDb {
         let db = Self {
             pool,
             db_path: Some(path),
+            salt: Arc::new(salt),
+            rollup_client_names,
+            cache: Arc::new(StatsCache::default()),
         };
         db.run_migrations().await?;
+        db.repair_permissions()?;
+        db.backfill_rollup_pii().await?;
         Ok(db)
     }
 
-    /// Runs embedded SQL migrations.
+    /// Runs embedded SQL migrations followed by idempotent additive schema
+    /// changes.
     pub async fn run_migrations(&self) -> Result<(), StatsError> {
         sqlx::migrate!("./migrations")
             .run(&self.pool)
             .await
             .map_err(StatsError::Migration)?;
+        self.ensure_additive_schema().await
+    }
+
+    /// Applies additive tables that old 1.9.3 binaries can ignore.
+    ///
+    /// This deliberately does **not** use a new sqlx migration file: an old
+    /// binary's embedded migrator rejects `_sqlx_migrations` rows whose version
+    /// it does not know (`VersionMissing`). Running idempotent DDL instead
+    /// keeps the database openable by 1.9.3 while new code gets the table.
+    async fn ensure_additive_schema(&self) -> Result<(), StatsError> {
+        sqlx::query(
+            r"
+            CREATE TABLE IF NOT EXISTS stats_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            ",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Repairs permissions on the database file and WAL/SHM sidecars so a
+    /// pre-existing loose `stats.db` cannot leak query history to other local
+    /// users. No-op for in-memory databases.
+    pub fn repair_permissions(&self) -> Result<(), StatsError> {
+        let Some(ref path) = self.db_path else {
+            return Ok(());
+        };
+        for suffix in ["", "-wal", "-shm"] {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            set_private_permissions(Path::new(&candidate))?;
+        }
+        Ok(())
+    }
+
+    /// One-time backfill for rollups written by older versions: hash raw
+    /// client identifiers and drop client names unless explicitly enabled.
+    /// Idempotent via the `rollup_pii_v1` marker in `stats_meta`.
+    async fn backfill_rollup_pii(&self) -> Result<(), StatsError> {
+        let done: Option<String> =
+            sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'rollup_pii_v1'")
+                .fetch_optional(&self.pool)
+                .await?;
+        if done.as_deref() == Some("1") {
+            return Ok(());
+        }
+
+        // Process in bounded batches so a large legacy rollup table does not
+        // hold one long write transaction during startup. The operation is
+        // idempotent, so a crash before the marker simply re-runs it.
+        let mut last_hour = i64::MIN;
+        loop {
+            let rows = sqlx::query(
+                "SELECT hour, top_clients FROM stats_hourly \
+                 WHERE hour > ? AND top_clients IS NOT NULL AND top_clients != '[]' \
+                 ORDER BY hour ASC LIMIT ?",
+            )
+            .bind(last_hour)
+            .bind(ROLLUP_PII_BACKFILL_BATCH)
+            .fetch_all(&self.pool)
+            .await?;
+            if rows.is_empty() {
+                break;
+            }
+
+            let mut tx = self.pool.begin().await?;
+            for row in &rows {
+                let hour: i64 = row.get("hour");
+                last_hour = last_hour.max(hour);
+                let raw: Option<String> = row.get("top_clients");
+                let Some(raw) = raw else { continue };
+                let Ok(clients) = serde_json::from_str::<Vec<ClientTop>>(&raw) else {
+                    // Preserve an unparseable payload rather than silently
+                    // deleting data; the next writer merge replaces it.
+                    continue;
+                };
+                let transformed: Vec<ClientTop> = clients
+                    .into_iter()
+                    .map(|(client_ip, client_name, total, blocked, last_seen)| {
+                        (
+                            self.hash_client_ip(&client_ip),
+                            if self.rollup_client_names {
+                                client_name
+                            } else {
+                                None
+                            },
+                            total,
+                            blocked,
+                            last_seen,
+                        )
+                    })
+                    .collect();
+                sqlx::query("UPDATE stats_hourly SET top_clients = ? WHERE hour = ?")
+                    .bind(encode_tops(&transformed))
+                    .bind(hour)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO stats_meta (key, value) VALUES ('rollup_pii_v1', '1') \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Timestamp (unix millis) of the last successful retention sweep, if any.
+    pub async fn retention_last_success_ms(&self) -> Result<Option<i64>, StatsError> {
+        let value: Option<String> =
+            sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'retention_last_success'")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(value.and_then(|raw| raw.parse::<i64>().ok()))
+    }
+
+    async fn record_retention_success(&self, now_ms: i64) -> Result<(), StatsError> {
+        sqlx::query(
+            "INSERT INTO stats_meta (key, value) VALUES ('retention_last_success', ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(now_ms.to_string())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -528,12 +842,19 @@ impl StatsDb {
         let fetch_limit = limit + 1;
 
         // `total_count` counts every row matching the filters regardless of the
-        // cursor, so it stays stable while paging.
-        let mut count_builder = filtered_query("SELECT COUNT(*) FROM query_log WHERE 1=1", filter);
-        let total_count: i64 = count_builder
-            .build_query_scalar()
-            .fetch_one(&self.pool)
-            .await?;
+        // cursor, so it stays stable while paging. It is optional because the
+        // live UI refresh must not run a whole-table count every few seconds.
+        let total_count = if filter.include_total.unwrap_or(true) {
+            let mut count_builder =
+                filtered_query("SELECT COUNT(*) FROM query_log WHERE 1=1", filter);
+            let total: i64 = count_builder
+                .build_query_scalar()
+                .fetch_one(&self.pool)
+                .await?;
+            Some(total)
+        } else {
+            None
+        };
 
         let mut builder = filtered_query(
             "SELECT id, ts, client_ip, client_name, qname, qtype, rcode, verdict, rule, list_source, upstream, elapsed_us, dnssec, proto FROM query_log WHERE 1=1",
@@ -595,16 +916,71 @@ impl StatsDb {
         Ok(QueryLogPage {
             entries,
             next_cursor,
-            total_count: Some(total_count),
+            total_count,
         })
     }
 
-    /// Deletes all entries from the query log after folding them into the
-    /// hourly rollups, so clearing the log does not silently reset the
-    /// statistics totals.
+    /// Deletes the query log and hourly rollups. This is the default
+    /// “clear query log” behavior: identifiable browsing history is erased
+    /// from both detailed and aggregate storage.
     pub async fn delete_query_logs(&self) -> Result<u64, StatsError> {
-        let report = self.rollup_and_delete(i64::MAX).await?;
-        Ok(report.deleted_records)
+        self.delete_query_logs_with_options(false).await
+    }
+
+    /// Clears the detailed query log while folding its rows into hourly
+    /// rollups. Used by the explicit `--keep-aggregates`/`keep_aggregates`
+    /// opt-in.
+    pub async fn delete_query_logs_keep_aggregates(&self) -> Result<u64, StatsError> {
+        self.delete_query_logs_with_options(true).await
+    }
+
+    /// Clears the query log, optionally preserving aggregate rollups.
+    ///
+    /// A large clear is followed by `VACUUM` (and a WAL truncate) so deleted
+    /// pages do not remain readable in free space or grow the file forever.
+    /// `secure_delete=ON` is set on every connection so overwritten/deleted
+    /// content is zeroed by SQLite as well.
+    pub async fn delete_query_logs_with_options(
+        &self,
+        keep_aggregates: bool,
+    ) -> Result<u64, StatsError> {
+        self.delete_query_logs_with_policy(keep_aggregates, self.rollup_client_names)
+            .await
+    }
+
+    /// Clears the query log with an explicit rollup client-name policy (the
+    /// API passes the live configuration so a hot-reloaded setting applies).
+    pub async fn delete_query_logs_with_policy(
+        &self,
+        keep_aggregates: bool,
+        rollup_client_names: bool,
+    ) -> Result<u64, StatsError> {
+        let deleted = if keep_aggregates {
+            let report = self
+                .rollup_and_delete_range(i64::MIN, i64::MAX, rollup_client_names)
+                .await?;
+            report.deleted_records
+        } else {
+            let deleted = sqlx::query("DELETE FROM query_log")
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+            sqlx::query("DELETE FROM stats_hourly")
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("DELETE FROM stats_watermark WHERE key = 'hourly_aggregation'")
+                .execute(&self.pool)
+                .await?;
+            deleted
+        };
+
+        self.invalidate_stats_cache();
+        if deleted >= VACUUM_MIN_DELETED_ROWS
+            && let Err(e) = self.vacuum().await
+        {
+            tracing::warn!(error = %e, "stats clear vacuum failed");
+        }
+        Ok(deleted)
     }
 
     /// Computes global aggregates for a specified time window in milliseconds.
@@ -709,6 +1085,127 @@ impl StatsDb {
             top_blocked_domains,
             top_clients,
         })
+    }
+
+    /// Invalidates all cached dashboard aggregates. Called after clear and
+    /// retention so the next dashboard poll reflects the deleted history.
+    pub fn invalidate_stats_cache(&self) {
+        let mut global = self
+            .cache
+            .global
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *global = None;
+        drop(global);
+        let mut hourly = self
+            .cache
+            .hourly
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *hourly = None;
+        drop(hourly);
+        let mut upstream = self
+            .cache
+            .upstream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *upstream = None;
+    }
+
+    /// Dashboard global statistics served from a short-lived cache.
+    pub async fn get_global_stats_cached(&self, window_ms: i64) -> Result<GlobalStats, StatsError> {
+        {
+            let guard = self
+                .cache
+                .global
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = guard.as_ref()
+                && cached.window_ms == window_ms
+                && cached.at.elapsed() < DASHBOARD_CACHE_TTL
+            {
+                return Ok(cached.value.clone());
+            }
+        }
+
+        let value = self.get_global_stats(window_ms).await?;
+        let mut guard = self
+            .cache
+            .global
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(CachedGlobal {
+            window_ms,
+            at: Instant::now(),
+            value: value.clone(),
+        });
+        Ok(value)
+    }
+
+    /// Dashboard per-upstream statistics served from a short-lived cache.
+    pub async fn get_upstream_stats_cached(
+        &self,
+        window_ms: i64,
+    ) -> Result<Vec<UpstreamStats>, StatsError> {
+        {
+            let guard = self
+                .cache
+                .upstream
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = guard.as_ref()
+                && cached.window_ms == window_ms
+                && cached.at.elapsed() < DASHBOARD_CACHE_TTL
+            {
+                return Ok(cached.value.clone());
+            }
+        }
+
+        let value = self.get_upstream_stats(window_ms).await?;
+        let mut guard = self
+            .cache
+            .upstream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(CachedUpstream {
+            window_ms,
+            at: Instant::now(),
+            value: value.clone(),
+        });
+        Ok(value)
+    }
+
+    /// Dashboard hourly activity served from a short-lived cache.
+    pub async fn get_hourly_activity_cached(
+        &self,
+        hours: u32,
+    ) -> Result<Vec<HourlyActivity>, StatsError> {
+        {
+            let guard = self
+                .cache
+                .hourly
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = guard.as_ref()
+                && cached.hours == hours
+                && cached.at.elapsed() < DASHBOARD_CACHE_TTL
+            {
+                return Ok(cached.value.clone());
+            }
+        }
+
+        let value = self.get_hourly_activity(hours).await?;
+        let mut guard = self
+            .cache
+            .hourly
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(CachedHourly {
+            hours,
+            at: Instant::now(),
+            value: value.clone(),
+        });
+        Ok(value)
     }
 
     /// Computes per-client statistics, bounded to [`MAX_AGGREGATE_ROWS`] rows
@@ -1117,12 +1614,13 @@ impl StatsDb {
     /// Aggregates older logs into `stats_hourly` and prunes query logs older
     /// than the retention period.
     ///
-    /// The aggregate read, the rollup upsert, the watermark update and the
-    /// delete all run in a single `BEGIN IMMEDIATE` transaction. Producers
-    /// cannot interleave a (possibly backdated) insert between the read and the
-    /// delete, so no pruned row can be deleted without being aggregated.
-    /// Because deleted rows no longer exist, the watermark is not used to skip
-    /// rows: every row below the cutoff is aggregated exactly once.
+    /// Each expired hour is processed in its own short `BEGIN IMMEDIATE`
+    /// transaction, so a large backlog cannot hold the writer lock for the
+    /// whole sweep. Inside a chunk the aggregate read, rollup upsert, watermark
+    /// update and delete share one transaction: producers cannot interleave a
+    /// (possibly backdated) insert between the read and the delete, so no
+    /// pruned row can be deleted without being aggregated. Because deleted rows
+    /// no longer exist, the watermark is not used to skip rows.
     ///
     /// After a sweep that removed at least [`VACUUM_MIN_DELETED_ROWS`] rows the
     /// database is vacuumed, so pages freed by retention are returned to the OS
@@ -1131,13 +1629,92 @@ impl StatsDb {
         &self,
         retention_days: u32,
     ) -> Result<RetentionReport, StatsError> {
+        // Compatibility wrapper: prune detailed rows only. The server calls
+        // `cleanup_retention_with_policy` with the configured rollup retention.
+        self.cleanup_retention_inner(retention_days, None, self.rollup_client_names)
+            .await
+    }
+
+    /// Full retention sweep with explicit rollup policy.
+    ///
+    /// Detailed query-log rows are processed in bounded hour buckets, each in
+    /// its own short `BEGIN IMMEDIATE` transaction. Expired `stats_hourly`
+    /// rows (and therefore their domains and hashed client identifiers) are
+    /// removed separately according to `rollup_retention_days`.
+    pub async fn cleanup_retention_with_policy(
+        &self,
+        retention_days: u32,
+        rollup_retention_days: u32,
+        rollup_client_names: bool,
+    ) -> Result<RetentionReport, StatsError> {
+        self.cleanup_retention_inner(
+            retention_days,
+            Some(rollup_retention_days),
+            rollup_client_names,
+        )
+        .await
+    }
+
+    async fn cleanup_retention_inner(
+        &self,
+        retention_days: u32,
+        rollup_retention_days: Option<u32>,
+        rollup_client_names: bool,
+    ) -> Result<RetentionReport, StatsError> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let retention_ms = i64::from(retention_days) * 24 * 3600 * 1000;
         let cutoff = now_ms.saturating_sub(retention_ms);
+        let batch_limit = i64::try_from(RETENTION_HOURS_PER_BATCH).unwrap_or(24);
 
-        let report = self.rollup_and_delete(cutoff).await?;
+        let mut report = RetentionReport::default();
 
-        if report.deleted_records >= VACUUM_MIN_DELETED_ROWS
+        // Discover a bounded set of expired hour buckets, process each in its
+        // own transaction, then repeat. This keeps both memory and the write
+        // lock duration bounded even for a multi-year backlog.
+        loop {
+            let hours = sqlx::query(
+                r"
+                SELECT (ts / 3600000) * 3600000 AS hour
+                FROM query_log
+                WHERE ts < ?
+                GROUP BY hour
+                ORDER BY hour ASC
+                LIMIT ?
+                ",
+            )
+            .bind(cutoff)
+            .bind(batch_limit)
+            .fetch_all(&self.pool)
+            .await?;
+
+            if hours.is_empty() {
+                break;
+            }
+
+            for row in hours {
+                let hour: i64 = row.get("hour");
+                let end = hour.saturating_add(3_600_000).min(cutoff);
+                if end <= hour {
+                    continue;
+                }
+                let chunk = self
+                    .rollup_and_delete_range(hour, end, rollup_client_names)
+                    .await?;
+                report.aggregated_hours += chunk.aggregated_hours;
+                report.deleted_records += chunk.deleted_records;
+                report.chunks += 1;
+            }
+        }
+
+        if let Some(rollup_days) = rollup_retention_days {
+            report.rollup_deleted_records =
+                self.delete_expired_rollups(rollup_days, now_ms).await?;
+        }
+
+        let total_deleted = report
+            .deleted_records
+            .saturating_add(report.rollup_deleted_records);
+        if total_deleted >= VACUUM_MIN_DELETED_ROWS
             && let Err(e) = self.vacuum().await
         {
             // Rollup and delete already committed; a failed compaction must not
@@ -1145,22 +1722,61 @@ impl StatsDb {
             tracing::warn!(error = %e, "stats retention vacuum failed");
         }
 
+        self.invalidate_stats_cache();
+        self.record_retention_success(now_ms).await?;
         Ok(report)
     }
 
-    /// Folds every row below `cutoff` into `stats_hourly` and deletes exactly
-    /// those rows in one transaction. [`Self::delete_query_logs`] reuses it with
-    /// `cutoff = i64::MAX` so clearing the log preserves aggregate history.
-    async fn rollup_and_delete(&self, cutoff: i64) -> Result<RetentionReport, StatsError> {
+    /// Deletes expired hourly rollups in bounded autocommit batches.
+    async fn delete_expired_rollups(
+        &self,
+        rollup_retention_days: u32,
+        now_ms: i64,
+    ) -> Result<u64, StatsError> {
+        const ROLLUP_DELETE_BATCH: i64 = 1_000;
+        let retention_ms = i64::from(rollup_retention_days) * 24 * 3600 * 1000;
+        let cutoff = now_ms.saturating_sub(retention_ms);
+
+        let mut total = 0u64;
+        loop {
+            let deleted = sqlx::query(
+                r"
+                DELETE FROM stats_hourly
+                WHERE hour IN (
+                    SELECT hour FROM stats_hourly
+                    WHERE hour + 3600000 <= ?
+                    ORDER BY hour ASC
+                    LIMIT ?
+                )
+                ",
+            )
+            .bind(cutoff)
+            .bind(ROLLUP_DELETE_BATCH)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            total = total.saturating_add(deleted);
+            if deleted == 0 {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Folds every row in `[start, end)` into `stats_hourly` and deletes
+    /// exactly those rows in one short transaction. Keeping the aggregate
+    /// read and delete in the same transaction prevents a concurrent
+    /// (possibly backdated) insert from being deleted without aggregation.
+    async fn rollup_and_delete_range(
+        &self,
+        start: i64,
+        end: i64,
+        rollup_client_names: bool,
+    ) -> Result<RetentionReport, StatsError> {
         // `BEGIN IMMEDIATE` takes the write lock up front so concurrent writers
         // wait instead of failing the aggregate/delete with `SQLITE_BUSY`.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
-        // Aggregate hourly buckets for every entry below the cutoff. The
-        // previous implementation filtered by `id > watermark_id`, which lost
-        // rows whose timestamp (and therefore id order) was inverted by
-        // concurrent producers. Aggregating and deleting the exact same
-        // predicate inside one transaction makes ordering irrelevant.
         let hours_to_aggregate = sqlx::query(
             r"
             SELECT
@@ -1171,11 +1787,12 @@ impl StatsDb {
                 MAX(id) as max_id,
                 MAX(ts) as max_ts
             FROM query_log
-            WHERE ts < ?
+            WHERE ts >= ? AND ts < ?
             GROUP BY hour
             ",
         )
-        .bind(cutoff)
+        .bind(start)
+        .bind(end)
         .fetch_all(&mut *tx)
         .await?;
 
@@ -1185,7 +1802,7 @@ impl StatsDb {
             .collect();
         let mut rollups: HashMap<i64, HourRollup> = HashMap::new();
         if !affected_hours.is_empty() {
-            collect_hour_rollups(&mut tx, cutoff, &mut rollups).await?;
+            collect_hour_rollups(&mut tx, start, end, &mut rollups).await?;
         }
         let existing_rollups = load_existing_rollups(&mut tx, &affected_hours).await?;
 
@@ -1210,6 +1827,24 @@ impl StatsDb {
             let mut rollup = rollups.remove(&hour).unwrap_or_default();
             let (existing_domains, existing_clients, existing_upstreams) =
                 existing_rollups.get(&hour).cloned().unwrap_or_default();
+
+            // Rollups never store raw client identifiers. Hash incoming IPs
+            // with the per-install key and re-hash/neutralize any legacy value
+            // that predates the one-time backfill.
+            for client in &mut rollup.clients {
+                client.0 = self.hash_client_ip(&client.0);
+                if !rollup_client_names {
+                    client.1 = None;
+                }
+            }
+            let mut existing_clients: Vec<ClientTop> = decode_tops(existing_clients.as_deref());
+            for client in &mut existing_clients {
+                client.0 = self.hash_client_ip(&client.0);
+                if !rollup_client_names {
+                    client.1 = None;
+                }
+            }
+
             rollup.domains = merge_domain_tops(
                 decode_tops(existing_domains.as_deref()),
                 rollup.domains,
@@ -1218,11 +1853,7 @@ impl StatsDb {
                 // when it ranks below the total-query top-N.
                 ROLLUP_TOP_N * 2,
             );
-            rollup.clients = merge_client_tops(
-                decode_tops(existing_clients.as_deref()),
-                rollup.clients,
-                ROLLUP_TOP_N,
-            );
+            rollup.clients = merge_client_tops(existing_clients, rollup.clients, ROLLUP_TOP_N);
             rollup.upstreams = merge_upstream_tops(
                 decode_tops(existing_upstreams.as_deref()),
                 rollup.upstreams,
@@ -1257,8 +1888,9 @@ impl StatsDb {
 
         // Delete exactly the rows that were aggregated above (same predicate in
         // the same transaction).
-        let del_res = sqlx::query("DELETE FROM query_log WHERE ts < ?")
-            .bind(cutoff)
+        let del_res = sqlx::query("DELETE FROM query_log WHERE ts >= ? AND ts < ?")
+            .bind(start)
+            .bind(end)
             .execute(&mut *tx)
             .await?;
 
@@ -1286,6 +1918,8 @@ impl StatsDb {
         Ok(RetentionReport {
             aggregated_hours,
             deleted_records: del_res.rows_affected(),
+            rollup_deleted_records: 0,
+            chunks: 1,
         })
     }
 
@@ -1297,6 +1931,8 @@ impl StatsDb {
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .execute(&self.pool)
             .await?;
+        // SQLite may recreate the WAL/SHM sidecars during the checkpoint.
+        self.repair_permissions()?;
         Ok(())
     }
 

@@ -416,16 +416,32 @@ pub struct StatsConfig {
     /// retention sweep while still advertising query logging as enabled.
     #[serde(default = "default_retention_days", alias = "query_log_retention_days")]
     pub retention_days: u32,
+    /// Days to keep hourly rollups (aggregate totals, top domains and hashed
+    /// client identifiers) after detailed query-log rows are pruned.
+    ///
+    /// Rollup rows older than this are deleted. Must be at least 1.
+    #[serde(default = "default_rollup_retention_days")]
+    pub rollup_retention_days: u32,
+    /// Include client display names in hourly rollups. Disabled by default so
+    /// long-lived aggregates do not retain identifiable device labels.
+    #[serde(default)]
+    pub rollup_client_names: bool,
 }
 
 fn default_retention_days() -> u32 {
     90
 }
 
+fn default_rollup_retention_days() -> u32 {
+    365
+}
+
 impl Default for StatsConfig {
     fn default() -> Self {
         Self {
             retention_days: default_retention_days(),
+            rollup_retention_days: default_rollup_retention_days(),
+            rollup_client_names: false,
         }
     }
 }
@@ -436,6 +452,12 @@ impl StatsConfig {
             return Err(ConfigError::validation(
                 "stats.retention_days",
                 "retention_days must be greater than 0",
+            ));
+        }
+        if self.rollup_retention_days == 0 {
+            return Err(ConfigError::validation(
+                "stats.rollup_retention_days",
+                "rollup_retention_days must be greater than 0",
             ));
         }
         Ok(())
@@ -1961,6 +1983,29 @@ key = "/path/to/key.pem"
         );
         Config::from_toml_str(&format!("{TEST_BASE}[stats]\nretention_days = 1\n"))
             .expect("retention_days = 1 must be accepted");
+    }
+
+    /// P1-19: rollup retention/client-name keys are optional and safe by
+    /// default, and a zero rollup retention is rejected.
+    #[test]
+    fn test_stats_rollup_retention_defaults_and_validation() {
+        let default = Config::from_toml_str(&format!("{TEST_BASE}[stats]\nretention_days = 90\n"))
+            .expect("stats defaults must parse");
+        let stats = default.get_stats_config();
+        assert_eq!(stats.rollup_retention_days, 365);
+        assert!(!stats.rollup_client_names);
+
+        expect_validation_field(
+            &format!("{TEST_BASE}[stats]\nrollup_retention_days = 0\n"),
+            "stats.rollup_retention_days",
+        );
+        let configured = Config::from_toml_str(&format!(
+            "{TEST_BASE}[stats]\nrollup_retention_days = 30\nrollup_client_names = true\n"
+        ))
+        .expect("explicit rollup settings must parse");
+        let stats = configured.get_stats_config();
+        assert_eq!(stats.rollup_retention_days, 30);
+        assert!(stats.rollup_client_names);
     }
 
     /// Audit 6 / WP-6.5: `web.port = 0` requested an ephemeral port that

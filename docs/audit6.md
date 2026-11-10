@@ -12,8 +12,8 @@ Phase 1 and later ship in 2.0.0.
 > packages. P1-1's DNAME half remains open (the pinned hickory parser decodes
 > DNAME as unsupported `RData::Unknown`; validation fails closed; see the
 > residual-risk note). P1-19, P1-23, and P1-24 (stats
-> privacy/polling/retention) remain deferred to Phase 2 and are recorded as
-> residual risks in the [1.9.4 release notes](release-notes-1.9.4.md). P2/P3 documentation truth items
+> privacy/polling/retention) are also closed in this branch; see the
+> [1.9.4 release notes](release-notes-1.9.4.md#stats-privacy-retention-and-polling). P2/P3 documentation truth items
 > are addressed in 1.9.4; RouterOS remains experimental and 2.0 still owns the
 > structural refactor (config/validator/session/chain state machines). The
 > verdict and scorecard below describe the audited v1.9.3 tree, not 1.9.4.
@@ -99,8 +99,8 @@ is “how much of the stated feature is actually implemented?”
 P0 means deployment/security blocker; P1 means high severity. Detailed evidence
 and the fix plan live in the [full plan](audit6-followup-plan.md). The status
 column records the 1.9.4 safety-gate outcome. P1-19, P1-23, and P1-24 are
-explicitly deferred to Phase 2 and recorded as residual risks in the
-[1.9.4 release notes](release-notes-1.9.4.md#deferred-to-phase-2).
+closed by the deferred stats/privacy work; see the
+[1.9.4 release notes](release-notes-1.9.4.md#stats-privacy-retention-and-polling).
 
 ### P0 — release-blocking
 
@@ -131,12 +131,12 @@ explicitly deferred to Phase 2 and recorded as residual risks in the
 | P1-16 | Auth/UI | The setup wizard is re-openable by any Admin and can reset the admin password without the current password or TOTP. | **Fixed.** Wizard is bootstrap-only and returns 403 after setup, including for Admins. |
 | P1-17 | Installer | Live upgrade and rollback use `cp -f` over a running binary, so the documented upgrade fails with `ETXTBSY`. | **Fixed.** Stop → temp-file/fsync/rename install → start, with binary+config rollback. |
 | P1-18 | Cache | Cache invalidation closures are never enabled; “invalidate domain” reports success while leaving entries cached. | **Fixed.** Moka invalidation closures enabled; errors flush instead of silently succeeding. |
-| P1-19 | Stats | Hourly rollups permanently retain client IPs, names, and full domains; retention/clear do not erase rollups. | **Deferred to Phase 2.** Documented residual risk in the 1.9.4 release notes. |
+| P1-19 | Stats | Hourly rollups permanently retain client IPs, names, and full domains; retention/clear do not erase rollups. | **Fixed.** Keyed BLAKE3 rollup client IDs, opt-in client names, rollup retention, clear/vacuum with `keep_aggregates` opt-in, `secure_delete`, and 0600 repair. |
 | P1-20 | Auth | Login accepts unbounded username/password strings and uses the full username as a lockout key, enabling pre-auth DoS and lockout eviction. | **Fixed.** 64/1024-byte caps and BLAKE3 lockout keys; active lockouts are never evicted. |
 | P1-21 | CI/Release | Release validation does not require the tagged commit to be on `main`, tested, or security-checked; main pushes skip tests/clippy/fmt. | **Fixed.** Branch/check release gate; CI and security run on `main` and `release/1.9.x` pushes. |
 | P1-22 | Installer/Docs | Signature verification defaults to off and silently downgrades to same-origin SHA-256 when assets are missing; docs claim signed verification. | **Fixed.** Signatures/cosign are required by default; `SITO_REQUIRE_SIGNATURE=0` is the explicit opt-out. |
-| P1-23 | Stats/API | Query-log pages run whole-table `COUNT(*)` every 3 seconds and dashboards run repeated aggregate scans, enabling authenticated self-DoS. | **Deferred to Phase 2.** Documented residual risk. |
-| P1-24 | Stats | Retention runs as one large immediate transaction with full scans, holds the write lock for minutes, and never runs at startup. | **Deferred to Phase 2.** Documented residual risk. |
+| P1-23 | Stats/API | Query-log pages run whole-table `COUNT(*)` every 3 seconds and dashboards run repeated aggregate scans, enabling authenticated self-DoS. | **Fixed.** Optional `include_total` for live refresh, 45 s dashboard cache with invalidation, and per-user stats rate limits. |
+| P1-24 | Stats | Retention runs as one large immediate transaction with full scans, holds the write lock for minutes, and never runs at startup. | **Fixed.** Bounded hour chunks with separate commits, jittered startup catch-up, and retention metrics. |
 | P1-25 | Upstream | Bootstrap/health probes omit RD=1, bootstrap answers bypass the SSRF denylist, and re-resolution serves stale cache instead of forcing refresh. | **Fixed.** RD=1, SSRF-filtered bootstrap (`upstream.allow_private_targets` opt-in), forced refresh, UDP junk tolerance, DoH/EDNS fixes. |
 | P1-26 | Core/Config apply | The filter engine is swapped before the runtime snapshot, creating a filter-enable bypass window and inconsistent failure state. | **Fixed.** Runtime snapshot publishes before the filter swap; hook failures roll back. |
 | P1-27 | Core/Config apply | The DNSSEC validator is swapped before the cache flush, so old-policy validation status can survive a policy change. | **Fixed.** The chain cache and the response cache both carry a monotonic DNSSEC policy generation; old-generation entries are unservable and in-flight inserts from the old policy are rejected. `Indeterminate` is no longer served from the response cache while validation is active. |

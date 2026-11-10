@@ -16,10 +16,45 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use sito_stats::{ClientStats, GlobalStats, UpstreamStats};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Longest accepted statistics window (5 years) — prevents absurd inputs from
 /// overflowing the millisecond conversion.
 pub const MAX_WINDOW_HOURS: i64 = 24 * 366 * 5;
+
+/// Maximum stats requests per authenticated user and endpoint per minute.
+const STATS_RATE_LIMIT: u32 = 240;
+const STATS_RATE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_STATS_RATE_BUCKETS: usize = 8_192;
+
+fn stats_rate_limiter() -> &'static Mutex<HashMap<String, (Instant, u32)>> {
+    static LIMITER: OnceLock<Mutex<HashMap<String, (Instant, u32)>>> = OnceLock::new();
+    LIMITER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Bounds repeated expensive aggregate scans even for an authenticated user.
+fn stats_rate_limited(username: &str, endpoint: &str) -> bool {
+    let key = format!("{username}\u{0}{endpoint}");
+    let mut buckets = stats_rate_limiter()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    buckets.retain(|_, (start, _)| now.duration_since(*start) <= STATS_RATE_WINDOW);
+    if buckets.len() >= MAX_STATS_RATE_BUCKETS
+        && !buckets.contains_key(&key)
+        && let Some(victim) = buckets.keys().next().cloned()
+    {
+        buckets.remove(&victim);
+    }
+    let entry = buckets.entry(key).or_insert((now, 0));
+    if now.duration_since(entry.0) > STATS_RATE_WINDOW {
+        *entry = (now, 0);
+    }
+    entry.1 = entry.1.saturating_add(1);
+    entry.1 > STATS_RATE_LIMIT
+}
 
 /// Builds the `X-Total-Count` header describing how many distinct rows match
 /// the window before the bounded aggregate query truncated the list.
@@ -82,10 +117,15 @@ pub fn parse_window_ms(window: Option<&str>) -> Result<i64, ProblemDetails> {
     tag = "Stats"
 )]
 pub async fn get_stats(
-    _viewer: RequireViewer,
+    viewer: RequireViewer,
     State(ctx): State<ServerContext>,
     Query(query): Query<StatsQuery>,
 ) -> Result<Json<GlobalStats>, ProblemDetails> {
+    if stats_rate_limited(&viewer.0.username, "global") {
+        return Err(ProblemDetails::too_many_requests(
+            "Too many statistics requests. Please slow down.",
+        ));
+    }
     let window_ms = parse_window_ms(query.window.as_deref())?;
     let stats = ctx
         .stats_db
@@ -109,10 +149,15 @@ pub async fn get_stats(
     tag = "Stats"
 )]
 pub async fn get_client_stats(
-    _viewer: RequireViewer,
+    viewer: RequireViewer,
     State(ctx): State<ServerContext>,
     Query(query): Query<StatsQuery>,
 ) -> Result<(HeaderMap, Json<Vec<ClientStats>>), ProblemDetails> {
+    if stats_rate_limited(&viewer.0.username, "clients") {
+        return Err(ProblemDetails::too_many_requests(
+            "Too many statistics requests. Please slow down.",
+        ));
+    }
     let window_ms = parse_window_ms(query.window.as_deref())?;
     let total = ctx
         .stats_db
@@ -141,10 +186,15 @@ pub async fn get_client_stats(
     tag = "Stats"
 )]
 pub async fn get_upstream_stats(
-    _viewer: RequireViewer,
+    viewer: RequireViewer,
     State(ctx): State<ServerContext>,
     Query(query): Query<StatsQuery>,
 ) -> Result<(HeaderMap, Json<Vec<UpstreamStats>>), ProblemDetails> {
+    if stats_rate_limited(&viewer.0.username, "upstreams") {
+        return Err(ProblemDetails::too_many_requests(
+            "Too many statistics requests. Please slow down.",
+        ));
+    }
     let window_ms = parse_window_ms(query.window.as_deref())?;
     let total = ctx
         .stats_db
@@ -180,6 +230,18 @@ mod tests {
         assert!(parse_window_ms(Some(&format!("{}h", MAX_WINDOW_HOURS + 1))).is_err());
     }
 
+    #[test]
+    fn test_stats_rate_limiter_blocks_after_budget() {
+        let user = format!("rate-test-{}", rand::random::<u64>());
+        for _ in 0..STATS_RATE_LIMIT {
+            assert!(!stats_rate_limited(&user, "global"));
+        }
+        assert!(stats_rate_limited(&user, "global"));
+        // A different endpoint or user is unaffected.
+        assert!(!stats_rate_limited(&user, "clients"));
+        assert!(!stats_rate_limited("another-user", "global"));
+    }
+
     use crate::auth::AuthUser;
     use crate::auth::token::Role;
     use arc_swap::ArcSwap;
@@ -189,7 +251,9 @@ mod tests {
 
     async fn mock_context(temp_dir: &std::path::Path) -> ServerContext {
         let db_path = temp_dir.join("test.db");
-        let stats_db = sito_stats::StatsDb::open(&db_path).await.unwrap();
+        let stats_db = sito_stats::StatsDb::open_with_rollup_client_names(&db_path, true)
+            .await
+            .unwrap();
         let querylog_writer = sito_stats::QueryLogWriter::spawn(stats_db.clone(), 100);
         let querylog_sender = querylog_writer.sender();
         let metrics = sito_stats::MetricsRegistry::new("1.2.1", "test");
@@ -324,6 +388,11 @@ mod tests {
         assert_eq!(headers.get("x-total-count").unwrap(), "1");
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].client_name.as_deref(), Some("archive-host"));
+        assert!(
+            clients[0].client_ip.starts_with("b3:"),
+            "archived client IP must be a keyed hash, got {}",
+            clients[0].client_ip
+        );
 
         let (headers, Json(upstreams)) = get_upstream_stats(
             viewer(),

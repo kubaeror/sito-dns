@@ -106,6 +106,9 @@ const QUERYLOG_METRICS_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stats retention sweep interval (retention_days is re-read every cycle).
 const RETENTION_INTERVAL: Duration = Duration::from_hours(24);
+/// Maximum random delay before the startup catch-up sweep so a fleet of
+/// restarted nodes does not all compact SQLite at once.
+const RETENTION_STARTUP_JITTER_MAX_SECS: u64 = 60;
 /// Debounce window for config file watcher events.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(100);
 /// Periodic flush interval for the persistent DNSSEC chain cache.
@@ -556,6 +559,46 @@ fn filter_status_metrics(status: &sito_filter::FilterStatus) -> sito_stats::Filt
     }
 }
 
+/// Runs one retention sweep and publishes its outcome to Prometheus.
+async fn run_stats_retention_sweep(
+    db: &StatsDb,
+    config: &ArcSwap<Config>,
+    metrics: &MetricsRegistry,
+) {
+    let stats = config.load().get_stats_config();
+    let started = Instant::now();
+    match db
+        .cleanup_retention_with_policy(
+            stats.retention_days,
+            stats.rollup_retention_days,
+            stats.rollup_client_names,
+        )
+        .await
+    {
+        Ok(report) => {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            metrics.record_retention_success(
+                elapsed_ms,
+                report.deleted_records,
+                report.rollup_deleted_records,
+                stats.rollup_retention_days,
+            );
+            info!(
+                deleted = report.deleted_records,
+                rollup_deleted = report.rollup_deleted_records,
+                chunks = report.chunks,
+                elapsed_ms,
+                "stats retention sweep completed"
+            );
+        }
+        Err(e) => {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            metrics.record_retention_failure(elapsed_ms);
+            warn!("Error during stats retention cleanup: {e}");
+        }
+    }
+}
+
 async fn init_runtime_components(
     config: &Config,
     shutdown_rx: &watch::Receiver<bool>,
@@ -565,7 +608,9 @@ async fn init_runtime_components(
 
     // Initialize Stats SQLite DB
     let db_path = config.server.data_dir.join("stats.db");
-    let stats_db = StatsDb::open(&db_path).await?;
+    let stats_config = config.get_stats_config();
+    let stats_db =
+        StatsDb::open_with_rollup_client_names(&db_path, stats_config.rollup_client_names).await?;
 
     // Initialize Prometheus metrics registry with 18 metrics per Table 14.2
     let metrics = MetricsRegistry::new(
@@ -1314,12 +1359,43 @@ pub async fn run_server_full(
     }
 
     // Periodic stats retention cleanup task (every 24h).
-    // `retention_days` is read on every cycle so config hot-reload applies.
+    // `retention_days`, `rollup_retention_days` and `rollup_client_names` are
+    // read on every cycle so config hot-reload applies. A catch-up sweep runs
+    // at startup when the persisted last success is older than the interval,
+    // after a bounded jitter to avoid a fleet-wide compaction storm.
     let retention_db = stats_db.clone();
     let retention_config = config_arc.clone();
+    let retention_metrics = metrics.clone();
     let mut retention_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let last_success = retention_db
+            .retention_last_success_ms()
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Could not read last stats retention timestamp: {e}");
+                None
+            });
+        let interval_ms = i64::try_from(RETENTION_INTERVAL.as_millis()).unwrap_or(i64::MAX);
+        let due = last_success.is_none_or(|last| now_ms.saturating_sub(last) >= interval_ms);
+
+        if due {
+            let jitter = rand::random::<u64>() % (RETENTION_STARTUP_JITTER_MAX_SECS + 1);
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(jitter)) => {}
+                res = retention_shutdown_rx.changed() => {
+                    if res.is_err() || *retention_shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+            }
+            run_stats_retention_sweep(&retention_db, &retention_config, &retention_metrics).await;
+        }
+
         let mut interval = tokio::time::interval(RETENTION_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate first tick; the catch-up above already ran (or
+        // was deliberately skipped because the last sweep is recent).
         interval.tick().await;
         loop {
             tokio::select! {
@@ -1329,10 +1405,11 @@ pub async fn run_server_full(
                     }
                 }
                 _ = interval.tick() => {
-                    let retention_days = retention_config.load().get_stats_config().retention_days;
-                    if let Err(e) = retention_db.cleanup_retention(retention_days).await {
-                        warn!("Error during stats retention cleanup: {e}");
-                    }
+                    run_stats_retention_sweep(
+                        &retention_db,
+                        &retention_config,
+                        &retention_metrics,
+                    ).await;
                 }
             }
         }

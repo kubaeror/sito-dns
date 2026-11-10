@@ -3240,7 +3240,9 @@ dependencies = [
 name = "sito-stats"
 version = "1.9.4"
 dependencies = [
+ "blake3",
  "chrono",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "sito-core",

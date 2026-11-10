@@ -240,17 +240,27 @@ filter status); existing clients ignore unknown fields.
 8. **Pin releases.** Use `SITO_VERSION=1.9.4`/tag-pinned installer scripts and
    the `1.9.4` image tag instead of mutable `main`/`latest` in production.
 
-## Deferred to Phase 2
+## Stats privacy, retention, and polling
 
-The following P1 findings are deliberately **not** fixed in 1.9.4 and remain
-documented residual risks:
+P1-19, P1-23, and P1-24 are closed in this branch:
 
-- **P1-19 — query-log/rollup privacy.** `stats_hourly` still retains client IPs,
-  names, and full domains; retention/clear do not erase rollups.
-- **P1-23 — query-log/dashboard polling cost.** Pages still compute expensive
-  aggregates over the filtered table; authenticated users can cause SQLite load.
-- **P1-24 — retention lock duration.** Retention still runs as a large
-  transaction and can delay query-log writes; it does not run at startup.
+- **P1-19 — query-log/rollup privacy.** `stats_hourly` now stores client IPs as
+  keyed BLAKE3 hashes using `<data_dir>/stats-salt` (0600); client names are
+  omitted unless `stats.rollup_client_names = true`. Rollups expire after
+  `stats.rollup_retention_days` (default 365). “Clear query log” deletes both
+  `query_log` and `stats_hourly` by default (`?keep_aggregates=true` preserves
+  rollups), large clears are vacuumed, SQLite runs with `secure_delete=ON`, and
+  `stats.db`/WAL/SHM permissions are repaired to 0600 on startup. Existing raw
+  rollups are hashed once on startup; raw `query_log` rows are not retroactively
+  anonymized.
+- **P1-23 — query-log/dashboard polling cost.** Query-log pages accept
+  `include_total` (default `true`; the live 3 s UI refresh sends `false`), and
+  dashboard aggregates are cached for 45 s with invalidation on clear/retention.
+  Stats endpoints are rate-limited per authenticated user.
+- **P1-24 — retention lock duration.** Retention processes bounded hour chunks
+  in separate short transactions, runs a jittered startup catch-up when the
+  last successful sweep is older than 24 h, and exposes success/failure,
+  duration, deleted-row and rollup-cleanup metrics.
 
 Additional deferred/unchanged items:
 

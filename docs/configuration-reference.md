@@ -413,6 +413,8 @@ The admin scheme is never derived from the DNS DoT/DoH certificate config.
 [stats]
 # `retention_days` also accepts the legacy alias `query_log_retention_days`
 retention_days = 90
+rollup_retention_days = 365
+rollup_client_names = false
 
 [privacy]
 anonymize_querylog = false
@@ -421,7 +423,19 @@ anonymize_querylog = false
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `stats.retention_days` | integer | `90` | Days to keep detailed per-query records before automated pruning and hourly aggregation (must be ≥ 1; alias: `query_log_retention_days`). |
+| `stats.rollup_retention_days` | integer | `365` | Days to keep hourly rollups (aggregate totals, top domains and keyed-hash client identifiers) before deleting them (must be ≥ 1). |
+| `stats.rollup_client_names` | boolean | `false` | Include client display names in hourly rollups. Off by default; raw client IPs are never stored in rollups (keyed BLAKE3 hashes are used). |
 | `privacy.anonymize_querylog` | boolean | `false` | Mask client IPs (/24 for IPv4, /56 for IPv6) before persisting to database and before live-tail broadcast. |
+
+> Clearing the query log (`DELETE /api/v1/querylog`, `sito clear-query-log`, or
+> the UI “Clear Logs” button) deletes both `query_log` and `stats_hourly` by
+> default. Pass `?keep_aggregates=true` (API) or `--keep-aggregates` (CLI) to
+> preserve rollups. Large clears are vacuumed and
+> SQLite runs with `secure_delete=ON`. Rollup client IPs are keyed BLAKE3
+> hashes using `<data_dir>/stats-salt` (0600); client names are omitted unless
+> `rollup_client_names = true`. Existing raw rollups are hashed once on startup
+> by the database backfill; existing raw `query_log` rows are not retroactively
+> anonymized.
 
 > Query logging is always enabled when `[stats]` is present. Prometheus metrics
 > are exposed at `/metrics` and require a Viewer-or-higher bearer token or
@@ -628,7 +642,7 @@ and `POST /api/v1/config/reload`.
 | `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
 | `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |
 | `privacy.anonymize_querylog` | Query-log writer updated. |
-| `stats.retention_days` | Re-read on the next retention sweep (every 24 h). |
+| `stats.retention_days`, `stats.rollup_retention_days`, `stats.rollup_client_names` | Re-read on the next retention sweep (every 24 h). |
 
 ### 16.2 Requires a restart
 
