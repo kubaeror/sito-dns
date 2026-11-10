@@ -1646,7 +1646,12 @@ impl HostsFilterEngine {
         // rule exists, so non-group clients are never silently unfiltered.
         let group_only_sources =
             !has_global_source && group_hint && self.group_custom_rules_compile();
-        if count == 0 && !allow_empty && !group_only_sources {
+        // A raw group hint that did not compile is not a usable source. This
+        // must fail closed even when `allow_empty_list = true`: that option
+        // only permits an *intentional* empty global source set, never a
+        // configured-but-unparseable group-only configuration.
+        let group_only_unusable = !has_global_source && group_hint && !group_only_sources;
+        if count == 0 && !group_only_sources && (!allow_empty || group_only_unusable) {
             // No usable rules were produced. This covers an empty/HTML/zero
             // list on a reload as well as a comment-only source: never publish
             // an empty snapshot that would silently disable filtering.
@@ -3278,6 +3283,68 @@ mod tests {
                 &client
             ),
             Verdict::Block(BlockReason::FilterUnavailable)
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// `allow_empty_list = true` permits an intentional empty global source
+    /// set, but it must not turn comment-only/invalid group-only rules into a
+    /// Ready/available empty snapshot.
+    #[tokio::test]
+    async fn test_invalid_only_group_rules_fail_closed_with_allow_empty_list() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_group_invalid_allow_empty_{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let config = FilteringConfig {
+            enabled: true,
+            fail_closed: true,
+            allow_empty_list: true,
+            lists: Vec::new(),
+            custom_rules: Vec::new(),
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init_with_observer_and_group_sources(
+            config,
+            temp_dir.clone(),
+            None,
+            vec![GroupRuleSet {
+                name: "kids".to_string(),
+                lists: Vec::new(),
+                custom_rules: vec![
+                    "# comment-only".to_string(),
+                    "!!! this is not a valid rule".to_string(),
+                ],
+            }],
+        )
+        .await;
+
+        assert_eq!(
+            engine.state(),
+            FilterState::Failed,
+            "allow_empty_list must not mask uncompiled group-only sources"
+        );
+        assert!(
+            engine.unavailable_for_fail_closed(),
+            "unparseable group rules must fail closed even with allow_empty_list"
+        );
+        assert!(
+            engine.group_snapshot("kids").is_none(),
+            "no usable group snapshot may be published"
+        );
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert_eq!(
+            engine.evaluate(
+                &Name::from_str("unrelated.example.").unwrap(),
+                RecordType::A,
+                &client
+            ),
+            Verdict::Block(BlockReason::FilterUnavailable),
+            "queries must SERVFAIL instead of being allowed unfiltered"
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;

@@ -55,7 +55,7 @@ named by the command.
 
 | Finding | Named test / check | Focused command |
 |---|---|---|
-| Group-only filtering | `test_group_only_custom_rules_are_sources`, `test_group_only_filter_configuration_resolves_end_to_end`, `test_group_rule_does_not_mask_failed_global_source`, `test_group_rule_does_not_mask_failed_global_source_end_to_end`, `test_invalid_only_group_rules_fail_closed` | `cargo test -p sito-filter group_rule_does_not_mask`; `cargo test -p sito-filter test_invalid_only_group_rules_fail_closed`; `cargo test -p sito test_group_rule_does_not_mask_failed_global_source_end_to_end` |
+| Group-only filtering | `test_group_only_custom_rules_are_sources`, `test_group_only_filter_configuration_resolves_end_to_end`, `test_group_rule_does_not_mask_failed_global_source`, `test_group_rule_does_not_mask_failed_global_source_end_to_end`, `test_invalid_only_group_rules_fail_closed`, `test_invalid_only_group_rules_fail_closed_with_allow_empty_list` | `cargo test -p sito-filter group_rule_does_not_mask`; `cargo test -p sito-filter test_invalid_only_group_rules_fail_closed`; `cargo test -p sito test_group_rule_does_not_mask_failed_global_source_end_to_end` |
 | `[dns.tls]`/legacy ACME restart | `test_restart_required_tracks_effective_tls_and_legacy_acme` | `cargo test -p sito-api test_restart_required_tracks_effective_tls_and_legacy_acme` |
 | `--no-setup` fresh boot | `test_no_setup_without_config_generates_random_password_on_loopback`, `test_no_setup_fresh_boot_resolves_a_query` | `cargo test -p sito test_no_setup_without_config`; `cargo test -p sito-test --test m11_no_setup` |
 | ACME domain-change reissue | `test_certificate_needs_renewal_when_domains_change` | `cargo test -p sito-transport test_certificate_needs_renewal_when_domains_change` |
