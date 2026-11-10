@@ -344,9 +344,9 @@ pub fn run_check_config(path: &Path) -> Result<(), anyhow::Error> {
 
 /// Executes the `clear-query-log` subcommand.
 ///
-/// Opens the configured stats database directly. The server must be stopped
-/// (the CLI does not take the service lease), matching the other offline
-/// database maintenance commands.
+/// Takes the service lease and refuses a live server unless `--force` is
+/// given. When stopped, the lease is held for the whole database operation so
+/// a supervisor cannot start the server mid-clear.
 pub async fn run_clear_query_log(
     config_path: &Path,
     keep_aggregates: bool,
@@ -361,7 +361,7 @@ pub async fn run_clear_query_log(
     })?;
     let config = Config::from_toml_str(&content)
         .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
-    let _access = begin_reset(
+    let access = begin_reset(
         &config.server.data_dir,
         "clear the query log",
         force,
@@ -384,6 +384,12 @@ pub async fn run_clear_query_log(
         println!("Deleted {deleted} query log entries; hourly rollups were preserved.");
     } else {
         println!("Deleted {deleted} query log entries and all hourly rollups.");
+    }
+    if let ResetAccess::Running { pid } = &access {
+        println!(
+            "{}",
+            running_service_warning(*pid, CLEAR_QUERY_LOG_LIVE_STATE)
+        );
     }
     Ok(deleted)
 }
@@ -1091,6 +1097,8 @@ const SESSIONS_FORCE_HINT: &str = "Use --force only if you understand that exist
      API tokens remain valid until the service is restarted.";
 const CLEAR_QUERY_LOG_FORCE_HINT: &str = "Use --force only if you understand that the running server \
      keeps its open SQLite connections; stop the service when possible.";
+const CLEAR_QUERY_LOG_LIVE_STATE: &str = "The running server keeps its open SQLite connections and \
+     may have cached dashboard aggregates until they expire";
 
 const ADMIN_LIVE_STATE: &str = "Existing web sessions and API tokens remain valid, and the running \
      server still accepts the old admin password and rejects the new one";

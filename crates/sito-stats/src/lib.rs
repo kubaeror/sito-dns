@@ -1906,7 +1906,7 @@ mod tests {
             .unwrap();
         assert_eq!(payload, "[]", "malformed payload must be neutralized");
         let marker: Option<String> =
-            sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'rollup_pii_v1'")
+            sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'rollup_pii_v2'")
                 .fetch_optional(db.pool())
                 .await
                 .unwrap();
@@ -2117,10 +2117,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.deleted_records, 12_000);
-        assert!(
-            report.chunks >= 3,
-            "a busy hour must be split into row-bounded chunks, got {}",
-            report.chunks
+        assert_eq!(
+            report.chunks, 3,
+            "12,000 rows must be split into 5,000-row chunks"
         );
         let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_log")
             .fetch_one(db.pool())
@@ -2148,6 +2147,147 @@ mod tests {
         assert!(
             plan.contains("idx_ql_ts"),
             "hour discovery must use idx_ql_ts: {plan}"
+        );
+    }
+
+    /// P1-24 Important 7: chunk boundary, aggregate and delete predicates use
+    /// the `(ts, id)` index and do not sort the whole hour.
+    #[tokio::test]
+    async fn test_retention_chunk_queries_use_ts_id_index() {
+        use sqlx::Row;
+        let db = StatsDb::in_memory().await.unwrap();
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_ql_ts_id'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(index_count, 1, "(ts, id) index must be created");
+
+        let boundary = sqlx::query(
+            r"
+            EXPLAIN QUERY PLAN
+            SELECT ts, id FROM query_log INDEXED BY idx_ql_ts_id
+            WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?)
+            ORDER BY ts ASC, id ASC LIMIT 1 OFFSET ?
+            ",
+        )
+        .bind(0i64)
+        .bind(1i64)
+        .bind(0i64)
+        .bind(0i64)
+        .bind(5_000i64)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let boundary_plan = boundary
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            boundary_plan.contains("idx_ql_ts_id"),
+            "chunk boundary must use idx_ql_ts_id: {boundary_plan}"
+        );
+        assert!(
+            !boundary_plan.contains("TEMP B-TREE"),
+            "chunk boundary must not sort the whole hour: {boundary_plan}"
+        );
+
+        let aggregate = sqlx::query(
+            r"
+            EXPLAIN QUERY PLAN
+            SELECT COUNT(*) FROM query_log INDEXED BY idx_ql_ts_id
+            WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+            ",
+        )
+        .bind(0i64)
+        .bind(1i64)
+        .bind(0i64)
+        .bind(0i64)
+        .bind(1i64)
+        .bind(0i64)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let aggregate_plan = aggregate
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            aggregate_plan.contains("idx_ql_ts_id"),
+            "chunk aggregate must use idx_ql_ts_id: {aggregate_plan}"
+        );
+    }
+
+    /// Important regression: a heavy hitter spread across many chunks must not
+    /// be lost because each chunk's top-N is computed separately.
+    #[tokio::test]
+    async fn test_rollup_top_n_preserves_heavy_hitter_across_chunks() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let hour = ((now - 200 * 86_400_000) / 3_600_000) * 3_600_000;
+        let mut entries = Vec::new();
+        let mut ts = hour;
+
+        // Three blocks of 5,000 rows each. Each block has 100 distinct
+        // distractors with 10 hits and 9 hits for the target. The target is
+        // below every chunk's top-100 but is the global heavy hitter (27 hits).
+        for block in 0..3 {
+            for i in 0..100 {
+                for _ in 0..10 {
+                    entries.push(retention_entry(
+                        ts,
+                        &format!("distract-{block}-{i}.example"),
+                        "allowed",
+                        None,
+                    ));
+                    ts += 1;
+                }
+            }
+            for _ in 0..9 {
+                entries.push(retention_entry(ts, "heavy.example", "allowed", None));
+                ts += 1;
+            }
+            for i in 0..3_991 {
+                entries.push(retention_entry(
+                    ts,
+                    &format!("filler-{block}-{i}.example"),
+                    "allowed",
+                    None,
+                ));
+                ts += 1;
+            }
+        }
+        assert_eq!(entries.len(), 15_000);
+        db.insert_batch(&entries).await.unwrap();
+
+        let report = db
+            .cleanup_retention_with_policy(90, 365, false)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_records, 15_000);
+        assert!(
+            report.chunks >= 3,
+            "expected multiple row-bounded chunks, got {}",
+            report.chunks
+        );
+
+        let payload: String =
+            sqlx::query_scalar("SELECT top_domains FROM stats_hourly WHERE hour = ?")
+                .bind(hour)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let tops: Vec<(String, i64, i64)> = serde_json::from_str(&payload).unwrap();
+        let heavy = tops
+            .iter()
+            .find(|(qname, _, _)| qname == "heavy.example")
+            .expect("heavy hitter must survive the per-hour rollup");
+        assert_eq!(
+            heavy.1, 27,
+            "heavy hitter count must be exact across chunks: {tops:?}"
         );
     }
 }

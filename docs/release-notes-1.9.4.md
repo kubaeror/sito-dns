@@ -259,9 +259,9 @@ P1-19, P1-23, and P1-24 are closed in this branch:
   dashboard aggregates are cached for 45 s with invalidation on clear/retention.
   Stats endpoints are rate-limited per authenticated user.
 - **P1-24 — retention lock duration.** Retention processes bounded hour chunks
-  in separate short transactions, runs a jittered startup catch-up when the
-  last successful sweep is older than 24 h, and exposes success/failure,
-  duration, deleted-row and rollup-cleanup metrics.
+  in separate short transactions, runs a bounded jittered catch-up on every
+  startup (within 5 minutes even when the last success is recent), and exposes
+  success/failure, duration, deleted-row and rollup-cleanup metrics.
 
 Additional deferred/unchanged items:
 

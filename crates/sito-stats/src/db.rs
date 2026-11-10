@@ -5,7 +5,7 @@ use crate::error::StatsError;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Pool, Row, Sqlite, SqliteConnection};
+use sqlx::{Connection, Pool, Row, Sqlite, SqliteConnection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -54,8 +54,17 @@ const DASHBOARD_CACHE_TTL: Duration = Duration::from_secs(45);
 /// Rows per transaction in the one-time legacy rollup PII backfill.
 const ROLLUP_PII_BACKFILL_BATCH: i64 = 1_000;
 
+/// One row-bounded retention chunk: hour range plus `(ts, id)` cursor bounds.
+#[derive(Clone, Copy)]
+struct RetentionChunk {
+    start: i64,
+    end: i64,
+    lower: (i64, i64),
+    upper: (i64, i64),
+}
+
 /// Bounded per-hour rollup payloads extracted from rows about to be pruned.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct HourRollup {
     /// `(qname, total, blocked)`
     domains: Vec<(String, i64, i64)>,
@@ -770,6 +779,11 @@ impl StatsDb {
         )
         .execute(&self.pool)
         .await?;
+        // Supports row-bounded retention chunk cursors `(ts, id)` without a
+        // temp B-tree. Additive runtime DDL keeps old binaries compatible.
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_ql_ts_id ON query_log(ts, id)")
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -790,10 +804,12 @@ impl StatsDb {
 
     /// One-time backfill for rollups written by older versions: hash raw
     /// client identifiers and drop client names unless explicitly enabled.
-    /// Idempotent via the `rollup_pii_v1` marker in `stats_meta`.
+    /// Idempotent via the `rollup_pii_v2` marker in `stats_meta`. v2 also
+    /// re-runs over databases written by the unreleased base that may have
+    /// marked v1 complete while skipping malformed payloads.
     async fn backfill_rollup_pii(&self) -> Result<(), StatsError> {
         let done: Option<String> =
-            sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'rollup_pii_v1'")
+            sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'rollup_pii_v2'")
                 .fetch_optional(&self.pool)
                 .await?;
         if done.as_deref() == Some("1") {
@@ -866,7 +882,7 @@ impl StatsDb {
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO stats_meta (key, value) VALUES ('rollup_pii_v1', '1') \
+            "INSERT INTO stats_meta (key, value) VALUES ('rollup_pii_v2', '1') \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
         .execute(&mut *tx)
@@ -1870,16 +1886,18 @@ impl StatsDb {
         let cutoff = now_ms.saturating_sub(retention_ms);
 
         let mut report = RetentionReport::default();
+        let mut conn = self.pool.acquire().await?;
+        Self::ensure_retention_temp_tables(&mut conn).await?;
 
         // Find the next expired timestamp with an index seek (`MIN(ts)` over
-        // `idx_ql_ts`), process that hour in row-bounded id chunks, then repeat.
-        // This avoids a full `GROUP BY hour` scan of the whole expired range on
-        // every batch and keeps each write transaction short.
+        // `idx_ql_ts`), process that hour in row-bounded `(ts, id)` chunks, then
+        // repeat. This avoids a full `GROUP BY hour` scan of the whole expired
+        // range and keeps each write transaction short.
         loop {
             let next_ts: Option<i64> =
                 sqlx::query_scalar("SELECT MIN(ts) FROM query_log WHERE ts < ?")
                     .bind(cutoff)
-                    .fetch_one(&self.pool)
+                    .fetch_one(&mut *conn)
                     .await?;
             let Some(next_ts) = next_ts else { break };
 
@@ -1889,39 +1907,54 @@ impl StatsDb {
                 break;
             }
 
-            let mut id_start = i64::MIN;
+            // Accumulate exact per-hour counts across chunks in temp tables so
+            // a heavy hitter that is not in any single chunk's top-N survives.
+            Self::clear_retention_temp_hour(&mut conn, hour).await?;
+
+            let mut lower = (hour, 0i64);
             loop {
-                // The id of the row just past this chunk, if any. Rows are
-                // ordered by id within the hour so a busy hour is split into
-                // at most RETENTION_ROWS_PER_CHUNK rows per transaction.
-                let boundary: Option<i64> = sqlx::query_scalar(
+                // The first `(ts, id)` row past this chunk, if any. The
+                // `(ts, id)` index supports this cursor without a temp B-tree.
+                let boundary: Option<(i64, i64)> = sqlx::query_as(
                     r"
-                    SELECT id FROM query_log
-                    WHERE ts >= ? AND ts < ? AND id >= ?
-                    ORDER BY id ASC
+                    SELECT ts, id FROM query_log INDEXED BY idx_ql_ts_id
+                    WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?)
+                    ORDER BY ts ASC, id ASC
                     LIMIT 1 OFFSET ?
                     ",
                 )
                 .bind(hour)
                 .bind(end)
-                .bind(id_start)
-                .bind(RETENTION_ROWS_PER_CHUNK.saturating_sub(1))
-                .fetch_optional(&self.pool)
+                .bind(lower.0)
+                .bind(lower.1)
+                .bind(RETENTION_ROWS_PER_CHUNK)
+                .fetch_optional(&mut *conn)
                 .await?;
-                let (id_end, done) = boundary.map_or((i64::MAX, true), |id| (id, false));
+                let (upper, done) =
+                    boundary.map_or(((end, i64::MIN), true), |cursor| (cursor, false));
 
-                let chunk = self
-                    .rollup_and_delete_chunk(hour, end, id_start, id_end, rollup_client_names)
+                let deleted = self
+                    .rollup_and_delete_chunk(
+                        &mut conn,
+                        &RetentionChunk {
+                            start: hour,
+                            end,
+                            lower,
+                            upper,
+                        },
+                        done,
+                        rollup_client_names,
+                    )
                     .await?;
-                report.aggregated_hours += chunk.aggregated_hours;
-                report.deleted_records += chunk.deleted_records;
+                report.deleted_records += deleted;
                 report.chunks += 1;
 
                 if done {
                     break;
                 }
-                id_start = id_end.saturating_add(1);
+                lower = upper;
             }
+            report.aggregated_hours += 1;
         }
 
         if let Some(rollup_days) = rollup_retention_days {
@@ -1985,30 +2018,176 @@ impl StatsDb {
         Ok(total)
     }
 
+    /// Creates the per-connection temp tables used to accumulate exact
+    /// per-hour top-N counts across row-bounded chunks.
+    async fn ensure_retention_temp_tables(conn: &mut SqliteConnection) -> Result<(), StatsError> {
+        for sql in [
+            r"
+            CREATE TEMP TABLE IF NOT EXISTS retention_domain_counts (
+                hour INTEGER NOT NULL,
+                qname TEXT NOT NULL,
+                total INTEGER NOT NULL DEFAULT 0,
+                blocked INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (hour, qname)
+            ) WITHOUT ROWID
+            ",
+            r"
+            CREATE TEMP TABLE IF NOT EXISTS retention_client_counts (
+                hour INTEGER NOT NULL,
+                client_ip TEXT NOT NULL,
+                client_name TEXT NOT NULL DEFAULT '',
+                total INTEGER NOT NULL DEFAULT 0,
+                blocked INTEGER NOT NULL DEFAULT 0,
+                last_seen INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (hour, client_ip)
+            ) WITHOUT ROWID
+            ",
+            r"
+            CREATE TEMP TABLE IF NOT EXISTS retention_upstream_counts (
+                hour INTEGER NOT NULL,
+                upstream TEXT NOT NULL,
+                total INTEGER NOT NULL DEFAULT 0,
+                errors INTEGER NOT NULL DEFAULT 0,
+                elapsed_sum INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (hour, upstream)
+            ) WITHOUT ROWID
+            ",
+        ] {
+            sqlx::query(sql).execute(&mut *conn).await?;
+        }
+        Ok(())
+    }
+
+    async fn clear_retention_temp_hour(
+        conn: &mut SqliteConnection,
+        hour: i64,
+    ) -> Result<(), StatsError> {
+        sqlx::query("DELETE FROM retention_domain_counts WHERE hour = ?")
+            .bind(hour)
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("DELETE FROM retention_client_counts WHERE hour = ?")
+            .bind(hour)
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("DELETE FROM retention_upstream_counts WHERE hour = ?")
+            .bind(hour)
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Reads the exact accumulated per-hour top lists from the temp tables.
+    async fn load_temp_hour_tops(
+        conn: &mut SqliteConnection,
+        hour: i64,
+    ) -> Result<HourRollup, StatsError> {
+        let limit = i64::try_from(ROLLUP_TOP_N).unwrap_or(100);
+
+        let domains: Vec<DomainTop> = sqlx::query_as(
+            r"
+            SELECT qname, total, blocked FROM (
+                SELECT qname, total, blocked,
+                    ROW_NUMBER() OVER (ORDER BY total DESC, qname ASC) AS rn_total,
+                    ROW_NUMBER() OVER (ORDER BY blocked DESC, qname ASC) AS rn_blocked
+                FROM retention_domain_counts WHERE hour = ?
+            )
+            WHERE rn_total <= ? OR rn_blocked <= ?
+            ",
+        )
+        .bind(hour)
+        .bind(limit)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?;
+
+        let clients: Vec<ClientTop> = sqlx::query_as(
+            "SELECT client_ip, NULLIF(client_name, ''), total, blocked, last_seen \
+             FROM retention_client_counts WHERE hour = ? \
+             ORDER BY total DESC, client_ip ASC LIMIT ?",
+        )
+        .bind(hour)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?;
+
+        let upstreams: Vec<UpstreamTop> = sqlx::query_as(
+            "SELECT upstream, total, errors, elapsed_sum FROM retention_upstream_counts \
+             WHERE hour = ? ORDER BY total DESC, upstream ASC LIMIT ?",
+        )
+        .bind(hour)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?;
+
+        Ok(HourRollup {
+            domains,
+            clients,
+            upstreams,
+        })
+    }
+
+    /// Hashes client identifiers and applies the name policy to a rollup.
+    fn normalize_hour_rollup(
+        &self,
+        mut rollup: HourRollup,
+        rollup_client_names: bool,
+    ) -> HourRollup {
+        for client in &mut rollup.clients {
+            client.0 = self.hash_client_ip(&client.0);
+            if !rollup_client_names {
+                client.1 = None;
+            }
+        }
+        rollup
+    }
+
+    /// Merges fresh full-hour top lists with the lists already stored for a
+    /// partially-pruned hour.
+    fn merge_hour_rollup(
+        &self,
+        existing: (Option<String>, Option<String>, Option<String>),
+        rollup: HourRollup,
+        rollup_client_names: bool,
+    ) -> HourRollup {
+        let mut rollup = self.normalize_hour_rollup(rollup, rollup_client_names);
+        let (existing_domains, existing_clients, existing_upstreams) = existing;
+
+        let mut existing_clients: Vec<ClientTop> = decode_tops(existing_clients.as_deref());
+        for client in &mut existing_clients {
+            client.0 = self.hash_client_ip(&client.0);
+            if !rollup_client_names {
+                client.1 = None;
+            }
+        }
+
+        rollup.domains = merge_domain_tops(
+            decode_tops(existing_domains.as_deref()),
+            rollup.domains,
+            // Keep room for the union of the top-N by total and by blocked
+            // count, so a blocked-heavy domain survives the rollup even when
+            // it ranks below the total-query top-N.
+            ROLLUP_TOP_N * 2,
+        );
+        rollup.clients = merge_client_tops(existing_clients, rollup.clients, ROLLUP_TOP_N);
+        rollup.upstreams = merge_upstream_tops(
+            decode_tops(existing_upstreams.as_deref()),
+            rollup.upstreams,
+            ROLLUP_TOP_N,
+        );
+        rollup
+    }
+
     /// Folds every row in `[start, end)` into `stats_hourly` and deletes
-    /// exactly those rows in one short transaction. Keeping the aggregate
-    /// read and delete in the same transaction prevents a concurrent
-    /// (possibly backdated) insert from being deleted without aggregation.
+    /// exactly those rows in one transaction. Used by the explicit
+    /// `keep_aggregates` clear path (which is not row-bounded because the
+    /// operator requested a full clear).
     async fn rollup_and_delete_range(
         &self,
         start: i64,
         end: i64,
         rollup_client_names: bool,
     ) -> Result<RetentionReport, StatsError> {
-        self.rollup_and_delete_chunk(start, end, i64::MIN, i64::MAX, rollup_client_names)
-            .await
-    }
-
-    async fn rollup_and_delete_chunk(
-        &self,
-        start: i64,
-        end: i64,
-        id_start: i64,
-        id_end: i64,
-        rollup_client_names: bool,
-    ) -> Result<RetentionReport, StatsError> {
-        // `BEGIN IMMEDIATE` takes the write lock up front so concurrent writers
-        // wait instead of failing the aggregate/delete with `SQLITE_BUSY`.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let hours_to_aggregate = sqlx::query(
@@ -2021,14 +2200,12 @@ impl StatsDb {
                 MAX(id) as max_id,
                 MAX(ts) as max_ts
             FROM query_log
-            WHERE ts >= ? AND ts < ? AND id >= ? AND id <= ?
+            WHERE ts >= ? AND ts < ?
             GROUP BY hour
             ",
         )
         .bind(start)
         .bind(end)
-        .bind(id_start)
-        .bind(id_end)
         .fetch_all(&mut *tx)
         .await?;
 
@@ -2038,7 +2215,7 @@ impl StatsDb {
             .collect();
         let mut rollups: HashMap<i64, HourRollup> = HashMap::new();
         if !affected_hours.is_empty() {
-            collect_hour_rollups(&mut tx, start, end, id_start, id_end, &mut rollups).await?;
+            collect_hour_rollups(&mut tx, start, end, i64::MIN, i64::MAX, &mut rollups).await?;
         }
         let existing_rollups = load_existing_rollups(&mut tx, &affected_hours).await?;
 
@@ -2058,43 +2235,9 @@ impl StatsDb {
                 max_seen_ts = max_seen_ts.max(mts);
             }
 
-            // Merge the new top lists into the ones already stored for this
-            // hour: a partially-pruned hour can be rolled up again later.
-            let mut rollup = rollups.remove(&hour).unwrap_or_default();
-            let (existing_domains, existing_clients, existing_upstreams) =
-                existing_rollups.get(&hour).cloned().unwrap_or_default();
-
-            // Rollups never store raw client identifiers. Hash incoming IPs
-            // with the per-install key and re-hash/neutralize any legacy value
-            // that predates the one-time backfill.
-            for client in &mut rollup.clients {
-                client.0 = self.hash_client_ip(&client.0);
-                if !rollup_client_names {
-                    client.1 = None;
-                }
-            }
-            let mut existing_clients: Vec<ClientTop> = decode_tops(existing_clients.as_deref());
-            for client in &mut existing_clients {
-                client.0 = self.hash_client_ip(&client.0);
-                if !rollup_client_names {
-                    client.1 = None;
-                }
-            }
-
-            rollup.domains = merge_domain_tops(
-                decode_tops(existing_domains.as_deref()),
-                rollup.domains,
-                // Keep room for the union of the top-N by total and by blocked
-                // count, so a blocked-heavy domain survives the rollup even
-                // when it ranks below the total-query top-N.
-                ROLLUP_TOP_N * 2,
-            );
-            rollup.clients = merge_client_tops(existing_clients, rollup.clients, ROLLUP_TOP_N);
-            rollup.upstreams = merge_upstream_tops(
-                decode_tops(existing_upstreams.as_deref()),
-                rollup.upstreams,
-                ROLLUP_TOP_N,
-            );
+            let rollup = rollups.remove(&hour).unwrap_or_default();
+            let existing = existing_rollups.get(&hour).cloned().unwrap_or_default();
+            let rollup = self.merge_hour_rollup(existing, rollup, rollup_client_names);
 
             sqlx::query(
                 r"
@@ -2122,20 +2265,12 @@ impl StatsDb {
             aggregated_hours += 1;
         }
 
-        // Delete exactly the rows that were aggregated above (same predicate in
-        // the same transaction).
-        let del_res =
-            sqlx::query("DELETE FROM query_log WHERE ts >= ? AND ts < ? AND id >= ? AND id <= ?")
-                .bind(start)
-                .bind(end)
-                .bind(id_start)
-                .bind(id_end)
-                .execute(&mut *tx)
-                .await?;
+        let del_res = sqlx::query("DELETE FROM query_log WHERE ts >= ? AND ts < ?")
+            .bind(start)
+            .bind(end)
+            .execute(&mut *tx)
+            .await?;
 
-        // Record the highest timestamp/id processed for observability. The
-        // watermark is informational now that aggregation and deletion share a
-        // transaction; `MAX` keeps it monotonic across runs.
         if max_seen_ts > 0 || max_seen_id > 0 {
             sqlx::query(
                 r"
@@ -2160,6 +2295,218 @@ impl StatsDb {
             rollup_deleted_records: 0,
             chunks: 1,
         })
+    }
+
+    /// Aggregates and deletes one row-bounded `(ts, id)` chunk. Top lists are
+    /// written only for the final chunk, using the full-hour lists computed
+    /// before any deletion.
+    async fn rollup_and_delete_chunk(
+        &self,
+        conn: &mut SqliteConnection,
+        chunk: &RetentionChunk,
+        final_hour: bool,
+        rollup_client_names: bool,
+    ) -> Result<u64, StatsError> {
+        let RetentionChunk {
+            start,
+            end,
+            lower,
+            upper,
+        } = *chunk;
+        // `BEGIN IMMEDIATE` takes the write lock up front so concurrent writers
+        // wait instead of failing the aggregate/delete with `SQLITE_BUSY`.
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+
+        let row = sqlx::query(
+            r"
+            SELECT
+                COUNT(*) as queries,
+                SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) as blocked,
+                SUM(CASE WHEN rule IN ('cache', 'stale_cache') OR verdict = 'stale' THEN 1 ELSE 0 END) as cached,
+                MAX(id) as max_id,
+                MAX(ts) as max_ts
+            FROM query_log INDEXED BY idx_ql_ts_id
+            WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+            ",
+        )
+        .bind(start)
+        .bind(end)
+        .bind(lower.0)
+        .bind(lower.1)
+        .bind(upper.0)
+        .bind(upper.1)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let hour = (start / 3_600_000) * 3_600_000;
+        let queries: i64 = row.get::<Option<i64>, _>("queries").unwrap_or(0);
+        let blocked: i64 = row.get::<Option<i64>, _>("blocked").unwrap_or(0);
+        let cached: i64 = row.get::<Option<i64>, _>("cached").unwrap_or(0);
+        let max_seen_id = row.get::<Option<i64>, _>("max_id").unwrap_or(0);
+        let max_seen_ts = row.get::<Option<i64>, _>("max_ts").unwrap_or(0);
+
+        // Accumulate exact per-hour counts for this chunk. The temp tables are
+        // updated in the same transaction as the delete, so a crash cannot
+        // leave deleted rows without their counts.
+        sqlx::query(
+            r"
+            INSERT INTO retention_domain_counts (hour, qname, total, blocked)
+            SELECT ?, qname, COUNT(*), SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END)
+            FROM query_log INDEXED BY idx_ql_ts_id
+            WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+            GROUP BY qname
+            ON CONFLICT(hour, qname) DO UPDATE SET
+                total = total + excluded.total,
+                blocked = blocked + excluded.blocked
+            ",
+        )
+        .bind(hour)
+        .bind(start)
+        .bind(end)
+        .bind(lower.0)
+        .bind(lower.1)
+        .bind(upper.0)
+        .bind(upper.1)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r"
+            INSERT INTO retention_client_counts (hour, client_ip, client_name, total, blocked, last_seen)
+            SELECT ?, client_ip, COALESCE(MAX(client_name), ''), COUNT(*),
+                   SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END), MAX(ts)
+            FROM query_log INDEXED BY idx_ql_ts_id
+            WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+            GROUP BY client_ip
+            ON CONFLICT(hour, client_ip) DO UPDATE SET
+                total = total + excluded.total,
+                blocked = blocked + excluded.blocked,
+                last_seen = MAX(last_seen, excluded.last_seen),
+                client_name = CASE
+                    WHEN client_name = '' THEN excluded.client_name
+                    WHEN excluded.client_name = '' THEN client_name
+                    WHEN excluded.client_name > client_name THEN excluded.client_name
+                    ELSE client_name
+                END
+            ",
+        )
+        .bind(hour)
+        .bind(start)
+        .bind(end)
+        .bind(lower.0)
+        .bind(lower.1)
+        .bind(upper.0)
+        .bind(upper.1)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r"
+            INSERT INTO retention_upstream_counts (hour, upstream, total, errors, elapsed_sum)
+            SELECT ?, upstream, COUNT(*),
+                   SUM(CASE WHEN rcode IS NOT NULL AND rcode != 0 THEN 1 ELSE 0 END),
+                   SUM(COALESCE(elapsed_us, 0))
+            FROM query_log INDEXED BY idx_ql_ts_id
+            WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+              AND upstream IS NOT NULL
+            GROUP BY upstream
+            ON CONFLICT(hour, upstream) DO UPDATE SET
+                total = total + excluded.total,
+                errors = errors + excluded.errors,
+                elapsed_sum = elapsed_sum + excluded.elapsed_sum
+            ",
+        )
+        .bind(hour)
+        .bind(start)
+        .bind(end)
+        .bind(lower.0)
+        .bind(lower.1)
+        .bind(upper.0)
+        .bind(upper.1)
+        .execute(&mut *tx)
+        .await?;
+
+        if final_hour {
+            let tops = Self::load_temp_hour_tops(&mut tx, hour).await?;
+            let existing = load_existing_rollups(&mut tx, &[hour]).await?;
+            let existing = existing.get(&hour).cloned().unwrap_or_default();
+            let merged = self.merge_hour_rollup(existing, tops, rollup_client_names);
+            sqlx::query(
+                r"
+                INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients, top_upstreams)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(hour) DO UPDATE SET
+                    queries = queries + excluded.queries,
+                    blocked = blocked + excluded.blocked,
+                    cached = cached + excluded.cached,
+                    top_domains = excluded.top_domains,
+                    top_clients = excluded.top_clients,
+                    top_upstreams = excluded.top_upstreams
+                ",
+            )
+            .bind(hour)
+            .bind(queries)
+            .bind(blocked)
+            .bind(cached)
+            .bind(encode_tops(&merged.domains))
+            .bind(encode_tops(&merged.clients))
+            .bind(encode_tops(&merged.upstreams))
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                r"
+                INSERT INTO stats_hourly (hour, queries, blocked, cached)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(hour) DO UPDATE SET
+                    queries = queries + excluded.queries,
+                    blocked = blocked + excluded.blocked,
+                    cached = cached + excluded.cached
+                ",
+            )
+            .bind(hour)
+            .bind(queries)
+            .bind(blocked)
+            .bind(cached)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Delete exactly the rows that were aggregated above (same predicate in
+        // the same transaction).
+        let del_res = sqlx::query(
+            "DELETE FROM query_log INDEXED BY idx_ql_ts_id WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?) AND (ts, id) < (?, ?)",
+        )
+        .bind(start)
+        .bind(end)
+        .bind(lower.0)
+        .bind(lower.1)
+        .bind(upper.0)
+        .bind(upper.1)
+        .execute(&mut *tx)
+        .await?;
+
+        if max_seen_ts > 0 || max_seen_id > 0 {
+            sqlx::query(
+                r"
+                INSERT INTO stats_watermark (key, last_id, last_ts)
+                VALUES ('hourly_aggregation', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    last_id = MAX(stats_watermark.last_id, excluded.last_id),
+                    last_ts = MAX(stats_watermark.last_ts, excluded.last_ts)
+                ",
+            )
+            .bind(max_seen_id)
+            .bind(max_seen_ts)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        if final_hour {
+            Self::clear_retention_temp_hour(conn, hour).await?;
+        }
+        Ok(del_res.rows_affected())
     }
 
     /// Triggers SQLite `VACUUM` and truncates the WAL so the compacted file

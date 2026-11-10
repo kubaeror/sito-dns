@@ -436,7 +436,10 @@ anonymize_querylog = false
 > `rollup_client_names = true`. Switching `rollup_client_names` from `true` to
 > `false` scrubs names from existing rollups on the next startup. Archived
 > per-client rows therefore show the keyed hash (`blake3:…`) instead of a raw
-> address for data older than the detailed query-log retention. Existing raw
+> address for data older than the detailed query-log retention. Symlinked
+> `stats.db` or `stats-salt` paths are refused. Hashes written by the
+> unreleased pre-release base may use the legacy `b3:` prefix; both prefixes
+> are recognized and are never re-hashed. Existing raw
 > rollups are hashed once on startup by the database backfill; existing raw
 > `query_log` rows are not retroactively anonymized. `sito clear-query-log`
 > takes the service lease and refuses a running server unless `--force` is

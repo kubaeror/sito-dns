@@ -1390,9 +1390,9 @@ pub async fn run_server_full(
 
     // Periodic stats retention cleanup task (every 24h).
     // `retention_days`, `rollup_retention_days` and `rollup_client_names` are
-    // read on every cycle so config hot-reload applies. A catch-up sweep runs
-    // at startup when the persisted last success is older than the interval,
-    // after a bounded jitter to avoid a fleet-wide compaction storm.
+    // read on every cycle so config hot-reload applies. A bounded catch-up
+    // sweep runs on every startup after a short delay (capped at 5 minutes)
+    // plus jitter, so restart-heavy deployments still retain data.
     let retention_db = stats_db.clone();
     let retention_config = config_arc.clone();
     let retention_metrics = metrics.clone();
