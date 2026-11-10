@@ -80,8 +80,8 @@ named by the command.
 | Finding | Named test / check | Focused command |
 |---|---|---|
 | Query-log 429 retry hint | `test_querylog_rate_limit_response_has_retry_after` | `cargo test -p sito-api test_querylog_rate_limit_response_has_retry_after` |
-| DoH3 deadline reset branch | `test_doh3_deadline_resets_stream_when_headers_already_sent`, `test_doh3_deadline_sends_gateway_timeout_when_writable` | `cargo test -p sito-transport doh3_deadline` |
+| DoH3 deadline reset branch | `test_doh3_deadline_resets_stream_when_response_already_started`, `test_doh3_deadline_sends_gateway_timeout_when_writable`, `test_doh3_deadline_resets_stream_when_gateway_timeout_fails` | `cargo test -p sito-transport doh3_deadline` |
 | Filter dropped-class counters | `test_excessive_ac_and_prefix_patterns_are_capped_before_build`, `test_excessive_regex_patterns_are_capped_without_disabling_other_classes` | `cargo test -p sito-filter excessive_` |
-| Warm zero-source status retention | `test_warm_zero_source_transition_is_failed_and_retains_snapshot` | `cargo test -p sito-filter warm_zero_source` |
+| Warm zero-source status retention | `test_warm_zero_source_transition_is_failed_and_retains_snapshot` (seeded failed list + dropped regex) | `cargo test -p sito-filter warm_zero_source` |
 | Retention wrapper no longer detailed-only | `test_compat_cleanup_retention_applies_default_rollup_retention` | `cargo test -p sito-stats compat_cleanup_retention` |
-| Writer slow-lock/no-drop backoff | `test_writer_waits_out_a_slow_write_lock_without_dropping`, `test_flush_retry_delay_is_bounded_and_grows` | `cargo test -p sito-stats writer::tests` |
+| Writer busy timeout / retry budget / shutdown bound | `test_on_disk_busy_timeout_is_30s`, `test_writer_retry_budget_is_bounded_and_counts_dropped_batch`, `test_shutdown_flush_deadline_counts_dropped_batch`, `test_writer_waits_out_a_slow_write_lock_without_dropping`, `test_flush_retry_delay_is_bounded_and_grows` | `cargo test -p sito-stats writer::tests` |

@@ -500,6 +500,10 @@ fn test_m9_release_configuration_and_systemd() {
     assert!(svc_content.contains("NoNewPrivileges=true"));
     assert!(svc_content.contains("CAP_NET_BIND_SERVICE"));
     assert!(svc_content.contains("LimitNOFILE=1048576"));
+    assert!(
+        svc_content.contains("TimeoutStopSec=180"),
+        "the unit must allow the bounded shutdown flush to finish"
+    );
 
     // Verify install.sh script exists and is hardened
     let install_path = Path::new("../../contrib/install.sh");

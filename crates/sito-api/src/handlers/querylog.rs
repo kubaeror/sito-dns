@@ -8,7 +8,7 @@ use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use sito_stats::{QueryLogFilter, QueryLogPage};
@@ -97,13 +97,7 @@ impl IntoResponse for QueryLogHandlerError {
     fn into_response(self) -> Response {
         match self {
             Self::Problem(problem) => problem.into_response(),
-            Self::RateLimited(problem) => {
-                let mut response = problem.into_response();
-                response
-                    .headers_mut()
-                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-                response
-            }
+            Self::RateLimited(problem) => problem.into_response_with_retry_after(),
         }
     }
 }
@@ -275,10 +269,11 @@ mod tests {
         let temp_dir = crate::test_support::temp_dir("sito_querylog_429");
         let ctx = crate::test_support::mock_context(&temp_dir).await;
 
-        let octet = rand::random::<u8>();
-        let client_ip = format!("198.51.100.{octet}");
+        // Fixed, otherwise unused address: the rate limiter is process-global
+        // and the other querylog test uses 198.51.100.201.
+        let client_ip = "198.51.100.250";
         for _ in 0..REST_RATE_LIMIT {
-            assert!(!rest_rate_limited(&client_ip));
+            assert!(!rest_rate_limited(client_ip));
         }
 
         let viewer = RequireViewer(AuthUser {
@@ -286,7 +281,7 @@ mod tests {
             role: Role::Viewer,
             token_id: None,
         });
-        let peer = std::net::SocketAddr::from(([198, 51, 100, octet], 12_345));
+        let peer = std::net::SocketAddr::from(([198, 51, 100, 250], 12_345));
         let Err(error) = get_querylog(
             viewer,
             State(ctx),

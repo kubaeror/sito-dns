@@ -40,6 +40,9 @@ services:
       - "./config:/etc/sito"
       - "sito-data:/var/lib/sito"
     restart: unless-stopped
+    # Give the bounded query-log shutdown flush time to finish before Docker
+    # sends SIGKILL (the default stop grace period is 10 s).
+    stop_grace_period: 30s
     healthcheck:
       test:
         [

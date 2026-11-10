@@ -1863,8 +1863,11 @@ impl StatsDb {
     ///
     /// Delegates to [`Self::cleanup_retention_with_policy`] with the default
     /// `stats.rollup_retention_days` (365) instead of silently pruning detailed
-    /// rows only. Use [`Self::cleanup_detailed_retention`] when the caller
-    /// deliberately wants to keep hourly rollups.
+    /// rows only. The wrapper cannot see the runtime configuration, so a
+    /// deployment with a non-default rollup retention must call
+    /// [`Self::cleanup_retention_with_policy`] directly. Use
+    /// [`Self::cleanup_detailed_retention`] when the caller deliberately wants
+    /// to keep hourly rollups.
     #[deprecated(
         note = "use cleanup_detailed_retention for detailed rows only, or cleanup_retention_with_policy for an explicit rollup policy"
     )]

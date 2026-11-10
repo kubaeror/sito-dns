@@ -127,8 +127,9 @@ document is the operator-facing summary and upgrade guide.
   limits. Oversized sets keep the previous snapshot instead of partially
   dropping a class. The public `RuleSetBuilder` result now reports
   `dropped_prefix_rules` and `dropped_substring_rules` (alongside
-  `dropped_regex_patterns`) and exposes `has_dropped_classes()`, so a future
-  caller cannot mistake a partially compiled set for a complete one.
+  `dropped_regex_patterns`) and exposes `has_dropped_classes()`. Direct callers
+  must check `has_dropped_classes()` (or the counters) before treating a built
+  set as complete.
 - A rejected warm zero-source apply preserves the retained snapshot's
   loaded/failed/degraded list fields, dropped-class counters, and compile time;
   only the lifecycle state and error change.
@@ -159,7 +160,8 @@ document is the operator-facing summary and upgrade guide.
   a global in-flight request cap returns 503, HTTP/2 streams are capped at 32,
   and requests/connections have absolute deadlines/lifetimes. A DoH3 request
   that exceeds its total deadline now returns HTTP 504 (matching DoH) when the
-  response stream is still writable, otherwise the stream is reset.
+  response has not started; once a response header block has been sent, the
+  stream is reset instead of emitting a second (invalid) HEADERS frame.
 - **One response-shaping path:** cache hits, upstream, stale, and synthesized
   answers carry the current client question/RD/CD/ID, rebuild OPT from the
   client's EDNS, never replay upstream EDNS options (COOKIE/NSID/ECS/padding/
@@ -282,10 +284,14 @@ P1-19, P1-23, and P1-24 are closed in this branch:
   in separate short transactions, runs a bounded jittered catch-up on every
   startup (within 5 minutes even when the last success is recent), and exposes
   success/failure, duration, deleted-row and rollup-cleanup metrics.
-- **Slow-disk query-log writer.** The SQLite pool busy timeout is 30 s and the
-  writer retries a failed batch up to five times with bounded exponential
-  backoff (50 ms–1 s) before counting it dropped, so a slow retention chunk does
-  not silently discard a batch.
+- **Slow-disk query-log writer.** The on-disk SQLite pool busy timeout is 30 s
+  and the writer makes five attempts (four retries) with bounded exponential
+  backoff (50 ms, 100 ms, 200 ms, 400 ms; capped at 1 s) before counting a batch
+  dropped, so a slow retention chunk does not silently discard it. The final
+  shutdown flush is bounded to 3 s and counts an uncommitted batch as dropped;
+  the systemd unit sets `TimeoutStopSec=180`, and the Compose files set
+  `stop_grace_period: 30s`. A plain `docker stop` should use a grace period of
+  at least 30 s.
 - **Retention API naming.** `StatsDb::cleanup_detailed_retention()` is the
   explicit detailed-only sweep. The deprecated `cleanup_retention()` wrapper
   now delegates to the full policy with the default `rollup_retention_days`

@@ -6,7 +6,9 @@
 
 use bytes::{Buf, Bytes};
 use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, trace, warn};
@@ -68,9 +70,11 @@ const MAX_DOH3_FIELD_SECTION_BYTES: u64 = 16 * 1024;
 /// Minimal response-stream surface used to answer a request-deadline expiry.
 ///
 /// A DoH3 deadline can fire before any response header is sent (answer 504) or
-/// after the handler already started the response (headers are no longer
-/// writable, so reset the stream). Keeping the decision in one helper makes
-/// both branches testable without a live QUIC connection.
+/// after the handler already started the response. h3 0.0.8 does **not**
+/// reject a second HEADERS frame on an open stream, so the response-started
+/// state must be tracked by the caller rather than inferred from
+/// `send_response` failing. Keeping the decision in one helper makes both
+/// branches testable without a live QUIC connection.
 trait TimeoutResponseStream {
     type Error;
 
@@ -79,7 +83,51 @@ trait TimeoutResponseStream {
     fn reset_stream(&mut self);
 }
 
-impl TimeoutResponseStream for h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes> {
+/// Wraps the h3 request stream and records whether a response header block was
+/// already accepted. Other stream methods are forwarded through `Deref`.
+struct TrackedRequestStream {
+    inner: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    response_started: Arc<AtomicBool>,
+}
+
+impl TrackedRequestStream {
+    fn new(
+        inner: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+        response_started: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            inner,
+            response_started,
+        }
+    }
+
+    async fn send_response(
+        &mut self,
+        response: http::Response<()>,
+    ) -> Result<(), h3::error::StreamError> {
+        let result = self.inner.send_response(response).await;
+        if result.is_ok() {
+            self.response_started.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+}
+
+impl Deref for TrackedRequestStream {
+    type Target = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for TrackedRequestStream {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl TimeoutResponseStream for TrackedRequestStream {
     type Error = h3::error::StreamError;
 
     async fn send_gateway_timeout(&mut self) -> Result<(), Self::Error> {
@@ -87,21 +135,27 @@ impl TimeoutResponseStream for h3::server::RequestStream<h3_quinn::BidiStream<By
             .status(http::StatusCode::GATEWAY_TIMEOUT)
             .body(())
             .unwrap();
-        self.send_response(response).await
+        self.inner.send_response(response).await
     }
 
     async fn finish_response(&mut self) -> Result<(), Self::Error> {
-        self.finish().await
+        self.inner.finish().await
     }
 
     fn reset_stream(&mut self) {
-        self.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+        self.inner
+            .stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
     }
 }
 
-/// Answers a request-deadline expiry: 504 when the response is still writable,
-/// otherwise reset the stream because headers were already sent.
-async fn finish_request_timeout<S: TimeoutResponseStream>(stream: &mut S) {
+/// Answers a request-deadline expiry: 504 only when no response has started,
+/// otherwise reset the stream. h3 would accept a second HEADERS frame, so the
+/// caller must supply the tracked state.
+async fn finish_request_timeout<S: TimeoutResponseStream>(stream: &mut S, response_started: bool) {
+    if response_started {
+        stream.reset_stream();
+        return;
+    }
     if stream.send_gateway_timeout().await.is_ok() {
         let _ = stream.finish_response().await;
     } else {
@@ -433,7 +487,7 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
 
                                 let deadline =
                                     tokio::time::Instant::now() + limits.request_timeout;
-                                let (req, mut stream) = match tokio::time::timeout_at(
+                                let (req, stream) = match tokio::time::timeout_at(
                                     deadline,
                                     resolver.resolve_request(),
                                 )
@@ -455,6 +509,11 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
                                         return;
                                     }
                                 };
+                                let response_started = Arc::new(AtomicBool::new(false));
+                                let mut stream = TrackedRequestStream::new(
+                                    stream,
+                                    Arc::clone(&response_started),
+                                );
 
                                 let handled = tokio::time::timeout_at(deadline, async {
 
@@ -717,9 +776,14 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
                                     );
                                     // DoH returns 504 on its request deadline; keep
                                     // the transports operationally consistent. If
-                                    // the response has already started, the stream
-                                    // is no longer writable, so reset it instead.
-                                    finish_request_timeout(&mut stream).await;
+                                    // the response has already started, a second
+                                    // HEADERS block would be accepted by h3 but is
+                                    // invalid, so reset the stream instead.
+                                    finish_request_timeout(
+                                        &mut stream,
+                                        response_started.load(Ordering::SeqCst),
+                                    )
+                                    .await;
                                 }
                             });
                             // Reap completed request tasks continuously, not
@@ -789,14 +853,15 @@ mod tests {
 
     /// Test double for the request-deadline response branch.
     ///
-    /// h3's `RequestStream` has no public way to mark a response as already
-    /// started without a live peer, so the "headers sent" state is modelled
-    /// here: `send_response` fails exactly as it does on a second header block.
+    /// The response-started state is passed explicitly because h3 0.0.8
+    /// accepts a second HEADERS block on an open stream; it cannot be inferred
+    /// from `send_response` failing.
     #[derive(Default)]
     struct FakeTimeoutStream {
-        headers_sent: bool,
+        gateway_sent: bool,
         finished: bool,
         reset: bool,
+        fail_gateway: bool,
     }
 
     // The trait mirrors the async h3 methods; the fake completes immediately.
@@ -805,12 +870,8 @@ mod tests {
         type Error = ();
 
         async fn send_gateway_timeout(&mut self) -> Result<(), Self::Error> {
-            if self.headers_sent {
-                // h3 refuses a second response header block on the stream.
-                Err(())
-            } else {
-                Ok(())
-            }
+            self.gateway_sent = true;
+            if self.fail_gateway { Err(()) } else { Ok(()) }
         }
 
         async fn finish_response(&mut self) -> Result<(), Self::Error> {
@@ -823,25 +884,27 @@ mod tests {
         }
     }
 
-    /// Deferred D4a: the "headers already sent, reset stream" deadline branch
-    /// used to be untested. A stream whose response already started must be
-    /// cancelled instead of trying (and failing) to send a second 504.
+    /// Deferred D4a: when the handler already started a response, the deadline
+    /// path must reset the stream instead of sending a second (invalid) HEADERS
+    /// block. h3 0.0.8 would accept that second block, so this state must be
+    /// tracked explicitly rather than inferred from `send_response`.
     #[tokio::test]
-    async fn test_doh3_deadline_resets_stream_when_headers_already_sent() {
-        let mut stream = FakeTimeoutStream {
-            headers_sent: true,
-            ..FakeTimeoutStream::default()
-        };
+    async fn test_doh3_deadline_resets_stream_when_response_already_started() {
+        let mut stream = FakeTimeoutStream::default();
 
-        finish_request_timeout(&mut stream).await;
+        finish_request_timeout(&mut stream, true).await;
 
         assert!(
             stream.reset,
-            "a stream whose headers were already sent must be reset"
+            "a stream whose response already started must be reset"
+        );
+        assert!(
+            !stream.gateway_sent,
+            "the helper must not try to send a 504 after a response started"
         );
         assert!(
             !stream.finished,
-            "the helper must not finish a stream that could not accept a 504"
+            "the helper must not finish a stream that was reset"
         );
     }
 
@@ -850,16 +913,36 @@ mod tests {
     async fn test_doh3_deadline_sends_gateway_timeout_when_writable() {
         let mut stream = FakeTimeoutStream::default();
 
-        finish_request_timeout(&mut stream).await;
+        finish_request_timeout(&mut stream, false).await;
 
         assert!(
+            stream.gateway_sent,
+            "a writable stream must be answered with 504"
+        );
+        assert!(
             stream.finished,
-            "a writable stream must be answered with 504 and finished"
+            "a writable stream must be finished after the 504"
         );
         assert!(
             !stream.reset,
             "a writable stream must not be reset after sending 504"
         );
+    }
+
+    /// A failed 504 write (for example the peer reset the stream) falls back to
+    /// resetting the stream.
+    #[tokio::test]
+    async fn test_doh3_deadline_resets_stream_when_gateway_timeout_fails() {
+        let mut stream = FakeTimeoutStream {
+            fail_gateway: true,
+            ..FakeTimeoutStream::default()
+        };
+
+        finish_request_timeout(&mut stream, false).await;
+
+        assert!(stream.gateway_sent);
+        assert!(stream.reset, "a failed 504 write must reset the stream");
+        assert!(!stream.finished);
     }
 
     #[tokio::test]

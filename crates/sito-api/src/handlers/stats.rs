@@ -14,7 +14,7 @@ use crate::models::StatsQuery;
 use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use sito_stats::{ClientStats, GlobalStats, UpstreamStats};
 use std::collections::HashMap;
@@ -96,13 +96,7 @@ impl IntoResponse for StatsHandlerError {
     fn into_response(self) -> Response {
         match self {
             Self::Problem(problem) => problem.into_response(),
-            Self::RateLimited(problem) => {
-                let mut response = problem.into_response();
-                response
-                    .headers_mut()
-                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-                response
-            }
+            Self::RateLimited(problem) => problem.into_response_with_retry_after(),
         }
     }
 }

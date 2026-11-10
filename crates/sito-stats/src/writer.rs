@@ -26,6 +26,13 @@ const MAX_FLUSH_ATTEMPTS: u32 = 5;
 const FLUSH_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
 /// Upper bound for the exponential flush backoff.
 const FLUSH_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+/// Overall budget for the final shutdown flush.
+///
+/// Normal flushes may wait out a slow disk (30 s busy timeout × attempts), but
+/// service managers stop a process on a fixed deadline. The shutdown flush is
+/// bounded so the final batch is either committed or counted as dropped before
+/// the process is killed.
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Bounded exponential backoff for a failed flush attempt.
 fn flush_retry_delay(attempt: u32) -> Duration {
@@ -43,6 +50,7 @@ async fn flush_batch(
     batch: &mut Vec<QueryLogEntry>,
     dropped_total: &AtomicU64,
     reason: &'static str,
+    deadline: Option<tokio::time::Instant>,
 ) {
     if batch.is_empty() {
         return;
@@ -50,7 +58,24 @@ async fn flush_batch(
 
     let mut attempt = 1u32;
     loop {
-        match db.insert_batch(batch).await {
+        let result = match deadline {
+            Some(deadline) => {
+                if let Ok(result) = tokio::time::timeout_at(deadline, db.insert_batch(batch)).await
+                {
+                    result
+                } else {
+                    error!(
+                        dropped = batch.len(),
+                        "Failed to flush query log batch ({reason}) before the shutdown deadline; dropping entries"
+                    );
+                    dropped_total.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    batch.clear();
+                    return;
+                }
+            }
+            None => db.insert_batch(batch).await,
+        };
+        match result {
             Ok(()) => {
                 batch.clear();
                 return;
@@ -196,26 +221,65 @@ impl QueryLogWriter {
                             Some(WriterCommand::Entry(entry)) => {
                                 batch.push(*entry);
                                 if batch.len() >= BATCH_SIZE_THRESHOLD {
-                                    flush_batch(&db, &mut batch, &dropped_total, "size threshold").await;
+                                    flush_batch(
+                                        &db,
+                                        &mut batch,
+                                        &dropped_total,
+                                        "size threshold",
+                                        None,
+                                    )
+                                    .await;
                                 }
                             }
                             Some(WriterCommand::Flush(ack)) => {
-                                flush_batch(&db, &mut batch, &dropped_total, "explicit flush").await;
+                                flush_batch(
+                                    &db,
+                                    &mut batch,
+                                    &dropped_total,
+                                    "explicit flush",
+                                    None,
+                                )
+                                .await;
                                 let _ = ack.send(());
                             }
                             Some(WriterCommand::Shutdown(ack)) => {
-                                flush_batch(&db, &mut batch, &dropped_total, "shutdown").await;
+                                let deadline =
+                                    tokio::time::Instant::now() + SHUTDOWN_FLUSH_TIMEOUT;
+                                flush_batch(
+                                    &db,
+                                    &mut batch,
+                                    &dropped_total,
+                                    "shutdown",
+                                    Some(deadline),
+                                )
+                                .await;
                                 let _ = ack.send(());
                                 break;
                             }
                             None => {
-                                flush_batch(&db, &mut batch, &dropped_total, "channel close").await;
+                                let deadline =
+                                    tokio::time::Instant::now() + SHUTDOWN_FLUSH_TIMEOUT;
+                                flush_batch(
+                                    &db,
+                                    &mut batch,
+                                    &dropped_total,
+                                    "channel close",
+                                    Some(deadline),
+                                )
+                                .await;
                                 break;
                             }
                         }
                     }
                     _ = interval.tick() => {
-                        flush_batch(&db, &mut batch, &dropped_total, "timer tick").await;
+                        flush_batch(
+                            &db,
+                            &mut batch,
+                            &dropped_total,
+                            "timer tick",
+                            None,
+                        )
+                        .await;
                     }
                 }
             }
@@ -239,10 +303,34 @@ impl QueryLogWriter {
         self
     }
 
-    /// Shuts down the writer cleanly, flushing any remaining buffered logs, and waits for task exit.
+    /// Shuts down the writer cleanly, flushing any remaining buffered logs, and
+    /// waits for task exit.
+    ///
+    /// The wait is bounded so a service manager stop deadline cannot kill the
+    /// process while this future is still waiting on a wedged disk. The
+    /// shutdown flush itself also has a shorter deadline and counts anything
+    /// it cannot commit as dropped.
     pub async fn shutdown(self) {
-        self.sender.shutdown().await;
-        let _ = self.join_handle.await;
+        let deadline =
+            tokio::time::Instant::now() + SHUTDOWN_FLUSH_TIMEOUT + Duration::from_secs(1);
+        if tokio::time::timeout_at(deadline, self.sender.shutdown())
+            .await
+            .is_err()
+        {
+            warn!(
+                "Query log writer shutdown command exceeded the {}s deadline",
+                SHUTDOWN_FLUSH_TIMEOUT.as_secs() + 1
+            );
+        }
+        if tokio::time::timeout_at(deadline, self.join_handle)
+            .await
+            .is_err()
+        {
+            warn!(
+                "Query log writer did not exit before the {}s shutdown deadline",
+                SHUTDOWN_FLUSH_TIMEOUT.as_secs() + 1
+            );
+        }
     }
 
     /// Waits for the writer task to exit.
@@ -326,6 +414,137 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.entries.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Deferred D4a review: the shutdown flush must be bounded even when the
+    /// write lock is held longer than the shutdown budget, and the uncommitted
+    /// batch must be counted as dropped.
+    #[tokio::test]
+    async fn test_shutdown_flush_deadline_counts_dropped_batch() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_shutdown_deadline_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let db = StatsDb::open(&db_path).await.unwrap();
+
+        let lock_options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(30));
+        let mut lock_conn = sqlx::SqliteConnection::connect_with(&lock_options)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut lock_conn)
+            .await
+            .unwrap();
+
+        let mut batch = vec![QueryLogEntry::new(
+            chrono::Utc::now().timestamp_millis(),
+            "192.0.2.12",
+            None,
+            "shutdown-deadline.example",
+            1,
+            Some(0),
+            "allowed",
+            "udp",
+        )];
+        let dropped = std::sync::atomic::AtomicU64::new(0);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        flush_batch(&db, &mut batch, &dropped, "test", Some(deadline)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the shutdown flush must not wait for the full busy timeout (elapsed {elapsed:?})"
+        );
+        assert_eq!(batch.len(), 0);
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            1,
+            "an uncommitted shutdown batch must be counted as dropped"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Deferred D4a review: assert the on-disk pool actually uses the raised
+    /// busy timeout. The old 10 s value fails this assertion.
+    #[tokio::test]
+    async fn test_on_disk_busy_timeout_is_30s() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_busy_timeout_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let db = StatsDb::open(&db_path).await.unwrap();
+
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            busy_timeout, 30_000,
+            "on-disk StatsDb must use the 30 s busy timeout"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Deferred D4a review: a permanently failing insert must exhaust the
+    /// retry budget (four retries, ~750 ms of backoff) and count the batch as
+    /// dropped. The old three-attempt policy finished in ~150 ms.
+    #[tokio::test]
+    async fn test_writer_retry_budget_is_bounded_and_counts_dropped_batch() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_writer_retry_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let db = StatsDb::open(&db_path).await.unwrap();
+        sqlx::query("DROP TABLE query_log")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let writer = QueryLogWriter::spawn(db.clone(), 16);
+        let sender = writer.sender();
+        assert!(
+            sender.try_send(QueryLogEntry::new(
+                chrono::Utc::now().timestamp_millis(),
+                "192.0.2.11",
+                None,
+                "retry-budget.example",
+                1,
+                Some(0),
+                "allowed",
+                "udp",
+            )),
+            "the entry must reach the writer queue"
+        );
+
+        let started = std::time::Instant::now();
+        sender.flush().await;
+        let elapsed = started.elapsed();
+        writer.shutdown().await;
+
+        assert_eq!(
+            sender.dropped_total(),
+            1,
+            "a permanently failing batch must be counted as dropped"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(600),
+            "the writer must exercise the full retry budget before dropping (elapsed {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the retry budget must remain bounded (elapsed {elapsed:?})"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

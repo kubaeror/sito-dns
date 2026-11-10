@@ -1860,7 +1860,7 @@ impl HostsFilterEngine {
         if dropped_prefix_rules > 0 {
             error!(
                 dropped = dropped_prefix_rules,
-                "Some prefix blocking rules could not be compiled and are inactive"
+                "Some prefix filtering rules could not be compiled and are inactive"
             );
         }
         let dropped_substring_rules = new_snapshot.allowlist.dropped_substring_rules
@@ -1868,7 +1868,7 @@ impl HostsFilterEngine {
         if dropped_substring_rules > 0 {
             error!(
                 dropped = dropped_substring_rules,
-                "Some substring blocking rules could not be compiled and are inactive"
+                "Some substring filtering rules could not be compiled and are inactive"
             );
         }
         self.snapshot.store(Arc::new(new_snapshot));
@@ -2587,21 +2587,37 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         tokio::fs::create_dir_all(&temp_dir).await.unwrap();
         let list_path = temp_dir.join("only.txt");
-        tokio::fs::write(&list_path, "||only.com^\n").await.unwrap();
+        // One valid rule plus an invalid regex that is dropped at compile time.
+        tokio::fs::write(&list_path, "||only.com^\n/^($/\n")
+            .await
+            .unwrap();
         let config = FilteringConfig {
-            lists: vec![FilterListConfig {
-                name: "only-list".to_string(),
-                url: format!("file://{}", list_path.display()),
-                enabled: true,
-                refresh_hours: None,
-            }],
+            lists: vec![
+                FilterListConfig {
+                    name: "only-list".to_string(),
+                    url: format!("file://{}", list_path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+                FilterListConfig {
+                    name: "failed-list".to_string(),
+                    url: format!("file://{}", temp_dir.join("missing.txt").display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+            ],
             ..Default::default()
         };
         let engine = HostsFilterEngine::init(config.clone(), temp_dir.clone()).await;
-        assert_eq!(engine.rule_count(), 1);
+        assert_eq!(engine.rule_count(), 2);
         assert_eq!(engine.state(), FilterState::Ready);
         let before = engine.status();
         assert_eq!(before.loaded_lists, 1);
+        assert_eq!(before.failed_lists, vec!["failed-list".to_string()]);
+        assert_eq!(
+            before.dropped_regex_patterns, 1,
+            "the invalid regex must be counted as dropped"
+        );
         assert!(before.last_compile_ms.is_some());
 
         // A live (warm) apply that removes every source must be rejected and
@@ -2616,21 +2632,28 @@ mod tests {
             .await
             .expect_err("zero sources must reject a warm apply");
         assert!(matches!(err, FilterError::NoSourcesConfigured));
-        assert_eq!(engine.rule_count(), 1, "the last rule must be retained");
+        assert_eq!(engine.rule_count(), 2, "the last rules must be retained");
         assert_eq!(engine.state(), FilterState::Failed);
         assert!(!engine.unavailable_for_fail_closed());
         let after = engine.status();
+        assert_eq!(
+            after.rule_count, before.rule_count,
+            "the retained snapshot's rule count must be preserved"
+        );
+        assert!(!after.unavailable);
         assert_eq!(
             after.loaded_lists, before.loaded_lists,
             "the retained snapshot's loaded-list count must be preserved"
         );
         assert_eq!(after.failed_lists, before.failed_lists);
+        assert_eq!(after.failed_lists.len(), 1);
         assert_eq!(after.degraded_lists, before.degraded_lists);
         assert_eq!(after.degraded_groups, before.degraded_groups);
         assert_eq!(
             after.dropped_regex_patterns, before.dropped_regex_patterns,
             "dropped-class counters must survive a rejected zero-source apply"
         );
+        assert_eq!(after.dropped_regex_patterns, 1);
         assert_eq!(
             after.last_compile_ms, before.last_compile_ms,
             "the retained snapshot's compile time must be preserved"
