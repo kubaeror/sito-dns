@@ -48,10 +48,14 @@ cargo test --workspace --all-features --locked --no-fail-fast
 cargo deny check
 python3 scripts/check_config_reference.py --github
 SITO_UPDATE_OPENAPI=1 cargo test -p sito-api test_export_openapi_json
-cargo check --manifest-path fuzz/Cargo.toml --locked
 shellcheck -S warning contrib/install.sh
 python3 contrib/tests/test_adguard_to_sito.py
 ```
+
+> The `cargo check --manifest-path fuzz/Cargo.toml --locked` step in the
+> original 1.9.3 validation list applied only while the fuzz harness existed.
+> It was removed after v1.9.3; current trees have no `fuzz/` directory. See
+> [docs/ci.md](ci.md#scheduled-fuzzing-was-intentionally-removed).
 
 The release workflow additionally verifies the tag/version, artifact checksums,
 cosign signatures, multi-arch image platforms, and SLSA/SPDX attestations.

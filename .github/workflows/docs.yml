@@ -13,6 +13,7 @@ on:
       - 'CODE_OF_CONDUCT.md'
       - 'SECURITY.md'
       - 'scripts/check_config_reference.py'
+      - 'scripts/check_markdown_links.py'
   workflow_call:
   workflow_dispatch:
 
@@ -78,6 +79,13 @@ jobs:
       - name: Verify configuration reference matches the config structs
         if: always() && steps.changed.outputs.config_docs == 'true'
         run: python3 scripts/check_config_reference.py --github
+
+      # Internal-only link check: external URLs are never fetched, so this
+      # stays deterministic. It always runs because any Markdown file can link
+      # anywhere else in the repository.
+      - name: Check internal Markdown links and anchors
+        if: always()
+        run: python3 scripts/check_markdown_links.py --github
 
       - name: Lint GitHub Actions workflows
         if: always() && steps.changed.outputs.workflows == 'true'

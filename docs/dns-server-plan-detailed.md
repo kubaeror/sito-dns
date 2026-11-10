@@ -1,5 +1,15 @@
 # Design Document: Custom DNS Server (AdGuard Home Clone) — Expanded Edition
 
+> **Historical design document.** This is the original expanded design/plan, not
+> a description of the shipped 1.9.4 behavior. Some planned features were
+> changed or never implemented. In particular, configuration is **file-only**:
+> there are no `DNSD__SECTION__KEY` environment overrides (only HA
+> `${SECRET:name}` placeholders are resolved from the environment), and
+> `config_version` migrations are a 2.0 item, not a 1.9.x automatic behavior.
+> For current behavior use
+> [configuration-reference.md](configuration-reference.md) and
+> [audit6.md](audit6.md).
+
 Working title: **sito**. Document v2 — every section expanded to detailed-spec level, ready for coding agents.
 
 ---
@@ -783,7 +793,7 @@ token_env = "MIKROTIK_API_TOKEN"
 interval_s = 300
 ```
 
-Rules: env override `DNSD__SECTION__KEY` (double underscore); secrets only via env or file paths (`*_env`, `*_file`); `config_version` — automatic migrations with a file backup; every change via API → validation → atomic write (tmp+rename) → snapshot swap.
+Rules: **design intent only — not implemented in 1.9.x.** The shipped server does not read `DNSD__SECTION__KEY` environment overrides (see the historical banner above); current config is TOML-file-only, secrets use `${SECRET:name}` in HA bundles, and `config_version` rejects anything other than `1`. Every change via API → validation → atomic write (tmp+rename) → snapshot swap.
 
 ---
 
@@ -883,7 +893,7 @@ services:
     # …
   sito-slave:
     networks: { lan: { ipv4_address: 192.168.1.11 } }
-    environment: [ "DNSD__HA__MASTER_URL=wss://192.168.1.10:8953" ]
+    environment: [ "DNSD__HA__MASTER_URL=wss://192.168.1.10:8953" ]  # design only; not supported in 1.9.x
     # …
 ```
 

@@ -1,7 +1,7 @@
 > **Historical document.** This audit records the state at its original commit
 > and is kept for context only. It is not evidence of current behavior. See
 > [audit6.md](audit6.md) and the [audit 6 claim matrix](audit6-claim-matrix.md)
-> for the current audit and verified claims.
+> for the current audit, 1.9.4 remediation status, and verified claims.
 
 # sito-dns v1.2.1 — Post-Remediation Audit & Fix Plan (Agent Handoff)
 

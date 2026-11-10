@@ -16,9 +16,11 @@ services:
       - /tmp:size=64m,mode=1777
     ports:
       # LAN-only deployment: publish DNS to the interface your clients use and
-      # keep 8080 on loopback (or behind a TLS reverse proxy). The historical
-      # mappings below are unchanged for compatibility; they expose the admin
-      # UI on every host interface over plain HTTP.
+      # keep 8080 on loopback (or behind a TLS reverse proxy). Docker's port
+      # mapping controls *host* exposure; web.bind controls the listener
+      # *inside* the container (keep it 0.0.0.0 so Docker can forward). The
+      # historical mappings below are unchanged for compatibility; they expose
+      # the admin UI on every host interface over plain HTTP.
       # For safe admin access, replace the 8080 line with:
       #   - "127.0.0.1:8080:8080/tcp"
       - "53:53/udp"

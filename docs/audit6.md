@@ -6,10 +6,20 @@ Phase 1 and later ship in 2.0.0.
 **Full plan:** [audit6-followup-plan.md](audit6-followup-plan.md).
 **Verified prior claims:** [audit6-claim-matrix.md](audit6-claim-matrix.md).
 
+> **Phase 0 status: complete in sito 1.9.4.** The safety gate fixed P0-1/P0-2 and
+> P1-1 through P1-18 and P1-20 through P1-22 and P1-25 through P1-27, plus the
+> directly exploitable transport/upstream/auth/installer items in the same work
+> packages. P1-19, P1-23, and P1-24 (stats privacy/polling/retention) remain
+> deferred to Phase 2 and are recorded as residual risks in the
+> [1.9.4 release notes](release-notes-1.9.4.md). P2/P3 documentation truth items
+> are addressed in 1.9.4; RouterOS remains experimental and 2.0 still owns the
+> structural refactor (config/validator/session/chain state machines). The
+> verdict and scorecard below describe the audited v1.9.3 tree, not 1.9.4.
+
 This document is the concise audit record. The linked plan remains the source
 of truth for finding details, work packages, and acceptance criteria.
 
-## Executive verdict
+## Executive verdict at audit time (v1.9.3)
 
 **Production readiness: 4/10. Completeness: 7/10.**
 
@@ -25,9 +35,9 @@ parental/service data is tiny, safe search is narrow, ACME is broken, RouterOS
 is niche and partially unsafe, and several settings exist only as raw TOML or
 dead knobs.
 
-After the Phase 0 safety gate, the realistic target is 6/10 readiness. After the
-2.0 plan, the target is 8.5/10 for core features, with RouterOS explicitly
-experimental and documentation matching code.
+After the Phase 0 safety gate, the realistic target is 6/10 readiness (the
+shipped 1.9.4 state). After the 2.0 plan, the target is 8.5/10 for core features,
+with RouterOS explicitly experimental and documentation matching code.
 
 ## Scorecard
 
@@ -85,48 +95,49 @@ is “how much of the stated feature is actually implemented?”
 ## P0 and P1 summary
 
 P0 means deployment/security blocker; P1 means high severity. Detailed evidence
-and the fix plan live in the [full plan](audit6-followup-plan.md). P1-19, P1-23,
-and P1-24 are explicitly deferred to Phase 2 and recorded as residual risks in
-the 1.9.4 release notes.
+and the fix plan live in the [full plan](audit6-followup-plan.md). The status
+column records the 1.9.4 safety-gate outcome. P1-19, P1-23, and P1-24 are
+explicitly deferred to Phase 2 and recorded as residual risks in the
+[1.9.4 release notes](release-notes-1.9.4.md#deferred-to-phase-2).
 
 ### P0 — release-blocking
 
-| ID | Area | Finding |
-|---|---|---|
-| P0-1 | ACME/TLS | The ACME bootstrap certificate has a ~2,000-year validity and no bootstrap marker, so a fresh ACME-only install never orders or renews a certificate. |
-| P0-2 | DNSSEC | NSEC/NSEC3 denial validation accepts ancestor-delegation records and does not check closest-encloser/NS-without-SOA semantics, allowing a signed parent's public delegation data to forge AD=1 NXDOMAIN/NODATA below a child zone. |
+| ID | Area | Finding (v1.9.3) | Status in 1.9.4 |
+|---|---|---|---|
+| P0-1 | ACME/TLS | The ACME bootstrap certificate has a ~2,000-year validity and no bootstrap marker, so a fresh ACME-only install never orders or renews a certificate. | **Fixed.** 7-day marked bootstrap placeholder; bootstrap is not served unless `acme.allow_bootstrap_cert = true`; legacy year-4096 self-signed pairs are detected and renewed. |
+| P0-2 | DNSSEC | NSEC/NSEC3 denial validation accepts ancestor-delegation records and does not check closest-encloser/NS-without-SOA semantics, allowing a signed parent's public delegation data to forge AD=1 NXDOMAIN/NODATA below a child zone. | **Fixed.** Parent-side delegation NSEC/NSEC3 records cannot prove denial below the cut; DS NODATA at the cut still works. |
 
 ### P1 — high
 
-| ID | Area | Finding |
-|---|---|---|
-| P1-1 | DNSSEC | Fail-open paths: junk RRSIG suppresses the unsigned probe, signed CNAME to unsigned target is classified without an authenticated DS denial, and strict mode can serve `Indeterminate`. |
-| P1-2 | DNSSEC | Key/chain fetching has per-fetch limits but no overall wall-clock or global per-query work cap. |
-| P1-3 | HA | The slave session loop has no master heartbeat/read deadline and can report `Synced` while serving stale shared config. |
-| P1-4 | HA | Same-version ACK trusts the local watermark as proof the local config still matches the master bundle. |
-| P1-5 | HA | A delayed same-version fork ACK is ignored after a newer publish, hiding divergence from the operator. |
-| P1-6 | HA/API | `publish_bundle()` logs and drops publish failures and does not enforce the 1 MiB WebSocket limit before persisting. |
-| P1-7 | Filter | Parser/compiler budgets are enforced after materialization; no line, token, or total parsed-byte caps. |
-| P1-8 | Filter | Empty or zero-yield list responses are accepted as a successful empty snapshot; `fail_closed` does not trigger. |
-| P1-9 | Filter/Rewrites/Clients/DoH | Malformed rules widen scope by dropping invalid tokens; rewrite `exception_clients` trusts an unauthenticated DoH path/SNI identity. |
-| P1-10 | DoQ | Admission allows unauthenticated memory/task growth before rate limiting (default stream/connection windows). |
-| P1-11 | DoH | The body is buffered before the rate check and there is no global request semaphore or lowered H2 stream cap. |
-| P1-12 | ACME/TLS | Challenge selection can pick TLS-ALPN-01 with no TCP 443 listener; only the DoH manager reloads after issuance. |
-| P1-13 | Cache/Transport | Forced-DO upstream OPT is not stripped and cache hits clone the stored question/flags, leaking OPT and wrong case/RD/DO/CD. |
-| P1-14 | DoH/DoH3 | Response encoding has no 65,535-byte cap, violating DNS message framing and allowing unbounded bandwidth. |
-| P1-15 | Auth/TOTP | TOTP setup/enable replaces the secret and backup codes with only an Admin session, allowing a stolen session to take over 2FA. |
-| P1-16 | Auth/UI | The setup wizard is re-openable by any Admin and can reset the admin password without the current password or TOTP. |
-| P1-17 | Installer | Live upgrade and rollback use `cp -f` over a running binary, so the documented upgrade fails with `ETXTBSY`. |
-| P1-18 | Cache | Cache invalidation closures are never enabled; “invalidate domain” reports success while leaving entries cached. |
-| P1-19 | Stats | Hourly rollups permanently retain client IPs, names, and full domains; retention/clear do not erase rollups. *(Deferred to Phase 2.)* |
-| P1-20 | Auth | Login accepts unbounded username/password strings and uses the full username as a lockout key, enabling pre-auth DoS and lockout eviction. |
-| P1-21 | CI/Release | Release validation does not require the tagged commit to be on `main`, tested, or security-checked; main pushes skip tests/clippy/fmt. |
-| P1-22 | Installer/Docs | Signature verification defaults to off and silently downgrades to same-origin SHA-256 when assets are missing; docs claim signed verification. |
-| P1-23 | Stats/API | Query-log pages run whole-table `COUNT(*)` every 3 seconds and dashboards run repeated aggregate scans, enabling authenticated self-DoS. *(Deferred to Phase 2.)* |
-| P1-24 | Stats | Retention runs as one large immediate transaction with full scans, holds the write lock for minutes, and never runs at startup. *(Deferred to Phase 2.)* |
-| P1-25 | Upstream | Bootstrap/health probes omit RD=1, bootstrap answers bypass the SSRF denylist, and re-resolution serves stale cache instead of forcing refresh. |
-| P1-26 | Core/Config apply | The filter engine is swapped before the runtime snapshot, creating a filter-enable bypass window and inconsistent failure state. |
-| P1-27 | Core/Config apply | The DNSSEC validator is swapped before the cache flush, so old-policy validation status can survive a policy change. |
+| ID | Area | Finding (v1.9.3) | Status in 1.9.4 |
+|---|---|---|---|
+| P1-1 | DNSSEC | Fail-open paths: junk RRSIG suppresses the unsigned probe, signed CNAME to unsigned target is classified without an authenticated DS denial, and strict mode can serve `Indeterminate`. | **Fixed.** Per-RRset probing, authenticated DS-denial requirement, CNAME/QTYPE=CNAME fixes, and strict `Indeterminate` → SERVFAIL. |
+| P1-2 | DNSSEC | Key/chain fetching has per-fetch limits but no overall wall-clock or global per-query work cap. | **Fixed.** 5-second per-query validation/key-fetch deadline; timeout fails closed in validate mode. |
+| P1-3 | HA | The slave session loop has no master heartbeat/read deadline and can report `Synced` while serving stale shared config. | **Fixed.** Any-frame liveness deadline of `3 × ping_interval_secs` clears `Synced` and fails readiness. |
+| P1-4 | HA | Same-version ACK trusts the local watermark as proof the local config still matches the master bundle. | **Fixed.** Watermark stores a BLAKE3 digest of the applied document; local drift forces a full apply. |
+| P1-5 | HA | A delayed same-version fork ACK is ignored after a newer publish, hiding divergence from the operator. | **Fixed.** Bounded publish-envelope history attributes late fork ACKs. |
+| P1-6 | HA/API | `publish_bundle()` logs and drops publish failures and does not enforce the 1 MiB WebSocket limit before persisting. | **Fixed.** Fallible publish outcomes, readiness failure, bounded retry, and pre-persist size rejection. |
+| P1-7 | Filter | Parser/compiler budgets are enforced after materialization; no line, token, or total parsed-byte caps. | **Fixed.** Line/pattern/total-byte/rule-count and AC/prefix budgets are enforced before allocation. |
+| P1-8 | Filter | Empty or zero-yield list responses are accepted as a successful empty snapshot; `fail_closed` does not trigger. | **Fixed.** Empty/HTML/zero-yield responses are rejected unless `filtering.allow_empty_list = true`; previous rules stay active. |
+| P1-9 | Filter/Rewrites/Clients/DoH | Malformed rules widen scope by dropping invalid tokens; rewrite `exception_clients` trusts an unauthenticated DoH path/SNI identity. | **Fixed.** Whole-rule rejection for bad modifier tokens and `id_authenticated` gating for rewrite exceptions. |
+| P1-10 | DoQ | Admission allows unauthenticated memory/task growth before rate limiting (default stream/connection windows). | **Fixed.** 128 KiB/2 MiB windows, 16 bidi streams, global stream semaphore, pre-read rate check, per-IP cap. |
+| P1-11 | DoH | The body is buffered before the rate check and there is no global request semaphore or lowered H2 stream cap. | **Fixed.** Pre-body admission, global request cap/503, 32 H2 streams, 10 s deadline, 300 s lifetime. |
+| P1-12 | ACME/TLS | Challenge selection can pick TLS-ALPN-01 with no TCP 443 listener; only the DoH manager reloads after issuance. | **Fixed.** TLS-ALPN requires a bound 443 DoH listener; HTTP-01 fallback; all four TLS managers reload after issuance. |
+| P1-13 | Cache/Transport | Forced-DO upstream OPT is not stripped and cache hits clone the stored question/flags, leaking OPT and wrong case/RD/DO/CD. | **Fixed.** One `shape_response` path rebuilds the client question/OPT and strips upstream EDNS options. |
+| P1-14 | DoH/DoH3 | Response encoding has no 65,535-byte cap, violating DNS message framing and allowing unbounded bandwidth. | **Fixed (defensive).** Explicit TC=1 truncation guard; the pinned hickory encoder already truncates at `u16::MAX`. |
+| P1-15 | Auth/TOTP | TOTP setup/enable replaces the secret and backup codes with only an Admin session, allowing a stolen session to take over 2FA. | **Fixed.** Setup/enable/disable require a short-lived reauth ticket (`X-Reauth-Token`). |
+| P1-16 | Auth/UI | The setup wizard is re-openable by any Admin and can reset the admin password without the current password or TOTP. | **Fixed.** Wizard is bootstrap-only and returns 403 after setup, including for Admins. |
+| P1-17 | Installer | Live upgrade and rollback use `cp -f` over a running binary, so the documented upgrade fails with `ETXTBSY`. | **Fixed.** Stop → temp-file/fsync/rename install → start, with binary+config rollback. |
+| P1-18 | Cache | Cache invalidation closures are never enabled; “invalidate domain” reports success while leaving entries cached. | **Fixed.** Moka invalidation closures enabled; errors flush instead of silently succeeding. |
+| P1-19 | Stats | Hourly rollups permanently retain client IPs, names, and full domains; retention/clear do not erase rollups. | **Deferred to Phase 2.** Documented residual risk in the 1.9.4 release notes. |
+| P1-20 | Auth | Login accepts unbounded username/password strings and uses the full username as a lockout key, enabling pre-auth DoS and lockout eviction. | **Fixed.** 64/1024-byte caps and BLAKE3 lockout keys; active lockouts are never evicted. |
+| P1-21 | CI/Release | Release validation does not require the tagged commit to be on `main`, tested, or security-checked; main pushes skip tests/clippy/fmt. | **Fixed.** Branch/check release gate; CI and security run on `main` and `release/1.9.x` pushes. |
+| P1-22 | Installer/Docs | Signature verification defaults to off and silently downgrades to same-origin SHA-256 when assets are missing; docs claim signed verification. | **Fixed.** Signatures/cosign are required by default; `SITO_REQUIRE_SIGNATURE=0` is the explicit opt-out. |
+| P1-23 | Stats/API | Query-log pages run whole-table `COUNT(*)` every 3 seconds and dashboards run repeated aggregate scans, enabling authenticated self-DoS. | **Deferred to Phase 2.** Documented residual risk. |
+| P1-24 | Stats | Retention runs as one large immediate transaction with full scans, holds the write lock for minutes, and never runs at startup. | **Deferred to Phase 2.** Documented residual risk. |
+| P1-25 | Upstream | Bootstrap/health probes omit RD=1, bootstrap answers bypass the SSRF denylist, and re-resolution serves stale cache instead of forcing refresh. | **Fixed.** RD=1, SSRF-filtered bootstrap (`upstream.allow_private_targets` opt-in), forced refresh, UDP junk tolerance, DoH/EDNS fixes. |
+| P1-26 | Core/Config apply | The filter engine is swapped before the runtime snapshot, creating a filter-enable bypass window and inconsistent failure state. | **Fixed.** Runtime snapshot publishes before the filter swap; hook failures roll back. |
+| P1-27 | Core/Config apply | The DNSSEC validator is swapped before the cache flush, so old-policy validation status can survive a policy change. | **Fixed.** Monotonic chain-cache policy generation rejects in-flight old-policy inserts. |
 
 ## Baseline at audit time
 
@@ -148,6 +159,23 @@ and the shared `sito-test-support` port broker:
 --all-features --all-targets -- -D warnings`, and `cargo deny check` are green.
 The weekly workflow now sets `SITO_PERF_TESTS=1` so the opt-in 50k insertion
 timing gate actually runs on the dedicated weekly runner.
+
+The final 1.9.4 safety-gate tree also passes the documentation checks:
+
+| Command | Result |
+|---|---|
+| `python3 scripts/check_config_reference.py --github` | Pass (key presence, documented types, and extractable defaults) |
+| `python3 scripts/check_markdown_links.py` | Pass (tracked internal Markdown files/anchors) |
+| `cargo fmt --all --check` | Pass |
+
+The Phase 0 work adds no config-schema version change, API contract break,
+SQLite migration, or HA wire-protocol change. Three additive config keys were
+introduced with safe defaults: `acme.allow_bootstrap_cert = false` (fail closed
+on encrypted listeners until a trusted certificate exists),
+`upstream.allow_private_targets = false` (hostname-configured upstreams may not
+resolve to private targets), and `filtering.allow_empty_list = false` (reject
+empty/zero-yield sources). Operators who intentionally relied on the old
+behavior must opt in; this is called out in the release notes.
 
 ## Historical documents
 

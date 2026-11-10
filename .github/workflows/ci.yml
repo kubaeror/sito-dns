@@ -76,6 +76,7 @@ jobs:
             config_docs:
               - 'docs/configuration-reference.md'
               - 'scripts/check_config_reference.py'
+              - 'scripts/check_markdown_links.py'
             api:
               - 'docs/openapi.json'
               - 'crates/sito-api/**'

@@ -244,12 +244,16 @@ cargo deny check
 python3 scripts/check_config_reference.py --github
 SITO_UPDATE_OPENAPI=1 cargo test -p sito-api test_export_openapi_json
 git diff --exit-code docs/openapi.json
-cargo check --manifest-path fuzz/Cargo.toml --locked
 shellcheck -S warning contrib/install.sh
 python3 contrib/tests/test_adguard_to_sito.py
 docker compose -f docker-compose.yml config
 docker compose -f docker-compose.ha.yml config
 ```
+
+> The `cargo check --manifest-path fuzz/Cargo.toml --locked` step in the
+> original 1.9.2 validation list applied only while the fuzz harness existed
+> through v1.9.3. The harness was removed afterwards; there is no `fuzz/`
+> directory in current trees.
 
 For a local release binary:
 

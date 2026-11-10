@@ -7,13 +7,13 @@ This guide covers deploying **sito** on Linux hosts using the automated one-line
 ## Network Exposure and Firewall
 
 **Read this before the host is reachable from an untrusted network.** The
-1.9.3 defaults are deliberately unchanged for compatibility, so they are
+1.9.4 defaults are deliberately unchanged for compatibility, so they are
 LAN defaults, not internet-safe defaults:
 
 * `web.bind` defaults to `0.0.0.0`, the admin UI is served over plain HTTP, and
   port `8080` accepts setup and login requests from every reachable source.
   There is no TLS in the admin listener itself.
-* `dns.bind` defaults to `["0.0.0.0", "::"]` and 1.9.3 has no DNS client
+* `dns.bind` defaults to `["0.0.0.0", "::"]` and 1.9.4 has no DNS client
   allow-list. `dns.rate_limit_per_ip` limits request rate; it is **not** an
   access control. Any host that can reach the DNS ports can recurse through
   this server.
@@ -82,7 +82,7 @@ choice without changing the historical mapping.
 
 > [!NOTE]
 > Changing the default to loopback (`web.bind = "127.0.0.1"`) and adding a
-> default-deny DNS client ACL is planned for **1.10.0**. 1.9.3 keeps existing
+> default-deny DNS client ACL is planned for **1.10.0**. 1.9.4 keeps existing
 > configurations working; the startup warning and this firewall guidance are
 > the patch-release mitigation.
 
@@ -96,12 +96,16 @@ and other non-systemd systems are not covered by the automated installer
 manually and supervise it with your init system.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/main/contrib/install.sh | sudo bash
+# Download and inspect the installer from the tag you intend to run.
+curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/v1.9.4/contrib/install.sh -o sito-install.sh
+sed -n '1,120p' sito-install.sh
+sudo SITO_VERSION=1.9.4 bash sito-install.sh
 ```
 
 The installer automatically:
 1. Detects your CPU architecture (`x86_64`, `aarch64`, or `armv7`).
-2. Fetches the latest signed release binary and verifies SHA256 checksums.
+2. Fetches the selected release binary and verifies cosign release signatures
+   (required by default) plus SHA256 checksums.
 3. Creates the unprivileged system user `sito`.
 4. Grants `CAP_NET_BIND_SERVICE` capability to bind ports 53 and 443 without root.
 5. Deploys the hardened systemd unit, enables, and starts the service.
@@ -252,7 +256,7 @@ sudo systemctl start sito
 
 # Option B: re-run the installer (SITO_VERSION pins a release)
 # The installer stops the service, replaces the binary atomically, and starts it.
-sudo SITO_VERSION=1.9.3 bash contrib/install.sh
+sudo SITO_VERSION=1.9.4 bash contrib/install.sh
 ```
 
 Without `--config`, the CLI prefers an existing `/etc/sito/config.toml` and
@@ -305,10 +309,10 @@ docker run -d \
   -p 853:853/udp \
   -p 443:443/tcp \
   -p 443:443/udp \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   -v /opt/sito/config:/etc/sito \
   -v sito-data:/var/lib/sito \
-  ghcr.io/kubaeror/sito-dns:latest
+  ghcr.io/kubaeror/sito-dns:1.9.4
 ```
 
 The image defines a healthcheck that probes DNS on the configured port and only
@@ -339,7 +343,7 @@ accepts the admin web interface while the API reports first-boot setup pending
 ```yaml
 services:
   sito:
-    image: ghcr.io/kubaeror/sito-dns:latest
+    image: ghcr.io/kubaeror/sito-dns:1.9.4
     container_name: sito
     restart: unless-stopped
     cap_add:
@@ -351,7 +355,7 @@ services:
       - "853:853/udp"
       - "443:443/tcp"
       - "443:443/udp"
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./config:/etc/sito
       - sito-data:/var/lib/sito
@@ -369,6 +373,14 @@ The `--setup-fallback` healthcheck flag keeps the container healthy while the
 first-boot wizard is active; once setup completes the DNS probe must succeed, so
 a broken DNS listener still turns the container unhealthy.
 
+> **Host binding vs in-container binding.** Docker's `ports` mapping controls
+> which host interface accepts connections; `web.bind` controls where the
+> process listens *inside* the container. Keep `web.bind = "0.0.0.0"` in the
+> container and publish the admin port only on loopback
+> (`127.0.0.1:8080:8080`) with an SSH tunnel or TLS reverse proxy in front.
+> Publishing `8080:8080` exposes the plain-HTTP admin UI on every host
+> interface. Pin the image tag (`1.9.4`) instead of `latest` in production.
+
 ### 4.2 High-Availability Master/Slave on LAN (`macvlan`)
 Run redundant master and slave instances on separate dedicated LAN IPs on a single server:
 
@@ -385,7 +397,7 @@ networks:
 
 services:
   sito-master:
-    image: ghcr.io/kubaeror/sito-dns:latest
+    image: ghcr.io/kubaeror/sito-dns:1.9.4
     container_name: sito-master
     cap_add: [NET_BIND_SERVICE]
     networks:
@@ -401,7 +413,7 @@ services:
       retries: 3
 
   sito-slave:
-    image: ghcr.io/kubaeror/sito-dns:latest
+    image: ghcr.io/kubaeror/sito-dns:1.9.4
     container_name: sito-slave
     cap_add: [NET_BIND_SERVICE]
     networks:
@@ -441,9 +453,17 @@ dig @127.0.0.1 -p 53 doubleclick.net +short
 ```
 
 ### 5.2 Verify API and Web Panel
+`/api/v1/*` endpoints require a session cookie or API token. Create a token in
+the web UI or sign in, then:
+
 ```bash
-curl -fsSL http://127.0.0.1:8080/api/v1/status | jq .
+export SITO=http://127.0.0.1:8080
+export TOKEN='sito_...'   # Viewer, Operator, or Admin API token
+curl -fsSL -H "Authorization: Bearer $TOKEN" "$SITO/api/v1/status" | jq .
 ```
+
+For a pre-authentication liveness probe use the dedicated `/health` endpoint
+instead; it exposes only a generic ready flag.
 
 The CLI health probe requires a matching DNS response with a `NOERROR` rcode:
 
@@ -493,20 +513,30 @@ the SPDX SBOM (`sito.spdx.json`).
 
 ### 6.1 Checksums
 
+The unified `SHA256SUMS` covers every archive plus the SPDX SBOM, so download
+**all** release assets into one directory before checking it:
+
 ```bash
 sha256sum -c SHA256SUMS
+```
+
+If you only downloaded one archive, verify its per-archive checksum instead
+(the `.sha256` filename matches the archive):
+
+```bash
+sha256sum -c sito-v1.9.4-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 ### 6.2 cosign signature (keyless)
 
 ```bash
 cosign verify-blob \
-  --certificate sito-v1.9.3-x86_64-unknown-linux-gnu.tar.gz.pem \
-  --signature   sito-v1.9.3-x86_64-unknown-linux-gnu.tar.gz.sig \
+  --certificate sito-v1.9.4-x86_64-unknown-linux-gnu.tar.gz.pem \
+  --signature   sito-v1.9.4-x86_64-unknown-linux-gnu.tar.gz.sig \
   --certificate-identity-regexp \
       '^https://github.com/kubaeror/sito-dns/\.github/workflows/release\.yml@refs/tags/.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  sito-v1.9.3-x86_64-unknown-linux-gnu.tar.gz
+  sito-v1.9.4-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 The identity pins the artifact to this repository's release workflow and the

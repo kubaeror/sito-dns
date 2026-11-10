@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v1.9.3**.
+This document is the exhaustive configuration reference for **sito v1.9.4**.
 
 `sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the `DNSD_SECRET_<name>` environment variable, then a bare `<name>` environment variable; there is no on-disk local secret store, and a placeholder that cannot be resolved rejects the whole pushed configuration.
 
@@ -15,7 +15,7 @@ This document is the exhaustive configuration reference for **sito v1.9.3**.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `config_version` | integer | `1` | Configuration schema version. Used for automatic configuration migrations. |
+| `config_version` | integer | `1` | Configuration schema version. Only version `1` is accepted; there are **no automatic configuration migrations** in 1.9.x. The 2.0 line adds an explicit migration path. |
 
 ---
 
@@ -58,11 +58,16 @@ edns_udp_size = 1232
 rate_limit_per_ip = 20
 max_tcp_connections = 256
 allow_plaintext_doh = false
+# Deprecated alias: [dns.tls] accepts the same cert/key/sni_certs fields as
+# [tls] and takes precedence when both are present. Prefer [tls] for new configs.
+# [dns.tls]
+# cert = "/etc/sito/cert.pem"
+# key = "/etc/sito/key.pem"
 ```
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `bind` | array of strings | `["0.0.0.0", "::"]` | IP addresses to bind listeners on. |
+| `bind` | array of IP addresses | `["0.0.0.0", "::"]` | IP addresses to bind listeners on. |
 | `port` | integer | `53` | Standard UDP and TCP DNS listener port (must be greater than 0). |
 | `dot_port` | integer | `853` | DNS-over-TLS (DoT) listener port. `0` disables DoT. |
 | `doh_port` | integer | `443` | DNS-over-HTTPS (DoH, HTTP/1.1 and HTTP/2) port. `0` disables DoH. |
@@ -70,13 +75,14 @@ allow_plaintext_doh = false
 | `doh3_port` | integer | `443` | DNS-over-HTTP/3 (DoH3) UDP port. `0` disables DoH3. |
 | `doh_dedicated_hostname` | string | `""` | When set, DoH/DoH3 requests whose Host/authority does not match are rejected with `421 Misdirected Request`. Empty allows any hostname. |
 | `dot_padding` | boolean | `false` | RFC 7830/8467 padding on DoT responses to mitigate traffic analysis. |
+| `tls` | table | `None` | Deprecated `[dns.tls]` alias for `[tls]` (same `cert`, `key`, `sni_certs` fields). `[dns.tls]` takes precedence over top-level `[tls]` when both exist; prefer `[tls]` for new configuration. |
 | `edns_udp_size` | integer | `1232` | Maximum EDNS0 UDP buffer size (1232 bytes prevents IPv6 fragmentation). |
-| `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual client IP (`0` disables rate limiting; maximum `1000000`). |
+| `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual source prefix (`0` disables rate limiting; maximum `1000000`). IPv4 budgets are keyed per `/24` and IPv6 per `/64`. |
 | `max_tcp_connections` | integer | `256` | Maximum concurrent TCP, DoT, and DoH client connections. |
 | `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
 > [!WARNING]
-> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 1.9.3 has **no DNS client allow-list**.
+> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 1.9.4 has **no DNS client allow-list**.
 > `rate_limit_per_ip` only limits rate; it does not authorize clients. A wildcard bind therefore accepts recursive queries from any source
 > that can reach the host. Restrict the DNS ports to your LAN with a host
 > firewall, or bind specific LAN addresses. The server emits a startup warning
@@ -151,12 +157,12 @@ allow_bootstrap_cert = false
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `tls.cert` | string | `None` | Path to PEM-encoded certificate chain for DoT, DoH, and Web UI. |
+| `tls.cert` | string | `None` | Path to PEM-encoded certificate chain for DoT, DoH, DoQ and DoH3. It does **not** secure the admin Web UI, which is plain HTTP behind your reverse proxy/SSH tunnel. |
 | `tls.key` | string | `None` | Path to PEM-encoded unencrypted PKCS#8 or RSA/EC private key. |
 | `tls.sni_certs` | array of tables | `[]` | Additional certificate/key pairs mapped to specific SNI hostnames. |
 | `acme.enabled` | boolean | `false` | Enables automated certificate issuance via Let's Encrypt / ACME. |
 | `acme.email` | string | `None` | Contact email address for ACME registration. |
-| `acme.domains` | array of strings | `[]` | Domain names for ACME TLS-ALPN-01 / HTTP-01 certificates. |
+| `acme.domains` | array of strings | `[]` | Domain names for ACME TLS-ALPN-01 / HTTP-01 certificates. TLS-ALPN-01 is selected only when a DoH listener is actually bound on TCP 443; otherwise HTTP-01 is used when its listener binds. |
 | `acme.staging` | boolean | `false` | When `true`, uses Let's Encrypt Staging API to avoid rate limits during testing. |
 | `acme.cache_dir` | string | `None` | Directory used to persist ACME account keys and certificates (defaults to `<data_dir>/acme`). |
 | `acme.http_port` | integer | `80` | Port for the dedicated ACME HTTP-01 challenge listener. |
@@ -191,7 +197,7 @@ servers = ["udp://192.168.1.1:53"]
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `servers` | array of strings | `["1.1.1.1", "1.0.0.1"]` | Upstream resolvers. Schemes: `udp://` or `host:port` (UDP with TCP fallback), `tls://` (DoT), `https://host[:port][/path]` (DoH, RFC 8484 with GET fallback; a bare `https://host` uses `/dns-query`), `quic://host[:port]` (DoQ, RFC 9250, default port 853). |
-| `bootstrap` | array of IPs | `["9.9.9.9", "149.112.112.112"]` | Plain IP addresses used to bootstrap resolution of encrypted upstream domain names. |
+| `bootstrap` | array of IP addresses | `["9.9.9.9", "149.112.112.112"]` | Plain IP addresses used to bootstrap resolution of encrypted upstream domain names. Bootstrap and health-probe queries set RD=1. |
 | `strategy` | string | `"failover"` | Forwarding strategy: `"parallel"` (fastest answer wins), `"failover"` (sequential fallback), or `"load_balance"`. |
 | `timeout_ms` | integer | `5000` | Overall per-query budget in milliseconds, shared across failover/load-balance retries (each sequential attempt gets an equal share of the remaining budget; parallel races use the full budget). |
 | `probe_domain` | string | `"example.com"` | Test domain used for periodic health-checking of upstreams. |
@@ -239,7 +245,16 @@ enabled = true
 | `allow_empty_list` | boolean | `false` | Accept an empty list body or a list that parses to zero rules. By default such a response is rejected, the previous snapshot is retained, and the list is marked failed so a broken CDN error page or compromised source cannot silently remove all protection. |
 | `regex_compile_budget_ms` | integer | unset | Optional wall-clock budget for compiling regex/wildcard rules. When a reload exceeds it, compilation is aborted and the previous snapshot is retained; the failure is reported through `last_error` and `last_compile_ms`. Unset disables the budget; `0` is rejected. |
 | `custom_rules` | array of strings | `[]` | In-line custom ABP / AdGuard filter rules. |
-| `lists` | array of tables | `[]` | Subscription lists to download and compile (`name`, `url`, `enabled`). Schemes: `http://`, `https://`, `file://`. Global `refresh_interval_hours` controls update frequency. |
+| `lists` | array of tables | `[]` | Subscription lists to download and compile. Schemes: `http://`, `https://`, `file://`. Global `refresh_interval_hours` controls update frequency unless a list sets `refresh_hours`. |
+
+### `[[filtering.lists]]` entries
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `lists.name` | string | required | Unique list name shown in status, API and UI. |
+| `lists.url` | string | required | Source URL (`http://`, `https://` or `file://`). |
+| `lists.enabled` | boolean | `true` | Download and compile this list. |
+| `lists.refresh_hours` | integer | `None` | Per-list refresh interval in hours. When unset, `filtering.refresh_interval_hours` is used. Must be greater than 0 when set. |
 
 ---
 
@@ -343,7 +358,7 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 > the UI is reachable beyond loopback unless an `https://` `web.public_url` (or
 > `web.tls_terminated_by_proxy = true` with no public URL) declares a TLS
 > reverse proxy. For remote access, bind `web.bind = "127.0.0.1"` and use an SSH
-> tunnel or reverse proxy. The loopback default is planned for 1.10.0; 1.9.3
+> tunnel or reverse proxy. The loopback default is planned for 1.10.0; 1.9.4
 > keeps the historical default so existing configurations keep working.
 
 
@@ -408,7 +423,11 @@ anonymize_querylog = false
 | `stats.retention_days` | integer | `90` | Days to keep detailed per-query records before automated pruning and hourly aggregation (must be ≥ 1; alias: `query_log_retention_days`). |
 | `privacy.anonymize_querylog` | boolean | `false` | Mask client IPs (/24 for IPv4, /56 for IPv6) before persisting to database and before live-tail broadcast. |
 
-> Query logging is always enabled when `[stats]` is present; Prometheus metrics are always exposed on `/metrics` and protected according to `web.metrics_auth`.
+> Query logging is always enabled when `[stats]` is present. Prometheus metrics
+> are exposed at `/metrics` and require a Viewer-or-higher bearer token or
+> session when `web.metrics_auth = true` (the default); set
+> `web.metrics_auth = false` only for a deliberately unauthenticated scrape
+> network.
 
 ---
 
@@ -435,13 +454,20 @@ replication_port = 8953
 | `master_url` | string | `None` | (Slave only) WebSocket URL of the master instance. |
 | `master_fingerprint` | string | `None` | (Slave only) Expected Blake3 public certificate fingerprint of master for pinning. |
 | `master_pubkey` | string | `None` | (Slave only, **required**) Ed25519 public key of the master used to verify signed configuration pushes. |
-| `cert` / `key` / `ca` | string | `None` | Paths to mTLS certificates and CA bundles for replication. When `ca` is set, the peer chain is additionally validated against it (on top of BLAKE3 pinning). |
+| `cert` / `key` / `ca` | string | `None` | Paths to mTLS certificates and CA bundles for replication. When `ca` is set, the peer chain is validated against it **including hostname/SAN verification**, even when BLAKE3 pinning is also configured. |
 | `ping_interval_secs` | integer | `15` | Master heartbeat interval. Slaves silent for 3× this interval are disconnected and removed from the active tracker. |
 | `slave_token` | string | `None` | Pre-shared token for slave authentication (mandatory when serving plaintext `ws://`). |
 | `pinned_slave_fingerprints` | array of strings | `[]` | BLAKE3 fingerprints of slave certificates accepted by the master. |
 | `allow_unpinned_tls` | boolean | `false` | Allow TLS peers without a configured fingerprint (insecure; only for controlled networks). |
 | `allow_insecure_ws` | boolean | `false` | Allow plaintext `ws://` replication. Requires a non-empty `slave_token`; must be set explicitly on both ends. |
 | `stats_interval_secs` | integer | `30` | Interval between slave-to-master statistics reports. |
+
+The slave stores a **single** `master_fingerprint`; the master stores a list of
+accepted `pinned_slave_fingerprints`. During certificate rotation, the master
+can pin both the old and new slave fingerprints at once, while each slave must
+switch its one master fingerprint to the new value. `allow_unpinned_tls = true`
+is an explicit insecure opt-out; with `ca` configured, the server name is still
+checked against the certificate SAN.
 
 Private keys referenced by `key` are read by the unprivileged service account
 (`sito` under systemd, uid/gid `65532` in the container image). Generate them
@@ -466,6 +492,17 @@ version is only accepted when the signed payload hash matches. A corrupt or
 unreadable watermark fails startup rather than resetting to version 0; delete
 it only when you intend to force a full resync from the master. The watermark
 is node-local and must not be copied between slaves.
+
+A slave must receive a frame (push, ping/pong, stats or close) within
+`3 × ping_interval_secs` (default 45 s); otherwise it leaves `Synced`, records a
+`readiness_reason`, and `/health` reports not ready while DNS keeps serving the
+last applied configuration. The watermark also records a BLAKE3 digest of the
+exact applied `config.toml`; a local edit or revert marks the node `Degraded`
+and forces a full apply before it can report `Synced` again. A watermark written
+by 1.9.3 or earlier has no digest and forces one full apply after upgrade.
+Master publish failures are reported through `ha_publish` on config writes and
+make HA readiness false; `POST /api/v1/ha/resync` returns `200` when a resync is
+queued and `503` when replication is inactive or no push could be queued.
 
 Replication preserves node-local identity. The master does not overwrite a
 slave's `dns.bind`, `[dns.tls]`/`[tls]` certificate paths, `[acme]` account and
@@ -517,7 +554,7 @@ interval_s = 300
 |---|---|---|---|
 | `enabled` | boolean | `false` | Enable automated client discovery from RouterOS DHCP server. |
 | `url` | string | `"https://192.168.1.1"` | Base URL of RouterOS REST API (`https://router.lan`). |
-| `token_env` | string | `"MIKROTIK_API_TOKEN"` | Environment variable containing the RouterOS API token. |
+| `token_env` | string | `None` | Environment variable containing the RouterOS API token. When unset, no bearer-token authentication is attempted (use `username`/`password_env` instead). |
 | `username` | string | `None` | Username for HTTP basic authentication when no token is used. |
 | `password` | string | `None` | Password for HTTP basic authentication (prefer `password_env` to keep secrets out of the config). |
 | `password_env` | string | `None` | Environment variable containing the RouterOS password. |
@@ -583,7 +620,7 @@ and `POST /api/v1/config/reload`.
 | `dns.rate_limit_per_ip` | Live rate limiters updated. |
 | `dns.cache.enabled`, `dns.cache.size_mb`, `dns.cache.min_ttl`, `dns.cache.max_ttl`, `dns.cache.negative_ttl_max`, `dns.cache.prefetch`, `dns.cache.serve_stale_hours` | Cache configuration updated. |
 | `dns.dnssec.mode`, `dns.dnssec.validate`, `dns.dnssec.ntp`, `dns.dnssec.nta`, `dns.dnssec.trust_anchors` | DNSSEC validator swapped for the new configuration; the response cache is flushed because cached validation decisions belong to the old policy. |
-| `upstream.servers`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.ecs`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt. |
+| `upstream.servers`, `upstream.bootstrap`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.ecs`, `upstream.allow_private_targets`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt, including a fresh bootstrap resolver and SSRF policy. |
 | `filtering.enabled`, `filtering.refresh_interval_hours`, `filtering.blocking_mode`, `filtering.blocking_ttl`, `filtering.cname_cloaking`, `filtering.fail_closed`, `filtering.anti_doh_bypass`, `filtering.max_rules`, `filtering.max_list_bytes`, `filtering.allow_empty_list`, `filtering.regex_compile_budget_ms`, `filtering.lists`, `filtering.custom_rules` | Filter engine reloaded with the new lists/rules; cached answers are flushed. List downloads continue asynchronously after the reload. |
 | `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
 | `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |
@@ -595,10 +632,9 @@ and `POST /api/v1/config/reload`.
 | Setting | Why |
 |---|---|
 | `server.role`, `server.instance_name`, `server.data_dir`, `server.log_format` | Read once at process start. |
-| `upstream.bootstrap` | The file watcher reuses the bootstrap resolver created at startup; `POST /api/v1/config/reload` rebuilds it immediately, but a config-file edit alone needs a restart. |
 | `web.enabled`, `web.bind`, `web.port` | The admin HTTP listener is bound at startup. |
 | `auth.session_ttl_hours`, `auth.login_rate_limit`, `auth.session_persist`, `auth.token_default_ttl_days` | Auth manager is created at startup. |
-| `tls.cert`, `tls.key`, `tls.sni_certs`, `acme.*` | TLS/ACME setup is initialized at startup. (Certificate file *contents* are re-read by the certificate watcher; changing the configured paths needs a restart.) |
+| `tls.cert`, `tls.key`, `tls.sni_certs`, `dns.tls.cert`, `dns.tls.key`, `dns.tls.sni_certs`, `acme.*` | TLS/ACME setup is initialized at startup. (Certificate file *contents* are re-read by the certificate watcher; changing the configured paths needs a restart.) |
 | `ha.*` | HA replication tasks are created at startup. |
 | `integrations.mikrotik.*`, `integrations.lists.*` | Integration sync/refresh tasks are spawned at startup. |
 

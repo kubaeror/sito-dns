@@ -3,8 +3,9 @@
 sito keeps its accounts in `<data_dir>/users.toml` (mode `0600`) and has no
 self-registration or e-mail-based password reset. Accounts, roles, and API
 tokens can be managed from the web panel (`/users` and `/account`) or through
-the administrative REST API under `/api/v1/auth/*`. TOTP status and disabling
-are available in the web UI; TOTP enrollment/setup remains API-only.
+the administrative REST API under `/api/v1/auth/*`. TOTP enrollment, replacement,
+and disabling are available to every role from the Account page and the REST
+API.
 
 ## Web UI
 
@@ -15,7 +16,7 @@ Navigation links are role-aware: **Users** is shown only to Admins and
 | Page | Who can open it | What it does |
 |---|---|---|
 | `/users` | Admin only | Lists local accounts with role and TOTP status; creates accounts; changes roles; deletes accounts with last-admin protection. |
-| `/account` | Any authenticated user | Shows profile and TOTP status; changes the caller's own password; creates, lists, and revokes the caller's own API tokens; disables the caller's own TOTP. |
+| `/account` | Any authenticated user | Shows profile and TOTP status; changes the caller's own password; creates, lists, and revokes the caller's own API tokens; enrolls, replaces, and disables the caller's own TOTP after re-authentication. |
 
 - **Visibility.** Operators and Viewers receive `403 Forbidden` from `/users`.
   Anonymous requests to either page redirect to `/login`.
@@ -31,9 +32,9 @@ Navigation links are role-aware: **Users** is shown only to Admins and
   and TOTP disable revoke all sessions for the account, so they return to
   `/login`. A newly created token's plaintext is shown exactly once; reloading
   `/account` never reveals it again.
-- **TOTP.** The Account page can disable TOTP after re-authentication with the
-  current password and a valid TOTP or backup code. Initial TOTP setup/enable
-  remains an API workflow (section 7).
+- **TOTP.** The Account page can enroll, replace, and disable TOTP after
+  re-authentication with the current password and a valid TOTP or backup code.
+  The same workflows are available through the REST API (section 7).
 - The **Clients** page shows the operator-only “Discovered but unidentified”
   table, matching `GET /api/v1/clients/unidentified`. Viewers see only the
   configured clients.
@@ -55,7 +56,9 @@ export TOKEN='sito_...'   # an Admin API token, or use a session cookie instead
    credential, login, `/api/v1/auth/*`, API tokens and every non-wizard route are
    disabled. Only `/wizard`, `/ui/wizard/*`, static assets, `/health` and
    `/status` are reachable; the wizard requires the one-time token printed in
-   the server logs (or an authenticated Admin session).
+   the server logs. The wizard is bootstrap-only and returns `403` after setup
+   completes, even for an Admin session; use the authenticated account flow for
+   later password changes.
 2. **Create** additional accounts with `POST /api/v1/auth/users` or the Admin
    **Users** page at `/users`.
 3. **Operate.** Users sign in at `/login` (session cookie) or authenticate with
@@ -427,6 +430,9 @@ on the next start (see section 1).
   cannot evict an account whose lockout is still active.
 * Expired tokens are rejected immediately and removed from memory; their
   on-disk snapshot is rewritten by the background pruner within 60 seconds.
+* The legacy `?token=` query parameter is accepted only on a WebSocket upgrade
+  with no `Authorization` header, logs a deprecation warning, and is scheduled
+  for removal in 2.0. Use `Authorization: Bearer` or a session cookie.
 
 ## 9. Audit Trail
 

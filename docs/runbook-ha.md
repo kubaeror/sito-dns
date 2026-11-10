@@ -151,8 +151,10 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
 
    To obtain the master public key for the slave configs:
    ```bash
-   # With the old master still reachable:
-   curl -s http://192.168.1.10:8080/api/v1/ha/status | jq -r .master_pubkey
+   # /api/v1/ha/status requires a Viewer-or-higher token or session.
+   export TOKEN='sito_...'   # Admin API token for resync; Viewer suffices for GETs
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.10:8080/api/v1/ha/status | jq -r .master_pubkey
 
    # Without it: the promoted master prints the same value in its status once running.
    ```
@@ -199,9 +201,10 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
    ```
 
 6. **Verify master status**:
-   Query the local status endpoint:
+   Query the local status endpoint with an authenticated token or session:
    ```bash
-   curl -s http://localhost:8080/api/v1/ha/status | jq .
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://localhost:8080/api/v1/ha/status | jq .
    ```
    Expected response (master):
    ```json
@@ -277,20 +280,21 @@ certificate pairs to generate; omitting both generates the complete set
 (CA + master + slave).
 `--san` is repeatable and adds a hostname or IP address to both certificates
 (in addition to `localhost`, `sito-master` / `sito-slave`, `127.0.0.1` and
-`::1`). Replication to LAN addresses such as `wss://192.168.1.10:8953` is
-authenticated by the BLAKE3 fingerprint pinning (`master_fingerprint` /
-`pinned_slave_fingerprints`) described below, which is independent of the
-certificate SAN. If you disable pinning with `allow_unpinned_tls = true` and
-rely on `ca` chain validation instead, the hostname you connect to must match
-one of the certificate SANs; use `--san <LAN_IP_OR_HOST>` to make LAN-IP URLs
-pass hostname verification.
+`::1`). With BLAKE3 fingerprint pinning and **no** `ca`, the certificate SAN is
+not used for the replication connection. When `ca` is configured, rustls
+validates the chain **and the hostname/SAN even if pinning is also configured**;
+use `--san <LAN_IP_OR_HOST>` so URLs such as `wss://192.168.1.10:8953` pass
+hostname verification. Do not rely on `allow_unpinned_tls = true` for a
+production cluster.
 
 Note down the new fingerprints printed by the command:
 - Master cert BLAKE3 fingerprint: `a1b2c3...`
 - Slave cert BLAKE3 fingerprint: `d4e5f6...`
 
 ### Step 2: Update Configurations with Dual-Fingerprint Pinning
-Both master and slave support pinning multiple valid fingerprints during rotation:
+The master accepts a list of valid slave fingerprints, so it can trust both the
+old and new slave certificates during rotation. Each slave stores a **single**
+`master_fingerprint`; switch that value when the master certificate changes.
 
 On the **master** node:
 ```toml
@@ -364,8 +368,8 @@ When a slave node fails or must be reprovisioned from bare metal:
 3. **Configure Minimal Slave Configuration and align restart-only fields**:
    Restart-only shared settings must already match the master's
    `config.toml` before the first push. The template below uses the shipped
-   `config.example.toml` values (`log_format = "pretty"` and the default
-   `[auth]` policy); copy the master's values if it overrides either. A
+   `config.example.toml` values (the default `log_format = "json"` and the
+   default `[auth]` policy); copy the master's values if it overrides either. A
    mismatch makes the slave reject the push with `restart_required`, enter
    `Degraded`, and keep its previous configuration and file until it is
    restarted with matching values.
@@ -379,8 +383,8 @@ When a slave node fails or must be reprovisioned from bare metal:
    instance_name = "sito-slave-2"
    data_dir = "/var/lib/sito"
    # Restart-only shared value; must match the master's config.toml.
-   # config.example.toml uses "pretty".
-   log_format = "pretty"
+   # The default (and config.example.toml) is "json".
+   log_format = "json"
 
    [dns]
    bind = ["0.0.0.0"]
@@ -417,9 +421,10 @@ When a slave node fails or must be reprovisioned from bare metal:
    systemctl start sito
    ```
 6. **Verify Initial Synchronization**:
-   Check the slave status endpoint:
+   Check the slave status endpoint with an authenticated token or session:
    ```bash
-   curl -s http://localhost:8080/api/v1/ha/status | jq .
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://localhost:8080/api/v1/ha/status | jq .
    ```
    The slave will transition through `Connecting` -> `HelloSent` -> `Applying` -> `Synced` (or `HelloSent` -> `Synced` when it is already at the master's version) in under 2 seconds once the restart-only fields from step 3 match the master. If the first push is rejected with `restart_required`, align `server.log_format` and the `[auth]` policy with the master and restart the slave; the master keeps reporting it unsynced until then. Verify that custom rules, rewrites, and client lists match the master. `Degraded` is only cleared by a successful apply or an early ACK for the already-running version.
 
@@ -449,18 +454,28 @@ When a slave node fails or must be reprovisioned from bare metal:
 | Slave reports `"Degraded"` with `Local configuration drift` | `config.toml` was edited or reverted locally after the last applied bundle | The persisted `ha_watermark.toml` stores the digest of the exact applied document. Wait for the master to push the current bundle (the slave forces a full apply even for the same version) or issue a resync. If the master is unreachable the node stays degraded and `/health` false until it reconnects. |
 | Slave reports a same-version payload fork | The master and slave hold different signed content for the same term and version (split brain) | The slave persists a fork latch in `ha_watermark.toml`, degrades, and rejects all same-term pushes; the master records divergence and stops showing the slave as synced. Do not retry the same version. Isolate the forked master and perform an explicit promotion with a strictly higher `term` **and** `version` (section 2); the promoted bundle clears the latch. |
 | API returns `409 Conflict` | Mutation attempted directly on a slave node | Perform configuration edits on the master node indicated in the `X-Dnsd-Master` header. |
-| `POST /api/v1/ha/resync` returns `503` | No HA coordinator/tracker on the node, the replication worker stopped, or the push could not be queued | Check the node's role and `GET /api/v1/ha/status`. A `429` means a resync is already queued; retry shortly. |
+| `POST /api/v1/ha/resync` returns `503` | HA replication is inactive on the node, the slave worker stopped, or (master) a push could not be queued for any of the connected slaves | Check the node's role and `GET /api/v1/ha/status`. A `429` means a resync is already queued; retry shortly. With no connected slaves and no active bundle the master still returns `200` with `slaves_notified: 0`. |
 
 ### Diagnostic Commands
 
+All `/api/v1/*` endpoints require authentication. Export an Admin API token (or
+use a session cookie) before running these examples:
+
+```bash
+export TOKEN='sito_...'   # Admin token: resync requires Admin; GETs accept Viewer+
+```
+
 1. **Check HA status on Master**:
    ```bash
-   curl -s http://192.168.1.10:8080/api/v1/ha/status | jq .
-   curl -s http://192.168.1.10:8080/api/v1/ha/slaves | jq .
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.10:8080/api/v1/ha/status | jq .
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.10:8080/api/v1/ha/slaves | jq .
    ```
 2. **Check HA status on Slave**:
    ```bash
-   curl -s http://192.168.1.11:8080/api/v1/ha/status | jq .
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.11:8080/api/v1/ha/status | jq .
    ```
    `/ha/status` fields:
    - Common: `role`, `instance_name`, `version`, `state`.
@@ -475,11 +490,13 @@ When a slave node fails or must be reprovisioned from bare metal:
    also window deltas, not lifetime totals).
 3. **Trigger Manual Resynchronization**:
    ```bash
-   # From the master:
-   curl -s -X POST http://192.168.1.10:8080/api/v1/ha/resync | jq .
+   # From the master (Admin token required):
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.10:8080/api/v1/ha/resync | jq .
 
    # Or from a slave:
-   curl -s -X POST http://192.168.1.11:8080/api/v1/ha/resync | jq .
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.11:8080/api/v1/ha/resync | jq .
    ```
    A master response includes the queueing result:
    ```json
@@ -491,13 +508,19 @@ When a slave node fails or must be reprovisioned from bare metal:
      "slaves_notified": 2
    }
    ```
-   `503 Service Unavailable` means HA is not active on the node, the slave
-   worker is not running, or (master) no connected slave could be queued;
-   `429 Too Many Requests` means a resync request is already pending.
+   `200 OK` means the resync was accepted (a master with no connected slaves
+   and no active bundle reports `slaves_notified: 0`). `503 Service Unavailable`
+   means HA is not active on the node, the slave worker is not running, or
+   (master) no connected slave could be queued; `429 Too Many Requests` means a
+   resync request is already pending.
 4. **Inspect Prometheus HA Metrics**:
    ```bash
-   curl -s http://192.168.1.10:8080/metrics | grep sito_ha_
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.10:8080/metrics | grep sito_ha_
    ```
+   `/metrics` requires authentication by default (`web.metrics_auth = true`);
+   use a Viewer-or-higher token or session. Operators who deliberately expose an
+   unauthenticated scrape endpoint must set `web.metrics_auth = false`.
    Look for:
     - `sito_ha_slaves_connected`: Number of active slaves connected to this master.
     - `sito_ha_config_version{instance="..."}`: Published configuration version per

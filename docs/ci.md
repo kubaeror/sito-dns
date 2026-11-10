@@ -11,7 +11,7 @@ pin policy, and the monthly runner-minute budget.
 | Workflow | File | Triggers | Purpose |
 |---|---|---|---|
 | **CI** | `ci.yml` | `pull_request` to `main`, `push` to `main`, `merge_group`, `workflow_dispatch` (`full`) | Classifies the change set and runs `fmt`, `clippy`, `test`, the three-target `build` matrix, `openapi`, `contrib`, and the reusable `docs-check`, `container-check`, `security-check` lanes. Publishes the single required check `ci-gate`. |
-| **Docs** | `docs.yml` | `workflow_call` from CI, `push` to `main` on docs/workflow paths, `workflow_dispatch` | Runs the configuration-reference drift check and the pinned `actionlint` container for `.github/workflows/**`. |
+| **Docs** | `docs.yml` | `workflow_call` from CI, `push` to `main` on docs/workflow paths, `workflow_dispatch` | Runs the configuration-reference drift/default/type check, the internal Markdown link checker, and the pinned `actionlint` container for `.github/workflows/**`. |
 | **Container** | `container.yml` | `workflow_call` from CI and Weekly, `push` to `main` on container paths, `workflow_dispatch` | Validates both Compose files, builds/smoke-tests the development `Dockerfile`, and builds `Dockerfile.release` with stub binaries. |
 | **Security** | `security.yml` | `workflow_call` from CI and Weekly, `push` to `main` on dependency paths, `workflow_dispatch` | Runs `cargo-deny check`. |
 | **Weekly Quality** | `weekly.yml` | Sunday at 03:00 UTC (`schedule`), `workflow_dispatch` | Release-mode tests, Criterion benchmarks, plus the reusable Container and Security workflows. |
@@ -35,14 +35,14 @@ part of the required `ci-gate` check, not separate advisory workflows.
 
 | Change | Lanes that run |
 |---|---|
-| Docs only (`docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates) | `ci.yml`: `changes`, `docs-check`, `ci-gate`. `docs-check` calls `docs.yml`, which runs `meta` (configuration check only if the config reference changed). No Rust, Docker, or `cargo-deny`. The `docs/openapi.json` exception below runs `openapi`. |
+| Docs only (`docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates) | `ci.yml`: `changes`, `docs-check`, `ci-gate`. `docs-check` calls `docs.yml`, which runs `meta` (config-reference defaults/types/link checks; the configuration check only needs the config-reference diff, while link checking covers the repository's tracked Markdown). No Rust, Docker, or `cargo-deny`. The `docs/openapi.json` exception below runs `openapi`. |
 | Code (`crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`) | `ci.yml`: `changes`, `fmt`, `clippy`, `test`, `build` (x86_64, aarch64, armv7), `ci-gate`. Dependency changes also run `security-check`. |
 | OpenAPI spec only (`docs/openapi.json` without crate changes) | `ci.yml`: `changes`, `openapi`, `ci-gate`; `docs-check` also runs because the path is under `docs/`. |
 | API crate (`crates/sito-api/**`) | Full code lane. `openapi` is skipped because `test` already regenerates and diffs the spec. |
 | Contrib/scripts (`contrib/**`, `scripts/**`) | `ci.yml`: `changes`, `contrib`, `ci-gate`. `contrib` runs `shellcheck` on the installer, the AdGuard converter fixture test, and the release-helper tests. |
 | Container (`Dockerfile`, `Dockerfile.*`, `.dockerignore`, `docker-compose*.yml`, `config.example.toml`, `contrib/systemd/**`) | `ci.yml`: `changes`, `container-check`, `ci-gate`. `container-check` calls `container.yml` (`compose`, `smoke`, and `release-image`). |
 | Dependencies (`Cargo.toml`, `Cargo.lock`, `deny.toml`, `rust-toolchain.toml`) | `ci.yml`: the code lane plus `security-check`, `ci-gate`; `security-check` calls `security.yml` (`cargo-deny`). `Cargo.*` and the toolchain also match the code classifier, so the full code lane runs as well. |
-| Workflow files (`.github/workflows/**`) | `ci.yml`: `changes`, `docs-check`, `ci-gate`; `docs-check` calls `docs.yml` (`meta` with `actionlint`). |
+| Workflow files (`.github/workflows/**`) | `ci.yml`: `changes`, `docs-check`, `ci-gate`; `docs-check` calls `docs.yml` (`meta` with the Markdown link check and `actionlint`). |
 | Mixed changes | Union of the matching lanes. |
 
 `docs/openapi.json` matches both the `docs/**` filter and the `api` filter, so
@@ -174,7 +174,7 @@ must be updated in the same change.
 ## Release pipeline
 
 Release runs only from a tag push. A tag must match the workspace version in
-`Cargo.toml` (`v1.9.3` or a prerelease such as `v1.9.3-rc.1`); a mismatch stops
+`Cargo.toml` (`v1.9.4` or a prerelease such as `v1.9.4-rc.1`); a mismatch stops
 the workflow before any asset is built. The order is deliberate:
 
 1. **`verify-tag`** — checks the tag against the workspace version.

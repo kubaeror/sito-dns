@@ -5,6 +5,121 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.9.4] - 2026-11-10
+
+Phase 0 safety-gate security patch. Closes the release-blocking P0 and directly
+exploitable P1 findings from the audit 6 review while remaining a non-breaking
+1.9.x patch: no config v2, REST/API v2, SQLite schema break, or HA protocol
+break. See the [1.9.4 release notes](docs/release-notes-1.9.4.md) for operator
+guidance and residual risks.
+
+### Added
+- **`acme.allow_bootstrap_cert` (default `false`)**: opt in to serving the
+  short-lived self-signed ACME placeholder on DoT/DoH/DoQ/DoH3 before the first
+  trusted certificate. With the default, encrypted listeners stay disabled
+  until a CA-issued certificate exists.
+- **`upstream.allow_private_targets` (default `false`)**: opt in to
+  hostname-configured upstreams resolving to private, loopback, link-local,
+  CGNAT, metadata, or NAT64/6to4/Teredo-embedded addresses. IP literals remain
+  explicit operator choices.
+- **`filtering.allow_empty_list` (default `false`)**: accept an empty list body
+  or a source that parses to zero rules. The default keeps the previous snapshot
+  and marks the list failed.
+- **`GET /api/v1/filtering/status`** and Prometheus filter-status gauges expose
+  loaded/failed/degraded lists, degraded groups, dropped patterns, compile time,
+  and unavailability.
+- **`POST /api/v1/auth/reauth`** and `X-Reauth-Token` tickets for TOTP
+  setup/enable/disable; self-service TOTP enrollment/replacement for every role.
+- Additive `ha_publish: { status, error, retry_at }` in config-write responses.
+- `scripts/check_markdown_links.py` validates internal Markdown links/anchors in
+  the Docs CI lane. The config-reference checker now validates documented types
+  and extractable defaults as well as key presence.
+- Release gate verifies the tag is on the required branch and that `ci-gate`
+  and `cargo-deny` are green; release images are Trivy-scanned and cosign-signed.
+- Behavioral installer E2E, release-gate tests, workflow policy test, and
+  SQLite advisory pin test.
+
+### Security
+- **ACME:** bootstrap certificates are 7-day marked placeholders; legacy
+  year-4096 self-signed pairs are detected and renewed. TLS-ALPN-01 requires a
+  bound TCP 443 DoH listener, otherwise HTTP-01 is used. A successful issuance
+  reloads DoT/DoH/DoQ/DoH3. A usable stored ACME certificate takes precedence
+  over static `[tls]` material on restart. Invalid/expired/mismatched TLS
+  material and certificate/key mismatch are startup errors. ACME account
+  credentials are written atomically with mode `0600`.
+- **DNSSEC:** parent-side delegation NSEC/NSEC3 records cannot prove denial
+  below a cut; junk/forged RRSIGs no longer suppress probing; signed CNAME into
+  an unsigned target needs an authenticated DS denial; strict mode fails closed
+  on `Indeterminate`; NSEC3 opt-out, QTYPE=CNAME, multi-label wildcards, and
+  old-policy chain-cache inserts are fixed. Validation/key fetches share a
+  5-second per-query deadline.
+- **HA:** heartbeat deadline (`3 × ping_interval_secs`), applied-config digest
+  drift detection, fallible publish with readiness/retry/oversize rejection,
+  per-slave divergence clearing, signing-key identity checks, bounded queue
+  bytes, and 64-global/8-per-source-IP admission.
+- **Auth:** TOTP operations require re-authentication; the wizard is
+  bootstrap-only; login inputs are length-capped; lockout keys are BLAKE3
+  digests and active lockouts are not evicted.
+- **Filter:** empty/HTML/zero-yield lists are rejected unless explicitly
+  allowed; zero-source filtering fails closed; parser/compiler budgets are
+  enforced before allocation; malformed modifier tokens reject the whole rule;
+  rewrite exceptions require registry-authenticated ids.
+- **Transport:** DoQ flow-control/stream/task caps and pre-read admission;
+  DoH/DoH3 pre-body admission, global request caps, deadlines/lifetimes, and H2
+  stream caps; one client-correct response-shaping path strips upstream EDNS
+  options and OPT for non-EDNS clients; QR=1 dropped and multi-question queries
+  rejected; prefix-keyed rate limits with LRU eviction; per-source connection
+  caps; ACME HTTP-01 limits; tracked QUIC shutdown.
+- **Upstream:** bootstrap/probe RD=1, SSRF-filtered bootstrap answers, forced
+  refresh on failure, UDP junk tolerance, bare DoH `/dns-query`, no ambient
+  proxy, one no-EDNS retry on FORMERR/BADVERS, and wedged-DoQ reconnect.
+- **Installer/release:** live upgrades use stop + temp-file/fsync/rename + start
+  with binary/config rollback; signatures and cosign are required by default
+  (`SITO_REQUIRE_SIGNATURE=0` explicit opt-out); release tags are branch/check
+  gated; bundled SQLite is pinned to a patched `libsqlite3-sys`.
+- **Cache:** invalidation closures are enabled so `invalidate_domain` works, and
+  runtime invalidation errors flush instead of silently succeeding.
+
+### Changed
+- Rate-limit budgets are keyed by IPv4 `/24`/IPv6 `/64` rather than full
+  addresses.
+- Filter status is visible through API/Prometheus instead of log-only.
+- Auth creates return `201`, the TOTP challenge returns `202`, `update_user`
+  reports the real TOTP state, and duplicate client groups return `409`.
+- Documentation now reflects actual behavior for ACME/TLS, `/metrics` auth,
+  HA resync/pinning/SAN, TOTP/reauth/wizard, installer signatures,
+  `--no-setup`, schedule timezone, container binds, benchmark provenance, fuzz
+  removal, and config defaults/types. Historical audits carry banners.
+- `config.example.toml` uses the actual default cache/log values and current
+  version text.
+
+### Deferred
+- **P1-19, P1-23, P1-24** (stats rollup privacy, query-log/dashboard polling
+  cost, retention lock duration) are deferred to Phase 2 and documented as
+  residual risks.
+- RouterOS remains experimental; moving it behind an optional feature is a 2.0
+  item. Fuzzing remains removed; the old `fuzz/Cargo.toml` commands in the
+  1.9.2/1.9.3 notes are marked historical. Weekly benchmarks upload estimates
+  but do not gate performance.
+
+### Upgrade notes
+- ACME users who relied on the bootstrap certificate must set
+  `acme.allow_bootstrap_cert = true`; otherwise encrypted listeners wait for the
+  first trusted certificate (restart once after first issuance).
+- Hostname upstreams that intentionally use private addresses need
+  `upstream.allow_private_targets = true`.
+- `filtering.enabled = true` with no lists/custom rules now fails closed; add a
+  source or disable filtering.
+- Sources that legitimately return an empty list need
+  `filtering.allow_empty_list = true`; otherwise the response is rejected and
+  the previous snapshot is retained.
+- TOTP automation must call `/api/v1/auth/reauth` and send `X-Reauth-Token`.
+- A 1.9.3 HA watermark without a digest forces one full apply after upgrade.
+- No data migration is required. Existing configs, SQLite databases,
+  sessions/tokens, and HA state files load.
+
+---
+
 ## [1.9.3] - 2026-11-06
 
 Release-engineering patch. There are no runtime, configuration, API, or data
