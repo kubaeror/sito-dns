@@ -5,6 +5,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [2.0.0-alpha.1] - Unreleased
+
+Phase 1 refactor foundations. This is **not a published release**: the
+workspace version advances so the 2.0 line can be built, tested and released
+as a prerelease. Phase 1 work packages land as separate commits on
+`feat/2.0-phase1-foundations`.
+
+### Changed
+- Workspace version is now `2.0.0-alpha.1`. The stable `1.9.5` release remains
+  the published install.
+- The release workflow treats tags containing `-` as prereleases: it marks the
+  GitHub release as a prerelease and never moves the `latest` release or image
+  tag (verified in `.github/workflows/release.yml`).
+
 ## [1.9.5] - 2026-11-10
 
 Release-engineering patch. There are no runtime, configuration, API, database,

@@ -1,6 +1,11 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v1.9.5**.
+This document is the exhaustive configuration reference for **sito v2.0.0-alpha.1**.
+
+> The `2.0.0-alpha.1` development line still accepts `config_version = 1`
+> until the config-v2 migration lands in Phase 1 (WP-1.3). The settings below
+> describe the live schema; the v2 schema and migration guide will replace
+> this note in the same work package.
 
 `sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the `DNSD_SECRET_<name>` environment variable, then a bare `<name>` environment variable; there is no on-disk local secret store, and a placeholder that cannot be resolved rejects the whole pushed configuration.
 

@@ -14,11 +14,16 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 
 `sito` is designed as a modern, rock-solid alternative to AdGuard Home and Pi-hole. Engineered in Rust (edition 2024), it combines sub-millisecond p99 latency, comprehensive ad/tracker/malware blocking (using AdGuard/ABP rule syntax), multi-protocol encryption (DoT, DoH H2, DoQ, DoH3), and automated master/slave high availability.
 
+> **Development status:** the `main` line is currently **2.0.0-alpha.1**
+> (Phase 1 refactor foundations). The latest stable release remains **1.9.5**;
+> the quickstart below intentionally pins the published stable installer and
+> container image. Alpha builds are not published as stable artifacts.
+
 ---
 
 ## 📊 Feature Comparison: sito vs. AdGuard Home vs. Pi-hole
 
-| Feature / Capability | **sito** (v1.9.x) | **AdGuard Home** | **Pi-hole (FTL)** |
+| Feature / Capability | **sito** (2.0 alpha) | **AdGuard Home** | **Pi-hole (FTL)** |
 |---|---|---|---|
 | **Language & Runtime** | **Rust (edition 2024, zero GC, zero Node.js)** | Go (GC overhead under load) | C (FTL) + PHP Web UI |
 | **Max Cache Throughput** | **≥ 500,000 QPS** (v1.0 reference run: 584k) | ~100,000 QPS | ~50,000 QPS |
@@ -29,7 +34,7 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 | **Filter Rule Engine** | **ABP/AdGuard syntax (see [compatibility matrix](docs/compatibility.md); qtype-aware `$dnsrewrite`)** | Full ABP + modifiers | Domain regex & wildcards |
 | **ReDoS Defense** | **Pure Dense DFA (no backtracking)** | RE2 linear time | POSIX regex (risk of backtrack) |
 | **ACME Certificates** | **Native TLS-ALPN-01 & HTTP-01** | Built-in ACME | External (Certbot) |
-| **RouterOS Integration** | **Native DHCP Lease Sync** | None | None |
+| **RouterOS Integration** | **Optional experimental DHCP Lease Sync** (`--features routeros`; not in the default build) | None | None |
 | **Distribution** | **Single standalone binary (HTMX + Askama UI embedded)** | Single standalone binary | Multiple packages / lighttpd |
 | **Config Format** | **Single TOML (`config.toml`)** | Single YAML | Multiple conf files + SQLite |
 
@@ -92,6 +97,8 @@ Client Query ──▶ [sito-transport] (UDP / TCP / DoT / DoH / DoQ / DoH3)
 ## 🚀 Quickstart
 
 ### Option 1: Automated One-Line Installer (Linux)
+The examples below install the latest **stable** release (1.9.5). The
+`2.0.0-alpha.1` development line is not published as a stable artifact yet.
 ```bash
 # Download and inspect the pinned installer, then run it for the same version.
 curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/v1.9.5/contrib/install.sh -o sito-install.sh

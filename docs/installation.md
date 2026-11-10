@@ -2,6 +2,11 @@
 
 This guide covers deploying **sito** on Linux hosts using the automated one-line installer, manual systemd service configuration, Docker, or Docker Compose.
 
+> **Development status:** the `main` line is currently **2.0.0-alpha.1**
+> (Phase 1 refactor foundations). The published stable release remains
+> **1.9.5**, and the pinned examples below intentionally target it. Alpha
+> builds are not published as stable artifacts.
+
 ---
 
 ## Network Exposure and Firewall

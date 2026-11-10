@@ -174,7 +174,7 @@ must be updated in the same change.
 ## Release pipeline
 
 Release runs only from a tag push. A tag must match the workspace version in
-`Cargo.toml` (`v1.9.5` or a prerelease such as `v1.9.5-rc.1`); a mismatch stops
+`Cargo.toml` (`v2.0.0-alpha.1` or a prerelease such as `v2.0.0-beta.1`); a mismatch stops
 the workflow before any asset is built. The order is deliberate:
 
 1. **`verify-tag`** — checks the tag against the workspace version.
