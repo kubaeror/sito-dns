@@ -8242,6 +8242,70 @@ mod tests {
         assert!(!response.metadata.authentic_data);
     }
 
+    /// P1-1 DNAME residual: hickory-proto 0.26.3 does not reject DNAME on the
+    /// wire; it decodes it as `RData::Unknown { code: DNAME }`. The validator
+    /// cannot interpret/follow it and must fail closed (strict mode Bogus with
+    /// SERVFAIL), never assert AD or serve it as validated.
+    #[tokio::test]
+    async fn test_dname_unknown_rdata_fails_closed() {
+        use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+        use sito_proto::rdata::NULL;
+
+        let qname = Name::from_str("alias.example.").expect("qname");
+        let target = Name::from_str("target.example.").expect("target");
+        let mut target_wire = Vec::new();
+        {
+            let mut encoder = BinEncoder::new(&mut target_wire);
+            target.emit(&mut encoder).expect("encode DNAME target");
+        }
+        let mut response = Message::new(1, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname.clone(), RecordType::DNAME));
+        response.answers.push(Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::Unknown {
+                code: RecordType::DNAME,
+                rdata: NULL::with(target_wire),
+            },
+        ));
+
+        // Prove the actual wire mechanism: DNAME survives decode as an
+        // unsupported/unknown RDATA, it is not a parse error.
+        let wire = sito_proto::encode_message(&response).expect("encode response");
+        let mut decoded = sito_proto::decode_message(&wire).expect("DNAME must decode");
+        assert!(
+            matches!(
+                decoded.answers.first().map(|record| &record.data),
+                Some(RData::Unknown { code, .. }) if *code == RecordType::DNAME
+            ),
+            "expected DNAME to decode as RData::Unknown"
+        );
+        assert_eq!(
+            decoded.answers[0].record_type(),
+            RecordType::DNAME,
+            "the unknown RDATA still reports the DNAME record type"
+        );
+
+        let validator = DnssecValidator::from_config(&DnssecConfig::default());
+        let offline = OfflineFetcher::new();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let outcome = validator
+            .validate_with_key_fetcher(&mut decoded, Some("offline"), now, &offline)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "DNAME without interpretable/authenticated data must fail closed: {outcome:?}"
+        );
+        assert_eq!(decoded.metadata.response_code, ResponseCode::ServFail);
+        assert!(
+            !decoded.metadata.authentic_data,
+            "a DNAME response must never be served with AD=1"
+        );
+    }
+
     /// RFC 4035 3.2.3: AD must not be set when the Answer/Authority sections
     /// contain an RRset that is not covered by a trusted signature.
     #[test]

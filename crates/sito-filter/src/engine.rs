@@ -875,6 +875,65 @@ impl HostsFilterEngine {
         }
     }
 
+    /// Whether any group defines non-blank custom rules. A `lists` reference
+    /// alone is not an independent source.
+    fn has_group_custom_rules(groups: &[GroupRuleSet]) -> bool {
+        groups.iter().any(|group| {
+            group
+                .custom_rules
+                .iter()
+                .any(|rule| !rule.trim().is_empty())
+        })
+    }
+
+    /// Cheap dry-run used only for the group-only initial decision: does at
+    /// least one group custom rule actually parse and compile to a non-empty
+    /// snapshot?
+    ///
+    /// Comment-only, invalid-only, or over-budget group rules must not make
+    /// the engine advertise an available empty snapshot. List references are
+    /// ignored here because they are not independent sources; they only work
+    /// when a global list of that name loaded.
+    fn group_custom_rules_compile(&self) -> bool {
+        let defs = self.group_defs.load();
+        if defs.is_empty() {
+            return false;
+        }
+        let config = self.config.load();
+        for def in defs.iter() {
+            let mut rules = Vec::new();
+            let mut over_budget = false;
+            for rule_text in &def.custom_rules {
+                let limits = ParseLimits::new(
+                    config.max_rules.saturating_sub(rules.len()),
+                    config.max_list_bytes,
+                );
+                if let Ok((parsed, _)) = parse_rules_with_limits(rule_text, "group", limits) {
+                    rules.extend(parsed);
+                } else {
+                    over_budget = true;
+                    break;
+                }
+            }
+            if over_budget || rules.is_empty() || rules.len() > config.max_rules {
+                continue;
+            }
+            if pattern_load_exceeds_limits(&rules).is_some() {
+                continue;
+            }
+            let budget = config
+                .regex_compile_budget_ms
+                .map(Duration::from_millis)
+                .map(CompileBudget::new);
+            if FilterSnapshot::compile_with_budget(rules, budget.as_ref())
+                .is_ok_and(|snapshot| snapshot.rule_count > 0)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Replaces the group rule definitions and rebuilds the per-group snapshots
     /// from the currently loaded lists. Called whenever clients/group policy or
     /// blocklists are (re)loaded.
@@ -883,12 +942,7 @@ impl HostsFilterEngine {
         // not an independent source (and an unloaded/disabled global list
         // yields no rules). Only group `custom_rules` can make an otherwise
         // source-less configuration non-empty.
-        let has_group_sources = groups.iter().any(|group| {
-            group
-                .custom_rules
-                .iter()
-                .any(|rule| !rule.trim().is_empty())
-        });
+        let has_group_sources = Self::has_group_custom_rules(&groups);
         self.group_sources_configured
             .store(has_group_sources, Ordering::Release);
         self.group_defs.store(Arc::new(groups));
@@ -1114,26 +1168,30 @@ impl HostsFilterEngine {
         data_dir: PathBuf,
         observer: Option<CompileObserver>,
     ) -> Self {
-        Self::init_with_observer_and_group_sources(config, data_dir, observer, false).await
+        Self::init_with_observer_and_group_sources(config, data_dir, observer, Vec::new()).await
     }
 
-    /// Initializes and loads lists, knowing whether client groups contribute
-    /// rules before the first reload runs.
+    /// Initializes and loads lists with the client group rule sets that will
+    /// apply before the first reload runs.
     ///
-    /// The server loads `[clients]` after the filter engine, so without this
-    /// hint a group-only configuration (global `filtering.lists` empty but
-    /// `clients.groups.*.custom_rules` non-empty) would be marked unavailable
-    /// and fail every query closed until a later reload.
+    /// The server loads `[clients]` after the filter engine, so passing the
+    /// group definitions here lets the initial reload tell a usable group-only
+    /// deployment (global `filtering.lists` empty but at least one group
+    /// `custom_rules` entry compiles) from a broken one. The hint is only used
+    /// when there is no configured global source; it must never mask a failed
+    /// or empty global source.
     pub async fn init_with_observer_and_group_sources(
         config: FilteringConfig,
         data_dir: PathBuf,
         observer: Option<CompileObserver>,
-        has_group_sources: bool,
+        group_rules: Vec<GroupRuleSet>,
     ) -> Self {
         let engine = Self::new(config, data_dir);
-        engine
-            .group_sources_configured
-            .store(has_group_sources, Ordering::Release);
+        engine.group_sources_configured.store(
+            Self::has_group_custom_rules(&group_rules),
+            Ordering::Release,
+        );
+        engine.group_defs.store(Arc::new(group_rules));
         if let Some(observer) = observer {
             engine.set_compile_observer(observer);
         }
@@ -1253,12 +1311,16 @@ impl HostsFilterEngine {
         // P2-95: filtering enabled with nothing to load must fail closed, not
         // advertise an empty `Ready` snapshot. Custom rules count as a source
         // when at least one non-blank entry is configured.
-        let has_source = config.lists.iter().any(|list| list.enabled)
+        let has_global_source = config.lists.iter().any(|list| list.enabled)
             || config
                 .custom_rules
                 .iter()
-                .any(|rule| !rule.trim().is_empty())
-            || self.group_sources_configured.load(Ordering::Acquire);
+                .any(|rule| !rule.trim().is_empty());
+        // A group custom rule is only an alternative source when there is no
+        // configured global source at all. It must never mask a global list
+        // that was configured but failed/returned nothing.
+        let group_hint = self.group_sources_configured.load(Ordering::Acquire);
+        let has_source = has_global_source || group_hint;
         if !has_source {
             let prev_count = self.snapshot.load().rule_count;
             if prev_count > 0 && !self.snapshot.load().unavailable {
@@ -1576,13 +1638,15 @@ impl HostsFilterEngine {
 
         let prev_count = self.snapshot.load().rule_count;
         // A group-only configuration legitimately has zero global rules while
-        // `set_group_rules`/`rebuild_group_snapshots` holds the effective
-        // rules. Publishing an empty *base* snapshot is safe because the
-        // pipeline also evaluates the group snapshot; it is not an
-        // enabled-but-empty engine (that path keeps `unavailable = false` and
-        // group matching still applies per client).
-        let group_sources = self.group_sources_configured.load(Ordering::Acquire);
-        if count == 0 && !allow_empty && !group_sources {
+        // the group snapshots hold the effective rules. Bypass the empty/failed
+        // branches only when:
+        //   * there is no configured global source at all, and
+        //   * at least one group custom rule actually parses/compiles.
+        // A failed global list always fails closed here, even when a group
+        // rule exists, so non-group clients are never silently unfiltered.
+        let group_only_sources =
+            !has_global_source && group_hint && self.group_custom_rules_compile();
+        if count == 0 && !allow_empty && !group_only_sources {
             // No usable rules were produced. This covers an empty/HTML/zero
             // list on a reload as well as a comment-only source: never publish
             // an empty snapshot that would silently disable filtering.
@@ -1663,7 +1727,7 @@ impl HostsFilterEngine {
             return Ok(prev_count);
         }
 
-        if count == 0 && !failed_lists.is_empty() && prev_count == 0 && !group_sources {
+        if count == 0 && !failed_lists.is_empty() && prev_count == 0 && !group_only_sources {
             let details = format!(
                 "all {} configured filter source(s) failed to load: {}",
                 failed_lists.len(),
@@ -3068,7 +3132,11 @@ mod tests {
             config,
             temp_dir.clone(),
             None,
-            true,
+            vec![GroupRuleSet {
+                name: "kids".to_string(),
+                lists: Vec::new(),
+                custom_rules: vec!["||fortnite.example^".to_string()],
+            }],
         )
         .await;
 
@@ -3104,6 +3172,112 @@ mod tests {
                 )
                 .is_allowed(),
             "queries outside the group must still resolve"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// A valid group rule must not mask a configured global list that failed
+    /// its first load: non-group clients stay fail-closed instead of being
+    /// silently unfiltered.
+    #[tokio::test]
+    async fn test_group_rule_does_not_mask_failed_global_source() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_failed_global_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let config = FilteringConfig {
+            enabled: true,
+            fail_closed: true,
+            lists: vec![FilterListConfig {
+                name: "dead".to_string(),
+                url: "http://127.0.0.1:1/list.txt".to_string(),
+                enabled: true,
+                refresh_hours: None,
+            }],
+            custom_rules: Vec::new(),
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init_with_observer_and_group_sources(
+            config,
+            temp_dir.clone(),
+            None,
+            vec![GroupRuleSet {
+                name: "kids".to_string(),
+                lists: Vec::new(),
+                custom_rules: vec!["||fortnite.example^".to_string()],
+            }],
+        )
+        .await;
+
+        assert_eq!(engine.state(), FilterState::Failed);
+        assert!(
+            engine.unavailable_for_fail_closed(),
+            "a failed global source must fail closed even when a group rule exists"
+        );
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert_eq!(
+            engine.evaluate(
+                &Name::from_str("unrelated.example.").unwrap(),
+                RecordType::A,
+                &client
+            ),
+            Verdict::Block(BlockReason::FilterUnavailable),
+            "non-group clients must get fail-closed, not allow-all"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Comment-only or invalid-only group rules must not make an otherwise
+    /// source-less configuration advertise a Ready/available snapshot.
+    #[tokio::test]
+    async fn test_invalid_only_group_rules_fail_closed() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_invalid_only_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let config = FilteringConfig {
+            enabled: true,
+            fail_closed: true,
+            lists: Vec::new(),
+            custom_rules: Vec::new(),
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init_with_observer_and_group_sources(
+            config,
+            temp_dir.clone(),
+            None,
+            vec![GroupRuleSet {
+                name: "kids".to_string(),
+                lists: Vec::new(),
+                custom_rules: vec![
+                    "# comment-only".to_string(),
+                    "!!! this is not a valid rule".to_string(),
+                ],
+            }],
+        )
+        .await;
+
+        assert_eq!(engine.state(), FilterState::Failed);
+        assert!(
+            engine.unavailable_for_fail_closed(),
+            "unparseable group rules must not count as a usable source"
+        );
+        assert!(
+            engine.group_snapshot("kids").is_none(),
+            "no usable group snapshot may be published"
+        );
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert_eq!(
+            engine.evaluate(
+                &Name::from_str("unrelated.example.").unwrap(),
+                RecordType::A,
+                &client
+            ),
+            Verdict::Block(BlockReason::FilterUnavailable)
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;

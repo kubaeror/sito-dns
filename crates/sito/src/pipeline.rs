@@ -2804,6 +2804,86 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
+    /// A group custom rule must not mask a configured global list that failed
+    /// to load: a non-group client gets SERVFAIL (fail closed), not allow-all.
+    #[tokio::test]
+    async fn test_group_rule_does_not_mask_failed_global_source_end_to_end() {
+        use sito_clients::{ClientEntryConfig, ClientGroupConfig, ClientsConfig};
+        use sito_core::config::FilterListConfig;
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+        use std::collections::HashMap;
+
+        let (mock_addr, calls) = spawn_mock_upstream(None).await;
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        config.filtering.enabled = true;
+        config.filtering.fail_closed = true;
+        config.filtering.custom_rules.clear();
+        config.filtering.lists = vec![FilterListConfig {
+            name: "dead".to_string(),
+            url: "http://127.0.0.1:1/blocklist.txt".to_string(),
+            enabled: true,
+            refresh_hours: None,
+        }];
+        config.upstream.servers = vec![mock_addr.to_string()];
+
+        let clients = ClientsConfig {
+            entries: vec![ClientEntryConfig {
+                name: "kid".to_string(),
+                ids: vec!["127.0.0.1".to_string()],
+                group: "kids".to_string(),
+                ignore_query_log: false,
+                ignore_stats: false,
+                use_global_upstreams: true,
+                upstreams: None,
+                trusted: false,
+            }],
+            groups: HashMap::from([(
+                "kids".to_string(),
+                ClientGroupConfig {
+                    custom_rules: vec!["||fortnite.example^".to_string()],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let validator = sito_dnssec::DnssecValidator::from_config(&config.dns.dnssec);
+        let (pipeline, temp_dir) =
+            build_test_pipeline_with_clients(config, upstream, validator, clients).await;
+
+        // 127.0.0.2 does not match the group entry.
+        let response = pipeline
+            .handle(
+                rewrite_query("unrelated.example.", RecordType::A),
+                ClientContext::new("127.0.0.2".parse().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::ServFail,
+            "a failed global source must fail closed even when a group rule exists"
+        );
+        assert!(
+            response.answers.is_empty(),
+            "fail-closed responses must not leak an unfiltered answer"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "fail-closed must stop before the upstream"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
     async fn build_test_pipeline(
         config: Config,
         upstream: std::sync::Arc<UpstreamManager>,
@@ -2851,22 +2931,17 @@ mod tests {
         config.dns.cache.enabled = true;
 
         let cache = std::sync::Arc::new(DnsCache::new(config.dns.cache.clone()));
-        let has_group_sources = clients.groups.values().any(|group| {
-            group
-                .custom_rules
-                .iter()
-                .any(|rule| !rule.trim().is_empty())
-        });
+        let group_rules = crate::server::group_rule_sets(&clients);
         let filter = std::sync::Arc::new(
             HostsFilterEngine::init_with_observer_and_group_sources(
                 config.filtering.clone(),
                 config.server.data_dir.clone(),
                 None,
-                has_group_sources,
+                group_rules.clone(),
             )
             .await,
         );
-        filter.set_group_rules(crate::server::group_rule_sets(&clients));
+        filter.set_group_rules(group_rules);
         let pipeline = DnsPipeline::new(
             std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(config.clone()))),
             filter,

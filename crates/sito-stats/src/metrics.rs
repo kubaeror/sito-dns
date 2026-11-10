@@ -1066,7 +1066,7 @@ impl MetricsRegistry {
             self.filter_dropped_regex.load(Ordering::Relaxed)
         );
         out.push_str(
-            "# HELP sito_filter_unavailable No usable filter snapshot is active (1 = fail-closed SERVFAIL)\n",
+            "# HELP sito_filter_unavailable No usable filter snapshot is active (1 = unavailable; fail_closed answers SERVFAIL)\n",
         );
         out.push_str("# TYPE sito_filter_unavailable gauge\n");
         let _ = writeln!(
@@ -1609,7 +1609,7 @@ sito_filter_degraded_groups 1
 # HELP sito_filter_dropped_regex_patterns Regex/wildcard patterns dropped from the active snapshot
 # TYPE sito_filter_dropped_regex_patterns gauge
 sito_filter_dropped_regex_patterns 5
-# HELP sito_filter_unavailable No usable filter snapshot is active (1 = fail-closed SERVFAIL)
+# HELP sito_filter_unavailable No usable filter snapshot is active (1 = unavailable; fail_closed answers SERVFAIL)
 # TYPE sito_filter_unavailable gauge
 sito_filter_unavailable 1
 # HELP sito_filter_compile_seconds Compilation duration for filter rule trie

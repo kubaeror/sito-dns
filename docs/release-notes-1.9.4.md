@@ -191,8 +191,9 @@ document is the operator-facing summary and upgrade guide.
   `SITO_INSTALL_COSIGN=0`.
 - Releases are gated on the required branch and green `ci-gate`/`cargo-deny`
   checks; container images are Trivy-scanned for fixed HIGH/CRITICAL
-  vulnerabilities (`--ignore-unfixed`; unfixed findings are reported but do not
-  fail the gate) and cosign-signed with provenance/SBOM attestations.
+  vulnerabilities (`--ignore-unfixed` suppresses unfixed findings entirely,
+  rather than merely not failing the gate) and cosign-signed with
+  provenance/SBOM attestations.
 - `invalidate_domain` works: cache invalidation closures are enabled, and a
   runtime error flushes the cache rather than reporting success while leaving
   stale entries.
@@ -254,10 +255,11 @@ documented residual risks:
 Additional deferred/unchanged items:
 
 - **DNAME (P1-1 residual).** The pinned `hickory-proto 0.26.3` has no DNAME
-  RDATA type, so DNAME responses are rejected/fail closed rather than
-  validated or followed. This is not an `AD=1` bypass, but signed DNAME
-  answers do not resolve until a hickory upgrade or local RDATA support lands
-  in Phase 1/2.
+  RDATA type; a wire DNAME record decodes as `RData::Unknown { code: DNAME }`.
+  The validator cannot interpret/follow it and fails closed in `validate` mode
+  (Bogus/SERVFAIL, `AD=0`) without rejecting the whole message. This is not an
+  `AD=1` bypass, but signed DNAME answers do not resolve until a hickory
+  upgrade or local RDATA support lands in Phase 1/2.
 - **RouterOS** remains an experimental, niche integration with the 1.9.x
   behavior; moving it behind an optional feature is a 2.0 item.
 - **Fuzzing** is not part of the 1.9.4 build or CI. The old `fuzz/Cargo.toml`

@@ -619,21 +619,17 @@ async fn init_runtime_components(
     // every scheduled refresh in `sito_filter_compile_seconds`.
     //
     // Group custom rules are a real source even when global
-    // `filtering.lists`/`custom_rules` are empty; pass that hint so a
-    // group-only deployment does not initialize as unavailable/fail-closed.
+    // `filtering.lists`/`custom_rules` are empty; pass the actual group rule
+    // sets so the initial reload can verify at least one compiles, instead of
+    // trusting raw text that may be comment-only or invalid.
     let initial_clients = clients_from_config(config)?;
-    let has_group_sources = initial_clients.groups.values().any(|group| {
-        group
-            .custom_rules
-            .iter()
-            .any(|rule| !rule.trim().is_empty())
-    });
+    let initial_group_rules = group_rule_sets(&initial_clients);
     let filter_engine = Arc::new(
         HostsFilterEngine::init_with_observer_and_group_sources(
             config.filtering.clone(),
             config.server.data_dir.clone(),
             Some(metrics.compile_observer()),
-            has_group_sources,
+            initial_group_rules,
         )
         .await,
     );

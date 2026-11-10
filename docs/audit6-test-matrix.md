@@ -23,7 +23,7 @@ named by the command.
 |---|---|---|
 | P0-1 | `test_fresh_bootstrap_certificate_requires_renewal`, `test_legacy_self_signed_bootstrap_requires_renewal`, `test_acme_bootstrap_issuance_all_transports_and_renewal` | `cargo test -p sito-transport test_fresh_bootstrap_certificate_requires_renewal`; `cargo test -p sito-test --test m11_acme test_legacy_self_signed_bootstrap_requires_renewal` |
 | P0-2 | `test_parent_delegation_nsec_cannot_prove_nxdomain_below_cut`, `test_parent_delegation_nsec3_cannot_prove_nxdomain_below_cut`, `test_parent_delegation_nsec3_nodata_only_denies_ds`, `test_ds_nodata_at_delegation_is_secure` | `cargo test -p sito-dnssec parent_delegation` |
-| P1-1 | `test_forged_covering_rrsig_still_probes_unsigned_delegation`, `test_signed_cname_to_stripped_target_without_ds_denial_is_bogus`, `test_m11_cd1_bypasses_post_fetch_indeterminate`; DNAME is a documented residual (see `docs/audit6.md`) | `cargo test -p sito-dnssec forged_covering_rrsig`; `cargo test -p sito-test --test m11_dnssec_security test_m11_cd1_bypasses_post_fetch_indeterminate` |
+| P1-1 | `test_forged_covering_rrsig_still_probes_unsigned_delegation`, `test_signed_cname_to_stripped_target_without_ds_denial_is_bogus`, `test_m11_cd1_bypasses_post_fetch_indeterminate`, `test_dname_unknown_rdata_fails_closed`; DNAME handling remains a documented residual (see `docs/audit6.md`) | `cargo test -p sito-dnssec forged_covering_rrsig`; `cargo test -p sito-dnssec test_dname_unknown_rdata_fails_closed`; `cargo test -p sito-test --test m11_dnssec_security test_m11_cd1_bypasses_post_fetch_indeterminate` |
 | P1-2 | `test_m11_blocked_key_fetch_is_bounded_and_servfails`, `test_m11_eight_hop_chain_is_bounded_end_to_end` | `cargo test -p sito-test --test m11_dnssec_security test_m11_blocked_key_fetch_is_bounded_and_servfails` |
 | P1-3 | `test_slave_goes_not_ready_when_master_stops_sending_frames` | `cargo test -p sito-test --test m11_ha_partition test_slave_goes_not_ready_when_master_stops_sending_frames` |
 | P1-4 | `test_restart_with_locally_modified_shared_config_does_not_early_ack_synced`, `test_legacy_watermark_without_digest_forces_full_apply` | `cargo test -p sito-test --test m11_ha_partition test_restart_with_locally_modified_shared_config_does_not_early_ack_synced` |
@@ -55,11 +55,11 @@ named by the command.
 
 | Finding | Named test / check | Focused command |
 |---|---|---|
-| Group-only filtering | `test_group_only_custom_rules_are_sources`, `test_group_only_filter_configuration_resolves_end_to_end` | `cargo test -p sito-filter test_group_only_custom_rules_are_sources`; `cargo test -p sito test_group_only_filter_configuration_resolves_end_to_end` |
+| Group-only filtering | `test_group_only_custom_rules_are_sources`, `test_group_only_filter_configuration_resolves_end_to_end`, `test_group_rule_does_not_mask_failed_global_source`, `test_group_rule_does_not_mask_failed_global_source_end_to_end`, `test_invalid_only_group_rules_fail_closed` | `cargo test -p sito-filter group_rule_does_not_mask`; `cargo test -p sito-filter test_invalid_only_group_rules_fail_closed`; `cargo test -p sito test_group_rule_does_not_mask_failed_global_source_end_to_end` |
 | `[dns.tls]`/legacy ACME restart | `test_restart_required_tracks_effective_tls_and_legacy_acme` | `cargo test -p sito-api test_restart_required_tracks_effective_tls_and_legacy_acme` |
 | `--no-setup` fresh boot | `test_no_setup_without_config_generates_random_password_on_loopback`, `test_no_setup_fresh_boot_resolves_a_query` | `cargo test -p sito test_no_setup_without_config`; `cargo test -p sito-test --test m11_no_setup` |
 | ACME domain-change reissue | `test_certificate_needs_renewal_when_domains_change` | `cargo test -p sito-transport test_certificate_needs_renewal_when_domains_change` |
 | D12 challenge readiness | `test_acme_readiness_no_80_no_443` | `cargo test -p sito-api test_acme_readiness_no_80_no_443` |
 | IPv4-mapped rate key | `test_ipv4_mapped_ipv6_uses_ipv4_24_bucket` | `cargo test -p sito-transport test_ipv4_mapped_ipv6_uses_ipv4_24_bucket` |
 | Filter-unavailable metric | `test_render_prometheus_golden_output`, `test_filter_metrics_are_reported` | `cargo test -p sito-stats filter_metrics` |
-| DNAME | Documented residual; `hickory-proto 0.26.3` rejects the RDATA type | `docs/audit6.md` residual note |
+| DNAME | `test_dname_unknown_rdata_fails_closed` (wire decode as `Unknown`, strict Bogus/SERVFAIL, no AD); handling remains a documented residual | `cargo test -p sito-dnssec test_dname_unknown_rdata_fails_closed` |
