@@ -63,13 +63,16 @@ guidance and residual risks.
 - **Filter:** empty/HTML/zero-yield lists are rejected unless explicitly
   allowed; zero-source filtering fails closed; parser/compiler budgets are
   enforced before allocation; malformed modifier tokens reject the whole rule;
-  rewrite exceptions require registry-authenticated ids.
+  rewrite exceptions require registry-authenticated ids; a group `$dnsrewrite`
+  no longer hides a global block on the CNAME-target path.
 - **Transport:** DoQ flow-control/stream/task caps and pre-read admission;
   DoH/DoH3 pre-body admission, global request caps, deadlines/lifetimes, and H2
-  stream caps; one client-correct response-shaping path strips upstream EDNS
-  options and OPT for non-EDNS clients; QR=1 dropped and multi-question queries
-  rejected; prefix-keyed rate limits with LRU eviction; per-source connection
-  caps; ACME HTTP-01 limits; tracked QUIC shutdown.
+  stream caps; a DoH3 total-deadline expiry returns HTTP 504 (or resets the
+  stream if the response already started); one client-correct response-shaping
+  path strips upstream EDNS options and OPT for non-EDNS clients; QR=1 dropped
+  and multi-question queries rejected; prefix-keyed rate limits with LRU
+  eviction; per-source connection caps; ACME HTTP-01 limits; tracked QUIC
+  shutdown.
 - **Upstream:** bootstrap/probe RD=1, SSRF-filtered bootstrap answers, forced
   refresh on failure, UDP junk tolerance, bare DoH `/dns-query`, no ambient
   proxy, one no-EDNS retry on FORMERR/BADVERS, and wedged-DoQ reconnect.
@@ -99,7 +102,8 @@ guidance and residual risks.
   clearing the log deletes rollups by default (`keep_aggregates` opts out);
   large clears vacuum and `secure_delete=ON`; stats files are repaired to 0600.
 - **P1-23:** `include_total=false` for live query-log refresh; 45 s dashboard
-  cache with invalidation; stats endpoints rate-limited.
+  cache with invalidation; stats endpoints rate-limited with `Retry-After: 1`
+  on `429`.
 - **P1-24:** retention runs in bounded hour chunks, startup catch-up with
   jitter, and success/failure/duration/deleted-row metrics.
 
@@ -107,7 +111,9 @@ guidance and residual risks.
 - RouterOS remains experimental; moving it behind an optional feature is a 2.0
   item. Fuzzing remains removed; the old `fuzz/Cargo.toml` commands in the
   1.9.2/1.9.3 notes are marked historical. Weekly benchmarks upload estimates
-  but do not gate performance.
+  but do not gate performance. The bounded account-lockout map's capacity
+  fallback (new keys rely on per-IP limiting when every slot is an active lock)
+  is documented as a residual.
 
 ### Upgrade notes
 - ACME users who relied on the bootstrap certificate must set

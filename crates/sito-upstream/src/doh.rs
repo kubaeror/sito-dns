@@ -104,11 +104,20 @@ impl HttpsUpstream {
         })
     }
 
-    /// Constructs an upstream from a caller-provided HTTP client (used by tests
-    /// and custom TLS configurations).
+    /// Constructs an upstream from a caller-provided HTTP client.
     ///
-    /// The caller is responsible for disabling redirects on the supplied client
-    /// (`redirect(reqwest::redirect::Policy::none())`); `new` does so itself.
+    /// This is intended for tests and custom TLS configurations; production
+    /// callers should use [`HttpsUpstream::new`]. It deliberately bypasses the
+    /// production client setup:
+    ///
+    /// - the URL is parsed as-is, so a bare `https://host` is **not** completed
+    ///   to `/dns-query` (`normalize_doh_url` is skipped);
+    /// - the supplied client decides proxy and address-pinning behavior. In
+    ///   particular this does **not** call `.no_proxy()` or
+    ///   `.resolve_to_addrs()`, so ambient `HTTP(S)_PROXY` settings can redirect
+    ///   DNS queries;
+    /// - the caller must also disable redirects
+    ///   (`redirect(reqwest::redirect::Policy::none())`); `new` does so itself.
     #[must_use]
     pub fn with_client(url: &str, client: reqwest::Client, _timeout_duration: Duration) -> Self {
         Self {

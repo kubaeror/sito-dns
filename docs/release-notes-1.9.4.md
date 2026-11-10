@@ -132,6 +132,10 @@ document is the operator-facing summary and upgrade guide.
   registry authenticated them (`/dns-query/<name>` cannot spoof a client).
 - Group compile-budget failures publish the non-regex subset and report the
   group degraded instead of dropping it; stale group rebuilds are discarded.
+- A CNAME target blocked by a global standard rule is no longer unblocked by a
+  per-group `$dnsrewrite` for the same target. Rewrites cannot be applied on the
+  already-resolved CNAME-target path, so they are treated as a no-match there;
+  `@@` allow rules still override the block.
 - `GET /api/v1/filtering/status` and new Prometheus gauges expose
   loaded/failed/degraded lists, degraded groups, dropped regex patterns,
   unavailability, and compile time.
@@ -144,7 +148,9 @@ document is the operator-facing summary and upgrade guide.
   shutdown.
 - **DoH/DoH3 admission:** DNS bodies are read only after rate/global admission;
   a global in-flight request cap returns 503, HTTP/2 streams are capped at 32,
-  and requests/connections have absolute deadlines/lifetimes.
+  and requests/connections have absolute deadlines/lifetimes. A DoH3 request
+  that exceeds its total deadline now returns HTTP 504 (matching DoH) when the
+  response stream is still writable, otherwise the stream is reset.
 - **One response-shaping path:** cache hits, upstream, stale, and synthesized
   answers carry the current client question/RD/CD/ID, rebuild OPT from the
   client's EDNS, never replay upstream EDNS options (COOKIE/NSID/ECS/padding/
@@ -260,7 +266,8 @@ P1-19, P1-23, and P1-24 are closed in this branch:
 - **P1-23 — query-log/dashboard polling cost.** Query-log pages accept
   `include_total` (default `true`; the live 3 s UI refresh sends `false`), and
   dashboard aggregates are cached for 45 s with invalidation on clear/retention.
-  Stats endpoints are rate-limited per authenticated user.
+  Stats endpoints are rate-limited per authenticated user, and their `429`
+  responses include `Retry-After: 1`.
 - **P1-24 — retention lock duration.** Retention processes bounded hour chunks
   in separate short transactions, runs a bounded jittered catch-up on every
   startup (within 5 minutes even when the last success is recent), and exposes
@@ -274,6 +281,11 @@ Additional deferred/unchanged items:
   (Bogus/SERVFAIL, `AD=0`) without rejecting the whole message. This is not an
   `AD=1` bypass, but signed DNAME answers do not resolve until a hickory
   upgrade or local RDATA support lands in Phase 1/2.
+- **Lockout capacity fail-open (residual).** The account lockout map is bounded
+  at 10,000 entries. If every entry is an active lockout, a new key is not
+  tracked and relies on the per-IP login rate limit instead. This is a
+  deliberate bounded-memory trade-off; the tracker never evicts an active
+  lockout to make room.
 - **RouterOS** remains an experimental, niche integration with the 1.9.x
   behavior; moving it behind an optional feature is a 2.0 item.
 - **Fuzzing** is not part of the 1.9.4 build or CI. The old `fuzz/Cargo.toml`
@@ -329,8 +341,6 @@ and GHCR and are covered by the static release-workflow policy test.
   response. When neither port 80 nor a TCP 443 TLS-ALPN listener is available,
   issuance retries on the normal backoff while an existing certificate keeps
   serving; it does not abort startup.
-- DoH returns HTTP 504 on its total request deadline while DoH3 aborts the
-  stream; the parity difference is documented in the transport tests.
 - TCP/DoH 300 s maximum-lifetime paths are covered structurally but not by a
   five-minute end-to-end test.
 - `MAX_HANDSHAKES_PER_IP = 8` counts whole HA sessions; large shared-NAT

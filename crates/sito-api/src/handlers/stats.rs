@@ -14,7 +14,8 @@ use crate::models::StatsQuery;
 use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
+use axum::response::{IntoResponse, Response};
 use sito_stats::{ClientStats, GlobalStats, UpstreamStats};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -64,6 +65,46 @@ fn total_count_header(total: i64) -> HeaderMap {
         HeaderValue::from_str(&total.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0"));
     headers.insert(HeaderName::from_static("x-total-count"), value);
     headers
+}
+
+/// Error type for the statistics handlers.
+///
+/// Rate-limit responses carry `Retry-After` so a polling UI backs off instead
+/// of retrying immediately. Other failures remain plain RFC 7807 problem
+/// details.
+#[derive(Debug)]
+pub enum StatsError {
+    Problem(ProblemDetails),
+    RateLimited(ProblemDetails),
+}
+
+impl StatsError {
+    fn rate_limited() -> Self {
+        Self::RateLimited(ProblemDetails::too_many_requests(
+            "Too many statistics requests. Please slow down.",
+        ))
+    }
+}
+
+impl From<ProblemDetails> for StatsError {
+    fn from(problem: ProblemDetails) -> Self {
+        Self::Problem(problem)
+    }
+}
+
+impl IntoResponse for StatsError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Problem(problem) => problem.into_response(),
+            Self::RateLimited(problem) => {
+                let mut response = problem.into_response();
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                response
+            }
+        }
+    }
 }
 
 /// Parses the `window` query parameter into milliseconds, clamping the result
@@ -120,11 +161,9 @@ pub async fn get_stats(
     viewer: RequireViewer,
     State(ctx): State<ServerContext>,
     Query(query): Query<StatsQuery>,
-) -> Result<Json<GlobalStats>, ProblemDetails> {
+) -> Result<Json<GlobalStats>, StatsError> {
     if stats_rate_limited(&viewer.0.username, "global") {
-        return Err(ProblemDetails::too_many_requests(
-            "Too many statistics requests. Please slow down.",
-        ));
+        return Err(StatsError::rate_limited());
     }
     let window_ms = parse_window_ms(query.window.as_deref())?;
     let stats = ctx
@@ -152,11 +191,9 @@ pub async fn get_client_stats(
     viewer: RequireViewer,
     State(ctx): State<ServerContext>,
     Query(query): Query<StatsQuery>,
-) -> Result<(HeaderMap, Json<Vec<ClientStats>>), ProblemDetails> {
+) -> Result<(HeaderMap, Json<Vec<ClientStats>>), StatsError> {
     if stats_rate_limited(&viewer.0.username, "clients") {
-        return Err(ProblemDetails::too_many_requests(
-            "Too many statistics requests. Please slow down.",
-        ));
+        return Err(StatsError::rate_limited());
     }
     let window_ms = parse_window_ms(query.window.as_deref())?;
     let total = ctx
@@ -189,11 +226,9 @@ pub async fn get_upstream_stats(
     viewer: RequireViewer,
     State(ctx): State<ServerContext>,
     Query(query): Query<StatsQuery>,
-) -> Result<(HeaderMap, Json<Vec<UpstreamStats>>), ProblemDetails> {
+) -> Result<(HeaderMap, Json<Vec<UpstreamStats>>), StatsError> {
     if stats_rate_limited(&viewer.0.username, "upstreams") {
-        return Err(ProblemDetails::too_many_requests(
-            "Too many statistics requests. Please slow down.",
-        ));
+        return Err(StatsError::rate_limited());
     }
     let window_ms = parse_window_ms(query.window.as_deref())?;
     let total = ctx
@@ -240,6 +275,50 @@ mod tests {
         // A different endpoint or user is unaffected.
         assert!(!stats_rate_limited(&user, "clients"));
         assert!(!stats_rate_limited("another-user", "global"));
+    }
+
+    /// Deferred D3: the stats 429 must carry `Retry-After` so a polling client
+    /// backs off instead of immediately retrying an expensive aggregate scan.
+    #[tokio::test]
+    async fn test_stats_rate_limit_response_has_retry_after() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_stats_429_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let username = format!("rate-header-{}", rand::random::<u64>());
+        for _ in 0..STATS_RATE_LIMIT {
+            assert!(!stats_rate_limited(&username, "global"));
+        }
+
+        let viewer = RequireViewer(AuthUser {
+            username,
+            role: Role::Viewer,
+            token_id: None,
+        });
+        let Err(error) = get_stats(
+            viewer,
+            State(ctx),
+            Query(StatsQuery {
+                window: Some("1h".into()),
+            }),
+        )
+        .await
+        else {
+            panic!("the exhausted stats budget must return 429");
+        };
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "1",
+            "stats 429 responses must advertise the retry window"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     use crate::auth::AuthUser;

@@ -83,6 +83,10 @@ Scheduled fuzzing was intentionally removed and is not part of CI; there is no
   `__Host-` session cookies.
 * Rate-limiting budgets are enforced per network prefix (IPv4 `/24`, IPv6
   `/64`), not per authenticated account.
+* The account lockout map is bounded at 10,000 entries. If every entry is an
+  active lockout, a new key is not tracked and relies on the per-IP login rate
+  limit instead. This is a deliberate bounded-memory trade-off; an active
+  lockout is never evicted to make room.
 * `auth.token_default_ttl_days = 0` disables token expiry for operators who
   explicitly opt out; the default is 90 days.
 * DNSSEC wildcard denial requires complete NSEC/NSEC3 proofs; responses whose

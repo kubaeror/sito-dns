@@ -387,24 +387,32 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
                                     return;
                                 };
 
-                                let handled = tokio::time::timeout(limits.request_timeout, async move {
-                                let (req, mut stream) =
-                                    match tokio::time::timeout(
-                                        STREAM_TIMEOUT,
-                                        resolver.resolve_request(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(r)) => r,
-                                        Ok(Err(e)) => {
-                                            debug!("DoH3 failed resolving request from {}: {}", peer_addr, e);
-                                            return;
-                                        }
-                                        Err(_) => {
-                                            debug!("DoH3 request setup timed out for {}", peer_addr);
-                                            return;
-                                        }
-                                    };
+                                let deadline =
+                                    tokio::time::Instant::now() + limits.request_timeout;
+                                let (req, mut stream) = match tokio::time::timeout_at(
+                                    deadline,
+                                    resolver.resolve_request(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(r)) => r,
+                                    Ok(Err(e)) => {
+                                        debug!(
+                                            "DoH3 failed resolving request from {}: {}",
+                                            peer_addr, e
+                                        );
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        debug!(
+                                            "DoH3 request setup timed out for {}",
+                                            peer_addr
+                                        );
+                                        return;
+                                    }
+                                };
+
+                                let handled = tokio::time::timeout_at(deadline, async {
 
                                 if let Some(ref expected) = dedicated_hostname {
                                     let host = req
@@ -663,6 +671,21 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
                                         client_ip,
                                         limits.request_timeout.as_secs()
                                     );
+                                    // DoH returns 504 on its request deadline; keep
+                                    // the transports operationally consistent. If
+                                    // the response has already started, the stream
+                                    // is no longer writable, so reset it instead.
+                                    let timeout_response = http::Response::builder()
+                                        .status(http::StatusCode::GATEWAY_TIMEOUT)
+                                        .body(())
+                                        .unwrap();
+                                    if stream.send_response(timeout_response).await.is_ok() {
+                                        let _ = stream.finish().await;
+                                    } else {
+                                        stream.stop_stream(
+                                            h3::error::Code::H3_REQUEST_CANCELLED,
+                                        );
+                                    }
                                 }
                             });
                             // Reap completed request tasks continuously, not
@@ -1024,9 +1047,10 @@ mod tests {
     /// even though the DoH path accepts it.
     /// P2-17: the whole DoH3 request is bounded by one total deadline. A
     /// client that sends headers and one body byte then stalls must be cut off
-    /// without waiting for the per-chunk 10 s timeout.
+    /// without waiting for the per-chunk 10 s timeout. Deferred D3: the
+    /// deadline returns HTTP 504 (like DoH) instead of resetting the stream.
     #[tokio::test]
-    async fn test_doh3_total_request_deadline_cuts_off_stalled_body() {
+    async fn test_doh3_total_request_deadline_returns_gateway_timeout() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_doh3_deadline_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
@@ -1102,12 +1126,14 @@ mod tests {
         // One body byte only: the server must not wait for the rest.
         stream.send_data(Bytes::from_static(&[0])).await.unwrap();
 
-        let result = tokio::time::timeout(Duration::from_secs(2), stream.recv_response())
+        let response = tokio::time::timeout(Duration::from_secs(2), stream.recv_response())
             .await
-            .expect("the total request deadline must fire well before the per-chunk timeout");
-        assert!(
-            result.is_err(),
-            "the stalled request must be aborted at the total deadline"
+            .expect("the total request deadline must fire well before the per-chunk timeout")
+            .expect("the stalled request must receive a 504 response, not a stream reset");
+        assert_eq!(
+            response.status(),
+            http::StatusCode::GATEWAY_TIMEOUT,
+            "the DoH3 deadline must mirror DoH and return 504"
         );
 
         drop(send_request);
