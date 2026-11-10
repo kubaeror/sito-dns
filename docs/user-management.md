@@ -49,16 +49,17 @@ export TOKEN='sito_...'   # an Admin API token, or use a session cookie instead
 ## 1. Account Lifecycle
 
 1. **Bootstrap.** On a fresh installation the first administrator is created by
-   the setup wizard at `/wizard` (or, for headless installs, by
-   `sito --no-setup`, which generates a random password and binds the panel to
-   loopback). The bootstrap account is named `admin`. While the first-boot setup
-   token is active, or `admin/adminadmin` is still the stored bootstrap
-   credential, login, `/api/v1/auth/*`, API tokens and every non-wizard route are
-   disabled. Only `/wizard`, `/ui/wizard/*`, static assets, `/health` and
-   `/status` are reachable; the wizard requires the one-time token printed in
-   the server logs. The wizard is bootstrap-only and returns `403` after setup
-   completes, even for an Admin session; use the authenticated account flow for
-   later password changes.
+   the setup wizard at `/wizard`. For headless installs with no `config.toml`,
+   `sito --no-setup` generates a random password, prints it once, and binds the
+   panel to loopback. When a config file already exists, `--no-setup` neither
+   creates nor rotates credentials. The bootstrap account is named `admin`.
+   While the first-boot setup token is active, or `admin/adminadmin` is still the
+   stored bootstrap credential, login, `/api/v1/auth/*`, API tokens and every
+   non-wizard routes are disabled. Only `/wizard`, `/ui/wizard/*`, static assets,
+   `/health` and `/status` are reachable; the wizard requires the one-time token
+   printed in the server logs. The wizard is bootstrap-only and returns `403`
+   after setup completes, even for an Admin session; use the authenticated
+   account flow for later password changes.
 2. **Create** additional accounts with `POST /api/v1/auth/users` or the Admin
    **Users** page at `/users`.
 3. **Operate.** Users sign in at `/login` (session cookie) or authenticate with

@@ -397,6 +397,7 @@ def parse_doc_table() -> list[dict[str, object]]:
             continue
         doc_type = cells[1].strip().strip("`").strip()
         default_raw = cells[2].strip().strip("`").strip()
+        description = cells[3].strip() if len(cells) > 3 else ""
         for key in keys:
             parts = [part.strip() for part in key.split(" / ")] if " / " in key else [key.strip()]
             for part in parts:
@@ -406,6 +407,7 @@ def parse_doc_table() -> list[dict[str, object]]:
                         "key": part,
                         "type": doc_type,
                         "default_raw": default_raw,
+                        "description": description,
                         "line": line_number,
                     }
                 )
@@ -489,6 +491,21 @@ def parse_doc_default(raw: str):
     return value
 
 
+def format_doc_default(value) -> str:
+    """Render a Rust/default value for a generated Markdown table cell."""
+    if value is UNKNOWN:
+        return "—"
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
 def defaults_equal(expected, documented) -> bool | None:
     """Return True/False, or None when the comparison is not meaningful."""
     if expected is UNKNOWN:
@@ -567,21 +584,33 @@ def write_missing_rows() -> list[str]:
             ),
             len(lines),
         )
-        table_end = next(
+        # Insert into the section's *main* table, not a later nested sub-table
+        # (for example `[[filtering.lists]]`). The first table after the heading
+        # is the main key/default table.
+        table_start = next(
             (
                 i
-                for i in range(section_end - 1, heading, -1)
+                for i in range(heading + 1, section_end)
                 if lines[i].startswith("|")
             ),
             None,
         )
-        if table_end is None:
+        if table_start is None:
             continue
+        table_end = next(
+            (
+                i
+                for i in range(table_start, section_end)
+                if not lines[i].startswith("|")
+            ),
+            section_end,
+        ) - 1
 
         new_rows = [
-            "| `{key}` | {kind} | `—` | {description} |".format(
+            "| `{key}` | {kind} | `{default}` | {description} |".format(
                 key=key,
                 kind=rust_type_to_doc(str(meta["type"])),
+                default=format_doc_default(meta["default"]),
                 description=(
                     str(meta["doc"]).replace("|", "\\|")
                     if meta["doc"]
@@ -650,7 +679,14 @@ def main() -> int:
 
             expected_default = meta["default"]
             documented_default = parse_doc_default(str(row["default_raw"]))
-            match = defaults_equal(expected_default, documented_default)
+            is_todo_placeholder = str(row.get("description", "")).strip().startswith("TODO:")
+            placeholder_default = str(row["default_raw"]).strip().strip("`").strip() == "—"
+            if is_todo_placeholder and placeholder_default:
+                # `--write` emits `—` only when the Rust default is not safely
+                # extractable. The author must replace it when filling the row.
+                match = None
+            else:
+                match = defaults_equal(expected_default, documented_default)
             if match is False:
                 if expected_default is UNKNOWN:
                     expected_display = "required/not extractable"

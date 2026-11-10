@@ -458,8 +458,8 @@ When a slave node fails or must be reprovisioned from bare metal:
 
 ### Diagnostic Commands
 
-All `/api/v1/*` endpoints require authentication. Export an Admin API token (or
-use a session cookie) before running these examples:
+The `/api/v1/*` endpoints used below require authentication. Export an Admin API
+token (or use a session cookie) before running these examples:
 
 ```bash
 export TOKEN='sito_...'   # Admin token: resync requires Admin; GETs accept Viewer+

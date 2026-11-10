@@ -501,8 +501,11 @@ exact applied `config.toml`; a local edit or revert marks the node `Degraded`
 and forces a full apply before it can report `Synced` again. A watermark written
 by 1.9.3 or earlier has no digest and forces one full apply after upgrade.
 Master publish failures are reported through `ha_publish` on config writes and
-make HA readiness false; `POST /api/v1/ha/resync` returns `200` when a resync is
-queued and `503` when replication is inactive or no push could be queued.
+make HA readiness false. `POST /api/v1/ha/resync` returns `200` when the request
+was accepted (including a master with no connected slaves and no active bundle,
+which reports `slaves_notified: 0`). It returns `503` when replication is
+inactive, the slave worker is stopped, or a master has connected slaves and an
+active bundle but the push could not be queued for any of them.
 
 Replication preserves node-local identity. The master does not overwrite a
 slave's `dns.bind`, `[dns.tls]`/`[tls]` certificate paths, `[acme]` account and

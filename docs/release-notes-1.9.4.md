@@ -253,7 +253,7 @@ Additional deferred/unchanged items:
   behavior; moving it behind an optional feature is a 2.0 item.
 - **Fuzzing** is not part of the 1.9.4 build or CI. The old `fuzz/Cargo.toml`
   commands in the 1.9.2/1.9.3 release notes are marked historical; the harness
-  was removed after v1.9.3. See
+  existed through the v1.9.3 tag and was removed by the post-tag CI rework. See
   [docs/ci.md](ci.md#scheduled-fuzzing-was-intentionally-removed).
 - **Benchmarks** remain a v1.0.0 reference-hardware record. The weekly job runs
   `cargo bench` and uploads estimates but has no threshold or regression gate.

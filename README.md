@@ -167,9 +167,9 @@ cargo build --release --locked --features "embed-ui,mimalloc"
 # Start daemon (if config is missing, boots into setup wizard mode on port 8080)
 ./target/release/sito --config /etc/sito/config.toml
 
-# For headless environments, skip the wizard and boot immediately. This
-# generates a random admin password (printed once), binds the panel to
-# loopback, and does not enable admin/adminadmin:
+# For headless environments on a first boot with no config.toml, skip the
+# wizard and boot immediately. This generates a random admin password (printed
+# once), binds the panel to loopback, and does not enable admin/adminadmin:
 ./target/release/sito --no-setup
 ```
 

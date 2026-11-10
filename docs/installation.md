@@ -453,8 +453,8 @@ dig @127.0.0.1 -p 53 doubleclick.net +short
 ```
 
 ### 5.2 Verify API and Web Panel
-`/api/v1/*` endpoints require a session cookie or API token. Create a token in
-the web UI or sign in, then:
+The `/api/v1/*` endpoints used below require a session cookie or API token.
+Create a token in the web UI or sign in, then:
 
 ```bash
 export SITO=http://127.0.0.1:8080
@@ -483,7 +483,7 @@ DNS response alone no longer masks an HA failure. See `docs/runbook-ha.md`
 
 Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard (or use the SSH tunnel above when the LAN-only firewall is enabled). While setup is pending the server prints a one-time setup token to the console; open `http://<host-ip>:8080/wizard?setup_token=<token>` or send the `X-Setup-Token` header. Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` already exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` account.
 
-If the wizard is skipped with `--no-setup`, a random administrator password is generated and printed once, and the panel binds to loopback. If credentials are lost later, stop the service so the running process cannot keep serving the old credentials, reset the account, then start it again:
+If the wizard is skipped with `--no-setup` **on a first boot with no `config.toml`**, a random administrator password is generated and printed once, and the panel binds to loopback. When a config file already exists, `--no-setup` neither creates nor rotates credentials. If credentials are lost later, stop the service so the running process cannot keep serving the old credentials, reset the account, then start it again:
 
 ```bash
 sudo systemctl stop sito

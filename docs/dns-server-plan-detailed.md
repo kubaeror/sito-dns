@@ -700,7 +700,7 @@ A ready Grafana dashboard in `contrib/grafana/`.
 ## 15. Configuration — Full Reference
 
 ```toml
-config_version = 1                     # automatic migrations on schema change
+config_version = 1                     # only accepted schema in 1.9.x; no automatic migrations
 
 [server]
 role = "master"                        # master | slave
