@@ -8860,6 +8860,16 @@ mod tests {
         assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
         assert!(!response.metadata.authentic_data);
         assert_eq!(response.answers.len(), 0);
+        assert_eq!(
+            strict.metrics.bogus_total.load(Ordering::Relaxed),
+            1,
+            "the strict post-fetch Indeterminate conversion must record Bogus once"
+        );
+        assert_eq!(
+            strict.metrics.indeterminate_total.load(Ordering::Relaxed),
+            0,
+            "the provisional inner Indeterminate must not be double-recorded"
+        );
 
         let log_only = DnssecValidator::new(DnssecMode::LogOnly, Vec::new());
         let offline = OfflineFetcher::new();
@@ -8871,6 +8881,16 @@ mod tests {
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
         assert!(!response.metadata.authentic_data);
         assert!(!response.answers.is_empty(), "log-only keeps the answer");
+        assert_eq!(
+            log_only.metrics.indeterminate_total.load(Ordering::Relaxed),
+            1,
+            "log-only must record its final Indeterminate exactly once"
+        );
+        assert_eq!(
+            log_only.metrics.bogus_total.load(Ordering::Relaxed),
+            0,
+            "log-only must not record Bogus"
+        );
     }
 
     /// Critical regression: an unsigned CNAME from an unsigned qname into a

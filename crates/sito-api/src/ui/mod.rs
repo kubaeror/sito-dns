@@ -451,12 +451,11 @@ mod tests {
         assert!(account_html.contains("/ui/account/tokens/tok_abc/delete"));
     }
 
-    /// Deferred D5: a pending TOTP enrollment must replace the starter form,
-    /// not render beside it. Submitting the starter form again would issue a
-    /// new secret and invalidate the one already displayed in the confirm card.
-    #[test]
-    fn test_account_template_suppresses_starter_form_during_pending_enrollment() {
-        let account_tmpl = AccountTemplate {
+    fn account_template(
+        totp_enabled: bool,
+        totp_setup: Option<TotpSetupView>,
+    ) -> AccountTemplate<'static> {
+        AccountTemplate {
             csrf_token: "csrf-token",
             is_authenticated: true,
             username: "alice",
@@ -464,14 +463,8 @@ mod tests {
             active_tab: "account",
             version: "1.2.1",
             tokens: Vec::new(),
-            totp_enabled: false,
-            totp_setup: Some(TotpSetupView {
-                secret: "JBSWY3DPEHPK3PXP".to_string(),
-                otpauth_url: "otpauth://totp/sito:alice?secret=JBSWY3DPEHPK3PXP".to_string(),
-                qr_code: String::new(),
-                backup_codes: vec!["AAAA-BBBB".to_string()],
-                reauth_token: "reauth-ticket".to_string(),
-            }),
+            totp_enabled,
+            totp_setup,
             can_create_operator_token: false,
             can_create_admin_token: false,
             error_message: "",
@@ -479,9 +472,27 @@ mod tests {
             new_token: None,
             new_token_name: "",
             new_token_scope: "",
-        };
+        }
+    }
 
-        let html = account_tmpl.render().expect("render account template");
+    fn pending_totp_setup() -> TotpSetupView {
+        TotpSetupView {
+            secret: "JBSWY3DPEHPK3PXP".to_string(),
+            otpauth_url: "otpauth://totp/sito:alice?secret=JBSWY3DPEHPK3PXP".to_string(),
+            qr_code: String::new(),
+            backup_codes: vec!["AAAA-BBBB".to_string()],
+            reauth_token: "reauth-ticket".to_string(),
+        }
+    }
+
+    /// Deferred D5: a pending TOTP enrollment must replace the starter form,
+    /// not render beside it. Submitting the starter form again would issue a
+    /// new secret and invalidate the one already displayed in the confirm card.
+    #[test]
+    fn test_account_template_suppresses_starter_form_during_pending_enrollment() {
+        let html = account_template(false, Some(pending_totp_setup()))
+            .render()
+            .expect("render account template");
         assert!(html.contains("Confirm TOTP Enrollment"));
         assert!(
             !html.contains("Begin TOTP Setup"),
@@ -491,5 +502,46 @@ mod tests {
             !html.contains("action=\"/ui/account/totp/setup\""),
             "the starter setup form must be suppressed while enrollment is pending"
         );
+    }
+
+    /// Deferred D5 review: the same invalidation exists in the replace flow.
+    /// An enabled user with a pending replacement must not see the replace
+    /// form, because submitting it overwrites the pending secret.
+    #[test]
+    fn test_account_template_suppresses_replace_form_during_pending_enrollment() {
+        let html = account_template(true, Some(pending_totp_setup()))
+            .render()
+            .expect("render account template");
+        assert!(html.contains("Confirm TOTP Enrollment"));
+        assert!(
+            !html.contains("Replace TOTP 2FA"),
+            "the replace form must be hidden while a replacement is pending"
+        );
+        assert!(
+            !html.contains("action=\"/ui/account/totp/setup\""),
+            "no enrollment-start form may be shown while enrollment is pending"
+        );
+        // Disabling is not an enrollment-start form and stays available.
+        assert!(html.contains("Disable TOTP 2FA"));
+    }
+
+    /// Negative counterpart: without a pending setup, the starter form appears
+    /// for a fresh user and the replace form appears for an enabled user.
+    #[test]
+    fn test_account_template_shows_enrollment_forms_without_pending_setup() {
+        let starter = account_template(false, None)
+            .render()
+            .expect("render account template");
+        assert!(!starter.contains("Confirm TOTP Enrollment"));
+        assert!(starter.contains("Begin TOTP Setup"));
+        assert!(starter.contains("action=\"/ui/account/totp/setup\""));
+
+        let replace = account_template(true, None)
+            .render()
+            .expect("render account template");
+        assert!(!replace.contains("Confirm TOTP Enrollment"));
+        assert!(replace.contains("Replace TOTP 2FA"));
+        assert!(replace.contains("action=\"/ui/account/totp/setup\""));
+        assert!(!replace.contains("Begin TOTP Setup"));
     }
 }

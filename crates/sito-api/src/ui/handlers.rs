@@ -5800,6 +5800,20 @@ mod tests {
             };
             let headers = session_headers(&session);
 
+            // Negative counterpart: a fresh user's account page still offers
+            // the enrollment starter form.
+            let resp = account_page(State(ctx.clone()), headers.clone()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = response_body(resp).await;
+            assert!(
+                body.contains("Begin TOTP Setup"),
+                "{username} must see the starter form before enrolling: {body}"
+            );
+            assert!(
+                body.contains("action=\"/ui/account/totp/setup\""),
+                "{username} must be able to start enrollment: {body}"
+            );
+
             // A stolen session without the password cannot enroll.
             let resp = account_totp_setup_handler(
                 State(ctx.clone()),
