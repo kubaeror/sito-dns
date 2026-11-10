@@ -15,8 +15,11 @@ concurrency:
 # `...release.yml@refs/heads/<branch>` which neither contrib/install.sh nor
 # crates/sito-api/src/updater.rs accepts (both pin `@refs/tags/.*`). Tag pushes
 # sign with `...release.yml@refs/tags/<tag>` and verify end-to-end.
-# The published assets are re-verified by artifact-e2e.yml, which can also be
-# dispatched manually for an existing tag without publishing anything.
+# Assets are staged as a draft GitHub release and published only after
+# artifact-e2e.yml and the container image job both succeed, so an E2E or image
+# failure cannot leave a published release without its image. artifact-e2e.yml
+# can also be dispatched manually for an existing published tag without
+# publishing anything.
 
 # Least privilege by default; jobs grant the narrow permissions they need.
 permissions:
@@ -156,7 +159,7 @@ jobs:
             sito-*.tar.gz.sha256
 
   sbom-and-release:
-    name: Generate SBOM & Publish Release
+    name: Generate SBOM & Stage Release
     needs: [verify-tag, release-gate, build-binaries]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -221,7 +224,7 @@ jobs:
           done
           ls -la
 
-      - name: Publish GitHub Release
+      - name: Stage GitHub Release (draft)
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           # Tag pushes only; ref_name is the tag that triggered the run.
@@ -229,11 +232,16 @@ jobs:
           files: |
             release-assets/*
           generate_release_notes: true
-          draft: false
+          # Stage, do not publish: artifact-e2e and docker-build-push consume
+          # this draft, and publish-release flips it only after both succeed.
+          # A draft is not visible to anonymous users, so artifact-e2e runs with
+          # contents: write to download its assets.
+          draft: true
           # Tags containing '-' are prereleases and must never be published as
-          # a stable release or move the repository's "latest" release.
+          # a stable release or move the repository's "latest" release. The
+          # latest flag itself is applied by publish-release.
           prerelease: ${{ contains(github.ref_name, '-') }}
-          make_latest: ${{ contains(github.ref_name, '-') && 'false' || 'true' }}
+          make_latest: 'false'
           body: |
             ## Container image
 
@@ -259,17 +267,19 @@ jobs:
   artifact-e2e:
     name: Verify release artifacts
     needs: [sbom-and-release]
+    # The release is still a draft here, and drafts are only visible to tokens
+    # with write access, so `gh release download` needs contents: write.
     permissions:
-      contents: read
+      contents: write
     uses: ./.github/workflows/artifact-e2e.yml
     with:
       tag: ${{ github.ref_name }}
 
   docker-build-push:
     name: Build and Push Multi-Arch Container Image
-    # Publishing is the last step of the release gate: the image is only built
-    # after the tag/version check, the binaries, the signed release/SBOM job and
-    # the artifact E2E verification have all succeeded.
+    # The image is only built after the tag/version check, the binaries, the
+    # signed release/SBOM job and the artifact E2E verification have all
+    # succeeded. publish-release then flips the staged draft to published.
     needs: [verify-tag, release-gate, build-binaries, sbom-and-release, artifact-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -505,3 +515,56 @@ jobs:
           docker run --rm \
             -v "${PWD}/config.example.toml:/etc/sito/config.toml:ro" \
             "${image}" --version
+
+  publish-release:
+    name: Publish GitHub Release
+    # The release is staged as a draft by sbom-and-release. Publish it only
+    # after artifact E2E and the image job are green, so a failure in either
+    # leaves a draft (recoverable) instead of published assets without an image.
+    needs: [sbom-and-release, artifact-e2e, docker-build-push]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # flip the staged draft to a published release
+    steps:
+      - name: Publish the staged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "${TAG}" in
+            *-*) prerelease_tag=true ;;
+            *) prerelease_tag=false ;;
+          esac
+          if [ "${prerelease_tag}" = "true" ]; then
+            # Prerelease: keep it out of the repository's "latest" slot.
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --draft=false --prerelease
+          else
+            # Stable: publish and explicitly move "latest" to this release.
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --draft=false --latest
+          fi
+
+          is_draft="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json isDraft --jq '.isDraft')"
+          if [ "${is_draft}" != "false" ]; then
+            echo "::error::release ${TAG} is still a draft after publish"
+            exit 1
+          fi
+          is_prerelease="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json isPrerelease --jq '.isPrerelease')"
+          if [ "${prerelease_tag}" = "true" ]; then
+            if [ "${is_prerelease}" != "true" ]; then
+              echo "::error::prerelease tag ${TAG} is not marked as a prerelease"
+              exit 1
+            fi
+          else
+            latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
+            if [ "${latest_tag}" != "${TAG}" ]; then
+              echo "::error::stable release ${TAG} is not latest (latest is ${latest_tag})"
+              exit 1
+            fi
+          fi
+          echo "Published ${TAG} (prerelease=${is_prerelease})"

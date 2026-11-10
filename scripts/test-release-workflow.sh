@@ -6,6 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RELEASE="${ROOT}/.github/workflows/release.yml"
+ARTIFACT_E2E="${ROOT}/.github/workflows/artifact-e2e.yml"
 CI="${ROOT}/.github/workflows/ci.yml"
 SECURITY="${ROOT}/.github/workflows/security.yml"
 INSTALLER="${ROOT}/contrib/install.sh"
@@ -72,6 +73,22 @@ expect_job_absent "${RELEASE}" "release-gate" 'continue-on-error' "release-gate 
 expect_match "${RELEASE}" 'needs: \[verify-tag, release-gate\]' "build job depends on the release gate"
 expect_match "${RELEASE}" 'needs: \[verify-tag, release-gate, build-binaries\]' "publish job depends on the release gate"
 expect_match "${RELEASE}" 'needs: \[verify-tag, release-gate, build-binaries, sbom-and-release, artifact-e2e\]' "image job depends on the release gate"
+
+# The release is staged as a draft and published only after both consumers
+# succeed, so an E2E or image failure cannot leave published assets behind.
+expect_job_match "${RELEASE}" "sbom-and-release" 'draft: true' "release assets are staged as a draft"
+expect_job_match "${RELEASE}" "sbom-and-release" 'Stage GitHub Release \(draft\)' "release staging step is explicit"
+expect_job_absent "${RELEASE}" "sbom-and-release" 'draft: false' "release staging never publishes immediately"
+expect_job_match "${RELEASE}" "sbom-and-release" "make_latest: 'false'" "draft staging does not move latest"
+expect_match "${RELEASE}" '^  publish-release:' "release workflow has a publish-release job"
+expect_job_match "${RELEASE}" "publish-release" 'needs: \[sbom-and-release, artifact-e2e, docker-build-push\]' "publish job waits for artifacts and image"
+expect_job_match "${RELEASE}" "publish-release" 'gh release edit' "publish job edits the staged release"
+expect_job_match "${RELEASE}" "publish-release" '\-\-draft=false' "publish job flips the draft"
+expect_job_match "${RELEASE}" "publish-release" 'contents: write' "publish job can publish the release"
+expect_job_absent "${RELEASE}" "publish-release" 'continue-on-error' "release publication cannot continue on error"
+expect_job_match "${RELEASE}" "artifact-e2e" 'contents: write' "artifact E2E can read the staged draft"
+expect_match "${ARTIFACT_E2E}" '^  contents: write' "artifact E2E workflow requests draft access"
+expect_match "${ARTIFACT_E2E}" 'could not remove.*cannot overwrite digest' "image removal failure is reported"
 
 expect_job_match "${RELEASE}" "docker-build-push" 'aquasec/trivy:[0-9.]+@sha256:[0-9a-f]{64}' "image scanner is pinned by digest"
 expect_job_match "${RELEASE}" "docker-build-push" 'severity HIGH,CRITICAL' "image scan gates on HIGH/CRITICAL"

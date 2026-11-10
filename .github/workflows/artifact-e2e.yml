@@ -24,9 +24,11 @@ on:
         type: string
         default: latest
 
-# Least privilege: reading release assets and metadata only.
+# Reads the staged release assets and metadata. The release workflow stages a
+# draft first, and draft releases are only visible to tokens with write access,
+# so `gh release download` requires contents: write. The job only downloads.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   artifact-e2e:
@@ -182,10 +184,13 @@ jobs:
               --entrypoint "/assets/${dir}/sito" \
               -v "${PWD}:/assets:ro" \
               "${RUNTIME_IMAGE}" check-config --config "/assets/${dir}/config.example.toml"
-            # The image is referenced by digest, and Docker keeps a single
-            # local reference per digest. Without removing it, the next
-            # --platform pull fails with "cannot overwrite digest"; drop the
+            # Every platform uses the same digest-pinned image. The observed
+            # failure is consistent with the runner's Docker store keeping a
+            # single local reference per digest: without removing it, the next
+            # --platform pull can fail with "cannot overwrite digest". Drop the
             # local image so the next platform can be pulled while
             # RUNTIME_IMAGE stays digest-pinned.
-            docker image rm "${RUNTIME_IMAGE}" >/dev/null 2>&1 || true
+            if ! docker image rm "${RUNTIME_IMAGE}" >/dev/null 2>&1; then
+              echo "::warning::could not remove ${RUNTIME_IMAGE}; the next --platform pull may fail with 'cannot overwrite digest'"
+            fi
           done <<< "${TARGETS}"

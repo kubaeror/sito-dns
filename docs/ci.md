@@ -15,8 +15,8 @@ pin policy, and the monthly runner-minute budget.
 | **Container** | `container.yml` | `workflow_call` from CI and Weekly, `push` to `main` on container paths, `workflow_dispatch` | Validates both Compose files, builds/smoke-tests the development `Dockerfile`, and builds `Dockerfile.release` with stub binaries. |
 | **Security** | `security.yml` | `workflow_call` from CI and Weekly, `push` to `main` on dependency paths, `workflow_dispatch` | Runs `cargo-deny check`. |
 | **Weekly Quality** | `weekly.yml` | Sunday at 03:00 UTC (`schedule`), `workflow_dispatch` | Release-mode tests, Criterion benchmarks, plus the reusable Container and Security workflows. |
-| **Release** | `release.yml` | Push of a `v*` tag only | Verifies the tag, builds and signs the three release archives, publishes the GitHub release, verifies the artifacts, and publishes the multi-arch container image. |
-| **Artifact E2E** | `artifact-e2e.yml` | `workflow_call` from Release, `workflow_dispatch` with a tag | Re-downloads a published release and verifies checksums, signatures, and execution of every architecture in the release runtime image. |
+| **Release** | `release.yml` | Push of a `v*` tag only | Verifies the tag, builds and signs the three release archives, stages a draft GitHub release, verifies the artifacts, publishes the multi-arch container image, and finally publishes the release. |
+| **Artifact E2E** | `artifact-e2e.yml` | `workflow_call` from Release, `workflow_dispatch` with a tag | Re-downloads a staged draft or published release and verifies checksums, signatures, and execution of every architecture in the release runtime image. |
 
 `release.yml` deliberately has no `workflow_dispatch`: GitHub mints the OIDC
 identity from the ref that started the run, and both the installer and the
@@ -174,7 +174,7 @@ must be updated in the same change.
 ## Release pipeline
 
 Release runs only from a tag push. A tag must match the workspace version in
-`Cargo.toml` (`v1.9.4` or a prerelease such as `v1.9.4-rc.1`); a mismatch stops
+`Cargo.toml` (`v1.9.5` or a prerelease such as `v1.9.5-rc.1`); a mismatch stops
 the workflow before any asset is built. The order is deliberate:
 
 1. **`verify-tag`** — checks the tag against the workspace version.
@@ -186,22 +186,24 @@ the workflow before any asset is built. The order is deliberate:
    checksums.
 3. **`sbom-and-release`** — downloads the archives, produces a unified
    `SHA256SUMS`, generates an SPDX SBOM with `cargo-sbom`, signs every archive
-   with cosign keyless signing, and publishes the GitHub release. Stable tags
-   update `latest`; tags containing `-` are published as prereleases and do not
-   move `latest`.
-4. **`artifact-e2e`** — re-downloads the published release and verifies all
-   three architectures: per-archive `.sha256`, the unified `SHA256SUMS` line,
-   the cosign signature identity, and execution of `--version` and
-   `check-config` on the shipped configuration.
+   with cosign keyless signing, and uploads everything to a **draft** GitHub
+   release. Tags containing `-` are marked as prereleases.
+4. **`artifact-e2e`** — re-downloads the staged draft (drafts require a token
+   with write access) and verifies all three architectures: per-archive
+   `.sha256`, the unified `SHA256SUMS` line, the cosign signature identity, and
+   execution of `--version` and `check-config` on the shipped configuration.
 5. **`docker-build-push`** — builds and pushes the multi-arch image, then
    verifies the digest, every generated tag, the required platforms, and the
    SLSA provenance and SPDX SBOM attestations. A final smoke test pulls the
    published image and runs `--version` and `check-config`.
+6. **`publish-release`** — flips the staged draft to published only after
+   `artifact-e2e` and `docker-build-push` are green. Stable tags also move
+   `latest`; prereleases stay prereleases and never move `latest`.
 
-The GitHub release is published by `sbom-and-release` before `artifact-e2e`
-runs; artifact E2E gates the container image, not the GitHub release. The image
-is published only after the tag gate, the signed assets, the SBOM, and artifact
-E2E have all passed.
+The GitHub release is not public until `publish-release` runs. A failure in
+`artifact-e2e` or `docker-build-push` leaves a recoverable draft instead of
+published assets without an image. The image is published only after the tag
+gate, the signed assets, the SBOM, and artifact E2E have all passed.
 
 ### Release image: prebuilt binaries and `cc-debian13`
 
