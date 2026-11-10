@@ -37,6 +37,9 @@ ReadWritePaths=/var/lib/sito /etc/sito
 LimitNOFILE=1048576
 Restart=on-failure
 RestartSec=2s
+# Allow the bounded query-log shutdown flush to finish before systemd kills the
+# process. The writer bounds its own final flush to 3 s; this is a safety net.
+TimeoutStopSec=180
 
 [Install]
 WantedBy=multi-user.target

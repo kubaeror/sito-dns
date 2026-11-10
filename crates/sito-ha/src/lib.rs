@@ -17,9 +17,9 @@ pub mod slave;
 pub mod transport;
 
 pub use bundle::{
-    AppliedWatermark, ConfigBundle, FilterListMetadata, build_and_sign_push, push_payload_hash,
-    sanitize_config_for_bundle, scan_for_secrets, substitute_secrets, verify_and_unpack_push,
-    verify_and_unpack_push_with_watermark, watermark_covers,
+    AppliedWatermark, ConfigBundle, FilterListMetadata, build_and_sign_push, config_digest,
+    push_payload_hash, sanitize_config_for_bundle, scan_for_secrets, substitute_secrets,
+    verify_and_unpack_push, verify_and_unpack_push_with_watermark, watermark_covers,
 };
 pub use config::HaConfig;
 pub use crypto::{
@@ -28,7 +28,9 @@ pub use crypto::{
     parse_public_key, verify_ed25519_signature,
 };
 pub use error::HaError;
-pub use master::{MasterCoordinator, ResyncOutcome, SlaveSummary, spawn_master_server};
+pub use master::{
+    MasterCoordinator, PublishOutcome, ResyncOutcome, SlaveSummary, spawn_master_server,
+};
 pub use protocol::{AckConflict, HaMessage, PROTOCOL_VERSION, UpstreamReport};
 pub use readiness::{HaReadiness, HaReadinessState};
 pub use slave::{
@@ -261,9 +263,7 @@ mod tests {
         )
         .with_token(Some("required-slave-token".to_string()));
 
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        let port = reserve_port();
 
         let master_ha_cfg = HaConfig {
             replication_port: port,
@@ -380,10 +380,7 @@ mod tests {
     }
 
     fn reserve_port() -> u16 {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        port
+        sito_test_support::reserve_port_number().expect("reserve a replication port")
     }
 
     async fn wait_until(timeout_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
@@ -451,7 +448,7 @@ mod tests {
                 version: 2,
                 term: 0,
                 timestamp: 1,
-                config_toml: "config_version = 1\n".to_string(),
+                config_toml: "config_version = 1\n[filtering]\nenabled = false\n".to_string(),
                 custom_rules: vec![],
                 rewrites: None,
                 clients: None,
@@ -530,7 +527,7 @@ mod tests {
                 version: 2,
                 term: 0,
                 timestamp: 1,
-                config_toml: "config_version = 1\n".to_string(),
+                config_toml: "config_version = 1\n[filtering]\nenabled = false\n".to_string(),
                 custom_rules: vec![],
                 rewrites: None,
                 clients: None,
@@ -609,7 +606,7 @@ mod tests {
                 version: 2,
                 term: 0,
                 timestamp: 1,
-                config_toml: "config_version = 1\n".to_string(),
+                config_toml: "config_version = 1\n[filtering]\nenabled = false\n".to_string(),
                 custom_rules: vec![],
                 rewrites: None,
                 clients: None,
@@ -683,7 +680,7 @@ mod tests {
                 version: 2,
                 term: 0,
                 timestamp: 1,
-                config_toml: "config_version = 1\n".to_string(),
+                config_toml: "config_version = 1\n[filtering]\nenabled = false\n".to_string(),
                 custom_rules: vec![],
                 rewrites: None,
                 clients: None,

@@ -218,6 +218,10 @@ impl ClientRegistry {
             ctx.group = Some(entry.group.clone());
             if ctx.id.is_none() {
                 ctx.id = Some(ClientId::new(&entry.name));
+                // The registry assigned this id from a resolved entry, so it
+                // is authenticated. A pre-existing id may be a raw DoH path /
+                // SNI value and keeps whatever flag `identify` set.
+                ctx.id_authenticated = true;
             }
             if ctx.mac.is_none() {
                 ctx.mac = self.resolve_known_mac(ctx.ip, entry);
@@ -252,7 +256,19 @@ impl ClientRegistry {
         // 1. Shared-secret ClientID from DoH path or DoT/DoQ SNI subdomain.
         //    Only secrets configured in `clients.client_id_secrets` count;
         //    display names and arbitrary SNI labels never identify a client.
-        if let Some(matched) = self.match_by_client_id_or_sni(ctx) {
+        if let Some((matched, matched_by_sni)) = self.match_by_client_id_or_sni(ctx) {
+            if matched_by_sni {
+                // DoH3 can carry both a client-supplied path id and a
+                // configured-secret SNI. The SNI authenticated the entry, not
+                // the path id, so replace `ctx.id` with the registry-resolved
+                // identity before marking it authenticated.
+                ctx.id = Some(ClientId::new(&matched.name));
+            }
+            // The id or SNI label carried a configured shared secret, so the
+            // registry vouches for the (possibly rewritten) id. IP/MAC/
+            // RouterOS matches below do not authenticate a pre-existing
+            // client-supplied id.
+            ctx.id_authenticated = true;
             return Some(matched);
         }
 
@@ -294,7 +310,9 @@ impl ClientRegistry {
         matched_idx.and_then(|idx| self.config.entries.get(idx))
     }
 
-    fn match_by_client_id_or_sni(&self, ctx: &ClientContext) -> Option<&ClientEntryConfig> {
+    /// Returns the matched entry and whether the match came from the SNI label
+    /// rather than the direct `ctx.id` secret.
+    fn match_by_client_id_or_sni(&self, ctx: &ClientContext) -> Option<(&ClientEntryConfig, bool)> {
         if self.index.secrets.is_empty() {
             // Path/SNI identity is disabled (safe default).
             return None;
@@ -304,7 +322,7 @@ impl ClientRegistry {
         if let Some(ref cid) = ctx.id
             && let Some(entry) = self.entry_for_secret(cid.as_str())
         {
-            return Some(entry);
+            return Some((entry, false));
         }
 
         // SNI match: {secret}.dns.domain or {secret}.sub.domain. The candidate
@@ -314,7 +332,7 @@ impl ClientRegistry {
             if let Some(candidate) = extract_id_from_sni(&sni_lower)
                 && let Some(entry) = self.entry_for_secret(candidate)
             {
-                return Some(entry);
+                return Some((entry, true));
             }
         }
 
@@ -699,6 +717,10 @@ lists = ["GlobalList"]
         assert!(policy.active_blocked_services.contains("tiktok"));
         assert_eq!(ctx.client_name.as_deref(), Some("Jane's Phone"));
         assert_eq!(ctx.group.as_deref(), Some("kids"));
+        assert!(
+            ctx.id_authenticated,
+            "a configured shared secret authenticates the id"
+        );
     }
 
     #[test]
@@ -710,6 +732,25 @@ lists = ["GlobalList"]
         let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
         assert_eq!(policy.group_name, "kids");
+    }
+
+    /// DoH3 can send both a path id and a configured-secret SNI. The SNI
+    /// authenticates its entry, never the unrelated path id.
+    #[test]
+    fn test_secret_sni_replaces_untrusted_path_id() {
+        let reg = ClientRegistry::new(sample_config());
+        let ip = IpAddr::from_str("172.16.0.7").unwrap();
+        let mut ctx = ClientContext::with_id(ip, "admin-laptop");
+        ctx.sni = Some("jane-secret-a1.dns.home.arpa".to_string());
+
+        let policy = reg.resolve(&mut ctx, reg.now());
+        assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
+        assert_eq!(
+            ctx.id.as_ref().map(sito_core::ClientId::as_str),
+            Some("Jane's Phone"),
+            "the secret SNI identity must replace the path-supplied id"
+        );
+        assert!(ctx.id_authenticated);
     }
 
     #[test]
@@ -735,6 +776,35 @@ lists = ["GlobalList"]
         assert_eq!(policy.client_name.as_deref(), Some("Admin Laptop"));
         assert_eq!(policy.group_name, "admin");
         assert!(policy.trusted);
+        assert!(ctx.id_authenticated);
+    }
+
+    /// P1-9: a client identified by IP keeps its registry identity, but a
+    /// path-supplied id remains unauthenticated and cannot be used by consumers
+    /// that gate on `id_authenticated`.
+    #[test]
+    fn test_ip_identified_client_does_not_authenticate_path_id() {
+        let reg = ClientRegistry::new(sample_config());
+        // 192.168.1.20 belongs to "Jane's Phone".
+        let ip = IpAddr::from_str("192.168.1.20").unwrap();
+        let mut ctx = ClientContext::with_id(ip, "admin-laptop");
+        let policy = reg.resolve(&mut ctx, reg.now());
+        assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
+        assert!(
+            !ctx.id_authenticated,
+            "the path id must not become authenticated just because the IP matched"
+        );
+
+        // When the client sent no id, the registry fills one from the entry
+        // and that id is authenticated.
+        let mut ctx = ClientContext::new(ip);
+        let policy = reg.resolve(&mut ctx, reg.now());
+        assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
+        assert_eq!(
+            ctx.id.as_ref().map(sito_core::ClientId::as_str),
+            Some("Jane's Phone")
+        );
+        assert!(ctx.id_authenticated);
     }
 
     #[test]

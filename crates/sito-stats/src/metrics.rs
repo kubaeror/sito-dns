@@ -311,10 +311,40 @@ pub struct MetricsRegistry {
     /// HA startup paths that left replication inactive, keyed by (role, reason).
     ha_startup_noop: Arc<Mutex<BTreeMap<(String, String), u64>>>,
     querylog_dropped: Arc<AtomicU64>,
+    stats_retention_last_success_seconds: Arc<AtomicU64>,
+    stats_retention_last_failure_seconds: Arc<AtomicU64>,
+    stats_retention_last_duration_millis: Arc<AtomicU64>,
+    stats_retention_deleted_rows_total: Arc<AtomicU64>,
+    stats_retention_rollup_deleted_rows_total: Arc<AtomicU64>,
+    stats_retention_failures_total: Arc<AtomicU64>,
+    stats_rollup_retention_days: Arc<AtomicU64>,
     filter_rules: Arc<AtomicU64>,
+    filter_state: Arc<AtomicU64>,
+    filter_lists_loaded: Arc<AtomicU64>,
+    filter_lists_failed: Arc<AtomicU64>,
+    filter_degraded_groups: Arc<AtomicU64>,
+    filter_dropped_regex: Arc<AtomicU64>,
+    filter_unavailable: Arc<AtomicU64>,
     filter_compile_seconds: Arc<Mutex<HistogramState>>,
     build_version: String,
     build_commit: String,
+}
+
+/// Filter-engine lifecycle/health values exposed as Prometheus gauges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FilterStatusMetrics {
+    /// `0 = disabled`, `1 = loading`, `2 = ready`, `3 = failed`.
+    pub state: u8,
+    /// Configured lists that loaded successfully.
+    pub loaded_lists: u64,
+    /// Configured lists that failed.
+    pub failed_lists: u64,
+    /// Groups published in a degraded (partial) form.
+    pub degraded_groups: u64,
+    /// Regex/wildcard patterns dropped from the active snapshot.
+    pub dropped_regex_patterns: u64,
+    /// No usable snapshot is active; fail-closed mode answers SERVFAIL.
+    pub unavailable: u64,
 }
 
 impl Default for MetricsRegistry {
@@ -347,7 +377,20 @@ impl MetricsRegistry {
             ha_diverged: Arc::new(Mutex::new(BTreeMap::new())),
             ha_startup_noop: Arc::new(Mutex::new(BTreeMap::new())),
             querylog_dropped: Arc::new(AtomicU64::new(0)),
+            stats_retention_last_success_seconds: Arc::new(AtomicU64::new(0)),
+            stats_retention_last_failure_seconds: Arc::new(AtomicU64::new(0)),
+            stats_retention_last_duration_millis: Arc::new(AtomicU64::new(0)),
+            stats_retention_deleted_rows_total: Arc::new(AtomicU64::new(0)),
+            stats_retention_rollup_deleted_rows_total: Arc::new(AtomicU64::new(0)),
+            stats_retention_failures_total: Arc::new(AtomicU64::new(0)),
+            stats_rollup_retention_days: Arc::new(AtomicU64::new(0)),
             filter_rules: Arc::new(AtomicU64::new(0)),
+            filter_state: Arc::new(AtomicU64::new(0)),
+            filter_lists_loaded: Arc::new(AtomicU64::new(0)),
+            filter_lists_failed: Arc::new(AtomicU64::new(0)),
+            filter_degraded_groups: Arc::new(AtomicU64::new(0)),
+            filter_dropped_regex: Arc::new(AtomicU64::new(0)),
+            filter_unavailable: Arc::new(AtomicU64::new(0)),
             filter_compile_seconds: Arc::new(Mutex::new(HistogramState::new())),
             build_version: version.into(),
             build_commit: commit.into(),
@@ -502,10 +545,80 @@ impl MetricsRegistry {
         self.querylog_dropped.store(dropped, Ordering::Relaxed);
     }
 
+    /// Publishes the configured rollup retention without waiting for the first
+    /// sweep.
+    pub fn set_rollup_retention_days(&self, days: u32) {
+        self.stats_rollup_retention_days
+            .store(u64::from(days), Ordering::Relaxed);
+    }
+
+    /// Publishes the persisted last-success timestamp at startup.
+    pub fn set_retention_last_success_seconds(&self, seconds: u64) {
+        self.stats_retention_last_success_seconds
+            .store(seconds, Ordering::Relaxed);
+    }
+
+    /// Records a successful retention sweep. Timestamps are unix seconds;
+    /// `duration_millis` is wall-clock duration of the whole sweep.
+    pub fn record_retention_success(
+        &self,
+        duration_millis: u64,
+        deleted_rows: u64,
+        rollup_deleted_rows: u64,
+        rollup_retention_days: u32,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.stats_retention_last_success_seconds
+            .store(now, Ordering::Relaxed);
+        self.stats_retention_last_duration_millis
+            .store(duration_millis, Ordering::Relaxed);
+        self.stats_retention_deleted_rows_total
+            .fetch_add(deleted_rows, Ordering::Relaxed);
+        self.stats_retention_rollup_deleted_rows_total
+            .fetch_add(rollup_deleted_rows, Ordering::Relaxed);
+        self.stats_rollup_retention_days
+            .store(u64::from(rollup_retention_days), Ordering::Relaxed);
+    }
+
+    /// Records a failed retention sweep.
+    pub fn record_retention_failure(&self, duration_millis: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.stats_retention_last_failure_seconds
+            .store(now, Ordering::Relaxed);
+        self.stats_retention_last_duration_millis
+            .store(duration_millis, Ordering::Relaxed);
+        self.stats_retention_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Publishes the number of active compiled filter rules.
     pub fn set_filter_rules(&self, count: usize) {
         self.filter_rules
             .store(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Publishes filter-engine lifecycle/health gauges.
+    ///
+    /// `state` is `0 = disabled`, `1 = loading`, `2 = ready`, `3 = failed`.
+    pub fn set_filter_status(&self, status: FilterStatusMetrics) {
+        self.filter_state
+            .store(u64::from(status.state), Ordering::Relaxed);
+        self.filter_lists_loaded
+            .store(status.loaded_lists, Ordering::Relaxed);
+        self.filter_lists_failed
+            .store(status.failed_lists, Ordering::Relaxed);
+        self.filter_degraded_groups
+            .store(status.degraded_groups, Ordering::Relaxed);
+        self.filter_dropped_regex
+            .store(status.dropped_regex_patterns, Ordering::Relaxed);
+        self.filter_unavailable
+            .store(status.unavailable, Ordering::Relaxed);
     }
 
     /// Records how long the last filter snapshot compilation took.
@@ -975,6 +1088,59 @@ impl MetricsRegistry {
             self.filter_rules.load(Ordering::Relaxed)
         );
 
+        out.push_str(
+            "# HELP sito_filter_state Filter engine lifecycle (0 disabled, 1 loading, 2 ready, 3 failed)\n",
+        );
+        out.push_str("# TYPE sito_filter_state gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_filter_state {}",
+            self.filter_state.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP sito_filter_lists_loaded Configured filter lists loaded in the last reload\n",
+        );
+        out.push_str("# TYPE sito_filter_lists_loaded gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_filter_lists_loaded {}",
+            self.filter_lists_loaded.load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP sito_filter_lists_failed Configured filter lists that failed in the last reload\n");
+        out.push_str("# TYPE sito_filter_lists_failed gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_filter_lists_failed {}",
+            self.filter_lists_failed.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP sito_filter_degraded_groups Groups published with a partial rule class\n",
+        );
+        out.push_str("# TYPE sito_filter_degraded_groups gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_filter_degraded_groups {}",
+            self.filter_degraded_groups.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP sito_filter_dropped_regex_patterns Regex/wildcard patterns dropped from the active snapshot\n",
+        );
+        out.push_str("# TYPE sito_filter_dropped_regex_patterns gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_filter_dropped_regex_patterns {}",
+            self.filter_dropped_regex.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP sito_filter_unavailable No usable filter snapshot is active (1 = unavailable; fail_closed answers SERVFAIL)\n",
+        );
+        out.push_str("# TYPE sito_filter_unavailable gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_filter_unavailable {}",
+            self.filter_unavailable.load(Ordering::Relaxed)
+        );
+
         // 10. sito_filter_compile_seconds
         out.push_str(
             "# HELP sito_filter_compile_seconds Compilation duration for filter rule trie\n",
@@ -1139,7 +1305,65 @@ impl MetricsRegistry {
             self.querylog_dropped.load(Ordering::Relaxed)
         );
 
-        // 19. sito_build_info
+        // 19. Stats retention / rollup cleanup
+        out.push_str("# HELP sito_stats_retention_last_success_seconds Unix timestamp of the last successful stats retention sweep\n");
+        out.push_str("# TYPE sito_stats_retention_last_success_seconds gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_retention_last_success_seconds {}",
+            self.stats_retention_last_success_seconds
+                .load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP sito_stats_retention_last_failure_seconds Unix timestamp of the last failed stats retention sweep\n");
+        out.push_str("# TYPE sito_stats_retention_last_failure_seconds gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_retention_last_failure_seconds {}",
+            self.stats_retention_last_failure_seconds
+                .load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP sito_stats_retention_last_duration_millis Duration of the last stats retention sweep\n");
+        out.push_str("# TYPE sito_stats_retention_last_duration_millis gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_retention_last_duration_millis {}",
+            self.stats_retention_last_duration_millis
+                .load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP sito_stats_retention_deleted_rows_total Detailed query-log rows deleted by retention\n");
+        out.push_str("# TYPE sito_stats_retention_deleted_rows_total counter\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_retention_deleted_rows_total {}",
+            self.stats_retention_deleted_rows_total
+                .load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP sito_stats_retention_rollup_deleted_rows_total Expired hourly rollup rows deleted by retention\n");
+        out.push_str("# TYPE sito_stats_retention_rollup_deleted_rows_total counter\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_retention_rollup_deleted_rows_total {}",
+            self.stats_retention_rollup_deleted_rows_total
+                .load(Ordering::Relaxed)
+        );
+        out.push_str("# HELP sito_stats_retention_failures_total Failed stats retention sweeps\n");
+        out.push_str("# TYPE sito_stats_retention_failures_total counter\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_retention_failures_total {}",
+            self.stats_retention_failures_total.load(Ordering::Relaxed)
+        );
+        out.push_str(
+            "# HELP sito_stats_rollup_retention_days Configured hourly rollup retention in days\n",
+        );
+        out.push_str("# TYPE sito_stats_rollup_retention_days gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_stats_rollup_retention_days {}",
+            self.stats_rollup_retention_days.load(Ordering::Relaxed)
+        );
+
+        // 20. sito_build_info
         out.push_str("# HELP sito_build_info Build and version metadata\n");
         out.push_str("# TYPE sito_build_info gauge\n");
         let _ = writeln!(
@@ -1393,6 +1617,14 @@ mod tests {
         reg.set_ha_diverged("sito-slave-1", true);
         reg.inc_ha_startup_noop("master", "replication_disabled");
         reg.set_querylog_dropped(1);
+        reg.set_filter_status(FilterStatusMetrics {
+            state: 2,
+            loaded_lists: 3,
+            failed_lists: 1,
+            degraded_groups: 1,
+            dropped_regex_patterns: 5,
+            unavailable: 1,
+        });
 
         let rendered = reg.render_prometheus();
         let expected = r#"# HELP sito_queries_total Total DNS queries processed
@@ -1486,6 +1718,24 @@ sito_cache_stale_served_total 1
 # HELP sito_filter_rules Number of active filter rules per list
 # TYPE sito_filter_rules gauge
 sito_filter_rules{list="total"} 0
+# HELP sito_filter_state Filter engine lifecycle (0 disabled, 1 loading, 2 ready, 3 failed)
+# TYPE sito_filter_state gauge
+sito_filter_state 2
+# HELP sito_filter_lists_loaded Configured filter lists loaded in the last reload
+# TYPE sito_filter_lists_loaded gauge
+sito_filter_lists_loaded 3
+# HELP sito_filter_lists_failed Configured filter lists that failed in the last reload
+# TYPE sito_filter_lists_failed gauge
+sito_filter_lists_failed 1
+# HELP sito_filter_degraded_groups Groups published with a partial rule class
+# TYPE sito_filter_degraded_groups gauge
+sito_filter_degraded_groups 1
+# HELP sito_filter_dropped_regex_patterns Regex/wildcard patterns dropped from the active snapshot
+# TYPE sito_filter_dropped_regex_patterns gauge
+sito_filter_dropped_regex_patterns 5
+# HELP sito_filter_unavailable No usable filter snapshot is active (1 = unavailable; fail_closed answers SERVFAIL)
+# TYPE sito_filter_unavailable gauge
+sito_filter_unavailable 1
 # HELP sito_filter_compile_seconds Compilation duration for filter rule trie
 # TYPE sito_filter_compile_seconds histogram
 sito_filter_compile_seconds_bucket{le="0.00025"} 0
@@ -1529,6 +1779,27 @@ sito_ha_startup_noop_total{role="master",reason="replication_disabled"} 1
 # HELP sito_querylog_dropped_total Total query log entries dropped due to buffer overflow
 # TYPE sito_querylog_dropped_total counter
 sito_querylog_dropped_total 1
+# HELP sito_stats_retention_last_success_seconds Unix timestamp of the last successful stats retention sweep
+# TYPE sito_stats_retention_last_success_seconds gauge
+sito_stats_retention_last_success_seconds 0
+# HELP sito_stats_retention_last_failure_seconds Unix timestamp of the last failed stats retention sweep
+# TYPE sito_stats_retention_last_failure_seconds gauge
+sito_stats_retention_last_failure_seconds 0
+# HELP sito_stats_retention_last_duration_millis Duration of the last stats retention sweep
+# TYPE sito_stats_retention_last_duration_millis gauge
+sito_stats_retention_last_duration_millis 0
+# HELP sito_stats_retention_deleted_rows_total Detailed query-log rows deleted by retention
+# TYPE sito_stats_retention_deleted_rows_total counter
+sito_stats_retention_deleted_rows_total 0
+# HELP sito_stats_retention_rollup_deleted_rows_total Expired hourly rollup rows deleted by retention
+# TYPE sito_stats_retention_rollup_deleted_rows_total counter
+sito_stats_retention_rollup_deleted_rows_total 0
+# HELP sito_stats_retention_failures_total Failed stats retention sweeps
+# TYPE sito_stats_retention_failures_total counter
+sito_stats_retention_failures_total 0
+# HELP sito_stats_rollup_retention_days Configured hourly rollup retention in days
+# TYPE sito_stats_rollup_retention_days gauge
+sito_stats_rollup_retention_days 0
 # HELP sito_build_info Build and version metadata
 # TYPE sito_build_info gauge
 sito_build_info{version="1.0.0",commit="abc1234"} 1
@@ -1711,6 +1982,10 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         assert!(rendered.contains("sito_filter_rules{list=\"total\"} 42"));
         assert!(rendered.contains("sito_filter_compile_seconds_count 1"));
         assert!(rendered.contains("sito_filter_compile_seconds_sum 0.25"));
+        assert!(
+            rendered.contains("sito_filter_unavailable 0"),
+            "the unavailable gauge must be exposed even when healthy"
+        );
     }
 
     /// Regression for audit WP-7.3: [`MetricsSnapshot::delta_since`] must
@@ -1840,6 +2115,39 @@ mod allocation_tests {
         assert_eq!(
             after, before,
             "metrics hot path must not allocate after warm-up"
+        );
+    }
+
+    #[test]
+    fn test_retention_metrics_record_success_and_failure() {
+        use std::sync::atomic::Ordering;
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.set_rollup_retention_days(365);
+        reg.record_retention_success(1_234, 10, 2, 365);
+
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains("sito_stats_retention_last_duration_millis 1234"));
+        assert!(rendered.contains("sito_stats_retention_deleted_rows_total 10"));
+        assert!(rendered.contains("sito_stats_retention_rollup_deleted_rows_total 2"));
+        assert!(rendered.contains("sito_stats_rollup_retention_days 365"));
+        assert!(
+            reg.stats_retention_last_success_seconds
+                .load(Ordering::Relaxed)
+                > 0
+        );
+        assert_eq!(
+            reg.stats_retention_failures_total.load(Ordering::Relaxed),
+            0
+        );
+
+        reg.record_retention_failure(99);
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains("sito_stats_retention_failures_total 1"));
+        assert!(rendered.contains("sito_stats_retention_last_duration_millis 99"));
+        assert!(
+            reg.stats_retention_last_failure_seconds
+                .load(Ordering::Relaxed)
+                > 0
         );
     }
 }

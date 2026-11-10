@@ -194,6 +194,7 @@ impl Config {
                     staging,
                     cache_dir,
                     http_port: default_acme_http_port(),
+                    allow_bootstrap_cert: false,
                 });
             }
         }
@@ -415,16 +416,32 @@ pub struct StatsConfig {
     /// retention sweep while still advertising query logging as enabled.
     #[serde(default = "default_retention_days", alias = "query_log_retention_days")]
     pub retention_days: u32,
+    /// Days to keep hourly rollups (aggregate totals, top domains and hashed
+    /// client identifiers) after detailed query-log rows are pruned.
+    ///
+    /// Rollup rows older than this are deleted. Must be at least 1.
+    #[serde(default = "default_rollup_retention_days")]
+    pub rollup_retention_days: u32,
+    /// Include client display names in hourly rollups. Disabled by default so
+    /// long-lived aggregates do not retain identifiable device labels.
+    #[serde(default)]
+    pub rollup_client_names: bool,
 }
 
 fn default_retention_days() -> u32 {
     90
 }
 
+fn default_rollup_retention_days() -> u32 {
+    365
+}
+
 impl Default for StatsConfig {
     fn default() -> Self {
         Self {
             retention_days: default_retention_days(),
+            rollup_retention_days: default_rollup_retention_days(),
+            rollup_client_names: false,
         }
     }
 }
@@ -435,6 +452,12 @@ impl StatsConfig {
             return Err(ConfigError::validation(
                 "stats.retention_days",
                 "retention_days must be greater than 0",
+            ));
+        }
+        if self.rollup_retention_days == 0 {
+            return Err(ConfigError::validation(
+                "stats.rollup_retention_days",
+                "rollup_retention_days must be greater than 0",
             ));
         }
         Ok(())
@@ -1138,6 +1161,16 @@ pub struct UpstreamConfig {
     pub probe_domain: String,
     #[serde(default = "default_upstream_pool_size")]
     pub pool_size: usize,
+    /// Allow hostname-configured upstreams to resolve to private, loopback,
+    /// link-local or otherwise reserved addresses.
+    ///
+    /// Disabled by default to prevent a compromised/spoofed bootstrap answer
+    /// from redirecting an upstream into the local network or a cloud metadata
+    /// endpoint. IP literals in `servers` are always accepted because they are
+    /// an explicit operator choice. Set this to `true` only when an internal
+    /// resolver is intentionally reached via a hostname.
+    #[serde(default)]
+    pub allow_private_targets: bool,
     /// EDNS Client Subnet (ECS) forwarding policy.
     ///
     /// `"off"` (default) strips client ECS options, so upstream resolvers only
@@ -1183,6 +1216,7 @@ impl Default for UpstreamConfig {
             timeout_ms: default_upstream_timeout_ms(),
             probe_domain: default_upstream_probe_domain(),
             pool_size: default_upstream_pool_size(),
+            allow_private_targets: false,
             ecs: UpstreamEcs::default(),
             per_domain: Vec::new(),
         }
@@ -1388,6 +1422,11 @@ pub struct FilteringConfig {
     /// exhaust memory. Lowering it can invalidate larger cached lists.
     #[serde(default = "default_filtering_max_list_bytes")]
     pub max_list_bytes: usize,
+    /// Accept an empty list body or a list that yields zero rules instead of
+    /// rejecting it and keeping the previous snapshot. Disabled by default:
+    /// a broken/hostile source must not silently remove all protection.
+    #[serde(default)]
+    pub allow_empty_list: bool,
     #[serde(default)]
     pub lists: Vec<FilterListConfig>,
     #[serde(default)]
@@ -1427,6 +1466,7 @@ impl Default for FilteringConfig {
             anti_doh_bypass: default_filtering_anti_doh_bypass(),
             max_rules: default_filtering_max_rules(),
             max_list_bytes: default_filtering_max_list_bytes(),
+            allow_empty_list: false,
             lists: Vec::new(),
             custom_rules: Vec::new(),
             regex_compile_budget_ms: None,
@@ -1531,6 +1571,13 @@ pub struct AcmeConfig {
     pub cache_dir: Option<PathBuf>,
     #[serde(default = "default_acme_http_port")]
     pub http_port: u16,
+    /// Serve a short-lived self-signed bootstrap certificate on encrypted
+    /// listeners while the first ACME certificate is being issued.
+    ///
+    /// Defaults to `false` (fail closed): encrypted listeners stay disabled
+    /// until a real certificate exists unless the operator explicitly opts in.
+    #[serde(default)]
+    pub allow_bootstrap_cert: bool,
 }
 
 fn default_acme_http_port() -> u16 {
@@ -1938,6 +1985,29 @@ key = "/path/to/key.pem"
             .expect("retention_days = 1 must be accepted");
     }
 
+    /// P1-19: rollup retention/client-name keys are optional and safe by
+    /// default, and a zero rollup retention is rejected.
+    #[test]
+    fn test_stats_rollup_retention_defaults_and_validation() {
+        let default = Config::from_toml_str(&format!("{TEST_BASE}[stats]\nretention_days = 90\n"))
+            .expect("stats defaults must parse");
+        let stats = default.get_stats_config();
+        assert_eq!(stats.rollup_retention_days, 365);
+        assert!(!stats.rollup_client_names);
+
+        expect_validation_field(
+            &format!("{TEST_BASE}[stats]\nrollup_retention_days = 0\n"),
+            "stats.rollup_retention_days",
+        );
+        let configured = Config::from_toml_str(&format!(
+            "{TEST_BASE}[stats]\nrollup_retention_days = 30\nrollup_client_names = true\n"
+        ))
+        .expect("explicit rollup settings must parse");
+        let stats = configured.get_stats_config();
+        assert_eq!(stats.rollup_retention_days, 30);
+        assert!(stats.rollup_client_names);
+    }
+
     /// Audit 6 / WP-6.5: `web.port = 0` requested an ephemeral port that
     /// clients cannot discover; it must be rejected.
     #[test]
@@ -2054,6 +2124,21 @@ key = "/path/to/key.pem"
         ))
         .expect("a positive compile budget must be accepted");
         assert_eq!(custom.filtering.regex_compile_budget_ms, Some(250));
+    }
+
+    /// P1-25: private bootstrap targets are opt-in and default to false.
+    #[test]
+    fn test_upstream_allow_private_targets_defaults_false_and_parses() {
+        let default = Config::from_toml_str(TEST_BASE).expect("minimal config must parse");
+        assert!(
+            !default.upstream.allow_private_targets,
+            "private bootstrap targets must be denied by default"
+        );
+
+        let opted_in =
+            Config::from_toml_str("config_version = 1\n[upstream]\nallow_private_targets = true\n")
+                .expect("the additive opt-in must parse");
+        assert!(opted_in.upstream.allow_private_targets);
     }
 
     /// Audit 6 / WP-6.5: an empty or malformed probe domain made every
@@ -2179,6 +2264,23 @@ key = "/path/to/key.pem"
                 .any(|w| w.contains("admin web UI")),
             "an explicit http:// public URL must still warn even with the proxy flag"
         );
+    }
+
+    /// D12: bootstrap serving is opt-in and defaults to fail-closed.
+    #[test]
+    fn test_acme_allow_bootstrap_cert_defaults_false() {
+        let default: AcmeConfig = toml::from_str("enabled = true\ndomains = [\"dns.example.com\"]")
+            .expect("parse default acme config");
+        assert!(
+            !default.allow_bootstrap_cert,
+            "bootstrap certificate serving must be disabled by default"
+        );
+
+        let opted_in: AcmeConfig = toml::from_str(
+            "enabled = true\ndomains = [\"dns.example.com\"]\nallow_bootstrap_cert = true",
+        )
+        .expect("parse opted-in acme config");
+        assert!(opted_in.allow_bootstrap_cert);
     }
 
     /// Warnings are written to logs; they must never echo credentials or

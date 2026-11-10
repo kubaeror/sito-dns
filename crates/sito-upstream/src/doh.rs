@@ -19,6 +19,35 @@ use sito_proto::{Message, decode_message, encode_message};
 /// Maximum accepted DoH response body (DNS-over-TCP size ceiling).
 const MAX_DOH_RESPONSE_BYTES: usize = 65_535;
 
+/// Default RFC 8484 path used when an operator configures a bare
+/// `https://host` target.
+pub(crate) const DEFAULT_DOH_PATH: &str = "/dns-query";
+
+/// Parses and normalizes a DoH URL.
+///
+/// A bare `https://host` (or `https://host/`) is completed to
+/// `https://host/dns-query`. Without this the manager's parsed default path
+/// would be discarded and POSTs would be sent to `/`.
+fn normalize_doh_url(url: &str) -> Result<reqwest::Url, UpstreamError> {
+    let mut parsed = reqwest::Url::parse(url)
+        .map_err(|e| UpstreamError::BadResponse(format!("invalid DoH URL '{url}': {e}")))?;
+    if parsed.scheme() != "https" {
+        return Err(UpstreamError::BadResponse(format!(
+            "DoH upstream URL must use https:// (got '{}')",
+            parsed.scheme()
+        )));
+    }
+    if parsed.host_str().is_none() {
+        return Err(UpstreamError::BadResponse(format!(
+            "DoH URL '{url}' has no host"
+        )));
+    }
+    if parsed.path().is_empty() || parsed.path() == "/" {
+        parsed.set_path(DEFAULT_DOH_PATH);
+    }
+    Ok(parsed)
+}
+
 /// A DNS-over-HTTPS upstream (RFC 8484).
 pub struct HttpsUpstream {
     url: reqwest::Url,
@@ -41,14 +70,7 @@ impl HttpsUpstream {
         resolved_ips: &[IpAddr],
         timeout_duration: Duration,
     ) -> Result<Self, UpstreamError> {
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|e| UpstreamError::BadResponse(format!("invalid DoH URL '{url}': {e}")))?;
-        if parsed.scheme() != "https" {
-            return Err(UpstreamError::BadResponse(format!(
-                "DoH upstream URL must use https:// (got '{}')",
-                parsed.scheme()
-            )));
-        }
+        let parsed = normalize_doh_url(url)?;
         let host = parsed
             .host_str()
             .ok_or_else(|| UpstreamError::BadResponse(format!("DoH URL '{url}' has no host")))?
@@ -61,6 +83,9 @@ impl HttpsUpstream {
             // Never follow redirects: a malicious/compromised upstream must not
             // be able to exfiltrate DNS queries to arbitrary hosts.
             .redirect(reqwest::redirect::Policy::none())
+            // Do not use ambient HTTP(S)_PROXY settings: a system proxy would
+            // bypass `resolve_to_addrs` pinning and could see every DNS query.
+            .no_proxy()
             .pool_max_idle_per_host(4);
         if !resolved_ips.is_empty() {
             let addrs: Vec<SocketAddr> = resolved_ips
@@ -79,11 +104,20 @@ impl HttpsUpstream {
         })
     }
 
-    /// Constructs an upstream from a caller-provided HTTP client (used by tests
-    /// and custom TLS configurations).
+    /// Constructs an upstream from a caller-provided HTTP client.
     ///
-    /// The caller is responsible for disabling redirects on the supplied client
-    /// (`redirect(reqwest::redirect::Policy::none())`); `new` does so itself.
+    /// This is intended for tests and custom TLS configurations; production
+    /// callers should use [`HttpsUpstream::new`]. It deliberately bypasses the
+    /// production client setup:
+    ///
+    /// - the URL is parsed as-is, so a bare `https://host` is **not** completed
+    ///   to `/dns-query` (`normalize_doh_url` is skipped);
+    /// - the supplied client decides proxy and address-pinning behavior. In
+    ///   particular this does **not** call `.no_proxy()` or
+    ///   `.resolve_to_addrs()`, so ambient `HTTP(S)_PROXY` settings can redirect
+    ///   DNS queries;
+    /// - the caller must also disable redirects
+    ///   (`redirect(reqwest::redirect::Policy::none())`); `new` does so itself.
     #[must_use]
     pub fn with_client(url: &str, client: reqwest::Client, _timeout_duration: Duration) -> Self {
         Self {
@@ -377,8 +411,115 @@ mod tests {
         addr
     }
 
+    /// Serializes tests that mutate process-wide proxy environment variables.
+    static DOH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Restores a proxy-related environment variable when dropped.
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: the owning test holds DOH_TEST_LOCK, and no other test in
+            // this binary builds an HTTPS reqwest client concurrently.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: see `set`.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `set`.
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Binds a listener that counts accepted connections. Accepted sockets are
+    /// dropped immediately so a proxied client fails fast instead of hanging.
+    async fn spawn_counting_listener() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (addr, count)
+    }
+
+    /// Important 1: production DoH must ignore ambient HTTPS proxy settings.
+    /// Otherwise a system proxy would receive every DNS query and bypass the
+    /// `resolve_to_addrs` pinning.
+    #[tokio::test]
+    async fn test_doh_new_ignores_ambient_https_proxy() {
+        let _serial = DOH_TEST_LOCK.lock().await;
+        let (proxy_addr, proxy_connections) = spawn_counting_listener().await;
+        let (target_addr, target_connections) = spawn_counting_listener().await;
+
+        let _proxy = EnvGuard::set("HTTPS_PROXY", format!("http://{proxy_addr}"));
+        let _all_proxy = EnvGuard::set("ALL_PROXY", format!("http://{proxy_addr}"));
+        let _lower_proxy = EnvGuard::set("https_proxy", format!("http://{proxy_addr}"));
+        let _no_proxy = EnvGuard::remove("NO_PROXY");
+        let _no_proxy_lower = EnvGuard::remove("no_proxy");
+
+        let upstream = HttpsUpstream::new(
+            &format!("https://127.0.0.1:{}/dns-query", target_addr.port()),
+            &[IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+            Duration::from_millis(500),
+        )
+        .expect("DoH client");
+
+        // The target is a plain TCP listener, so the TLS handshake fails; the
+        // important assertion is *where* the connection went.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            upstream.resolve(&make_query(0x5151)),
+        )
+        .await;
+
+        assert_eq!(
+            proxy_connections.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "production DoH must not use an ambient HTTPS proxy"
+        );
+        assert!(
+            target_connections.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the DoH request must connect directly to the pinned target"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_doh_bare_host_uses_default_dns_query_path() {
+        let _serial = DOH_TEST_LOCK.lock().await;
+        let upstream = HttpsUpstream::new("https://dns.example", &[], Duration::from_secs(1))
+            .expect("bare DoH URL must be accepted");
+        assert!(
+            format!("{upstream:?}").contains("https://dns.example/dns-query"),
+            "pathless DoH targets must use /dns-query: {upstream:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_doh_post_success_and_validation() {
+        let _serial = DOH_TEST_LOCK.lock().await;
         let addr = spawn_post_only_server().await;
         let upstream = HttpsUpstream::with_client(
             &format!("http://{addr}/dns-query"),
@@ -397,6 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_doh_response_id_mismatch_rejected() {
+        let _serial = DOH_TEST_LOCK.lock().await;
         // Server responds with a different ID than requested.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -441,6 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_doh_get_fallback_validates_and_restores_id() {
+        let _serial = DOH_TEST_LOCK.lock().await;
         // POST is rejected with 405; the GET form must then succeed even
         // though the wire query uses ID 0 and the caller's ID is non-zero.
         let addr = spawn_http_server(|head| {
@@ -491,6 +634,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_doh_redirects_are_not_followed() {
+        let _serial = DOH_TEST_LOCK.lock().await;
         let addr = spawn_http_server(|_head| {
             http_response(
                 "302 Found",
@@ -522,6 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_doh_missing_content_type_rejected() {
+        let _serial = DOH_TEST_LOCK.lock().await;
         let addr = spawn_http_server(|_head| {
             let body =
                 encode_message(&Message::new(0, MessageType::Response, OpCode::Query)).unwrap();

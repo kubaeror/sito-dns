@@ -17,10 +17,13 @@ pub(crate) async fn mock_context(temp_dir: &Path) -> ServerContext {
     let querylog_sender = querylog_writer.sender();
     let metrics = sito_stats::MetricsRegistry::new("1.2.1", "test");
     let auth_mgr = Arc::new(crate::auth::AuthManager::new());
-    let config = Config::default();
-    let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    // Filtering is disabled in the mock context: `Config::default()` has no
+    // sources, and an enabled-with-zero-sources engine now fails closed.
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(config.clone())));
     let filter = Arc::new(
-        sito_filter::HostsFilterEngine::init(Default::default(), temp_dir.to_path_buf()).await,
+        sito_filter::HostsFilterEngine::init(config.filtering, temp_dir.to_path_buf()).await,
     );
     let cache = Arc::new(sito_cache::DnsCache::new(Default::default()));
     let bootstrap = sito_upstream::BootstrapResolver::new(
@@ -72,6 +75,7 @@ pub(crate) async fn mock_context(temp_dir: &Path) -> ServerContext {
         slave_tracker: None,
         resync_sender: None,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        acme_challenges: None,
         dns_starter: None,
     }
 }

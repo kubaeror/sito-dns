@@ -10,6 +10,27 @@ pub struct StatusResponse {
     pub uptime_seconds: u64,
     pub role: String,
     pub listeners: Vec<String>,
+    /// ACME challenge/issuance readiness (D12). Omitted when ACME is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acme: Option<AcmeStatus>,
+}
+
+/// ACME readiness exposed by the authenticated status endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AcmeStatus {
+    pub enabled: bool,
+    pub ready: bool,
+    /// Dedicated HTTP-01 listener is bound.
+    pub http01_available: bool,
+    /// TCP 443 DoH listener with `acme-tls/1` is bound.
+    pub tls_alpn_available: bool,
+    /// Stable reason code when not ready (`acme_challenge_unavailable` or
+    /// `acme_issuance_failed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Most recent issuance/renewal error, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Query parameters for statistics window.
@@ -17,6 +38,32 @@ pub struct StatusResponse {
 pub struct StatsQuery {
     /// Time window: "1h", "24h", "7d", "30d" (default: "24h").
     pub window: Option<String>,
+}
+
+/// Observable filter-engine status (additive, read-only).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FilterStatusDto {
+    /// `disabled`, `loading`, `ready` or `failed`.
+    pub state: String,
+    /// Active compiled rules.
+    pub rule_count: usize,
+    /// Configured lists that loaded in the last reload.
+    pub loaded_lists: usize,
+    /// Configured lists that failed (fetch, parse, empty/zero-yield, limits).
+    pub failed_lists: Vec<String>,
+    /// Lists whose newest content was rejected while an older snapshot stayed.
+    pub degraded_lists: Vec<String>,
+    /// Groups published without their regex/wildcard (or substring/prefix)
+    /// class after a budget/limit failure.
+    pub degraded_groups: Vec<String>,
+    /// Regex/wildcard patterns dropped from the active snapshot.
+    pub dropped_regex_patterns: usize,
+    /// True when no usable snapshot is active and fail-closed answers SERVFAIL.
+    pub unavailable: bool,
+    /// Most recent reload error.
+    pub last_error: Option<String>,
+    /// Wall-clock milliseconds of the last parse+compile attempt.
+    pub last_compile_ms: Option<u64>,
 }
 
 /// Filter list subscription details. `id` is the stable list name (numeric
@@ -313,6 +360,23 @@ pub struct ConfigUpdateResponse {
     /// Settings that changed but only take effect after a process restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restart_required: Vec<String>,
+    /// HA publication result when this node is a cluster master. Omitted for
+    /// non-HA nodes and slaves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ha_publish: Option<HaPublishStatus>,
+}
+
+/// Outcome of publishing a configuration to HA replica slaves.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct HaPublishStatus {
+    /// `published`, `no_slaves` or `failed`.
+    pub status: String,
+    /// Human-readable failure reason. Never contains secret material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// RFC3339 timestamp of the first background retry, when one is scheduled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<String>,
 }
 
 /// Full configuration response with secrets masked.
@@ -372,6 +436,23 @@ pub struct LoginResponse {
     pub totp_required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_token: Option<String>,
+}
+
+/// Re-authentication request for a sensitive operation.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReauthRequest {
+    pub password: String,
+    /// Current TOTP or backup code; required when TOTP is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+/// Short-lived, session-bound re-authentication ticket.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReauthResponse {
+    pub reauth_token: String,
+    /// Remaining lifetime in seconds.
+    pub expires_in: u64,
 }
 
 /// TOTP verification request.

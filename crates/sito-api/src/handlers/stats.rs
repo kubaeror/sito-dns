@@ -15,11 +15,47 @@ use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::response::{IntoResponse, Response};
 use sito_stats::{ClientStats, GlobalStats, UpstreamStats};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Longest accepted statistics window (5 years) — prevents absurd inputs from
 /// overflowing the millisecond conversion.
 pub const MAX_WINDOW_HOURS: i64 = 24 * 366 * 5;
+
+/// Maximum stats requests per authenticated user and endpoint per minute.
+const STATS_RATE_LIMIT: u32 = 240;
+const STATS_RATE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_STATS_RATE_BUCKETS: usize = 8_192;
+
+fn stats_rate_limiter() -> &'static Mutex<HashMap<String, (Instant, u32)>> {
+    static LIMITER: OnceLock<Mutex<HashMap<String, (Instant, u32)>>> = OnceLock::new();
+    LIMITER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Bounds repeated expensive aggregate scans even for an authenticated user.
+fn stats_rate_limited(username: &str, endpoint: &str) -> bool {
+    let key = format!("{username}\u{0}{endpoint}");
+    let mut buckets = stats_rate_limiter()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    buckets.retain(|_, (start, _)| now.duration_since(*start) <= STATS_RATE_WINDOW);
+    if buckets.len() >= MAX_STATS_RATE_BUCKETS
+        && !buckets.contains_key(&key)
+        && let Some(victim) = buckets.keys().next().cloned()
+    {
+        buckets.remove(&victim);
+    }
+    let entry = buckets.entry(key).or_insert((now, 0));
+    if now.duration_since(entry.0) > STATS_RATE_WINDOW {
+        *entry = (now, 0);
+    }
+    entry.1 = entry.1.saturating_add(1);
+    entry.1 > STATS_RATE_LIMIT
+}
 
 /// Builds the `X-Total-Count` header describing how many distinct rows match
 /// the window before the bounded aggregate query truncated the list.
@@ -29,6 +65,40 @@ fn total_count_header(total: i64) -> HeaderMap {
         HeaderValue::from_str(&total.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0"));
     headers.insert(HeaderName::from_static("x-total-count"), value);
     headers
+}
+
+/// Error type for the statistics handlers.
+///
+/// Rate-limit responses carry `Retry-After` so a polling UI backs off instead
+/// of retrying immediately. Other failures remain plain RFC 7807 problem
+/// details.
+#[derive(Debug)]
+pub enum StatsHandlerError {
+    Problem(ProblemDetails),
+    RateLimited(ProblemDetails),
+}
+
+impl StatsHandlerError {
+    fn rate_limited() -> Self {
+        Self::RateLimited(ProblemDetails::too_many_requests(
+            "Too many statistics requests. Please slow down.",
+        ))
+    }
+}
+
+impl From<ProblemDetails> for StatsHandlerError {
+    fn from(problem: ProblemDetails) -> Self {
+        Self::Problem(problem)
+    }
+}
+
+impl IntoResponse for StatsHandlerError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Problem(problem) => problem.into_response(),
+            Self::RateLimited(problem) => problem.into_response_with_retry_after(),
+        }
+    }
 }
 
 /// Parses the `window` query parameter into milliseconds, clamping the result
@@ -77,15 +147,20 @@ pub fn parse_window_ms(window: Option<&str>) -> Result<i64, ProblemDetails> {
         (status = 200, description = "Global statistics retrieved", body = GlobalStats),
         (status = 400, description = "Invalid window", body = ProblemDetails),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 429, description = "Rate limited", body = ProblemDetails,
+            headers(("Retry-After", description = "Seconds to wait before retrying")))
     ),
     tag = "Stats"
 )]
 pub async fn get_stats(
-    _viewer: RequireViewer,
+    viewer: RequireViewer,
     State(ctx): State<ServerContext>,
     Query(query): Query<StatsQuery>,
-) -> Result<Json<GlobalStats>, ProblemDetails> {
+) -> Result<Json<GlobalStats>, StatsHandlerError> {
+    if stats_rate_limited(&viewer.0.username, "global") {
+        return Err(StatsHandlerError::rate_limited());
+    }
     let window_ms = parse_window_ms(query.window.as_deref())?;
     let stats = ctx
         .stats_db
@@ -104,15 +179,20 @@ pub async fn get_stats(
             headers(("X-Total-Count", description = "Number of distinct matching rows before the response limit"))),
         (status = 400, description = "Invalid window", body = ProblemDetails),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 429, description = "Rate limited", body = ProblemDetails,
+            headers(("Retry-After", description = "Seconds to wait before retrying")))
     ),
     tag = "Stats"
 )]
 pub async fn get_client_stats(
-    _viewer: RequireViewer,
+    viewer: RequireViewer,
     State(ctx): State<ServerContext>,
     Query(query): Query<StatsQuery>,
-) -> Result<(HeaderMap, Json<Vec<ClientStats>>), ProblemDetails> {
+) -> Result<(HeaderMap, Json<Vec<ClientStats>>), StatsHandlerError> {
+    if stats_rate_limited(&viewer.0.username, "clients") {
+        return Err(StatsHandlerError::rate_limited());
+    }
     let window_ms = parse_window_ms(query.window.as_deref())?;
     let total = ctx
         .stats_db
@@ -136,15 +216,20 @@ pub async fn get_client_stats(
             headers(("X-Total-Count", description = "Number of distinct matching rows before the response limit"))),
         (status = 400, description = "Invalid window", body = ProblemDetails),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 429, description = "Rate limited", body = ProblemDetails,
+            headers(("Retry-After", description = "Seconds to wait before retrying")))
     ),
     tag = "Stats"
 )]
 pub async fn get_upstream_stats(
-    _viewer: RequireViewer,
+    viewer: RequireViewer,
     State(ctx): State<ServerContext>,
     Query(query): Query<StatsQuery>,
-) -> Result<(HeaderMap, Json<Vec<UpstreamStats>>), ProblemDetails> {
+) -> Result<(HeaderMap, Json<Vec<UpstreamStats>>), StatsHandlerError> {
+    if stats_rate_limited(&viewer.0.username, "upstreams") {
+        return Err(StatsHandlerError::rate_limited());
+    }
     let window_ms = parse_window_ms(query.window.as_deref())?;
     let total = ctx
         .stats_db
@@ -180,6 +265,62 @@ mod tests {
         assert!(parse_window_ms(Some(&format!("{}h", MAX_WINDOW_HOURS + 1))).is_err());
     }
 
+    #[test]
+    fn test_stats_rate_limiter_blocks_after_budget() {
+        let user = format!("rate-test-{}", rand::random::<u64>());
+        for _ in 0..STATS_RATE_LIMIT {
+            assert!(!stats_rate_limited(&user, "global"));
+        }
+        assert!(stats_rate_limited(&user, "global"));
+        // A different endpoint or user is unaffected.
+        assert!(!stats_rate_limited(&user, "clients"));
+        assert!(!stats_rate_limited("another-user", "global"));
+    }
+
+    /// Deferred D3: the stats 429 must carry `Retry-After` so a polling client
+    /// backs off instead of immediately retrying an expensive aggregate scan.
+    #[tokio::test]
+    async fn test_stats_rate_limit_response_has_retry_after() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_stats_429_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let username = format!("rate-header-{}", rand::random::<u64>());
+        for _ in 0..STATS_RATE_LIMIT {
+            assert!(!stats_rate_limited(&username, "global"));
+        }
+
+        let viewer = RequireViewer(AuthUser {
+            username,
+            role: Role::Viewer,
+            token_id: None,
+        });
+        let Err(error) = get_stats(
+            viewer,
+            State(ctx),
+            Query(StatsQuery {
+                window: Some("1h".into()),
+            }),
+        )
+        .await
+        else {
+            panic!("the exhausted stats budget must return 429");
+        };
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "1",
+            "stats 429 responses must advertise the retry window"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
     use crate::auth::AuthUser;
     use crate::auth::token::Role;
     use arc_swap::ArcSwap;
@@ -189,15 +330,18 @@ mod tests {
 
     async fn mock_context(temp_dir: &std::path::Path) -> ServerContext {
         let db_path = temp_dir.join("test.db");
-        let stats_db = sito_stats::StatsDb::open(&db_path).await.unwrap();
+        let stats_db = sito_stats::StatsDb::open_with_rollup_client_names(&db_path, true)
+            .await
+            .unwrap();
         let querylog_writer = sito_stats::QueryLogWriter::spawn(stats_db.clone(), 100);
         let querylog_sender = querylog_writer.sender();
         let metrics = sito_stats::MetricsRegistry::new("1.2.1", "test");
         let auth_mgr = Arc::new(crate::auth::AuthManager::new());
-        let config = Config::default();
-        let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+        let mut config = Config::default();
+        config.filtering.enabled = false;
+        let config_arc = Arc::new(ArcSwap::new(Arc::new(config.clone())));
         let filter = Arc::new(
-            sito_filter::HostsFilterEngine::init(Default::default(), temp_dir.to_path_buf()).await,
+            sito_filter::HostsFilterEngine::init(config.filtering, temp_dir.to_path_buf()).await,
         );
         let cache = Arc::new(sito_cache::DnsCache::new(Default::default()));
         let bootstrap = sito_upstream::BootstrapResolver::new(
@@ -251,6 +395,7 @@ mod tests {
             slave_tracker: None,
             resync_sender: None,
             setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            acme_challenges: None,
             dns_starter: None,
         }
     }
@@ -292,7 +437,7 @@ mod tests {
             entries.push(entry);
         }
         ctx.stats_db.insert_batch(&entries).await.unwrap();
-        let report = ctx.stats_db.cleanup_retention(90).await.unwrap();
+        let report = ctx.stats_db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(report.deleted_records, 3);
 
         let Json(stats) = get_stats(
@@ -322,6 +467,11 @@ mod tests {
         assert_eq!(headers.get("x-total-count").unwrap(), "1");
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].client_name.as_deref(), Some("archive-host"));
+        assert!(
+            clients[0].client_ip.starts_with("blake3:"),
+            "archived client IP must be a keyed hash, got {}",
+            clients[0].client_ip
+        );
 
         let (headers, Json(upstreams)) = get_upstream_stats(
             viewer(),

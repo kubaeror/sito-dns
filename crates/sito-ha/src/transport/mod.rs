@@ -30,3 +30,10 @@ pub fn ws_config() -> WebSocketConfig {
 /// Upper bound on the slave's TCP/TLS connect and WebSocket upgrade; mirrors
 /// the master's 10 s handshake budget so a stalled peer cannot pin the worker.
 pub const SLAVE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on a single WebSocket write.
+///
+/// A peer that stops reading must not pin a replication session (and its
+/// per-slave queue) forever. Sends on both the master and slave sides use this
+/// deadline.
+pub const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);

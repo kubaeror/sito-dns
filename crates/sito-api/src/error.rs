@@ -1,6 +1,6 @@
 //! RFC 7807 Problem Details error implementation for REST API.
 
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -63,6 +63,19 @@ impl ProblemDetails {
             "Internal Server Error",
             detail,
         )
+    }
+
+    /// Renders this problem with a one-second `Retry-After` hint.
+    ///
+    /// Used by rate-limited endpoints so a polling client backs off instead of
+    /// immediately retrying an expensive request.
+    #[must_use]
+    pub fn into_response_with_retry_after(self) -> Response {
+        let mut response = self.into_response();
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        response
     }
 }
 

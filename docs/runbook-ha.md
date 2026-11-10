@@ -8,7 +8,8 @@ This runbook provides step-by-step operational procedures for managing, maintain
 
 `sito` implements an active-passive master/slave replication architecture governed by [ADR-0002](adr/0002-ha-master-slave-push.md):
 - **Master Node**: Accepts administrative REST API mutations and Web UI configurations, generates monotonic configuration bundles, signs them using an Ed25519 private key (`data_dir/ha_signing.key`, permissions `0600`), and pushes updates to connected slaves in real-time over WebSocket with mutual TLS (mTLS) on port `8953`. The active bundle and its version are persisted to `data_dir/ha_state.toml` (mode `0600`) on every publish. On startup the master compares the sanitized current `config.toml` with the persisted bundle and republishes at `N + 1` when the configuration changed, so a restart can never leave slaves on stale settings.
-- **Slave Nodes**: Connect to the master over WebSocket + mTLS, verify the master's Ed25519 signature and certificate fingerprint, enforce the cluster epoch (a bundle from an older term is rejected even when its version is higher) and strict monotonic version ordering within a term, and apply configuration snapshots atomically. The last applied term, version, signed payload hash and timestamp are persisted to `data_dir/ha_watermark.toml` (atomic, mode `0600`) before the push is acknowledged, so a restart cannot replay an older bundle or accept same-version content with a different hash. A corrupt watermark fails startup; delete the file only to force a full resync.
+- **Slave Nodes**: Connect to the master over WebSocket + mTLS, verify the master's Ed25519 signature and certificate fingerprint, enforce the cluster epoch (a bundle from an older term is rejected even when its version is higher) and strict monotonic version ordering within a term, and apply configuration snapshots atomically. The last applied term, version, signed payload hash, digest of the exact applied `config.toml`, and timestamp are persisted to `data_dir/ha_watermark.toml` (atomic, mode `0600`) before the push is acknowledged, so a restart cannot replay an older bundle, accept same-version content with a different hash, or early-ACK a locally edited configuration. A watermark written by 1.9.3 or earlier has no digest and forces one full apply before any early ACK. A slave that receives no frame for `3 × ping_interval_secs` leaves `Synced` and reports not-ready. A corrupt watermark fails startup; delete the file only to force a full resync.
+- **Admission limits**: the replication listener accepts at most 64 concurrent slave sessions and at most 8 concurrent sessions per source IP; a 10 s timeout bounds TLS/WebSocket handshakes and one WebSocket write. A NAT deployment with more than eight simultaneous HA peers from one address must be split across source addresses.
 - **Continuous Resolution**: Slaves serve DNS queries continuously without downtime. If an invalid or unparsable configuration bundle is received, the slave performs an automatic rollback to its last known good snapshot and enters a `Degraded` state.
 - **Read-Only Enforcement**: Slave REST API endpoints reject mutating operations (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP `409 Conflict` and return the `X-Dnsd-Master: <master_url>` header to redirect operators to the authoritative master.
 - **Statistics Aggregation**: Slaves report traffic and upstream metrics to the master every 30 seconds via `stats_report`. The master stores the latest report per slave and exposes it through `GET /api/v1/ha/slaves`; replica counters are **not** merged into the master's own Prometheus registry. Scrape each replica's `/metrics` endpoint separately (labels such as `sito_ha_config_version{instance="..."}` identify the node).
@@ -105,8 +106,12 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
      the file does not exist, but every slave must then be given the new
      public key.
    - **State file** (`data_dir/ha_state.toml`): the persisted active bundle,
-     version and cluster term. Restoring the old master's file keeps the
-     sequence monotonic and the term unchanged. If it is missing or corrupt,
+     version and cluster term, plus the Ed25519 public key that wrote it
+     (`signing_key_pubkey`). Restoring the old master's file keeps the
+     sequence monotonic and the term unchanged. If the loaded
+     `ha_signing.key` no longer matches that recorded identity, startup fails
+     with an actionable error instead of silently re-signing the persisted
+     state with a new key. If it is missing or corrupt,
      the promoted master **must not** adopt a counter from its peers: it starts
      a fresh sequence and detects any replica that is ahead (same term) or in a
      newer term, marks itself `diverged`, and refuses to overwrite the cluster.
@@ -146,21 +151,25 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
 
    To obtain the master public key for the slave configs:
    ```bash
-   # With the old master still reachable:
-   curl -s http://192.168.1.10:8080/api/v1/ha/status | jq -r .master_pubkey
+   # /api/v1/ha/status requires a Viewer-or-higher token or session.
+   export TOKEN='sito_...'   # Admin API token for resync; Viewer suffices for GETs
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.10:8080/api/v1/ha/status | jq -r .master_pubkey
 
    # Without it: the promoted master prints the same value in its status once running.
    ```
    Never let an unpromoted master start below or beside a newer term: it marks
    itself in `GET /api/v1/ha/status` with `"diverged": true` plus a
    `diverged_reason` and stops replicating, rather than republishing its stale
-   bundle over newer configuration. Divergence is sticky until the slave
-   disconnects, accepts the master's current bundle after promotion or local
-   reconciliation, or (for advisory ahead/newer-term records only) an operator
-   calls `POST /api/v1/ha/resync`. A same-version payload fork is **not**
-   cleared by a resync: re-pushing the same stale bundle cannot resolve it.
-   Recovery is always the explicit promotion above (or disconnecting and
-   fixing/re-syncing the forked replica), not waiting for an automatic rebase.
+   bundle over newer configuration. Divergence is sticky per slave: it is not
+   cleared by another slave's success and **not** cleared by
+   `POST /api/v1/ha/resync` (a resync only re-pushes the current bundle). It
+   clears only when that specific slave acknowledges the master's current
+   term/version, or when the slave disconnects. A same-version payload fork is
+   likewise cleared only by that slave accepting the current bundle after a
+   promotion/reconciliation. Recovery is always the explicit promotion above
+   (or disconnecting and fixing/re-syncing the forked replica), not waiting for
+   an automatic rebase.
 
 4. **Verify or generate master certificates**:
    `sito` uses the certificates configured in `[ha] cert`/`key` for mTLS and
@@ -192,9 +201,10 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
    ```
 
 6. **Verify master status**:
-   Query the local status endpoint:
+   Query the local status endpoint with an authenticated token or session:
    ```bash
-   curl -s http://localhost:8080/api/v1/ha/status | jq .
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://localhost:8080/api/v1/ha/status | jq .
    ```
    Expected response (master):
    ```json
@@ -270,20 +280,21 @@ certificate pairs to generate; omitting both generates the complete set
 (CA + master + slave).
 `--san` is repeatable and adds a hostname or IP address to both certificates
 (in addition to `localhost`, `sito-master` / `sito-slave`, `127.0.0.1` and
-`::1`). Replication to LAN addresses such as `wss://192.168.1.10:8953` is
-authenticated by the BLAKE3 fingerprint pinning (`master_fingerprint` /
-`pinned_slave_fingerprints`) described below, which is independent of the
-certificate SAN. If you disable pinning with `allow_unpinned_tls = true` and
-rely on `ca` chain validation instead, the hostname you connect to must match
-one of the certificate SANs; use `--san <LAN_IP_OR_HOST>` to make LAN-IP URLs
-pass hostname verification.
+`::1`). With BLAKE3 fingerprint pinning and **no** `ca`, the certificate SAN is
+not used for the replication connection. When `ca` is configured, rustls
+validates the chain **and the hostname/SAN even if pinning is also configured**;
+use `--san <LAN_IP_OR_HOST>` so URLs such as `wss://192.168.1.10:8953` pass
+hostname verification. Do not rely on `allow_unpinned_tls = true` for a
+production cluster.
 
 Note down the new fingerprints printed by the command:
 - Master cert BLAKE3 fingerprint: `a1b2c3...`
 - Slave cert BLAKE3 fingerprint: `d4e5f6...`
 
 ### Step 2: Update Configurations with Dual-Fingerprint Pinning
-Both master and slave support pinning multiple valid fingerprints during rotation:
+The master accepts a list of valid slave fingerprints, so it can trust both the
+old and new slave certificates during rotation. Each slave stores a **single**
+`master_fingerprint`; switch that value when the master certificate changes.
 
 On the **master** node:
 ```toml
@@ -357,8 +368,8 @@ When a slave node fails or must be reprovisioned from bare metal:
 3. **Configure Minimal Slave Configuration and align restart-only fields**:
    Restart-only shared settings must already match the master's
    `config.toml` before the first push. The template below uses the shipped
-   `config.example.toml` values (`log_format = "pretty"` and the default
-   `[auth]` policy); copy the master's values if it overrides either. A
+   `config.example.toml` values (the default `log_format = "json"` and the
+   default `[auth]` policy); copy the master's values if it overrides either. A
    mismatch makes the slave reject the push with `restart_required`, enter
    `Degraded`, and keep its previous configuration and file until it is
    restarted with matching values.
@@ -372,8 +383,8 @@ When a slave node fails or must be reprovisioned from bare metal:
    instance_name = "sito-slave-2"
    data_dir = "/var/lib/sito"
    # Restart-only shared value; must match the master's config.toml.
-   # config.example.toml uses "pretty".
-   log_format = "pretty"
+   # The default (and config.example.toml) is "json".
+   log_format = "json"
 
    [dns]
    bind = ["0.0.0.0"]
@@ -410,9 +421,10 @@ When a slave node fails or must be reprovisioned from bare metal:
    systemctl start sito
    ```
 6. **Verify Initial Synchronization**:
-   Check the slave status endpoint:
+   Check the slave status endpoint with an authenticated token or session:
    ```bash
-   curl -s http://localhost:8080/api/v1/ha/status | jq .
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://localhost:8080/api/v1/ha/status | jq .
    ```
    The slave will transition through `Connecting` -> `HelloSent` -> `Applying` -> `Synced` (or `HelloSent` -> `Synced` when it is already at the master's version) in under 2 seconds once the restart-only fields from step 3 match the master. If the first push is rejected with `restart_required`, align `server.log_format` and the `[auth]` policy with the master and restart the slave; the master keeps reporting it unsynced until then. Verify that custom rules, rewrites, and client lists match the master. `Degraded` is only cleared by a successful apply or an early ACK for the already-running version.
 
@@ -437,21 +449,34 @@ When a slave node fails or must be reprovisioned from bare metal:
 | Log says `Failed to initialize mTLS ... Permission denied` | Private key is owned by root or another user that the service account cannot read | Regenerate with `--uid/--gid` for the runtime user, or `chown` the key files; keep keys mode `0600`. |
 | `Signature verification failed` | Bundle signature does not match master public key | Verify that the master didn't regenerate `ha_signing.key` without updating slaves. Compare `master_pubkey` from the master's `/api/v1/ha/status` with the slave config. |
 | `Incoming version <= have_version` | Out of order or replayed bundle | Normal during network blips; the master will send the latest monotonic version. After a promotion, an older-term master is rejected even with a higher version; promote the master explicitly (section 2). |
-| Master reports `"diverged": true` | A slave is ahead in the same term, reports a newer term (stale/partitioned master, lost/corrupt `ha_state.toml`, or forked master), or reported a same-version payload fork | Read `diverged_reason`. Divergence is **sticky**: it is not cleared by another slave applying the current version. A same-version fork marks that slave unsynced and visible but does **not** stop publishing to healthy replicas; it clears when that slave accepts the current bundle after promotion/reconciliation or disconnects. `POST /api/v1/ha/resync` clears only advisory ahead/newer-term records, not a real fork. Isolate the stale master, resolve the fork, restore its state file or perform the explicit promotion in section 2 (raise both `term` and `version`), then restart it. |
+| Master reports `"diverged": true` | A slave is ahead in the same term, reports a newer term (stale/partitioned master, lost/corrupt `ha_state.toml`, or forked master), or reported a same-version payload fork | Read `diverged_reason`. Divergence is **sticky per slave**: it is not cleared by another slave applying the current version, nor by `POST /api/v1/ha/resync`. It clears when that specific slave acknowledges the master's current term/version or disconnects. A same-version fork marks that slave unsynced and visible but does **not** stop publishing to healthy replicas. Isolate the stale master, resolve the fork, restore its state file or perform the explicit promotion in section 2 (raise both `term` and `version`), then restart it. |
+| Slave stays `Synced` but its master is gone / stale config | The TCP session is blackholed (no frames, no close) | The slave now treats any frame as liveness proof and requires one within `3 × ping_interval_secs` (default 45 s). On timeout it leaves `Synced`, sets `readiness_reason`, and `/health` reports not ready while DNS keeps serving the last applied configuration. Check the network path/port 8953 and the master process. |
+| Slave reports `"Degraded"` with `Local configuration drift` | `config.toml` was edited or reverted locally after the last applied bundle | The persisted `ha_watermark.toml` stores the digest of the exact applied document. Wait for the master to push the current bundle (the slave forces a full apply even for the same version) or issue a resync. If the master is unreachable the node stays degraded and `/health` false until it reconnects. |
 | Slave reports a same-version payload fork | The master and slave hold different signed content for the same term and version (split brain) | The slave persists a fork latch in `ha_watermark.toml`, degrades, and rejects all same-term pushes; the master records divergence and stops showing the slave as synced. Do not retry the same version. Isolate the forked master and perform an explicit promotion with a strictly higher `term` **and** `version` (section 2); the promoted bundle clears the latch. |
+| Master `/health` stays false after an external `config.toml` edit, log says the HA bundle exceeds the replication limit | The file watcher rolled the live configuration back, but the oversized external file is left on disk; publication re-reads it on every attempt | Correct or replace `config.toml` with a document under the replication limit (or restore the previous file). Until then each republish/retry re-reads the oversized document and `/health` cannot recover. The `PUT /api/v1/config` path rolls the persisted document back and is not affected. |
 | API returns `409 Conflict` | Mutation attempted directly on a slave node | Perform configuration edits on the master node indicated in the `X-Dnsd-Master` header. |
-| `POST /api/v1/ha/resync` returns `503` | No HA coordinator/tracker on the node, the replication worker stopped, or the push could not be queued | Check the node's role and `GET /api/v1/ha/status`. A `429` means a resync is already queued; retry shortly. |
+| `POST /api/v1/ha/resync` returns `503` | HA replication is inactive on the node, the slave worker stopped, or (master) a push could not be queued for any of the connected slaves | Check the node's role and `GET /api/v1/ha/status`. A `429` means a resync is already queued; retry shortly. With no connected slaves and no active bundle the master still returns `200` with `slaves_notified: 0`. |
 
 ### Diagnostic Commands
 
+The `/api/v1/*` endpoints used below require authentication. Export an Admin API
+token (or use a session cookie) before running these examples:
+
+```bash
+export TOKEN='sito_...'   # Admin token: resync requires Admin; GETs accept Viewer+
+```
+
 1. **Check HA status on Master**:
    ```bash
-   curl -s http://192.168.1.10:8080/api/v1/ha/status | jq .
-   curl -s http://192.168.1.10:8080/api/v1/ha/slaves | jq .
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.10:8080/api/v1/ha/status | jq .
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.10:8080/api/v1/ha/slaves | jq .
    ```
 2. **Check HA status on Slave**:
    ```bash
-   curl -s http://192.168.1.11:8080/api/v1/ha/status | jq .
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.11:8080/api/v1/ha/status | jq .
    ```
    `/ha/status` fields:
    - Common: `role`, `instance_name`, `version`, `state`.
@@ -466,11 +491,13 @@ When a slave node fails or must be reprovisioned from bare metal:
    also window deltas, not lifetime totals).
 3. **Trigger Manual Resynchronization**:
    ```bash
-   # From the master:
-   curl -s -X POST http://192.168.1.10:8080/api/v1/ha/resync | jq .
+   # From the master (Admin token required):
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.10:8080/api/v1/ha/resync | jq .
 
    # Or from a slave:
-   curl -s -X POST http://192.168.1.11:8080/api/v1/ha/resync | jq .
+   curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.11:8080/api/v1/ha/resync | jq .
    ```
    A master response includes the queueing result:
    ```json
@@ -482,13 +509,19 @@ When a slave node fails or must be reprovisioned from bare metal:
      "slaves_notified": 2
    }
    ```
-   `503 Service Unavailable` means HA is not active on the node, the slave
-   worker is not running, or (master) no connected slave could be queued;
-   `429 Too Many Requests` means a resync request is already pending.
+   `200 OK` means the resync was accepted (a master with no connected slaves
+   and no active bundle reports `slaves_notified: 0`). `503 Service Unavailable`
+   means HA is not active on the node, the slave worker is not running, or
+   (master) no connected slave could be queued; `429 Too Many Requests` means a
+   resync request is already pending.
 4. **Inspect Prometheus HA Metrics**:
    ```bash
-   curl -s http://192.168.1.10:8080/metrics | grep sito_ha_
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://192.168.1.10:8080/metrics | grep sito_ha_
    ```
+   `/metrics` requires authentication by default (`web.metrics_auth = true`);
+   use a Viewer-or-higher token or session. Operators who deliberately expose an
+   unauthenticated scrape endpoint must set `web.metrics_auth = false`.
    Look for:
     - `sito_ha_slaves_connected`: Number of active slaves connected to this master.
     - `sito_ha_config_version{instance="..."}`: Published configuration version per

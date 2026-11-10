@@ -118,6 +118,19 @@ impl QuicUpstream {
         *guard = Some(conn.clone());
         Ok(conn)
     }
+
+    /// Forget the cached connection after a stream failure, unless another task
+    /// has already replaced it.
+    async fn invalidate_connection(&self, stale: &quinn::Connection) {
+        let mut guard = self.connection.lock().await;
+        if guard
+            .as_ref()
+            .is_some_and(|current| current.stable_id() == stale.stable_id())
+        {
+            *guard = None;
+            trace!(peer = %self.remote_addr, "Dropped wedged cached DoQ connection");
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -138,57 +151,70 @@ impl Upstream for QuicUpstream {
         };
 
         let conn = self.get_connection().await?;
+        // A stream-slot timeout/open error must not invalidate the connection:
+        // the connection itself may be healthy and merely at its stream limit.
         let (mut send, mut recv) = tokio::time::timeout(self.timeout, conn.open_bi())
             .await
             .map_err(|_| UpstreamError::Timeout)?
             .map_err(|e| UpstreamError::Io(format!("failed to open DoQ stream: {e}")))?;
 
-        let write = async {
-            send.write_all(&encoded_len.to_be_bytes())
+        let result = async {
+            let write = async {
+                send.write_all(&encoded_len.to_be_bytes())
+                    .await
+                    .map_err(|e| UpstreamError::Io(format!("DoQ stream write failed: {e}")))?;
+                send.write_all(&encoded)
+                    .await
+                    .map_err(|e| UpstreamError::Io(format!("DoQ stream write failed: {e}")))?;
+                let _ = send.finish();
+                Ok::<(), UpstreamError>(())
+            };
+            tokio::time::timeout(self.timeout, write)
                 .await
-                .map_err(|e| UpstreamError::Io(format!("DoQ stream write failed: {e}")))?;
-            send.write_all(&encoded)
-                .await
-                .map_err(|e| UpstreamError::Io(format!("DoQ stream write failed: {e}")))?;
-            let _ = send.finish();
-            Ok::<(), UpstreamError>(())
-        };
-        tokio::time::timeout(self.timeout, write)
-            .await
-            .map_err(|_| UpstreamError::Timeout)??;
+                .map_err(|_| UpstreamError::Timeout)??;
 
-        let read = async {
-            let mut len_buf = [0u8; 2];
-            recv.read_exact(&mut len_buf)
+            let read = async {
+                let mut len_buf = [0u8; 2];
+                recv.read_exact(&mut len_buf)
+                    .await
+                    .map_err(|e| UpstreamError::Io(format!("DoQ stream read failed: {e}")))?;
+                let resp_len = u16::from_be_bytes(len_buf) as usize;
+                if resp_len == 0 {
+                    return Err(UpstreamError::BadResponse("empty DoQ response".to_string()));
+                }
+                let mut resp_buf = vec![0u8; resp_len];
+                recv.read_exact(&mut resp_buf)
+                    .await
+                    .map_err(|e| UpstreamError::Io(format!("DoQ stream read failed: {e}")))?;
+                Ok::<Vec<u8>, UpstreamError>(resp_buf)
+            };
+            let resp_buf = tokio::time::timeout(self.timeout, read)
                 .await
-                .map_err(|e| UpstreamError::Io(format!("DoQ stream read failed: {e}")))?;
-            let resp_len = u16::from_be_bytes(len_buf) as usize;
-            if resp_len == 0 {
-                return Err(UpstreamError::BadResponse("empty DoQ response".to_string()));
+                .map_err(|_| UpstreamError::Timeout)??;
+
+            let mut response = decode_message(&resp_buf)
+                .map_err(|e| UpstreamError::BadResponse(format!("invalid DoQ response: {e}")))?;
+            // RFC 9250 section 4.2.1: responses MUST use DNS message ID 0. Check the
+            // wire ID before rewriting it, otherwise the mismatch check is vacuous.
+            if response.metadata.id != 0 {
+                return Err(UpstreamError::BadResponse(format!(
+                    "DoQ response ID must be 0 on the wire, got {}",
+                    response.metadata.id
+                )));
             }
-            let mut resp_buf = vec![0u8; resp_len];
-            recv.read_exact(&mut resp_buf)
-                .await
-                .map_err(|e| UpstreamError::Io(format!("DoQ stream read failed: {e}")))?;
-            Ok::<Vec<u8>, UpstreamError>(resp_buf)
-        };
-        let resp_buf = tokio::time::timeout(self.timeout, read)
-            .await
-            .map_err(|_| UpstreamError::Timeout)??;
-
-        let mut response = decode_message(&resp_buf)
-            .map_err(|e| UpstreamError::BadResponse(format!("invalid DoQ response: {e}")))?;
-        // RFC 9250 section 4.2.1: responses MUST use DNS message ID 0. Check the
-        // wire ID before rewriting it, otherwise the mismatch check is vacuous.
-        if response.metadata.id != 0 {
-            return Err(UpstreamError::BadResponse(format!(
-                "DoQ response ID must be 0 on the wire, got {}",
-                response.metadata.id
-            )));
+            response.metadata.id = msg.metadata.id;
+            validate_response(msg, &response)?;
+            Ok(response)
         }
-        response.metadata.id = msg.metadata.id;
-        validate_response(msg, &response)?;
-        Ok(response)
+        .await;
+
+        // Drop a cached connection whose stream failed. Without this a wedged
+        // connection that has not reported a close reason would keep being
+        // reused for every query.
+        if result.is_err() {
+            self.invalidate_connection(&conn).await;
+        }
+        result
     }
 }
 
@@ -208,9 +234,12 @@ mod tests {
     }
 
     /// Starts a minimal RFC 9250 echo server with a fresh self-signed
-    /// certificate, replying with the given wire DNS message ID.
+    /// certificate, replying with the given wire DNS message ID. When
+    /// `wedged_first_connection` is set, the first connection is held open but
+    /// never answered, so the client must reconnect after timing out.
     fn spawn_doq_server(
         response_id: u16,
+        wedged_first_connection: bool,
     ) -> (SocketAddr, rustls::pki_types::CertificateDer<'static>) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
@@ -233,34 +262,55 @@ mod tests {
         let addr = endpoint.local_addr().unwrap();
 
         tokio::spawn(async move {
-            if let Some(incoming) = endpoint.accept().await {
+            let mut connection_index = 0usize;
+            let mut held_open = Vec::new();
+            let mut held_streams = Vec::new();
+            while let Some(incoming) = endpoint.accept().await {
                 let Ok(conn) = incoming.await else {
-                    return;
+                    continue;
                 };
-                loop {
-                    let Ok((mut send, mut recv)) = conn.accept_bi().await else {
-                        break;
-                    };
-                    let mut len_buf = [0u8; 2];
-                    if recv.read_exact(&mut len_buf).await.is_err() {
-                        break;
+                connection_index += 1;
+                if wedged_first_connection && connection_index == 1 {
+                    // Read part of the query but never answer it, and keep the
+                    // stream handles alive so the client observes a timeout
+                    // rather than an early stream finish.
+                    if let Ok((send, mut recv)) = conn.accept_bi().await {
+                        let mut len_buf = [0u8; 2];
+                        let _ = recv.read_exact(&mut len_buf).await;
+                        held_streams.push((send, recv));
                     }
-                    let query_len = u16::from_be_bytes(len_buf) as usize;
-                    let mut query_buf = vec![0u8; query_len];
-                    if recv.read_exact(&mut query_buf).await.is_err() {
-                        break;
-                    }
-                    let query = decode_message(&query_buf).unwrap();
-                    // RFC 9250: queries use ID 0.
-                    assert_eq!(query.metadata.id, 0);
-                    let mut resp = Message::new(response_id, MessageType::Response, OpCode::Query);
-                    resp.metadata.response_code = sito_proto::ResponseCode::NoError;
-                    resp.queries = query.queries.clone();
-                    let encoded = encode_message(&resp).unwrap();
-                    let _ = send.write_all(&(encoded.len() as u16).to_be_bytes()).await;
-                    let _ = send.write_all(&encoded).await;
-                    let _ = send.finish();
+                    held_open.push(conn);
+                    continue;
                 }
+                let conn_for_task = conn.clone();
+                held_open.push(conn);
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((mut send, mut recv)) = conn_for_task.accept_bi().await else {
+                            break;
+                        };
+                        let mut len_buf = [0u8; 2];
+                        if recv.read_exact(&mut len_buf).await.is_err() {
+                            break;
+                        }
+                        let query_len = u16::from_be_bytes(len_buf) as usize;
+                        let mut query_buf = vec![0u8; query_len];
+                        if recv.read_exact(&mut query_buf).await.is_err() {
+                            break;
+                        }
+                        let query = decode_message(&query_buf).unwrap();
+                        // RFC 9250: queries use ID 0.
+                        assert_eq!(query.metadata.id, 0);
+                        let mut resp =
+                            Message::new(response_id, MessageType::Response, OpCode::Query);
+                        resp.metadata.response_code = sito_proto::ResponseCode::NoError;
+                        resp.queries = query.queries.clone();
+                        let encoded = encode_message(&resp).unwrap();
+                        let _ = send.write_all(&(encoded.len() as u16).to_be_bytes()).await;
+                        let _ = send.write_all(&encoded).await;
+                        let _ = send.finish();
+                    }
+                });
             }
         });
 
@@ -286,7 +336,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_doq_query_roundtrip_uses_id_zero_on_wire() {
-        let (addr, cert) = spawn_doq_server(0);
+        let (addr, cert) = spawn_doq_server(0, false);
         let upstream = QuicUpstream::with_client_config(
             "localhost",
             addr,
@@ -306,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_doq_untrusted_certificate_rejected() {
-        let (addr, _cert) = spawn_doq_server(0);
+        let (addr, _cert) = spawn_doq_server(0, false);
         // Trust a different self-signed certificate than the server presents.
         let other = rcgen::generate_simple_self_signed(vec!["other.local".to_string()]).unwrap();
         let other_der = rustls::pki_types::CertificateDer::from(other.cert);
@@ -326,11 +376,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_doq_drops_wedged_cached_connection_and_reconnects() {
+        let (addr, cert) = spawn_doq_server(0, true);
+        let upstream = QuicUpstream::with_client_config(
+            "localhost",
+            addr,
+            Duration::from_millis(250),
+            client_config_trusting(&cert),
+        )
+        .unwrap();
+
+        // First connection is accepted but never answered: the query times out
+        // and the cached connection must be discarded.
+        let first = upstream.resolve(&make_query(0x1111)).await;
+        assert!(
+            matches!(first, Err(UpstreamError::Timeout)),
+            "wedged connection must surface as a timeout: {first:?}"
+        );
+
+        // The next query must open a fresh connection and succeed.
+        let second = tokio::time::timeout(
+            Duration::from_secs(3),
+            upstream.resolve(&make_query(0x2222)),
+        )
+        .await
+        .expect("second query must not hang on the wedged connection")
+        .expect("a fresh DoQ connection must answer");
+        assert_eq!(second.metadata.id, 0x2222);
+    }
+
+    #[tokio::test]
     async fn test_doq_rejects_nonzero_wire_id() {
         // RFC 9250: responses MUST carry DNS message ID 0. A server echoing a
         // non-zero ID must be rejected (previously the check was vacuous
         // because the ID was overwritten before validation).
-        let (addr, cert) = spawn_doq_server(0x1234);
+        let (addr, cert) = spawn_doq_server(0x1234, false);
         let upstream = QuicUpstream::with_client_config(
             "localhost",
             addr,

@@ -94,6 +94,8 @@ mod tests {
         let mut config = Config::default();
         config.server.data_dir = temp_dir.clone();
         config.upstream.servers = vec![mock_addr.to_string()];
+        // This test exercises blocking/cache/upstream, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.filtering.custom_rules = vec!["0.0.0.0 ads.example.com".to_string()];
 
         let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
@@ -241,6 +243,8 @@ mod tests {
         let mut config = Config::default();
         config.server.data_dir = temp_dir.clone();
         config.upstream.servers = vec![mock_addr.to_string()];
+        // This test exercises filter precedence, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.filtering.custom_rules = vec![
             "||ads.example.com^".to_string(),
             "@@||ads.example.com^$important".to_string(),
@@ -386,6 +390,9 @@ mod tests {
         let mut base = Config::default();
         base.server.data_dir = temp_dir.clone();
         base.upstream.servers = vec![addr_global.to_string()];
+        // This test exercises per-client upstream routing, not filtering/DNSSEC.
+        base.filtering.enabled = false;
+        base.dns.dnssec.validate = false;
         let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
 
         let global_upstream = Arc::new(
@@ -835,6 +842,8 @@ mod tests {
 
         let mut config = Config::default();
         config.server.data_dir = temp_dir.clone();
+        // This test exercises listener rebinding, not filtering.
+        config.filtering.enabled = false;
         config.dns.bind = vec!["127.0.0.1".parse().unwrap()];
         config.dns.port = first_port;
         let mut web_cfg = config.get_web_config();
@@ -947,6 +956,7 @@ mod tests {
         let mut config = Config::default();
         config.server.data_dir = temp_dir.clone();
         config.upstream.servers = vec!["127.0.0.1:1".to_string()];
+        config.filtering.enabled = false;
 
         let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
         let upstream = Arc::new(
@@ -1078,6 +1088,9 @@ mod tests {
         let mut config = Config::default();
         config.server.data_dir = temp_dir.clone();
         config.upstream.servers = vec![mock_addr.to_string()];
+        // This test exercises negative caching, not filtering/DNSSEC.
+        config.filtering.enabled = false;
+        config.dns.dnssec.validate = false;
         config.dns.cache.enabled = true;
         config.dns.cache.min_ttl = 10;
         config.dns.cache.negative_ttl_max = 300;
@@ -1203,7 +1216,11 @@ mod tests {
         let mut config = Config::default();
         config.server.data_dir = temp_dir.clone();
         config.upstream.servers = vec![mock_addr.to_string()];
+        // This test exercises CNAME uncloaking on cache hits, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.filtering.cname_cloaking = true;
+        // Keep filtering active (so CNAME uncloaking runs) with a benign rule.
+        config.filtering.custom_rules = vec!["||never-match.invalid^".to_string()];
 
         let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
         let upstream = Arc::new(
@@ -1312,6 +1329,7 @@ mod tests {
         let mut config = Config::default();
         config.server.data_dir = temp_dir.clone();
         config.upstream.servers = vec![mock_addr.to_string()];
+        config.filtering.enabled = false;
         config.dns.cache.enabled = true;
         config.dns.cache.prefetch = true;
         config.dns.cache.min_ttl = 5;
@@ -1438,6 +1456,8 @@ mod tests {
         let mut config = Config::default();
         config.server.data_dir = temp_dir.clone();
         config.upstream.servers = vec![mock_addr.to_string()];
+        // This test exercises CNAME filtering precedence, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.dns.cache.enabled = false;
         config.filtering.enabled = false;
         config.filtering.cname_cloaking = true;

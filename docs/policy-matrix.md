@@ -49,7 +49,10 @@ When a client is resolved, its effective group policy is compiled lazily at quer
 | **Schedules** | 5- or 6-field cron expressions | None | None | None |
 
 ### Schedule Evaluation (`croner`):
-- Evaluated lazily at query timestamp using UTC.
+- Evaluated lazily at query timestamp in the client's configured timezone.
+  `clients.timezone` defaults to `"local"` (the host's system timezone,
+  DST-aware), not UTC; `"UTC"` and fixed offsets such as `"+02:00"` are also
+  accepted. IANA zone names are not supported (no tzdb dependency).
 - Supports both standard 5-field cron (`min hour dom month dow`) and 6-field cron with seconds (`sec min hour dom month dow`).
 - Supports interval ranges (e.g. `0 0 15-21 * * MON-FRI` for 15:00:00 through 21:59:59).
 - Syntax errors in configuration are rejected at load time via `sito check-config` with the exact 1-indexed field number that failed validation.

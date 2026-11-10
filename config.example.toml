@@ -5,13 +5,13 @@ role = "master"
 instance_name = "sito-main"
 data_dir = "/var/lib/sito"
 log_level = "info"
-log_format = "pretty"
+log_format = "json"
 # Require cosign-verified release signatures for in-app updates (default true)
 # update_require_signature = true
 
 [dns]
 # Security: this wildcard default accepts DNS queries from every source that
-# can reach the host, and 1.9.2 has no DNS client allow-list. Restrict the DNS
+# can reach the host, and 1.9.5 has no DNS client allow-list. Restrict the DNS
 # ports to your LAN with a host firewall, or bind specific LAN addresses.
 # A default-deny DNS ACL is planned for 1.10.0.
 bind = ["0.0.0.0", "::"]
@@ -39,8 +39,8 @@ size_mb = 64
 min_ttl = 60
 max_ttl = 86400
 negative_ttl_max = 3600
-prefetch = false
-serve_stale_hours = 0
+prefetch = true
+serve_stale_hours = 12
 
 [dns.dnssec]
 # "validate"/"strict" (bogus -> SERVFAIL), "permissive"/"log_only" (log and
@@ -63,6 +63,9 @@ strategy = "failover"
 timeout_ms = 5000
 probe_domain = "example.com"
 pool_size = 4
+# Hostname-configured upstreams may not resolve to private/reserved addresses
+# unless this is true. IP literals are always accepted.
+allow_private_targets = false
 
 [filtering]
 enabled = true
@@ -82,6 +85,11 @@ anti_doh_bypass = "off"
 # and no network answers SERVFAIL until a fetch under the new cap succeeds; a
 # live reload keeps the previous snapshot and records the list in failed_lists.
 max_list_bytes = 67108864
+# Reject (default) an empty list body or a list that parses to zero rules,
+# keeping the previous snapshot and marking the list failed. Set to true only
+# for sources that legitimately return an empty list; false keeps filtering
+# fail-closed against a broken/hostile source.
+allow_empty_list = false
 lists = []
 custom_rules = [
     "0.0.0.0 ads.example.com",
@@ -99,6 +107,10 @@ token_default_ttl_days = 90
 
 [stats]
 retention_days = 90
+# Hourly rollups keep aggregate totals and top domains; client IPs are stored
+# as keyed BLAKE3 hashes and names are omitted unless explicitly enabled.
+rollup_retention_days = 365
+rollup_client_names = false
 
 [privacy]
 anonymize_querylog = false
@@ -162,13 +174,14 @@ anonymize_querylog = false
 # tunnel or a TLS reverse proxy; the DNS [tls] certificate never secures the
 # admin scheme. Binding a wildcard address without declaring a reverse proxy
 # triggers a startup network-exposure warning. The loopback default is planned
-# for 1.10.0; 1.9.2 keeps 0.0.0.0 for compatibility.
+# for 1.10.0; 1.9.5 keeps 0.0.0.0 for compatibility.
 enabled = true
 bind = "0.0.0.0"
 port = 8080
 metrics_auth = true
 # When binding non-loopback over plain HTTP the admin interface is reachable
-# without transport encryption; use a TLS reverse proxy or [tls] in production.
+# without transport encryption; use an SSH tunnel or a TLS reverse proxy. The
+# DNS [tls] certificate never secures the admin scheme.
 trusted_proxies = []
 # The admin UI is served over plain HTTP by axum; TLS is terminated either by
 # an explicit public URL or by a reverse proxy. The DNS [tls] certificate only

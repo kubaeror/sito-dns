@@ -2,11 +2,11 @@
   "openapi": "3.1.0",
   "info": {
     "title": "sito DNS Administrative API",
-    "description": "Administrative REST API and OpenAPI 3.1 specification for the sito DNS server. Account, role, and API-token management plus TOTP status/disabling are available in the web UI (/users and /account); TOTP enrollment/setup remains REST-only. See docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
+    "description": "Administrative REST API and OpenAPI 3.1 specification for the sito DNS server. Account, role, API-token management, and self-service TOTP enrollment are available in the web UI (/users and /account); sensitive TOTP changes require a fresh re-authentication ticket from POST /api/v1/auth/reauth. See docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
     "license": {
       "name": "GPL-3.0-only"
     },
-    "version": "1.9.3"
+    "version": "1.9.5"
   },
   "paths": {
     "/api/v1/auth/change-password": {
@@ -97,7 +97,17 @@
         },
         "responses": {
           "200": {
-            "description": "Login successful or TOTP required",
+            "description": "Login successful",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Password accepted; TOTP verification required",
             "content": {
               "application/json": {
                 "schema": {
@@ -148,6 +158,72 @@
             }
           }
         }
+      }
+    },
+    "/api/v1/auth/reauth": {
+      "post": {
+        "tags": [
+          "crate::handlers::auth_handlers"
+        ],
+        "summary": "Re-authenticate a live session and issue a short-lived ticket for a\nsensitive operation (TOTP enrollment/change).",
+        "operationId": "reauth",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReauthRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Re-authentication accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReauthResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid password or second factor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A user session is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Locked out or rate limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/auth/tokens": {
@@ -218,7 +294,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "API token created",
             "content": {
               "application/json": {
@@ -343,8 +419,20 @@
         "tags": [
           "crate::handlers::auth_handlers"
         ],
-        "summary": "Disable TOTP 2FA. Requires the account password and, when TOTP is enabled,\na valid TOTP or backup code.",
+        "summary": "Disable TOTP 2FA.",
+        "description": "Requires a fresh re-authentication ticket (`X-Reauth-Token`) from\n`POST /api/v1/auth/reauth`; that call proves the account password and, when\nTOTP is enabled, the current TOTP or backup code. The legacy request-body\ncredentials remain accepted for client compatibility but are superseded by\nthe re-authentication ticket.",
         "operationId": "disable_totp",
+        "parameters": [
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Short-lived re-authentication ticket from POST /api/v1/auth/reauth",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -366,18 +454,8 @@
               }
             }
           },
-          "400": {
-            "description": "Missing second-factor code",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            }
-          },
           "401": {
-            "description": "Invalid password or code",
+            "description": "Missing, invalid, or expired re-authentication ticket",
             "content": {
               "application/json": {
                 "schema": {
@@ -395,12 +473,19 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "User account not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
-          {
-            "bearer_auth": []
-          },
           {
             "cookie_auth": []
           }
@@ -414,6 +499,17 @@
         ],
         "summary": "Enable TOTP 2FA by verifying setup code.",
         "operationId": "enable_totp",
+        "parameters": [
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Short-lived re-authentication ticket from POST /api/v1/auth/reauth",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -446,7 +542,7 @@
             }
           },
           "401": {
-            "description": "Unauthorized",
+            "description": "Missing, invalid, or expired re-authentication ticket",
             "content": {
               "application/json": {
                 "schema": {
@@ -467,9 +563,6 @@
           }
         },
         "security": [
-          {
-            "bearer_auth": []
-          },
           {
             "cookie_auth": []
           }
@@ -483,6 +576,17 @@
         ],
         "summary": "Initiate TOTP 2FA setup.",
         "operationId": "get_totp_setup",
+        "parameters": [
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Short-lived re-authentication ticket from POST /api/v1/auth/reauth",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "TOTP setup credentials generated",
@@ -495,7 +599,7 @@
             }
           },
           "401": {
-            "description": "Unauthorized",
+            "description": "Missing, invalid, or expired re-authentication ticket",
             "content": {
               "application/json": {
                 "schema": {
@@ -516,9 +620,6 @@
           }
         },
         "security": [
-          {
-            "bearer_auth": []
-          },
           {
             "cookie_auth": []
           }
@@ -634,7 +735,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "User created",
             "content": {
               "application/json": {
@@ -1101,14 +1202,21 @@
               }
             }
           },
-          "400": {
-            "description": "Group already exists"
-          },
           "401": {
             "description": "Unauthorized"
           },
           "403": {
             "description": "Forbidden"
+          },
+          "409": {
+            "description": "Group already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         }
       }
@@ -2058,6 +2166,32 @@
         }
       }
     },
+    "/api/v1/filtering/status": {
+      "get": {
+        "tags": [
+          "Filtering"
+        ],
+        "operationId": "get_filtering_status",
+        "responses": {
+          "200": {
+            "description": "Filter engine lifecycle and per-list health",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FilterStatusDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
     "/api/v1/ha/resync": {
       "post": {
         "tags": [
@@ -2328,6 +2462,18 @@
               ],
               "minimum": 0
             }
+          },
+          {
+            "name": "include_total",
+            "in": "query",
+            "description": "Defaults to `true` for API compatibility. The live UI refresh passes\n`false` so the 3 s poll does not run a whole-table `COUNT(*)`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -2349,6 +2495,14 @@
           },
           "429": {
             "description": "Rate limited",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2364,6 +2518,17 @@
           "QueryLog"
         ],
         "operationId": "delete_querylog",
+        "parameters": [
+          {
+            "name": "keep_aggregates",
+            "in": "query",
+            "description": "Preserve `stats_hourly` rollups (the old “fold into aggregates”\nbehavior). Defaults to `false`: both detailed rows and rollups are\nerased.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Query log cleared successfully",
@@ -2584,6 +2749,24 @@
           },
           "403": {
             "description": "Forbidden"
+          },
+          "429": {
+            "description": "Rate limited",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         }
       }
@@ -2645,6 +2828,24 @@
           },
           "403": {
             "description": "Forbidden"
+          },
+          "429": {
+            "description": "Rate limited",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         }
       }
@@ -2706,6 +2907,24 @@
           },
           "403": {
             "description": "Forbidden"
+          },
+          "429": {
+            "description": "Rate limited",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         }
       }
@@ -3026,6 +3245,46 @@
   },
   "components": {
     "schemas": {
+      "AcmeStatus": {
+        "type": "object",
+        "description": "ACME readiness exposed by the authenticated status endpoint.",
+        "required": [
+          "enabled",
+          "ready",
+          "http01_available",
+          "tls_alpn_available"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "http01_available": {
+            "type": "boolean",
+            "description": "Dedicated HTTP-01 listener is bound."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Most recent issuance/renewal error, if any."
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stable reason code when not ready (`acme_challenge_unavailable` or\n`acme_issuance_failed`)."
+          },
+          "tls_alpn_available": {
+            "type": "boolean",
+            "description": "TCP 443 DoH listener with `acme-tls/1` is bound."
+          }
+        }
+      },
       "AddFilterListRequest": {
         "type": "object",
         "description": "Request to create a new filter list.",
@@ -3366,6 +3625,17 @@
           "message"
         ],
         "properties": {
+          "ha_publish": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HaPublishStatus",
+                "description": "HA publication result when this node is a cluster master. Omitted for\nnon-HA nodes and slaves."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "message": {
             "type": "string"
           },
@@ -3574,6 +3844,82 @@
           }
         }
       },
+      "FilterStatusDto": {
+        "type": "object",
+        "description": "Observable filter-engine status (additive, read-only).",
+        "required": [
+          "state",
+          "rule_count",
+          "loaded_lists",
+          "failed_lists",
+          "degraded_lists",
+          "degraded_groups",
+          "dropped_regex_patterns",
+          "unavailable"
+        ],
+        "properties": {
+          "degraded_groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Groups published without their regex/wildcard (or substring/prefix)\nclass after a budget/limit failure."
+          },
+          "degraded_lists": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Lists whose newest content was rejected while an older snapshot stayed."
+          },
+          "dropped_regex_patterns": {
+            "type": "integer",
+            "description": "Regex/wildcard patterns dropped from the active snapshot.",
+            "minimum": 0
+          },
+          "failed_lists": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Configured lists that failed (fetch, parse, empty/zero-yield, limits)."
+          },
+          "last_compile_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Wall-clock milliseconds of the last parse+compile attempt.",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Most recent reload error."
+          },
+          "loaded_lists": {
+            "type": "integer",
+            "description": "Configured lists that loaded in the last reload.",
+            "minimum": 0
+          },
+          "rule_count": {
+            "type": "integer",
+            "description": "Active compiled rules.",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "`disabled`, `loading`, `ready` or `failed`."
+          },
+          "unavailable": {
+            "type": "boolean",
+            "description": "True when no usable snapshot is active and fail-closed answers SERVFAIL."
+          }
+        }
+      },
       "GenericMessageResponse": {
         "type": "object",
         "description": "Generic success message response.",
@@ -3662,6 +4008,33 @@
           "total_queries": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "HaPublishStatus": {
+        "type": "object",
+        "description": "Outcome of publishing a configuration to HA replica slaves.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable failure reason. Never contains secret material."
+          },
+          "retry_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC3339 timestamp of the first background retry, when one is scheduled."
+          },
+          "status": {
+            "type": "string",
+            "description": "`published`, `no_slaves` or `failed`."
           }
         }
       },
@@ -4085,6 +4458,13 @@
             ],
             "format": "int64"
           },
+          "include_total": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether to run the `COUNT(*)` used for `total_count`. Defaults to\n`true` for API compatibility; the live UI refresh sets it to `false`\nso the 3 s poll does not scan the filtered table."
+          },
           "limit": {
             "type": [
               "integer",
@@ -4140,6 +4520,44 @@
               "null"
             ],
             "format": "int64"
+          }
+        }
+      },
+      "ReauthRequest": {
+        "type": "object",
+        "description": "Re-authentication request for a sensitive operation.",
+        "required": [
+          "password"
+        ],
+        "properties": {
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Current TOTP or backup code; required when TOTP is enabled."
+          },
+          "password": {
+            "type": "string"
+          }
+        }
+      },
+      "ReauthResponse": {
+        "type": "object",
+        "description": "Short-lived, session-bound re-authentication ticket.",
+        "required": [
+          "reauth_token",
+          "expires_in"
+        ],
+        "properties": {
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Remaining lifetime in seconds.",
+            "minimum": 0
+          },
+          "reauth_token": {
+            "type": "string"
           }
         }
       },
@@ -4237,6 +4655,17 @@
           "listeners"
         ],
         "properties": {
+          "acme": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AcmeStatus",
+                "description": "ACME challenge/issuance readiness (D12). Omitted when ACME is disabled."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "listeners": {
             "type": "array",
             "items": {

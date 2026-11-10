@@ -13,11 +13,8 @@ feature-depth = 1
 [advisories]
 version = 2
 ignore = [
-    # `basic-toml` is a build-time-only dependency of askama_macros (parsing
-    # template configuration during compilation); it is not linked into the
-    # runtime binary. The crate is unmaintained (RUSTSEC-2026-0374) and
-    # askama 0.16.1 (the latest release) still requires it; track an askama
-    # update that drops the dependency.
+    # Build-time-only via askama_macros (template config parsing); not linked
+    # into the runtime binary. Askama has not dropped basic-toml yet.
     "RUSTSEC-2026-0374",
 ]
 

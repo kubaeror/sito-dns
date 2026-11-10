@@ -23,7 +23,6 @@ use crate::state::ServerContext;
 use sito_core::config::Config;
 use sito_upstream::BootstrapResolver;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Future returned by [`ConfigApplyHooks::apply`] (boxed so the trait stays
 /// object-safe without an extra macro dependency in the server binary).
@@ -77,6 +76,81 @@ pub enum FilterApply {
 pub struct AppliedReport {
     /// Settings that changed but are only read at process start.
     pub restart_required: Vec<String>,
+    /// HA publication result on a master, or `None` for non-HA nodes.
+    pub ha_publish: Option<HaPublishReport>,
+}
+
+/// Client-visible summary of an HA publication attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaPublishReport {
+    /// `published`, `no_slaves` or `failed`.
+    pub status: String,
+    /// Failure detail, never containing secret material.
+    pub error: Option<String>,
+    /// RFC3339 timestamp of the first scheduled retry.
+    pub retry_at: Option<String>,
+}
+
+impl HaPublishReport {
+    #[must_use]
+    pub fn from_outcome(outcome: sito_ha::PublishOutcome) -> Self {
+        match outcome {
+            sito_ha::PublishOutcome::Published { .. } => Self {
+                status: "published".to_string(),
+                error: None,
+                retry_at: None,
+            },
+            sito_ha::PublishOutcome::NoSlaves => Self {
+                status: "no_slaves".to_string(),
+                error: None,
+                retry_at: None,
+            },
+            // Callers normally treat this as an apply error before building a
+            // report; keep a faithful representation for completeness.
+            sito_ha::PublishOutcome::TooLarge { bytes, limit } => Self {
+                status: "failed".to_string(),
+                error: Some(format!(
+                    "configuration bundle is {bytes} bytes, above the {limit}-byte replication limit"
+                )),
+                retry_at: None,
+            },
+        }
+    }
+
+    /// Builds a failed report with the historical one-second retry estimate.
+    ///
+    /// Compatibility wrapper for external callers; use
+    /// [`Self::failed_with_retry`] when the caller knows the delay of the retry
+    /// loop that was actually scheduled.
+    #[must_use]
+    pub fn failed(error: impl Into<String>) -> Self {
+        Self::failed_with_retry(error, Some(std::time::Duration::from_secs(1)))
+    }
+
+    /// Builds a failed report from the actual retry schedule.
+    ///
+    /// `retry_delay` is the delay before the first attempt of the retry loop
+    /// that was actually started, or `None` when no new loop was scheduled
+    /// (HA inactive, or an existing loop already owns the backoff schedule).
+    /// Guessing a fixed one-second delay misleads operators when the next
+    /// attempt is much later.
+    #[must_use]
+    pub fn failed_with_retry(
+        error: impl Into<String>,
+        retry_delay: Option<std::time::Duration>,
+    ) -> Self {
+        let retry_at = retry_delay.and_then(|delay| {
+            let delta = chrono::TimeDelta::from_std(delay).ok()?;
+            chrono::Utc::now()
+                .checked_add_signed(delta)
+                .map(|at| at.to_rfc3339())
+        });
+        Self {
+            status: "failed".to_string(),
+            error: Some(error.into()),
+            retry_at,
+        }
+    }
 }
 
 /// Deep validation of a candidate configuration.
@@ -241,11 +315,13 @@ async fn apply_full_config_locked(
     match apply_inner(ctx, candidate, filter_apply, hooks).await {
         Ok(()) => Ok(AppliedReport {
             restart_required: restart_required_fields(&previous, candidate),
+            ha_publish: None,
         }),
         Err(e) => {
             // Roll the components applied so far back to the previous
-            // configuration. Best effort: a failed rollback is logged loudly.
-            if let Err(rollback_err) = apply_inner(ctx, &previous, FilterApply::Sync, hooks).await {
+            // configuration, using the same filter mode as the failed apply.
+            // Best effort: a failed rollback is logged loudly.
+            if let Err(rollback_err) = apply_inner(ctx, &previous, filter_apply, hooks).await {
                 tracing::error!(
                     error = %rollback_err.detail,
                     "Failed to roll back configuration apply; runtime may be partially updated"
@@ -342,11 +418,16 @@ async fn apply_and_persist_document_locked(
     hooks: Option<&dyn ConfigApplyHooks>,
 ) -> Result<AppliedReport, ProblemDetails> {
     let previous = (**ctx.config.load()).clone();
-    let report = apply_full_config_locked(ctx, candidate, filter_apply, hooks).await?;
+    let previous_document = tokio::fs::read_to_string(&ctx.config_path).await.ok();
+    let mut report = apply_full_config_locked(ctx, candidate, filter_apply, hooks).await?;
 
     if let Err(e) = save_config_document_atomic(&ctx.config_path, document, candidate).await {
+        // Roll back with the same filter mode that was applied: a Deferred
+        // apply never touched the filter engine, so a Sync rollback could
+        // fail on an unrelated filter-source error and leave the runtime at
+        // the rejected candidate.
         if let Err(rollback_err) =
-            apply_full_config_locked(ctx, &previous, FilterApply::Sync, hooks).await
+            apply_full_config_locked(ctx, &previous, filter_apply, hooks).await
         {
             tracing::error!(
                 error = %rollback_err.detail,
@@ -355,7 +436,73 @@ async fn apply_and_persist_document_locked(
         }
         return Err(e);
     }
-    ctx.publish_bundle().await;
+
+    let (publish_result, retry_delay) = ctx.publish_bundle_with_retry().await;
+    match publish_result {
+        Ok(sito_ha::PublishOutcome::TooLarge { bytes, limit }) => {
+            // An oversized bundle is the one HA failure that is an apply
+            // error: the configuration cannot be replicated at all. Roll both
+            // the live configuration and the persisted document back (D8) and
+            // republish the restored configuration so readiness recovers.
+            tracing::error!(
+                bytes,
+                limit,
+                "HA bundle exceeds the replication limit; rolling back the local apply"
+            );
+            if let Some(previous_document) = previous_document.as_deref()
+                && let Err(e) =
+                    save_config_document_atomic(&ctx.config_path, previous_document, &previous)
+                        .await
+            {
+                tracing::error!(
+                    error = %e.detail,
+                    "Failed to restore the previous configuration document after an oversized HA bundle"
+                );
+            } else if previous_document.is_none() {
+                // There was no previous document: remove the newly written one
+                // so a restart cannot load the rejected configuration.
+                if let Err(e) = tokio::fs::remove_file(&ctx.config_path).await
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::error!(
+                        error = %e,
+                        "Failed to remove the rejected configuration document after an oversized HA bundle"
+                    );
+                }
+            }
+            if let Err(e) = apply_full_config_locked(ctx, &previous, filter_apply, hooks).await {
+                tracing::error!(
+                    error = %e.detail,
+                    "Failed to roll back in-memory configuration after an oversized HA bundle"
+                );
+            }
+            if let Err(e) = ctx.publish_bundle().await {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to republish the restored configuration after an oversized HA bundle"
+                );
+            }
+            return Err(ProblemDetails::bad_request(format!(
+                "The configuration produces a {bytes}-byte HA bundle, above the {limit}-byte WebSocket replication limit; it was not applied. Reduce filter lists/rules or configuration size"
+            )));
+        }
+        Ok(outcome) => {
+            if ctx.master_coordinator.is_some() {
+                report.ha_publish = Some(HaPublishReport::from_outcome(outcome));
+            }
+        }
+        Err(e) => {
+            // D8: the local apply and persist succeeded; an HA publish failure
+            // must not roll it back. Surface the failure, leave HA readiness
+            // false, and let the background retry recover.
+            tracing::error!(error = %e, "HA publication failed after a successful local apply");
+            report.ha_publish = Some(HaPublishReport::failed_with_retry(
+                e.to_string(),
+                retry_delay,
+            ));
+        }
+    }
+
     Ok(report)
 }
 
@@ -425,10 +572,50 @@ pub async fn apply_config_document_event(
         return ConfigFileApplyOutcome::SelfWriteIgnored;
     }
 
+    // Capture the live configuration before applying so an unreplicable
+    // (oversized) document can be rolled back. The file itself is the
+    // operator's external edit and is left in place; only the running
+    // configuration must not adopt it.
+    let previous = (**ctx.config.load()).clone();
     match apply_full_config_locked(ctx, &new_cfg, filter_apply, hooks).await {
         Ok(report) => {
-            ctx.publish_bundle().await;
-            ConfigFileApplyOutcome::Applied(report)
+            // A slave's shared configuration is master-owned. If an external
+            // edit changed the document, the applied-config digest no longer
+            // matches and the node must stop reporting `Synced` instead of
+            // silently serving drift until the next push.
+            if let Some(ref tracker) = ctx.slave_tracker
+                && let Err(e) = tracker.verify_applied_config(&current)
+            {
+                tracing::warn!(error = %e, "Failed to verify the applied HA configuration digest");
+            }
+            match ctx.publish_bundle().await {
+                Ok(sito_ha::PublishOutcome::TooLarge { bytes, limit }) => {
+                    if let Err(e) =
+                        apply_full_config_locked(ctx, &previous, filter_apply, hooks).await
+                    {
+                        tracing::error!(
+                            error = %e.detail,
+                            "Failed to roll back an oversized file-watcher apply"
+                        );
+                    }
+                    if let Err(e) = ctx.publish_bundle().await {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to republish the restored configuration after an oversized file-watcher apply"
+                        );
+                    }
+                    ConfigFileApplyOutcome::Rejected(ProblemDetails::bad_request(format!(
+                        "The configuration produces a {bytes}-byte HA bundle, above the {limit}-byte replication limit; the previous configuration remains active and the file was not rolled back"
+                    )))
+                }
+                Ok(_) => ConfigFileApplyOutcome::Applied(report),
+                Err(e) => {
+                    // D8: a persisted local edit is not rolled back because HA
+                    // publication failed; readiness and retry handle recovery.
+                    tracing::warn!(error = %e, "HA publication failed after a file-watcher apply");
+                    ConfigFileApplyOutcome::Applied(report)
+                }
+            }
         }
         Err(e) => ConfigFileApplyOutcome::Rejected(e),
     }
@@ -442,16 +629,62 @@ async fn apply_inner(
 ) -> Result<(), ProblemDetails> {
     // 1. Upstream manager: constructing it validates every configured server
     //    (including per-domain scopes) before anything is swapped.
-    let bootstrap = BootstrapResolver::new(
-        cfg.upstream.bootstrap.clone(),
-        Duration::from_millis(cfg.upstream.timeout_ms),
-    );
+    let bootstrap = BootstrapResolver::from_config(&cfg.upstream);
     ctx.upstream
         .reload(&cfg.upstream, &bootstrap)
         .await
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid upstream configuration: {e}")))?;
 
-    // 2. Filter engine (unless the caller queues the list fetch).
+    let clients = clients_from_config(cfg)?;
+    let rewrites = rewrites_from_config(cfg)?;
+
+    // Capture the DNSSEC policy before the runtime snapshot is replaced; the
+    // comparison below must be against the live pre-apply configuration.
+    let previous_dnssec = ctx.config.load().dns.dnssec.clone();
+
+    // 2. Publish the coherent runtime snapshot (config/clients/rewrites) and
+    //    cache policy BEFORE the filter engine becomes active. Queries may
+    //    briefly see the new config with the old filter snapshot (safe: the
+    //    filter reload then installs the matching rules), but must never see
+    //    the old config with the new filter snapshot.
+    ctx.cache.update_config(cfg.dns.cache.clone()).await;
+    ctx.querylog_sender
+        .set_anonymize(cfg.privacy.anonymize_querylog);
+    let current_clients = ctx.clients.load();
+    let clients_registry = sito_clients::ClientRegistry::with_stores(
+        clients.clone(),
+        current_clients.routeros_leases_store(),
+        current_clients.unidentified_store(),
+    );
+    drop(current_clients);
+    ctx.runtime.replace(sito_runtime::RuntimeSnapshot {
+        config: Arc::new(cfg.clone()),
+        clients: Arc::new(clients_registry),
+        rewrites: Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
+    });
+
+    // 3. Hook-owned components (DNSSEC, scoped upstreams, rate limiters,
+    //    listener rebind, log level). A failure here is rolled back by the
+    //    caller; the filter engine has not been touched yet.
+    if let Some(hooks) = hooks {
+        hooks.apply(cfg, &clients).await?;
+    }
+
+    // A DNSSEC mode/validate/anchor/NTA change invalidates every cached
+    // validation decision. The hook above already installed the new validator;
+    // advancing the cache policy epoch immediately makes every old entry
+    // invisible and rejects inserts from queries that captured the old epoch
+    // before the swap. Do this before the filter reload so no query can serve
+    // an old-policy validation decision after the validator swap.
+    if previous_dnssec != cfg.dns.dnssec {
+        ctx.cache.advance_policy_epoch();
+        ctx.cache.flush();
+    }
+
+    // 4. Filter engine last (unless the caller queues the list fetch), so the
+    //    filter snapshot always corresponds to an already-published runtime
+    //    configuration. A reload failure keeps the previous snapshot and
+    //    causes the caller to roll the runtime snapshot back.
     if filter_apply == FilterApply::Sync {
         ctx.filter
             .reload_with_config(&cfg.filtering)
@@ -464,39 +697,6 @@ async fn apply_inner(
         ctx.cache.flush();
     }
 
-    let clients = clients_from_config(cfg)?;
-    let rewrites = rewrites_from_config(cfg)?;
-
-    // 3. Hook-owned components (DNSSEC, scoped upstreams, rate limiters,
-    //    listener rebind, log level).
-    if let Some(hooks) = hooks {
-        hooks.apply(cfg, &clients).await?;
-    }
-
-    // A DNSSEC mode/validate/anchor/NTA change invalidates every cached
-    // validation decision. Without this, an entry validated under the old
-    // policy would keep being served (Secure with AD=1 after an anchor was
-    // removed, or Unchecked after validation was enabled).
-    if ctx.config.load().dns.dnssec != cfg.dns.dnssec {
-        ctx.cache.flush();
-    }
-
-    // 4. Cache policy, query-log privacy and the coherent runtime snapshot.
-    ctx.cache.update_config(cfg.dns.cache.clone()).await;
-    ctx.querylog_sender
-        .set_anonymize(cfg.privacy.anonymize_querylog);
-    let current_clients = ctx.clients.load();
-    let clients_registry = sito_clients::ClientRegistry::with_stores(
-        clients,
-        current_clients.routeros_leases_store(),
-        current_clients.unidentified_store(),
-    );
-    drop(current_clients);
-    ctx.runtime.replace(sito_runtime::RuntimeSnapshot {
-        config: Arc::new(cfg.clone()),
-        clients: Arc::new(clients_registry),
-        rewrites: Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
-    });
     Ok(())
 }
 
@@ -607,9 +807,22 @@ pub fn restart_required_fields(old: &Config, new: &Config) -> Vec<String> {
         "web",
         &mut fields,
     );
-    // TLS/ACME material feeds the listener acceptors built at startup.
-    mark(old.tls != new.tls, "tls", &mut fields);
-    mark(old.acme != new.acme, "acme", &mut fields);
+    // TLS/ACME material feeds the listener acceptors built at startup. Compare
+    // the effective configuration (`dns.tls` wins over top-level `[tls]`;
+    // `[acme]` wins over legacy `[web] acme_*`) and the raw top-level aliases,
+    // so editing either alias is reported even when the other is unchanged.
+    mark(
+        old.get_tls_config() != new.get_tls_config()
+            || old.dns.tls != new.dns.tls
+            || old.tls != new.tls,
+        "tls",
+        &mut fields,
+    );
+    mark(
+        old.get_acme_config() != new.get_acme_config() || old.acme != new.acme,
+        "acme",
+        &mut fields,
+    );
     // HA workers and integrations are initialized at startup.
     mark(old.ha != new.ha, "ha", &mut fields);
     mark(
@@ -623,6 +836,42 @@ pub fn restart_required_fields(old: &Config, new: &Config) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Deferred D4b: `retry_at` must reflect the retry loop that was actually
+    /// scheduled, and must be absent when no new loop was started.
+    #[test]
+    fn test_ha_publish_report_retry_at_matches_actual_schedule() {
+        let before = chrono::Utc::now();
+        let report =
+            HaPublishReport::failed_with_retry("publish failed", Some(Duration::from_secs(2)));
+        assert_eq!(report.status, "failed");
+        let retry_at = chrono::DateTime::parse_from_rfc3339(
+            report
+                .retry_at
+                .as_deref()
+                .expect("a scheduled retry has a time"),
+        )
+        .expect("RFC3339 retry_at")
+        .with_timezone(&chrono::Utc);
+        let delay = retry_at.signed_duration_since(before);
+        assert!(
+            delay >= chrono::TimeDelta::try_seconds(1).unwrap()
+                && delay <= chrono::TimeDelta::try_seconds(3).unwrap(),
+            "retry_at must be the scheduled delay, not a fixed guess: {delay}"
+        );
+
+        let report = HaPublishReport::failed_with_retry("publish failed", None);
+        assert!(
+            report.retry_at.is_none(),
+            "an already-running retry loop must not advertise a new retry time"
+        );
+
+        // The compatibility constructor keeps the historical one-second
+        // estimate so external Rust callers do not need to change.
+        let report = HaPublishReport::failed("publish failed");
+        assert!(report.retry_at.is_some());
+    }
 
     #[test]
     fn test_upstream_target_validation_rejects_typos() {
@@ -950,6 +1199,66 @@ mod tests {
         );
     }
 
+    /// `[dns.tls]` is the effective TLS source (top-level `[tls]` is the
+    /// alias). Both must be restart-required, as must legacy `[web] acme_*`
+    /// keys resolved through `get_acme_config()`.
+    #[test]
+    fn test_restart_required_tracks_effective_tls_and_legacy_acme() {
+        let old = Config::default();
+
+        let mut dns_tls = old.clone();
+        dns_tls.dns.tls = Some(
+            toml::from_str::<sito_core::config::TlsConfig>(
+                r#"
+                cert = "/etc/sito/new-cert.pem"
+                key = "/etc/sito/new-key.pem"
+                "#,
+            )
+            .unwrap(),
+        );
+        assert!(
+            restart_required_fields(&old, &dns_tls)
+                .iter()
+                .any(|field| field == "tls"),
+            "[dns.tls] changes feed the startup TLS acceptors"
+        );
+
+        let mut top_level_tls = old.clone();
+        top_level_tls.tls = dns_tls.dns.tls.clone();
+        assert!(
+            restart_required_fields(&old, &top_level_tls)
+                .iter()
+                .any(|field| field == "tls"),
+            "top-level [tls] is still a supported alias and requires a restart"
+        );
+
+        let mut legacy_acme = old.clone();
+        legacy_acme.web = Some(
+            toml::from_str::<toml::Value>(
+                r#"
+                acme_enabled = true
+                acme_domains = ["dns.example.com"]
+                "#,
+            )
+            .unwrap(),
+        );
+        assert!(
+            restart_required_fields(&old, &legacy_acme)
+                .iter()
+                .any(|field| field == "acme"),
+            "legacy [web] acme_* keys are resolved by get_acme_config() and must be restart-required"
+        );
+
+        // An unrelated [web] change remains hot-applied.
+        let mut unrelated_web = old.clone();
+        unrelated_web.web =
+            Some(toml::from_str::<toml::Value>(r#"trusted_proxies = ["10.0.0.1"]"#).unwrap());
+        assert_eq!(
+            restart_required_fields(&old, &unrelated_web),
+            Vec::<String>::new()
+        );
+    }
+
     /// Regression: HA restores the slave's node-local `[web]` identity before
     /// the restart check runs. A master with `web.enabled = true` (and its own
     /// proxy/public-URL settings) must therefore not make a slave that
@@ -1069,6 +1378,126 @@ acme_enabled = false
             fields.iter().any(|field| field == "auth"),
             "a real [auth] policy change must be reported: {fields:?}"
         );
+    }
+
+    /// Hook used to observe what the runtime snapshot contains at the moment
+    /// hook-owned components are applied.
+    struct RuntimeProbeHook {
+        runtime: Arc<sito_runtime::RuntimeState>,
+        seen_filter_enabled: Arc<std::sync::atomic::AtomicBool>,
+        fail: bool,
+    }
+
+    impl ConfigApplyHooks for RuntimeProbeHook {
+        fn apply<'a>(
+            &'a self,
+            _cfg: &'a Config,
+            _clients: &'a sito_clients::ClientsConfig,
+        ) -> ApplyFuture<'a> {
+            Box::pin(async move {
+                self.seen_filter_enabled.store(
+                    self.runtime.snapshot().config.filtering.enabled,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                if self.fail {
+                    return Err(ProblemDetails::internal_error("injected hook failure"));
+                }
+                Ok(())
+            })
+        }
+    }
+
+    /// P1-26: the runtime config/clients/rewrites snapshot must be published
+    /// BEFORE the filter engine is reloaded. Otherwise enabling filtering runs
+    /// with the new filter snapshot and the old `filtering.enabled=false`
+    /// runtime config.
+    #[tokio::test]
+    async fn test_runtime_snapshot_is_published_before_filter_reload() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_filter_order");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut previous = (**ctx.config.load()).clone();
+        previous.filtering.enabled = false;
+        previous.filtering.lists.clear();
+        previous.filtering.custom_rules.clear();
+        ctx.config.store(Arc::new(previous.clone()));
+
+        let mut candidate = previous.clone();
+        candidate.filtering.enabled = true;
+        candidate.filtering.custom_rules = vec!["||ordered.example^".to_string()];
+
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook = RuntimeProbeHook {
+            runtime: Arc::clone(&ctx.runtime),
+            seen_filter_enabled: Arc::clone(&seen),
+            fail: false,
+        };
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, Some(&hook))
+            .await
+            .unwrap();
+
+        assert!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            "the new runtime config must be published before hooks/filter reload"
+        );
+        assert_eq!(
+            ctx.runtime.snapshot().config.filtering.custom_rules,
+            vec!["||ordered.example^".to_string()]
+        );
+        assert_eq!(ctx.filter.rule_count(), 1);
+        assert_eq!(ctx.filter.status().state, sito_filter::FilterState::Ready);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P1-26: a later hook failure rolls the runtime snapshot back so the old
+    /// config and the old filter snapshot both remain active.
+    #[tokio::test]
+    async fn test_failed_hook_leaves_old_config_and_filter() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_filter_hook_fail");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut previous = (**ctx.config.load()).clone();
+        previous.filtering.enabled = true;
+        previous.filtering.custom_rules = vec!["||old.example^".to_string()];
+        apply_full_config(&ctx, &previous, FilterApply::Sync, None)
+            .await
+            .unwrap();
+        assert_eq!(ctx.filter.rule_count(), 1);
+
+        let mut candidate = previous.clone();
+        candidate.filtering.custom_rules = vec!["||new.example^".to_string()];
+
+        let hook = RuntimeProbeHook {
+            runtime: Arc::clone(&ctx.runtime),
+            seen_filter_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail: true,
+        };
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, Some(&hook))
+            .await
+            .expect_err("the injected hook failure must reject the apply");
+
+        assert_eq!(
+            ctx.runtime.snapshot().config.filtering.custom_rules,
+            vec!["||old.example^".to_string()],
+            "the runtime snapshot must be rolled back"
+        );
+        let snapshot = ctx.filter.snapshot();
+        let client = sito_core::client::ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            snapshot
+                .evaluate("old.example", sito_proto::RecordType::A, &client)
+                .is_blocked(),
+            "the old filter snapshot must remain active"
+        );
+        assert!(
+            snapshot
+                .evaluate("new.example", sito_proto::RecordType::A, &client)
+                .is_allowed(),
+            "the rejected filter snapshot must not remain active"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     mod write_serialization {

@@ -262,6 +262,16 @@ pub struct AppliedWatermark {
     /// Version at which the fork was detected.
     #[serde(default)]
     pub forked_at_version: u64,
+    /// BLAKE3 digest of the exact `config.toml` document this node persisted
+    /// when it applied the bundle.
+    ///
+    /// On restart the digest is compared with the on-disk document. A mismatch
+    /// means a local edit/revert changed the configuration while the process
+    /// was stopped (or the file watcher applied one while running) and the
+    /// slave must re-apply the master's bundle instead of early-ACKing
+    /// `Synced`. Missing in watermarks written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_config_digest: Option<String>,
 }
 
 impl AppliedWatermark {
@@ -270,6 +280,18 @@ impl AppliedWatermark {
     pub fn normalized_hash(&self) -> &str {
         self.payload_hash.trim_start_matches("blake3:")
     }
+}
+
+/// Computes the BLAKE3 digest of a configuration document as normalized hex.
+///
+/// The digest is over the exact persisted document, so any local edit
+/// (including whitespace) is detected. Node-local edits are also flagged until
+/// the next successful replication apply re-establishes a matching digest;
+/// this is deliberately fail-safe because the local file and the applied
+/// bundle can otherwise diverge silently.
+#[must_use]
+pub fn config_digest(document: &str) -> String {
+    blake3::hash(document.as_bytes()).to_hex().to_string()
 }
 
 /// Extracts the signed payload hash from a `ConfigPush` envelope.

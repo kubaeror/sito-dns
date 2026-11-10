@@ -18,6 +18,9 @@ pub use engine::{
     apply_rewrite_cancellations,
 };
 pub use error::FilterError;
-pub use parser::{DnsRewriteRule, Pattern, Rule, RuleKind, RuleModifiers, parse_rules};
+pub use parser::{
+    DnsRewriteRule, ParseError, ParseLimits, Pattern, Rule, RuleKind, RuleModifiers, parse_rules,
+    parse_rules_with_limits,
+};
 pub use structures::{CompileBudget, CompileBudgetExceeded};
 pub use subscription::{ListMetadata, SubscriptionFetcher};

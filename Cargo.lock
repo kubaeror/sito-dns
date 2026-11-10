@@ -1856,9 +1856,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.37.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -2578,6 +2578,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -3002,10 +3003,11 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sito"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "async-trait",
  "axum",
  "chrono",
  "clap",
@@ -3014,6 +3016,7 @@ dependencies = [
  "mimalloc",
  "notify",
  "rand 0.10.3",
+ "rcgen",
  "rustls",
  "serde",
  "serde_json",
@@ -3030,6 +3033,7 @@ dependencies = [
  "sito-stats",
  "sito-transport",
  "sito-upstream",
+ "time",
  "tokio",
  "toml",
  "tracing",
@@ -3038,7 +3042,7 @@ dependencies = [
 
 [[package]]
 name = "sito-api"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3068,6 +3072,7 @@ dependencies = [
  "sito-rewrites",
  "sito-runtime",
  "sito-stats",
+ "sito-transport",
  "sito-upstream",
  "subtle",
  "tar",
@@ -3082,7 +3087,7 @@ dependencies = [
 
 [[package]]
 name = "sito-cache"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "arc-swap",
  "moka",
@@ -3094,7 +3099,7 @@ dependencies = [
 
 [[package]]
 name = "sito-clients"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -3112,7 +3117,7 @@ dependencies = [
 
 [[package]]
 name = "sito-core"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3126,7 +3131,7 @@ dependencies = [
 
 [[package]]
 name = "sito-dnssec"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3145,7 +3150,7 @@ dependencies = [
 
 [[package]]
 name = "sito-filter"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -3165,7 +3170,7 @@ dependencies = [
 
 [[package]]
 name = "sito-ha"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3187,6 +3192,7 @@ dependencies = [
  "sito-rewrites",
  "sito-runtime",
  "sito-stats",
+ "sito-test-support",
  "subtle",
  "thiserror",
  "tokio",
@@ -3198,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "sito-proto"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "hickory-proto",
  "idna",
@@ -3208,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "sito-rewrites"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "hickory-proto",
  "serde",
@@ -3222,7 +3228,7 @@ dependencies = [
 
 [[package]]
 name = "sito-runtime"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "arc-swap",
  "sito-clients",
@@ -3232,9 +3238,11 @@ dependencies = [
 
 [[package]]
 name = "sito-stats"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
+ "blake3",
  "chrono",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "sito-core",
@@ -3247,7 +3255,7 @@ dependencies = [
 
 [[package]]
 name = "sito-test"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3282,6 +3290,7 @@ dependencies = [
  "sito-rewrites",
  "sito-runtime",
  "sito-stats",
+ "sito-test-support",
  "sito-transport",
  "sito-upstream",
  "subtle",
@@ -3297,8 +3306,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sito-test-support"
+version = "1.9.5"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "sito-transport"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3322,6 +3338,7 @@ dependencies = [
  "serde_json",
  "sito-core",
  "sito-proto",
+ "sito-test-support",
  "socket2",
  "thiserror",
  "time",
@@ -3333,7 +3350,7 @@ dependencies = [
 
 [[package]]
 name = "sito-upstream"
-version = "1.9.3"
+version = "1.9.5"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3535,8 +3552,6 @@ dependencies = [
 [[package]]
 name = "sqlx-sqlite"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c"
 dependencies = [
  "atoi",
  "flume",

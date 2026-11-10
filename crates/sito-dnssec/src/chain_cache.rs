@@ -57,6 +57,12 @@ pub struct PolicyState {
 struct PolicyRecord {
     state: PolicyState,
     metadata_known: bool,
+    /// Monotonic policy generation. Incremented on every effective policy
+    /// change. Validators carry the generation they were built under, and an
+    /// insert from an older generation is rejected: this closes the hot-reload
+    /// race where an in-flight query validates under the old policy after
+    /// `ensure_policy` flushed the cache.
+    generation: u64,
 }
 
 /// Effect of [`ChainCache::ensure_policy`] on the cached entries.
@@ -128,6 +134,10 @@ struct PersistedCache {
     /// `None` marks legacy files exactly like `policy_anchors`.
     #[serde(default)]
     policy_ntas: Option<Vec<String>>,
+    /// Monotonic policy generation that produced the entries. Absent in older
+    /// files (treated as generation 0).
+    #[serde(default)]
+    policy_generation: u64,
 }
 
 /// Counters collected while loading a persisted cache (used for diagnostics
@@ -213,6 +223,7 @@ impl ChainCache {
                     ntas,
                 },
                 metadata_known: true,
+                generation: 1,
             });
             self.dirty.store(true, Ordering::Release);
             return PolicyChange::FullClear;
@@ -221,6 +232,7 @@ impl ChainCache {
         if previous.state.fingerprint == fingerprint {
             return PolicyChange::None;
         }
+        let next_generation = previous.generation.saturating_add(1);
 
         // Files written before 1.9.1 carry a fingerprint but no anchor/NTA
         // metadata. We cannot prove which cached `Unsigned` zones are
@@ -239,6 +251,7 @@ impl ChainCache {
                     ntas,
                 },
                 metadata_known: true,
+                generation: next_generation,
             });
             self.dirty.store(true, Ordering::Release);
             return PolicyChange::FullClear;
@@ -257,6 +270,7 @@ impl ChainCache {
                     ntas,
                 },
                 metadata_known: true,
+                generation: next_generation,
             });
             self.dirty.store(true, Ordering::Release);
             return PolicyChange::FullClear;
@@ -293,6 +307,7 @@ impl ChainCache {
                     ntas,
                 },
                 metadata_known: true,
+                generation: next_generation,
             });
             self.dirty.store(true, Ordering::Release);
             return PolicyChange::FullClear;
@@ -316,6 +331,7 @@ impl ChainCache {
                 ntas,
             },
             metadata_known: true,
+            generation: next_generation,
         });
         // The metadata (at least the fingerprint) changed even when no entry
         // was invalidated, so the next flush must persist it.
@@ -429,6 +445,7 @@ impl ChainCache {
             policy,
             policy_anchors,
             policy_ntas,
+            policy_generation,
         } = persisted;
         // Older formats recorded root/TLD `Signed` evidence from fetched
         // chain-helper RRSIGs. Such an entry covers every descendant and would
@@ -451,6 +468,7 @@ impl ChainCache {
                     ntas: normalize_policy_names(policy_ntas.unwrap_or_default()),
                 },
                 metadata_known,
+                generation: policy_generation,
             });
         }
 
@@ -520,9 +538,60 @@ impl ChainCache {
             .map(|entry| entry.value().clone())
     }
 
-    /// Records an authenticated status. Older evidence never overwrites newer
-    /// evidence; the write is in memory only and marks the cache dirty.
+    /// Current monotonic policy generation (0 before the first
+    /// [`Self::ensure_policy`]).
+    #[must_use]
+    pub fn policy_generation(&self) -> u64 {
+        self.policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |record| record.generation)
+    }
+
+    /// Records an authenticated status under the cache's current policy
+    /// generation. Convenience for tests and non-validator callers.
+    ///
+    /// Production validation uses [`Self::insert_for_generation`] so an
+    /// in-flight query built under an older policy cannot write after a reload.
     pub fn insert(&self, name: LowerName, status: ZoneStatus, expires_at: u32, now: u32) {
+        let _policy_guard = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.insert_locked(name, status, expires_at, now);
+    }
+
+    /// Records an authenticated status only when `generation` matches the
+    /// cache's current policy generation. Returns `false` when the policy
+    /// changed after the validator was built (the insert is rejected).
+    pub fn insert_for_generation(
+        &self,
+        name: LowerName,
+        status: ZoneStatus,
+        expires_at: u32,
+        now: u32,
+        generation: u64,
+    ) -> bool {
+        // Hold the policy lock across the generation check and the insert:
+        // `ensure_policy` takes the same lock, so an in-flight insert either
+        // completes before the flush or observes the new generation and is
+        // rejected. It can never land between the flush and the metadata swap.
+        let policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = policy.as_ref().map_or(0, |record| record.generation);
+        if current != generation {
+            return false;
+        }
+        self.insert_locked(name, status, expires_at, now);
+        true
+    }
+
+    /// Caller must hold the `policy` lock. Older evidence never overwrites
+    /// newer evidence; the write is in memory only and marks the cache dirty.
+    fn insert_locked(&self, name: LowerName, status: ZoneStatus, expires_at: u32, now: u32) {
         if let Some(mut existing) = self.entries.get_mut(&name) {
             if now < existing.validated_at {
                 return;
@@ -666,6 +735,7 @@ impl ChainCache {
                     policy: Some(record.state.fingerprint.clone()),
                     policy_anchors: record.metadata_known.then(|| record.state.anchors.clone()),
                     policy_ntas: record.metadata_known.then(|| record.state.ntas.clone()),
+                    policy_generation: record.generation,
                 },
                 None => PersistedCache {
                     format_version: CHAIN_CACHE_FORMAT_VERSION,
@@ -673,6 +743,7 @@ impl ChainCache {
                     policy: None,
                     policy_anchors: None,
                     policy_ntas: None,
+                    policy_generation: 0,
                 },
             }
         };
@@ -1584,6 +1655,7 @@ mod tests {
             policy: Some("fp-1".to_string()),
             policy_anchors: Some(Vec::new()),
             policy_ntas: Some(Vec::new()),
+            policy_generation: 1,
         };
         std::fs::write(
             &path,
@@ -1692,6 +1764,85 @@ mod tests {
                 entry.status == ZoneStatus::Signed && (entry.name == "." || entry.name == "com.")
             }),
             "root/TLD signed entries must not be re-persisted"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    /// An in-flight validation built under the old policy must not insert after
+    /// a reload's `ensure_policy` flushed the cache.
+    #[test]
+    fn test_in_flight_insert_from_old_policy_generation_is_rejected() {
+        let cache = ChainCache::new(None);
+        let now = system_now();
+        assert_eq!(
+            cache.ensure_policy("v1-old".to_string(), Vec::new(), Vec::new()),
+            PolicyChange::FullClear
+        );
+        let old_generation = cache.policy_generation();
+        assert_eq!(old_generation, 1);
+        assert!(cache.insert_for_generation(
+            name("old.example."),
+            ZoneStatus::Unsigned,
+            now + 600,
+            now,
+            old_generation,
+        ));
+
+        // Reload: the shared cache adopts the new policy and generation.
+        assert_eq!(
+            cache.ensure_policy("v1-new".to_string(), Vec::new(), Vec::new()),
+            PolicyChange::FullClear
+        );
+        let new_generation = cache.policy_generation();
+        assert!(new_generation > old_generation);
+
+        // Late write from the validator that was built under the old policy.
+        assert!(
+            !cache.insert_for_generation(
+                name("stale.example."),
+                ZoneStatus::Unsigned,
+                now + 600,
+                now,
+                old_generation,
+            ),
+            "an old-generation insert must be rejected"
+        );
+        assert!(
+            cache.get(&name("stale.example."), now).is_none(),
+            "the rejected entry must not be visible"
+        );
+
+        // The reloaded validator can still insert under the new generation.
+        assert!(cache.insert_for_generation(
+            name("fresh.example."),
+            ZoneStatus::Signed,
+            now + 600,
+            now,
+            new_generation,
+        ));
+        assert!(cache.get(&name("fresh.example."), now).is_some());
+    }
+
+    /// The generation is part of the persisted policy record, so a restart
+    /// cannot silently reuse a validator's old generation.
+    #[test]
+    fn test_policy_generation_survives_flush_and_load() {
+        let path = temp_path("generation");
+        let now = system_now();
+        let cache = ChainCache::new(Some(path.clone()));
+        let _ = cache.ensure_policy("v1-old".to_string(), Vec::new(), Vec::new());
+        let _ = cache.ensure_policy("v1-new".to_string(), Vec::new(), Vec::new());
+        let generation = cache.policy_generation();
+        assert!(generation > 1);
+        cache.flush().expect("flush generation");
+
+        let reloaded = ChainCache::new(Some(path.clone()));
+        reloaded.load(now);
+        assert_eq!(
+            reloaded.policy_generation(),
+            generation,
+            "the policy generation must survive a restart"
         );
 
         let _ = std::fs::remove_dir_all(path.parent().expect("parent"));

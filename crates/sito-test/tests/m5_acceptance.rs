@@ -39,6 +39,9 @@ async fn create_test_context(temp_dir: &Path) -> (ServerContext, PathBuf, QueryL
     let config_path = temp_dir.join("config.toml");
     let mut config = Config::default();
     config.server.data_dir = temp_dir.to_path_buf();
+    // This test exercises the REST/RBAC surface, not filtering. Filtering
+    // enabled with zero sources now fails closed.
+    config.filtering.enabled = false;
     let config_toml = toml::to_string_pretty(&config).unwrap();
     tokio::fs::write(&config_path, &config_toml).await.unwrap();
 
@@ -100,6 +103,7 @@ async fn create_test_context(temp_dir: &Path) -> (ServerContext, PathBuf, QueryL
         slave_tracker: None,
         resync_sender: None,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        acme_challenges: None,
         dns_starter: None,
     };
 

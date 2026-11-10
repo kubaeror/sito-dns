@@ -45,9 +45,14 @@ use tower::ServiceExt;
 const TEST_ADMIN_PASSWORD: &str = "TestAdminPassword123!";
 
 /// Reserves a free loopback TCP port for HA replication listeners.
-fn reserve_tcp_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve tcp port");
-    listener.local_addr().expect("local addr").port()
+///
+/// The returned lease must stay alive for the test so the port cannot be
+/// selected by another test in this binary.
+fn reserve_tcp_port() -> (u16, sito_test::harness::ReservedPort) {
+    let mut lease = sito_test::harness::reserve_port().expect("reserve tcp port");
+    let port = lease.port();
+    lease.release_listener();
+    (port, lease)
 }
 
 /// Minimal applier for tests that only need the push to update the filter and
@@ -208,6 +213,7 @@ async fn create_test_context(
         slave_tracker: slave_track,
         resync_sender: resync_tx,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        acme_challenges: None,
         dns_starter: None,
     };
 
@@ -265,7 +271,7 @@ async fn test_m8_mtls_handshake_rejects_foreign_cert() {
     let coordinator =
         MasterCoordinator::new("master-mtls".to_string(), 1, signing_key, metrics.clone());
 
-    let replication_port = reserve_tcp_port();
+    let (replication_port, _replication_port_lease) = reserve_tcp_port();
     let master_ha_cfg = HaConfig {
         replication_port,
         listen_addr: "127.0.0.1".to_string(),
@@ -1074,7 +1080,7 @@ async fn test_m8_ha_runtime_child_probe() {
             let coordinator =
                 MasterCoordinator::new("child-master".to_string(), 1, signing_key, metrics);
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let replication_port = reserve_tcp_port();
+            let (replication_port, _replication_port_lease) = reserve_tcp_port();
             let handle = spawn_master_server(
                 HaConfig {
                     replication_port,
@@ -1088,17 +1094,15 @@ async fn test_m8_ha_runtime_child_probe() {
                 shutdown_rx,
             );
 
-            let mut readiness = coordinator.readiness();
-            for _ in 0..100 {
-                if readiness.ready {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                readiness = coordinator.readiness();
-            }
+            let ready = wait_until(Duration::from_secs(2), || {
+                let coordinator = coordinator.clone();
+                async move { coordinator.readiness().ready }
+            })
+            .await;
             assert!(
-                readiness.ready,
-                "listener did not become ready after chown: {readiness:?}"
+                ready,
+                "listener did not become ready after chown: {:?}",
+                coordinator.readiness()
             );
 
             let (ctx, token, dir) =
@@ -1163,7 +1167,7 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
         metrics.clone(),
     );
 
-    let replication_port = reserve_tcp_port();
+    let (replication_port, _replication_port_lease) = reserve_tcp_port();
     let master_ha_cfg = HaConfig {
         replication_port,
         listen_addr: "127.0.0.1".to_string(),
@@ -1660,6 +1664,9 @@ config_version = 1
 [server]
 role = "slave"
 
+[filtering]
+enabled = false
+
 [auth]
 session_ttl_hours = 24
 login_rate_limit = 5
@@ -1773,7 +1780,7 @@ async fn test_m8_push_before_listeners_fails_and_retries_after_ready() {
             version: 2,
             term: 0,
             timestamp: 1,
-            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n\n[upstream]\nservers = [\"9.9.9.9\"]\n".to_string(),
+            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n\n[filtering]\nenabled = false\n\n[upstream]\nservers = [\"9.9.9.9\"]\n".to_string(),
             custom_rules: vec![],
             rewrites: None,
             clients: None,
@@ -1842,7 +1849,7 @@ async fn test_m8_chaos_master_mid_push_kill() {
         metrics.clone(),
     );
 
-    let replication_port = reserve_tcp_port();
+    let (replication_port, _replication_port_lease) = reserve_tcp_port();
     let master_ha_cfg = HaConfig {
         replication_port,
         listen_addr: "127.0.0.1".to_string(),
@@ -1894,7 +1901,7 @@ async fn test_m8_chaos_master_mid_push_kill() {
         ..Default::default()
     };
     let (_resync_tx, resync_rx) = tokio::sync::mpsc::channel(1);
-    let _worker = spawn_slave_worker(
+    let worker = spawn_slave_worker(
         slave_ha_cfg,
         slave_tracker.clone(),
         slave_handles,
@@ -1921,9 +1928,16 @@ async fn test_m8_chaos_master_mid_push_kill() {
         lists: vec![],
     };
     coordinator.update_bundle(bundle).unwrap();
+    // No coordinator event exposes "WebSocket write in flight". This short
+    // bounded delay lets the push leave the master so the test genuinely kills
+    // it mid-push; the assertion accepts version 1 or 2, so a slower or faster
+    // machine cannot make the test flaky.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let _ = shutdown_tx.send(true);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let joined = tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("slave worker must stop after shutdown");
+    joined.expect("slave worker task panicked");
 
     // Assert slave version is strictly 1 (or 2 if finished before kill), never corrupted
     let v = slave_tracker.get_version();

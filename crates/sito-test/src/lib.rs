@@ -5,7 +5,11 @@ pub mod harness;
 pub mod mock;
 
 pub use client::{DotConnection, TestDnsClient};
-pub use harness::{TestServerInstance, generate_expired_test_cert, generate_test_cert, wait_until};
+pub use harness::{
+    ReservedPort, ReservedUdpPort, TestServerInstance, generate_expired_test_cert,
+    generate_test_cert, reserve_port, reserve_port_number, reserve_udp_port,
+    reserve_udp_port_number, wait_until,
+};
 pub use mock::MockDnsServer;
 
 #[cfg(test)]
@@ -25,6 +29,8 @@ mod tests {
         mock_upstream.add_a_record("example.com", Ipv4Addr::new(93, 184, 216, 34), 300);
 
         let mut config = Config::default();
+        // This acceptance test exercises transport/filtering, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
 
         let server = TestServerInstance::spawn(config).await.unwrap();
@@ -341,6 +347,8 @@ mod tests {
         mock_upstream.add_a_record("secure.example.com", Ipv4Addr::new(93, 184, 216, 34), 300);
 
         let mut config = Config::default();
+        // This acceptance test exercises transport/filtering, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
         config.dns.dot_port = 0;
         config.tls = Some(sito_core::config::TlsConfig {
@@ -391,6 +399,8 @@ mod tests {
         mock_upstream.add_a_record("doh.example.com", Ipv4Addr::new(192, 0, 2, 1), 300);
 
         let mut config = Config::default();
+        // This acceptance test exercises transport/filtering, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
         config.dns.doh_port = 0;
         config.tls = Some(sito_core::config::TlsConfig {
@@ -433,9 +443,18 @@ mod tests {
             RData::A(A(Ipv4Addr::new(192, 0, 2, 1)))
         );
 
-        // Check Cache-Control: no-store header on raw HTTP response
+        // Check Cache-Control: no-store header on raw HTTP response.
+        let mut raw_query = sito_proto::Message::new(
+            4242,
+            sito_proto::MessageType::Query,
+            sito_proto::OpCode::Query,
+        );
+        raw_query.queries.push(sito_proto::Query::query(
+            Name::from_str("doh.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let query_wire = sito_proto::encode_message(&raw_query).unwrap();
         let http_client = client.doh_http_client().unwrap();
-        let query_wire = sito_proto::encode_message(&resp_post).unwrap();
         let http_resp = http_client
             .post(&doh_url)
             .header("Content-Type", "application/dns-message")
@@ -859,6 +878,8 @@ mod tests {
         mock_upstream.add_a_record("reload.test", Ipv4Addr::new(10, 1, 1, 1), 300);
 
         let mut config = Config::default();
+        // This acceptance test exercises transport/filtering, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
         config.dns.dot_port = 0;
         config.tls = Some(sito_core::config::TlsConfig {
@@ -1113,6 +1134,8 @@ mod tests {
         .unwrap();
 
         let mut config = Config::default();
+        // This acceptance test exercises transport/filtering, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
         config.filtering.custom_rules = vec!["||ad-tracker.com^".to_string()];
         config.clients = Some(clients_val);
@@ -1298,6 +1321,8 @@ mod tests {
         .unwrap();
 
         let mut config = Config::default();
+        // This acceptance test exercises transport/filtering, not DNSSEC.
+        config.dns.dnssec.validate = false;
         config.upstream.servers = vec![mock_upstream.addr().to_string()];
         config.rewrites = Some(rewrites_val);
         config.clients = Some(clients_val);

@@ -2,12 +2,10 @@ name: Security
 
 on:
   push:
-    branches: [main]
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'deny.toml'
-      - 'rust-toolchain.toml'
+    # The release gate requires a green `cargo-deny` check on the tagged
+    # commit, so every push to a release branch must run this workflow (a
+    # path-filtered run could leave a release commit without the check).
+    branches: [main, release/1.9.x]
   workflow_call:
   workflow_dispatch:
 

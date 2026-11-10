@@ -22,6 +22,9 @@ pub(crate) const MAX_PIPELINED_QUERIES: usize = 64;
 /// non-reading) client must not pin a connection task indefinitely.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum lifetime of one TCP DNS connection, independent of activity.
+const MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(300);
+
 /// Build the 2-octet DNS-over-TCP length prefix for a frame, rejecting
 /// messages that would wrap around the u16 length field.
 pub(crate) fn frame_prefix(len: usize) -> Option<[u8; 2]> {
@@ -64,6 +67,9 @@ pub async fn start_tcp_listener<H: QueryHandler>(
     info!("TCP listener started on {}", local_addr);
 
     let semaphore = Arc::new(Semaphore::new(config.max_connections));
+    let per_ip_limiter = crate::admission::PerIpConnectionLimiter::new(
+        crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP,
+    );
     let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
         Arc::new(RateLimiter::new(
             config.rate_limit_per_ip,
@@ -73,6 +79,7 @@ pub async fn start_tcp_listener<H: QueryHandler>(
     rate_limiter.spawn_pruner(shutdown_rx.clone());
 
     let handle = tokio::spawn(async move {
+        let mut accept_backoff = crate::admission::AcceptBackoff::default();
         loop {
             tokio::select! {
                 res = shutdown_rx.changed() => {
@@ -83,9 +90,14 @@ pub async fn start_tcp_listener<H: QueryHandler>(
                 }
                 accept_res = listener.accept() => {
                     let (stream, peer_addr) = match accept_res {
-                        Ok(conn) => conn,
+                        Ok(conn) => {
+                            accept_backoff.reset();
+                            conn
+                        }
                         Err(e) => {
-                            warn!("TCP accept error: {}", e);
+                            let delay = accept_backoff.next_delay();
+                            warn!("TCP accept error: {}; retrying after {:?}", e, delay);
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                     };
@@ -94,6 +106,13 @@ pub async fn start_tcp_listener<H: QueryHandler>(
                         warn!(
                             "TCP max connections ({}) reached; rejecting connection from {}",
                             config.max_connections, peer_addr
+                        );
+                        continue;
+                    };
+                    let Some(per_ip_permit) = per_ip_limiter.try_acquire(peer_addr.ip()) else {
+                        warn!(
+                            "TCP per-IP connection limit ({}) reached; rejecting connection from {}",
+                            crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP, peer_addr
                         );
                         continue;
                     };
@@ -106,6 +125,7 @@ pub async fn start_tcp_listener<H: QueryHandler>(
 
                     tokio::spawn(async move {
                         let _permit = permit; // Holds connection slot until task ends
+                        let _per_ip_permit = per_ip_permit;
                         if let Err(e) = handle_tcp_connection(
                             stream,
                             peer_addr,
@@ -189,7 +209,17 @@ async fn handle_tcp_connection<H: QueryHandler>(
 
     // Reader loop with RFC 7766 pipelining
     let client_ip = peer_addr.ip();
+    let conn_start = std::time::Instant::now();
     loop {
+        if conn_start.elapsed() >= MAX_CONNECTION_LIFETIME {
+            debug!(
+                "TCP connection lifetime ({}s) reached for {}",
+                MAX_CONNECTION_LIFETIME.as_secs(),
+                peer_addr
+            );
+            break;
+        }
+
         let mut len_buf = [0u8; 2];
         let read_len = match timeout(idle_timeout, reader.read_exact(&mut len_buf)).await {
             Ok(Ok(_)) => u16::from_be_bytes(len_buf) as usize,

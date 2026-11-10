@@ -2,10 +2,11 @@
 
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
@@ -25,7 +26,71 @@ use crate::error::HaError;
 use crate::master::tracker::{ActiveSlave, SlaveStatsSummary, SlaveSummary};
 use crate::protocol::{AckConflict, HaMessage};
 use crate::readiness::{HaReadiness, HaReadinessState};
-use crate::transport::{build_server_tls_config, ws_config};
+use crate::transport::{MAX_WS_MESSAGE_SIZE, WS_SEND_TIMEOUT, build_server_tls_config, ws_config};
+
+/// Maximum number of published envelopes kept for delayed ACK binding.
+///
+/// A slave may acknowledge a bundle after the master has published newer
+/// ones, and multiple slaves may report a fork for the same envelope. The
+/// history is coordinator-wide and pruned only by this bound, never by an
+/// individual slave's ACK.
+pub const MAX_PUBLISH_HISTORY: usize = 64;
+
+/// Maximum bytes queued for one slave before the master falls back to
+/// coalesced delivery.
+///
+/// The channel capacity alone bounds the number of queued pushes, not their
+/// size: with 1 MiB bundles a slow peer could otherwise pin tens of MiB.
+pub const MAX_SLAVE_QUEUE_BYTES: usize = MAX_WS_MESSAGE_SIZE * 4;
+
+/// Maximum concurrently unauthenticated/active handshake slots per source IP.
+const MAX_HANDSHAKES_PER_IP: usize = 8;
+
+/// Identifies one slave session for queue accounting.
+///
+/// `instance` alone is not unique across reconnects: a superseded session can
+/// still drain its channel after the replacement registered. Keying by the
+/// connection id keeps the old session's bytes from being charged to (or
+/// subtracted from) the new session.
+type SessionKey = (String, u64);
+
+/// Outcome of publishing a configuration bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// The bundle was persisted and queued for at least one connected slave.
+    Published { version: u64, term: u64 },
+    /// The bundle was persisted but no slave is currently connected.
+    NoSlaves,
+    /// The signed envelope exceeds the WebSocket message limit and was not
+    /// persisted or broadcast.
+    TooLarge { bytes: usize, limit: usize },
+}
+
+/// A published envelope retained for delayed ACK binding.
+///
+/// Entries are shared by all slaves and pruned only in publish order by
+/// [`MAX_PUBLISH_HISTORY`]; an individual ACK must not remove an entry because
+/// another slave may still report a fork for the same envelope.
+#[derive(Debug, Clone)]
+struct PublishedEnvelope {
+    term: u64,
+    version: u64,
+    payload_hash: String,
+}
+
+/// On-disk master state.
+///
+/// `ConfigBundle` is flattened so files written by 1.9.3 (a bare bundle JSON
+/// document) still deserialize. New writes add the signing-key identity; an
+/// older reader ignores the unknown top-level field.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedMasterState {
+    #[serde(flatten)]
+    bundle: ConfigBundle,
+    /// Hex Ed25519 public key that signed the persisted bundle/state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signing_key_pubkey: Option<String>,
+}
 
 /// Maximum amount by which an authenticated peer may report being ahead of the
 /// master's sequence before the report is treated as implausible (and therefore
@@ -77,6 +142,48 @@ struct Divergence {
     reason: String,
 }
 
+/// Per-IP accounting for accepted HA connections.
+///
+/// The global connection semaphore bounds total slots, but a single source
+/// could still consume all of them before authenticating. This budget makes
+/// the unauthenticated handshake/session surface per-IP as well.
+#[derive(Debug, Default)]
+struct HandshakeBudget {
+    active: Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl HandshakeBudget {
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<HandshakePermit> {
+        let mut active = self.active.lock().unwrap();
+        let count = active.entry(ip).or_insert(0);
+        if *count >= MAX_HANDSHAKES_PER_IP {
+            return None;
+        }
+        *count += 1;
+        Some(HandshakePermit {
+            budget: Arc::clone(self),
+            ip,
+        })
+    }
+}
+
+struct HandshakePermit {
+    budget: Arc<HandshakeBudget>,
+    ip: IpAddr,
+}
+
+impl Drop for HandshakePermit {
+    fn drop(&mut self) {
+        let mut active = self.budget.active.lock().unwrap();
+        if let Some(count) = active.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&self.ip);
+            }
+        }
+    }
+}
+
 /// Master HA coordinator.
 #[derive(Clone)]
 pub struct MasterCoordinator {
@@ -96,7 +203,7 @@ pub struct MasterCoordinator {
     /// Path where the active version/bundle are persisted across restarts.
     state_path: Arc<Mutex<Option<PathBuf>>>,
     /// Slaves with an asynchronous fallback delivery already scheduled.
-    pending_fallbacks: Arc<Mutex<HashSet<String>>>,
+    pending_fallbacks: Arc<Mutex<HashSet<SessionKey>>>,
     /// Last stale version for which a catch-up push was already attempted per slave.
     stale_repushes: Arc<Mutex<HashMap<String, u64>>>,
     /// Serializes bundle publication so the version check and store cannot
@@ -111,9 +218,18 @@ pub struct MasterCoordinator {
     #[cfg(test)]
     state_write_hook: Arc<Mutex<Option<StateWriteHook>>>,
     /// Divergence records per currently connected slave. They are sticky: only
-    /// an explicit operator resync/promotion or disconnect removes them, never
-    /// an unrelated version advance.
+    /// that slave's applied ACK for the current term/version or a disconnect
+    /// removes them, never an unrelated version advance or a global resync.
     diverged: Arc<Mutex<HashMap<String, Divergence>>>,
+    /// Bounded, coordinator-wide history of published envelopes used to bind
+    /// delayed ACKs (including forks reported by multiple slaves).
+    active_push_history: Arc<Mutex<VecDeque<PublishedEnvelope>>>,
+    /// Bytes currently queued per slave session.
+    queued_bytes: Arc<Mutex<HashMap<SessionKey, usize>>>,
+    /// Most recent publish failure, surfaced through HA readiness.
+    last_publish_error: Arc<Mutex<Option<String>>>,
+    /// True while a background publish retry is already scheduled.
+    publish_retry_running: Arc<AtomicBool>,
     /// Whether the replication listener is actually serving. Updated by
     /// `spawn_master_server` and surfaced by `/ha/status` and `/health`.
     readiness: HaReadinessState,
@@ -154,14 +270,57 @@ impl MasterCoordinator {
             #[cfg(test)]
             state_write_hook: Arc::new(Mutex::new(None)),
             diverged: Arc::new(Mutex::new(HashMap::new())),
+            active_push_history: Arc::new(Mutex::new(VecDeque::new())),
+            queued_bytes: Arc::new(Mutex::new(HashMap::new())),
+            last_publish_error: Arc::new(Mutex::new(None)),
+            publish_retry_running: Arc::new(AtomicBool::new(false)),
             readiness: HaReadinessState::not_ready("master replication listener has not started"),
         }
     }
 
-    /// Current readiness of the master replication listener.
+    /// Current readiness of the master replication path.
+    ///
+    /// A running listener is not enough: a publish that failed to persist or
+    /// broadcast must make the node unready until a later publish succeeds, so
+    /// `/health` cannot stay green while slaves never receive the config.
     #[must_use]
     pub fn readiness(&self) -> HaReadiness {
-        self.readiness.snapshot()
+        let listener = self.readiness.snapshot();
+        if !listener.ready {
+            return listener;
+        }
+        if let Some(error) = self.last_publish_error.lock().unwrap().clone() {
+            return HaReadiness::not_ready(format!(
+                "last HA configuration publish failed: {error}"
+            ));
+        }
+        listener
+    }
+
+    fn set_publish_error(&self, error: Option<String>) {
+        *self.last_publish_error.lock().unwrap() = error;
+    }
+
+    /// Records a publish failure detected before the bundle reaches the
+    /// coordinator (read/serialize/sanitize/empty/secret-scan errors).
+    ///
+    /// Keeps HA readiness false so `/health` cannot stay green while the API
+    /// cannot build a replicable bundle.
+    pub fn mark_publish_failed(&self, reason: impl Into<String>) {
+        self.set_publish_error(Some(reason.into()));
+    }
+
+    /// Starts a publish retry if one is not already running.
+    ///
+    /// Returns false when a retry task is already in flight so a burst of
+    /// failed API applies cannot spawn an unbounded number of retry loops.
+    pub fn begin_publish_retry(&self) -> bool {
+        !self.publish_retry_running.swap(true, Ordering::SeqCst)
+    }
+
+    /// Marks the background publish retry as finished.
+    pub fn end_publish_retry(&self) {
+        self.publish_retry_running.store(false, Ordering::SeqCst);
     }
 
     /// Marks the replication listener as serving connections.
@@ -252,7 +411,11 @@ impl MasterCoordinator {
         let Some(path) = path else {
             return Ok(None);
         };
-        let payload = serde_json::to_vec_pretty(bundle).map_err(|e| {
+        let state = PersistedMasterState {
+            bundle: bundle.clone(),
+            signing_key_pubkey: Some(self.signing_key.public_key_hex()),
+        };
+        let payload = serde_json::to_vec_pretty(&state).map_err(|e| {
             std::io::Error::other(format!("failed to serialize HA master state: {e}"))
         })?;
         Ok(Some((path, payload)))
@@ -310,8 +473,8 @@ impl MasterCoordinator {
                 });
             }
         };
-        let bundle: ConfigBundle = match serde_json::from_str(&data) {
-            Ok(bundle) => bundle,
+        let state: PersistedMasterState = match serde_json::from_str(&data) {
+            Ok(state) => state,
             Err(e) => {
                 let backup = path.with_extension(format!("corrupt.{}", Utc::now().timestamp()));
                 if let Err(rename_err) = std::fs::rename(&path, &backup) {
@@ -325,6 +488,19 @@ impl MasterCoordinator {
                 return Ok(None);
             }
         };
+        if let Some(expected) = state.signing_key_pubkey {
+            let actual = self.signing_key.public_key_hex();
+            if expected != actual {
+                return Err(HaError::Validation {
+                    field: "ha_signing_key".to_string(),
+                    reason: format!(
+                        "HA state at {} was written by signing key {expected}, but the loaded key is {actual}. ha_signing.key was lost or replaced. Restore the original key from backup, or delete the state file and re-enroll every slave with this master's new master_pubkey after an explicit higher-version promotion",
+                        path.display()
+                    ),
+                });
+            }
+        }
+        let bundle = state.bundle;
         if bundle.version == 0 {
             return Ok(None);
         }
@@ -354,10 +530,16 @@ impl MasterCoordinator {
         let mut bundle = bundle;
         bundle.strip_structured_secrets();
         let push = build_and_sign_push(&bundle, &self.signing_key)?;
+        Self::ensure_push_fits(&push)?;
         self.current_version.store(bundle.version, Ordering::SeqCst);
         self.current_term.store(bundle.term, Ordering::SeqCst);
         *self.active_bundle.lock().unwrap() = Some(bundle.clone());
-        *self.active_push.lock().unwrap() = Some(push);
+        *self.active_push.lock().unwrap() = Some(push.clone());
+        self.record_published_envelope(&push);
+        // Upgrade a legacy state file with the signing-key identity so a
+        // future key loss is detectable. A write failure here is actionable:
+        // silently continuing would keep the key-loss blind spot.
+        self.persist_bundle(&bundle)?;
         #[allow(clippy::cast_precision_loss)]
         {
             self.metrics
@@ -416,8 +598,9 @@ impl MasterCoordinator {
     /// version that instance reported.
     ///
     /// Records are deliberately sticky: nothing here is cleared by an
-    /// unrelated version advance. Only [`Self::trigger_resync`] (an explicit
-    /// operator action) or disconnecting the slave removes them.
+    /// unrelated version advance or by another slave's success. Only that
+    /// slave's applied ACK for the master's current term/version, an explicit
+    /// disconnect, or an explicit operator promotion clears them.
     fn mark_diverged(
         &self,
         kind: DivergenceKind,
@@ -444,42 +627,17 @@ impl MasterCoordinator {
         }
     }
 
-    /// Clears the advisory (non-fork) divergence records after an explicit
-    /// operator resync.
-    ///
-    /// A real same-version fork is not cleared here: re-pushing a stale active
-    /// bundle cannot resolve it. The fork record clears only when that slave
-    /// disconnects or successfully applies the current bundle after a
-    /// promotion/reconciliation.
-    fn clear_advisory_divergence(&self) {
-        let slaves = self.slaves.lock().unwrap();
-        let mut diverged = self.diverged.lock().unwrap();
-        let cleared: Vec<String> = diverged
-            .iter()
-            .filter(|(_, d)| d.kind != DivergenceKind::Fork)
-            .map(|(instance, _)| instance.clone())
-            .collect();
-        for instance in cleared {
-            diverged.remove(&instance);
-            if slaves.contains_key(&instance) {
-                self.metrics.set_ha_diverged(&instance, false);
-            }
-        }
-    }
-
-    /// Clears one instance's *fork* divergence after it successfully applied
+    /// Clears one instance's divergence record after it successfully applied
     /// the master's current bundle/term.
     ///
-    /// Advisory ahead/newer-term records stay sticky until an explicit resync
-    /// or disconnect: a same-term version advance by the same slave is not
-    /// proof that the earlier continuity condition is gone.
+    /// Divergence is per-slave and clearing it is per-slave: an operator
+    /// resync only re-pushes the bundle and never clears another slave's
+    /// advisory record before that slave proves recovery by ACKing the current
+    /// term/version.
     fn clear_divergence_for(&self, instance: &str) {
         let slaves = self.slaves.lock().unwrap();
         let mut diverged = self.diverged.lock().unwrap();
-        let is_fork = diverged
-            .get(instance)
-            .is_some_and(|d| d.kind == DivergenceKind::Fork);
-        if is_fork && diverged.remove(instance).is_some() && slaves.contains_key(instance) {
+        if diverged.remove(instance).is_some() && slaves.contains_key(instance) {
             self.metrics.set_ha_diverged(instance, false);
         }
     }
@@ -533,15 +691,55 @@ impl MasterCoordinator {
         }
 
         let push_msg = build_and_sign_push(&bundle, &self.signing_key)?;
+        Self::ensure_push_fits(&push_msg)?;
         Ok((bundle, version, push_msg, current))
+    }
+
+    /// Rejects a signed envelope that cannot fit the WebSocket message limit
+    /// before it is persisted or broadcast. An oversized bundle must be an
+    /// apply error, not a config that every slave rejects forever.
+    fn ensure_push_fits(push: &HaMessage) -> Result<(), HaError> {
+        let bytes = push.to_json()?.len();
+        if bytes > MAX_WS_MESSAGE_SIZE {
+            return Err(HaError::BundleTooLarge {
+                bytes,
+                limit: MAX_WS_MESSAGE_SIZE,
+            });
+        }
+        Ok(())
+    }
+
+    /// Records a published envelope in the bounded ACK-binding history.
+    fn record_published_envelope(&self, push: &HaMessage) {
+        let HaMessage::ConfigPush {
+            term,
+            version,
+            payload_hash_blake3,
+            ..
+        } = push
+        else {
+            return;
+        };
+        let mut history = self.active_push_history.lock().unwrap();
+        history.push_back(PublishedEnvelope {
+            term: *term,
+            version: *version,
+            payload_hash: payload_hash_blake3
+                .trim_start_matches("blake3:")
+                .to_string(),
+        });
+        while history.len() > MAX_PUBLISH_HISTORY {
+            history.pop_front();
+        }
     }
 
     /// Publishes a prepared bundle. The caller must hold
     /// [`Self::publish_lock`] and have persisted the bundle first.
-    fn publish_prepared(&self, bundle: ConfigBundle, version: u64, push_msg: HaMessage) {
+    fn publish_prepared(&self, bundle: ConfigBundle, version: u64, push_msg: &HaMessage) {
         self.current_version.store(version, Ordering::SeqCst);
         *self.active_bundle.lock().unwrap() = Some(bundle);
-        *self.active_push.lock().unwrap() = Some(push_msg);
+        *self.active_push.lock().unwrap() = Some(push_msg.clone());
+        self.record_published_envelope(push_msg);
     }
 
     /// Publishes the active configuration version to the HA metrics.
@@ -562,6 +760,12 @@ impl MasterCoordinator {
     /// in production, otherwise a sync write landing during an async
     /// conflict-restore could overwrite the newer state file.
     pub fn update_bundle(&self, bundle: ConfigBundle) -> Result<u64, HaError> {
+        let result = self.update_bundle_inner(bundle);
+        self.record_publish_result(&result);
+        result
+    }
+
+    fn update_bundle_inner(&self, bundle: ConfigBundle) -> Result<u64, HaError> {
         // Serialize the check-then-store: two concurrent publishers could
         // otherwise both pass the monotonicity check and store out of order,
         // regressing the active version and broadcasting a stale bundle.
@@ -574,7 +778,7 @@ impl MasterCoordinator {
         // Persist before publishing: a failed write must leave both the
         // in-memory active bundle/push and the version sequence untouched.
         self.persist_bundle(&bundle)?;
-        self.publish_prepared(bundle, version, push_msg.clone());
+        self.publish_prepared(bundle, version, &push_msg);
         self.record_published_version(version);
 
         // Broadcast to all active slaves
@@ -588,6 +792,16 @@ impl MasterCoordinator {
         Ok(version)
     }
 
+    fn record_publish_result<T>(&self, result: &Result<T, HaError>) {
+        match result {
+            Ok(_) => self.set_publish_error(None),
+            Err(HaError::BundleTooLarge { bytes, limit }) => self.set_publish_error(Some(format!(
+                "bundle would be {bytes} bytes, above the {limit}-byte replication limit"
+            ))),
+            Err(e) => self.set_publish_error(Some(e.to_string())),
+        }
+    }
+
     /// Async variant of [`Self::update_bundle`] that persists state on the
     /// blocking pool.
     ///
@@ -596,6 +810,50 @@ impl MasterCoordinator {
     /// order. The standard `publish_lock` is only held for the in-memory
     /// check/store/sign step and is dropped before awaiting the disk write.
     pub async fn update_bundle_async(&self, bundle: ConfigBundle) -> Result<u64, HaError> {
+        let result = self.update_bundle_async_inner(bundle).await;
+        self.record_publish_result(&result);
+        result.map(|(version, _)| version)
+    }
+
+    /// Publishes a bundle and reports the observable outcome.
+    ///
+    /// This is the variant API/config callers use: a `TooLarge` outcome is not
+    /// a transport error, it is a configuration that cannot be replicated and
+    /// must be treated as an apply error by the caller. Publication failures
+    /// are also recorded in HA readiness.
+    pub async fn publish_bundle_async(
+        &self,
+        bundle: ConfigBundle,
+    ) -> Result<PublishOutcome, HaError> {
+        match self.update_bundle_async_inner(bundle).await {
+            Ok((version, notified)) => {
+                self.set_publish_error(None);
+                if notified == 0 {
+                    Ok(PublishOutcome::NoSlaves)
+                } else {
+                    Ok(PublishOutcome::Published {
+                        version,
+                        term: self.get_current_term(),
+                    })
+                }
+            }
+            Err(HaError::BundleTooLarge { bytes, limit }) => {
+                self.set_publish_error(Some(format!(
+                    "bundle would be {bytes} bytes, above the {limit}-byte replication limit"
+                )));
+                Ok(PublishOutcome::TooLarge { bytes, limit })
+            }
+            Err(e) => {
+                self.set_publish_error(Some(e.to_string()));
+                Err(e)
+            }
+        }
+    }
+
+    async fn update_bundle_async_inner(
+        &self,
+        bundle: ConfigBundle,
+    ) -> Result<(u64, usize), HaError> {
         let _persist_guard = self.persist_lock.lock().await;
 
         let (bundle, version, push_msg, previous_version) = {
@@ -626,7 +884,7 @@ impl MasterCoordinator {
             // now-active bundle instead. Only detect and clone under the
             // standard lock: it must never be held across the awaited write.
             if self.current_version.load(Ordering::SeqCst) == previous_version {
-                self.publish_prepared(bundle, version, push_msg.clone());
+                self.publish_prepared(bundle, version, &push_msg);
                 None
             } else {
                 Some(self.active_bundle.lock().unwrap().clone())
@@ -653,14 +911,14 @@ impl MasterCoordinator {
         self.record_published_version(version);
 
         // Broadcast to all active slaves
-        self.broadcast(&push_msg);
+        let notified = self.broadcast(&push_msg);
 
         info!(
             version,
             "Master updated configuration bundle and broadcasted push to connected slaves"
         );
 
-        Ok(version)
+        Ok((version, notified))
     }
 
     /// Broadcasts a message to all connected slaves.
@@ -668,11 +926,34 @@ impl MasterCoordinator {
     /// Returns the number of slaves for which delivery was queued (a full
     /// queue with a coalesced fallback task counts as queued).
     pub fn broadcast(&self, msg: &HaMessage) -> usize {
+        let wire_size = msg.to_json().map_or(0, |json| json.len());
         let mut notified = 0;
         let slaves = self.slaves.lock().unwrap();
+        let mut queued = self.queued_bytes.lock().unwrap();
         for slave in slaves.values() {
+            let instance = &slave.instance;
+            let session = (instance.clone(), slave.connection_id);
+            let current = queued.get(&session).copied().unwrap_or(0);
+            if wire_size > 0 && current.saturating_add(wire_size) > MAX_SLAVE_QUEUE_BYTES {
+                // The per-slave byte budget is exhausted even though the
+                // message-count channel may still have room: coalesce instead
+                // of letting a slow peer pin tens of MiB of bundles.
+                warn!(
+                    instance = %instance,
+                    queued_bytes = current,
+                    message_bytes = wire_size,
+                    limit = MAX_SLAVE_QUEUE_BYTES,
+                    "HA push byte budget exhausted; scheduling coalesced delivery"
+                );
+                self.schedule_coalesced_delivery(instance, slave.connection_id, &slave.sender, msg);
+                notified += 1;
+                continue;
+            }
             match slave.sender.try_send(msg.clone()) {
                 Ok(()) => {
+                    if wire_size > 0 {
+                        *queued.entry(session).or_insert(0) += wire_size;
+                    }
                     notified += 1;
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -680,49 +961,15 @@ impl MasterCoordinator {
                     // fallback deliveries per slave so a slow or stalled replica
                     // cannot spawn unbounded tasks; the task sends the latest
                     // active bundle when the channel has room.
-                    let instance = slave.instance.clone();
-                    let first_schedule = self
-                        .pending_fallbacks
-                        .lock()
-                        .unwrap()
-                        .insert(instance.clone());
+                    self.schedule_coalesced_delivery(
+                        instance,
+                        slave.connection_id,
+                        &slave.sender,
+                        msg,
+                    );
                     // The push will be delivered by the coalesced fallback
                     // task (either this one or one already pending).
                     notified += 1;
-                    if !first_schedule {
-                        debug!(
-                            instance = %instance,
-                            "HA fallback delivery already pending; coalescing push"
-                        );
-                        continue;
-                    }
-                    warn!(
-                        instance = %instance,
-                        "HA push queue full; scheduling coalesced asynchronous delivery"
-                    );
-                    let coordinator = self.clone();
-                    let sender = slave.sender.clone();
-                    let fallback = msg.clone();
-                    tokio::spawn(async move {
-                        // Prefer the latest active bundle; fall back to the
-                        // message that could not be enqueued.
-                        let latest = coordinator
-                            .active_push
-                            .lock()
-                            .unwrap()
-                            .clone()
-                            .or(Some(fallback));
-                        if let Some(latest) = latest
-                            && let Err(e) = sender.send(latest).await
-                        {
-                            warn!(instance = %instance, "Failed to deliver queued HA push: {e}");
-                        }
-                        coordinator
-                            .pending_fallbacks
-                            .lock()
-                            .unwrap()
-                            .remove(&instance);
-                    });
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     debug!(instance = %slave.instance, "HA push channel closed");
@@ -730,6 +977,166 @@ impl MasterCoordinator {
             }
         }
         notified
+    }
+
+    /// Queues `msg` for one slave session and records its wire size in the
+    /// per-session byte budget when the queue accepted it.
+    ///
+    /// Every non-broadcast send path (initial push, resync, catch-up repush)
+    /// must go through this helper so the coalesced-delivery budget reflects
+    /// all bytes queued for a slave, not only broadcast traffic. The caller
+    /// passes the precomputed `wire_size` so the budget decision and the send
+    /// use the same value.
+    ///
+    /// An over-budget send is refused before touching the channel; callers may
+    /// coalesce it instead of growing the queue.
+    fn try_queue_accounted(
+        &self,
+        instance: &str,
+        connection_id: u64,
+        sender: &mpsc::Sender<HaMessage>,
+        wire_size: usize,
+        msg: HaMessage,
+    ) -> Result<(), String> {
+        let session = (instance.to_string(), connection_id);
+        // Hold the accounting lock across the budget check, `try_send` and the
+        // increment: the session loop subtracts under the same lock, and
+        // releasing it in between would let the subtract observe the old value
+        // and turn the later increment into phantom bytes.
+        let mut queued = self.queued_bytes.lock().unwrap();
+        // Registration installs the session key and reconnect removes every
+        // old key for the instance. A missing key therefore means this sender
+        // belongs to a superseded session: refuse instead of recreating
+        // accounting for a channel nobody will drain.
+        let Some(current) = queued.get(&session).copied() else {
+            return Err("slave session is no longer active".to_string());
+        };
+        if wire_size > 0 && current.saturating_add(wire_size) > MAX_SLAVE_QUEUE_BYTES {
+            return Err(format!(
+                "per-slave queue byte budget exhausted ({current} + {wire_size} > {MAX_SLAVE_QUEUE_BYTES})"
+            ));
+        }
+        sender.try_send(msg).map_err(|e| e.to_string())?;
+        if wire_size > 0 {
+            *queued.entry(session).or_insert(0) += wire_size;
+        }
+        Ok(())
+    }
+
+    /// Removes `wire_size` from one session's queued-byte accounting.
+    ///
+    /// Keying by `(instance, connection_id)` ensures a superseded session that
+    /// drains its old channel after a reconnect cannot subtract from the
+    /// replacement session's budget.
+    fn account_drained(&self, instance: &str, connection_id: u64, wire_size: usize) {
+        if wire_size == 0 {
+            return;
+        }
+        let mut queued = self.queued_bytes.lock().unwrap();
+        if let Some(current) = queued.get_mut(&(instance.to_string(), connection_id)) {
+            *current = current.saturating_sub(wire_size);
+        }
+    }
+
+    /// Schedules at most one coalesced delivery task per slave session.
+    ///
+    /// The task captures the session's `connection_id` and re-checks ownership
+    /// before waiting, delivering, or charging bytes. A superseded task must
+    /// never charge the replacement session, and it must stop waiting on the
+    /// old session's budget.
+    fn schedule_coalesced_delivery(
+        &self,
+        instance: &str,
+        connection_id: u64,
+        sender: &mpsc::Sender<HaMessage>,
+        fallback_msg: &HaMessage,
+    ) {
+        let instance = instance.to_string();
+        let session = (instance.clone(), connection_id);
+        let first_schedule = self
+            .pending_fallbacks
+            .lock()
+            .unwrap()
+            .insert(session.clone());
+        if !first_schedule {
+            debug!(
+                instance = %instance,
+                connection_id,
+                "HA fallback delivery already pending; coalescing push"
+            );
+            return;
+        }
+        let coordinator = self.clone();
+        let sender = sender.clone();
+        let fallback = fallback_msg.clone();
+        tokio::spawn(async move {
+            // Prefer the latest active bundle; fall back to the message that
+            // could not be enqueued.
+            let latest = coordinator
+                .active_push
+                .lock()
+                .unwrap()
+                .clone()
+                .or(Some(fallback));
+            if let Some(latest) = latest {
+                let size = latest.to_json().map_or(0, |json| json.len());
+                // Wait only while this exact session still owns the active
+                // entry. After a reconnect the old task must not wait on,
+                // deliver to, or charge the replacement session.
+                //
+                // The bytes are reserved *before* the awaited send: the
+                // session loop can receive and subtract as soon as the send
+                // completes, so accounting after the await would race and
+                // leave phantom bytes.
+                let mut reserved = false;
+                loop {
+                    let (owns, has_room) = {
+                        let slaves = coordinator.slaves.lock().unwrap();
+                        let owns = slaves
+                            .get(&instance)
+                            .is_some_and(|s| s.connection_id == connection_id);
+                        if owns {
+                            let mut queued = coordinator.queued_bytes.lock().unwrap();
+                            let current = queued.get(&session).copied().unwrap_or(0);
+                            if size == 0 || current.saturating_add(size) <= MAX_SLAVE_QUEUE_BYTES {
+                                if size > 0 {
+                                    *queued.entry(session.clone()).or_insert(0) += size;
+                                }
+                                (true, true)
+                            } else {
+                                (true, false)
+                            }
+                        } else {
+                            (false, false)
+                        }
+                    };
+                    if !owns {
+                        break;
+                    }
+                    if has_room {
+                        reserved = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if reserved && let Err(e) = sender.send(latest).await {
+                    // The send failed, so release the reservation. The key may
+                    // already be gone if a reconnect superseded this session.
+                    if size > 0 {
+                        let mut queued = coordinator.queued_bytes.lock().unwrap();
+                        if let Some(current) = queued.get_mut(&session) {
+                            *current = current.saturating_sub(size);
+                        }
+                    }
+                    warn!(instance = %instance, "Failed to deliver queued HA push: {e}");
+                }
+            }
+            coordinator
+                .pending_fallbacks
+                .lock()
+                .unwrap()
+                .remove(&session);
+        });
     }
 
     /// Re-pushes the active bundle to one slave that acknowledged a stale
@@ -743,31 +1150,44 @@ impl MasterCoordinator {
         drop(repushed);
 
         if let Some(push) = self.active_push.lock().unwrap().clone() {
-            let slaves = self.slaves.lock().unwrap();
-            if let Some(slave) = slaves.get(instance)
-                && let Err(e) = slave.sender.try_send(push)
-            {
-                warn!(instance = %instance, "Catch-up push could not be queued: {e}");
+            let target = {
+                let slaves = self.slaves.lock().unwrap();
+                slaves
+                    .get(instance)
+                    .map(|slave| (slave.sender.clone(), slave.connection_id))
+            };
+            if let Some((sender, connection_id)) = target {
+                let wire_size = push.to_json().map_or(0, |json| json.len());
+                if let Err(e) = self.try_queue_accounted(
+                    instance,
+                    connection_id,
+                    &sender,
+                    wire_size,
+                    push.clone(),
+                ) {
+                    warn!(
+                        instance = %instance,
+                        error = %e,
+                        "Catch-up push could not be queued; coalescing"
+                    );
+                    self.schedule_coalesced_delivery(instance, connection_id, &sender, &push);
+                }
             }
         }
     }
 
     /// Triggers a re-push of the current active configuration bundle to all slaves.
-    /// Triggers a re-push of the current active configuration bundle to all slaves.
     ///
-    /// This is the explicit operator recovery action. It clears advisory
-    /// (ahead/newer-term) records only when a push was actually queued; a real
-    /// same-version fork is left latched until the slave accepts the current
-    /// bundle (after promotion/reconciliation) or disconnects.
+    /// This is the explicit operator recovery action. It does **not** clear any
+    /// divergence record: H-10 requires the record to clear only after that
+    /// specific slave ACKs the current term/version, because a queued re-push
+    /// is not proof that the slave recovered.
     pub fn trigger_resync(&self) -> ResyncOutcome {
         let push_opt = self.active_push.lock().unwrap().clone();
         let slaves_notified = match push_opt {
             Some(ref push) => self.broadcast(push),
             None => 0,
         };
-        if push_opt.is_some() && slaves_notified > 0 {
-            self.clear_advisory_divergence();
-        }
         ResyncOutcome {
             version: self.get_current_version(),
             active_bundle: push_opt.is_some(),
@@ -997,6 +1417,15 @@ impl MasterCoordinator {
         // that it no longer owns the entry.
         {
             let mut slaves = self.slaves.lock().unwrap();
+            // A reconnecting instance starts with an empty queue; accounting
+            // from every superseded session must not leak into the new one.
+            // Keys include the connection id, so drop every key for this
+            // instance and install the new session's zero baseline.
+            {
+                let mut queued = self.queued_bytes.lock().unwrap();
+                queued.retain(|(instance, _), _| instance != &slave_instance);
+                queued.insert((slave_instance.clone(), connection_id), 0);
+            }
             slaves.insert(
                 slave_instance.clone(),
                 ActiveSlave {
@@ -1030,8 +1459,16 @@ impl MasterCoordinator {
                 cur_v,
                 "Pushing current configuration bundle to newly connected slave"
             );
-            if let Err(e) = tx.try_send(push.clone()) {
-                warn!(instance = %slave_instance, "Initial HA push could not be queued: {e}");
+            let wire_size = push.to_json().map_or(0, |json| json.len());
+            if let Err(e) = self.try_queue_accounted(
+                &slave_instance,
+                connection_id,
+                &tx,
+                wire_size,
+                push.clone(),
+            ) {
+                warn!(instance = %slave_instance, error = %e, "Initial HA push could not be queued; coalescing");
+                self.schedule_coalesced_delivery(&slave_instance, connection_id, &tx, push);
             }
         }
 
@@ -1045,10 +1482,11 @@ impl MasterCoordinator {
             tokio::select! {
                 // Outgoing messages queued for this slave
                 Some(msg) = rx.recv() => {
-                    if let Ok(json) = msg.to_json()
-                        && ws_stream.send(WsMessage::Text(json.into())).await.is_err() {
-                            break;
-                        }
+                    let wire_size = msg.to_json().map_or(0, |json| json.len());
+                    self.account_drained(&slave_instance, connection_id, wire_size);
+                    if send_master_message(&mut ws_stream, &msg, "configuration push").await.is_err() {
+                        break;
+                    }
                 }
 
                 // Periodic ping + liveness watchdog
@@ -1083,10 +1521,9 @@ impl MasterCoordinator {
                     #[allow(clippy::cast_sign_loss)]
                     let ts = Utc::now().timestamp_millis() as u64;
                     let ping = HaMessage::Ping { ts };
-                    if let Ok(json) = ping.to_json()
-                        && ws_stream.send(WsMessage::Text(json.into())).await.is_err() {
-                            break;
-                        }
+                    if send_master_message(&mut ws_stream, &ping, "heartbeat ping").await.is_err() {
+                        break;
+                    }
                 }
 
                 // Incoming messages from slave
@@ -1156,6 +1593,10 @@ impl MasterCoordinator {
             // reconnects.
             self.stale_repushes.lock().unwrap().remove(instance);
             self.diverged.lock().unwrap().remove(instance);
+            self.queued_bytes
+                .lock()
+                .unwrap()
+                .remove(&(instance.to_string(), connection_id));
             self.metrics.remove_ha_diverged(instance);
         }
         #[allow(clippy::cast_possible_wrap)]
@@ -1163,27 +1604,14 @@ impl MasterCoordinator {
         owned
     }
 
-    /// Returns true when the master's currently active push has exactly this
-    /// term and version.
-    ///
-    /// Used to bind a structured fork rejection to a push the master actually
-    /// sent: an authenticated peer cannot invent a fork for an arbitrary
-    /// (possibly huge) version.
-    fn active_push_matches(&self, term: u64, version: u64) -> bool {
-        self.active_push
+    /// Returns the payload hash of a still-retained published envelope.
+    fn published_envelope_hash(&self, term: u64, version: u64) -> Option<String> {
+        self.active_push_history
             .lock()
             .unwrap()
-            .as_ref()
-            .is_some_and(|push| {
-                matches!(
-                    push,
-                    HaMessage::ConfigPush {
-                        version: pushed_version,
-                        term: pushed_term,
-                        ..
-                    } if *pushed_version == version && *pushed_term == term
-                )
-            })
+            .iter()
+            .find(|envelope| envelope.term == term && envelope.version == version)
+            .map(|envelope| envelope.payload_hash.clone())
     }
 
     fn process_slave_msg(&self, slave_instance: &str, connection_id: u64, text: &str) -> bool {
@@ -1257,26 +1685,29 @@ impl MasterCoordinator {
                 if !applied {
                     if conflict == Some(AckConflict::SameVersionFork) {
                         // Only a push the master actually sent can prove a
-                        // fork. Without this binding an authenticated replica
-                        // could latch a fabricated fork for any version and
-                        // (before publishing was decoupled) block the cluster.
-                        if !self.active_push_matches(term, version) {
+                        // fork. The bounded published-envelope history keeps
+                        // recently superseded bundles, so an ACK that arrives
+                        // after a newer publish is still attributed correctly.
+                        // Without this binding an authenticated replica could
+                        // latch a fabricated fork for any version.
+                        let Some(published_hash) = self.published_envelope_hash(term, version)
+                        else {
                             warn!(
                                 instance = %slave_instance,
                                 acked_version = version,
                                 acked_term = term,
                                 current,
                                 current_term,
-                                "Ignoring same-version fork ACK without a matching active push"
+                                "Ignoring same-version fork ACK without a matching published envelope"
                             );
                             return true;
-                        }
+                        };
                         // Same term and version but different content: this is
                         // the fork signal. Record it so the slave is reported
                         // unsynced and can never silently "win" the fork; this
                         // does not stop publishing to other replicas.
                         let reason = format!(
-                            "slave '{slave_instance}' rejected term {term} version {version} with a same-version payload-hash fork: resolve the fork or promote the slave"
+                            "slave '{slave_instance}' rejected term {term} version {version} with a same-version payload-hash fork (published envelope {published_hash}): resolve the fork or promote the slave"
                         );
                         error!(
                             instance = %slave_instance,
@@ -1343,9 +1774,10 @@ impl MasterCoordinator {
                     self.metrics
                         .set_ha_config_version(slave_instance, version as f64);
                     self.stale_repushes.lock().unwrap().remove(slave_instance);
-                    // This slave has accepted the current term/version, so a
-                    // real fork record for it is now resolved. Advisory
-                    // ahead/newer-term records stay sticky until resync.
+                    // This slave has accepted the current term/version, so any
+                    // divergence record for it (fork, ahead, newer-term) is now
+                    // resolved. Other slaves' records are untouched: H-10
+                    // clears divergence per acknowledging slave.
                     self.clear_divergence_for(slave_instance);
                 } else if version < current {
                     warn!(
@@ -1419,12 +1851,34 @@ impl MasterCoordinator {
                 // Resync requested: always re-push the active bundle; the slave
                 // acknowledges without re-applying when it is already current.
                 if let Some(ref push) = *self.active_push.lock().unwrap() {
-                    let slaves = self.slaves.lock().unwrap();
-                    if let Some(s) = slaves.get(slave_instance)
-                        && s.connection_id == connection_id
-                        && let Err(e) = s.sender.try_send(push.clone())
-                    {
-                        warn!(instance = %slave_instance, "Resync push could not be queued: {e}");
+                    let sender = {
+                        let slaves = self.slaves.lock().unwrap();
+                        slaves
+                            .get(slave_instance)
+                            .filter(|s| s.connection_id == connection_id)
+                            .map(|s| s.sender.clone())
+                    };
+                    if let Some(sender) = sender {
+                        let wire_size = push.to_json().map_or(0, |json| json.len());
+                        if let Err(e) = self.try_queue_accounted(
+                            slave_instance,
+                            connection_id,
+                            &sender,
+                            wire_size,
+                            push.clone(),
+                        ) {
+                            warn!(
+                                instance = %slave_instance,
+                                error = %e,
+                                "Resync push could not be queued; coalescing"
+                            );
+                            self.schedule_coalesced_delivery(
+                                slave_instance,
+                                connection_id,
+                                &sender,
+                                push,
+                            );
+                        }
                     }
                 }
             }
@@ -1433,6 +1887,32 @@ impl MasterCoordinator {
 
         true
     }
+}
+
+/// Sends one HA message to a replica with a hard write deadline.
+///
+/// A peer that stops reading must not pin the session task (or its queue)
+/// forever; the caller closes the session on timeout.
+async fn send_master_message<S>(
+    ws_stream: &mut tokio_tungstenite::WebSocketStream<S>,
+    message: &HaMessage,
+    context: &str,
+) -> Result<(), HaError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let json = message.to_json()?;
+    timeout(
+        WS_SEND_TIMEOUT,
+        ws_stream.send(WsMessage::Text(json.into())),
+    )
+    .await
+    .map_err(|_| {
+        HaError::Timeout(format!(
+            "HA master {context} send timed out after {WS_SEND_TIMEOUT:?}"
+        ))
+    })?
+    .map_err(|e| HaError::Connection(format!("Failed to send {context}: {e}")))
 }
 
 /// Maximum concurrently accepted slave connections (handshake + session).
@@ -1514,6 +1994,7 @@ pub fn spawn_master_server(
         info!(addr = %listen_addr, "Master HA replication listener active");
 
         let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_SLAVE_CONNECTIONS));
+        let handshake_budget = Arc::new(HandshakeBudget::default());
 
         loop {
             tokio::select! {
@@ -1534,11 +2015,20 @@ pub fn spawn_master_server(
                                 );
                                 continue;
                             };
+                            let Some(handshake_permit) = handshake_budget.try_acquire(peer_addr.ip()) else {
+                                warn!(
+                                    peer = %peer_addr,
+                                    limit = MAX_HANDSHAKES_PER_IP,
+                                    "HA per-IP connection/handshake limit reached; rejecting"
+                                );
+                                continue;
+                            };
                             let coord = coordinator.clone();
                             let acceptor_opt = tls_acceptor.clone();
 
                             tokio::spawn(async move {
                                 let _permit = permit;
+                                let _handshake_permit = handshake_permit;
                                 let upgrade = async {
                                     if let Some(acceptor) = acceptor_opt {
                                         let tls_stream = timeout(
@@ -1784,7 +2274,14 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let state_path = dir.join("ha_state.toml");
-        let coordinator = test_coordinator().with_state_path(state_path.clone());
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        let coordinator = MasterCoordinator::new(
+            "test-master".to_string(),
+            1,
+            key.clone(),
+            sito_stats::MetricsRegistry::new("test", "test"),
+        )
+        .with_state_path(state_path.clone());
 
         assert_eq!(
             coordinator
@@ -1804,7 +2301,25 @@ mod tests {
             "the temporary file must be renamed away"
         );
 
-        let restored = test_coordinator().with_state_path(state_path);
+        // The same signing key must restore the persisted state. Using a new
+        // key must fail closed with an actionable error (H-08).
+        let wrong = test_coordinator().with_state_path(state_path.clone());
+        let err = wrong
+            .restore_state()
+            .expect_err("a replaced signing key must not silently re-sign persisted state");
+        assert!(
+            err.to_string()
+                .contains("ha_signing.key was lost or replaced"),
+            "the key-loss error must be actionable: {err}"
+        );
+
+        let restored = MasterCoordinator::new(
+            "test-master".to_string(),
+            1,
+            key,
+            sito_stats::MetricsRegistry::new("test", "test"),
+        )
+        .with_state_path(state_path);
         assert_eq!(restored.restore_state().unwrap(), Some(4));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1820,7 +2335,14 @@ mod tests {
             rand::random::<u64>()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let coordinator = test_coordinator().with_state_path(dir.join("ha_state.toml"));
+        let coordinator = test_coordinator()
+            .with_state_path(dir.join("ha_state.toml"))
+            .with_state_write_hook(Arc::new(|_version| {
+                // Simulate a slow disk inside the blocking-pool writer instead
+                // of using an unreplicable multi-MiB bundle (which publish must
+                // now reject before persisting).
+                std::thread::sleep(Duration::from_millis(200));
+            }));
 
         let ticks = Arc::new(AtomicU64::new(0));
         let ticker_ticks = ticks.clone();
@@ -1834,10 +2356,10 @@ mod tests {
         tokio::task::yield_now().await;
         let before = ticks.load(Ordering::Relaxed);
 
-        // A large payload makes the blocking write long enough to observe.
-        let mut big_bundle = test_bundle(2);
-        big_bundle.config_toml = "x".repeat(16 * 1024 * 1024);
-        coordinator.update_bundle_async(big_bundle).await.unwrap();
+        coordinator
+            .update_bundle_async(test_bundle(2))
+            .await
+            .unwrap();
         let after = ticks.load(Ordering::Relaxed);
 
         ticker.abort();
@@ -2108,8 +2630,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_master_bind_failure_records_startup_noop() {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
+        // Keep the probe listener bound so the master cannot bind the port.
+        let port_lease = sito_test_support::reserve_port().unwrap();
+        let port = port_lease.port();
         let coordinator = test_coordinator();
         let metrics = coordinator.metrics.clone();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2132,7 +2655,7 @@ mod tests {
                 .contains(r#"sito_ha_startup_noop_total{role="master",reason="bind_failed"} 1"#),
             "a listener bind failure must be observable: {rendered}"
         );
-        drop(probe);
+        drop(port_lease);
     }
 
     #[tokio::test]
@@ -2178,9 +2701,7 @@ mod tests {
     async fn test_master_listener_bind_marks_readiness_ready() {
         let coordinator = test_coordinator();
         let observer = coordinator.clone();
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        let port = sito_test_support::reserve_port_number().unwrap();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = spawn_master_server(
@@ -2215,8 +2736,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_master_bind_failure_marks_readiness_failed() {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
+        // Keep the probe listener bound so the master cannot bind the port.
+        let port_lease = sito_test_support::reserve_port().unwrap();
+        let port = port_lease.port();
         let coordinator = test_coordinator();
         let observer = coordinator.clone();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2242,7 +2764,7 @@ mod tests {
                 .contains("Failed to bind"),
             "readiness must name the bind failure"
         );
-        drop(probe);
+        drop(port_lease);
     }
 
     #[tokio::test]
@@ -2300,6 +2822,399 @@ mod tests {
         // Cleanup removes the per-instance metric label.
         coordinator.metrics.set_ha_config_version("slave-1", 1.0);
         coordinator.metrics.remove_ha_config_version("slave-1");
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_respects_per_slave_queue_byte_budget() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<HaMessage>(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "slow-slave".to_string(),
+            ActiveSlave {
+                instance: "slow-slave".to_string(),
+                remote_addr: "127.0.0.1:12345".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+        // Pretend the session has a full byte budget queued even though the
+        // message-count channel has room.
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .insert(("slow-slave".to_string(), 1), MAX_SLAVE_QUEUE_BYTES);
+
+        assert_eq!(coordinator.broadcast(&HaMessage::Ping { ts: 2 }), 1);
+        // The coalesced task must wait for the byte budget instead of queueing
+        // another message.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the byte budget must block delivery while the queue is full"
+        );
+
+        // Draining the accounting (as the session loop does after a read)
+        // releases the coalesced delivery.
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .remove(&("slow-slave".to_string(), 1));
+        let delivered = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("coalesced delivery timed out")
+            .expect("channel closed");
+        assert!(matches!(delivered, HaMessage::ConfigPush { .. }));
+    }
+
+    /// Regression (deferred D2): every non-broadcast send path must account
+    /// its bytes, a rejected send must not inflate the budget, and an
+    /// over-budget send must be refused before it touches the channel.
+    #[tokio::test]
+    async fn test_try_queue_accounted_tracks_bytes_and_rejects_full_queue() {
+        let coordinator = test_coordinator();
+        let (tx, mut rx) = mpsc::channel::<HaMessage>(1);
+        let msg = HaMessage::Ping { ts: 7 };
+        let size = msg.to_json().unwrap().len();
+        let key = ("slave-1".to_string(), 1);
+        // Registration installs the session key; the helper refuses to create
+        // accounting for an unregistered/superseded session.
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .insert(key.clone(), 0);
+
+        coordinator
+            .try_queue_accounted("slave-1", 1, &tx, size, msg.clone())
+            .expect("queue has room");
+        assert_eq!(
+            coordinator.queued_bytes.lock().unwrap().get(&key).copied(),
+            Some(size),
+            "a queued message must be accounted"
+        );
+
+        // The single-slot channel is full: a rejected send must not add bytes.
+        assert!(
+            coordinator
+                .try_queue_accounted("slave-1", 1, &tx, size, msg.clone())
+                .is_err()
+        );
+        assert_eq!(
+            coordinator.queued_bytes.lock().unwrap().get(&key).copied(),
+            Some(size),
+            "a rejected send must not change the accounting"
+        );
+
+        let _ = rx.recv().await;
+        drop(rx);
+        // A closed channel must not add bytes either.
+        assert!(
+            coordinator
+                .try_queue_accounted("slave-1", 1, &tx, size, msg.clone())
+                .is_err()
+        );
+        assert_eq!(
+            coordinator.queued_bytes.lock().unwrap().get(&key).copied(),
+            Some(size)
+        );
+
+        // A sender whose session key was removed by a reconnect must not
+        // recreate accounting for a channel nobody will drain.
+        let (unregistered_tx, mut unregistered_rx) = mpsc::channel::<HaMessage>(4);
+        assert!(
+            coordinator
+                .try_queue_accounted("slave-3", 3, &unregistered_tx, size, msg.clone())
+                .is_err(),
+            "an unregistered/superseded session must be refused"
+        );
+        assert!(
+            unregistered_rx.try_recv().is_err(),
+            "a refused session must not receive the message"
+        );
+
+        // An over-budget send is refused before it is queued, so a coalesced
+        // fallback can take over instead of growing the queue.
+        let (over_tx, mut over_rx) = mpsc::channel::<HaMessage>(4);
+        let over_key = ("slave-2".to_string(), 9);
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .insert(over_key.clone(), MAX_SLAVE_QUEUE_BYTES);
+        let err = coordinator
+            .try_queue_accounted("slave-2", 9, &over_tx, size, msg)
+            .expect_err("an over-budget send must be refused");
+        assert!(err.contains("budget"), "unexpected error: {err}");
+        assert!(
+            over_rx.try_recv().is_err(),
+            "an over-budget send must not touch the channel"
+        );
+        assert_eq!(
+            coordinator
+                .queued_bytes
+                .lock()
+                .unwrap()
+                .get(&over_key)
+                .copied(),
+            Some(MAX_SLAVE_QUEUE_BYTES),
+            "a refused send must not change the accounting"
+        );
+    }
+
+    /// Regression (deferred D2): a reconnecting instance used to inherit the
+    /// superseded session's `queued_bytes`, so the coalesced-delivery loop
+    /// could spin until phantom accounting cleared. Registration must reset it.
+    #[tokio::test]
+    async fn test_reconnect_resets_per_slave_queue_accounting() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+        let coordinator = test_coordinator();
+        // No active bundle: registration has nothing to enqueue, so any
+        // remaining value after registration is phantom accounting. The key
+        // carries a superseded connection id.
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .insert(("slave-1".to_string(), 999), MAX_SLAVE_QUEUE_BYTES);
+
+        let (server_socket, client_socket) = tokio::io::duplex(64 * 1024);
+        let server_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            server_socket,
+            Role::Server,
+            Some(WebSocketConfig::default()),
+        )
+        .await;
+        let mut client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            client_socket,
+            Role::Client,
+            Some(WebSocketConfig::default()),
+        )
+        .await;
+
+        let coord = coordinator.clone();
+        let session = tokio::spawn(async move {
+            coord
+                .handle_connection(server_ws, "127.0.0.1:1000".parse().unwrap())
+                .await;
+        });
+
+        let hello = HaMessage::Hello {
+            instance: "slave-1".to_string(),
+            have_version: 0,
+            have_term: 0,
+            capabilities: vec![],
+            token: None,
+            role: Some("slave".to_string()),
+            protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        };
+        client_ws
+            .send(WsMessage::Text(hello.to_json().unwrap().into()))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if coordinator.slaves.lock().unwrap().contains_key("slave-1") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the reconnecting session must register");
+
+        let active_connection_id = coordinator.slaves.lock().unwrap()["slave-1"].connection_id;
+        let queued = coordinator.queued_bytes.lock().unwrap();
+        assert_eq!(
+            queued
+                .get(&("slave-1".to_string(), active_connection_id))
+                .copied(),
+            Some(0),
+            "registration must install a zero baseline for the new session"
+        );
+        assert!(
+            !queued.contains_key(&("slave-1".to_string(), 999)),
+            "phantom accounting from the superseded session must be reset"
+        );
+
+        session.abort();
+    }
+
+    /// Regression (deferred D2): a superseded session draining its old channel
+    /// must subtract from its own session key, not the replacement's.
+    #[tokio::test]
+    async fn test_superseded_session_drain_does_not_charge_new_session() {
+        let coordinator = test_coordinator();
+        let old_key = ("slave-1".to_string(), 1);
+        let new_key = ("slave-1".to_string(), 2);
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .insert(old_key.clone(), 500);
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .insert(new_key.clone(), 700);
+
+        // The old session drains after the reconnect completed.
+        coordinator.account_drained("slave-1", 1, 500);
+
+        let queued = coordinator.queued_bytes.lock().unwrap();
+        assert_eq!(queued.get(&old_key).copied(), Some(0));
+        assert_eq!(
+            queued.get(&new_key).copied(),
+            Some(700),
+            "the replacement session's budget must not be reduced by the old drain"
+        );
+    }
+
+    /// Regression (deferred D2): a coalesced fallback task spawned for a
+    /// superseded session must stop when it loses ownership, and must not
+    /// deliver to or charge the replacement session.
+    #[tokio::test]
+    async fn test_pending_coalesced_task_does_not_charge_reconnected_session() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (old_tx, _old_rx) = mpsc::channel::<HaMessage>(4);
+        coordinator.slaves.lock().unwrap().insert(
+            "slave-1".to_string(),
+            ActiveSlave {
+                instance: "slave-1".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: old_tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+        let old_key = ("slave-1".to_string(), 1);
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .insert(old_key.clone(), MAX_SLAVE_QUEUE_BYTES);
+
+        // Broadcast sees the exhausted budget and schedules the fallback task.
+        assert_eq!(coordinator.broadcast(&HaMessage::Ping { ts: 2 }), 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if coordinator
+                    .pending_fallbacks
+                    .lock()
+                    .unwrap()
+                    .contains(&old_key)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the fallback task must be pending");
+
+        // Reconnect: replace the active entry and reset the superseded
+        // session's accounting.
+        let (new_tx, mut new_rx) = mpsc::channel::<HaMessage>(4);
+        {
+            let mut slaves = coordinator.slaves.lock().unwrap();
+            coordinator
+                .queued_bytes
+                .lock()
+                .unwrap()
+                .retain(|(instance, _), _| instance != "slave-1");
+            slaves.insert(
+                "slave-1".to_string(),
+                ActiveSlave {
+                    instance: "slave-1".to_string(),
+                    remote_addr: "127.0.0.1:1001".parse().unwrap(),
+                    synced_version: 0,
+                    last_ping: Instant::now(),
+                    connected_at: Utc::now(),
+                    last_stats: None,
+                    sender: new_tx,
+                    capabilities: vec![],
+                    connection_id: 2,
+                },
+            );
+        }
+
+        // The old task must notice it lost ownership and exit.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !coordinator
+                    .pending_fallbacks
+                    .lock()
+                    .unwrap()
+                    .contains(&old_key)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the superseded fallback task must exit");
+
+        assert_eq!(
+            coordinator
+                .queued_bytes
+                .lock()
+                .unwrap()
+                .get(&("slave-1".to_string(), 2))
+                .copied(),
+            None,
+            "the superseded task must not charge the replacement session"
+        );
+        assert!(
+            new_rx.try_recv().is_err(),
+            "the superseded task must not deliver to the replacement session"
+        );
+    }
+
+    #[test]
+    fn test_per_ip_handshake_budget_is_bounded_and_released() {
+        let budget = Arc::new(HandshakeBudget::default());
+        let ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let mut permits = Vec::new();
+        for _ in 0..MAX_HANDSHAKES_PER_IP {
+            permits.push(
+                budget
+                    .try_acquire(ip)
+                    .expect("a slot must be available below the per-IP limit"),
+            );
+        }
+        assert!(
+            budget.try_acquire(ip).is_none(),
+            "the per-IP handshake budget must be bounded"
+        );
+        // A different source IP has its own budget.
+        assert!(
+            budget
+                .try_acquire("198.51.100.20".parse().unwrap())
+                .is_some()
+        );
+        permits.pop();
+        assert!(
+            budget.try_acquire(ip).is_some(),
+            "dropping a permit must release a slot"
+        );
     }
 
     #[test]
@@ -2639,8 +3554,65 @@ mod tests {
         );
     }
 
+    /// Important 1 regression: the published-envelope history is shared by all
+    /// slaves. One slave's ACK must not remove the envelope before another
+    /// slave reports the same-version fork for it.
     #[tokio::test]
-    async fn test_term_divergence_survives_another_slave_version_advance() {
+    async fn test_two_slaves_both_record_fork_for_same_published_envelope() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        for (instance, connection_id) in [("fork-a", 1), ("fork-b", 2)] {
+            let (tx, _rx) = mpsc::channel::<HaMessage>(8);
+            coordinator.slaves.lock().unwrap().insert(
+                instance.to_string(),
+                ActiveSlave {
+                    instance: instance.to_string(),
+                    remote_addr: format!("127.0.0.1:{connection_id}").parse().unwrap(),
+                    synced_version: 2,
+                    last_ping: Instant::now(),
+                    connected_at: Utc::now(),
+                    last_stats: None,
+                    sender: tx,
+                    capabilities: vec![],
+                    connection_id,
+                },
+            );
+        }
+
+        let ack = HaMessage::Ack {
+            version: 2,
+            term: 0,
+            applied: false,
+            conflict: Some(AckConflict::SameVersionFork),
+            error: Some("same-version payload fork".to_string()),
+        }
+        .to_json()
+        .unwrap();
+
+        assert!(coordinator.process_slave_msg("fork-a", 1, &ack));
+        assert!(coordinator.process_slave_msg("fork-b", 2, &ack));
+
+        let summaries = coordinator.list_slaves();
+        for instance in ["fork-a", "fork-b"] {
+            let summary = summaries
+                .iter()
+                .find(|s| s.instance == instance)
+                .expect("tracked slave");
+            assert!(
+                summary.diverged,
+                "{instance} must be reported diverged for the shared envelope: {summaries:?}"
+            );
+            assert_eq!(
+                summary.synced_version, 0,
+                "{instance} must be marked unsynced after its fork ACK"
+            );
+        }
+        assert!(coordinator.is_diverged());
+    }
+
+    #[tokio::test]
+    async fn test_term_divergence_survives_other_slave_and_clears_on_own_ack() {
         let coordinator = test_coordinator();
         coordinator.update_bundle(test_bundle(2)).unwrap();
 
@@ -2721,15 +3693,24 @@ mod tests {
             "the sticky gauge must stay raised: {rendered}"
         );
 
-        // Only an explicit resync clears it.
+        // H-10: an operator resync re-pushes the bundle but does not clear
+        // another slave's advisory record before that slave proves recovery.
         coordinator.trigger_resync();
-        assert!(!coordinator.is_diverged());
+        assert!(
+            coordinator.is_diverged(),
+            "a resync must not clear divergence before the slave ACKs"
+        );
+        assert!(coordinator.process_slave_msg("newer-term-slave", 1, &synced));
+        assert!(
+            !coordinator.is_diverged(),
+            "the acknowledging slave's own divergence must clear"
+        );
         assert!(
             coordinator
                 .metrics
                 .render_prometheus()
                 .contains(r#"sito_ha_diverged{instance="newer-term-slave"} 0"#),
-            "resync must zero the divergence gauge"
+            "the per-slave divergence gauge must be zeroed after the ACK"
         );
     }
 
@@ -2877,7 +3858,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_same_term_ahead_divergence_is_sticky_until_resync() {
+    async fn test_same_term_ahead_divergence_clears_only_on_slave_ack() {
         let coordinator = test_coordinator();
         coordinator.update_bundle(test_bundle(2)).unwrap();
 
@@ -2909,7 +3890,8 @@ mod tests {
         assert!(coordinator.process_slave_msg("ahead-slave", 1, &ahead));
         assert!(coordinator.is_diverged());
 
-        // An ACK for the master's own version does not auto-clear the latch.
+        // The ACK for the master's own version proves this slave recovered:
+        // per-slave divergence clears only now, not on a global resync.
         let current = HaMessage::Ack {
             version: 2,
             term: 0,
@@ -2921,12 +3903,18 @@ mod tests {
         .unwrap();
         assert!(coordinator.process_slave_msg("ahead-slave", 1, &current));
         assert!(
-            coordinator.is_diverged(),
-            "same-term divergence must stay latched until explicit resync"
+            !coordinator.is_diverged(),
+            "the acknowledging slave's ahead divergence must clear"
         );
 
+        // A resync without a matching ACK does not clear anything.
+        assert!(coordinator.process_slave_msg("ahead-slave", 1, &ahead));
+        assert!(coordinator.is_diverged());
         coordinator.trigger_resync();
-        assert!(!coordinator.is_diverged());
+        assert!(
+            coordinator.is_diverged(),
+            "a resync alone must not clear divergence"
+        );
     }
 
     #[tokio::test]
@@ -3232,10 +4220,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_master_rejects_oversized_websocket_hello() {
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap().port()
-        };
+        let port = sito_test_support::reserve_port_number().unwrap();
         let coordinator = test_coordinator().with_token(Some("tok".to_string()));
         let master_cfg = HaConfig {
             replication_port: port,

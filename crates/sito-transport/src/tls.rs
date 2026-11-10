@@ -44,6 +44,9 @@ pub enum TlsError {
     #[error("Certificate '{path}' is not yet valid (not_before: {not_before})")]
     CertificateNotYetValid { path: PathBuf, not_before: String },
 
+    #[error("TLS certificate and private key do not contain the same public key")]
+    CertKeyMismatch,
+
     #[error("TLS configuration error: {0}")]
     Config(String),
 
@@ -124,10 +127,25 @@ pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError>
     })
 }
 
+/// Validity of the self-signed bootstrap certificate generated while ACME is
+/// still ordering a real certificate.
+///
+/// This is deliberately short: the bootstrap certificate is only a placeholder
+/// so encrypted listeners can start before issuance completes. It must never be
+/// mistaken for a usable long-lived certificate.
+pub const BOOTSTRAP_CERT_VALIDITY_DAYS: i64 = 7;
+
 /// Generates a self-signed certificate and private key pair for the given domain names.
+///
+/// The returned certificate is short-lived ([`BOOTSTRAP_CERT_VALIDITY_DAYS`])
+/// because this helper is used for the ACME bootstrap placeholder. Callers that
+/// need a longer-lived test certificate should build one explicitly.
 pub fn generate_self_signed_cert(domains: &[String]) -> Result<(String, String), TlsError> {
-    let params = rcgen::CertificateParams::new(domains.to_vec())
+    let mut params = rcgen::CertificateParams::new(domains.to_vec())
         .map_err(|e| TlsError::Config(format!("Failed to build certificate params: {e}")))?;
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now;
+    params.not_after = now + time::Duration::days(BOOTSTRAP_CERT_VALIDITY_DAYS);
     let key_pair = rcgen::KeyPair::generate()
         .map_err(|e| TlsError::Config(format!("Failed to generate key pair: {e}")))?;
     let cert = params
@@ -245,6 +263,24 @@ pub fn create_certified_key(
 ) -> Result<Arc<CertifiedKey>, TlsError> {
     let signing_key = rustls::crypto::ring::sign::any_supported_type(key)
         .map_err(|e| TlsError::Config(format!("unsupported private key format: {e}")))?;
+
+    // rustls does not check that the private key belongs to the leaf
+    // certificate; it only fails later, during the handshake. ACME writes the
+    // key before the certificate, so a watcher can observe exactly that mixed
+    // pair. Compare the certificate SPKI with the signing key's SPKI and refuse
+    // to install an unusable pair.
+    if let Some(key_spki) = signing_key.public_key()
+        && let Some(cert) = certs.first()
+    {
+        let (_, x509) = x509_parser::parse_x509_certificate(cert.as_ref()).map_err(|e| {
+            TlsError::Config(format!(
+                "Failed to parse certificate while verifying the certificate/key pair: {e}"
+            ))
+        })?;
+        if x509.tbs_certificate.subject_pki.raw != key_spki.as_ref() {
+            return Err(TlsError::CertKeyMismatch);
+        }
+    }
 
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
 }
@@ -371,6 +407,11 @@ impl TlsAcceptorManager {
         self.server_config.load_full()
     }
 
+    /// ALPN protocols currently advertised by this manager.
+    pub fn alpn_protocols(&self) -> Vec<Vec<u8>> {
+        self.current_config().alpn_protocols.clone()
+    }
+
     /// Obtain a `TlsAcceptor` configured with the latest `ServerConfig`.
     pub fn acceptor(&self) -> TlsAcceptor {
         TlsAcceptor::from(self.current_config())
@@ -380,6 +421,82 @@ impl TlsAcceptorManager {
     pub fn reload(&self, new_config: ServerConfig) {
         self.server_config.store(Arc::new(new_config));
         info!("TLS server configuration reloaded successfully");
+    }
+
+    /// Reload this manager from certificate/key files while preserving the
+    /// manager's ALPN protocols, virtual-host certificates and in-flight ACME
+    /// challenge keys.
+    ///
+    /// The new pair is validated (including the certificate/key public-key
+    /// match) before it replaces the running configuration, so a failed reload
+    /// leaves the previous pair active.
+    pub fn reload_from_files(&self, cert_path: &Path, key_path: &Path) -> Result<(), TlsError> {
+        let new_config = load_server_config_with_challenges(
+            cert_path,
+            key_path,
+            self.sni_certs().as_slice(),
+            self.alpn_protocols(),
+            self.challenge_keys(),
+        )?;
+        self.reload(new_config);
+        Ok(())
+    }
+}
+
+/// The TLS managers used by every encrypted DNS transport.
+///
+/// ACME issuance used to reload only the DoH manager, leaving DoT/DoQ/DoH3 on
+/// stale certificates until the next restart. `reload_all` updates every
+/// configured listener from the same persisted pair.
+#[derive(Clone, Default)]
+pub struct TlsManagerSet {
+    pub dot: Option<TlsAcceptorManager>,
+    pub doh: Option<TlsAcceptorManager>,
+    pub doq: Option<TlsAcceptorManager>,
+    pub doh3: Option<TlsAcceptorManager>,
+}
+
+impl TlsManagerSet {
+    /// Build a set containing only the DoH manager (the pre-existing API shape).
+    pub fn from_doh(doh: Option<TlsAcceptorManager>) -> Self {
+        Self {
+            doh,
+            ..Self::default()
+        }
+    }
+
+    /// Whether no encrypted listener has a TLS manager.
+    pub fn is_empty(&self) -> bool {
+        self.dot.is_none() && self.doh.is_none() && self.doq.is_none() && self.doh3.is_none()
+    }
+
+    /// Reload every configured transport from `cert`/`key`.
+    ///
+    /// All managers are attempted even if one fails; the collected errors are
+    /// returned so the caller can log every transport that did not pick up the
+    /// new certificate.
+    pub fn reload_all(&self, cert: &Path, key: &Path) -> Result<(), TlsError> {
+        let mut first_error = None;
+        for (protocol, manager) in [
+            ("dot", self.dot.as_ref()),
+            ("doh", self.doh.as_ref()),
+            ("doq", self.doq.as_ref()),
+            ("doh3", self.doh3.as_ref()),
+        ] {
+            let Some(manager) = manager else {
+                continue;
+            };
+            if let Err(e) = manager.reload_from_files(cert, key) {
+                error!(protocol, error = %e, "Failed to reload TLS certificate");
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -639,6 +756,30 @@ mod tests {
         let key = load_private_key(&key_file).unwrap();
         let certified = create_certified_key(certs, &key);
         assert!(certified.is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Regression (P2-14): ACME writes the key before the certificate, so the
+    /// certificate watcher can observe a mismatched pair. Loading it must fail
+    /// instead of installing a pair that cannot complete a handshake.
+    #[tokio::test]
+    async fn test_reject_mismatched_certificate_and_key() {
+        let temp_dir = create_test_dir("mismatch");
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+
+        let (cert_pem, _) = generate_test_cert(&["mismatch.example.com"]);
+        let (_, other_key_pem) = generate_test_cert(&["other.example.com"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, other_key_pem).unwrap();
+
+        let err = load_server_config(&cert_file, &key_file, &[], vec![b"dot".to_vec()])
+            .expect_err("a certificate/key mismatch must be rejected");
+        assert!(
+            matches!(err, TlsError::CertKeyMismatch),
+            "expected CertKeyMismatch, got {err:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

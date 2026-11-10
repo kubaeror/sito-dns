@@ -41,6 +41,19 @@ pub struct QueryLogQueryParams {
     pub to: Option<i64>,
     pub cursor: Option<i64>,
     pub limit: Option<usize>,
+    /// Defaults to `true` for API compatibility. The live UI refresh passes
+    /// `false` so the 3 s poll does not run a whole-table `COUNT(*)`.
+    pub include_total: Option<bool>,
+}
+
+/// Query parameters for clearing the log.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+pub struct ClearQueryLogParams {
+    /// Preserve `stats_hourly` rollups (the old “fold into aggregates”
+    /// behavior). Defaults to `false`: both detailed rows and rollups are
+    /// erased.
+    #[serde(default)]
+    pub keep_aggregates: bool,
 }
 
 fn rest_rate_limiter() -> &'static Mutex<HashMap<String, (Instant, u32)>> {
@@ -69,6 +82,26 @@ fn rest_rate_limited(client_ip: &str) -> bool {
     entry.1 > REST_RATE_LIMIT
 }
 
+/// Error type for the query-log REST handler.
+///
+/// Rate-limit responses carry `Retry-After` so a polling UI backs off instead
+/// of immediately retrying the paginated query. Other failures remain plain
+/// RFC 7807 problem details.
+#[derive(Debug)]
+pub enum QueryLogHandlerError {
+    Problem(ProblemDetails),
+    RateLimited(ProblemDetails),
+}
+
+impl IntoResponse for QueryLogHandlerError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Problem(problem) => problem.into_response(),
+            Self::RateLimited(problem) => problem.into_response_with_retry_after(),
+        }
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/querylog",
@@ -77,7 +110,8 @@ fn rest_rate_limited(client_ip: &str) -> bool {
         (status = 200, description = "Query logs retrieved with cursor pagination", body = QueryLogPage),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
-        (status = 429, description = "Rate limited", body = ProblemDetails)
+        (status = 429, description = "Rate limited", body = ProblemDetails,
+            headers(("Retry-After", description = "Seconds to wait before retrying")))
     ),
     tag = "QueryLog"
 )]
@@ -87,14 +121,14 @@ pub async fn get_querylog(
     MaybeConnectInfo(peer_addr): MaybeConnectInfo,
     headers: HeaderMap,
     Query(params): Query<QueryLogQueryParams>,
-) -> Result<Json<QueryLogPage>, ProblemDetails> {
+) -> Result<Json<QueryLogPage>, QueryLogHandlerError> {
     let config = ctx.config.load();
     let trusted_proxies = config.get_web_config().trusted_proxies.clone();
     drop(config);
     let client_ip = resolve_client_ip(peer_addr, &headers, &trusted_proxies);
     if rest_rate_limited(&client_ip) {
-        return Err(ProblemDetails::too_many_requests(
-            "Too many query-log requests. Please slow down.",
+        return Err(QueryLogHandlerError::RateLimited(
+            ProblemDetails::too_many_requests("Too many query-log requests. Please slow down."),
         ));
     }
 
@@ -111,19 +145,19 @@ pub async fn get_querylog(
         to: params.to,
         cursor: params.cursor,
         limit: Some(limit),
+        include_total: params.include_total,
     };
 
-    let page = ctx
-        .stats_db
-        .query_logs(&filter)
-        .await
-        .map_err(|e| ProblemDetails::internal_error(e.to_string()))?;
+    let page = ctx.stats_db.query_logs(&filter).await.map_err(|e| {
+        QueryLogHandlerError::Problem(ProblemDetails::internal_error(e.to_string()))
+    })?;
     Ok(Json(page))
 }
 
 #[utoipa::path(
     delete,
     path = "/api/v1/querylog",
+    params(ClearQueryLogParams),
     responses(
         (status = 200, description = "Query log cleared successfully", body = GenericMessageResponse),
         (status = 401, description = "Unauthorized"),
@@ -135,10 +169,12 @@ pub async fn delete_querylog(
     _operator: RequireOperator,
     headers: HeaderMap,
     State(ctx): State<ServerContext>,
+    Query(params): Query<ClearQueryLogParams>,
 ) -> Result<Response, ProblemDetails> {
+    let rollup_client_names = ctx.config.load().get_stats_config().rollup_client_names;
     let affected = ctx
         .stats_db
-        .delete_query_logs()
+        .delete_query_logs_with_policy(params.keep_aggregates, rollup_client_names)
         .await
         .map_err(|e| ProblemDetails::internal_error(e.to_string()))?;
 
@@ -221,5 +257,54 @@ mod tests {
     fn test_limit_clamping() {
         assert_eq!(0usize.clamp(1, MAX_QUERYLOG_LIMIT), 1);
         assert_eq!(usize::MAX.clamp(1, MAX_QUERYLOG_LIMIT), MAX_QUERYLOG_LIMIT);
+    }
+
+    /// Deferred D4a: the query-log 429 must carry `Retry-After` like the stats
+    /// endpoints, so a polling UI backs off instead of retrying immediately.
+    #[tokio::test]
+    async fn test_querylog_rate_limit_response_has_retry_after() {
+        use crate::auth::token::Role;
+        use crate::auth::{AuthUser, MaybeConnectInfo, RequireViewer};
+
+        let temp_dir = crate::test_support::temp_dir("sito_querylog_429");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        // Fixed, otherwise unused address: the rate limiter is process-global
+        // and the other querylog test uses 198.51.100.201.
+        let client_ip = "198.51.100.250";
+        for _ in 0..REST_RATE_LIMIT {
+            assert!(!rest_rate_limited(client_ip));
+        }
+
+        let viewer = RequireViewer(AuthUser {
+            username: "viewer".to_string(),
+            role: Role::Viewer,
+            token_id: None,
+        });
+        let peer = std::net::SocketAddr::from(([198, 51, 100, 250], 12_345));
+        let Err(error) = get_querylog(
+            viewer,
+            State(ctx),
+            MaybeConnectInfo(Some(peer)),
+            HeaderMap::new(),
+            Query(QueryLogQueryParams::default()),
+        )
+        .await
+        else {
+            panic!("the exhausted query-log budget must return 429");
+        };
+
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "1",
+            "query-log 429 responses must advertise the retry window"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

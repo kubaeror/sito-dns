@@ -15,19 +15,28 @@ published.
 | Job | What it proves | Depends on |
 | --- | --- | --- |
 | `verify-tag` | The tag matches the workspace version in `Cargo.toml` (`vX.Y.Z`) or is a prerelease of that version (`vX.Y.Z-<suffix>`). | — |
-| `build-binaries` | All three release archives build (x86_64, aarch64, armv7) and `contrib/install.sh` passes shellcheck. | `verify-tag` |
-| `sbom-and-release` | `SHA256SUMS`, the SPDX SBOM, and cosign keyless signatures are generated and published as a GitHub release. | `verify-tag`, `build-binaries` |
-| `artifact-e2e` | The published release is downloadable; checksums, the cosign identity (`release.yml@refs/tags/*`), `sito --version`, and `sito check-config` all pass. | `sbom-and-release` |
-| `docker-build-push` | The multi-arch image is pushed, then its digest, platform list, tags, provenance, and SBOM are verified. | `verify-tag`, `build-binaries`, `sbom-and-release`, `artifact-e2e` |
+| `release-gate` | The tagged commit is an ancestor of the required branch (`release/1.9.x` for 1.9.x, `main` for 2.0) and has a successful `ci-gate` check and `cargo-deny` security check. | `verify-tag` |
+| `build-binaries` | All three release archives build (x86_64, aarch64, armv7) and `contrib/install.sh` passes shellcheck. | `verify-tag`, `release-gate` |
+| `sbom-and-release` | `SHA256SUMS`, the SPDX SBOM, and cosign keyless signatures are generated and staged as a draft GitHub release. | `verify-tag`, `release-gate`, `build-binaries` |
+| `artifact-e2e` | The staged draft is downloadable (it needs a write-capable token); checksums, the cosign identity (`release.yml@refs/tags/*`), `sito --version`, and `sito check-config` all pass. | `sbom-and-release` |
+| `docker-build-push` | The multi-arch image is pushed; its digest, platform list, tags, provenance, and SBOM are verified; the digest is scanned by a digest-pinned Trivy (fixed HIGH/CRITICAL gate; unfixed findings are ignored) and signed/verified with cosign keyless signing. | `verify-tag`, `release-gate`, `build-binaries`, `sbom-and-release`, `artifact-e2e` |
+| `publish-release` | The staged draft is flipped to published and verified not to be a draft; stable tags are marked latest and prereleases stay prereleases. | `sbom-and-release`, `artifact-e2e`, `docker-build-push` |
 
 Consequences:
 
 - A tag that does not match the workspace version fails in `verify-tag`, before
   a binary, release asset, or image is produced.
-- A failed signature, SBOM, download, checksum, or artifact E2E check stops the
-  workflow before the image is built.
-- `docker-build-push` is blocking. It is not optional and has no
-  `continue-on-error`.
+- A tag whose commit is not on the required release branch, or whose CI or
+  `cargo-deny` check is missing/red, fails in `release-gate` before any artifact
+  is built.
+- A failed download, checksum, or artifact E2E check stops the workflow before
+  the image is built; the staged release remains a draft. A failed signature or
+  SBOM generation fails earlier in `sbom-and-release`, before the draft is
+  created.
+- A HIGH/CRITICAL image vulnerability or a missing image signature fails
+  `docker-build-push`, and the staged release remains a draft.
+- `docker-build-push` and `publish-release` are blocking. Neither is optional
+  and neither has `continue-on-error`.
 
 The container image is built from the already-built release binaries through
 `Dockerfile.release` (`binaries=./prebuilt`); no Rust compilation happens in the
@@ -38,8 +47,8 @@ image pipeline. Artifact E2E executes all three architectures in the pinned
 
 | Tag | GitHub release | Docker tags |
 | --- | --- | --- |
-| `vX.Y.Z` (matches the workspace version) | Stable, marked latest | `X.Y.Z`, `X.Y`, `latest` |
-| `vX.Y.Z-<suffix>` (same base version) | Prerelease, never latest | `X.Y.Z-<suffix>` only |
+| `vX.Y.Z` (matches the workspace version) | Staged as a draft, then published and marked latest after the image passes | `X.Y.Z`, `X.Y`, `latest` |
+| `vX.Y.Z-<suffix>` (same base version) | Staged as a draft, then published as a prerelease (never latest) after the image passes | `X.Y.Z-<suffix>` only |
 | Anything else | Workflow fails in `verify-tag` | Nothing is pushed |
 
 The prerelease decision is `contains(github.ref_name, '-')`. A prerelease tag
@@ -57,9 +66,10 @@ gh run watch <run-id> --exit-status
 ```
 
 Expected: `verify-tag`, all three `build-binaries` matrix jobs,
-`sbom-and-release`, `artifact-e2e`, and `docker-build-push` are green. The
-`docker-build-push` log ends with `Verified ghcr.io/<owner>/<repo>@sha256:...`,
-the platform list, and the generated tags.
+`sbom-and-release`, `artifact-e2e`, `docker-build-push`, and `publish-release`
+are green. The `docker-build-push` log ends with
+`Verified ghcr.io/<owner>/<repo>@sha256:...`, the platform list, and the
+generated tags. The release is a draft until `publish-release` succeeds.
 
 ## Verify the published image
 
@@ -220,10 +230,14 @@ Expected: both checksum checks print `OK`, `cosign verify-blob` prints
 - **`verify-tag` failed**: nothing was published. Delete the incorrect tag and
   push a tag that matches `Cargo.toml`, or bump the workspace version. Never
   reuse a tag that already produced release assets.
-- **A release/signature/SBOM verification failed**: nothing reaches
-  `docker-build-push`, so no image is published. Fix the cause and use a new
-  tag (for example a new patch or prerelease suffix).
+- **A download, checksum, or artifact E2E verification failed**: nothing
+  reaches `docker-build-push`, so no image is published and the staged release
+  stays a draft. Fix the cause and use a new tag (for example a new patch or
+  prerelease suffix).
+- **A signature or SBOM generation failed**: the failure is in
+  `sbom-and-release`, before the draft is created, so nothing is published at
+  all. Fix the cause and use a new tag.
 - **Post-push verification failed**: the image may already be in GHCR, but the
-  workflow is red. Treat the image as unpublished: remove the affected
-  tag(s)/digest from GHCR, fix the problem, and publish again with a new tag.
-  Do not leave `latest` pointing at an unverified digest.
+  workflow is red and the release stays a draft. Treat the image as unpublished:
+  remove the affected tag(s)/digest from GHCR, fix the problem, and publish
+  again with a new tag. Do not leave `latest` pointing at an unverified digest.

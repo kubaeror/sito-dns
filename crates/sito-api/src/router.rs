@@ -247,6 +247,11 @@ async fn health_handler(State(ctx): State<ServerContext>) -> impl IntoResponse {
     } else {
         Some("HA replication is not ready")
     };
+    // D12: expose a stable challenge/issuance reason code without leaking any
+    // filesystem path, ACME account detail or certificate error text. This
+    // endpoint is unauthenticated, so `last_error` stays on `/api/v1/status`.
+    let acme = ctx.acme_readiness(&cfg);
+    let acme_reason = acme.reason;
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -258,6 +263,11 @@ async fn health_handler(State(ctx): State<ServerContext>) -> impl IntoResponse {
                 "required": ha_required,
                 "ready": ha.ready,
                 "reason": ha_reason,
+            },
+            "acme": {
+                "enabled": acme.enabled,
+                "ready": acme.ready,
+                "reason": acme_reason,
             },
         })),
     )
@@ -312,6 +322,7 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
         .route("/querylog/clear", post(querylog::delete_querylog))
         .route("/querylog/stream", get(querylog::stream_querylog))
         // Filtering
+        .route("/filtering/status", get(filtering::get_filtering_status))
         .route(
             "/filtering/lists",
             get(filtering::get_filter_lists).post(filtering::add_filter_list),
@@ -381,6 +392,7 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
         .route("/auth/login", post(auth_handlers::login))
         .route("/auth/totp/verify", post(auth_handlers::verify_totp))
         .route("/auth/logout", post(auth_handlers::logout))
+        .route("/auth/reauth", post(auth_handlers::reauth))
         .route("/auth/totp/setup", get(auth_handlers::get_totp_setup))
         .route("/auth/totp/enable", post(auth_handlers::enable_totp))
         .route("/auth/totp/disable", post(auth_handlers::disable_totp))
