@@ -46,6 +46,14 @@ pub const MAX_SLAVE_QUEUE_BYTES: usize = MAX_WS_MESSAGE_SIZE * 4;
 /// Maximum concurrently unauthenticated/active handshake slots per source IP.
 const MAX_HANDSHAKES_PER_IP: usize = 8;
 
+/// Identifies one slave session for queue accounting.
+///
+/// `instance` alone is not unique across reconnects: a superseded session can
+/// still drain its channel after the replacement registered. Keying by the
+/// connection id keeps the old session's bytes from being charged to (or
+/// subtracted from) the new session.
+type SessionKey = (String, u64);
+
 /// Outcome of publishing a configuration bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishOutcome {
@@ -195,7 +203,7 @@ pub struct MasterCoordinator {
     /// Path where the active version/bundle are persisted across restarts.
     state_path: Arc<Mutex<Option<PathBuf>>>,
     /// Slaves with an asynchronous fallback delivery already scheduled.
-    pending_fallbacks: Arc<Mutex<HashSet<String>>>,
+    pending_fallbacks: Arc<Mutex<HashSet<SessionKey>>>,
     /// Last stale version for which a catch-up push was already attempted per slave.
     stale_repushes: Arc<Mutex<HashMap<String, u64>>>,
     /// Serializes bundle publication so the version check and store cannot
@@ -216,8 +224,8 @@ pub struct MasterCoordinator {
     /// Bounded, coordinator-wide history of published envelopes used to bind
     /// delayed ACKs (including forks reported by multiple slaves).
     active_push_history: Arc<Mutex<VecDeque<PublishedEnvelope>>>,
-    /// Bytes currently queued per slave.
-    queued_bytes: Arc<Mutex<HashMap<String, usize>>>,
+    /// Bytes currently queued per slave session.
+    queued_bytes: Arc<Mutex<HashMap<SessionKey, usize>>>,
     /// Most recent publish failure, surfaced through HA readiness.
     last_publish_error: Arc<Mutex<Option<String>>>,
     /// True while a background publish retry is already scheduled.
@@ -924,7 +932,8 @@ impl MasterCoordinator {
         let mut queued = self.queued_bytes.lock().unwrap();
         for slave in slaves.values() {
             let instance = &slave.instance;
-            let current = queued.get(instance).copied().unwrap_or(0);
+            let session = (instance.clone(), slave.connection_id);
+            let current = queued.get(&session).copied().unwrap_or(0);
             if wire_size > 0 && current.saturating_add(wire_size) > MAX_SLAVE_QUEUE_BYTES {
                 // The per-slave byte budget is exhausted even though the
                 // message-count channel may still have room: coalesce instead
@@ -936,14 +945,14 @@ impl MasterCoordinator {
                     limit = MAX_SLAVE_QUEUE_BYTES,
                     "HA push byte budget exhausted; scheduling coalesced delivery"
                 );
-                self.schedule_coalesced_delivery(slave, msg);
+                self.schedule_coalesced_delivery(instance, slave.connection_id, &slave.sender, msg);
                 notified += 1;
                 continue;
             }
             match slave.sender.try_send(msg.clone()) {
                 Ok(()) => {
                     if wire_size > 0 {
-                        *queued.entry(instance.clone()).or_insert(0) += wire_size;
+                        *queued.entry(session).or_insert(0) += wire_size;
                     }
                     notified += 1;
                 }
@@ -952,7 +961,12 @@ impl MasterCoordinator {
                     // fallback deliveries per slave so a slow or stalled replica
                     // cannot spawn unbounded tasks; the task sends the latest
                     // active bundle when the channel has room.
-                    self.schedule_coalesced_delivery(slave, msg);
+                    self.schedule_coalesced_delivery(
+                        instance,
+                        slave.connection_id,
+                        &slave.sender,
+                        msg,
+                    );
                     // The push will be delivered by the coalesced fallback
                     // task (either this one or one already pending).
                     notified += 1;
@@ -965,48 +979,95 @@ impl MasterCoordinator {
         notified
     }
 
-    /// Queues `msg` for `instance` and records its wire size in the per-slave
-    /// byte budget when the queue accepted it.
+    /// Queues `msg` for one slave session and records its wire size in the
+    /// per-session byte budget when the queue accepted it.
     ///
     /// Every non-broadcast send path (initial push, resync, catch-up repush)
     /// must go through this helper so the coalesced-delivery budget reflects
-    /// all bytes queued for a slave, not only broadcast traffic.
+    /// all bytes queued for a slave, not only broadcast traffic. The caller
+    /// passes the precomputed `wire_size` so the budget decision and the send
+    /// use the same value.
+    ///
+    /// An over-budget send is refused before touching the channel; callers may
+    /// coalesce it instead of growing the queue.
     fn try_queue_accounted(
         &self,
         instance: &str,
+        connection_id: u64,
         sender: &mpsc::Sender<HaMessage>,
+        wire_size: usize,
         msg: HaMessage,
     ) -> Result<(), String> {
-        let wire_size = msg.to_json().map_or(0, |json| json.len());
-        // Hold the accounting lock across `try_send` and the increment: the
-        // session loop subtracts under the same lock, and releasing it in
-        // between would let the subtract observe the old value and turn the
-        // later increment into phantom bytes.
+        let session = (instance.to_string(), connection_id);
+        // Hold the accounting lock across the budget check, `try_send` and the
+        // increment: the session loop subtracts under the same lock, and
+        // releasing it in between would let the subtract observe the old value
+        // and turn the later increment into phantom bytes.
         let mut queued = self.queued_bytes.lock().unwrap();
+        // Registration installs the session key and reconnect removes every
+        // old key for the instance. A missing key therefore means this sender
+        // belongs to a superseded session: refuse instead of recreating
+        // accounting for a channel nobody will drain.
+        let Some(current) = queued.get(&session).copied() else {
+            return Err("slave session is no longer active".to_string());
+        };
+        if wire_size > 0 && current.saturating_add(wire_size) > MAX_SLAVE_QUEUE_BYTES {
+            return Err(format!(
+                "per-slave queue byte budget exhausted ({current} + {wire_size} > {MAX_SLAVE_QUEUE_BYTES})"
+            ));
+        }
         sender.try_send(msg).map_err(|e| e.to_string())?;
         if wire_size > 0 {
-            *queued.entry(instance.to_string()).or_insert(0) += wire_size;
+            *queued.entry(session).or_insert(0) += wire_size;
         }
         Ok(())
     }
 
-    /// Schedules at most one coalesced delivery task per slave.
-    fn schedule_coalesced_delivery(&self, slave: &ActiveSlave, fallback_msg: &HaMessage) {
-        let instance = slave.instance.clone();
+    /// Removes `wire_size` from one session's queued-byte accounting.
+    ///
+    /// Keying by `(instance, connection_id)` ensures a superseded session that
+    /// drains its old channel after a reconnect cannot subtract from the
+    /// replacement session's budget.
+    fn account_drained(&self, instance: &str, connection_id: u64, wire_size: usize) {
+        if wire_size == 0 {
+            return;
+        }
+        let mut queued = self.queued_bytes.lock().unwrap();
+        if let Some(current) = queued.get_mut(&(instance.to_string(), connection_id)) {
+            *current = current.saturating_sub(wire_size);
+        }
+    }
+
+    /// Schedules at most one coalesced delivery task per slave session.
+    ///
+    /// The task captures the session's `connection_id` and re-checks ownership
+    /// before waiting, delivering, or charging bytes. A superseded task must
+    /// never charge the replacement session, and it must stop waiting on the
+    /// old session's budget.
+    fn schedule_coalesced_delivery(
+        &self,
+        instance: &str,
+        connection_id: u64,
+        sender: &mpsc::Sender<HaMessage>,
+        fallback_msg: &HaMessage,
+    ) {
+        let instance = instance.to_string();
+        let session = (instance.clone(), connection_id);
         let first_schedule = self
             .pending_fallbacks
             .lock()
             .unwrap()
-            .insert(instance.clone());
+            .insert(session.clone());
         if !first_schedule {
             debug!(
                 instance = %instance,
+                connection_id,
                 "HA fallback delivery already pending; coalescing push"
             );
             return;
         }
         let coordinator = self.clone();
-        let sender = slave.sender.clone();
+        let sender = sender.clone();
         let fallback = fallback_msg.clone();
         tokio::spawn(async move {
             // Prefer the latest active bundle; fall back to the message that
@@ -1019,39 +1080,62 @@ impl MasterCoordinator {
                 .or(Some(fallback));
             if let Some(latest) = latest {
                 let size = latest.to_json().map_or(0, |json| json.len());
-                // Respect the per-slave byte budget before delivering the
-                // coalesced message. A dead/blackholed session prevents this
-                // loop from running forever: disconnect removes the queue
-                // accounting entry, which makes room immediately.
+                // Wait only while this exact session still owns the active
+                // entry. After a reconnect the old task must not wait on,
+                // deliver to, or charge the replacement session.
+                //
+                // The bytes are reserved *before* the awaited send: the
+                // session loop can receive and subtract as soon as the send
+                // completes, so accounting after the await would race and
+                // leave phantom bytes.
+                let mut reserved = false;
                 loop {
-                    let has_room = {
-                        let queued = coordinator.queued_bytes.lock().unwrap();
-                        let current = queued.get(&instance).copied().unwrap_or(0);
-                        current.saturating_add(size) <= MAX_SLAVE_QUEUE_BYTES
+                    let (owns, has_room) = {
+                        let slaves = coordinator.slaves.lock().unwrap();
+                        let owns = slaves
+                            .get(&instance)
+                            .is_some_and(|s| s.connection_id == connection_id);
+                        if owns {
+                            let mut queued = coordinator.queued_bytes.lock().unwrap();
+                            let current = queued.get(&session).copied().unwrap_or(0);
+                            if size == 0 || current.saturating_add(size) <= MAX_SLAVE_QUEUE_BYTES {
+                                if size > 0 {
+                                    *queued.entry(session.clone()).or_insert(0) += size;
+                                }
+                                (true, true)
+                            } else {
+                                (true, false)
+                            }
+                        } else {
+                            (false, false)
+                        }
                     };
+                    if !owns {
+                        break;
+                    }
                     if has_room {
+                        reserved = true;
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                if let Err(e) = sender.send(latest).await {
-                    warn!(instance = %instance, "Failed to deliver queued HA push: {e}");
-                } else {
-                    // Account for the delivered message so the next broadcast
-                    // sees an accurate byte budget until the session drains it.
-                    let still_connected =
-                        coordinator.slaves.lock().unwrap().contains_key(&instance);
-                    if still_connected {
+                if reserved && let Err(e) = sender.send(latest).await {
+                    // The send failed, so release the reservation. The key may
+                    // already be gone if a reconnect superseded this session.
+                    if size > 0 {
                         let mut queued = coordinator.queued_bytes.lock().unwrap();
-                        *queued.entry(instance.clone()).or_insert(0) += size;
+                        if let Some(current) = queued.get_mut(&session) {
+                            *current = current.saturating_sub(size);
+                        }
                     }
+                    warn!(instance = %instance, "Failed to deliver queued HA push: {e}");
                 }
             }
             coordinator
                 .pending_fallbacks
                 .lock()
                 .unwrap()
-                .remove(&instance);
+                .remove(&session);
         });
     }
 
@@ -1066,11 +1150,28 @@ impl MasterCoordinator {
         drop(repushed);
 
         if let Some(push) = self.active_push.lock().unwrap().clone() {
-            let slaves = self.slaves.lock().unwrap();
-            if let Some(slave) = slaves.get(instance)
-                && let Err(e) = self.try_queue_accounted(instance, &slave.sender, push)
-            {
-                warn!(instance = %instance, "Catch-up push could not be queued: {e}");
+            let target = {
+                let slaves = self.slaves.lock().unwrap();
+                slaves
+                    .get(instance)
+                    .map(|slave| (slave.sender.clone(), slave.connection_id))
+            };
+            if let Some((sender, connection_id)) = target {
+                let wire_size = push.to_json().map_or(0, |json| json.len());
+                if let Err(e) = self.try_queue_accounted(
+                    instance,
+                    connection_id,
+                    &sender,
+                    wire_size,
+                    push.clone(),
+                ) {
+                    warn!(
+                        instance = %instance,
+                        error = %e,
+                        "Catch-up push could not be queued; coalescing"
+                    );
+                    self.schedule_coalesced_delivery(instance, connection_id, &sender, &push);
+                }
             }
         }
     }
@@ -1317,8 +1418,14 @@ impl MasterCoordinator {
         {
             let mut slaves = self.slaves.lock().unwrap();
             // A reconnecting instance starts with an empty queue; accounting
-            // from the superseded session must not leak into the new one.
-            self.queued_bytes.lock().unwrap().remove(&slave_instance);
+            // from every superseded session must not leak into the new one.
+            // Keys include the connection id, so drop every key for this
+            // instance and install the new session's zero baseline.
+            {
+                let mut queued = self.queued_bytes.lock().unwrap();
+                queued.retain(|(instance, _), _| instance != &slave_instance);
+                queued.insert((slave_instance.clone(), connection_id), 0);
+            }
             slaves.insert(
                 slave_instance.clone(),
                 ActiveSlave {
@@ -1352,8 +1459,16 @@ impl MasterCoordinator {
                 cur_v,
                 "Pushing current configuration bundle to newly connected slave"
             );
-            if let Err(e) = self.try_queue_accounted(&slave_instance, &tx, push.clone()) {
-                warn!(instance = %slave_instance, "Initial HA push could not be queued: {e}");
+            let wire_size = push.to_json().map_or(0, |json| json.len());
+            if let Err(e) = self.try_queue_accounted(
+                &slave_instance,
+                connection_id,
+                &tx,
+                wire_size,
+                push.clone(),
+            ) {
+                warn!(instance = %slave_instance, error = %e, "Initial HA push could not be queued; coalescing");
+                self.schedule_coalesced_delivery(&slave_instance, connection_id, &tx, push);
             }
         }
 
@@ -1368,12 +1483,7 @@ impl MasterCoordinator {
                 // Outgoing messages queued for this slave
                 Some(msg) = rx.recv() => {
                     let wire_size = msg.to_json().map_or(0, |json| json.len());
-                    if wire_size > 0 {
-                        let mut queued = self.queued_bytes.lock().unwrap();
-                        if let Some(current) = queued.get_mut(&slave_instance) {
-                            *current = current.saturating_sub(wire_size);
-                        }
-                    }
+                    self.account_drained(&slave_instance, connection_id, wire_size);
                     if send_master_message(&mut ws_stream, &msg, "configuration push").await.is_err() {
                         break;
                     }
@@ -1483,7 +1593,10 @@ impl MasterCoordinator {
             // reconnects.
             self.stale_repushes.lock().unwrap().remove(instance);
             self.diverged.lock().unwrap().remove(instance);
-            self.queued_bytes.lock().unwrap().remove(instance);
+            self.queued_bytes
+                .lock()
+                .unwrap()
+                .remove(&(instance.to_string(), connection_id));
             self.metrics.remove_ha_diverged(instance);
         }
         #[allow(clippy::cast_possible_wrap)]
@@ -1738,13 +1851,34 @@ impl MasterCoordinator {
                 // Resync requested: always re-push the active bundle; the slave
                 // acknowledges without re-applying when it is already current.
                 if let Some(ref push) = *self.active_push.lock().unwrap() {
-                    let slaves = self.slaves.lock().unwrap();
-                    if let Some(s) = slaves.get(slave_instance)
-                        && s.connection_id == connection_id
-                        && let Err(e) =
-                            self.try_queue_accounted(slave_instance, &s.sender, push.clone())
-                    {
-                        warn!(instance = %slave_instance, "Resync push could not be queued: {e}");
+                    let sender = {
+                        let slaves = self.slaves.lock().unwrap();
+                        slaves
+                            .get(slave_instance)
+                            .filter(|s| s.connection_id == connection_id)
+                            .map(|s| s.sender.clone())
+                    };
+                    if let Some(sender) = sender {
+                        let wire_size = push.to_json().map_or(0, |json| json.len());
+                        if let Err(e) = self.try_queue_accounted(
+                            slave_instance,
+                            connection_id,
+                            &sender,
+                            wire_size,
+                            push.clone(),
+                        ) {
+                            warn!(
+                                instance = %slave_instance,
+                                error = %e,
+                                "Resync push could not be queued; coalescing"
+                            );
+                            self.schedule_coalesced_delivery(
+                                slave_instance,
+                                connection_id,
+                                &sender,
+                                push,
+                            );
+                        }
                     }
                 }
             }
@@ -2716,7 +2850,7 @@ mod tests {
             .queued_bytes
             .lock()
             .unwrap()
-            .insert("slow-slave".to_string(), MAX_SLAVE_QUEUE_BYTES);
+            .insert(("slow-slave".to_string(), 1), MAX_SLAVE_QUEUE_BYTES);
 
         assert_eq!(coordinator.broadcast(&HaMessage::Ping { ts: 2 }), 1);
         // The coalesced task must wait for the byte budget instead of queueing
@@ -2733,7 +2867,7 @@ mod tests {
             .queued_bytes
             .lock()
             .unwrap()
-            .remove("slow-slave");
+            .remove(&("slow-slave".to_string(), 1));
         let delivered = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("coalesced delivery timed out")
@@ -2742,24 +2876,28 @@ mod tests {
     }
 
     /// Regression (deferred D2): every non-broadcast send path must account
-    /// its bytes, and a rejected send must not inflate the budget.
+    /// its bytes, a rejected send must not inflate the budget, and an
+    /// over-budget send must be refused before it touches the channel.
     #[tokio::test]
     async fn test_try_queue_accounted_tracks_bytes_and_rejects_full_queue() {
         let coordinator = test_coordinator();
         let (tx, mut rx) = mpsc::channel::<HaMessage>(1);
         let msg = HaMessage::Ping { ts: 7 };
         let size = msg.to_json().unwrap().len();
+        let key = ("slave-1".to_string(), 1);
+        // Registration installs the session key; the helper refuses to create
+        // accounting for an unregistered/superseded session.
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .insert(key.clone(), 0);
 
         coordinator
-            .try_queue_accounted("slave-1", &tx, msg.clone())
+            .try_queue_accounted("slave-1", 1, &tx, size, msg.clone())
             .expect("queue has room");
         assert_eq!(
-            coordinator
-                .queued_bytes
-                .lock()
-                .unwrap()
-                .get("slave-1")
-                .copied(),
+            coordinator.queued_bytes.lock().unwrap().get(&key).copied(),
             Some(size),
             "a queued message must be accounted"
         );
@@ -2767,16 +2905,11 @@ mod tests {
         // The single-slot channel is full: a rejected send must not add bytes.
         assert!(
             coordinator
-                .try_queue_accounted("slave-1", &tx, msg.clone())
+                .try_queue_accounted("slave-1", 1, &tx, size, msg.clone())
                 .is_err()
         );
         assert_eq!(
-            coordinator
-                .queued_bytes
-                .lock()
-                .unwrap()
-                .get("slave-1")
-                .copied(),
+            coordinator.queued_bytes.lock().unwrap().get(&key).copied(),
             Some(size),
             "a rejected send must not change the accounting"
         );
@@ -2786,17 +2919,54 @@ mod tests {
         // A closed channel must not add bytes either.
         assert!(
             coordinator
-                .try_queue_accounted("slave-1", &tx, msg)
+                .try_queue_accounted("slave-1", 1, &tx, size, msg.clone())
                 .is_err()
+        );
+        assert_eq!(
+            coordinator.queued_bytes.lock().unwrap().get(&key).copied(),
+            Some(size)
+        );
+
+        // A sender whose session key was removed by a reconnect must not
+        // recreate accounting for a channel nobody will drain.
+        let (unregistered_tx, mut unregistered_rx) = mpsc::channel::<HaMessage>(4);
+        assert!(
+            coordinator
+                .try_queue_accounted("slave-3", 3, &unregistered_tx, size, msg.clone())
+                .is_err(),
+            "an unregistered/superseded session must be refused"
+        );
+        assert!(
+            unregistered_rx.try_recv().is_err(),
+            "a refused session must not receive the message"
+        );
+
+        // An over-budget send is refused before it is queued, so a coalesced
+        // fallback can take over instead of growing the queue.
+        let (over_tx, mut over_rx) = mpsc::channel::<HaMessage>(4);
+        let over_key = ("slave-2".to_string(), 9);
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .insert(over_key.clone(), MAX_SLAVE_QUEUE_BYTES);
+        let err = coordinator
+            .try_queue_accounted("slave-2", 9, &over_tx, size, msg)
+            .expect_err("an over-budget send must be refused");
+        assert!(err.contains("budget"), "unexpected error: {err}");
+        assert!(
+            over_rx.try_recv().is_err(),
+            "an over-budget send must not touch the channel"
         );
         assert_eq!(
             coordinator
                 .queued_bytes
                 .lock()
                 .unwrap()
-                .get("slave-1")
+                .get(&over_key)
                 .copied(),
-            Some(size)
+            Some(MAX_SLAVE_QUEUE_BYTES),
+            "a refused send must not change the accounting"
         );
     }
 
@@ -2810,12 +2980,13 @@ mod tests {
 
         let coordinator = test_coordinator();
         // No active bundle: registration has nothing to enqueue, so any
-        // remaining value after registration is phantom accounting.
+        // remaining value after registration is phantom accounting. The key
+        // carries a superseded connection id.
         coordinator
             .queued_bytes
             .lock()
             .unwrap()
-            .insert("slave-1".to_string(), MAX_SLAVE_QUEUE_BYTES);
+            .insert(("slave-1".to_string(), 999), MAX_SLAVE_QUEUE_BYTES);
 
         let (server_socket, client_socket) = tokio::io::duplex(64 * 1024);
         let server_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
@@ -2863,18 +3034,158 @@ mod tests {
         .await
         .expect("the reconnecting session must register");
 
+        let active_connection_id = coordinator.slaves.lock().unwrap()["slave-1"].connection_id;
+        let queued = coordinator.queued_bytes.lock().unwrap();
+        assert_eq!(
+            queued
+                .get(&("slave-1".to_string(), active_connection_id))
+                .copied(),
+            Some(0),
+            "registration must install a zero baseline for the new session"
+        );
+        assert!(
+            !queued.contains_key(&("slave-1".to_string(), 999)),
+            "phantom accounting from the superseded session must be reset"
+        );
+
+        session.abort();
+    }
+
+    /// Regression (deferred D2): a superseded session draining its old channel
+    /// must subtract from its own session key, not the replacement's.
+    #[tokio::test]
+    async fn test_superseded_session_drain_does_not_charge_new_session() {
+        let coordinator = test_coordinator();
+        let old_key = ("slave-1".to_string(), 1);
+        let new_key = ("slave-1".to_string(), 2);
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .insert(old_key.clone(), 500);
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .insert(new_key.clone(), 700);
+
+        // The old session drains after the reconnect completed.
+        coordinator.account_drained("slave-1", 1, 500);
+
+        let queued = coordinator.queued_bytes.lock().unwrap();
+        assert_eq!(queued.get(&old_key).copied(), Some(0));
+        assert_eq!(
+            queued.get(&new_key).copied(),
+            Some(700),
+            "the replacement session's budget must not be reduced by the old drain"
+        );
+    }
+
+    /// Regression (deferred D2): a coalesced fallback task spawned for a
+    /// superseded session must stop when it loses ownership, and must not
+    /// deliver to or charge the replacement session.
+    #[tokio::test]
+    async fn test_pending_coalesced_task_does_not_charge_reconnected_session() {
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+
+        let (old_tx, _old_rx) = mpsc::channel::<HaMessage>(4);
+        coordinator.slaves.lock().unwrap().insert(
+            "slave-1".to_string(),
+            ActiveSlave {
+                instance: "slave-1".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 0,
+                last_ping: Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: old_tx,
+                capabilities: vec![],
+                connection_id: 1,
+            },
+        );
+        let old_key = ("slave-1".to_string(), 1);
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .insert(old_key.clone(), MAX_SLAVE_QUEUE_BYTES);
+
+        // Broadcast sees the exhausted budget and schedules the fallback task.
+        assert_eq!(coordinator.broadcast(&HaMessage::Ping { ts: 2 }), 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if coordinator
+                    .pending_fallbacks
+                    .lock()
+                    .unwrap()
+                    .contains(&old_key)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the fallback task must be pending");
+
+        // Reconnect: replace the active entry and reset the superseded
+        // session's accounting.
+        let (new_tx, mut new_rx) = mpsc::channel::<HaMessage>(4);
+        {
+            let mut slaves = coordinator.slaves.lock().unwrap();
+            coordinator
+                .queued_bytes
+                .lock()
+                .unwrap()
+                .retain(|(instance, _), _| instance != "slave-1");
+            slaves.insert(
+                "slave-1".to_string(),
+                ActiveSlave {
+                    instance: "slave-1".to_string(),
+                    remote_addr: "127.0.0.1:1001".parse().unwrap(),
+                    synced_version: 0,
+                    last_ping: Instant::now(),
+                    connected_at: Utc::now(),
+                    last_stats: None,
+                    sender: new_tx,
+                    capabilities: vec![],
+                    connection_id: 2,
+                },
+            );
+        }
+
+        // The old task must notice it lost ownership and exit.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !coordinator
+                    .pending_fallbacks
+                    .lock()
+                    .unwrap()
+                    .contains(&old_key)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the superseded fallback task must exit");
+
         assert_eq!(
             coordinator
                 .queued_bytes
                 .lock()
                 .unwrap()
-                .get("slave-1")
+                .get(&("slave-1".to_string(), 2))
                 .copied(),
             None,
-            "phantom accounting from the superseded session must be reset"
+            "the superseded task must not charge the replacement session"
         );
-
-        session.abort();
+        assert!(
+            new_rx.try_recv().is_err(),
+            "the superseded task must not deliver to the replacement session"
+        );
     }
 
     #[test]

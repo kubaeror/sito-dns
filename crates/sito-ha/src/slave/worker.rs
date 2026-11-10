@@ -775,9 +775,7 @@ pub fn spawn_slave_worker(
             // A previously failed apply stays visible while reconnecting: the
             // `Degraded` state (and its reason) is only cleared by a successful
             // apply or an early ACK for the version already running.
-            if tracker.get_state() != SlaveState::Degraded {
-                tracker.set_state(SlaveState::Connecting);
-            }
+            mark_session_ended(&tracker);
             info!(url = %master_url, "Connecting to master WebSocket replication server");
 
             match connect_and_run(
@@ -796,7 +794,8 @@ pub fn spawn_slave_worker(
                     backoff.reset();
                     // The session is over: stop advertising readiness until
                     // the next successful sync even though DNS keeps serving.
-                    tracker.set_state(SlaveState::Connecting);
+                    // A failed apply stays Degraded with its reason.
+                    mark_session_ended(&tracker);
                     // Avoid a tight reconnect loop when the master accepts and
                     // immediately closes the connection.
                     tokio::select! {
@@ -993,6 +992,15 @@ async fn connect_and_run(
 /// apply-failure reason from `/ha/status`.
 fn record_master_liveness_loss(tracker: &SlaveStatusTracker, reason: String) {
     tracker.set_connection_error(Some(reason));
+    mark_session_ended(tracker);
+}
+
+/// Drops out of `Synced` when a replication session ends.
+///
+/// A `Degraded` state records a failed apply and is only cleared by a
+/// successful apply; a clean disconnect or a new connection attempt must not
+/// erase the operator-visible reason.
+fn mark_session_ended(tracker: &SlaveStatusTracker) {
     if tracker.get_state() != SlaveState::Degraded {
         tracker.set_state(SlaveState::Connecting);
     }
@@ -3191,6 +3199,28 @@ ttl = 60
             !tracker.readiness().ready,
             "a master-liveness loss must not report replication ready"
         );
+    }
+
+    /// A clean session end must not erase a failed-apply reason either.
+    #[test]
+    fn test_clean_session_end_preserves_degraded_reason() {
+        let degraded = SlaveStatusTracker::new("slave-degraded".to_string(), 4, None);
+        degraded.mark_degraded("previous apply failed".to_string());
+        mark_session_ended(&degraded);
+        assert_eq!(
+            degraded.get_state(),
+            SlaveState::Degraded,
+            "a clean disconnect must not clear a failed-apply state"
+        );
+        assert_eq!(
+            degraded.degraded_reason.lock().unwrap().as_deref(),
+            Some("previous apply failed")
+        );
+
+        let synced = SlaveStatusTracker::new("slave-synced".to_string(), 4, None);
+        synced.mark_synced(4);
+        mark_session_ended(&synced);
+        assert_eq!(synced.get_state(), SlaveState::Connecting);
     }
 
     /// A failed apply must survive reconnects: `Degraded` is not cleared by a

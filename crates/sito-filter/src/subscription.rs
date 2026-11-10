@@ -635,8 +635,15 @@ impl SubscriptionFetcher {
                                         warn!(
                                             list = %list_name,
                                             error = %e,
-                                            "Cached blocklist is empty/HTML despite HTTP 304; retrying without conditional headers"
+                                            "Cached blocklist is empty/HTML despite HTTP 304; quarantining and retrying without conditional headers"
                                         );
+                                        quarantine_cache(
+                                            &cache_path,
+                                            &meta_path,
+                                            list_name,
+                                            &e.to_string(),
+                                        )
+                                        .await;
                                         last_error = Some(e);
                                         conditional = None;
                                         if attempt < self.max_retries {
@@ -1260,6 +1267,63 @@ mod tests {
             requests[1]
         );
 
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// A 304 that serves an empty/HTML cache must quarantine that cache too,
+    /// otherwise the rejected pair is re-read on every refresh cycle.
+    #[tokio::test]
+    async fn test_304_empty_or_html_cache_is_quarantined() {
+        let data_dir = temp_dir("sito_304_html_cache");
+        let list_name = "etag-list";
+        let cache_path = cache_path_for_list(&data_dir, list_name);
+        let meta_path = meta_path_for_list(&data_dir, list_name);
+        let cached_html = "<html><body>CDN error</body></html>\n";
+        save_to_cache(&cache_path, cached_html).await.unwrap();
+        save_metadata(
+            &meta_path,
+            &ListMetadata {
+                etag: Some("\"v1\"".to_string()),
+                content_len: Some(cached_html.len() as u64),
+                line_count: Some(cached_html.lines().count()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let responses = vec![
+            "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        ];
+        let (addr, _captured, server) = spawn_http_server(responses).await;
+
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            0,
+            Duration::from_millis(10),
+        );
+        fetcher.allow_private_targets = true;
+
+        let err = fetcher
+            .fetch_or_cached(list_name, &format!("http://{addr}/list.txt"), &data_dir)
+            .await
+            .expect_err("an HTML cache served under HTTP 304 must be rejected");
+        assert!(
+            matches!(err, FilterError::HtmlResponse { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !cache_path.exists(),
+            "the rejected 304 cache must be quarantined"
+        );
+        assert!(
+            !meta_path.exists(),
+            "the rejected 304 cache metadata must be quarantined"
+        );
+
+        server.await.unwrap();
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 

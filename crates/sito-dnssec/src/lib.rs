@@ -7736,20 +7736,60 @@ mod tests {
     /// could take the Insecure shortcut without probing the anchor.
     #[tokio::test]
     async fn test_anchor_island_under_unsigned_delegation_is_not_insecure() {
-        let (_unsigned_parent, _parent_key, _parent_signer) = create_test_signer("signed.example.");
+        let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
         let unsigned_cut = Name::from_str("unsigned.signed.example.").expect("cut");
         let (island_origin, island_key, island_signer) =
             create_test_signer("island.unsigned.signed.example.");
         let qname = Name::from_str("www.island.unsigned.signed.example.").expect("qname");
+        let sibling = Name::from_str("www.unsigned.signed.example.").expect("sibling");
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
 
         let validator = d05_validator(None);
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
         validator.add_trust_anchor(&island_key, LowerName::from(&island_origin));
-        // An earlier sibling query authenticated the parent-side DS denial for
-        // the unsigned delegation. The in-memory status survives until expiry.
-        validator
-            .insecure_zones
-            .insert(LowerName::from(&unsigned_cut), now.saturating_add(3600));
+
+        // Populate the unsigned parent through the normal validation path: a
+        // sibling query authenticates the parent-side DS denial for the
+        // unsigned delegation. This is the state that used to shadow the
+        // island after a reload.
+        let ds_denial = signed_nsec_response(
+            &parent_origin,
+            &unsigned_cut,
+            &Name::from_str("z.signed.example.").expect("next"),
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+            &unsigned_cut,
+            &parent_key,
+            &parent_signer,
+            ResponseCode::NoError,
+        );
+        let sibling_fetcher = StaticFetcher::new()
+            .with(
+                &parent_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer),
+            )
+            .with(&unsigned_cut, RecordType::DS, ds_denial);
+        let mut sibling_response = stripped_response(&sibling);
+        let sibling_outcome = validator
+            .validate_with_key_fetcher(
+                &mut sibling_response,
+                Some("sibling"),
+                now,
+                &sibling_fetcher,
+            )
+            .await;
+        assert_eq!(
+            sibling_outcome,
+            ValidationOutcome::Insecure,
+            "the sibling must be authenticated as an unsigned delegation"
+        );
+        assert!(
+            validator
+                .insecure_zones
+                .contains_key(&LowerName::from(&unsigned_cut)),
+            "the normal path must populate the in-memory unsigned zone"
+        );
+
         assert!(
             !validator.insecure_zone_covers(&LowerName::from(&qname), now),
             "the parent's unsigned status must not cover the anchored island"
@@ -7757,10 +7797,8 @@ mod tests {
 
         // Sibling names outside the island still legitimately use the
         // authenticated parent-side denial.
-        let sibling =
-            LowerName::from(&Name::from_str("www.unsigned.signed.example.").expect("sibling"));
         assert!(
-            validator.insecure_zone_covers(&sibling, now),
+            validator.insecure_zone_covers(&LowerName::from(&sibling), now),
             "names outside the anchor island must remain Insecure"
         );
 

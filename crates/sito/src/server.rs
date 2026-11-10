@@ -229,6 +229,14 @@ fn choose_tls_material(
     }
 }
 
+/// Whether the stored ACME certificate/key pair should be selected at startup.
+///
+/// Factored out of [`init_tls_and_acme`] so the wiring (`pair.is_some()` AND
+/// `stored_pair_is_usable()`) is testable without binding listeners.
+fn acme_startup_pair_usable(pair_exists: bool, config: &AcmeServiceConfig) -> bool {
+    pair_exists && config.stored_pair_is_usable()
+}
+
 /// Record whether a TCP DoH listener actually bound port 443 with the
 /// `acme-tls/1` ALPN. Called after every bind/rebind so ACME challenge
 /// selection reflects reality rather than configuration intent.
@@ -1728,7 +1736,7 @@ async fn init_tls_and_acme(
         // Fail closed on unreadable/unparseable material: a truncated
         // certificate or key must never be selected and then abort startup in
         // the TLS builder while a valid static pair is available.
-        let usable = pair.is_some() && service_cfg.stored_pair_is_usable();
+        let usable = acme_startup_pair_usable(pair.is_some(), service_cfg);
         (pair, usable)
     } else {
         (None, false)
@@ -2744,6 +2752,14 @@ mod tests {
             "truncated ACME material must never be considered usable"
         );
         assert!(
+            !acme_startup_pair_usable(false, &config),
+            "a missing pair must not be selected"
+        );
+        assert!(
+            !acme_startup_pair_usable(true, &config),
+            "an existing but unusable pair must not be selected"
+        );
+        assert!(
             sito_transport::certificate_needs_renewal(&config),
             "the renewal path must still run for truncated material"
         );
@@ -2826,7 +2842,11 @@ mod tests {
 
         let acme_pair = Some((cert_path.clone(), key_path.clone()));
         let acme_pair_value = acme_pair.clone().expect("acme pair");
-        let acme_pair_usable = !config.is_bootstrap_cert() && !config.stored_cert_is_expired();
+        assert!(
+            acme_startup_pair_usable(true, &config),
+            "a still-valid CA-issued pair must be selected at startup"
+        );
+        let acme_pair_usable = acme_startup_pair_usable(true, &config);
         assert_eq!(
             choose_tls_material(None, acme_pair.clone(), acme_pair_usable, true, false),
             TlsStartupMaterial::Pair(acme_pair_value.0.clone(), acme_pair_value.1.clone()),
