@@ -7,13 +7,13 @@ This guide covers deploying **sito** on Linux hosts using the automated one-line
 ## Network Exposure and Firewall
 
 **Read this before the host is reachable from an untrusted network.** The
-1.9.4 defaults are deliberately unchanged for compatibility, so they are
+1.9.5 defaults are deliberately unchanged for compatibility, so they are
 LAN defaults, not internet-safe defaults:
 
 * `web.bind` defaults to `0.0.0.0`, the admin UI is served over plain HTTP, and
   port `8080` accepts setup and login requests from every reachable source.
   There is no TLS in the admin listener itself.
-* `dns.bind` defaults to `["0.0.0.0", "::"]` and 1.9.4 has no DNS client
+* `dns.bind` defaults to `["0.0.0.0", "::"]` and 1.9.5 has no DNS client
   allow-list. `dns.rate_limit_per_ip` limits request rate; it is **not** an
   access control. Any host that can reach the DNS ports can recurse through
   this server.
@@ -82,7 +82,7 @@ choice without changing the historical mapping.
 
 > [!NOTE]
 > Changing the default to loopback (`web.bind = "127.0.0.1"`) and adding a
-> default-deny DNS client ACL is planned for **1.10.0**. 1.9.4 keeps existing
+> default-deny DNS client ACL is planned for **1.10.0**. 1.9.5 keeps existing
 > configurations working; the startup warning and this firewall guidance are
 > the patch-release mitigation.
 
@@ -97,9 +97,9 @@ manually and supervise it with your init system.
 
 ```bash
 # Download and inspect the installer from the tag you intend to run.
-curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/v1.9.4/contrib/install.sh -o sito-install.sh
+curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/v1.9.5/contrib/install.sh -o sito-install.sh
 sed -n '1,120p' sito-install.sh
-sudo SITO_VERSION=1.9.4 bash sito-install.sh
+sudo SITO_VERSION=1.9.5 bash sito-install.sh
 ```
 
 The installer automatically:
@@ -256,7 +256,7 @@ sudo systemctl start sito
 
 # Option B: re-run the installer (SITO_VERSION pins a release)
 # The installer stops the service, replaces the binary atomically, and starts it.
-sudo SITO_VERSION=1.9.4 bash contrib/install.sh
+sudo SITO_VERSION=1.9.5 bash contrib/install.sh
 ```
 
 Without `--config`, the CLI prefers an existing `/etc/sito/config.toml` and
@@ -312,7 +312,7 @@ docker run -d \
   -p 127.0.0.1:8080:8080 \
   -v /opt/sito/config:/etc/sito \
   -v sito-data:/var/lib/sito \
-  ghcr.io/kubaeror/sito-dns:1.9.4
+  ghcr.io/kubaeror/sito-dns:1.9.5
 ```
 
 The image defines a healthcheck that probes DNS on the configured port and only
@@ -343,7 +343,7 @@ accepts the admin web interface while the API reports first-boot setup pending
 ```yaml
 services:
   sito:
-    image: ghcr.io/kubaeror/sito-dns:1.9.4
+    image: ghcr.io/kubaeror/sito-dns:1.9.5
     container_name: sito
     restart: unless-stopped
     cap_add:
@@ -379,7 +379,7 @@ a broken DNS listener still turns the container unhealthy.
 > container and publish the admin port only on loopback
 > (`127.0.0.1:8080:8080`) with an SSH tunnel or TLS reverse proxy in front.
 > Publishing `8080:8080` exposes the plain-HTTP admin UI on every host
-> interface. Pin the image tag (`1.9.4`) instead of `latest` in production.
+> interface. Pin the image tag (`1.9.5`) instead of `latest` in production.
 
 ### 4.2 High-Availability Master/Slave on LAN (`macvlan`)
 Run redundant master and slave instances on separate dedicated LAN IPs on a single server:
@@ -397,7 +397,7 @@ networks:
 
 services:
   sito-master:
-    image: ghcr.io/kubaeror/sito-dns:1.9.4
+    image: ghcr.io/kubaeror/sito-dns:1.9.5
     container_name: sito-master
     cap_add: [NET_BIND_SERVICE]
     networks:
@@ -413,7 +413,7 @@ services:
       retries: 3
 
   sito-slave:
-    image: ghcr.io/kubaeror/sito-dns:1.9.4
+    image: ghcr.io/kubaeror/sito-dns:1.9.5
     container_name: sito-slave
     cap_add: [NET_BIND_SERVICE]
     networks:
@@ -524,19 +524,19 @@ If you only downloaded one archive, verify its per-archive checksum instead
 (the `.sha256` filename matches the archive):
 
 ```bash
-sha256sum -c sito-v1.9.4-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c sito-v1.9.5-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 ### 6.2 cosign signature (keyless)
 
 ```bash
 cosign verify-blob \
-  --certificate sito-v1.9.4-x86_64-unknown-linux-gnu.tar.gz.pem \
-  --signature   sito-v1.9.4-x86_64-unknown-linux-gnu.tar.gz.sig \
+  --certificate sito-v1.9.5-x86_64-unknown-linux-gnu.tar.gz.pem \
+  --signature   sito-v1.9.5-x86_64-unknown-linux-gnu.tar.gz.sig \
   --certificate-identity-regexp \
       '^https://github.com/kubaeror/sito-dns/\.github/workflows/release\.yml@refs/tags/.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  sito-v1.9.4-x86_64-unknown-linux-gnu.tar.gz
+  sito-v1.9.5-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 The identity pins the artifact to this repository's release workflow and the

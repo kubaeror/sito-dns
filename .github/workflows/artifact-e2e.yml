@@ -1,13 +1,13 @@
 name: Artifact E2E
 
-# Verifies an already-published release end to end: the unified checksum file,
-# the cosign keyless signature identity, and that every packaged binary accepts
-# the configuration shipped inside its archive.
+# Verifies a staged release end to end: the unified checksum file, the cosign
+# keyless signature identity, and that every packaged binary accepts the
+# configuration shipped inside its archive.
 #
-# - `workflow_call`: invoked by release.yml after the tag-only release has been
-#   published. It is a job in that workflow rather than a `release: published`
-#   trigger because GitHub does not start workflows for releases created with
-#   the repository's GITHUB_TOKEN.
+# - `workflow_call`: invoked by release.yml while the release is still a draft,
+#   before publish-release flips it public. It is a job in that workflow rather
+#   than a `release: published` trigger because GitHub does not start workflows
+#   for releases created with the repository's GITHUB_TOKEN.
 # - `workflow_dispatch`: re-verify any existing release without publishing.
 on:
   workflow_call:
@@ -24,9 +24,11 @@ on:
         type: string
         default: latest
 
-# Least privilege: reading release assets and metadata only.
+# Reads the staged release assets and metadata. The release workflow stages a
+# draft first, and draft releases are only visible to tokens with write access,
+# so `gh release download` requires contents: write. The job only downloads.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   artifact-e2e:
@@ -182,4 +184,13 @@ jobs:
               --entrypoint "/assets/${dir}/sito" \
               -v "${PWD}:/assets:ro" \
               "${RUNTIME_IMAGE}" check-config --config "/assets/${dir}/config.example.toml"
+            # Every platform uses the same digest-pinned image. The observed
+            # failure is consistent with the runner's Docker store keeping a
+            # single local reference per digest: without removing it, the next
+            # --platform pull can fail with "cannot overwrite digest". Drop the
+            # local image so the next platform can be pulled while
+            # RUNTIME_IMAGE stays digest-pinned.
+            if ! docker image rm "${RUNTIME_IMAGE}" >/dev/null 2>&1; then
+              echo "::warning::could not remove ${RUNTIME_IMAGE}; the next --platform pull may fail with 'cannot overwrite digest'"
+            fi
           done <<< "${TARGETS}"

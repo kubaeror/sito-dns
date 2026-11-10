@@ -1,7 +1,7 @@
 # Security Review and Threat Model (current)
 
 This document summarizes the **implemented** security controls and known
-limitations of the current tree (1.9.4). It replaces an earlier v1.0.0/v1.2.1
+limitations of the current tree (1.9.x). It replaces an earlier v1.0.0/v1.2.1
 audit record whose claims had drifted from the code. Point-in-time audits with
 file/line evidence and remediation status live in:
 

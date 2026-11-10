@@ -94,33 +94,33 @@ Client Query ──▶ [sito-transport] (UDP / TCP / DoT / DoH / DoQ / DoH3)
 ### Option 1: Automated One-Line Installer (Linux)
 ```bash
 # Download and inspect the pinned installer, then run it for the same version.
-curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/v1.9.4/contrib/install.sh -o sito-install.sh
+curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/v1.9.5/contrib/install.sh -o sito-install.sh
 sed -n '1,120p' sito-install.sh
-sudo SITO_VERSION=1.9.4 bash sito-install.sh
+sudo SITO_VERSION=1.9.5 bash sito-install.sh
 ```
 
 The installer verifies the cosign signature of the release assets by default;
 a missing signature or cosign binary fails closed. See
 [the installation guide](docs/installation.md#6-verifying-releases) and
-[release verification](docs/release-verification.md). Replace `v1.9.4` with a
+[release verification](docs/release-verification.md). Replace `v1.9.5` with a
 newer tag deliberately instead of piping a mutable `main` script.
 
 ### Network exposure (read before exposing the host)
 
-The 1.9.4 defaults are intended for a trusted LAN: the admin UI listens on
+The 1.9.5 defaults are intended for a trusted LAN: the admin UI listens on
 `0.0.0.0:8080` over plain HTTP, and DNS listens on `0.0.0.0`/`::` with no
 client allow-list. **Do not expose port 8080 to the internet.** Restrict DNS to
 your LAN with a host firewall, or bind `dns.bind` to your LAN address. For
 remote admin access, bind `web.bind = "127.0.0.1"` and use an SSH tunnel or a
 TLS reverse proxy. The server logs a startup warning for each exposed listener.
 The loopback-by-default change and a DNS client ACL are planned for 1.10.0;
-existing configurations keep working in 1.9.4.
+existing configurations keep working in 1.9.5.
 
 ### Option 2: Docker / Docker Compose
 ```yaml
 services:
   sito:
-    image: ghcr.io/kubaeror/sito-dns:1.9.4
+    image: ghcr.io/kubaeror/sito-dns:1.9.5
     container_name: sito
     restart: unless-stopped
     cap_add:
@@ -217,8 +217,8 @@ Swagger UI / OpenAPI documentation is available at `http://localhost:8080/api/do
 * **[User Management & Authentication](docs/user-management.md):** Accounts, roles/RBAC, password changes, API tokens, TOTP 2FA, last-admin protection, and recovery — including the Admin **Users** page (`/users`), the per-user **Account** page (`/account`), and the Operator-only unidentified-clients table in the web panel.
 * **[Migrating from AdGuard Home](docs/migration-adguard.md):** Migration instructions and automated converter script (`contrib/adguard_to_sito.py`).
 * **[High-Availability Runbook](docs/runbook-ha.md):** Deployment architectures, mTLS certificates, failover, and slave promotion.
-* **[1.9.4 Release Notes](docs/release-notes-1.9.4.md):** Security and behavior changes, upgrade actions, and known issues for 1.9.4.
-* **[Changelog](CHANGELOG.md):** Release notes for v1.9.4 and complete history of phases M0 through M9.
+* **[1.9.5 Release Notes](docs/release-notes-1.9.5.md):** Release-engineering patch: multi-platform artifact E2E and container image publication. See the [1.9.4 release notes](docs/release-notes-1.9.4.md#known-issues) for known issues.
+* **[Changelog](CHANGELOG.md):** Release notes for v1.9.5 and complete history of phases M0 through M9.
 
 ---
 
