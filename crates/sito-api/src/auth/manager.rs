@@ -145,7 +145,7 @@ fn record_reauth_failure(
     if locked {
         // Mirrors `login`: the threshold-crossing attempt is the 429.
         ReauthError::LockedOut {
-            remaining_seconds: 15 * 60,
+            remaining_seconds: crate::auth::lockout::LOCKOUT_DURATION_SECS,
         }
     } else {
         otherwise
@@ -2181,7 +2181,7 @@ impl AuthManager {
             let (locked, rem) = self.lockout.record_failure(&key);
             return if locked {
                 LoginResult::LockedOut {
-                    remaining_seconds: 15 * 60,
+                    remaining_seconds: crate::auth::lockout::LOCKOUT_DURATION_SECS,
                 }
             } else {
                 LoginResult::InvalidCredentials {
@@ -2195,7 +2195,7 @@ impl AuthManager {
             let (locked, rem) = self.lockout.record_failure(&key);
             return if locked {
                 LoginResult::LockedOut {
-                    remaining_seconds: 15 * 60,
+                    remaining_seconds: crate::auth::lockout::LOCKOUT_DURATION_SECS,
                 }
             } else {
                 LoginResult::InvalidCredentials {
@@ -2387,7 +2387,7 @@ impl AuthManager {
             // Account locked: consume the partial token as well.
             lock(&self.partial_tokens).remove(partial_token);
             return TotpVerifyResult::LockedOut {
-                remaining_seconds: 15 * 60,
+                remaining_seconds: crate::auth::lockout::LOCKOUT_DURATION_SECS,
             };
         }
         if remaining_attempts == 0 {

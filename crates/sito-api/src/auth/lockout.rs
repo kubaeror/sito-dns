@@ -14,7 +14,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub const MAX_FAILED_ATTEMPTS: u32 = 5;
-const LOCKOUT_DURATION: Duration = Duration::from_mins(15); // 15 minutes
+/// Lockout duration in seconds, shared by login, re-auth, and the tracker.
+pub const LOCKOUT_DURATION_SECS: u64 = 15 * 60; // 15 minutes
+const LOCKOUT_DURATION: Duration = Duration::from_secs(LOCKOUT_DURATION_SECS);
 pub const MAX_LOCKOUT_ENTRIES: usize = 10_000;
 pub const MAX_IP_RATE_ENTRIES: usize = 10_000;
 

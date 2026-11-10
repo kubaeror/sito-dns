@@ -577,7 +577,7 @@ pub async fn reload_config(
         }
         Err(e) => {
             tracing::error!(error = %e, "HA publication failed after a config reload");
-            report.ha_publish = Some(crate::config_apply::HaPublishReport::failed(
+            report.ha_publish = Some(crate::config_apply::HaPublishReport::failed_with_retry(
                 e.to_string(),
                 retry_delay,
             ));

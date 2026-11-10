@@ -37,6 +37,10 @@ fn looks_like_truncated_response(bytes: &[u8], query_id: u16) -> bool {
 pub struct PlainUpstream {
     server_addr: SocketAddr,
     query_timeout: Duration,
+    /// Test-only count of ignored datagrams, used to synchronize tests that
+    /// need to prove junk was processed before the genuine reply arrives.
+    #[cfg(test)]
+    rejected_datagrams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PlainUpstream {
@@ -44,11 +48,25 @@ impl PlainUpstream {
         Self {
             server_addr,
             query_timeout,
+            #[cfg(test)]
+            rejected_datagrams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
     pub fn server_addr(&self) -> SocketAddr {
         self.server_addr
+    }
+
+    #[cfg(test)]
+    fn rejected_datagrams(&self) -> usize {
+        self.rejected_datagrams
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn record_rejected_datagram(&self) {
+        self.rejected_datagrams
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn resolve_tcp(
@@ -179,6 +197,8 @@ impl Upstream for PlainUpstream {
                         "Ignoring malformed datagram from upstream {}: {}",
                         self.server_addr, e
                     );
+                    #[cfg(test)]
+                    self.record_rejected_datagram();
                     continue;
                 }
             };
@@ -193,6 +213,8 @@ impl Upstream for PlainUpstream {
                         "Ignoring mismatched datagram from upstream {}: {}",
                         self.server_addr, e
                     );
+                    #[cfg(test)]
+                    self.record_rejected_datagram();
                 }
             }
         };
@@ -234,6 +256,7 @@ mod tests {
     use sito_proto::set_edns_payload_size;
     use sito_proto::{MessageType, OpCode, Query, RData, Record, RecordType, ResponseCode};
     use std::str::FromStr;
+    use std::time::Duration;
 
     fn make_query() -> Message {
         let mut query = Message::new(7, MessageType::Query, OpCode::Query);
@@ -322,15 +345,30 @@ mod tests {
         );
     }
 
+    /// Waits until the upstream has ignored at least one datagram, so a test
+    /// cannot send the genuine reply first and pass without exercising junk.
+    async fn wait_for_rejected_datagram(upstream: &PlainUpstream) {
+        for _ in 0..200 {
+            if upstream.rejected_datagrams() > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("junk datagram was not rejected before the genuine reply");
+    }
+
     /// P2-9 Important 2: an attacker who knows the port must not be able to
     /// force a TCP fallback (and fail the query) with a full-buffer garbage
     /// datagram whose header does not match the query.
     #[tokio::test]
     async fn test_plain_udp_ignores_full_buffer_junk() {
+        use std::sync::Arc;
         use std::time::Duration;
 
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let server_release = Arc::clone(&release);
 
         let server_task = tokio::spawn(async move {
             let mut buf = [0u8; 4096];
@@ -344,6 +382,7 @@ mod tests {
             junk[0..2].copy_from_slice(&(query.metadata.id ^ 0xffff).to_be_bytes());
             junk[2] = 0x00;
             server.send_to(&junk, peer).await.unwrap();
+            server_release.notified().await;
 
             let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
             resp.queries = query.queries.clone();
@@ -357,10 +396,16 @@ mod tests {
             server.send_to(&bytes, peer).await.unwrap();
         });
 
-        let upstream = PlainUpstream::new(addr, Duration::from_secs(2));
-        let response = upstream
-            .resolve(&make_query())
+        let upstream = Arc::new(PlainUpstream::new(addr, Duration::from_secs(2)));
+        let resolve = {
+            let upstream = Arc::clone(&upstream);
+            tokio::spawn(async move { upstream.resolve(&make_query()).await })
+        };
+        wait_for_rejected_datagram(&upstream).await;
+        release.notify_one();
+        let response = resolve
             .await
+            .unwrap()
             .expect("genuine response after full-buffer junk must be accepted");
         server_task.await.unwrap();
 
@@ -375,10 +420,13 @@ mod tests {
     /// `looks_like_truncated_response` (the combined test also sets a wrong ID).
     #[tokio::test]
     async fn test_plain_udp_ignores_full_buffer_junk_with_matching_id_and_no_qr() {
+        use std::sync::Arc;
         use std::time::Duration;
 
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let server_release = Arc::clone(&release);
 
         let server_task = tokio::spawn(async move {
             let mut buf = [0u8; 4096];
@@ -389,6 +437,7 @@ mod tests {
             junk[0..2].copy_from_slice(&query.metadata.id.to_be_bytes());
             junk[2] = 0x00; // QR=0
             server.send_to(&junk, peer).await.unwrap();
+            server_release.notified().await;
 
             let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
             resp.queries = query.queries.clone();
@@ -402,10 +451,16 @@ mod tests {
             server.send_to(&bytes, peer).await.unwrap();
         });
 
-        let upstream = PlainUpstream::new(addr, Duration::from_secs(2));
-        let response = upstream
-            .resolve(&make_query())
+        let upstream = Arc::new(PlainUpstream::new(addr, Duration::from_secs(2)));
+        let resolve = {
+            let upstream = Arc::clone(&upstream);
+            tokio::spawn(async move { upstream.resolve(&make_query()).await })
+        };
+        wait_for_rejected_datagram(&upstream).await;
+        release.notify_one();
+        let response = resolve
             .await
+            .unwrap()
             .expect("genuine response after matching-ID QR=0 junk must be accepted");
         server_task.await.unwrap();
 
@@ -420,10 +475,13 @@ mod tests {
     /// `looks_like_truncated_response`.
     #[tokio::test]
     async fn test_plain_udp_ignores_full_buffer_junk_with_qr_and_wrong_id() {
+        use std::sync::Arc;
         use std::time::Duration;
 
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let server_release = Arc::clone(&release);
 
         let server_task = tokio::spawn(async move {
             let mut buf = [0u8; 4096];
@@ -434,6 +492,7 @@ mod tests {
             junk[0..2].copy_from_slice(&(query.metadata.id ^ 0xffff).to_be_bytes());
             junk[2] = 0x80; // QR=1
             server.send_to(&junk, peer).await.unwrap();
+            server_release.notified().await;
 
             let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
             resp.queries = query.queries.clone();
@@ -447,10 +506,16 @@ mod tests {
             server.send_to(&bytes, peer).await.unwrap();
         });
 
-        let upstream = PlainUpstream::new(addr, Duration::from_secs(2));
-        let response = upstream
-            .resolve(&make_query())
+        let upstream = Arc::new(PlainUpstream::new(addr, Duration::from_secs(2)));
+        let resolve = {
+            let upstream = Arc::clone(&upstream);
+            tokio::spawn(async move { upstream.resolve(&make_query()).await })
+        };
+        wait_for_rejected_datagram(&upstream).await;
+        release.notify_one();
+        let response = resolve
             .await
+            .unwrap()
             .expect("genuine response after QR=1 wrong-ID junk must be accepted");
         server_task.await.unwrap();
 

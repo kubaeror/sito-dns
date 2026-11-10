@@ -462,6 +462,57 @@ impl axum::extract::FromRef<ServerContext> for MetricsRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Deferred D4b review: `publish_bundle_with_retry` must report the delay
+    /// only for a newly started retry loop. A second failure while that loop is
+    /// still active returns `None`, so the REST `retry_at` is omitted instead
+    /// of advertising a duplicate schedule.
+    #[tokio::test]
+    async fn test_publish_bundle_with_retry_reports_only_new_loop_delay() {
+        let temp_dir = crate::test_support::temp_dir("sito_ha_retry_report");
+        let mut ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.master_coordinator = Some(sito_ha::MasterCoordinator::new(
+            "retry-report-test".to_string(),
+            0,
+            Arc::new(
+                sito_ha::Ed25519SigningKey::generate().expect("test signing key must generate"),
+            ),
+            ctx.metrics.clone(),
+        ));
+        // Force a deterministic pre-coordinator publish failure: reading the
+        // configured path as a file fails when it is a directory.
+        std::fs::create_dir_all(&ctx.config_path).expect("create directory at config path");
+
+        let (first, first_delay) = ctx.publish_bundle_with_retry().await;
+        assert!(first.is_err(), "the first publish must fail");
+        assert_eq!(
+            first_delay,
+            Some(Duration::from_secs(1)),
+            "the call that starts the retry loop reports its initial delay"
+        );
+        let first_report =
+            crate::config_apply::HaPublishReport::failed_with_retry("publish failed", first_delay);
+        assert!(
+            first_report.retry_at.is_some(),
+            "REST retry_at must be present for the newly scheduled loop"
+        );
+
+        let (second, second_delay) = ctx.publish_bundle_with_retry().await;
+        assert!(second.is_err(), "the second publish must fail too");
+        assert_eq!(
+            second_delay, None,
+            "an already-running retry loop must not report a second schedule"
+        );
+        let second_report =
+            crate::config_apply::HaPublishReport::failed_with_retry("publish failed", second_delay);
+        assert!(
+            second_report.retry_at.is_none(),
+            "REST retry_at must be omitted while the existing loop owns the schedule"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 
     #[test]
     fn test_sanitize_clients_for_bundle_strips_shared_secrets() {

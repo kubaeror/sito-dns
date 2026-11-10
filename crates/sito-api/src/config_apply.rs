@@ -117,7 +117,17 @@ impl HaPublishReport {
         }
     }
 
-    /// Builds a failed report.
+    /// Builds a failed report with the historical one-second retry estimate.
+    ///
+    /// Compatibility wrapper for external callers; use
+    /// [`Self::failed_with_retry`] when the caller knows the delay of the retry
+    /// loop that was actually scheduled.
+    #[must_use]
+    pub fn failed(error: impl Into<String>) -> Self {
+        Self::failed_with_retry(error, Some(std::time::Duration::from_secs(1)))
+    }
+
+    /// Builds a failed report from the actual retry schedule.
     ///
     /// `retry_delay` is the delay before the first attempt of the retry loop
     /// that was actually started, or `None` when no new loop was scheduled
@@ -125,7 +135,10 @@ impl HaPublishReport {
     /// Guessing a fixed one-second delay misleads operators when the next
     /// attempt is much later.
     #[must_use]
-    pub fn failed(error: impl Into<String>, retry_delay: Option<std::time::Duration>) -> Self {
+    pub fn failed_with_retry(
+        error: impl Into<String>,
+        retry_delay: Option<std::time::Duration>,
+    ) -> Self {
         let retry_at = retry_delay.and_then(|delay| {
             let delta = chrono::TimeDelta::from_std(delay).ok()?;
             chrono::Utc::now()
@@ -483,7 +496,10 @@ async fn apply_and_persist_document_locked(
             // must not roll it back. Surface the failure, leave HA readiness
             // false, and let the background retry recover.
             tracing::error!(error = %e, "HA publication failed after a successful local apply");
-            report.ha_publish = Some(HaPublishReport::failed(e.to_string(), retry_delay));
+            report.ha_publish = Some(HaPublishReport::failed_with_retry(
+                e.to_string(),
+                retry_delay,
+            ));
         }
     }
 
@@ -827,7 +843,8 @@ mod tests {
     #[test]
     fn test_ha_publish_report_retry_at_matches_actual_schedule() {
         let before = chrono::Utc::now();
-        let report = HaPublishReport::failed("publish failed", Some(Duration::from_secs(2)));
+        let report =
+            HaPublishReport::failed_with_retry("publish failed", Some(Duration::from_secs(2)));
         assert_eq!(report.status, "failed");
         let retry_at = chrono::DateTime::parse_from_rfc3339(
             report
@@ -844,11 +861,16 @@ mod tests {
             "retry_at must be the scheduled delay, not a fixed guess: {delay}"
         );
 
-        let report = HaPublishReport::failed("publish failed", None);
+        let report = HaPublishReport::failed_with_retry("publish failed", None);
         assert!(
             report.retry_at.is_none(),
             "an already-running retry loop must not advertise a new retry time"
         );
+
+        // The compatibility constructor keeps the historical one-second
+        // estimate so external Rust callers do not need to change.
+        let report = HaPublishReport::failed("publish failed");
+        assert!(report.retry_at.is_some());
     }
 
     #[test]

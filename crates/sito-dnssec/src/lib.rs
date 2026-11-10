@@ -6402,6 +6402,13 @@ mod tests {
         );
         assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
         assert!(!response.metadata.authentic_data);
+        // The pre-fetch pass may record its inconclusive result, but the
+        // outcome actually served to the caller must also be counted.
+        assert_eq!(
+            strict.metrics.bogus_total.load(Ordering::Relaxed),
+            1,
+            "the strict sync conversion must record the Bogus outcome it serves"
+        );
 
         let log_only = DnssecValidator::new(DnssecMode::LogOnly, Vec::new());
         let mut response = build();

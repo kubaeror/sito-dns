@@ -480,7 +480,7 @@ Startup, check-config, API writes, restore, and HA apply all reject unknown keys
 
 ### D8 — HA publish failure semantics
 
-- A local config apply that passes validation and persists locally **does not roll back** if HA publish fails. The master keeps the new local config, sets HA readiness false, returns `ha_publish: { status: "failed", error, retry_at }` in the API, and retries with backoff.
+- A local config apply that passes validation and persists locally **does not roll back** if HA publish fails. The master keeps the new local config, sets HA readiness false, returns `ha_publish: { status: "failed", error, retry_at }` in the API (`retry_at` is present only when this failure started a new retry loop; it is omitted while an existing loop owns the backoff schedule), and retries with backoff.
 - `NoSlaves` is ready by default (`ha.require_slaves = false`). One missing slave among several marks `Degraded`; `ha.require_all_slaves = true` makes it not-ready.
 - An **oversized bundle** is an apply error and rolls back because the config cannot be replicated.
 - `/health` is false when `ha.require_slaves`/`require_all_slaves` is violated or when the local node is a slave that lost its master.

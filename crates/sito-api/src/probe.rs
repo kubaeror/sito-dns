@@ -160,9 +160,28 @@ pub async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result
         ));
     }
 
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+    probe_udp_target(target_addr, qname).await
+}
+
+/// Sends one UDP probe to `target_addr` and validates the reply.
+///
+/// The socket is connected to the target so the kernel drops datagrams from
+/// other peers; the response ID/question is still validated because a spoofed
+/// datagram from the target address must not count the server as up.
+async fn probe_udp_target(target_addr: SocketAddr, qname: sito_proto::Name) -> Result<f64, String> {
+    let start = std::time::Instant::now();
+    let bind_addr = if target_addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = tokio::net::UdpSocket::bind(bind_addr)
         .await
         .map_err(|e| format!("Failed to bind local UDP socket: {e}"))?;
+    socket
+        .connect(target_addr)
+        .await
+        .map_err(|e| format!("UDP connect failed: {e}"))?;
 
     let mut query_msg = sito_proto::Message::new(
         rand::random(),
@@ -177,12 +196,12 @@ pub async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result
         .map_err(|e| format!("Failed to encode DNS probe message: {e}"))?;
 
     socket
-        .send_to(&wire, target_addr)
+        .send(&wire)
         .await
         .map_err(|e| format!("UDP send failed: {e}"))?;
 
     let mut buf = [0u8; 512];
-    let (bytes_read, _peer) = tokio::time::timeout(PROBE_TIMEOUT, socket.recv_from(&mut buf))
+    let bytes_read = tokio::time::timeout(PROBE_TIMEOUT, socket.recv(&mut buf))
         .await
         .map_err(|_| "Probe query timed out".to_string())?
         .map_err(|e| format!("UDP recv failed: {e}"))?;
@@ -234,6 +253,56 @@ mod tests {
             validate_probe_reply(&query, &wrong_id).is_err(),
             "a mismatched probe reply must be rejected"
         );
+    }
+
+    /// Deferred D4b review: exercise the actual UDP receive path, not only the
+    /// reply-validation helper, so removing the validation call fails a test.
+    #[tokio::test]
+    async fn test_udp_probe_receive_path_rejects_edns_failure() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let query = sito_proto::decode_message(&buf[..n]).unwrap();
+            let mut response = Message::response(query.metadata.id, query.metadata.op_code);
+            response.metadata.response_code = ResponseCode::FormErr;
+            let bytes = sito_proto::encode_message(&response).unwrap();
+            server.send_to(&bytes, peer).await.unwrap();
+        });
+
+        let qname = sito_proto::Name::from_str("example.com.").unwrap();
+        let err = probe_udp_target(addr, qname)
+            .await
+            .expect_err("a FORMERR UDP probe reply must not count the server as up");
+        assert!(
+            err.contains("could not process"),
+            "unexpected probe error: {err}"
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_udp_probe_receive_path_accepts_matching_reply() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let query = sito_proto::decode_message(&buf[..n]).unwrap();
+            let mut response = Message::response(query.metadata.id, query.metadata.op_code);
+            response.queries = query.queries.clone();
+            response.metadata.response_code = ResponseCode::NoError;
+            let bytes = sito_proto::encode_message(&response).unwrap();
+            server.send_to(&bytes, peer).await.unwrap();
+        });
+
+        let qname = sito_proto::Name::from_str("example.com.").unwrap();
+        let rtt = probe_udp_target(addr, qname)
+            .await
+            .expect("a matching NOERROR reply must succeed");
+        assert!(rtt.is_finite(), "unexpected probe RTT: {rtt}");
+        server_task.await.unwrap();
     }
 
     #[test]
