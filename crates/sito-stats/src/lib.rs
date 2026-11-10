@@ -267,7 +267,7 @@ mod tests {
         db.insert_batch(&entries).await.unwrap();
 
         // Prune logs older than 90 days
-        let report = db.cleanup_retention(90).await.unwrap();
+        let report = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(report.deleted_records, 1);
         assert_eq!(report.aggregated_hours, 1);
 
@@ -491,7 +491,7 @@ mod tests {
         db.insert_batch(&[entry1, entry2]).await.unwrap();
 
         // 1st aggregation: entries are older than 90 days
-        let rep1 = db.cleanup_retention(90).await.unwrap();
+        let rep1 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep1.aggregated_hours, 1);
         assert_eq!(rep1.deleted_records, 2);
 
@@ -516,8 +516,8 @@ mod tests {
         assert_eq!(queries, 2);
         assert_eq!(blocked, 1);
 
-        // Run cleanup_retention again - should aggregate 0 hours because watermark prevents double counting
-        let rep2 = db.cleanup_retention(90).await.unwrap();
+        // Run cleanup_detailed_retention again - should aggregate 0 hours because watermark prevents double counting
+        let rep2 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep2.aggregated_hours, 0);
         assert_eq!(rep2.deleted_records, 0);
 
@@ -550,7 +550,7 @@ mod tests {
         db.insert_batch(&[entry3]).await.unwrap();
 
         // 3rd cleanup should only aggregate entry3 (1 new query, not re-aggregating entry1 and entry2)
-        let rep3 = db.cleanup_retention(90).await.unwrap();
+        let rep3 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep3.aggregated_hours, 1);
         assert_eq!(rep3.deleted_records, 1);
 
@@ -696,7 +696,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rep1 = db.cleanup_retention(90).await.unwrap();
+        let rep1 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep1.aggregated_hours, 1);
         assert_eq!(rep1.deleted_records, 2);
 
@@ -721,7 +721,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rep2 = db.cleanup_retention(90).await.unwrap();
+        let rep2 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep2.aggregated_hours, 1);
         assert_eq!(rep2.deleted_records, 1);
 
@@ -761,7 +761,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = db.cleanup_retention(90).await;
+        let err = db.cleanup_detailed_retention(90).await;
         assert!(err.is_err(), "cleanup must surface the aggregation failure");
 
         // Aggregate, watermark update and delete share one transaction, so the
@@ -829,7 +829,7 @@ mod tests {
         assert_eq!(stats.cached_queries, 2);
         assert_eq!(stats.blocked_queries, 1);
 
-        let report = db.cleanup_retention(90).await.unwrap();
+        let report = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(report.aggregated_hours, 1);
         let (cached, blocked): (i64, i64) = sqlx::query_as(
             "SELECT cached, blocked FROM stats_hourly WHERE hour = (1000000000000 / 3600000) * 3600000",
@@ -903,7 +903,7 @@ mod tests {
         }
         db.insert_batch(&entries).await.unwrap();
 
-        let report = db.cleanup_retention(90).await.unwrap();
+        let report = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(report.deleted_records, 8);
 
         // The hourly rollup carries bounded top lists (previously always '[]').
@@ -976,7 +976,7 @@ mod tests {
         db.insert_batch(&[retention_entry(hour_ts, "first.test", "allowed", None)])
             .await
             .unwrap();
-        let rep1 = db.cleanup_retention(90).await.unwrap();
+        let rep1 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep1.aggregated_hours, 1);
 
         db.insert_batch(&[retention_entry(
@@ -987,7 +987,7 @@ mod tests {
         )])
         .await
         .unwrap();
-        let rep2 = db.cleanup_retention(90).await.unwrap();
+        let rep2 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep2.aggregated_hours, 1);
 
         let (top_domains,): (String,) = sqlx::query_as(
@@ -1074,7 +1074,7 @@ mod tests {
         );
     }
 
-    /// WP-7.2: `cleanup_retention` vacuums after a large sweep so pages freed
+    /// WP-7.2: `cleanup_detailed_retention` vacuums after a large sweep so pages freed
     /// by the delete are returned to the filesystem.
     #[tokio::test]
     async fn test_retention_vacuum_shrinks_database_after_large_delete() {
@@ -1100,7 +1100,7 @@ mod tests {
         db.insert_batch(&entries).await.unwrap();
 
         let before = db.db_size_bytes().await.unwrap();
-        let report = db.cleanup_retention(90).await.unwrap();
+        let report = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(report.deleted_records, 3_000);
         let after = db.db_size_bytes().await.unwrap();
         assert!(
@@ -1316,7 +1316,7 @@ mod tests {
         }
         db.insert_batch(&entries).await.unwrap();
 
-        let report = db.cleanup_retention(90).await.unwrap();
+        let report = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(report.deleted_records, 120 * 3 + 2);
 
         let stats = db.get_global_stats(365 * 86_400_000).await.unwrap();
@@ -1461,7 +1461,7 @@ mod tests {
         second.client_name = Some("secret-laptop".into());
         db.insert_batch(&[first, second]).await.unwrap();
 
-        db.cleanup_retention(90).await.unwrap();
+        db.cleanup_detailed_retention(90).await.unwrap();
 
         let rows: Vec<(i64, String)> =
             sqlx::query_as("SELECT hour, top_clients FROM stats_hourly ORDER BY hour ASC")
@@ -1529,6 +1529,35 @@ mod tests {
         .unwrap();
         assert!(!domains.contains("expired-domain.example"));
         assert!(domains.contains("retained-domain.example"));
+    }
+
+    /// Deferred D4a: the compatibility `cleanup_retention` wrapper now applies
+    /// the default rollup retention instead of silently pruning detailed rows
+    /// only.
+    #[allow(deprecated)]
+    #[tokio::test]
+    async fn test_compat_cleanup_retention_applies_default_rollup_retention() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let expired_hour = ((now - 400 * 86_400_000) / 3_600_000) * 3_600_000;
+        sqlx::query(
+            "INSERT INTO stats_hourly (hour, queries, blocked, cached) VALUES (?, 1, 0, 0)",
+        )
+        .bind(expired_hour)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let report = db.cleanup_retention(90).await.unwrap();
+        assert_eq!(
+            report.rollup_deleted_records, 1,
+            "the compatibility wrapper must apply the default rollup retention"
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_hourly")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     /// P1-24: retention commits bounded chunks and records a startup
@@ -1862,7 +1891,7 @@ mod tests {
         );
         entry.client_ip = "b3::1".into();
         db.insert_batch(&[entry]).await.unwrap();
-        db.cleanup_retention(90).await.unwrap();
+        db.cleanup_detailed_retention(90).await.unwrap();
 
         let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
             .fetch_one(db.pool())
@@ -1936,7 +1965,7 @@ mod tests {
                 .await
                 .unwrap();
             db.insert_batch(&[entry]).await.unwrap();
-            db.cleanup_retention(90).await.unwrap();
+            db.cleanup_detailed_retention(90).await.unwrap();
             let payload: String =
                 sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
                     .fetch_one(db.pool())
@@ -2013,7 +2042,7 @@ mod tests {
         let first_hash = {
             let db = StatsDb::open(&db_path).await.unwrap();
             db.insert_batch(&[entry.clone()]).await.unwrap();
-            db.cleanup_retention(90).await.unwrap();
+            db.cleanup_detailed_retention(90).await.unwrap();
             let payload: String =
                 sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
                     .fetch_one(db.pool())
@@ -2030,7 +2059,7 @@ mod tests {
             let mut second = entry;
             second.ts += 3_600_000;
             db.insert_batch(&[second]).await.unwrap();
-            db.cleanup_retention(90).await.unwrap();
+            db.cleanup_detailed_retention(90).await.unwrap();
             let payloads: Vec<String> =
                 sqlx::query_scalar("SELECT top_clients FROM stats_hourly ORDER BY hour")
                     .fetch_all(db.pool())

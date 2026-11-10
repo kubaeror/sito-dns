@@ -2495,6 +2495,14 @@
           },
           "429": {
             "description": "Rate limited",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {

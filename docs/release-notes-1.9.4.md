@@ -125,7 +125,13 @@ document is the operator-facing summary and upgrade guide.
 - **Budgets are enforced before allocation:** per-line (8 KiB), per-pattern
   (16 KiB), total input bytes, total rules, regex, Aho-Corasick, and prefix
   limits. Oversized sets keep the previous snapshot instead of partially
-  dropping a class.
+  dropping a class. The public `RuleSetBuilder` result now reports
+  `dropped_prefix_rules` and `dropped_substring_rules` (alongside
+  `dropped_regex_patterns`) and exposes `has_dropped_classes()`, so a future
+  caller cannot mistake a partially compiled set for a complete one.
+- A rejected warm zero-source apply preserves the retained snapshot's
+  loaded/failed/degraded list fields, dropped-class counters, and compile time;
+  only the lifecycle state and error change.
 - A malformed `$dnstype`/`$denyallow` token rejects the whole rule; it no longer
   widens by keeping the valid subset.
 - Rewrite exceptions no longer trust DoH-path/SNI ids unless the client
@@ -270,11 +276,21 @@ P1-19, P1-23, and P1-24 are closed in this branch:
   `include_total` (default `true`; the live 3 s UI refresh sends `false`), and
   dashboard aggregates are cached for 45 s with invalidation on clear/retention.
   Stats endpoints are rate-limited per authenticated user, and their `429`
-  responses include `Retry-After: 1`.
+  responses include `Retry-After: 1`. The REST query-log endpoint now returns
+  the same `Retry-After: 1` on its `429`.
 - **P1-24 — retention lock duration.** Retention processes bounded hour chunks
   in separate short transactions, runs a bounded jittered catch-up on every
   startup (within 5 minutes even when the last success is recent), and exposes
   success/failure, duration, deleted-row and rollup-cleanup metrics.
+- **Slow-disk query-log writer.** The SQLite pool busy timeout is 30 s and the
+  writer retries a failed batch up to five times with bounded exponential
+  backoff (50 ms–1 s) before counting it dropped, so a slow retention chunk does
+  not silently discard a batch.
+- **Retention API naming.** `StatsDb::cleanup_detailed_retention()` is the
+  explicit detailed-only sweep. The deprecated `cleanup_retention()` wrapper
+  now delegates to the full policy with the default `rollup_retention_days`
+  (365) instead of silently pruning detailed rows only; callers that need a
+  specific rollup policy use `cleanup_retention_with_policy()`.
 
 Additional deferred/unchanged items:
 

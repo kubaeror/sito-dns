@@ -16,9 +16,24 @@ pub const BATCH_SIZE_THRESHOLD: usize = 1000;
 /// Batch time interval before flushing accumulated entries to disk.
 pub const BATCH_TIME_INTERVAL: Duration = Duration::from_secs(5);
 /// Maximum attempts to persist a batch before dropping it and counting the loss.
-const MAX_FLUSH_ATTEMPTS: u32 = 3;
-/// Delay between failed flush attempts.
-const FLUSH_RETRY_DELAY: Duration = Duration::from_millis(50);
+///
+/// A retention sweep processes row-bounded chunks, but a slow disk can still
+/// hold the write lock past the pool's busy timeout. The extra attempts (with
+/// bounded backoff) keep the no-drop guarantee instead of discarding a batch
+/// after a short transient stall.
+const MAX_FLUSH_ATTEMPTS: u32 = 5;
+/// Base delay between failed flush attempts (exponential, capped).
+const FLUSH_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
+/// Upper bound for the exponential flush backoff.
+const FLUSH_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+
+/// Bounded exponential backoff for a failed flush attempt.
+fn flush_retry_delay(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(16);
+    FLUSH_RETRY_BASE_DELAY
+        .saturating_mul(1u32 << exponent)
+        .min(FLUSH_RETRY_MAX_DELAY)
+}
 
 /// Persists `batch`, retrying transient SQLite failures a bounded number of
 /// times. On persistent failure the entries are dropped and counted in
@@ -47,7 +62,7 @@ async fn flush_batch(
                     error = %e,
                     "Failed to flush query log batch ({reason}); retrying"
                 );
-                tokio::time::sleep(FLUSH_RETRY_DELAY).await;
+                tokio::time::sleep(flush_retry_delay(attempt)).await;
                 attempt += 1;
             }
             Err(e) => {
@@ -233,5 +248,85 @@ impl QueryLogWriter {
     /// Waits for the writer task to exit.
     pub async fn wait(self) {
         let _ = self.join_handle.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Connection;
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+
+    #[test]
+    fn test_flush_retry_delay_is_bounded_and_grows() {
+        assert_eq!(flush_retry_delay(1), Duration::from_millis(50));
+        assert_eq!(flush_retry_delay(2), Duration::from_millis(100));
+        assert_eq!(flush_retry_delay(3), Duration::from_millis(200));
+        assert_eq!(flush_retry_delay(4), Duration::from_millis(400));
+        assert_eq!(flush_retry_delay(5), Duration::from_millis(800));
+        assert_eq!(flush_retry_delay(6), FLUSH_RETRY_MAX_DELAY);
+        assert_eq!(flush_retry_delay(u32::MAX), FLUSH_RETRY_MAX_DELAY);
+    }
+
+    /// Deferred D4a: a slow disk that holds the write lock past a short stall
+    /// must not make the writer discard the batch.
+    #[tokio::test]
+    async fn test_writer_waits_out_a_slow_write_lock_without_dropping() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_writer_lock_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let db = StatsDb::open(&db_path).await.unwrap();
+
+        let lock_options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(30));
+        let mut lock_conn = sqlx::SqliteConnection::connect_with(&lock_options)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut lock_conn)
+            .await
+            .unwrap();
+
+        let writer = QueryLogWriter::spawn(db.clone(), 16);
+        let sender = writer.sender();
+        let entry = QueryLogEntry::new(
+            chrono::Utc::now().timestamp_millis(),
+            "192.0.2.10",
+            None,
+            "slow-lock.example",
+            1,
+            Some(0),
+            "allowed",
+            "udp",
+        );
+        assert!(sender.try_send(entry));
+
+        // Release the lock after a stall that exceeds the old retry delay but
+        // stays well inside the busy timeout.
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            sqlx::query("COMMIT").execute(&mut lock_conn).await.unwrap();
+        });
+
+        sender.flush().await;
+        release.await.unwrap();
+        writer.shutdown().await;
+
+        assert_eq!(
+            sender.dropped_total(),
+            0,
+            "a slow write lock must not drop a query-log batch"
+        );
+        let page = db
+            .query_logs(&crate::QueryLogFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

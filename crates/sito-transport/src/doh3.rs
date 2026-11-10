@@ -65,6 +65,50 @@ impl Default for Doh3Limits {
 /// buffering before the limit is checked.
 const MAX_DOH3_FIELD_SECTION_BYTES: u64 = 16 * 1024;
 
+/// Minimal response-stream surface used to answer a request-deadline expiry.
+///
+/// A DoH3 deadline can fire before any response header is sent (answer 504) or
+/// after the handler already started the response (headers are no longer
+/// writable, so reset the stream). Keeping the decision in one helper makes
+/// both branches testable without a live QUIC connection.
+trait TimeoutResponseStream {
+    type Error;
+
+    async fn send_gateway_timeout(&mut self) -> Result<(), Self::Error>;
+    async fn finish_response(&mut self) -> Result<(), Self::Error>;
+    fn reset_stream(&mut self);
+}
+
+impl TimeoutResponseStream for h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes> {
+    type Error = h3::error::StreamError;
+
+    async fn send_gateway_timeout(&mut self) -> Result<(), Self::Error> {
+        let response = http::Response::builder()
+            .status(http::StatusCode::GATEWAY_TIMEOUT)
+            .body(())
+            .unwrap();
+        self.send_response(response).await
+    }
+
+    async fn finish_response(&mut self) -> Result<(), Self::Error> {
+        self.finish().await
+    }
+
+    fn reset_stream(&mut self) {
+        self.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+}
+
+/// Answers a request-deadline expiry: 504 when the response is still writable,
+/// otherwise reset the stream because headers were already sent.
+async fn finish_request_timeout<S: TimeoutResponseStream>(stream: &mut S) {
+    if stream.send_gateway_timeout().await.is_ok() {
+        let _ = stream.finish_response().await;
+    } else {
+        stream.reset_stream();
+    }
+}
+
 /// Configuration options for the DoH3 listener.
 #[derive(Clone)]
 pub struct Doh3Config {
@@ -675,17 +719,7 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
                                     // the transports operationally consistent. If
                                     // the response has already started, the stream
                                     // is no longer writable, so reset it instead.
-                                    let timeout_response = http::Response::builder()
-                                        .status(http::StatusCode::GATEWAY_TIMEOUT)
-                                        .body(())
-                                        .unwrap();
-                                    if stream.send_response(timeout_response).await.is_ok() {
-                                        let _ = stream.finish().await;
-                                    } else {
-                                        stream.stop_stream(
-                                            h3::error::Code::H3_REQUEST_CANCELLED,
-                                        );
-                                    }
+                                    finish_request_timeout(&mut stream).await;
                                 }
                             });
                             // Reap completed request tasks continuously, not
@@ -752,6 +786,81 @@ mod tests {
     use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::watch;
+
+    /// Test double for the request-deadline response branch.
+    ///
+    /// h3's `RequestStream` has no public way to mark a response as already
+    /// started without a live peer, so the "headers sent" state is modelled
+    /// here: `send_response` fails exactly as it does on a second header block.
+    #[derive(Default)]
+    struct FakeTimeoutStream {
+        headers_sent: bool,
+        finished: bool,
+        reset: bool,
+    }
+
+    // The trait mirrors the async h3 methods; the fake completes immediately.
+    #[allow(clippy::unused_async_trait_impl)]
+    impl TimeoutResponseStream for FakeTimeoutStream {
+        type Error = ();
+
+        async fn send_gateway_timeout(&mut self) -> Result<(), Self::Error> {
+            if self.headers_sent {
+                // h3 refuses a second response header block on the stream.
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn finish_response(&mut self) -> Result<(), Self::Error> {
+            self.finished = true;
+            Ok(())
+        }
+
+        fn reset_stream(&mut self) {
+            self.reset = true;
+        }
+    }
+
+    /// Deferred D4a: the "headers already sent, reset stream" deadline branch
+    /// used to be untested. A stream whose response already started must be
+    /// cancelled instead of trying (and failing) to send a second 504.
+    #[tokio::test]
+    async fn test_doh3_deadline_resets_stream_when_headers_already_sent() {
+        let mut stream = FakeTimeoutStream {
+            headers_sent: true,
+            ..FakeTimeoutStream::default()
+        };
+
+        finish_request_timeout(&mut stream).await;
+
+        assert!(
+            stream.reset,
+            "a stream whose headers were already sent must be reset"
+        );
+        assert!(
+            !stream.finished,
+            "the helper must not finish a stream that could not accept a 504"
+        );
+    }
+
+    /// The writable branch still answers 504 and finishes the stream.
+    #[tokio::test]
+    async fn test_doh3_deadline_sends_gateway_timeout_when_writable() {
+        let mut stream = FakeTimeoutStream::default();
+
+        finish_request_timeout(&mut stream).await;
+
+        assert!(
+            stream.finished,
+            "a writable stream must be answered with 504 and finished"
+        );
+        assert!(
+            !stream.reset,
+            "a writable stream must not be reset after sending 504"
+        );
+    }
 
     #[tokio::test]
     async fn test_doh3_post_and_get() {

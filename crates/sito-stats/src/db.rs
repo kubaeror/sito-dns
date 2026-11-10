@@ -729,7 +729,10 @@ impl StatsDb {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(Duration::from_secs(10))
+            // A retention chunk can hold the writer lock on a slow disk. Give
+            // the single-writer pipeline enough room to wait it out instead of
+            // returning SQLITE_BUSY and dropping a query-log batch.
+            .busy_timeout(Duration::from_secs(30))
             .pragma("secure_delete", "ON");
 
         let pool = SqlitePoolOptions::new()
@@ -1830,8 +1833,12 @@ impl StatsDb {
             .collect())
     }
 
-    /// Aggregates older logs into `stats_hourly` and prunes query logs older
-    /// than the retention period.
+    /// Aggregates older detailed logs into `stats_hourly` and prunes
+    /// `query_log` rows older than the retention period.
+    ///
+    /// Hourly rollups are **not** deleted by this method; use
+    /// [`Self::cleanup_retention_with_policy`] (or the deprecated
+    /// [`Self::cleanup_retention`] wrapper) for the full retention policy.
     ///
     /// Each expired hour is processed in its own short `BEGIN IMMEDIATE`
     /// transaction, so a large backlog cannot hold the writer lock for the
@@ -1844,14 +1851,34 @@ impl StatsDb {
     /// After a sweep that removed at least [`VACUUM_MIN_DELETED_ROWS`] rows the
     /// database is vacuumed, so pages freed by retention are returned to the OS
     /// instead of growing the file forever.
+    pub async fn cleanup_detailed_retention(
+        &self,
+        retention_days: u32,
+    ) -> Result<RetentionReport, StatsError> {
+        self.cleanup_retention_inner(retention_days, None, self.rollup_client_names)
+            .await
+    }
+
+    /// Compatibility retention sweep.
+    ///
+    /// Delegates to [`Self::cleanup_retention_with_policy`] with the default
+    /// `stats.rollup_retention_days` (365) instead of silently pruning detailed
+    /// rows only. Use [`Self::cleanup_detailed_retention`] when the caller
+    /// deliberately wants to keep hourly rollups.
+    #[deprecated(
+        note = "use cleanup_detailed_retention for detailed rows only, or cleanup_retention_with_policy for an explicit rollup policy"
+    )]
     pub async fn cleanup_retention(
         &self,
         retention_days: u32,
     ) -> Result<RetentionReport, StatsError> {
-        // Compatibility wrapper: prune detailed rows only. The server calls
-        // `cleanup_retention_with_policy` with the configured rollup retention.
-        self.cleanup_retention_inner(retention_days, None, self.rollup_client_names)
-            .await
+        let rollup_retention_days = sito_core::config::StatsConfig::default().rollup_retention_days;
+        self.cleanup_retention_with_policy(
+            retention_days,
+            rollup_retention_days,
+            self.rollup_client_names,
+        )
+        .await
     }
 
     /// Full retention sweep with explicit rollup policy.

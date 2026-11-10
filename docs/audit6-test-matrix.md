@@ -74,3 +74,14 @@ named by the command.
 | Stats large-hour/index commands | `test_large_single_hour_is_row_bounded`, `test_large_same_timestamp_hour_is_row_bounded`, `test_retention_hour_discovery_uses_ts_index`, `test_retention_chunk_queries_use_ts_id_index` | `cargo test -p sito-stats large_single_hour`; `cargo test -p sito-stats same_timestamp`; `cargo test -p sito-stats retention_hour_discovery`; `cargo test -p sito-stats retention_chunk_queries` |
 | Lockout capacity residual | Documented in `docs/release-notes-1.9.4.md` and `docs/security-audit.md` | `python3 scripts/check_markdown_links.py` |
 | `with_client` caveat | Doc comment on `HttpsUpstream::with_client` | `cargo test -p sito-upstream` |
+
+## Deferred D4a — stats/filter/transport quality cleanup
+
+| Finding | Named test / check | Focused command |
+|---|---|---|
+| Query-log 429 retry hint | `test_querylog_rate_limit_response_has_retry_after` | `cargo test -p sito-api test_querylog_rate_limit_response_has_retry_after` |
+| DoH3 deadline reset branch | `test_doh3_deadline_resets_stream_when_headers_already_sent`, `test_doh3_deadline_sends_gateway_timeout_when_writable` | `cargo test -p sito-transport doh3_deadline` |
+| Filter dropped-class counters | `test_excessive_ac_and_prefix_patterns_are_capped_before_build`, `test_excessive_regex_patterns_are_capped_without_disabling_other_classes` | `cargo test -p sito-filter excessive_` |
+| Warm zero-source status retention | `test_warm_zero_source_transition_is_failed_and_retains_snapshot` | `cargo test -p sito-filter warm_zero_source` |
+| Retention wrapper no longer detailed-only | `test_compat_cleanup_retention_applies_default_rollup_retention` | `cargo test -p sito-stats compat_cleanup_retention` |
+| Writer slow-lock/no-drop backoff | `test_writer_waits_out_a_slow_write_lock_without_dropping`, `test_flush_retry_delay_is_bounded_and_grows` | `cargo test -p sito-stats writer::tests` |

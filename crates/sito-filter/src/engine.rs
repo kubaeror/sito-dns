@@ -1415,14 +1415,15 @@ impl HostsFilterEngine {
                 // not commit a zero-source configuration.
                 let reason = "filtering.enabled has no configured sources; retained the previous filter snapshot".to_string();
                 error!("{reason}");
-                self.set_status(FilterStatus {
-                    state: FilterState::Failed,
-                    rule_count: prev_count,
-                    last_error: Some(reason),
-                    unavailable: false,
-                    dropped_regex_patterns: self.snapshot.load().dropped_regex_patterns,
-                    ..FilterStatus::default()
-                });
+                // Preserve the retained snapshot's observable status fields
+                // (loaded/failed/degraded lists, dropped-class counters and
+                // compile time); only the lifecycle state and error change.
+                let mut status = self.status();
+                status.state = FilterState::Failed;
+                status.rule_count = prev_count;
+                status.last_error = Some(reason);
+                status.unavailable = false;
+                self.set_status(status);
                 return Err(FilterError::NoSourcesConfigured);
             }
             self.snapshot.store(Arc::new(FilterSnapshot::unavailable()));
@@ -1852,6 +1853,22 @@ impl HostsFilterEngine {
             error!(
                 dropped = new_snapshot.dropped_regex_patterns,
                 "Some regex/wildcard blocking rules could not be compiled and are inactive"
+            );
+        }
+        let dropped_prefix_rules = new_snapshot.allowlist.dropped_prefix_rules
+            + new_snapshot.blocklist.dropped_prefix_rules;
+        if dropped_prefix_rules > 0 {
+            error!(
+                dropped = dropped_prefix_rules,
+                "Some prefix blocking rules could not be compiled and are inactive"
+            );
+        }
+        let dropped_substring_rules = new_snapshot.allowlist.dropped_substring_rules
+            + new_snapshot.blocklist.dropped_substring_rules;
+        if dropped_substring_rules > 0 {
+            error!(
+                dropped = dropped_substring_rules,
+                "Some substring blocking rules could not be compiled and are inactive"
             );
         }
         self.snapshot.store(Arc::new(new_snapshot));
@@ -2567,13 +2584,25 @@ mod tests {
     async fn test_warm_zero_source_transition_is_failed_and_retains_snapshot() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_warm_zero_source_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let list_path = temp_dir.join("only.txt");
+        tokio::fs::write(&list_path, "||only.com^\n").await.unwrap();
         let config = FilteringConfig {
-            custom_rules: vec!["0.0.0.0 only.com".to_string()],
+            lists: vec![FilterListConfig {
+                name: "only-list".to_string(),
+                url: format!("file://{}", list_path.display()),
+                enabled: true,
+                refresh_hours: None,
+            }],
             ..Default::default()
         };
         let engine = HostsFilterEngine::init(config.clone(), temp_dir.clone()).await;
         assert_eq!(engine.rule_count(), 1);
         assert_eq!(engine.state(), FilterState::Ready);
+        let before = engine.status();
+        assert_eq!(before.loaded_lists, 1);
+        assert!(before.last_compile_ms.is_some());
 
         // A live (warm) apply that removes every source must be rejected and
         // published as Failed while the last good snapshot stays active.
@@ -2590,9 +2619,26 @@ mod tests {
         assert_eq!(engine.rule_count(), 1, "the last rule must be retained");
         assert_eq!(engine.state(), FilterState::Failed);
         assert!(!engine.unavailable_for_fail_closed());
+        let after = engine.status();
         assert_eq!(
-            engine.config.load_full().custom_rules,
-            config.custom_rules,
+            after.loaded_lists, before.loaded_lists,
+            "the retained snapshot's loaded-list count must be preserved"
+        );
+        assert_eq!(after.failed_lists, before.failed_lists);
+        assert_eq!(after.degraded_lists, before.degraded_lists);
+        assert_eq!(after.degraded_groups, before.degraded_groups);
+        assert_eq!(
+            after.dropped_regex_patterns, before.dropped_regex_patterns,
+            "dropped-class counters must survive a rejected zero-source apply"
+        );
+        assert_eq!(
+            after.last_compile_ms, before.last_compile_ms,
+            "the retained snapshot's compile time must be preserved"
+        );
+        assert!(after.last_error.is_some());
+        assert_eq!(
+            engine.config.load_full().lists.len(),
+            config.lists.len(),
             "the rejected zero-source config must not be committed"
         );
         let client = ClientContext::new("127.0.0.1".parse().unwrap());

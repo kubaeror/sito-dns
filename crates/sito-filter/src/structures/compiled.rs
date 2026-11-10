@@ -203,6 +203,13 @@ pub struct CompiledRuleSet {
     /// Regex patterns that could not be compiled (oversized, invalid or over
     /// the global batch budget).
     pub dropped_regex_patterns: usize,
+    /// Prefix rule entries dropped because the prefix class exceeded its
+    /// pattern/byte limits. Non-zero means `|prefix` rules are inactive.
+    pub dropped_prefix_rules: usize,
+    /// Substring rule entries dropped because the Aho-Corasick class exceeded
+    /// its pattern/byte limits or failed to build. Non-zero means substring
+    /// rules are inactive.
+    pub dropped_substring_rules: usize,
     /// Indexed `|prefix` rules (start-anchored matches).
     pub prefix_trie: PrefixTrie,
 }
@@ -277,6 +284,18 @@ impl CompiledRuleSet {
     #[must_use]
     pub fn has_regex(&self) -> bool {
         !self.regex_batches.is_empty()
+    }
+
+    /// Whether any structural class was dropped while compiling this set.
+    ///
+    /// Callers that build a [`CompiledRuleSet`] directly must check this (or
+    /// the individual counters) instead of assuming a successful build means
+    /// every rule is active.
+    #[must_use]
+    pub fn has_dropped_classes(&self) -> bool {
+        self.dropped_regex_patterns > 0
+            || self.dropped_prefix_rules > 0
+            || self.dropped_substring_rules > 0
     }
 }
 
@@ -368,7 +387,9 @@ impl RuleSetBuilder {
         // must be rejected before that allocation.
         let prefix_bytes: usize = self.prefixes.iter().map(|(prefix, _)| prefix.len()).sum();
         let mut prefix_trie = PrefixTrie::new();
+        let mut dropped_prefix_rules = 0usize;
         if self.prefixes.len() > MAX_PREFIX_PATTERNS || prefix_bytes > MAX_PREFIX_PATTERN_BYTES {
+            dropped_prefix_rules = self.prefixes.len();
             error!(
                 patterns = self.prefixes.len(),
                 pattern_bytes = prefix_bytes,
@@ -383,8 +404,8 @@ impl RuleSetBuilder {
         }
 
         // 3. Aho-Corasick for substrings
-        let (ac, ac_pattern_to_rules) = if self.substrings.is_empty() {
-            (None, Vec::new())
+        let (ac, ac_pattern_to_rules, dropped_substring_rules) = if self.substrings.is_empty() {
+            (None, Vec::new(), 0)
         } else {
             let mut unique_subs: FnvHashMap<String, Vec<u32>> = FnvHashMap::default();
             for (sub, rule_id) in self.substrings {
@@ -393,6 +414,7 @@ impl RuleSetBuilder {
             let mut entries: Vec<(String, Vec<u32>)> = unique_subs.into_iter().collect();
             entries.sort_by_key(|(_, rules)| rules.iter().copied().min().unwrap_or(u32::MAX));
             let ac_bytes: usize = entries.iter().map(|(sub, _)| sub.len()).sum();
+            let ac_rule_count: usize = entries.iter().map(|(_, rules)| rules.len()).sum();
             if entries.len() > MAX_AC_PATTERNS || ac_bytes > MAX_AC_PATTERN_BYTES {
                 // Bound automaton construction before it allocates: a list
                 // with hundreds of thousands of substrings can otherwise
@@ -404,7 +426,7 @@ impl RuleSetBuilder {
                     max_pattern_bytes = MAX_AC_PATTERN_BYTES,
                     "Substring rule set exceeds compilation limits; skipping Aho-Corasick for this set"
                 );
-                (None, Vec::new())
+                (None, Vec::new(), ac_rule_count)
             } else {
                 let mut pat_strings = Vec::with_capacity(entries.len());
                 let mut pat_to_rules = Vec::with_capacity(entries.len());
@@ -417,10 +439,10 @@ impl RuleSetBuilder {
                     .match_kind(MatchKind::Standard)
                     .build(&pat_strings)
                 {
-                    Ok(automaton) => (Some(automaton), pat_to_rules),
+                    Ok(automaton) => (Some(automaton), pat_to_rules, 0),
                     Err(e) => {
                         warn!(error = %e, "Failed to build Aho-Corasick automaton for substrings; skipping AC");
-                        (None, Vec::new())
+                        (None, Vec::new(), ac_rule_count)
                     }
                 }
             }
@@ -521,6 +543,8 @@ impl RuleSetBuilder {
             ac_pattern_to_rules,
             regex_batches,
             dropped_regex_patterns,
+            dropped_prefix_rules,
+            dropped_substring_rules,
             prefix_trie,
         })
     }
@@ -636,6 +660,12 @@ mod tests {
             !compiled.has_regex(),
             "an over-limit regex set must be refused instead of compiled"
         );
+        assert_eq!(
+            compiled.dropped_regex_patterns,
+            MAX_REGEX_PATTERNS + 1,
+            "the dropped regex class must be counted, not silently ignored"
+        );
+        assert!(compiled.has_dropped_classes());
 
         // Other structural classes stay active.
         let mut candidates = Vec::new();
@@ -668,6 +698,20 @@ mod tests {
         assert!(
             compiled.prefix_trie.is_empty(),
             "an over-limit prefix set must not build a trie"
+        );
+        assert_eq!(
+            compiled.dropped_substring_rules,
+            MAX_AC_PATTERNS + 1,
+            "dropped substring rules must be counted"
+        );
+        assert_eq!(
+            compiled.dropped_prefix_rules,
+            MAX_PREFIX_PATTERNS + 1,
+            "dropped prefix rules must be counted"
+        );
+        assert!(
+            compiled.has_dropped_classes(),
+            "a caller must be able to detect dropped classes"
         );
 
         let mut candidates = Vec::new();

@@ -118,6 +118,23 @@ guidance and residual risks.
   fallback (new keys rely on per-IP limiting when every slot is an active lock
   and `auth.login_rate_limit > 0`) is documented as a residual.
 
+### Deferred D4a — stats/filter/transport cleanup
+- The REST query-log `429` now includes `Retry-After: 1`, matching the stats
+  endpoints.
+- `RuleSetBuilder` exposes `dropped_prefix_rules` and
+  `dropped_substring_rules` plus `has_dropped_classes()`, so a partially
+  compiled set cannot be mistaken for a complete one. A rejected warm
+  zero-source apply preserves the retained snapshot's loaded/failed/degraded
+  fields, dropped-class counters, and compile time.
+- The query-log writer uses a 30 s SQLite busy timeout and five flush attempts
+  with bounded exponential backoff (50 ms–1 s), keeping the no-drop guarantee
+  under a slow retention chunk.
+- `StatsDb::cleanup_detailed_retention()` is the explicit detailed-only sweep;
+  the deprecated `cleanup_retention()` wrapper now applies the default rollup
+  retention instead of pruning detailed rows only.
+- Added the previously untested DoH3 “headers already sent, reset stream”
+  deadline branch and regression coverage for each item.
+
 ### Upgrade notes
 - ACME users who relied on the bootstrap certificate must set
   `acme.allow_bootstrap_cert = true`; otherwise encrypted listeners wait for the

@@ -443,7 +443,7 @@ mod tests {
             entries.push(entry);
         }
         ctx.stats_db.insert_batch(&entries).await.unwrap();
-        let report = ctx.stats_db.cleanup_retention(90).await.unwrap();
+        let report = ctx.stats_db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(report.deleted_records, 3);
 
         let Json(stats) = get_stats(
