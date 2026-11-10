@@ -50,6 +50,15 @@ image job and v1.9.4 has no published container image. With the E2E fix and the
 draft gate, the 1.9.5 release publishes the multi-arch image (and its scan,
 signature, and attestations) as intended.
 
+### Distroless runtime refresh
+
+The first 1.9.5 image build was scanned successfully but failed the release gate
+on two HIGH `zlib1g` CVEs in the previous distroless Debian 13 base. The runtime
+base is updated to the newer digest
+`sha256:cc66d222f0a7ec996b78a99fe76a969bc80b539a5016ad866c14d1949bc6d0ab`
+(Debian 13.7), which scans clean for HIGH/CRITICAL vulnerabilities. The image
+remains digest-pinned; no mutable tag was introduced.
+
 ## Upgrade notes
 
 - No action is required. Configuration, databases, sessions, HA state, and API

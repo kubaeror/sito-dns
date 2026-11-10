@@ -27,6 +27,11 @@ the [1.9.5 release notes](docs/release-notes-1.9.5.md).
   `artifact-e2e`, so the v1.9.4 E2E failure skipped the image job. With the E2E
   fix, 1.9.5 publishes the multi-arch image with its scan, signature, and
   attestations.
+- **The distroless runtime base is refreshed.** The first 1.9.5 image scan
+  found two HIGH `zlib1g` CVEs in the previous Debian 13 base. The image now
+  uses the newer digest-pinned Debian 13.7 distroless base
+  (`sha256:cc66d222f0a7ec996b78a99fe76a969bc80b539a5016ad866c14d1949bc6d0ab`),
+  which scans clean for HIGH/CRITICAL vulnerabilities.
 
 ### Changed
 - **The GitHub release is staged as a draft.** `sbom-and-release` uploads the
