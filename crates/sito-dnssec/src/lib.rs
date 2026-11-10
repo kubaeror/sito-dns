@@ -3129,6 +3129,10 @@ impl DnssecValidator {
     /// chain walk must use [`Self::validate_with_key_fetcher`]; callers that
     /// intentionally serve unvalidated data use [`DnssecMode::LogOnly`], which
     /// keeps `Indeterminate` with AD=0.
+    ///
+    /// `validate_response_inner` returns `Indeterminate` provisionally so the
+    /// chain-walking caller can still fetch keys. This entry point is the
+    /// finalizer, so it records the outcome actually served exactly once.
     pub fn validate_response(
         &self,
         response: &mut Message,
@@ -3141,7 +3145,7 @@ impl DnssecValidator {
         // Without a fetcher there is no post-fetch pass to rescue an
         // Indeterminate result. Serving it as AD=0 in strict mode would be a
         // fail-open for a caller that only ever invokes this sync API.
-        if outcome == ValidationOutcome::Indeterminate && self.mode == DnssecMode::Validate {
+        if outcome == ValidationOutcome::Indeterminate {
             return self.indeterminate_outcome(response, upstream);
         }
         outcome
@@ -3192,9 +3196,10 @@ impl DnssecValidator {
 
         let Some(query) = response.queries.first() else {
             response.metadata.authentic_data = false;
-            let outcome = ValidationOutcome::Indeterminate;
-            self.metrics.record_validation(&outcome);
-            return outcome;
+            // `Indeterminate` is provisional: the entry point that finalizes
+            // the outcome records it (or the Bogus/Insecure conversion) exactly
+            // once. Recording here would double-count the same validation.
+            return ValidationOutcome::Indeterminate;
         };
         let qname = query.name().clone();
         let qtype = query.query_type();
@@ -3781,10 +3786,10 @@ impl DnssecValidator {
         }
 
         // RRSIGs were present and valid, but could not link to a trust anchor.
+        // Leave the result provisional: the caller may still fetch the chain,
+        // and whichever entry point finalizes it records the outcome once.
         response.metadata.authentic_data = false;
-        let outcome = ValidationOutcome::Indeterminate;
-        self.metrics.record_validation(&outcome);
-        outcome
+        ValidationOutcome::Indeterminate
     }
 
     /// Marks a response secure and records the outcome.
@@ -6402,12 +6407,18 @@ mod tests {
         );
         assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
         assert!(!response.metadata.authentic_data);
-        // The pre-fetch pass may record its inconclusive result, but the
-        // outcome actually served to the caller must also be counted.
+        // Deferred D5: the provisional `Indeterminate` returned by the inner
+        // pass must not be counted in addition to the Bogus outcome actually
+        // served. One sync call is one validation outcome.
         assert_eq!(
             strict.metrics.bogus_total.load(Ordering::Relaxed),
             1,
             "the strict sync conversion must record the Bogus outcome it serves"
+        );
+        assert_eq!(
+            strict.metrics.indeterminate_total.load(Ordering::Relaxed),
+            0,
+            "the provisional inner Indeterminate must not be double-recorded"
         );
 
         let log_only = DnssecValidator::new(DnssecMode::LogOnly, Vec::new());
@@ -6416,6 +6427,16 @@ mod tests {
         assert_eq!(outcome, ValidationOutcome::Indeterminate);
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
         assert!(!response.metadata.authentic_data);
+        assert_eq!(
+            log_only.metrics.indeterminate_total.load(Ordering::Relaxed),
+            1,
+            "log-only must record its final Indeterminate exactly once"
+        );
+        assert_eq!(
+            log_only.metrics.bogus_total.load(Ordering::Relaxed),
+            0,
+            "log-only must not record a Bogus outcome"
+        );
     }
 
     /// Critical regression: a forged answer with a present-but-unverifiable

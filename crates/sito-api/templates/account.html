@@ -227,7 +227,7 @@
     </div>
   </form>
 </div>
-{% else %}
+{% else if totp_setup.is_none() %}
 <div class="card" style="margin-top: 20px; max-width: 720px;">
   <div class="card-header">
     <div class="card-title">Enable TOTP 2FA</div>

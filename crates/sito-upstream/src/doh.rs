@@ -423,7 +423,7 @@ mod tests {
     impl EnvGuard {
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let previous = std::env::var_os(key);
-            // SAFETY: the owning test holds PROXY_ENV_LOCK, and no other test in
+            // SAFETY: the owning test holds DOH_TEST_LOCK, and no other test in
             // this binary builds an HTTPS reqwest client concurrently.
             unsafe { std::env::set_var(key, value) };
             Self { key, previous }

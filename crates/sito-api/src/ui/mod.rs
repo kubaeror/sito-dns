@@ -89,8 +89,8 @@ mod tests {
         AccountTemplate, ClientDiscoveryViewItem, ClientViewItem, ClientsTemplate,
         DashboardStatsPartialTemplate, DashboardTemplate, FilteringTemplate, LoginTemplate,
         QueryLogRowItem, QueryLogRowsPartialTemplate, QueryLogTemplate, RewriteViewItem,
-        RewritesTemplate, SettingsTemplate, SystemTemplate, TokenViewItem, UpstreamViewItem,
-        UpstreamsTemplate, UserViewItem, UsersTemplate, WizardTemplate,
+        RewritesTemplate, SettingsTemplate, SystemTemplate, TokenViewItem, TotpSetupView,
+        UpstreamViewItem, UpstreamsTemplate, UserViewItem, UsersTemplate, WizardTemplate,
     };
     use sito_stats::GlobalStats;
 
@@ -449,5 +449,47 @@ mod tests {
         assert!(account_html.contains("ci-deploy"));
         assert!(account_html.contains("Disable TOTP"));
         assert!(account_html.contains("/ui/account/tokens/tok_abc/delete"));
+    }
+
+    /// Deferred D5: a pending TOTP enrollment must replace the starter form,
+    /// not render beside it. Submitting the starter form again would issue a
+    /// new secret and invalidate the one already displayed in the confirm card.
+    #[test]
+    fn test_account_template_suppresses_starter_form_during_pending_enrollment() {
+        let account_tmpl = AccountTemplate {
+            csrf_token: "csrf-token",
+            is_authenticated: true,
+            username: "alice",
+            user_role: "viewer",
+            active_tab: "account",
+            version: "1.2.1",
+            tokens: Vec::new(),
+            totp_enabled: false,
+            totp_setup: Some(TotpSetupView {
+                secret: "JBSWY3DPEHPK3PXP".to_string(),
+                otpauth_url: "otpauth://totp/sito:alice?secret=JBSWY3DPEHPK3PXP".to_string(),
+                qr_code: String::new(),
+                backup_codes: vec!["AAAA-BBBB".to_string()],
+                reauth_token: "reauth-ticket".to_string(),
+            }),
+            can_create_operator_token: false,
+            can_create_admin_token: false,
+            error_message: "",
+            notice_message: "",
+            new_token: None,
+            new_token_name: "",
+            new_token_scope: "",
+        };
+
+        let html = account_tmpl.render().expect("render account template");
+        assert!(html.contains("Confirm TOTP Enrollment"));
+        assert!(
+            !html.contains("Begin TOTP Setup"),
+            "the starter form must be hidden while enrollment is pending"
+        );
+        assert!(
+            !html.contains("action=\"/ui/account/totp/setup\""),
+            "the starter setup form must be suppressed while enrollment is pending"
+        );
     }
 }

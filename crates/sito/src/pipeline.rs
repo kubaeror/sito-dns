@@ -4142,11 +4142,12 @@ mod tests {
         edns.set_dnssec_ok(true);
         query.set_edns(edns);
 
-        let mut response = Message::response(22, OpCode::Query);
+        let mut response = Message::response(99, OpCode::Notify);
         response.queries.push(hickory_proto::op::Query::query(
             stored_name.clone(),
             RecordType::A,
         ));
+        response.metadata.authoritative = true;
         response.metadata.recursion_desired = false;
         response.metadata.checking_disabled = false;
         response.answers.push(Record::from_rdata(
@@ -4159,6 +4160,19 @@ mod tests {
         ));
 
         shape_response(&query, &mut response, true);
+        assert_eq!(
+            response.metadata.id, 22,
+            "the response ID must come from the current query"
+        );
+        assert_eq!(
+            response.metadata.op_code,
+            OpCode::Query,
+            "the response opcode must come from the current query"
+        );
+        assert!(
+            !response.metadata.authoritative,
+            "the recursive resolver must never set AA on a shaped response"
+        );
         assert!(response.metadata.recursion_desired);
         assert!(response.metadata.checking_disabled);
         assert_eq!(response.queries.len(), 1);
@@ -4199,6 +4213,7 @@ mod tests {
 
         let mut cached = Message::response(1, OpCode::Query);
         cached.queries = stored_query.queries.clone();
+        cached.metadata.authoritative = true;
         cached.metadata.recursion_desired = false;
         cached.answers.push(Record::from_rdata(
             stored_name.clone(),
@@ -4226,6 +4241,15 @@ mod tests {
             .await
             .expect("cache hit response");
 
+        assert_eq!(
+            resp.metadata.id, 2,
+            "the response ID must come from the current query, not the cache entry"
+        );
+        assert_eq!(resp.metadata.op_code, OpCode::Query);
+        assert!(
+            !resp.metadata.authoritative,
+            "a cache hit must not replay the stored AA bit"
+        );
         assert!(
             resp.metadata.recursion_desired,
             "RD must come from the query"

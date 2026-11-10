@@ -98,3 +98,11 @@ named by the command.
 | Full-buffer QR and ID checks are independent | `test_plain_udp_ignores_full_buffer_junk_with_matching_id_and_no_qr`, `test_plain_udp_ignores_full_buffer_junk_with_qr_and_wrong_id` | `cargo test -p sito-upstream full_buffer_junk` |
 | Direct probe rejects FORMERR/BADVERS | `test_probe_rejects_edns_failure_replies` | `cargo test -p sito-api test_probe_rejects_edns_failure_replies` |
 | HA `retry_at` reflects the actual retry schedule | `test_ha_publish_report_retry_at_matches_actual_schedule` | `cargo test -p sito-api test_ha_publish_report_retry_at_matches_actual_schedule` |
+
+## Deferred D5 — final test/UI/metric nits
+
+| Finding | Named test / check | Focused command |
+|---|---|---|
+| Pending TOTP enrollment hides the starter form | `test_account_template_suppresses_starter_form_during_pending_enrollment`, `test_self_service_totp_enrollment_for_all_roles` | `cargo test -p sito-api --all-features test_account_template_suppresses_starter_form_during_pending_enrollment`; `cargo test -p sito-api --all-features test_self_service_totp_enrollment_for_all_roles` |
+| Response shaping normalizes ID/opcode/AA | `test_response_shaping_copies_question_flags_and_do`, `test_cache_hit_copies_current_question_and_flags` | `cargo test -p sito --lib test_response_shaping_`; `cargo test -p sito --lib test_cache_hit_copies_current_question_and_flags` |
+| DNSSEC sync outcome recorded exactly once | `test_sync_validate_response_fails_closed_without_key_fetcher` | `cargo test -p sito-dnssec test_sync_validate_response_fails_closed_without_key_fetcher` |

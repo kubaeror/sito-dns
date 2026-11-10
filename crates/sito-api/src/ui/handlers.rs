@@ -5830,6 +5830,17 @@ mod tests {
                 body.contains("Confirm TOTP Enrollment"),
                 "{username} must see the enrollment form: {body}"
             );
+            // Deferred D5: the pending enrollment replaces the starter form.
+            // Rendering both lets the user POST /ui/account/totp/setup again,
+            // which invalidates the secret already displayed above.
+            assert!(
+                !body.contains("Begin TOTP Setup"),
+                "{username} must not see the starter form during pending enrollment: {body}"
+            );
+            assert!(
+                !body.contains("action=\"/ui/account/totp/setup\""),
+                "the starter setup form must be suppressed while enrollment is pending"
+            );
             let reauth_token = extract_attr(&body, "name=\"reauth_token\" value=\"");
             let backup_code = extract_first_backup_code(&body);
 
