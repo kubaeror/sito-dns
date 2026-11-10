@@ -288,10 +288,11 @@ P1-19, P1-23, and P1-24 are closed in this branch:
   and the writer makes five attempts (four retries) with bounded exponential
   backoff (50 ms, 100 ms, 200 ms, 400 ms; capped at 1 s) before counting a batch
   dropped, so a slow retention chunk does not silently discard it. The final
-  shutdown flush is bounded to 3 s and counts an uncommitted batch as dropped;
-  the systemd unit sets `TimeoutStopSec=180`, and the Compose files set
-  `stop_grace_period: 30s`. A plain `docker stop` should use a grace period of
-  at least 30 s.
+  shutdown flush is bounded to 3 s and counts an uncommitted batch as dropped.
+  If shutdown aborts an already-running normal flush, every accepted but
+  uncommitted entry is added to `dropped_total` as well. The systemd unit sets
+  `TimeoutStopSec=180`, and the Compose files set `stop_grace_period: 30s`. A
+  plain `docker stop` should use a grace period of at least 30 s.
 - **Retention API naming.** `StatsDb::cleanup_detailed_retention()` is the
   explicit detailed-only sweep. The deprecated `cleanup_retention()` wrapper
   now delegates to the full policy with the default `rollup_retention_days`

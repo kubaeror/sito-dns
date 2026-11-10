@@ -42,6 +42,15 @@ fn flush_retry_delay(attempt: u32) -> Duration {
         .min(FLUSH_RETRY_MAX_DELAY)
 }
 
+/// Removes `count` settled entries from the pending counter without
+/// underflowing if an outer shutdown timeout has already reconciled it.
+fn settle_pending(pending_entries: &AtomicU64, count: usize) {
+    let count = count as u64;
+    let _ = pending_entries.try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+        Some(pending.saturating_sub(count))
+    });
+}
+
 /// Persists `batch`, retrying transient SQLite failures a bounded number of
 /// times. On persistent failure the entries are dropped and counted in
 /// `dropped_total` so data loss is observable instead of silent.
@@ -49,6 +58,7 @@ async fn flush_batch(
     db: &StatsDb,
     batch: &mut Vec<QueryLogEntry>,
     dropped_total: &AtomicU64,
+    pending_entries: &AtomicU64,
     reason: &'static str,
     deadline: Option<tokio::time::Instant>,
 ) {
@@ -68,6 +78,7 @@ async fn flush_batch(
                         dropped = batch.len(),
                         "Failed to flush query log batch ({reason}) before the shutdown deadline; dropping entries"
                     );
+                    settle_pending(pending_entries, batch.len());
                     dropped_total.fetch_add(batch.len() as u64, Ordering::Relaxed);
                     batch.clear();
                     return;
@@ -77,6 +88,7 @@ async fn flush_batch(
         };
         match result {
             Ok(()) => {
+                settle_pending(pending_entries, batch.len());
                 batch.clear();
                 return;
             }
@@ -96,6 +108,7 @@ async fn flush_batch(
                     dropped = batch.len(),
                     "Failed to flush query log batch ({reason}) after {attempt} attempts; dropping entries"
                 );
+                settle_pending(pending_entries, batch.len());
                 dropped_total.fetch_add(batch.len() as u64, Ordering::Relaxed);
                 batch.clear();
                 return;
@@ -117,6 +130,10 @@ pub struct QueryLogSender {
     /// Entries dropped by the pipeline: channel backpressure plus batches whose
     /// SQLite flush failed after bounded retries.
     dropped_total: Arc<AtomicU64>,
+    /// Entries accepted by `try_send` but not yet committed or counted as
+    /// dropped. `QueryLogWriter::shutdown` uses this to account for a batch
+    /// abandoned by the outer shutdown deadline.
+    pending_entries: Arc<AtomicU64>,
     live_tail_tx: broadcast::Sender<QueryLogEntry>,
     anonymize: Arc<AtomicBool>,
 }
@@ -137,6 +154,9 @@ impl QueryLogSender {
         // Broadcast immediately to live-tail listeners regardless of storage queue
         let _ = self.live_tail_tx.send(entry.clone());
 
+        // Increment before enqueueing so the writer can never observe an entry
+        // it has already persisted but whose pending count was not raised yet.
+        self.pending_entries.fetch_add(1, Ordering::Relaxed);
         if self
             .tx
             .try_send(WriterCommand::Entry(Box::new(entry)))
@@ -144,6 +164,7 @@ impl QueryLogSender {
         {
             true
         } else {
+            self.pending_entries.fetch_sub(1, Ordering::Relaxed);
             self.dropped_total.fetch_add(1, Ordering::Relaxed);
             false
         }
@@ -199,15 +220,18 @@ impl QueryLogWriter {
     pub fn spawn_with_anonymize(db: StatsDb, capacity: usize, anonymize: bool) -> Self {
         let (tx, mut rx) = mpsc::channel(capacity);
         let dropped_total = Arc::new(AtomicU64::new(0));
+        let pending_entries = Arc::new(AtomicU64::new(0));
         let (live_tail_tx, _) = broadcast::channel(1000);
         let anonymize_arc = Arc::new(AtomicBool::new(anonymize));
 
         let sender = QueryLogSender {
             tx,
             dropped_total: Arc::clone(&dropped_total),
+            pending_entries: Arc::clone(&pending_entries),
             live_tail_tx: live_tail_tx.clone(),
             anonymize: anonymize_arc,
         };
+        let writer_pending_entries = Arc::clone(&pending_entries);
 
         let join_handle = tokio::spawn(async move {
             let mut batch: Vec<QueryLogEntry> = Vec::with_capacity(BATCH_SIZE_THRESHOLD);
@@ -225,6 +249,7 @@ impl QueryLogWriter {
                                         &db,
                                         &mut batch,
                                         &dropped_total,
+                                        &writer_pending_entries,
                                         "size threshold",
                                         None,
                                     )
@@ -236,6 +261,7 @@ impl QueryLogWriter {
                                     &db,
                                     &mut batch,
                                     &dropped_total,
+                                    &writer_pending_entries,
                                     "explicit flush",
                                     None,
                                 )
@@ -249,6 +275,7 @@ impl QueryLogWriter {
                                     &db,
                                     &mut batch,
                                     &dropped_total,
+                                    &writer_pending_entries,
                                     "shutdown",
                                     Some(deadline),
                                 )
@@ -263,6 +290,7 @@ impl QueryLogWriter {
                                     &db,
                                     &mut batch,
                                     &dropped_total,
+                                    &writer_pending_entries,
                                     "channel close",
                                     Some(deadline),
                                 )
@@ -276,6 +304,7 @@ impl QueryLogWriter {
                             &db,
                             &mut batch,
                             &dropped_total,
+                            &writer_pending_entries,
                             "timer tick",
                             None,
                         )
@@ -308,12 +337,21 @@ impl QueryLogWriter {
     ///
     /// The wait is bounded so a service manager stop deadline cannot kill the
     /// process while this future is still waiting on a wedged disk. The
-    /// shutdown flush itself also has a shorter deadline and counts anything
-    /// it cannot commit as dropped.
+    /// shutdown flush itself also has a shorter deadline. If the outer bound
+    /// expires while a normal flush is still in progress, the writer task is
+    /// aborted and every entry it has accepted but not committed is added to
+    /// `dropped_total`, so shutdown never loses a batch silently.
     pub async fn shutdown(self) {
+        let QueryLogWriter {
+            sender,
+            mut join_handle,
+        } = self;
+        let dropped_total = Arc::clone(&sender.dropped_total);
+        let pending_entries = Arc::clone(&sender.pending_entries);
         let deadline =
             tokio::time::Instant::now() + SHUTDOWN_FLUSH_TIMEOUT + Duration::from_secs(1);
-        if tokio::time::timeout_at(deadline, self.sender.shutdown())
+
+        if tokio::time::timeout_at(deadline, sender.shutdown())
             .await
             .is_err()
         {
@@ -321,8 +359,11 @@ impl QueryLogWriter {
                 "Query log writer shutdown command exceeded the {}s deadline",
                 SHUTDOWN_FLUSH_TIMEOUT.as_secs() + 1
             );
+            // Stop the task so the pending counter is stable before accounting
+            // for an in-flight normal flush.
+            join_handle.abort();
         }
-        if tokio::time::timeout_at(deadline, self.join_handle)
+        if tokio::time::timeout_at(deadline, &mut join_handle)
             .await
             .is_err()
         {
@@ -330,10 +371,26 @@ impl QueryLogWriter {
                 "Query log writer did not exit before the {}s shutdown deadline",
                 SHUTDOWN_FLUSH_TIMEOUT.as_secs() + 1
             );
+            join_handle.abort();
+            // Do not let task cancellation itself exceed the stop budget.
+            let _ = tokio::time::timeout(Duration::from_secs(1), &mut join_handle).await;
+        }
+
+        let abandoned = pending_entries.swap(0, Ordering::SeqCst);
+        if abandoned > 0 {
+            dropped_total.fetch_add(abandoned, Ordering::Relaxed);
+            warn!(
+                dropped = abandoned,
+                "Query log writer shutdown abandoned uncommitted entries"
+            );
         }
     }
 
-    /// Waits for the writer task to exit.
+    /// Waits for the writer task to exit **without a deadline**.
+    ///
+    /// This is intended for tests and callers that already bound shutdown
+    /// themselves. Production shutdown uses [`Self::shutdown`], which bounds
+    /// the wait and accounts for abandoned entries.
     pub async fn wait(self) {
         let _ = self.join_handle.await;
     }
@@ -453,9 +510,10 @@ mod tests {
             "udp",
         )];
         let dropped = std::sync::atomic::AtomicU64::new(0);
+        let pending = std::sync::atomic::AtomicU64::new(1);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         let started = std::time::Instant::now();
-        flush_batch(&db, &mut batch, &dropped, "test", Some(deadline)).await;
+        flush_batch(&db, &mut batch, &dropped, &pending, "test", Some(deadline)).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -463,12 +521,80 @@ mod tests {
             "the shutdown flush must not wait for the full busy timeout (elapsed {elapsed:?})"
         );
         assert_eq!(batch.len(), 0);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
         assert_eq!(
             dropped.load(Ordering::Relaxed),
             1,
             "an uncommitted shutdown batch must be counted as dropped"
         );
 
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Deferred D4a re-review: if the writer is already inside a normal
+    /// (undeadlined) flush when shutdown is requested, the outer shutdown
+    /// deadline must abort the writer and count the in-flight batch as dropped
+    /// instead of leaving it uncounted.
+    #[tokio::test]
+    async fn test_shutdown_counts_in_flight_normal_flush() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_shutdown_in_flight_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let db = StatsDb::open(&db_path).await.unwrap();
+
+        let lock_options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(30));
+        let mut lock_conn = sqlx::SqliteConnection::connect_with(&lock_options)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut lock_conn)
+            .await
+            .unwrap();
+
+        let writer = QueryLogWriter::spawn(db.clone(), 2_000);
+        let sender = writer.sender();
+        for i in 0..BATCH_SIZE_THRESHOLD {
+            assert!(sender.try_send(QueryLogEntry::new(
+                chrono::Utc::now().timestamp_millis(),
+                "192.0.2.13",
+                None,
+                format!("in-flight-{i}.example"),
+                1,
+                Some(0),
+                "allowed",
+                "udp",
+            )));
+        }
+
+        // Let the writer drain the channel and enter the size-threshold flush,
+        // which blocks on the external write lock. Shutdown then queues behind
+        // that normal (undeadlined) flush.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let started = std::time::Instant::now();
+        writer.shutdown().await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_secs(3),
+            "shutdown must wait for the bounded stop budget (elapsed {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "shutdown must return at the outer bound (elapsed {elapsed:?})"
+        );
+        assert_eq!(
+            sender.dropped_total(),
+            BATCH_SIZE_THRESHOLD as u64,
+            "an in-flight normal flush abandoned by shutdown must be counted as dropped"
+        );
+
+        drop(lock_conn);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 

@@ -130,8 +130,10 @@ guidance and residual risks.
 - The query-log writer uses a 30 s on-disk SQLite busy timeout and five flush
   attempts (four retries) with bounded exponential backoff (50, 100, 200, and
   400 ms; capped at 1 s), keeping the no-drop guarantee under a slow retention
-  chunk. The final shutdown flush is bounded to 3 s; systemd sets
-  `TimeoutStopSec=180` and Compose sets `stop_grace_period: 30s`.
+  chunk. The final shutdown flush is bounded to 3 s, and an already-running
+  normal flush abandoned by the outer shutdown bound is counted in
+  `dropped_total`; systemd sets `TimeoutStopSec=180` and Compose sets
+  `stop_grace_period: 30s`.
 - `StatsDb::cleanup_detailed_retention()` is the explicit detailed-only sweep;
   the deprecated `cleanup_retention()` wrapper now applies the default rollup
   retention instead of pruning detailed rows only.
