@@ -9,7 +9,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr as _;
 use std::time::Duration;
 
+use sito_proto::Message;
 use sito_upstream::Upstream as _;
+use sito_upstream::upstream::{is_edns_failure_code, validate_response};
 
 /// Maximum number of upstream servers probed in a single REST request.
 pub const MAX_PROBE_SERVERS: usize = 16;
@@ -71,6 +73,23 @@ fn split_probe_host_port(addr_str: &str, scheme: &str, default_port: u16) -> (St
     (authority.to_string(), default_port)
 }
 
+/// Validates a direct probe reply.
+///
+/// The upstream manager accepts a matching-ID FORMERR/BADVERS reply without a
+/// question so it can retry once without EDNS. A one-shot probe has no retry
+/// path, so a server that can only return an EDNS failure must be reported as
+/// down instead of "up" just because it answered at the network layer.
+fn validate_probe_reply(query: &Message, response: &Message) -> Result<(), String> {
+    validate_response(query, response).map_err(|e| format!("Invalid probe reply: {e}"))?;
+    if is_edns_failure_code(response.metadata.response_code) {
+        return Err(format!(
+            "Upstream could not process the probe query ({})",
+            response.metadata.response_code
+        ));
+    }
+    Ok(())
+}
+
 /// Probes a single upstream target (UDP, DoT, DoH or DoQ) and returns the
 /// measured RTT in milliseconds.
 pub async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result<f64, String> {
@@ -100,9 +119,11 @@ pub async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result
         query
             .queries
             .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
-        doh.resolve(&query)
+        let response = doh
+            .resolve(&query)
             .await
             .map_err(|e| format!("DoH query failed: {e}"))?;
+        validate_probe_reply(&query, &response)?;
         return Ok(start.elapsed().as_secs_f64() * 1000.0);
     }
 
@@ -116,9 +137,11 @@ pub async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result
         query
             .queries
             .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
-        doq.resolve(&query)
+        let response = doq
+            .resolve(&query)
             .await
             .map_err(|e| format!("DoQ query failed: {e}"))?;
+        validate_probe_reply(&query, &response)?;
         return Ok(start.elapsed().as_secs_f64() * 1000.0);
     }
 
@@ -159,10 +182,13 @@ pub async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result
         .map_err(|e| format!("UDP send failed: {e}"))?;
 
     let mut buf = [0u8; 512];
-    tokio::time::timeout(PROBE_TIMEOUT, socket.recv_from(&mut buf))
+    let (bytes_read, _peer) = tokio::time::timeout(PROBE_TIMEOUT, socket.recv_from(&mut buf))
         .await
         .map_err(|_| "Probe query timed out".to_string())?
         .map_err(|e| format!("UDP recv failed: {e}"))?;
+    let response = sito_proto::decode_message(&buf[..bytes_read])
+        .map_err(|e| format!("UDP probe reply is not a DNS message: {e}"))?;
+    validate_probe_reply(&query_msg, &response)?;
 
     Ok(start.elapsed().as_secs_f64() * 1000.0)
 }
@@ -170,6 +196,45 @@ pub async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sito_proto::{MessageType, OpCode, Query, RecordType, ResponseCode};
+    use std::str::FromStr;
+
+    fn probe_query() -> Message {
+        let mut query = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            sito_proto::Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        query
+    }
+
+    /// Deferred D4b: a matching-ID FORMERR/BADVERS without a question is
+    /// accepted by the transport so the manager can retry without EDNS, but a
+    /// direct one-shot probe must report the target as unhealthy.
+    #[test]
+    fn test_probe_rejects_edns_failure_replies() {
+        let query = probe_query();
+        for code in [ResponseCode::FormErr, ResponseCode::BADVERS] {
+            let mut response = Message::response(0x1234, OpCode::Query);
+            response.metadata.response_code = code;
+            assert!(
+                validate_probe_reply(&query, &response).is_err(),
+                "a {code} probe reply must not count the server as up"
+            );
+        }
+
+        let mut response = Message::response(0x1234, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.metadata.response_code = ResponseCode::NoError;
+        assert!(validate_probe_reply(&query, &response).is_ok());
+
+        let mut wrong_id = Message::response(0x9999, OpCode::Query);
+        wrong_id.queries = query.queries.clone();
+        assert!(
+            validate_probe_reply(&query, &wrong_id).is_err(),
+            "a mismatched probe reply must be rejected"
+        );
+    }
 
     #[test]
     fn test_forbidden_probe_targets() {

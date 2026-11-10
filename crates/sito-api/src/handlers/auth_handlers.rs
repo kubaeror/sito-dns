@@ -46,12 +46,18 @@ fn current_session_id(ctx: &ServerContext, headers: &HeaderMap) -> Option<String
         .filter(|session_id| ctx.auth_mgr.validate_session(session_id).is_some())
 }
 
-/// Validates the `X-Reauth-Token` header for a sensitive TOTP operation.
+/// Validates the `X-Reauth-Token` header for a sensitive TOTP operation and
+/// returns the ticket together with the session it was validated against.
+///
+/// Callers must use the returned session id when consuming the ticket instead
+/// of looking the session up a second time: the session can expire between the
+/// validation and the operation, and a second lookup would then silently skip
+/// the single-use consume (leaving the ticket live until its TTL).
 fn require_reauth_token(
     ctx: &ServerContext,
     headers: &HeaderMap,
     username: &str,
-) -> Result<String, ProblemDetails> {
+) -> Result<(String, String), ProblemDetails> {
     let token = headers
         .get(REAUTH_TOKEN_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -73,7 +79,7 @@ fn require_reauth_token(
             "Re-authentication token is invalid, expired, or bound to another session",
         ));
     }
-    Ok(token.to_string())
+    Ok((token.to_string(), session_id))
 }
 
 /// True when the request asked for the partial token in the JSON body.
@@ -384,7 +390,7 @@ pub async fn get_totp_setup(
     headers: HeaderMap,
 ) -> Result<Json<TotpSetupResponse>, ProblemDetails> {
     let username = session_username(&viewer)?;
-    require_reauth_token(&ctx, &headers, username)?;
+    let _ = require_reauth_token(&ctx, &headers, username)?;
     let setup = ctx
         .auth_mgr
         .begin_totp_enrollment(username)
@@ -415,8 +421,7 @@ pub async fn enable_totp(
     Json(req): Json<TotpConfirmRequest>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
     let username = session_username(&viewer)?.to_string();
-    let reauth_token = require_reauth_token(&ctx, &headers, &username)?;
-    let session_id = current_session_id(&ctx, &headers);
+    let (reauth_token, session_id) = require_reauth_token(&ctx, &headers, &username)?;
     ctx.auth_mgr
         .try_confirm_totp_setup(&username, &req.code)
         .await
@@ -430,12 +435,12 @@ pub async fn enable_totp(
             )),
         })?;
     // Enabling/replacing TOTP revokes the session that authorized it, so the
-    // ticket is consumed explicitly as well.
-    if let Some(session_id) = session_id {
-        let _ = ctx
-            .auth_mgr
-            .consume_reauth_token(&reauth_token, &username, &session_id);
-    }
+    // ticket is consumed explicitly as well. The session id comes from the
+    // validation lookup above: re-reading the cookie here would skip the
+    // consume once the session has been purged.
+    let _ = ctx
+        .auth_mgr
+        .consume_reauth_token(&reauth_token, &username, &session_id);
     Ok(Json(GenericMessageResponse {
         message: "TOTP 2FA enabled successfully".to_string(),
     }))
@@ -468,8 +473,7 @@ pub async fn disable_totp(
     Json(_req): Json<DisableTotpRequest>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
     let username = session_username(&viewer)?.to_string();
-    let reauth_token = require_reauth_token(&ctx, &headers, &username)?;
-    let session_id = current_session_id(&ctx, &headers);
+    let (reauth_token, session_id) = require_reauth_token(&ctx, &headers, &username)?;
 
     ctx.auth_mgr
         .try_disable_totp(&username)
@@ -483,11 +487,11 @@ pub async fn disable_totp(
                 "Failed to persist the user store while disabling TOTP: {detail}"
             )),
         })?;
-    if let Some(session_id) = session_id {
-        let _ = ctx
-            .auth_mgr
-            .consume_reauth_token(&reauth_token, &username, &session_id);
-    }
+    // Disabling the second factor revokes the authorizing session; consume
+    // the ticket with the session id from the single validation lookup above.
+    let _ = ctx
+        .auth_mgr
+        .consume_reauth_token(&reauth_token, &username, &session_id);
     Ok(Json(GenericMessageResponse {
         message: "TOTP 2FA disabled successfully".to_string(),
     }))
@@ -1360,6 +1364,55 @@ mod tests {
         .expect("enable with re-auth succeeds");
         assert!(enabled.message.contains("enabled"));
         assert!(ctx.auth_mgr.totp_enabled("alice"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Deferred D4b: enabling TOTP purges the authorizing session. The
+    /// single-use ticket must still be consumed with the session id captured
+    /// during validation; a second cookie lookup after the purge would leave
+    /// the ticket live until its TTL.
+    #[tokio::test]
+    async fn test_enable_totp_consumes_ticket_after_session_purge() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_reauth_consume");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let (user, headers) = login_session(&ctx, "admin", "adminadmin").await;
+
+        let Json(ticket) = reauth(
+            State(ctx.clone()),
+            MaybeConnectInfo(None),
+            user.clone(),
+            headers.clone(),
+            Json(ReauthRequest {
+                password: "adminadmin".to_string(),
+                code: None,
+            }),
+        )
+        .await
+        .expect("re-auth succeeds");
+        let headers = with_reauth_token(headers, &ticket.reauth_token);
+        let Json(setup) = get_totp_setup(user.clone(), State(ctx.clone()), headers.clone())
+            .await
+            .expect("setup with re-auth succeeds");
+        assert_eq!(ctx.auth_mgr.reauth_tokens_len(), 1);
+
+        let _ = enable_totp(
+            user,
+            State(ctx.clone()),
+            headers,
+            Json(TotpConfirmRequest {
+                code: setup.backup_codes[0].clone(),
+            }),
+        )
+        .await
+        .expect("enable with re-auth succeeds");
+
+        assert!(ctx.auth_mgr.totp_enabled("admin"));
+        assert_eq!(
+            ctx.auth_mgr.reauth_tokens_len(),
+            0,
+            "the ticket must be consumed using the validated session id even after enabling TOTP purges that session"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

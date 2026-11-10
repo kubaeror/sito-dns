@@ -117,11 +117,21 @@ impl HaPublishReport {
         }
     }
 
+    /// Builds a failed report.
+    ///
+    /// `retry_delay` is the delay before the first attempt of the retry loop
+    /// that was actually started, or `None` when no new loop was scheduled
+    /// (HA inactive, or an existing loop already owns the backoff schedule).
+    /// Guessing a fixed one-second delay misleads operators when the next
+    /// attempt is much later.
     #[must_use]
-    pub fn failed(error: impl Into<String>) -> Self {
-        let retry_at = chrono::Utc::now()
-            .checked_add_signed(chrono::TimeDelta::try_seconds(1).unwrap_or_default())
-            .map(|at| at.to_rfc3339());
+    pub fn failed(error: impl Into<String>, retry_delay: Option<std::time::Duration>) -> Self {
+        let retry_at = retry_delay.and_then(|delay| {
+            let delta = chrono::TimeDelta::from_std(delay).ok()?;
+            chrono::Utc::now()
+                .checked_add_signed(delta)
+                .map(|at| at.to_rfc3339())
+        });
         Self {
             status: "failed".to_string(),
             error: Some(error.into()),
@@ -414,7 +424,8 @@ async fn apply_and_persist_document_locked(
         return Err(e);
     }
 
-    match ctx.publish_bundle().await {
+    let (publish_result, retry_delay) = ctx.publish_bundle_with_retry().await;
+    match publish_result {
         Ok(sito_ha::PublishOutcome::TooLarge { bytes, limit }) => {
             // An oversized bundle is the one HA failure that is an apply
             // error: the configuration cannot be replicated at all. Roll both
@@ -472,7 +483,7 @@ async fn apply_and_persist_document_locked(
             // must not roll it back. Surface the failure, leave HA readiness
             // false, and let the background retry recover.
             tracing::error!(error = %e, "HA publication failed after a successful local apply");
-            report.ha_publish = Some(HaPublishReport::failed(e.to_string()));
+            report.ha_publish = Some(HaPublishReport::failed(e.to_string(), retry_delay));
         }
     }
 
@@ -809,6 +820,36 @@ pub fn restart_required_fields(old: &Config, new: &Config) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Deferred D4b: `retry_at` must reflect the retry loop that was actually
+    /// scheduled, and must be absent when no new loop was started.
+    #[test]
+    fn test_ha_publish_report_retry_at_matches_actual_schedule() {
+        let before = chrono::Utc::now();
+        let report = HaPublishReport::failed("publish failed", Some(Duration::from_secs(2)));
+        assert_eq!(report.status, "failed");
+        let retry_at = chrono::DateTime::parse_from_rfc3339(
+            report
+                .retry_at
+                .as_deref()
+                .expect("a scheduled retry has a time"),
+        )
+        .expect("RFC3339 retry_at")
+        .with_timezone(&chrono::Utc);
+        let delay = retry_at.signed_duration_since(before);
+        assert!(
+            delay >= chrono::TimeDelta::try_seconds(1).unwrap()
+                && delay <= chrono::TimeDelta::try_seconds(3).unwrap(),
+            "retry_at must be the scheduled delay, not a fixed guess: {delay}"
+        );
+
+        let report = HaPublishReport::failed("publish failed", None);
+        assert!(
+            report.retry_at.is_none(),
+            "an already-running retry loop must not advertise a new retry time"
+        );
+    }
 
     #[test]
     fn test_upstream_target_validation_rejects_typos() {

@@ -546,7 +546,8 @@ pub async fn reload_config(
     let previous = (**ctx.config.load()).clone();
     let report = apply_full_config(&ctx, &parsed, FilterApply::Sync, hooks.as_dyn()).await?;
     let mut report = report;
-    match ctx.publish_bundle().await {
+    let (publish_result, retry_delay) = ctx.publish_bundle_with_retry().await;
+    match publish_result {
         Ok(sito_ha::PublishOutcome::TooLarge { bytes, limit }) => {
             // The document is already on disk; refuse to serve an
             // unreplicable configuration and roll the live apply back.
@@ -576,7 +577,10 @@ pub async fn reload_config(
         }
         Err(e) => {
             tracing::error!(error = %e, "HA publication failed after a config reload");
-            report.ha_publish = Some(crate::config_apply::HaPublishReport::failed(e.to_string()));
+            report.ha_publish = Some(crate::config_apply::HaPublishReport::failed(
+                e.to_string(),
+                retry_delay,
+            ));
         }
     }
 

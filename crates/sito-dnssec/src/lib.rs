@@ -3118,18 +3118,33 @@ impl DnssecValidator {
         result
     }
 
-    /// Validate a response against DNSSEC rules.
+    /// Validate a response against DNSSEC rules using only records already in
+    /// the message (no key fetcher).
+    ///
+    /// This is the pre-fetch/log-only entry point. It cannot walk or fetch a
+    /// missing DNSKEY/DS chain, so in [`DnssecMode::Validate`] an inconclusive
+    /// result is converted to the same fail-closed outcome
+    /// [`Self::validate_with_key_fetcher`] produces after its fetch: Bogus with
+    /// SERVFAIL and no answer. Direct library callers that want to try the
+    /// chain walk must use [`Self::validate_with_key_fetcher`]; callers that
+    /// intentionally serve unvalidated data use [`DnssecMode::LogOnly`], which
+    /// keeps `Indeterminate` with AD=0.
     pub fn validate_response(
         &self,
         response: &mut Message,
         upstream: Option<&str>,
         now: u32,
     ) -> ValidationOutcome {
-        // No fetcher is available here, so a present-but-unchecked relevant
-        // RRSIG stays Indeterminate: callers that can fetch the chain add
-        // their own strict post-fetch pass.
         let mut verify_budget = VerifyBudget::new();
-        self.validate_response_inner(response, upstream, now, None, true, &mut verify_budget)
+        let outcome =
+            self.validate_response_inner(response, upstream, now, None, true, &mut verify_budget);
+        // Without a fetcher there is no post-fetch pass to rescue an
+        // Indeterminate result. Serving it as AD=0 in strict mode would be a
+        // fail-open for a caller that only ever invokes this sync API.
+        if outcome == ValidationOutcome::Indeterminate && self.mode == DnssecMode::Validate {
+            return self.indeterminate_outcome(response, upstream);
+        }
+        outcome
     }
 
     /// Validate a response, treating additional-section records starting at
@@ -4484,7 +4499,13 @@ mod tests {
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
         let outcome = validator.validate_response(&mut msg, Some("test"), now);
 
-        assert_eq!(outcome, ValidationOutcome::Indeterminate);
+        // The sync API has no key fetcher, so strict mode fails closed instead
+        // of returning AD=0 for an unlinked denial signature.
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "an unlinked denial signature must not be served as AD=0 in strict mode: {outcome:?}"
+        );
+        assert_eq!(msg.metadata.response_code, ResponseCode::ServFail);
         assert!(!msg.metadata.authentic_data);
     }
 
@@ -4669,7 +4690,10 @@ mod tests {
                 RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
             ));
             let outcome = validator.validate_response(&mut msg, Some("cache-test"), now);
-            assert_eq!(outcome, ValidationOutcome::Indeterminate);
+            assert!(
+                matches!(outcome, ValidationOutcome::Bogus { .. }),
+                "an unlinked response must fail closed in strict mode: {outcome:?}"
+            );
         }
 
         assert!(
@@ -6340,38 +6364,49 @@ mod tests {
         assert_eq!(msg.answers.len(), 0);
     }
 
-    /// Regression: a response that carries a relevant RRSIG but no key yet
-    /// must be Indeterminate (so the chain fetch can run), not Bogus just
-    /// because a cache reload restored signed-zone evidence for the name.
+    /// Deferred D4b: the synchronous API has no key fetcher. A relevant RRSIG
+    /// without key material must therefore fail closed in strict mode instead
+    /// of being returned as AD=0; log-only keeps it Indeterminate for
+    /// diagnostics. Chain-walking callers use `validate_with_key_fetcher`.
     #[test]
-    fn test_relevant_rrsig_without_key_is_indeterminate_not_bogus() {
+    fn test_sync_validate_response_fails_closed_without_key_fetcher() {
         let (origin, dnskey, a_record, rrsig_record, _) =
             create_test_signed_domain("reload.example.");
 
-        let mut trust_anchors = TrustAnchors::empty();
-        trust_anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
-        let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new())
-            .with_trust_anchors(trust_anchors);
-
+        let build = || {
+            let mut response = Message::new(82, MessageType::Response, OpCode::Query);
+            response
+                .queries
+                .push(Query::query(origin.clone(), RecordType::A));
+            response.answers.push(a_record.clone());
+            response.answers.push(rrsig_record.clone());
+            response
+        };
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
 
+        let mut trust_anchors = TrustAnchors::empty();
+        trust_anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+        let strict = DnssecValidator::new(DnssecMode::Validate, Vec::new())
+            .with_trust_anchors(trust_anchors);
         // Simulate signed-zone evidence restored from the persistent chain
         // cache after a restart while the key cache is still empty.
-        validator
+        strict
             .signed_zones
             .insert(LowerName::from(&origin), now + 300);
 
-        let mut response = Message::new(82, MessageType::Response, OpCode::Query);
-        response.queries.push(Query::query(origin, RecordType::A));
-        response.answers.push(a_record);
-        response.answers.push(rrsig_record);
-
-        let outcome = validator.validate_response(&mut response, Some("reload"), now);
-        assert_eq!(
-            outcome,
-            ValidationOutcome::Indeterminate,
-            "a relevant RRSIG without key material must reach the chain fetcher: {outcome:?}"
+        let mut response = build();
+        let outcome = strict.validate_response(&mut response, Some("reload"), now);
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a relevant RRSIG without key material must fail closed in the sync API: {outcome:?}"
         );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+
+        let log_only = DnssecValidator::new(DnssecMode::LogOnly, Vec::new());
+        let mut response = build();
+        let outcome = log_only.validate_response(&mut response, Some("reload"), now);
+        assert_eq!(outcome, ValidationOutcome::Indeterminate);
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
         assert!(!response.metadata.authentic_data);
     }
@@ -8589,13 +8624,12 @@ mod tests {
 
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
         let outcome = validator.validate_response(&mut msg, Some("cname-unsigned"), now);
-        assert_eq!(
-            outcome,
-            ValidationOutcome::Indeterminate,
-            "without an authenticated DS denial the target is not proven unsigned"
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "without an authenticated DS denial the target is not proven unsigned and strict mode must fail closed: {outcome:?}"
         );
         assert!(!msg.metadata.authentic_data);
-        assert_eq!(msg.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(msg.metadata.response_code, ResponseCode::ServFail);
     }
 
     /// Hostile regression: absence of signed-zone evidence for a CNAME target

@@ -39,6 +39,34 @@ fn no_unreserved_port(protocol: &str) -> io::Error {
     )
 }
 
+/// Binds an ephemeral loopback TCP probe socket and reserves its port.
+///
+/// Shared by the standalone leases and [`PortReservations`] so the bind/probe
+/// retry policy cannot drift between them. The caller owns the returned
+/// listener and must drop it before the code under test binds the port.
+fn bind_reserved_tcp() -> io::Result<(TcpListener, u16)> {
+    for _ in 0..20 {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        if try_reserve_port(port) {
+            return Ok((listener, port));
+        }
+    }
+    Err(no_unreserved_port("TCP"))
+}
+
+/// Binds an ephemeral loopback UDP probe socket and reserves its port.
+fn bind_reserved_udp() -> io::Result<(UdpSocket, u16)> {
+    for _ in 0..20 {
+        let socket = UdpSocket::bind("127.0.0.1:0")?;
+        let port = socket.local_addr()?.port();
+        if try_reserve_port(port) {
+            return Ok((socket, port));
+        }
+    }
+    Err(no_unreserved_port("UDP"))
+}
+
 /// A loopback TCP port reserved for the lifetime of a test.
 ///
 /// The port is bound on `127.0.0.1:0` so the OS picks a free ephemeral port.
@@ -92,17 +120,11 @@ impl Drop for ReservedPort {
 /// until it is dropped. See [`ReservedPort`] for the listener lifecycle.
 #[must_use = "the lease must be held for the port to stay reserved"]
 pub fn reserve_port() -> io::Result<ReservedPort> {
-    for _ in 0..20 {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        if try_reserve_port(port) {
-            return Ok(ReservedPort {
-                port,
-                listener: Some(listener),
-            });
-        }
-    }
-    Err(no_unreserved_port("TCP"))
+    let (listener, port) = bind_reserved_tcp()?;
+    Ok(ReservedPort {
+        port,
+        listener: Some(listener),
+    })
 }
 
 /// Reserves an ephemeral loopback TCP port for the rest of the test process.
@@ -111,14 +133,9 @@ pub fn reserve_port() -> io::Result<ReservedPort> {
 /// the reservation until the process exits. Use it when the code under test
 /// binds the port itself and the test does not need to hold a probe socket.
 pub fn reserve_port_number() -> io::Result<u16> {
-    for _ in 0..20 {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        if try_reserve_port(port) {
-            return Ok(port);
-        }
-    }
-    Err(no_unreserved_port("TCP"))
+    let (listener, port) = bind_reserved_tcp()?;
+    drop(listener);
+    Ok(port)
 }
 
 /// A loopback UDP port reserved for the lifetime of a test.
@@ -174,17 +191,11 @@ impl Drop for ReservedUdpPort {
 /// until it is dropped. See [`ReservedUdpPort`] for the socket lifecycle.
 #[must_use = "the lease must be held for the port to stay reserved"]
 pub fn reserve_udp_port() -> io::Result<ReservedUdpPort> {
-    for _ in 0..20 {
-        let socket = UdpSocket::bind("127.0.0.1:0")?;
-        let port = socket.local_addr()?.port();
-        if try_reserve_port(port) {
-            return Ok(ReservedUdpPort {
-                port,
-                socket: Some(socket),
-            });
-        }
-    }
-    Err(no_unreserved_port("UDP"))
+    let (socket, port) = bind_reserved_udp()?;
+    Ok(ReservedUdpPort {
+        port,
+        socket: Some(socket),
+    })
 }
 
 /// Reserves an ephemeral loopback UDP port for the rest of the test process.
@@ -194,14 +205,9 @@ pub fn reserve_udp_port() -> io::Result<ReservedUdpPort> {
 /// test binds the port itself and the test does not need to hold a probe
 /// socket.
 pub fn reserve_udp_port_number() -> io::Result<u16> {
-    for _ in 0..20 {
-        let socket = UdpSocket::bind("127.0.0.1:0")?;
-        let port = socket.local_addr()?.port();
-        if try_reserve_port(port) {
-            return Ok(port);
-        }
-    }
-    Err(no_unreserved_port("UDP"))
+    let (socket, port) = bind_reserved_udp()?;
+    drop(socket);
+    Ok(port)
 }
 
 /// RAII broker that reserves ephemeral ports and releases them if startup
@@ -222,28 +228,16 @@ impl PortReservations {
 
     /// Reserves a loopback TCP port and returns its still-bound listener.
     pub fn reserve_tcp(&mut self) -> io::Result<(TcpListener, u16)> {
-        for _ in 0..20 {
-            let listener = TcpListener::bind("127.0.0.1:0")?;
-            let port = listener.local_addr()?.port();
-            if try_reserve_port(port) {
-                self.ports.push(port);
-                return Ok((listener, port));
-            }
-        }
-        Err(no_unreserved_port("TCP"))
+        let (listener, port) = bind_reserved_tcp()?;
+        self.ports.push(port);
+        Ok((listener, port))
     }
 
     /// Reserves a loopback UDP port and returns its still-bound socket.
     pub fn reserve_udp(&mut self) -> io::Result<(UdpSocket, u16)> {
-        for _ in 0..20 {
-            let socket = UdpSocket::bind("127.0.0.1:0")?;
-            let port = socket.local_addr()?.port();
-            if try_reserve_port(port) {
-                self.ports.push(port);
-                return Ok((socket, port));
-            }
-        }
-        Err(no_unreserved_port("UDP"))
+        let (socket, port) = bind_reserved_udp()?;
+        self.ports.push(port);
+        Ok((socket, port))
     }
 
     /// Transfers ownership of the reserved ports to the caller.
@@ -305,8 +299,20 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    /// Serializes the port-broker tests: after a lease is dropped another
+    /// parallel test could otherwise reserve the same OS-assigned ephemeral
+    /// port between the drop and the `try_reserve_port` assertion.
+    static PORT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn port_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        PORT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn reserve_port_holds_the_port_until_the_lease_is_dropped() {
+        let _guard = port_test_guard();
         let mut lease = reserve_port().expect("reserve an ephemeral TCP port");
         let port = lease.port();
 
@@ -337,6 +343,7 @@ mod tests {
 
     #[test]
     fn reserve_port_returns_distinct_ports_for_live_leases() {
+        let _guard = port_test_guard();
         let first = reserve_port().expect("first reservation");
         let second = reserve_port().expect("second reservation");
         assert_ne!(first.port(), second.port());
@@ -344,6 +351,7 @@ mod tests {
 
     #[test]
     fn reserve_port_number_returns_distinct_reserved_ports() {
+        let _guard = port_test_guard();
         let first = reserve_port_number().expect("first numbered reservation");
         let second = reserve_port_number().expect("second numbered reservation");
         assert_ne!(first, second);
@@ -352,6 +360,7 @@ mod tests {
 
     #[test]
     fn reserve_udp_port_holds_the_port_until_the_lease_is_dropped() {
+        let _guard = port_test_guard();
         let mut lease = reserve_udp_port().expect("reserve an ephemeral UDP port");
         let port = lease.port();
 
@@ -379,10 +388,47 @@ mod tests {
 
     #[test]
     fn reserve_udp_port_number_returns_distinct_reserved_ports() {
+        let _guard = port_test_guard();
         let first = reserve_udp_port_number().expect("first UDP numbered reservation");
         let second = reserve_udp_port_number().expect("second UDP numbered reservation");
         assert_ne!(first, second);
         release_ports(&[first, second]);
+    }
+
+    /// Deferred D4b: the reservation broker releases every port it holds when
+    /// startup fails before `commit`, and `commit` transfers them to the owner.
+    #[test]
+    fn port_reservations_release_on_drop_and_commit_transfers_ownership() {
+        let _guard = port_test_guard();
+
+        let mut abandoned = super::PortReservations::new();
+        let (listener, tcp_port) = abandoned.reserve_tcp().expect("reserve TCP");
+        drop(listener);
+        let (socket, udp_port) = abandoned.reserve_udp().expect("reserve UDP");
+        drop(socket);
+        drop(abandoned);
+        assert!(
+            super::try_reserve_port(tcp_port),
+            "dropping an uncommitted broker must release its TCP port"
+        );
+        assert!(
+            super::try_reserve_port(udp_port),
+            "dropping an uncommitted broker must release its UDP port"
+        );
+        release_ports(&[tcp_port, udp_port]);
+
+        let mut broker = super::PortReservations::new();
+        let (listener, committed_tcp) = broker.reserve_tcp().expect("reserve TCP");
+        let (socket, committed_udp) = broker.reserve_udp().expect("reserve UDP");
+        drop((listener, socket));
+        let committed = broker.commit();
+        assert_eq!(committed, vec![committed_tcp, committed_udp]);
+        assert!(
+            !super::try_reserve_port(committed_tcp),
+            "commit must keep the ports reserved for the caller"
+        );
+        assert!(!super::try_reserve_port(committed_udp));
+        release_ports(&committed);
     }
 
     #[tokio::test]

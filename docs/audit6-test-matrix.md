@@ -85,3 +85,16 @@ named by the command.
 | Warm zero-source status retention | `test_warm_zero_source_transition_is_failed_and_retains_snapshot` (seeded failed list + dropped regex) | `cargo test -p sito-filter warm_zero_source` |
 | Retention wrapper no longer detailed-only | `test_compat_cleanup_retention_applies_default_rollup_retention` | `cargo test -p sito-stats compat_cleanup_retention` |
 | Writer busy timeout / retry budget / shutdown bound | `test_on_disk_busy_timeout_is_30s`, `test_writer_retry_budget_is_bounded_and_counts_dropped_batch`, `test_shutdown_flush_deadline_counts_dropped_batch`, `test_shutdown_counts_in_flight_normal_flush`, `test_writer_waits_out_a_slow_write_lock_without_dropping`, `test_flush_retry_delay_is_bounded_and_grows` | `cargo test -p sito-stats writer::tests` |
+
+## Deferred D4b — auth/upstream/tests/docs cleanup
+
+| Finding | Named test / check | Focused command |
+|---|---|---|
+| Re-auth lockout threshold | `test_reauth_lockout_triggers_on_the_fifth_failure` | `cargo test -p sito-api test_reauth_lockout_triggers_on_the_fifth_failure` |
+| Re-auth oversized input on locked account | `test_reauth_rejects_oversized_credentials_before_lockout` | `cargo test -p sito-api test_reauth_rejects_oversized_credentials_before_lockout` |
+| Re-auth ticket consumed after session purge | `test_enable_totp_consumes_ticket_after_session_purge` | `cargo test -p sito-api test_enable_totp_consumes_ticket_after_session_purge` |
+| Sync DNSSEC API fails closed without a fetcher | `test_sync_validate_response_fails_closed_without_key_fetcher` | `cargo test -p sito-dnssec test_sync_validate_response_fails_closed_without_key_fetcher` |
+| Port reservation broker release/commit | `port_reservations_release_on_drop_and_commit_transfers_ownership` | `cargo test -p sito-test-support port_reservations` |
+| Full-buffer QR and ID checks are independent | `test_plain_udp_ignores_full_buffer_junk_with_matching_id_and_no_qr`, `test_plain_udp_ignores_full_buffer_junk_with_qr_and_wrong_id` | `cargo test -p sito-upstream full_buffer_junk` |
+| Direct probe rejects FORMERR/BADVERS | `test_probe_rejects_edns_failure_replies` | `cargo test -p sito-api test_probe_rejects_edns_failure_replies` |
+| HA `retry_at` reflects the actual retry schedule | `test_ha_publish_report_retry_at_matches_actual_schedule` | `cargo test -p sito-api test_ha_publish_report_retry_at_matches_actual_schedule` |

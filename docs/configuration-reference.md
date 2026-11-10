@@ -639,6 +639,11 @@ and `POST /api/v1/config/reload`.
 > the HA applier) is ignored and does **not** force a full re-apply. When an
 > explicit reload is required, use `POST /api/v1/config/reload`: it re-reads
 > the file and applies it even when the content matches the current runtime.
+>
+> On an HA master, an external edit that produces a bundle above the
+> replication limit is rolled back in memory but the oversized file stays on
+> disk. Because publication re-reads the file, `/health` remains not ready and
+> republish/retry cannot succeed until the file is corrected or replaced.
 
 ### 16.1 Applied live (no restart)
 

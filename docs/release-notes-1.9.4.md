@@ -74,6 +74,13 @@ document is the operator-facing summary and upgrade guide.
 - **Oversized bundles are rejected before persistence.** A signed WebSocket
   envelope over the 1 MiB limit returns an apply error and rolls back the live
   config instead of poisoning every slave forever.
+- **An oversized external edit is not self-healing.** The file watcher rolls the
+  live configuration back, but the oversized `config.toml` is the operator's
+  external edit and is left on disk. Every publish/retry re-reads that file, so
+  HA readiness (and `/health`) stays false and republish cannot succeed until
+  the file is corrected or replaced with a valid document. The `PUT
+  /api/v1/config` path restores the previous persisted document and is not
+  affected.
 - **Per-slave divergence.** `POST /api/v1/ha/resync` re-pushes the current
   bundle; it does not clear another slave's divergence. Each slave's record
   clears only when that slave ACKs the current term/version.
@@ -160,8 +167,9 @@ document is the operator-facing summary and upgrade guide.
   a global in-flight request cap returns 503, HTTP/2 streams are capped at 32,
   and requests/connections have absolute deadlines/lifetimes. A DoH3 request
   that exceeds its total deadline now returns HTTP 504 (matching DoH) when the
-  response has not started; once a response header block has been sent, the
-  stream is reset instead of emitting a second (invalid) HEADERS frame.
+  response has not started; once the response has started (a header block was
+  sent), the stream is reset instead of emitting a second (invalid) HEADERS
+  frame.
 - **One response-shaping path:** cache hits, upstream, stale, and synthesized
   answers carry the current client question/RD/CD/ID, rebuild OPT from the
   client's EDNS, never replay upstream EDNS options (COOKIE/NSID/ECS/padding/
@@ -286,8 +294,8 @@ P1-19, P1-23, and P1-24 are closed in this branch:
   success/failure, duration, deleted-row and rollup-cleanup metrics.
 - **Slow-disk query-log writer.** The on-disk SQLite pool busy timeout is 30 s
   and the writer makes five attempts (four retries) with bounded exponential
-  backoff (50 ms, 100 ms, 200 ms, 400 ms; capped at 1 s) before counting a batch
-  dropped, so a slow retention chunk does not silently discard it. The final
+  backoff (50 ms, 100 ms, 200 ms, 400 ms) before counting a batch dropped, so a
+  slow retention chunk does not silently discard it. The final
   shutdown flush is bounded to 3 s and counts an uncommitted batch as dropped.
   If shutdown aborts an already-running normal flush, every accepted but
   uncommitted entry is added to `dropped_total` as well. The systemd unit sets
@@ -297,7 +305,9 @@ P1-19, P1-23, and P1-24 are closed in this branch:
   explicit detailed-only sweep. The deprecated `cleanup_retention()` wrapper
   now delegates to the full policy with the default `rollup_retention_days`
   (365) instead of silently pruning detailed rows only; callers that need a
-  specific rollup policy use `cleanup_retention_with_policy()`.
+  specific rollup policy use `cleanup_retention_with_policy()`. This is a
+  behavior change for external Rust callers: the wrapper can now delete
+  rollups older than 365 days that it previously left untouched.
 
 Additional deferred/unchanged items:
 

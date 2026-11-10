@@ -244,7 +244,23 @@ impl ServerContext {
     /// (and roll back). A failed publish is also recorded in HA readiness and
     /// a bounded background retry is scheduled.
     pub async fn publish_bundle(&self) -> Result<sito_ha::PublishOutcome, sito_ha::HaError> {
+        self.publish_bundle_with_retry().await.0
+    }
+
+    /// Like [`Self::publish_bundle`], but also reports the delay before the
+    /// first attempt of a newly scheduled background retry.
+    ///
+    /// `None` means no new retry loop was started (no HA coordinator, or one is
+    /// already running with its own backoff schedule). Callers that expose a
+    /// `retry_at` timestamp must omit it in that case instead of guessing.
+    pub async fn publish_bundle_with_retry(
+        &self,
+    ) -> (
+        Result<sito_ha::PublishOutcome, sito_ha::HaError>,
+        Option<std::time::Duration>,
+    ) {
         let result = self.publish_bundle_inner().await;
+        let mut retry_delay = None;
         if let Err(e) = &result {
             // Some failures happen before the coordinator sees a bundle
             // (unreadable/empty/sanitize/secret/version errors). They must
@@ -252,9 +268,9 @@ impl ServerContext {
             if let Some(ref coordinator) = self.master_coordinator {
                 coordinator.mark_publish_failed(e.to_string());
             }
-            self.schedule_publish_retry();
+            retry_delay = self.schedule_publish_retry();
         }
-        result
+        (result, retry_delay)
     }
 
     async fn publish_bundle_inner(&self) -> Result<sito_ha::PublishOutcome, sito_ha::HaError> {
@@ -360,17 +376,19 @@ impl ServerContext {
     /// The local configuration has already been persisted by the caller and
     /// must not be rolled back because of an HA failure (D8). The coordinator
     /// guard keeps a burst of failed API writes from spawning many loops.
-    fn schedule_publish_retry(&self) {
-        let Some(ref coordinator) = self.master_coordinator else {
-            return;
-        };
+    ///
+    /// Returns the initial delay only when this call started a new loop;
+    /// `None` means an existing loop owns the schedule (or HA is not active).
+    fn schedule_publish_retry(&self) -> Option<std::time::Duration> {
+        let coordinator = self.master_coordinator.as_ref()?;
         if !coordinator.begin_publish_retry() {
-            return;
+            return None;
         }
+        let initial_delay = std::time::Duration::from_secs(1);
         let retry_ctx = self.clone();
         let retry_coordinator = coordinator.clone();
         tokio::spawn(async move {
-            let mut delay = std::time::Duration::from_secs(1);
+            let mut delay = initial_delay;
             for attempt in 1..=5 {
                 tokio::time::sleep(delay).await;
                 match retry_ctx.publish_bundle().await {
@@ -394,6 +412,7 @@ impl ServerContext {
             }
             retry_coordinator.end_publish_retry();
         });
+        Some(initial_delay)
     }
 }
 

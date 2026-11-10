@@ -370,6 +370,96 @@ mod tests {
         );
     }
 
+    /// Deferred D4b: a full-buffer datagram with the matching ID but QR=0 must
+    /// not trigger the TCP fallback. This isolates the QR half of
+    /// `looks_like_truncated_response` (the combined test also sets a wrong ID).
+    #[tokio::test]
+    async fn test_plain_udp_ignores_full_buffer_junk_with_matching_id_and_no_qr() {
+        use std::time::Duration;
+
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let query = decode_message(&buf[..n]).unwrap();
+
+            let mut junk = vec![0xffu8; MIN_UDP_BUFFER_SIZE];
+            junk[0..2].copy_from_slice(&query.metadata.id.to_be_bytes());
+            junk[2] = 0x00; // QR=0
+            server.send_to(&junk, peer).await.unwrap();
+
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::NoError;
+            resp.answers.push(Record::from_rdata(
+                query.queries[0].name().clone(),
+                300,
+                RData::A(A(std::net::Ipv4Addr::new(5, 6, 7, 8))),
+            ));
+            let bytes = encode_message(&resp).unwrap();
+            server.send_to(&bytes, peer).await.unwrap();
+        });
+
+        let upstream = PlainUpstream::new(addr, Duration::from_secs(2));
+        let response = upstream
+            .resolve(&make_query())
+            .await
+            .expect("genuine response after matching-ID QR=0 junk must be accepted");
+        server_task.await.unwrap();
+
+        assert_eq!(
+            response.answers[0].data,
+            RData::A(A(std::net::Ipv4Addr::new(5, 6, 7, 8)))
+        );
+    }
+
+    /// Deferred D4b: a full-buffer datagram with QR=1 but a wrong ID must not
+    /// trigger the TCP fallback. This isolates the ID half of
+    /// `looks_like_truncated_response`.
+    #[tokio::test]
+    async fn test_plain_udp_ignores_full_buffer_junk_with_qr_and_wrong_id() {
+        use std::time::Duration;
+
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let query = decode_message(&buf[..n]).unwrap();
+
+            let mut junk = vec![0xffu8; MIN_UDP_BUFFER_SIZE];
+            junk[0..2].copy_from_slice(&(query.metadata.id ^ 0xffff).to_be_bytes());
+            junk[2] = 0x80; // QR=1
+            server.send_to(&junk, peer).await.unwrap();
+
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::NoError;
+            resp.answers.push(Record::from_rdata(
+                query.queries[0].name().clone(),
+                300,
+                RData::A(A(std::net::Ipv4Addr::new(8, 7, 6, 5))),
+            ));
+            let bytes = encode_message(&resp).unwrap();
+            server.send_to(&bytes, peer).await.unwrap();
+        });
+
+        let upstream = PlainUpstream::new(addr, Duration::from_secs(2));
+        let response = upstream
+            .resolve(&make_query())
+            .await
+            .expect("genuine response after QR=1 wrong-ID junk must be accepted");
+        server_task.await.unwrap();
+
+        assert_eq!(
+            response.answers[0].data,
+            RData::A(A(std::net::Ipv4Addr::new(8, 7, 6, 5)))
+        );
+    }
+
     #[tokio::test]
     async fn test_plain_udp_randomizes_wire_id_and_restores_caller_id() {
         use std::sync::{Arc, Mutex};

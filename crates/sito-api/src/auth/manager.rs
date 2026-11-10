@@ -133,8 +133,23 @@ pub(crate) fn lockout_key(username: &str) -> String {
     format!("user:{}", blake3::hash(username.as_bytes()).to_hex())
 }
 
-fn record_reauth_failure(lockout: &LockoutTracker, key: &str) {
-    let _ = lockout.record_failure(key);
+/// Records a failed re-authentication attempt and maps the lockout threshold
+/// crossing to the same result login returns: the attempt that reaches the
+/// limit reports `LockedOut`, not the next one.
+fn record_reauth_failure(
+    lockout: &LockoutTracker,
+    key: &str,
+    otherwise: ReauthError,
+) -> ReauthError {
+    let (locked, _remaining) = lockout.record_failure(key);
+    if locked {
+        // Mirrors `login`: the threshold-crossing attempt is the 429.
+        ReauthError::LockedOut {
+            remaining_seconds: 15 * 60,
+        }
+    } else {
+        otherwise
+    }
 }
 /// Maximum number of API tokens kept in memory/on disk.
 pub const MAX_API_TOKENS: usize = 256;
@@ -2403,18 +2418,23 @@ impl AuthManager {
             return Err(ReauthError::RateLimited);
         }
 
+        // Bound pre-auth input before lockout bookkeeping or Argon2, matching
+        // `login` (and so an oversized value cannot grow the lockout map).
+        if username.len() > MAX_LOGIN_USERNAME_BYTES || password.len() > MAX_LOGIN_PASSWORD_BYTES {
+            return Err(ReauthError::InvalidCredentials);
+        }
+
         let key = lockout_key(username);
         if let Some(remaining_seconds) = self.lockout.check_lockout(&key) {
             return Err(ReauthError::LockedOut { remaining_seconds });
         }
 
-        if username.len() > MAX_LOGIN_USERNAME_BYTES || password.len() > MAX_LOGIN_PASSWORD_BYTES {
-            return Err(ReauthError::InvalidCredentials);
-        }
-
         if !self.verify_user_password(username, password).await {
-            record_reauth_failure(&self.lockout, &key);
-            return Err(ReauthError::InvalidCredentials);
+            return Err(record_reauth_failure(
+                &self.lockout,
+                &key,
+                ReauthError::InvalidCredentials,
+            ));
         }
 
         let Some((credential_epoch, totp_enabled)) = lock(&self.users).get(username).map(|user| {
@@ -2423,18 +2443,27 @@ impl AuthManager {
                 user.totp.as_ref().is_some_and(|totp| totp.enabled),
             )
         }) else {
-            record_reauth_failure(&self.lockout, &key);
-            return Err(ReauthError::InvalidCredentials);
+            return Err(record_reauth_failure(
+                &self.lockout,
+                &key,
+                ReauthError::InvalidCredentials,
+            ));
         };
 
         if totp_enabled {
             let Some(code) = code.map(str::trim).filter(|code| !code.is_empty()) else {
-                record_reauth_failure(&self.lockout, &key);
-                return Err(ReauthError::SecondFactorRequired);
+                return Err(record_reauth_failure(
+                    &self.lockout,
+                    &key,
+                    ReauthError::SecondFactorRequired,
+                ));
             };
             if !self.verify_second_factor(username, code).await {
-                record_reauth_failure(&self.lockout, &key);
-                return Err(ReauthError::InvalidCredentials);
+                return Err(record_reauth_failure(
+                    &self.lockout,
+                    &key,
+                    ReauthError::InvalidCredentials,
+                ));
             }
         }
 
@@ -3238,6 +3267,72 @@ mod tests {
             "the raw username must never be a lockout-map key: {keys:?}"
         );
         assert_eq!(keys[0], lockout_key("admin"));
+    }
+
+    /// Deferred D4b: re-auth must report the threshold-crossing failure as a
+    /// lockout (matching login), not return 401 once more and 429 only on the
+    /// following attempt.
+    #[tokio::test]
+    async fn test_reauth_lockout_triggers_on_the_fifth_failure() {
+        let mgr = AuthManager::new();
+        let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("login failed");
+        };
+
+        for attempt in 1..crate::auth::lockout::MAX_FAILED_ATTEMPTS {
+            assert!(
+                matches!(
+                    mgr.reauth("admin", "wrongpassword", None, &session.id, "")
+                        .await,
+                    Err(ReauthError::InvalidCredentials)
+                ),
+                "attempt {attempt} must stay a 401"
+            );
+        }
+        assert!(
+            matches!(
+                mgr.reauth("admin", "wrongpassword", None, &session.id, "")
+                    .await,
+                Err(ReauthError::LockedOut { .. })
+            ),
+            "the fifth failure must be the 429 lockout, like login"
+        );
+    }
+
+    /// Deferred D4b: oversized re-auth credentials are rejected before the
+    /// lockout check and Argon2 (matching login), including while locked out.
+    #[tokio::test]
+    async fn test_reauth_rejects_oversized_credentials_before_lockout() {
+        let mgr = AuthManager::new();
+        let LoginResult::Success(session) = mgr.login("admin", "adminadmin", "127.0.0.1").await
+        else {
+            panic!("login failed");
+        };
+        for _ in 0..crate::auth::lockout::MAX_FAILED_ATTEMPTS {
+            let _ = mgr
+                .reauth("admin", "wrongpassword", None, &session.id, "")
+                .await;
+        }
+        assert!(mgr.lockout.check_lockout(&lockout_key("admin")).is_some());
+
+        let long_username = "u".repeat(MAX_LOGIN_USERNAME_BYTES + 1);
+        assert!(matches!(
+            mgr.reauth(&long_username, "whatever", None, &session.id, "")
+                .await,
+            Err(ReauthError::InvalidCredentials)
+        ));
+        let long_password = "p".repeat(MAX_LOGIN_PASSWORD_BYTES + 1);
+        assert!(matches!(
+            mgr.reauth("admin", &long_password, None, &session.id, "")
+                .await,
+            Err(ReauthError::InvalidCredentials)
+        ));
+        assert_eq!(
+            mgr.lockout.attempts_len(),
+            1,
+            "oversized inputs must not create or extend lockout entries"
+        );
     }
 
     #[tokio::test]
