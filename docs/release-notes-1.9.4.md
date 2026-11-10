@@ -250,9 +250,10 @@ P1-19, P1-23, and P1-24 are closed in this branch:
   `stats.rollup_retention_days` (default 365). “Clear query log” deletes both
   `query_log` and `stats_hourly` by default (`?keep_aggregates=true` preserves
   rollups), large clears are vacuumed, SQLite runs with `secure_delete=ON`, and
-  `stats.db`/WAL/SHM permissions are repaired to 0600 on startup. Existing raw
-  rollups are hashed once on startup; raw `query_log` rows are not retroactively
-  anonymized.
+  `stats.db`/WAL/SHM permissions are repaired to 0600 on startup. Switching
+  `rollup_client_names` off scrubs names from existing rollups on the next
+  startup. Existing raw rollups are hashed once on startup; raw `query_log`
+  rows are not retroactively anonymized.
 - **P1-23 — query-log/dashboard polling cost.** Query-log pages accept
   `include_total` (default `true`; the live 3 s UI refresh sends `false`), and
   dashboard aggregates are cached for 45 s with invalidation on clear/retention.

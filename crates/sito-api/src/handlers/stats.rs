@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].client_name.as_deref(), Some("archive-host"));
         assert!(
-            clients[0].client_ip.starts_with("b3:"),
+            clients[0].client_ip.starts_with("blake3:"),
             "archived client IP must be a keyed hash, got {}",
             clients[0].client_ip
         );

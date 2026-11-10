@@ -545,6 +545,19 @@ impl MetricsRegistry {
         self.querylog_dropped.store(dropped, Ordering::Relaxed);
     }
 
+    /// Publishes the configured rollup retention without waiting for the first
+    /// sweep.
+    pub fn set_rollup_retention_days(&self, days: u32) {
+        self.stats_rollup_retention_days
+            .store(u64::from(days), Ordering::Relaxed);
+    }
+
+    /// Publishes the persisted last-success timestamp at startup.
+    pub fn set_retention_last_success_seconds(&self, seconds: u64) {
+        self.stats_retention_last_success_seconds
+            .store(seconds, Ordering::Relaxed);
+    }
+
     /// Records a successful retention sweep. Timestamps are unix seconds;
     /// `duration_millis` is wall-clock duration of the whole sweep.
     pub fn record_retention_success(
@@ -2102,6 +2115,39 @@ mod allocation_tests {
         assert_eq!(
             after, before,
             "metrics hot path must not allocate after warm-up"
+        );
+    }
+
+    #[test]
+    fn test_retention_metrics_record_success_and_failure() {
+        use std::sync::atomic::Ordering;
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.set_rollup_retention_days(365);
+        reg.record_retention_success(1_234, 10, 2, 365);
+
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains("sito_stats_retention_last_duration_millis 1234"));
+        assert!(rendered.contains("sito_stats_retention_deleted_rows_total 10"));
+        assert!(rendered.contains("sito_stats_retention_rollup_deleted_rows_total 2"));
+        assert!(rendered.contains("sito_stats_rollup_retention_days 365"));
+        assert!(
+            reg.stats_retention_last_success_seconds
+                .load(Ordering::Relaxed)
+                > 0
+        );
+        assert_eq!(
+            reg.stats_retention_failures_total.load(Ordering::Relaxed),
+            0
+        );
+
+        reg.record_retention_failure(99);
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains("sito_stats_retention_failures_total 1"));
+        assert!(rendered.contains("sito_stats_retention_last_duration_millis 99"));
+        assert!(
+            reg.stats_retention_last_failure_seconds
+                .load(Ordering::Relaxed)
+                > 0
         );
     }
 }

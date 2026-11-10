@@ -210,6 +210,10 @@ pub enum Commands {
         /// erased.
         #[arg(long)]
         keep_aggregates: bool,
+        /// Allow clearing while the server is running. The running process
+        /// keeps its SQLite connections; stop the service when possible.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -346,6 +350,7 @@ pub fn run_check_config(path: &Path) -> Result<(), anyhow::Error> {
 pub async fn run_clear_query_log(
     config_path: &Path,
     keep_aggregates: bool,
+    force: bool,
 ) -> Result<u64, anyhow::Error> {
     let content = std::fs::read_to_string(config_path).map_err(|e| {
         anyhow::anyhow!(
@@ -356,6 +361,12 @@ pub async fn run_clear_query_log(
     })?;
     let config = Config::from_toml_str(&content)
         .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    let _access = begin_reset(
+        &config.server.data_dir,
+        "clear the query log",
+        force,
+        CLEAR_QUERY_LOG_FORCE_HINT,
+    )?;
     let db_path = config.server.data_dir.join("stats.db");
     if !db_path.is_file() {
         anyhow::bail!(
@@ -1078,6 +1089,8 @@ const ADMIN_FORCE_HINT: &str = "Use --force only if you understand that existing
      accepted until then.";
 const SESSIONS_FORCE_HINT: &str = "Use --force only if you understand that existing web sessions and \
      API tokens remain valid until the service is restarted.";
+const CLEAR_QUERY_LOG_FORCE_HINT: &str = "Use --force only if you understand that the running server \
+     keeps its open SQLite connections; stop the service when possible.";
 
 const ADMIN_LIVE_STATE: &str = "Existing web sessions and API tokens remain valid, and the running \
      server still accepts the old admin password and rejects the new one";

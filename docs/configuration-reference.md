@@ -433,9 +433,14 @@ anonymize_querylog = false
 > preserve rollups. Large clears are vacuumed and
 > SQLite runs with `secure_delete=ON`. Rollup client IPs are keyed BLAKE3
 > hashes using `<data_dir>/stats-salt` (0600); client names are omitted unless
-> `rollup_client_names = true`. Existing raw rollups are hashed once on startup
-> by the database backfill; existing raw `query_log` rows are not retroactively
-> anonymized.
+> `rollup_client_names = true`. Switching `rollup_client_names` from `true` to
+> `false` scrubs names from existing rollups on the next startup. Archived
+> per-client rows therefore show the keyed hash (`blake3:…`) instead of a raw
+> address for data older than the detailed query-log retention. Existing raw
+> rollups are hashed once on startup by the database backfill; existing raw
+> `query_log` rows are not retroactively anonymized. `sito clear-query-log`
+> takes the service lease and refuses a running server unless `--force` is
+> given.
 
 > Query logging is always enabled when `[stats]` is present. Prometheus metrics
 > are exposed at `/metrics` and require a Viewer-or-higher bearer token or

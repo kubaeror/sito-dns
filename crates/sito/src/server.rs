@@ -109,6 +109,9 @@ const RETENTION_INTERVAL: Duration = Duration::from_hours(24);
 /// Maximum random delay before the startup catch-up sweep so a fleet of
 /// restarted nodes does not all compact SQLite at once.
 const RETENTION_STARTUP_JITTER_MAX_SECS: u64 = 60;
+/// Even when the persisted last success is recent, run a bounded catch-up
+/// within this window so restart-heavy deployments still retain data.
+const RETENTION_STARTUP_CATCHUP_MAX_DELAY_MS: i64 = 5 * 60 * 1000;
 /// Debounce window for config file watcher events.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(100);
 /// Periodic flush interval for the persistent DNSSEC chain cache.
@@ -559,6 +562,21 @@ fn filter_status_metrics(status: &sito_filter::FilterStatus) -> sito_stats::Filt
     }
 }
 
+/// Delay before the first retention sweep after startup.
+///
+/// Normally this is the time remaining until `last_success + interval`, but it
+/// is capped so a process that restarts more often than the interval still
+/// runs a bounded catch-up within [`RETENTION_STARTUP_CATCHUP_MAX_DELAY_MS`].
+/// `None`/an old timestamp means run immediately (subject only to jitter).
+fn retention_startup_delay_ms(last_success_ms: Option<i64>, now_ms: i64, interval_ms: i64) -> i64 {
+    let Some(last) = last_success_ms else {
+        return 0;
+    };
+    last.saturating_add(interval_ms)
+        .saturating_sub(now_ms)
+        .clamp(0, RETENTION_STARTUP_CATCHUP_MAX_DELAY_MS)
+}
+
 /// Runs one retention sweep and publishes its outcome to Prometheus.
 async fn run_stats_retention_sweep(
     db: &StatsDb,
@@ -617,6 +635,18 @@ async fn init_runtime_components(
         env!("CARGO_PKG_VERSION"),
         option_env!("SITO_BUILD_COMMIT").unwrap_or("unknown"),
     );
+    metrics.set_rollup_retention_days(stats_config.rollup_retention_days);
+    if let Ok(Some(last_success_ms)) = stats_db.retention_last_success_ms().await {
+        metrics
+            .set_retention_last_success_seconds(u64::try_from(last_success_ms / 1000).unwrap_or(0));
+    }
+    if stats_config.rollup_retention_days < stats_config.retention_days {
+        warn!(
+            retention_days = stats_config.retention_days,
+            rollup_retention_days = stats_config.rollup_retention_days,
+            "stats.rollup_retention_days is shorter than stats.retention_days; archived totals will expire before detailed rows"
+        );
+    }
 
     // Initialize QueryLogWriter (10k buffer per M5.1)
     let querylog_writer = QueryLogWriter::spawn_with_anonymize(
@@ -1377,25 +1407,29 @@ pub async fn run_server_full(
                 None
             });
         let interval_ms = i64::try_from(RETENTION_INTERVAL.as_millis()).unwrap_or(i64::MAX);
-        let due = last_success.is_none_or(|last| now_ms.saturating_sub(last) >= interval_ms);
+        let base_delay_ms = retention_startup_delay_ms(last_success, now_ms, interval_ms);
+        let jitter_ms = (rand::random::<u64>() % (RETENTION_STARTUP_JITTER_MAX_SECS * 1000 + 1))
+            .try_into()
+            .unwrap_or(i64::MAX);
+        let delay_ms = base_delay_ms.saturating_add(jitter_ms).max(0);
+        let delay = Duration::from_millis(u64::try_from(delay_ms).unwrap_or(u64::MAX));
 
-        if due {
-            let jitter = rand::random::<u64>() % (RETENTION_STARTUP_JITTER_MAX_SECS + 1);
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(jitter)) => {}
-                res = retention_shutdown_rx.changed() => {
-                    if res.is_err() || *retention_shutdown_rx.borrow() {
-                        return;
-                    }
+        // Always run one bounded catch-up at startup. The delay only avoids
+        // duplicate work when the last sweep is recent; it is capped so a
+        // restart-heavy process still runs retention within a few minutes.
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            res = retention_shutdown_rx.changed() => {
+                if res.is_err() || *retention_shutdown_rx.borrow() {
+                    return;
                 }
             }
-            run_stats_retention_sweep(&retention_db, &retention_config, &retention_metrics).await;
         }
+        run_stats_retention_sweep(&retention_db, &retention_config, &retention_metrics).await;
 
         let mut interval = tokio::time::interval(RETENTION_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Consume the immediate first tick; the catch-up above already ran (or
-        // was deliberately skipped because the last sweep is recent).
+        // Consume the immediate first tick; the startup catch-up above ran.
         interval.tick().await;
         loop {
             tokio::select! {
@@ -2310,6 +2344,28 @@ mod tests {
     use super::canonical_config_path;
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn test_retention_startup_delay_schedules_recent_success() {
+        let interval_ms = 24 * 3600 * 1000;
+        let now = 1_700_000_000_000i64;
+
+        // No prior success: run immediately.
+        assert_eq!(retention_startup_delay_ms(None, now, interval_ms), 0);
+
+        // Recent success: normally wait until last_success + interval, but cap
+        // the delay so a process restarting more often still runs retention.
+        let recent = now - 12 * 3600 * 1000;
+        let delay = retention_startup_delay_ms(Some(recent), now, interval_ms);
+        assert_eq!(delay, RETENTION_STARTUP_CATCHUP_MAX_DELAY_MS);
+
+        // Success older than the interval: run immediately.
+        let old = now - interval_ms - 1;
+        assert_eq!(retention_startup_delay_ms(Some(old), now, interval_ms), 0);
+
+        // A recent success schedules a sweep (delay is not "skip forever").
+        assert!(delay > 0);
+    }
 
     #[test]
     fn test_canonical_config_path_for_relative_default() {

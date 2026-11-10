@@ -29,13 +29,20 @@ const ROLLUP_TOP_N: usize = 100;
 /// after a meaningful amount of data was freed.
 const VACUUM_MIN_DELETED_ROWS: u64 = 1_000;
 
-/// Number of hour buckets processed per retention batch. Each hour is folded
-/// into `stats_hourly` and deleted in its own short transaction, so a large
-/// first sweep never holds the SQLite write lock for the whole backlog.
-const RETENTION_HOURS_PER_BATCH: usize = 24;
-
 /// Prefix for keyed BLAKE3 client identifiers stored in `stats_hourly`.
-const ROLLUP_HASH_PREFIX: &str = "b3:";
+/// The colon-only form is deliberately longer than an IP literal can be, and
+/// `is_hashed_client_id` additionally requires exactly 64 hex characters.
+const ROLLUP_HASH_PREFIX: &str = "blake3:";
+
+/// Legacy prefix used by an earlier unreleased build. Recognized only when it
+/// is followed by exactly 64 hex characters, so a real IPv6 address such as
+/// `b3::1` is still hashed rather than mistaken for a stored digest.
+const LEGACY_ROLLUP_HASH_PREFIX: &str = "b3:";
+
+/// Maximum number of detailed query-log rows processed in one retention
+/// transaction. A single busy hour is sub-chunked by `id` to keep the writer
+/// lock short even when millions of rows share one hour.
+const RETENTION_ROWS_PER_CHUNK: i64 = 5_000;
 
 /// Per-install salt file name under the stats data directory.
 const SALT_FILE_NAME: &str = "stats-salt";
@@ -321,12 +328,14 @@ fn filtered_query(base: &str, filter: &QueryLogFilter) -> sqlx::QueryBuilder<Sql
 /// `hour -> (top_domains, top_clients, top_upstreams)`.
 type ExistingRollups = HashMap<i64, (Option<String>, Option<String>, Option<String>)>;
 
-/// Extracts bounded per-hour top lists for the rows in `[start, end)` inside
-/// the retention transaction.
+/// Extracts bounded per-hour top lists for the rows in `[start, end)` and
+/// `[id_start, id_end]` inside the retention transaction.
 async fn collect_hour_rollups(
     conn: &mut SqliteConnection,
     start: i64,
     end: i64,
+    id_start: i64,
+    id_end: i64,
     rollups: &mut HashMap<i64, HourRollup>,
 ) -> Result<(), StatsError> {
     let limit = i64::try_from(ROLLUP_TOP_N).unwrap_or(100);
@@ -351,7 +360,7 @@ async fn collect_hour_rollups(
                     ORDER BY SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) DESC, qname ASC
                 ) AS rn_blocked
             FROM query_log
-            WHERE ts >= ? AND ts < ?
+            WHERE ts >= ? AND ts < ? AND id >= ? AND id <= ?
             GROUP BY (ts / 3600000) * 3600000, qname
         )
         WHERE rn_total <= ? OR rn_blocked <= ?
@@ -359,6 +368,8 @@ async fn collect_hour_rollups(
     )
     .bind(start)
     .bind(end)
+    .bind(id_start)
+    .bind(id_end)
     .bind(limit)
     .bind(limit)
     .fetch_all(&mut *conn)
@@ -389,7 +400,7 @@ async fn collect_hour_rollups(
                     ORDER BY COUNT(*) DESC, client_ip ASC
                 ) AS rn
             FROM query_log
-            WHERE ts >= ? AND ts < ?
+            WHERE ts >= ? AND ts < ? AND id >= ? AND id <= ?
             GROUP BY (ts / 3600000) * 3600000, client_ip
         )
         WHERE rn <= ?
@@ -397,6 +408,8 @@ async fn collect_hour_rollups(
     )
     .bind(start)
     .bind(end)
+    .bind(id_start)
+    .bind(id_end)
     .bind(limit)
     .fetch_all(&mut *conn)
     .await?;
@@ -427,7 +440,7 @@ async fn collect_hour_rollups(
                     ORDER BY COUNT(*) DESC, upstream ASC
                 ) AS rn
             FROM query_log
-            WHERE ts >= ? AND ts < ? AND upstream IS NOT NULL
+            WHERE ts >= ? AND ts < ? AND id >= ? AND id <= ? AND upstream IS NOT NULL
             GROUP BY (ts / 3600000) * 3600000, upstream
         )
         WHERE rn <= ?
@@ -435,6 +448,8 @@ async fn collect_hour_rollups(
     )
     .bind(start)
     .bind(end)
+    .bind(id_start)
+    .bind(id_end)
     .bind(limit)
     .fetch_all(&mut *conn)
     .await?;
@@ -514,6 +529,52 @@ fn set_private_permissions(_path: &Path) -> Result<(), StatsError> {
     Ok(())
 }
 
+/// Creates the database file with mode 0600 before SQLite opens it, and
+/// repairs an existing file. Symlinks are refused so a hostile data directory
+/// cannot redirect writes outside it.
+fn ensure_private_db_file(path: &Path) -> Result<(), StatsError> {
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(StatsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to use symlinked stats database '{}'",
+                path.display()
+            ),
+        )));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                set_private_permissions(path)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
 /// Loads the per-install 32-byte salt, creating it atomically with mode 0600
 /// when it does not exist. A short/corrupt salt is a hard error: regenerating
 /// it would silently change every stored rollup hash.
@@ -522,6 +583,14 @@ fn load_or_create_salt(directory: &Path) -> Result<[u8; 32], StatsError> {
 
     let path = directory.join(SALT_FILE_NAME);
     std::fs::create_dir_all(directory)?;
+    if let Ok(meta) = std::fs::symlink_metadata(&path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(StatsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to use symlinked stats salt '{}'", path.display()),
+        )));
+    }
 
     #[cfg(unix)]
     let mut options = {
@@ -566,13 +635,27 @@ impl StatsDb {
         &self.pool
     }
 
+    /// Whether `value` is a stored keyed digest (current or legacy prefix).
+    ///
+    /// Requiring exactly 64 hex characters avoids treating a real IPv6 address
+    /// such as `b3::1` as already hashed and writing it raw.
+    fn is_hashed_client_id(value: &str) -> bool {
+        [ROLLUP_HASH_PREFIX, LEGACY_ROLLUP_HASH_PREFIX]
+            .iter()
+            .any(|prefix| {
+                value.strip_prefix(prefix).is_some_and(|hex| {
+                    hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+            })
+    }
+
     /// Hashes a client identifier for storage in `stats_hourly`.
     ///
     /// Already-hashed values are returned unchanged so re-merging a rollup does
     /// not hash twice. The keyed BLAKE3 digest is not reversible without the
     /// per-install salt.
     fn hash_client_ip(&self, client_ip: &str) -> String {
-        if client_ip.starts_with(ROLLUP_HASH_PREFIX) {
+        if Self::is_hashed_client_id(client_ip) {
             return client_ip.to_string();
         }
         let mut hasher = blake3::Hasher::new_keyed(self.salt.as_ref());
@@ -609,6 +692,7 @@ impl StatsDb {
         };
         db.run_migrations().await?;
         db.backfill_rollup_pii().await?;
+        db.sync_rollup_name_policy().await?;
         Ok(db)
     }
 
@@ -630,6 +714,7 @@ impl StatsDb {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         tokio::fs::create_dir_all(&directory).await?;
         let salt = load_or_create_salt(&directory)?;
+        ensure_private_db_file(&path)?;
 
         let options = SqliteConnectOptions::new()
             .filename(&path)
@@ -654,6 +739,7 @@ impl StatsDb {
         db.run_migrations().await?;
         db.repair_permissions()?;
         db.backfill_rollup_pii().await?;
+        db.sync_rollup_name_policy().await?;
         Ok(db)
     }
 
@@ -738,27 +824,37 @@ impl StatsDb {
                 last_hour = last_hour.max(hour);
                 let raw: Option<String> = row.get("top_clients");
                 let Some(raw) = raw else { continue };
-                let Ok(clients) = serde_json::from_str::<Vec<ClientTop>>(&raw) else {
-                    // Preserve an unparseable payload rather than silently
-                    // deleting data; the next writer merge replaces it.
-                    continue;
+                let transformed: Vec<ClientTop> = match serde_json::from_str::<Vec<ClientTop>>(&raw)
+                {
+                    Ok(clients) => clients
+                        .into_iter()
+                        .map(|(client_ip, client_name, total, blocked, last_seen)| {
+                            (
+                                self.hash_client_ip(&client_ip),
+                                if self.rollup_client_names {
+                                    client_name
+                                } else {
+                                    None
+                                },
+                                total,
+                                blocked,
+                                last_seen,
+                            )
+                        })
+                        .collect(),
+                    Err(e) => {
+                        // Never leave an unparseable legacy payload in place:
+                        // it may contain raw identifiers and the marker below
+                        // would prevent another attempt. Dropping only the
+                        // bounded top-N list keeps the aggregate counts.
+                        tracing::warn!(
+                            hour,
+                            error = %e,
+                            "Discarding unparseable legacy stats_hourly.top_clients payload"
+                        );
+                        Vec::new()
+                    }
                 };
-                let transformed: Vec<ClientTop> = clients
-                    .into_iter()
-                    .map(|(client_ip, client_name, total, blocked, last_seen)| {
-                        (
-                            self.hash_client_ip(&client_ip),
-                            if self.rollup_client_names {
-                                client_name
-                            } else {
-                                None
-                            },
-                            total,
-                            blocked,
-                            last_seen,
-                        )
-                    })
-                    .collect();
                 sqlx::query("UPDATE stats_hourly SET top_clients = ? WHERE hour = ?")
                     .bind(encode_tops(&transformed))
                     .bind(hour)
@@ -768,12 +864,115 @@ impl StatsDb {
             tx.commit().await?;
         }
 
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO stats_meta (key, value) VALUES ('rollup_pii_v1', '1') \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO stats_meta (key, value) VALUES ('rollup_client_names_policy', ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(if self.rollup_client_names {
+            "true"
+        } else {
+            "false"
+        })
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Enforces the current `rollup_client_names` policy on existing rollups.
+    ///
+    /// When the operator switches the setting from `true` to `false`, rewrite
+    /// every stored `top_clients` list with names removed. A marker stores the
+    /// last policy so this full scrub runs only on the transition (or once when
+    /// upgrading from a build that had no policy marker).
+    async fn sync_rollup_name_policy(&self) -> Result<(), StatsError> {
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM stats_meta WHERE key = 'rollup_client_names_policy'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let current = if self.rollup_client_names {
+            "true"
+        } else {
+            "false"
+        };
+
+        if !self.rollup_client_names && stored.as_deref() != Some("false") {
+            self.scrub_rollup_client_names().await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO stats_meta (key, value) VALUES ('rollup_client_names_policy', ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(current)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Rewrites every rollup client list with names removed (and raw IPs
+    /// hashed) in bounded batches.
+    async fn scrub_rollup_client_names(&self) -> Result<(), StatsError> {
+        let mut last_hour = i64::MIN;
+        loop {
+            let rows = sqlx::query(
+                "SELECT hour, top_clients FROM stats_hourly \
+                 WHERE hour > ? AND top_clients IS NOT NULL AND top_clients != '[]' \
+                 ORDER BY hour ASC LIMIT ?",
+            )
+            .bind(last_hour)
+            .bind(ROLLUP_PII_BACKFILL_BATCH)
+            .fetch_all(&self.pool)
+            .await?;
+            if rows.is_empty() {
+                break;
+            }
+
+            let mut tx = self.pool.begin().await?;
+            for row in &rows {
+                let hour: i64 = row.get("hour");
+                last_hour = last_hour.max(hour);
+                let raw: Option<String> = row.get("top_clients");
+                let Some(raw) = raw else { continue };
+                let transformed: Vec<ClientTop> = match serde_json::from_str::<Vec<ClientTop>>(&raw)
+                {
+                    Ok(clients) => clients
+                        .into_iter()
+                        .map(|(client_ip, _name, total, blocked, last_seen)| {
+                            (
+                                self.hash_client_ip(&client_ip),
+                                None,
+                                total,
+                                blocked,
+                                last_seen,
+                            )
+                        })
+                        .collect(),
+                    Err(e) => {
+                        tracing::warn!(
+                            hour,
+                            error = %e,
+                            "Discarding unparseable stats_hourly.top_clients payload during name scrub"
+                        );
+                        Vec::new()
+                    }
+                };
+                sqlx::query("UPDATE stats_hourly SET top_clients = ? WHERE hour = ?")
+                    .bind(encode_tops(&transformed))
+                    .bind(hour)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+        }
         Ok(())
     }
 
@@ -955,27 +1154,32 @@ impl StatsDb {
         keep_aggregates: bool,
         rollup_client_names: bool,
     ) -> Result<u64, StatsError> {
-        let deleted = if keep_aggregates {
+        let (deleted, total_deleted) = if keep_aggregates {
             let report = self
                 .rollup_and_delete_range(i64::MIN, i64::MAX, rollup_client_names)
                 .await?;
-            report.deleted_records
+            (report.deleted_records, report.deleted_records)
         } else {
+            // Delete both tables atomically so a crash cannot leave the
+            // detailed log empty while identifiable rollups survive.
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             let deleted = sqlx::query("DELETE FROM query_log")
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?
                 .rows_affected();
-            sqlx::query("DELETE FROM stats_hourly")
-                .execute(&self.pool)
-                .await?;
+            let rollups = sqlx::query("DELETE FROM stats_hourly")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
             sqlx::query("DELETE FROM stats_watermark WHERE key = 'hourly_aggregation'")
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
-            deleted
+            tx.commit().await?;
+            (deleted, deleted.saturating_add(rollups))
         };
 
         self.invalidate_stats_cache();
-        if deleted >= VACUUM_MIN_DELETED_ROWS
+        if total_deleted >= VACUUM_MIN_DELETED_ROWS
             && let Err(e) = self.vacuum().await
         {
             tracing::warn!(error = %e, "stats clear vacuum failed");
@@ -1664,45 +1868,59 @@ impl StatsDb {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let retention_ms = i64::from(retention_days) * 24 * 3600 * 1000;
         let cutoff = now_ms.saturating_sub(retention_ms);
-        let batch_limit = i64::try_from(RETENTION_HOURS_PER_BATCH).unwrap_or(24);
 
         let mut report = RetentionReport::default();
 
-        // Discover a bounded set of expired hour buckets, process each in its
-        // own transaction, then repeat. This keeps both memory and the write
-        // lock duration bounded even for a multi-year backlog.
+        // Find the next expired timestamp with an index seek (`MIN(ts)` over
+        // `idx_ql_ts`), process that hour in row-bounded id chunks, then repeat.
+        // This avoids a full `GROUP BY hour` scan of the whole expired range on
+        // every batch and keeps each write transaction short.
         loop {
-            let hours = sqlx::query(
-                r"
-                SELECT (ts / 3600000) * 3600000 AS hour
-                FROM query_log
-                WHERE ts < ?
-                GROUP BY hour
-                ORDER BY hour ASC
-                LIMIT ?
-                ",
-            )
-            .bind(cutoff)
-            .bind(batch_limit)
-            .fetch_all(&self.pool)
-            .await?;
+            let next_ts: Option<i64> =
+                sqlx::query_scalar("SELECT MIN(ts) FROM query_log WHERE ts < ?")
+                    .bind(cutoff)
+                    .fetch_one(&self.pool)
+                    .await?;
+            let Some(next_ts) = next_ts else { break };
 
-            if hours.is_empty() {
+            let hour = (next_ts / 3_600_000) * 3_600_000;
+            let end = hour.saturating_add(3_600_000).min(cutoff);
+            if end <= hour {
                 break;
             }
 
-            for row in hours {
-                let hour: i64 = row.get("hour");
-                let end = hour.saturating_add(3_600_000).min(cutoff);
-                if end <= hour {
-                    continue;
-                }
+            let mut id_start = i64::MIN;
+            loop {
+                // The id of the row just past this chunk, if any. Rows are
+                // ordered by id within the hour so a busy hour is split into
+                // at most RETENTION_ROWS_PER_CHUNK rows per transaction.
+                let boundary: Option<i64> = sqlx::query_scalar(
+                    r"
+                    SELECT id FROM query_log
+                    WHERE ts >= ? AND ts < ? AND id >= ?
+                    ORDER BY id ASC
+                    LIMIT 1 OFFSET ?
+                    ",
+                )
+                .bind(hour)
+                .bind(end)
+                .bind(id_start)
+                .bind(RETENTION_ROWS_PER_CHUNK.saturating_sub(1))
+                .fetch_optional(&self.pool)
+                .await?;
+                let (id_end, done) = boundary.map_or((i64::MAX, true), |id| (id, false));
+
                 let chunk = self
-                    .rollup_and_delete_range(hour, end, rollup_client_names)
+                    .rollup_and_delete_chunk(hour, end, id_start, id_end, rollup_client_names)
                     .await?;
                 report.aggregated_hours += chunk.aggregated_hours;
                 report.deleted_records += chunk.deleted_records;
                 report.chunks += 1;
+
+                if done {
+                    break;
+                }
+                id_start = id_end.saturating_add(1);
             }
         }
 
@@ -1723,7 +1941,11 @@ impl StatsDb {
         }
 
         self.invalidate_stats_cache();
-        self.record_retention_success(now_ms).await?;
+        if let Err(e) = self.record_retention_success(now_ms).await {
+            // The sweep itself committed; a marker write failure must not turn
+            // a successful deletion into a failed sweep.
+            tracing::warn!(error = %e, "failed to record stats retention success marker");
+        }
         Ok(report)
     }
 
@@ -1773,6 +1995,18 @@ impl StatsDb {
         end: i64,
         rollup_client_names: bool,
     ) -> Result<RetentionReport, StatsError> {
+        self.rollup_and_delete_chunk(start, end, i64::MIN, i64::MAX, rollup_client_names)
+            .await
+    }
+
+    async fn rollup_and_delete_chunk(
+        &self,
+        start: i64,
+        end: i64,
+        id_start: i64,
+        id_end: i64,
+        rollup_client_names: bool,
+    ) -> Result<RetentionReport, StatsError> {
         // `BEGIN IMMEDIATE` takes the write lock up front so concurrent writers
         // wait instead of failing the aggregate/delete with `SQLITE_BUSY`.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1787,12 +2021,14 @@ impl StatsDb {
                 MAX(id) as max_id,
                 MAX(ts) as max_ts
             FROM query_log
-            WHERE ts >= ? AND ts < ?
+            WHERE ts >= ? AND ts < ? AND id >= ? AND id <= ?
             GROUP BY hour
             ",
         )
         .bind(start)
         .bind(end)
+        .bind(id_start)
+        .bind(id_end)
         .fetch_all(&mut *tx)
         .await?;
 
@@ -1802,7 +2038,7 @@ impl StatsDb {
             .collect();
         let mut rollups: HashMap<i64, HourRollup> = HashMap::new();
         if !affected_hours.is_empty() {
-            collect_hour_rollups(&mut tx, start, end, &mut rollups).await?;
+            collect_hour_rollups(&mut tx, start, end, id_start, id_end, &mut rollups).await?;
         }
         let existing_rollups = load_existing_rollups(&mut tx, &affected_hours).await?;
 
@@ -1888,11 +2124,14 @@ impl StatsDb {
 
         // Delete exactly the rows that were aggregated above (same predicate in
         // the same transaction).
-        let del_res = sqlx::query("DELETE FROM query_log WHERE ts >= ? AND ts < ?")
-            .bind(start)
-            .bind(end)
-            .execute(&mut *tx)
-            .await?;
+        let del_res =
+            sqlx::query("DELETE FROM query_log WHERE ts >= ? AND ts < ? AND id >= ? AND id <= ?")
+                .bind(start)
+                .bind(end)
+                .bind(id_start)
+                .bind(id_end)
+                .execute(&mut *tx)
+                .await?;
 
         // Record the highest timestamp/id processed for observability. The
         // watermark is informational now that aggregation and deletion share a

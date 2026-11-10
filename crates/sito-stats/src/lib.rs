@@ -940,7 +940,7 @@ mod tests {
             .find(|c| c.client_name.as_deref() == Some("archived-host"))
             .expect("archived client must be merged into a long window");
         assert!(
-            archived.client_ip.starts_with("b3:"),
+            archived.client_ip.starts_with("blake3:"),
             "rollup client IP must be a keyed hash, got {}",
             archived.client_ip
         );
@@ -1483,7 +1483,7 @@ mod tests {
             let tops: Vec<(String, Option<String>, i64, i64, i64)> =
                 serde_json::from_str(payload).unwrap();
             assert_eq!(tops.len(), 1);
-            assert!(tops[0].0.starts_with("b3:"));
+            assert!(tops[0].0.starts_with("blake3:"));
             assert!(tops[0].1.is_none(), "names are opt-in");
             hashes.push(tops[0].0.clone());
         }
@@ -1494,7 +1494,7 @@ mod tests {
 
         let clients = db.get_client_stats(365 * 86_400_000).await.unwrap();
         assert_eq!(clients.len(), 1);
-        assert!(clients[0].client_ip.starts_with("b3:"));
+        assert!(clients[0].client_ip.starts_with("blake3:"));
         assert!(clients[0].client_name.is_none());
     }
 
@@ -1740,7 +1740,7 @@ mod tests {
             .unwrap();
         assert!(!payload.contains("10.9.9.9"));
         assert!(!payload.contains("legacy-host"));
-        assert!(payload.contains("b3:"));
+        assert!(payload.contains("blake3:"));
 
         // The new metadata table exists but is not recorded as a sqlx
         // migration, so an old 1.9.3 migrator does not see an unknown version.
@@ -1756,9 +1756,15 @@ mod tests {
                 .fetch_all(db.pool())
                 .await
                 .unwrap();
-        assert!(
-            versions.iter().all(|v| *v <= 20_260_922_000_000),
-            "no new sqlx migration version may be visible to 1.9.3: {versions:?}"
+        assert_eq!(
+            versions,
+            vec![
+                20_260_905_000_000i64,
+                20_260_906_000_000,
+                20_260_913_000_000,
+                20_260_922_000_000,
+            ],
+            "no new sqlx migration version may be visible to 1.9.3"
         );
 
         // Old 1.9.3-style access (old columns only) still works.
@@ -1823,5 +1829,325 @@ mod tests {
 
         drop(db);
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    async fn create_legacy_db(path: &std::path::Path) -> sqlx::SqlitePool {
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        for sql in [
+            include_str!("../migrations/20260905000000_init.sql"),
+            include_str!("../migrations/20260906000000_watermark.sql"),
+            include_str!("../migrations/20260913000000_client_ip_index.sql"),
+        ] {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        }
+        pool
+    }
+
+    /// P1-19 Important 2: a real IPv6 literal with the legacy `b3:` prefix must
+    /// still be hashed, not mistaken for a stored digest.
+    #[tokio::test]
+    async fn test_b3_ipv6_literal_is_hashed_not_treated_as_digest() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut entry = retention_entry(
+            now - 100 * 86_400_000,
+            "ipv6-prefix.example",
+            "allowed",
+            None,
+        );
+        entry.client_ip = "b3::1".into();
+        db.insert_batch(&[entry]).await.unwrap();
+        db.cleanup_retention(90).await.unwrap();
+
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            !payload.contains("\"b3::1\""),
+            "IPv6 literal must not be stored raw: {payload}"
+        );
+        let tops: Vec<(String, Option<String>, i64, i64, i64)> =
+            serde_json::from_str(&payload).unwrap();
+        assert!(tops[0].0.starts_with("blake3:"));
+    }
+
+    /// P1-19 Important 3: malformed legacy payloads are neutralized before the
+    /// backfill marker is written.
+    #[tokio::test]
+    async fn test_backfill_neutralizes_malformed_rollup_payload() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-stats-malformed-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let pool = create_legacy_db(&db_path).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let hour = ((now - 100 * 86_400_000) / 3_600_000) * 3_600_000;
+        sqlx::query(
+            "INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients) \
+             VALUES (?, 5, 1, 0, '[]', ?)",
+        )
+        .bind(hour)
+        .bind("not-json 10.9.9.9 legacy-host")
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = StatsDb::open(&db_path).await.unwrap();
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(payload, "[]", "malformed payload must be neutralized");
+        let marker: Option<String> =
+            sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'rollup_pii_v1'")
+                .fetch_optional(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(marker.as_deref(), Some("1"));
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-19 Important 4: switching `rollup_client_names` true -> false scrubs
+    /// names from already-written rollups on the next startup.
+    #[tokio::test]
+    async fn test_rollup_client_names_true_to_false_scrubs_existing_names() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito-stats-name-transition-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut entry = retention_entry(now - 100 * 86_400_000, "names.example", "allowed", None);
+        entry.client_ip = "10.7.7.7".into();
+        entry.client_name = Some("named-device".into());
+
+        {
+            let db = StatsDb::open_with_rollup_client_names(&db_path, true)
+                .await
+                .unwrap();
+            db.insert_batch(&[entry]).await.unwrap();
+            db.cleanup_retention(90).await.unwrap();
+            let payload: String =
+                sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert!(payload.contains("named-device"));
+        }
+
+        let db = StatsDb::open_with_rollup_client_names(&db_path, false)
+            .await
+            .unwrap();
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(!payload.contains("named-device"));
+        assert!(!payload.contains("10.7.7.7"));
+        assert!(payload.contains("blake3:"));
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-19: names are preserved by a legacy backfill when explicitly enabled.
+    #[tokio::test]
+    async fn test_backfill_preserves_names_when_enabled() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito-stats-backfill-names-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let pool = create_legacy_db(&db_path).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let hour = ((now - 100 * 86_400_000) / 3_600_000) * 3_600_000;
+        sqlx::query(
+            "INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients) \
+             VALUES (?, 5, 1, 0, '[]', ?)",
+        )
+        .bind(hour)
+        .bind(r#"[["10.9.9.9","legacy-host",5,1,123]]"#)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = StatsDb::open_with_rollup_client_names(&db_path, true)
+            .await
+            .unwrap();
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(payload.contains("legacy-host"));
+        assert!(!payload.contains("10.9.9.9"));
+        assert!(payload.contains("blake3:"));
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-19: the salt persists across restarts and a corrupt salt is rejected.
+    #[tokio::test]
+    async fn test_salt_persists_and_corrupt_salt_is_rejected() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-stats-salt-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let salt_path = temp_dir.join("stats-salt");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut entry = retention_entry(now - 100 * 86_400_000, "salt.example", "allowed", None);
+        entry.client_ip = "10.6.6.6".into();
+
+        let first_hash = {
+            let db = StatsDb::open(&db_path).await.unwrap();
+            db.insert_batch(&[entry.clone()]).await.unwrap();
+            db.cleanup_retention(90).await.unwrap();
+            let payload: String =
+                sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            let tops: Vec<(String, Option<String>, i64, i64, i64)> =
+                serde_json::from_str(&payload).unwrap();
+            tops[0].0.clone()
+        };
+        assert_eq!(std::fs::metadata(&salt_path).unwrap().len(), 32);
+
+        {
+            let db = StatsDb::open(&db_path).await.unwrap();
+            let mut second = entry;
+            second.ts += 3_600_000;
+            db.insert_batch(&[second]).await.unwrap();
+            db.cleanup_retention(90).await.unwrap();
+            let payloads: Vec<String> =
+                sqlx::query_scalar("SELECT top_clients FROM stats_hourly ORDER BY hour")
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap();
+            let hashes: Vec<String> = payloads
+                .iter()
+                .map(|payload| {
+                    let tops: Vec<(String, Option<String>, i64, i64, i64)> =
+                        serde_json::from_str(payload).unwrap();
+                    tops[0].0.clone()
+                })
+                .collect();
+            assert!(hashes.iter().all(|hash| hash == &first_hash));
+        }
+
+        std::fs::write(&salt_path, [0u8; 31]).unwrap();
+        assert!(
+            StatsDb::open(&db_path).await.is_err(),
+            "a short salt must be rejected instead of silently regenerated"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-19: default clear vacuums a large deletion and keeps
+    /// `secure_delete=ON`.
+    #[tokio::test]
+    async fn test_clear_query_log_vacuums_and_secure_delete_is_on() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-stats-clear-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let db = StatsDb::open(&db_path).await.unwrap();
+
+        let padding = "x".repeat(200);
+        let old_ts = 1_000_000_000_000i64;
+        let mut entries = Vec::new();
+        for i in 0..3_000i64 {
+            let mut entry = retention_entry(old_ts + i, "clear.test", "allowed", None);
+            entry.rule = Some(format!("{padding}-{i}"));
+            entries.push(entry);
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let before = db.db_size_bytes().await.unwrap();
+        let deleted = db.delete_query_logs().await.unwrap();
+        assert_eq!(deleted, 3_000);
+        let after = db.db_size_bytes().await.unwrap();
+        assert!(
+            after < before,
+            "large clear must vacuum (before={before}, after={after})"
+        );
+
+        let secure_delete: i64 = sqlx::query_scalar("PRAGMA secure_delete")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(secure_delete, 1, "secure_delete must be enabled");
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-24 Important 7: a single busy hour is sub-chunked by row count.
+    #[tokio::test]
+    async fn test_large_single_hour_is_row_bounded() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let hour = ((now - 200 * 86_400_000) / 3_600_000) * 3_600_000;
+        let mut entries = Vec::new();
+        for i in 0..12_000i64 {
+            entries.push(retention_entry(
+                hour + i,
+                "busy-hour.example",
+                "allowed",
+                None,
+            ));
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let report = db
+            .cleanup_retention_with_policy(90, 365, false)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_records, 12_000);
+        assert!(
+            report.chunks >= 3,
+            "a busy hour must be split into row-bounded chunks, got {}",
+            report.chunks
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_log")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    /// P1-24 Important 5: hour discovery uses the `ts` index instead of a
+    /// full-range `GROUP BY` scan.
+    #[tokio::test]
+    async fn test_retention_hour_discovery_uses_ts_index() {
+        use sqlx::Row;
+        let db = StatsDb::in_memory().await.unwrap();
+        let rows = sqlx::query("EXPLAIN QUERY PLAN SELECT MIN(ts) FROM query_log WHERE ts < ?")
+            .bind(0i64)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        let plan = rows
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains("idx_ql_ts"),
+            "hour discovery must use idx_ql_ts: {plan}"
+        );
     }
 }

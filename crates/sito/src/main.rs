@@ -164,9 +164,11 @@ async fn main() -> anyhow::Result<()> {
             Commands::ClearQueryLog {
                 config,
                 keep_aggregates,
+                force,
             } => {
                 let config_path = config.unwrap_or(default_config_path.clone());
-                if let Err(e) = sito::cli::run_clear_query_log(&config_path, keep_aggregates).await
+                if let Err(e) =
+                    sito::cli::run_clear_query_log(&config_path, keep_aggregates, force).await
                 {
                     eprintln!("{e}");
                     std::process::exit(1);
