@@ -19,7 +19,7 @@ published.
 | `build-binaries` | All three release archives build (x86_64, aarch64, armv7) and `contrib/install.sh` passes shellcheck. | `verify-tag`, `release-gate` |
 | `sbom-and-release` | `SHA256SUMS`, the SPDX SBOM, and cosign keyless signatures are generated and published as a GitHub release. | `verify-tag`, `release-gate`, `build-binaries` |
 | `artifact-e2e` | The published release is downloadable; checksums, the cosign identity (`release.yml@refs/tags/*`), `sito --version`, and `sito check-config` all pass. | `sbom-and-release` |
-| `docker-build-push` | The multi-arch image is pushed; its digest, platform list, tags, provenance, and SBOM are verified; the digest is scanned by a digest-pinned Trivy (HIGH/CRITICAL gate) and signed/verified with cosign keyless signing. | `verify-tag`, `release-gate`, `build-binaries`, `sbom-and-release`, `artifact-e2e` |
+| `docker-build-push` | The multi-arch image is pushed; its digest, platform list, tags, provenance, and SBOM are verified; the digest is scanned by a digest-pinned Trivy (fixed HIGH/CRITICAL gate; unfixed findings are ignored) and signed/verified with cosign keyless signing. | `verify-tag`, `release-gate`, `build-binaries`, `sbom-and-release`, `artifact-e2e` |
 
 Consequences:
 

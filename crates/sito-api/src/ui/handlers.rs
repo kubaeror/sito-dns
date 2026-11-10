@@ -24,7 +24,7 @@ use crate::error::ProblemDetails;
 use crate::handlers::auth_handlers::{
     user_mutation_problem, validate_password_policy, validate_username,
 };
-use crate::models::{FilterListDto, StatusResponse};
+use crate::models::{AcmeStatus, FilterListDto, StatusResponse};
 use crate::probe::probe_upstream_target;
 use crate::state::ServerContext;
 use crate::ui::templates::{
@@ -323,11 +323,21 @@ fn get_status_response(ctx: &ServerContext) -> StatusResponse {
             listeners.push(format!("{bind}:{} (DoH)", cfg.dns.doh_port));
         }
     }
+    let acme_readiness = ctx.acme_readiness(&cfg);
+    let acme = acme_readiness.enabled.then(|| AcmeStatus {
+        enabled: acme_readiness.enabled,
+        ready: acme_readiness.ready,
+        http01_available: acme_readiness.http01_available,
+        tls_alpn_available: acme_readiness.tls_alpn_available,
+        reason: acme_readiness.reason.map(str::to_string),
+        last_error: acme_readiness.last_error,
+    });
     StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: uptime,
         role: cfg.server.role.clone(),
         listeners,
+        acme,
     }
 }
 
@@ -3345,6 +3355,7 @@ mod tests {
             slave_tracker: None,
             resync_sender: None,
             setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            acme_challenges: None,
             dns_starter: None,
         }
     }

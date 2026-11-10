@@ -643,6 +643,17 @@ async fn apply_inner(
         hooks.apply(cfg, &clients).await?;
     }
 
+    // A DNSSEC mode/validate/anchor/NTA change invalidates every cached
+    // validation decision. The hook above already installed the new validator;
+    // advancing the cache policy epoch immediately makes every old entry
+    // invisible and rejects inserts from queries that captured the old epoch
+    // before the swap. Do this before the filter reload so no query can serve
+    // an old-policy validation decision after the validator swap.
+    if previous_dnssec != cfg.dns.dnssec {
+        ctx.cache.advance_policy_epoch();
+        ctx.cache.flush();
+    }
+
     // 4. Filter engine last (unless the caller queues the list fetch), so the
     //    filter snapshot always corresponds to an already-published runtime
     //    configuration. A reload failure keeps the previous snapshot and
@@ -656,14 +667,6 @@ async fn apply_inner(
             })?;
         ctx.metrics.set_filter_rules(ctx.filter.rule_count());
         // Filter rules changed: drop cached answers that may now be blocked.
-        ctx.cache.flush();
-    }
-
-    // A DNSSEC mode/validate/anchor/NTA change invalidates every cached
-    // validation decision. Without this, an entry validated under the old
-    // policy would keep being served (Secure with AD=1 after an anchor was
-    // removed, or Unchecked after validation was enabled).
-    if previous_dnssec != cfg.dns.dnssec {
         ctx.cache.flush();
     }
 
@@ -777,9 +780,22 @@ pub fn restart_required_fields(old: &Config, new: &Config) -> Vec<String> {
         "web",
         &mut fields,
     );
-    // TLS/ACME material feeds the listener acceptors built at startup.
-    mark(old.tls != new.tls, "tls", &mut fields);
-    mark(old.acme != new.acme, "acme", &mut fields);
+    // TLS/ACME material feeds the listener acceptors built at startup. Compare
+    // the effective configuration (`dns.tls` wins over top-level `[tls]`;
+    // `[acme]` wins over legacy `[web] acme_*`) and the raw top-level aliases,
+    // so editing either alias is reported even when the other is unchanged.
+    mark(
+        old.get_tls_config() != new.get_tls_config()
+            || old.dns.tls != new.dns.tls
+            || old.tls != new.tls,
+        "tls",
+        &mut fields,
+    );
+    mark(
+        old.get_acme_config() != new.get_acme_config() || old.acme != new.acme,
+        "acme",
+        &mut fields,
+    );
     // HA workers and integrations are initialized at startup.
     mark(old.ha != new.ha, "ha", &mut fields);
     mark(
@@ -1117,6 +1133,66 @@ mod tests {
             restart_required_fields(&old, &new2).is_empty(),
             "changing only the DoH hostname must not require a restart: {:?}",
             restart_required_fields(&old, &new2)
+        );
+    }
+
+    /// `[dns.tls]` is the effective TLS source (top-level `[tls]` is the
+    /// alias). Both must be restart-required, as must legacy `[web] acme_*`
+    /// keys resolved through `get_acme_config()`.
+    #[test]
+    fn test_restart_required_tracks_effective_tls_and_legacy_acme() {
+        let old = Config::default();
+
+        let mut dns_tls = old.clone();
+        dns_tls.dns.tls = Some(
+            toml::from_str::<sito_core::config::TlsConfig>(
+                r#"
+                cert = "/etc/sito/new-cert.pem"
+                key = "/etc/sito/new-key.pem"
+                "#,
+            )
+            .unwrap(),
+        );
+        assert!(
+            restart_required_fields(&old, &dns_tls)
+                .iter()
+                .any(|field| field == "tls"),
+            "[dns.tls] changes feed the startup TLS acceptors"
+        );
+
+        let mut top_level_tls = old.clone();
+        top_level_tls.tls = dns_tls.dns.tls.clone();
+        assert!(
+            restart_required_fields(&old, &top_level_tls)
+                .iter()
+                .any(|field| field == "tls"),
+            "top-level [tls] is still a supported alias and requires a restart"
+        );
+
+        let mut legacy_acme = old.clone();
+        legacy_acme.web = Some(
+            toml::from_str::<toml::Value>(
+                r#"
+                acme_enabled = true
+                acme_domains = ["dns.example.com"]
+                "#,
+            )
+            .unwrap(),
+        );
+        assert!(
+            restart_required_fields(&old, &legacy_acme)
+                .iter()
+                .any(|field| field == "acme"),
+            "legacy [web] acme_* keys are resolved by get_acme_config() and must be restart-required"
+        );
+
+        // An unrelated [web] change remains hot-applied.
+        let mut unrelated_web = old.clone();
+        unrelated_web.web =
+            Some(toml::from_str::<toml::Value>(r#"trusted_proxies = ["10.0.0.1"]"#).unwrap());
+        assert_eq!(
+            restart_required_fields(&old, &unrelated_web),
+            Vec::<String>::new()
         );
     }
 

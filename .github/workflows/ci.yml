@@ -165,6 +165,8 @@ jobs:
         run: git diff --exit-code docs/openapi.json
       - name: Verify configuration reference matches the config structs
         run: python3 scripts/check_config_reference.py --github
+      - name: Verify best-effort error swallowing is reviewed
+        run: bash scripts/check-error-swallowing.sh
 
   openapi:
     name: openapi

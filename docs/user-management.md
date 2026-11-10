@@ -339,13 +339,24 @@ enrollment flow (QR code, secret, and one-time backup codes); the REST API can
 be used instead. API bearer tokens cannot manage TOTP — a real user session is
 required.
 
+> **CSRF for session-cookie scripts.** The curl examples below authenticate
+> with the `sito_session` cookie, so every mutating request also needs the
+> session-bound double-submit token. Read the non-HttpOnly `sito_csrf` cookie
+> from the login response and send it both as a cookie and as
+> `X-CSRF-Token`; also send an `Origin` header matching the configured admin
+> URL (missing `Origin` fails closed for cookie sessions). Bearer-token clients
+> are not browser-ambient and do not need the cookie/CSRF pair, but API tokens
+> cannot manage TOTP.
+
 1. Re-authenticate for a short-lived ticket (5 minutes). The current password is
    required; when TOTP is already enabled, a current TOTP or backup code is
    required too:
 
    ```bash
    curl -sS -X POST "$SITO/api/v1/auth/reauth" \
-     -H "Cookie: sito_session=<session-id>" \
+     -H "Origin: $SITO" \
+     -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
+     -H "X-CSRF-Token: <csrf-token>" \
      -H 'Content-Type: application/json' \
      -d '{"password":"NewCorrectHorse2","code":"123456"}'
    ```
@@ -356,7 +367,9 @@ required.
 2. Start setup with the ticket in `X-Reauth-Token`:
 
    ```bash
-   curl -sS -H "Cookie: sito_session=<session-id>" \
+   curl -sS -H "Origin: $SITO" \
+     -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
+     -H "X-CSRF-Token: <csrf-token>" \
      -H "X-Reauth-Token: <reauth-token>" \
      "$SITO/api/v1/auth/totp/setup"
    ```
@@ -369,7 +382,9 @@ required.
 
    ```bash
    curl -sS -X POST "$SITO/api/v1/auth/totp/enable" \
-     -H "Cookie: sito_session=<session-id>" \
+     -H "Origin: $SITO" \
+     -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
+     -H "X-CSRF-Token: <csrf-token>" \
      -H "X-Reauth-Token: <reauth-token>" \
      -H 'Content-Type: application/json' \
      -d '{"code":"123456"}'
@@ -391,7 +406,9 @@ required.
 
    ```bash
    curl -sS -X POST "$SITO/api/v1/auth/totp/disable" \
-     -H "Cookie: sito_session=<session-id>" \
+     -H "Origin: $SITO" \
+     -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
+     -H "X-CSRF-Token: <csrf-token>" \
      -H "X-Reauth-Token: <reauth-token>" \
      -H 'Content-Type: application/json' \
      -d '{"password":"NewCorrectHorse2","code":"123456"}'

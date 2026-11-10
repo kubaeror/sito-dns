@@ -20,7 +20,7 @@ use sito_core::verdict::{BlockReason, RewriteAction, RuleRef, Verdict};
 use sito_proto::normalize_domain;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
@@ -808,6 +808,11 @@ pub struct HostsFilterEngine {
     /// Incremented whenever `list_rules` changes. A group rebuild that started
     /// from an older generation must not publish its stale snapshot.
     list_generation: AtomicU64,
+    /// True when `clients.groups.*` contributes non-blank custom rules. The
+    /// global `filtering.lists`/`custom_rules` may be empty in a group-only
+    /// deployment; that must not mark the engine unavailable or fail every
+    /// query closed.
+    group_sources_configured: AtomicBool,
 }
 
 impl HostsFilterEngine {
@@ -833,6 +838,7 @@ impl HostsFilterEngine {
             compile_observer: std::sync::RwLock::new(None),
             status_observer: std::sync::RwLock::new(None),
             list_generation: AtomicU64::new(0),
+            group_sources_configured: AtomicBool::new(false),
         }
     }
 
@@ -873,6 +879,18 @@ impl HostsFilterEngine {
     /// from the currently loaded lists. Called whenever clients/group policy or
     /// blocklists are (re)loaded.
     pub fn set_group_rules(&self, groups: Vec<GroupRuleSet>) {
+        // A group `lists` entry only selects a globally configured list; it is
+        // not an independent source (and an unloaded/disabled global list
+        // yields no rules). Only group `custom_rules` can make an otherwise
+        // source-less configuration non-empty.
+        let has_group_sources = groups.iter().any(|group| {
+            group
+                .custom_rules
+                .iter()
+                .any(|rule| !rule.trim().is_empty())
+        });
+        self.group_sources_configured
+            .store(has_group_sources, Ordering::Release);
         self.group_defs.store(Arc::new(groups));
         let list_rules = self
             .list_rules
@@ -1096,7 +1114,26 @@ impl HostsFilterEngine {
         data_dir: PathBuf,
         observer: Option<CompileObserver>,
     ) -> Self {
+        Self::init_with_observer_and_group_sources(config, data_dir, observer, false).await
+    }
+
+    /// Initializes and loads lists, knowing whether client groups contribute
+    /// rules before the first reload runs.
+    ///
+    /// The server loads `[clients]` after the filter engine, so without this
+    /// hint a group-only configuration (global `filtering.lists` empty but
+    /// `clients.groups.*.custom_rules` non-empty) would be marked unavailable
+    /// and fail every query closed until a later reload.
+    pub async fn init_with_observer_and_group_sources(
+        config: FilteringConfig,
+        data_dir: PathBuf,
+        observer: Option<CompileObserver>,
+        has_group_sources: bool,
+    ) -> Self {
         let engine = Self::new(config, data_dir);
+        engine
+            .group_sources_configured
+            .store(has_group_sources, Ordering::Release);
         if let Some(observer) = observer {
             engine.set_compile_observer(observer);
         }
@@ -1220,7 +1257,8 @@ impl HostsFilterEngine {
             || config
                 .custom_rules
                 .iter()
-                .any(|rule| !rule.trim().is_empty());
+                .any(|rule| !rule.trim().is_empty())
+            || self.group_sources_configured.load(Ordering::Acquire);
         if !has_source {
             let prev_count = self.snapshot.load().rule_count;
             if prev_count > 0 && !self.snapshot.load().unavailable {
@@ -1537,7 +1575,14 @@ impl HostsFilterEngine {
         let loaded_lists = count_loaded_lists(&fetched_lists, &failed_lists);
 
         let prev_count = self.snapshot.load().rule_count;
-        if count == 0 && !allow_empty {
+        // A group-only configuration legitimately has zero global rules while
+        // `set_group_rules`/`rebuild_group_snapshots` holds the effective
+        // rules. Publishing an empty *base* snapshot is safe because the
+        // pipeline also evaluates the group snapshot; it is not an
+        // enabled-but-empty engine (that path keeps `unavailable = false` and
+        // group matching still applies per client).
+        let group_sources = self.group_sources_configured.load(Ordering::Acquire);
+        if count == 0 && !allow_empty && !group_sources {
             // No usable rules were produced. This covers an empty/HTML/zero
             // list on a reload as well as a comment-only source: never publish
             // an empty snapshot that would silently disable filtering.
@@ -1618,7 +1663,7 @@ impl HostsFilterEngine {
             return Ok(prev_count);
         }
 
-        if count == 0 && !failed_lists.is_empty() && prev_count == 0 {
+        if count == 0 && !failed_lists.is_empty() && prev_count == 0 && !group_sources {
             let details = format!(
                 "all {} configured filter source(s) failed to load: {}",
                 failed_lists.len(),
@@ -3001,6 +3046,67 @@ mod tests {
             "the previous snapshot must remain active"
         );
         assert!(engine.evaluate(&probe, RecordType::A, &client).is_allowed());
+    }
+
+    /// A group-only configuration (no global lists/custom rules, but group
+    /// `custom_rules`) must initialize as a usable empty base snapshot instead
+    /// of fail-closed/unavailable, and the group rules must block.
+    #[tokio::test]
+    async fn test_group_only_custom_rules_are_sources() {
+        let temp_dir = std::env::temp_dir().join(format!("sito_group_only_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let config = FilteringConfig {
+            enabled: true,
+            fail_closed: true,
+            lists: Vec::new(),
+            custom_rules: Vec::new(),
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init_with_observer_and_group_sources(
+            config,
+            temp_dir.clone(),
+            None,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            engine.state(),
+            FilterState::Ready,
+            "group custom rules are a source even with empty globals"
+        );
+        assert!(
+            !engine.unavailable_for_fail_closed(),
+            "a group-only deployment must not fail closed for every query"
+        );
+
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: Vec::new(),
+            custom_rules: vec!["||fortnite.example^".to_string()],
+        }]);
+        let snapshot = engine
+            .group_snapshot("kids")
+            .expect("group-only snapshot compiled");
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(matches!(
+            snapshot.evaluate("fortnite.example", RecordType::A, &client),
+            Verdict::Block(_)
+        ));
+        assert!(
+            engine
+                .evaluate(
+                    &Name::from_str("example.org.").unwrap(),
+                    RecordType::A,
+                    &client
+                )
+                .is_allowed(),
+            "queries outside the group must still resolve"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     /// Regression: group `lists`/`custom_rules` must actually be compiled and

@@ -74,6 +74,7 @@ use utoipa::OpenApi;
             crate::handlers::update::ApplyUpdateResponse,
             crate::handlers::update::ApplyUpdatePayload,
             crate::models::StatusResponse,
+            crate::models::AcmeStatus,
             crate::models::StatsQuery,
             crate::models::FilterStatusDto,
             crate::models::FilterListDto,

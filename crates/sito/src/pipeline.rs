@@ -305,10 +305,18 @@ fn validation_status(outcome: Option<&sito_dnssec::ValidationOutcome>) -> Valida
 /// Whether a cached entry may be served while local validation is active.
 ///
 /// `Unchecked` entries (CD=1 / validation disabled) must never be served when
-/// a CD=0 query expects the resolver to have validated the answer. Insecure
-/// and Indeterminate entries are legitimate but are always served with AD=0.
+/// a CD=0 query expects the resolver to have validated the answer.
+/// `Indeterminate` is not an authenticated decision either: in log-only mode a
+/// Bogus result is recorded that way, and strict mode answers it with SERVFAIL
+/// rather than serving the data. Only an authenticated `Secure`/`Insecure`
+/// decision may be served; both are returned with AD cleared when not
+/// `Secure`.
 fn cache_entry_servable(status: ValidationStatus, validation_active: bool) -> bool {
-    !validation_active || status != ValidationStatus::Unchecked
+    !validation_active
+        || matches!(
+            status,
+            ValidationStatus::Secure | ValidationStatus::Insecure
+        )
 }
 
 /// Whether a *stale* (RFC 8767) entry may be served while local validation is
@@ -1179,12 +1187,12 @@ impl DnsPipeline {
 
     /// Cache lookup honouring the stored validation status.
     ///
-    /// While local validation is active, an `Unchecked` entry must never be
-    /// served (it was cached by a CD=1 query or while validation was off).
-    /// `Insecure`/`Indeterminate` entries are legitimate answers for unsigned
-    /// or inconclusive data: they are served to DNSSEC-aware clients with AD=0
-    /// instead of forcing an upstream re-resolution. DO=0 clients additionally
-    /// never see DNSSEC records.
+    /// While local validation is active, only an authenticated
+    /// `Secure`/`Insecure` decision may be served. `Unchecked` (CD=1 or
+    /// validation disabled) and `Indeterminate` (inconclusive, or Bogus in
+    /// log-only mode) entries force an upstream re-resolution so strict mode
+    /// can fail closed. `Insecure` answers are served with AD=0; DO=0 clients
+    /// additionally never see DNSSEC records.
     async fn cached_response(
         &self,
         cache_query: &Message,
@@ -1249,6 +1257,9 @@ impl DnsPipeline {
             // so a CD=1 query cannot poison cached answers for CD=0 clients.
             bg_query.metadata.checking_disabled = false;
             let bg_wants_dnssec = query_has_do(&bg_query);
+            // Same ordering rule as the query path: read the epoch before the
+            // validator so a reload always wins against an in-flight refresh.
+            let bg_policy_epoch = self.cache.policy_epoch();
             let dnssec_mode = self.dnssec.load().mode;
             let bg_validator = if dnssec_mode == sito_dnssec::DnssecMode::Disabled {
                 None
@@ -1295,7 +1306,7 @@ impl DnsPipeline {
                     || resp.metadata.response_code == ResponseCode::NXDomain
                 {
                     bg_cache
-                        .insert_with_status(&bg_query, &resp, bg_status)
+                        .insert_with_status_at_epoch(&bg_query, &resp, bg_status, bg_policy_epoch)
                         .await;
                 }
             });
@@ -1438,6 +1449,12 @@ impl QueryHandler for DnsPipeline {
                 return QueryOutcome::notimp(&query, domain_str, qtype);
             }
 
+            // Capture the cache policy epoch before loading the validator: if
+            // a reload swaps the validator after this point, the captured
+            // epoch no longer matches and the insert is rejected. Reading the
+            // epoch first therefore cannot pair a new epoch with an old
+            // validator.
+            let cache_policy_epoch = self.cache.policy_epoch();
             let dnssec_mode = self.dnssec.load().mode;
             let validation_active = !query.metadata.checking_disabled
                 && dnssec_mode != sito_dnssec::DnssecMode::Disabled;
@@ -1869,7 +1886,12 @@ impl QueryHandler for DnsPipeline {
                             || upstream_resp.metadata.response_code == ResponseCode::NXDomain)
                     {
                         self.cache
-                            .insert_with_status(&cache_query, &upstream_resp, cache_status)
+                            .insert_with_status_at_epoch(
+                                &cache_query,
+                                &upstream_resp,
+                                cache_status,
+                                cache_policy_epoch,
+                            )
                             .await;
                         if let Some(ref m) = self.metrics {
                             m.set_cache_size_bytes(
@@ -2697,6 +2719,91 @@ mod tests {
     }
 
     /// Builds a pipeline around `upstream` with the standard test registries.
+    /// A group-only filter configuration must resolve normal queries and block
+    /// only the group's rule. Before the fix, the empty global source set made
+    /// the engine unavailable and the pipeline SERVFAILed every client.
+    #[tokio::test]
+    async fn test_group_only_filter_configuration_resolves_end_to_end() {
+        use sito_clients::{ClientEntryConfig, ClientGroupConfig, ClientsConfig};
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+        use std::collections::HashMap;
+
+        let (mock_addr, calls) = spawn_mock_upstream(None).await;
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        config.filtering.enabled = true;
+        config.filtering.fail_closed = true;
+        config.filtering.lists.clear();
+        config.filtering.custom_rules.clear();
+        config.upstream.servers = vec![mock_addr.to_string()];
+
+        let clients = ClientsConfig {
+            entries: vec![ClientEntryConfig {
+                name: "kid".to_string(),
+                ids: vec!["127.0.0.1".to_string()],
+                group: "kids".to_string(),
+                ignore_query_log: false,
+                ignore_stats: false,
+                use_global_upstreams: true,
+                upstreams: None,
+                trusted: false,
+            }],
+            groups: HashMap::from([(
+                "kids".to_string(),
+                ClientGroupConfig {
+                    custom_rules: vec!["||fortnite.example^".to_string()],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let validator = sito_dnssec::DnssecValidator::from_config(&config.dns.dnssec);
+        let (pipeline, temp_dir) =
+            build_test_pipeline_with_clients(config, upstream, validator, clients).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+        let blocked = pipeline
+            .handle(
+                rewrite_query("fortnite.example.", RecordType::A),
+                client.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            blocked.answers.iter().any(
+                |record| matches!(record.data, RData::A(A(ip)) if ip == std::net::Ipv4Addr::UNSPECIFIED)
+            ),
+            "the group custom rule must block: {blocked:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a blocked group query must not reach upstream"
+        );
+
+        let allowed = pipeline
+            .handle(rewrite_query("example.org.", RecordType::A), client)
+            .await
+            .unwrap();
+        assert_eq!(
+            allowed.metadata.response_code,
+            ResponseCode::NoError,
+            "a group-only filter must not SERVFAIL unrelated queries"
+        );
+        assert_eq!(allowed.answers.len(), 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
     async fn build_test_pipeline(
         config: Config,
         upstream: std::sync::Arc<UpstreamManager>,
@@ -2708,11 +2815,28 @@ mod tests {
     /// Builds a pipeline with a caller-supplied DNSSEC validator (used by
     /// tests that need a specific trust anchor).
     async fn build_test_pipeline_with_validator(
-        mut config: Config,
+        config: Config,
         upstream: std::sync::Arc<UpstreamManager>,
         dnssec: sito_dnssec::DnssecValidator,
     ) -> (DnsPipeline, std::path::PathBuf) {
-        use sito_clients::{ClientRegistry, ClientsConfig, ParentalRegistry, ServiceRegistry};
+        build_test_pipeline_with_clients(
+            config,
+            upstream,
+            dnssec,
+            sito_clients::ClientsConfig::default(),
+        )
+        .await
+    }
+
+    /// Builds a pipeline with an explicit client registry, compiling group
+    /// rule sets from it (used by the group-only end-to-end test).
+    async fn build_test_pipeline_with_clients(
+        mut config: Config,
+        upstream: std::sync::Arc<UpstreamManager>,
+        dnssec: sito_dnssec::DnssecValidator,
+        clients: sito_clients::ClientsConfig,
+    ) -> (DnsPipeline, std::path::PathBuf) {
+        use sito_clients::{ClientRegistry, ParentalRegistry, ServiceRegistry};
         use sito_filter::HostsFilterEngine;
         use sito_rewrites::{RewriteTable, RewritesConfig};
         use std::sync::atomic::AtomicUsize;
@@ -2727,9 +2851,22 @@ mod tests {
         config.dns.cache.enabled = true;
 
         let cache = std::sync::Arc::new(DnsCache::new(config.dns.cache.clone()));
+        let has_group_sources = clients.groups.values().any(|group| {
+            group
+                .custom_rules
+                .iter()
+                .any(|rule| !rule.trim().is_empty())
+        });
         let filter = std::sync::Arc::new(
-            HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
+            HostsFilterEngine::init_with_observer_and_group_sources(
+                config.filtering.clone(),
+                config.server.data_dir.clone(),
+                None,
+                has_group_sources,
+            )
+            .await,
         );
+        filter.set_group_rules(crate::server::group_rule_sets(&clients));
         let pipeline = DnsPipeline::new(
             std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(config.clone()))),
             filter,
@@ -2737,7 +2874,7 @@ mod tests {
             upstream,
             std::sync::Arc::new(dnssec),
             std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(ClientRegistry::new(
-                ClientsConfig::default(),
+                clients,
             )))),
             std::sync::Arc::new(
                 ParentalRegistry::try_bundled().expect("bundled parental lists must load"),
@@ -3054,6 +3191,44 @@ mod tests {
         assert!(
             !resp.metadata.authentic_data,
             "the upstream AD bit must be replaced by local validation"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// A fresh `Indeterminate` entry is not an authenticated decision (in
+    /// log-only mode a Bogus result is recorded that way). While validation is
+    /// active it must force re-resolution instead of being served, so strict
+    /// mode can return SERVFAIL.
+    #[tokio::test]
+    async fn test_do_client_never_served_indeterminate_cache_entry() {
+        let mut config = Config::default();
+        config.filtering.enabled = false;
+        let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("indeterminate.example.").unwrap();
+        let query = do_query(18, &name);
+
+        let mut cached = Message::response(18, OpCode::Query);
+        cached.queries = query.queries.clone();
+        cached.answers.push(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 18))),
+        ));
+        pipeline
+            .cache
+            .insert_with_status(&query, &cached, ValidationStatus::Indeterminate)
+            .await;
+
+        let resp = pipeline.handle(query, client).await.unwrap();
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "an Indeterminate entry must not be served while validation is active"
+        );
+        assert!(
+            !resp.metadata.authentic_data,
+            "an inconclusive entry must never assert AD"
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;

@@ -3,7 +3,7 @@
 use arc_swap::ArcSwap;
 use moka::future::Cache;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 use tracing::{debug, trace, warn};
@@ -59,6 +59,11 @@ pub struct SingleFlightGuard {
 pub struct DnsCache {
     cache: ArcSwap<Cache<CacheKey, Arc<CacheEntry>>>,
     config: ArcSwap<CacheConfig>,
+    /// Monotonic DNSSEC policy generation. Entries carry the generation that
+    /// produced their validation status; a hot reload advances this value so
+    /// old-policy entries become invisible and in-flight inserts from a query
+    /// that started under the old policy are rejected.
+    policy_epoch: AtomicU64,
     /// Per-key single-flight locks. Weak references let finished keys be
     /// replaced lazily; waiters keep their strong reference alive.
     flights: Arc<Mutex<HashMap<CacheKey, Weak<tokio::sync::Mutex<()>>>>>,
@@ -72,8 +77,31 @@ impl DnsCache {
         Self {
             cache: ArcSwap::from_pointee(cache),
             config: ArcSwap::new(Arc::new(config)),
+            // Start at 1 so an entry always carries a meaningful generation.
+            policy_epoch: AtomicU64::new(1),
             flights: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Current DNSSEC policy generation.
+    ///
+    /// Pipeline queries capture this before loading the validator and pass it
+    /// to [`Self::insert_with_status_at_epoch`]; a policy change advances the
+    /// generation, so a query that validated under the old policy cannot
+    /// insert its status after the flush.
+    #[must_use]
+    pub fn policy_epoch(&self) -> u64 {
+        self.policy_epoch.load(Ordering::Acquire)
+    }
+
+    /// Advances the DNSSEC policy generation and returns the new value.
+    ///
+    /// Call this after the new validator is installed (so a query that reads
+    /// the new epoch also observes the new validator) and before/with the
+    /// cache flush. Existing entries are filtered by `get` immediately; the
+    /// flush only reclaims their memory.
+    pub fn advance_policy_epoch(&self) -> u64 {
+        self.policy_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// Applies hot-reloaded cache settings, rebuilding the cache when
@@ -185,13 +213,34 @@ impl DnsCache {
     ) -> Option<(Message, ValidationStatus)> {
         self.get_by_key_with_status(&CacheKey::from_query(query)?)
             .await
+            .map(|(message, status, _)| (message, status))
+    }
+
+    /// Retrieve a response with its validation status and the DNSSEC policy
+    /// generation that produced it.
+    ///
+    /// This is the epoch-aware form intended for tests and callers that need
+    /// to observe the generation. A production query should not normally need
+    /// it: `get_for_query_with_status` already refuses entries from an older
+    /// generation.
+    pub async fn get_for_query_with_status_and_epoch(
+        &self,
+        query: &Message,
+    ) -> Option<(Message, ValidationStatus, u64)> {
+        self.get_by_key_with_status(&CacheKey::from_query(query)?)
+            .await
     }
 
     async fn get_by_key(&self, key: &CacheKey) -> Option<(Message, ValidationStatus)> {
-        self.get_by_key_with_status(key).await
+        self.get_by_key_with_status(key)
+            .await
+            .map(|(message, status, _)| (message, status))
     }
 
-    async fn get_by_key_with_status(&self, key: &CacheKey) -> Option<(Message, ValidationStatus)> {
+    async fn get_by_key_with_status(
+        &self,
+        key: &CacheKey,
+    ) -> Option<(Message, ValidationStatus, u64)> {
         let config = self.config.load();
         if !config.enabled {
             return None;
@@ -199,6 +248,19 @@ impl DnsCache {
 
         let cache = self.cache.load_full();
         let entry = cache.get(key).await?;
+
+        // A policy change makes every entry from an older generation
+        // unservable immediately, even before the flush reclaims it.
+        if entry.policy_epoch != self.policy_epoch() {
+            trace!(
+                "Ignoring cache entry for {} from DNSSEC policy epoch {} (current {})",
+                key.qname,
+                entry.policy_epoch,
+                self.policy_epoch()
+            );
+            cache.invalidate(key).await;
+            return None;
+        }
 
         let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
         let max_stale_secs = entry
@@ -251,7 +313,7 @@ impl DnsCache {
             key.qname,
             entry.max_lifespan_secs.saturating_sub(elapsed_secs)
         );
-        Some((response, entry.validation_status))
+        Some((response, entry.validation_status, entry.policy_epoch))
     }
 
     /// Retrieve a stale cached response according to RFC 8767 when upstreams fail.
@@ -269,7 +331,7 @@ impl DnsCache {
     ) -> Option<Message> {
         self.get_stale_by_key(&CacheKey::new(name, qtype, qclass))
             .await
-            .map(|(message, _)| message)
+            .map(|(message, _, _)| message)
     }
 
     /// Retrieve a stale response for `query`, honouring its DO/CD/ECS cache key.
@@ -290,10 +352,12 @@ impl DnsCache {
         &self,
         query: &Message,
     ) -> Option<(Message, ValidationStatus)> {
-        self.get_stale_by_key(&CacheKey::from_query(query)?).await
+        self.get_stale_by_key(&CacheKey::from_query(query)?)
+            .await
+            .map(|(message, status, _)| (message, status))
     }
 
-    async fn get_stale_by_key(&self, key: &CacheKey) -> Option<(Message, ValidationStatus)> {
+    async fn get_stale_by_key(&self, key: &CacheKey) -> Option<(Message, ValidationStatus, u64)> {
         let config = self.config.load();
         if !config.enabled || config.serve_stale_hours == 0 {
             return None;
@@ -301,6 +365,17 @@ impl DnsCache {
 
         let cache = self.cache.load_full();
         let entry = cache.get(key).await?;
+
+        if entry.policy_epoch != self.policy_epoch() {
+            trace!(
+                "Ignoring stale cache entry for {} from DNSSEC policy epoch {} (current {})",
+                key.qname,
+                entry.policy_epoch,
+                self.policy_epoch()
+            );
+            cache.invalidate(key).await;
+            return None;
+        }
 
         let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
         let max_stale_secs = entry
@@ -332,7 +407,7 @@ impl DnsCache {
             "Cache serving stale entry for {} (elapsed: {}s, original lifespan: {}s)",
             key.qname, elapsed_secs, entry.max_lifespan_secs
         );
-        Some((response, entry.validation_status))
+        Some((response, entry.validation_status, entry.policy_epoch))
     }
 
     /// Check whether a cached entry is eligible for background prefetch
@@ -399,25 +474,42 @@ impl DnsCache {
         response: &Message,
         validation_status: ValidationStatus,
     ) {
+        self.insert_with_status_at_epoch(query, response, validation_status, self.policy_epoch())
+            .await;
+    }
+
+    /// Insert a response only when `policy_epoch` is still current.
+    ///
+    /// Returns `true` when the entry was stored and `false` when a DNSSEC
+    /// policy change made the caller's validation decision stale. The epoch
+    /// must be captured before the validator that produced
+    /// `validation_status` is loaded (see [`DnsCache::policy_epoch`]).
+    pub async fn insert_with_status_at_epoch(
+        &self,
+        query: &Message,
+        response: &Message,
+        validation_status: ValidationStatus,
+        policy_epoch: u64,
+    ) -> bool {
         let Some(key) = CacheKey::from_query(query) else {
-            return;
+            return false;
         };
 
         let config = self.config.load();
         if !config.enabled {
-            return;
+            return false;
         }
 
         let Some(first_query) = query.queries.first() else {
-            return;
+            return false;
         };
 
         if response.metadata.message_type != MessageType::Response {
-            return;
+            return false;
         }
         if response.metadata.truncation {
             trace!("Not caching truncated response for {}", key.qname);
-            return;
+            return false;
         }
 
         let rcode = response.metadata.response_code;
@@ -426,7 +518,7 @@ impl DnsCache {
                 "Not caching {} response for {} (only NoError/NXDomain are cacheable)",
                 rcode, key.qname
             );
-            return;
+            return false;
         }
 
         // A response whose question does not match the query must never be
@@ -439,7 +531,7 @@ impl DnsCache {
                 "Not caching response without a question section for {}",
                 key.qname
             );
-            return;
+            return false;
         };
         let matches = response_question.name() == first_query.name()
             && response_question.query_type() == first_query.query_type()
@@ -449,7 +541,7 @@ impl DnsCache {
                 qname = %key.qname,
                 "Refusing to cache response with a mismatched question section"
             );
-            return;
+            return false;
         }
 
         // Bailiwick: every answer record must belong to the query name or a
@@ -460,7 +552,7 @@ impl DnsCache {
                 qname = %key.qname,
                 "Refusing to cache response with out-of-bailiwick answer owners"
             );
-            return;
+            return false;
         }
 
         // NODATA detection (RFC 2308): a NoError answer without an RRset of
@@ -501,7 +593,7 @@ impl DnsCache {
                     "Not caching negative response for {} without a bailiwick SOA record",
                     key.qname
                 );
-                return;
+                return false;
             };
             let clamped_ttl = soa_ttl.clamp(ttl_floor, config.negative_ttl_max.max(config.min_ttl));
             // RFC 2308: the negative answer must never outlive the CNAME chain
@@ -570,6 +662,20 @@ impl DnsCache {
         let serialized_len = encode_message(response).map_or(256, |b| b.len());
         let estimated_bytes = (serialized_len + key.qname.len() + 128) as u32;
 
+        // Re-check immediately before the insert. The caller captured the
+        // epoch before loading its validator; if a reload advanced the policy
+        // while this response was validated/fetched, its status belongs to a
+        // policy that no longer exists and must not become visible.
+        if policy_epoch != self.policy_epoch() {
+            debug!(
+                qname = %key.qname,
+                policy_epoch,
+                current = self.policy_epoch(),
+                "Discarding cache insert from an older DNSSEC policy generation"
+            );
+            return false;
+        }
+
         let entry = CacheEntry {
             message: response.clone(),
             stored_at: Instant::now(),
@@ -578,6 +684,7 @@ impl DnsCache {
             authority_ttls,
             additional_ttls,
             validation_status,
+            policy_epoch,
             hits: Arc::new(AtomicU32::new(0)),
             estimated_bytes,
         };
@@ -587,6 +694,7 @@ impl DnsCache {
             key.qname, max_lifespan_secs, estimated_bytes
         );
         self.cache.load_full().insert(key, Arc::new(entry)).await;
+        true
     }
 
     /// Invalidate all entries in the current cache generation.

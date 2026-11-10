@@ -10,6 +10,27 @@ pub struct StatusResponse {
     pub uptime_seconds: u64,
     pub role: String,
     pub listeners: Vec<String>,
+    /// ACME challenge/issuance readiness (D12). Omitted when ACME is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acme: Option<AcmeStatus>,
+}
+
+/// ACME readiness exposed by the authenticated status endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AcmeStatus {
+    pub enabled: bool,
+    pub ready: bool,
+    /// Dedicated HTTP-01 listener is bound.
+    pub http01_available: bool,
+    /// TCP 443 DoH listener with `acme-tls/1` is bound.
+    pub tls_alpn_available: bool,
+    /// Stable reason code when not ready (`acme_challenge_unavailable` or
+    /// `acme_issuance_failed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Most recent issuance/renewal error, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Query parameters for statistics window.

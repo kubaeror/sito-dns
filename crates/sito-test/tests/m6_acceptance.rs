@@ -110,6 +110,7 @@ async fn create_test_context() -> (ServerContext, PathBuf) {
         slave_tracker: None,
         resync_sender: None,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        acme_challenges: None,
         dns_starter: None,
     };
 

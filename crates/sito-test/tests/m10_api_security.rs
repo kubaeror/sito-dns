@@ -92,6 +92,7 @@ async fn create_test_context(temp_dir: &Path, setup_pending: bool) -> ServerCont
         slave_tracker: None,
         resync_sender: None,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(setup_pending)),
+        acme_challenges: None,
         dns_starter: None,
     }
 }

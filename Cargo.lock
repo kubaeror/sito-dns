@@ -3003,7 +3003,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sito"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3042,7 +3042,7 @@ dependencies = [
 
 [[package]]
 name = "sito-api"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3072,6 +3072,7 @@ dependencies = [
  "sito-rewrites",
  "sito-runtime",
  "sito-stats",
+ "sito-transport",
  "sito-upstream",
  "subtle",
  "tar",
@@ -3086,7 +3087,7 @@ dependencies = [
 
 [[package]]
 name = "sito-cache"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "arc-swap",
  "moka",
@@ -3098,7 +3099,7 @@ dependencies = [
 
 [[package]]
 name = "sito-clients"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -3116,7 +3117,7 @@ dependencies = [
 
 [[package]]
 name = "sito-core"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3130,7 +3131,7 @@ dependencies = [
 
 [[package]]
 name = "sito-dnssec"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3149,7 +3150,7 @@ dependencies = [
 
 [[package]]
 name = "sito-filter"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -3169,7 +3170,7 @@ dependencies = [
 
 [[package]]
 name = "sito-ha"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3203,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "sito-proto"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "hickory-proto",
  "idna",
@@ -3213,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "sito-rewrites"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "hickory-proto",
  "serde",
@@ -3227,7 +3228,7 @@ dependencies = [
 
 [[package]]
 name = "sito-runtime"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "arc-swap",
  "sito-clients",
@@ -3237,7 +3238,7 @@ dependencies = [
 
 [[package]]
 name = "sito-stats"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "chrono",
  "serde",
@@ -3252,7 +3253,7 @@ dependencies = [
 
 [[package]]
 name = "sito-test"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3304,14 +3305,14 @@ dependencies = [
 
 [[package]]
 name = "sito-test-support"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "sito-transport"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3347,7 +3348,7 @@ dependencies = [
 
 [[package]]
 name = "sito-upstream"
-version = "1.9.3"
+version = "1.9.4"
 dependencies = [
  "arc-swap",
  "async-trait",

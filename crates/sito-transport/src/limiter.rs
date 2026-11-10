@@ -26,8 +26,10 @@ const EVICTION_SAMPLE: usize = 32;
 
 /// Returns the rate-limit key for an address: IPv4 `/24`, IPv6 `/64`.
 ///
-/// Non-global forms (IPv4-mapped IPv6, loopback, etc.) keep their family and
-/// are masked the same way.
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is the same host as its IPv4
+/// form and must use the IPv4 `/24` bucket. Masking it as IPv6 `/64` would
+/// collapse an entire IPv4 LAN into one bucket and throttle every client when
+/// the listener accepts dual-stack socket traffic (`IPV6_V6ONLY=false`).
 pub(crate) fn rate_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(v4) => {
@@ -35,6 +37,9 @@ pub(crate) fn rate_key(ip: IpAddr) -> IpAddr {
             IpAddr::V4(Ipv4Addr::from(bits))
         }
         IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return IpAddr::V4(Ipv4Addr::from(u32::from(v4) & 0xFFFF_FF00));
+            }
             let bits = u128::from(v6) & 0xFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000;
             IpAddr::V6(Ipv6Addr::from(bits))
         }
@@ -355,6 +360,29 @@ mod tests {
         assert!(
             !limiter.check(b),
             "the recently used bucket must still hold its exhausted budget"
+        );
+    }
+
+    /// An IPv4-mapped IPv6 peer must share the IPv4 `/24` key, not collapse
+    /// the whole IPv4 LAN into the IPv6 `/64` bucket.
+    #[test]
+    fn test_ipv4_mapped_ipv6_uses_ipv4_24_bucket() {
+        let mapped: IpAddr = "::ffff:192.0.2.10".parse().expect("mapped address");
+        assert_eq!(
+            rate_key(mapped),
+            rate_key("192.0.2.10".parse().expect("IPv4 address")),
+            "a mapped address must use its IPv4 /24 key"
+        );
+        assert_eq!(
+            rate_key(mapped).to_string(),
+            "192.0.2.0",
+            "the mapped key must be masked to the IPv4 /24"
+        );
+
+        // A genuine IPv6 address still uses /64.
+        assert_eq!(
+            rate_key("2001:db8:1:2::1".parse().expect("IPv6 address")).to_string(),
+            "2001:db8:1:2::"
         );
     }
 }

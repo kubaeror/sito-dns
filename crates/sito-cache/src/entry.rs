@@ -43,6 +43,11 @@ pub struct CacheEntry {
     pub authority_ttls: Vec<u32>,
     pub additional_ttls: Vec<u32>,
     pub validation_status: ValidationStatus,
+    /// DNSSEC policy generation under which this entry's
+    /// `validation_status` was produced. An entry whose generation no longer
+    /// matches the cache's current generation must not be served or inserted:
+    /// a hot reload can swap the validator while a query is in flight.
+    pub policy_epoch: u64,
     pub hits: Arc<AtomicU32>,
     pub estimated_bytes: u32,
 }

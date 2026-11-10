@@ -9,9 +9,10 @@ Phase 1 and later ship in 2.0.0.
 > **Phase 0 status: complete in sito 1.9.4.** The safety gate fixed P0-1/P0-2 and
 > P1-1 through P1-18 and P1-20 through P1-22 and P1-25 through P1-27, plus the
 > directly exploitable transport/upstream/auth/installer items in the same work
-> packages. P1-19, P1-23, and P1-24 (stats privacy/polling/retention) remain
-> deferred to Phase 2 and are recorded as residual risks in the
-> [1.9.4 release notes](release-notes-1.9.4.md). P2/P3 documentation truth items
+> packages. P1-1's DNAME half remains open (the pinned hickory parser rejects
+> DNAME; see the residual-risk note). P1-19, P1-23, and P1-24 (stats
+> privacy/polling/retention) remain deferred to Phase 2 and are recorded as
+> residual risks in the [1.9.4 release notes](release-notes-1.9.4.md). P2/P3 documentation truth items
 > are addressed in 1.9.4; RouterOS remains experimental and 2.0 still owns the
 > structural refactor (config/validator/session/chain state machines). The
 > verdict and scorecard below describe the audited v1.9.3 tree, not 1.9.4.
@@ -111,7 +112,7 @@ explicitly deferred to Phase 2 and recorded as residual risks in the
 
 | ID | Area | Finding (v1.9.3) | Status in 1.9.4 |
 |---|---|---|---|
-| P1-1 | DNSSEC | Fail-open paths: junk RRSIG suppresses the unsigned probe, signed CNAME to unsigned target is classified without an authenticated DS denial, and strict mode can serve `Indeterminate`. | **Fixed.** Per-RRset probing, authenticated DS-denial requirement, CNAME/QTYPE=CNAME fixes, and strict `Indeterminate` → SERVFAIL. |
+| P1-1 | DNSSEC | Fail-open paths: junk RRSIG suppresses the unsigned probe, signed CNAME to unsigned target is classified without an authenticated DS denial, strict mode can serve `Indeterminate`, and DNAME/QTYPE=CNAME are misclassified. | **Fixed for CNAME/strict mode; DNAME remains open.** Per-RRset probing, authenticated DS-denial requirement, CNAME/QTYPE=CNAME fixes, and strict `Indeterminate` → SERVFAIL. DNAME responses are not represented by the pinned hickory-proto 0.26.3 RDATA parser, so the resolver rejects/does not follow DNAME and fails closed rather than asserting AD; see the residual-risk note below. |
 | P1-2 | DNSSEC | Key/chain fetching has per-fetch limits but no overall wall-clock or global per-query work cap. | **Fixed.** 5-second per-query validation/key-fetch deadline; timeout fails closed in validate mode. |
 | P1-3 | HA | The slave session loop has no master heartbeat/read deadline and can report `Synced` while serving stale shared config. | **Fixed.** Any-frame liveness deadline of `3 × ping_interval_secs` clears `Synced` and fails readiness. |
 | P1-4 | HA | Same-version ACK trusts the local watermark as proof the local config still matches the master bundle. | **Fixed.** Watermark stores a BLAKE3 digest of the applied document; local drift forces a full apply. |
@@ -137,7 +138,18 @@ explicitly deferred to Phase 2 and recorded as residual risks in the
 | P1-24 | Stats | Retention runs as one large immediate transaction with full scans, holds the write lock for minutes, and never runs at startup. | **Deferred to Phase 2.** Documented residual risk. |
 | P1-25 | Upstream | Bootstrap/health probes omit RD=1, bootstrap answers bypass the SSRF denylist, and re-resolution serves stale cache instead of forcing refresh. | **Fixed.** RD=1, SSRF-filtered bootstrap (`upstream.allow_private_targets` opt-in), forced refresh, UDP junk tolerance, DoH/EDNS fixes. |
 | P1-26 | Core/Config apply | The filter engine is swapped before the runtime snapshot, creating a filter-enable bypass window and inconsistent failure state. | **Fixed.** Runtime snapshot publishes before the filter swap; hook failures roll back. |
-| P1-27 | Core/Config apply | The DNSSEC validator is swapped before the cache flush, so old-policy validation status can survive a policy change. | **Fixed.** Monotonic chain-cache policy generation rejects in-flight old-policy inserts. |
+| P1-27 | Core/Config apply | The DNSSEC validator is swapped before the cache flush, so old-policy validation status can survive a policy change. | **Fixed.** The chain cache and the response cache both carry a monotonic DNSSEC policy generation; old-generation entries are unservable and in-flight inserts from the old policy are rejected. `Indeterminate` is no longer served from the response cache while validation is active. |
+
+### Residual risk: DNAME
+
+P1-1's CNAME and strict-`Indeterminate` paths are fixed in 1.9.4, but DNAME
+remains open. The pinned `hickory-proto 0.26.3` has no `RData::DNAME` variant
+and returns `UnsupportedRecordType` when decoding one, so sito cannot inspect,
+validate, or follow a DNAME RRset. A response containing DNAME is rejected by
+the transport/parser (fail closed: no `AD=1`, no unvalidated answer) rather than
+being served as validated data. Closing this requires a hickory upgrade or a
+local DNAME RDATA implementation; it is tracked for the Phase 1/2 DNSSEC work
+and is not claimed as fixed below.
 
 ## Baseline at audit time
 

@@ -317,6 +317,7 @@ pub struct MetricsRegistry {
     filter_lists_failed: Arc<AtomicU64>,
     filter_degraded_groups: Arc<AtomicU64>,
     filter_dropped_regex: Arc<AtomicU64>,
+    filter_unavailable: Arc<AtomicU64>,
     filter_compile_seconds: Arc<Mutex<HistogramState>>,
     build_version: String,
     build_commit: String,
@@ -335,6 +336,8 @@ pub struct FilterStatusMetrics {
     pub degraded_groups: u64,
     /// Regex/wildcard patterns dropped from the active snapshot.
     pub dropped_regex_patterns: u64,
+    /// No usable snapshot is active; fail-closed mode answers SERVFAIL.
+    pub unavailable: u64,
 }
 
 impl Default for MetricsRegistry {
@@ -373,6 +376,7 @@ impl MetricsRegistry {
             filter_lists_failed: Arc::new(AtomicU64::new(0)),
             filter_degraded_groups: Arc::new(AtomicU64::new(0)),
             filter_dropped_regex: Arc::new(AtomicU64::new(0)),
+            filter_unavailable: Arc::new(AtomicU64::new(0)),
             filter_compile_seconds: Arc::new(Mutex::new(HistogramState::new())),
             build_version: version.into(),
             build_commit: commit.into(),
@@ -547,6 +551,8 @@ impl MetricsRegistry {
             .store(status.degraded_groups, Ordering::Relaxed);
         self.filter_dropped_regex
             .store(status.dropped_regex_patterns, Ordering::Relaxed);
+        self.filter_unavailable
+            .store(status.unavailable, Ordering::Relaxed);
     }
 
     /// Records how long the last filter snapshot compilation took.
@@ -1059,6 +1065,15 @@ impl MetricsRegistry {
             "sito_filter_dropped_regex_patterns {}",
             self.filter_dropped_regex.load(Ordering::Relaxed)
         );
+        out.push_str(
+            "# HELP sito_filter_unavailable No usable filter snapshot is active (1 = fail-closed SERVFAIL)\n",
+        );
+        out.push_str("# TYPE sito_filter_unavailable gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_filter_unavailable {}",
+            self.filter_unavailable.load(Ordering::Relaxed)
+        );
 
         // 10. sito_filter_compile_seconds
         out.push_str(
@@ -1484,6 +1499,7 @@ mod tests {
             failed_lists: 1,
             degraded_groups: 1,
             dropped_regex_patterns: 5,
+            unavailable: 1,
         });
 
         let rendered = reg.render_prometheus();
@@ -1593,6 +1609,9 @@ sito_filter_degraded_groups 1
 # HELP sito_filter_dropped_regex_patterns Regex/wildcard patterns dropped from the active snapshot
 # TYPE sito_filter_dropped_regex_patterns gauge
 sito_filter_dropped_regex_patterns 5
+# HELP sito_filter_unavailable No usable filter snapshot is active (1 = fail-closed SERVFAIL)
+# TYPE sito_filter_unavailable gauge
+sito_filter_unavailable 1
 # HELP sito_filter_compile_seconds Compilation duration for filter rule trie
 # TYPE sito_filter_compile_seconds histogram
 sito_filter_compile_seconds_bucket{le="0.00025"} 0
@@ -1818,6 +1837,10 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         assert!(rendered.contains("sito_filter_rules{list=\"total\"} 42"));
         assert!(rendered.contains("sito_filter_compile_seconds_count 1"));
         assert!(rendered.contains("sito_filter_compile_seconds_sum 0.25"));
+        assert!(
+            rendered.contains("sito_filter_unavailable 0"),
+            "the unavailable gauge must be exposed even when healthy"
+        );
     }
 
     /// Regression for audit WP-7.3: [`MetricsSnapshot::delta_since`] must

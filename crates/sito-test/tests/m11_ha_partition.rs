@@ -746,6 +746,7 @@ async fn publish_context(dir: &Path, config_path: &Path) -> ServerContext {
         slave_tracker: None,
         resync_sender: None,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        acme_challenges: None,
         dns_starter: None,
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
     }

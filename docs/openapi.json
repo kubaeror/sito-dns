@@ -6,7 +6,7 @@
     "license": {
       "name": "GPL-3.0-only"
     },
-    "version": "1.9.3"
+    "version": "1.9.4"
   },
   "paths": {
     "/api/v1/auth/change-password": {
@@ -3160,6 +3160,46 @@
   },
   "components": {
     "schemas": {
+      "AcmeStatus": {
+        "type": "object",
+        "description": "ACME readiness exposed by the authenticated status endpoint.",
+        "required": [
+          "enabled",
+          "ready",
+          "http01_available",
+          "tls_alpn_available"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "http01_available": {
+            "type": "boolean",
+            "description": "Dedicated HTTP-01 listener is bound."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Most recent issuance/renewal error, if any."
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stable reason code when not ready (`acme_challenge_unavailable` or\n`acme_issuance_failed`)."
+          },
+          "tls_alpn_available": {
+            "type": "boolean",
+            "description": "TCP 443 DoH listener with `acme-tls/1` is bound."
+          }
+        }
+      },
       "AddFilterListRequest": {
         "type": "object",
         "description": "Request to create a new filter list.",
@@ -4523,6 +4563,17 @@
           "listeners"
         ],
         "properties": {
+          "acme": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AcmeStatus",
+                "description": "ACME challenge/issuance readiness (D12). Omitted when ACME is disabled."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "listeners": {
             "type": "array",
             "items": {

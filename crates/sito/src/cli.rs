@@ -776,6 +776,28 @@ pub fn prepare_no_setup_bootstrap(
     }
     config.set_web_config(web);
 
+    // Built-in defaults enable filtering with zero sources. Since P2-95 that
+    // fails closed and would SERVFAIL every query until the operator adds a
+    // list, which contradicts `--no-setup`'s "boot immediately" contract.
+    // Disable filtering explicitly (instead of inventing a benign block rule)
+    // and say so, so resolution works and the operator knows to configure a
+    // source before it protects anything.
+    if config.filtering.enabled
+        && !config.filtering.lists.iter().any(|list| list.enabled)
+        && !config
+            .filtering
+            .custom_rules
+            .iter()
+            .any(|rule| !rule.trim().is_empty())
+    {
+        config.filtering.enabled = false;
+        eprintln!(
+            "WARNING: --no-setup has no filter list or custom rule configured; \
+             filtering is disabled so DNS resolution works. Configure filtering \
+             in the web UI before relying on blocking."
+        );
+    }
+
     // Never silently rotate credentials that already exist on this node.
     if config.server.data_dir.join("users.toml").exists() {
         return Ok(NoSetupBootstrap::KeptExistingUsers);
@@ -1528,6 +1550,10 @@ mod tests {
         assert!(
             config.get_web_config().bind.is_loopback(),
             "admin UI must bind loopback when no config exists"
+        );
+        assert!(
+            !config.filtering.enabled,
+            "--no-setup without sources must disable filtering instead of SERVFAILing every query"
         );
 
         let users_file = dir.join("users.toml");

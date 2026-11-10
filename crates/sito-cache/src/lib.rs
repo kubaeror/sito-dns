@@ -452,6 +452,78 @@ mod tests {
         assert_eq!(status, ValidationStatus::Secure);
     }
 
+    /// P1-27: a DNSSEC policy change must invalidate validation decisions in
+    /// the response cache, not only in the chain cache. An entry validated
+    /// under the old generation must be invisible immediately, and an insert
+    /// from a query that captured the old epoch while validation was in flight
+    /// must be rejected even if it happens after the flush.
+    #[tokio::test]
+    async fn test_policy_epoch_rejects_in_flight_insert_and_hides_old_entries() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+        let qname = Name::from_str("epoch.example.").unwrap();
+        let query = query_for(90, &qname);
+        let response = answer_response(90, &qname, [192, 0, 2, 90]);
+
+        let old_epoch = cache.policy_epoch();
+        assert!(
+            cache
+                .insert_with_status_at_epoch(
+                    &query,
+                    &response,
+                    ValidationStatus::Secure,
+                    old_epoch,
+                )
+                .await
+        );
+
+        // Simulate the config apply: the new validator is installed, then the
+        // cache generation advances (before the memory flush).
+        cache.advance_policy_epoch();
+        let new_epoch = cache.policy_epoch();
+        assert!(new_epoch > old_epoch);
+
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_none(),
+            "an old-generation entry must be unservable immediately"
+        );
+
+        // The in-flight query captured `old_epoch` before validation. Its
+        // insert arrives after the generation change and must be dropped.
+        assert!(
+            !cache
+                .insert_with_status_at_epoch(
+                    &query,
+                    &response,
+                    ValidationStatus::Secure,
+                    old_epoch,
+                )
+                .await,
+            "an insert from the old policy generation must be rejected"
+        );
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_none(),
+            "the rejected insert must not become visible"
+        );
+
+        // A query that captured the new epoch proceeds normally.
+        assert!(
+            cache
+                .insert_with_status_at_epoch(
+                    &query,
+                    &response,
+                    ValidationStatus::Insecure,
+                    new_epoch,
+                )
+                .await
+        );
+        let (_, status, epoch) = cache
+            .get_for_query_with_status_and_epoch(&query)
+            .await
+            .expect("new-generation entry");
+        assert_eq!(status, ValidationStatus::Insecure);
+        assert_eq!(epoch, new_epoch);
+    }
+
     /// `min_ttl` is a cache policy floor for unvalidated data only. Raising a
     /// `Secure` TTL above the RRSIG-authenticated TTL would serve AD=1 data
     /// after its signature/TTL expired.

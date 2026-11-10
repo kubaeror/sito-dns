@@ -41,11 +41,76 @@ pub struct ServerContext {
     pub slave_tracker: Option<sito_ha::SlaveStatusTracker>,
     pub resync_sender: Option<tokio::sync::mpsc::Sender<()>>,
     pub setup_pending: Arc<AtomicBool>,
+    /// Live ACME challenge-listener state when ACME is enabled; used by
+    /// readiness reporting (D12 `acme_challenge_unavailable`).
+    pub acme_challenges: Option<sito_transport::AcmeChallengeAvailability>,
     pub dns_starter: Option<UnboundedSender<()>>,
     /// Serializes every configuration apply/persist path (HA applier, file
     /// watcher, REST/UI handlers) so a slower older document cannot overwrite
     /// a newer one after the newer push already reached the runtime.
     pub apply_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// ACME readiness derived from the live challenge-listener state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcmeReadiness {
+    /// ACME is enabled in the effective configuration.
+    pub enabled: bool,
+    /// A challenge path is available and the last issuance check succeeded.
+    pub ready: bool,
+    /// HTTP-01 listener bound.
+    pub http01_available: bool,
+    /// TCP 443 DoH listener bound with `acme-tls/1`.
+    pub tls_alpn_available: bool,
+    /// Stable reason code when not ready.
+    pub reason: Option<&'static str>,
+    /// Most recent issuance/renewal error, for the authenticated status view.
+    pub last_error: Option<String>,
+}
+
+/// Computes ACME readiness from the live challenge state and configuration.
+fn acme_readiness_for(
+    challenges: Option<&sito_transport::AcmeChallengeAvailability>,
+    config: &Config,
+) -> AcmeReadiness {
+    let enabled = config.get_acme_config().is_some_and(|acme| acme.enabled);
+    if !enabled {
+        return AcmeReadiness {
+            enabled: false,
+            ready: true,
+            http01_available: false,
+            tls_alpn_available: false,
+            reason: None,
+            last_error: None,
+        };
+    }
+    let Some(challenges) = challenges else {
+        return AcmeReadiness {
+            enabled: true,
+            ready: false,
+            http01_available: false,
+            tls_alpn_available: false,
+            reason: Some("acme_challenge_unavailable"),
+            last_error: None,
+        };
+    };
+    let options = challenges.options();
+    let last_error = challenges.last_error();
+    let (ready, reason) = if challenges.challenge_unavailable() {
+        (false, Some("acme_challenge_unavailable"))
+    } else if last_error.is_some() {
+        (false, Some("acme_issuance_failed"))
+    } else {
+        (true, None)
+    };
+    AcmeReadiness {
+        enabled,
+        ready,
+        http01_available: options.http01_available,
+        tls_alpn_available: options.tls_alpn_available,
+        reason,
+        last_error,
+    }
 }
 
 /// Whether the configuration makes HA replication part of the node's role.
@@ -99,6 +164,17 @@ impl ServerContext {
             ),
             _ => sito_ha::HaReadiness::ready(),
         }
+    }
+
+    /// Current ACME readiness.
+    ///
+    /// D12: when ACME is enabled but neither port 80 (HTTP-01) nor a TCP 443
+    /// DoH listener (TLS-ALPN-01) is available, readiness is false with the
+    /// stable reason `acme_challenge_unavailable`. A failed issuance is
+    /// reported separately so an existing certificate can still serve traffic.
+    #[must_use]
+    pub fn acme_readiness(&self, config: &Config) -> AcmeReadiness {
+        acme_readiness_for(self.acme_challenges.as_ref(), config)
     }
 
     /// Acquires the configuration apply/persist lock.
@@ -393,5 +469,54 @@ mod tests {
         assert!(!sanitized.to_string().contains("super-secret"));
 
         assert!(sanitize_clients_for_bundle(None).is_none());
+    }
+
+    /// D12: an ACME deployment with neither a port 80 listener nor a TCP 443
+    /// TLS-ALPN challenge path must report `acme_challenge_unavailable`.
+    #[test]
+    fn test_acme_readiness_no_80_no_443() {
+        let mut config = Config::default();
+        config.acme = Some(sito_core::config::AcmeConfig {
+            enabled: true,
+            email: Some("admin@example.com".to_string()),
+            domains: vec!["dns.example.com".to_string()],
+            ..Default::default()
+        });
+
+        // No challenge listener at all (fresh defaults are fail-safe false).
+        let challenges = sito_transport::AcmeChallengeAvailability::new(false, false);
+        let readiness = acme_readiness_for(Some(&challenges), &config);
+        assert!(!readiness.ready);
+        assert_eq!(readiness.reason, Some("acme_challenge_unavailable"));
+
+        // Either bound listener makes ACME issuable.
+        let http = sito_transport::AcmeChallengeAvailability::new(false, true);
+        let readiness = acme_readiness_for(Some(&http), &config);
+        assert!(
+            readiness.ready,
+            "HTTP-01 on port 80 is a usable path: {readiness:?}"
+        );
+
+        let tls_alpn = sito_transport::AcmeChallengeAvailability::new(true, false);
+        let readiness = acme_readiness_for(Some(&tls_alpn), &config);
+        assert!(
+            readiness.ready,
+            "TLS-ALPN-01 on 443 is a usable path: {readiness:?}"
+        );
+
+        // A failed issuance is surfaced separately but does not claim the
+        // challenge path is missing.
+        tls_alpn.record_error("order failed");
+        let readiness = acme_readiness_for(Some(&tls_alpn), &config);
+        assert!(!readiness.ready);
+        assert_eq!(readiness.reason, Some("acme_issuance_failed"));
+        assert_eq!(readiness.last_error.as_deref(), Some("order failed"));
+
+        // Disabled ACME is always "ready" and produces no warning signal.
+        config.acme.as_mut().unwrap().enabled = false;
+        let readiness = acme_readiness_for(Some(&challenges), &config);
+        assert!(readiness.ready);
+        assert!(!readiness.enabled);
+        assert_eq!(readiness.reason, None);
     }
 }

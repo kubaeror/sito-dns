@@ -529,6 +529,58 @@ fn pair_metadata_matches(cert_path: &Path, key_path: &Path, metadata_path: &Path
     parts.next() == Some(cert_hash.as_str()) && parts.next() == Some(key_hash.as_str())
 }
 
+/// Names covered by the first certificate in `cert_pem`.
+///
+/// Only DNS SANs are returned; a certificate without a SAN extension covers
+/// nothing here (ACME always issues SAN certificates, so this is a safe
+/// renewal trigger rather than a compatibility fallback).
+fn certificate_dns_names(cert_pem: &[u8]) -> Result<Vec<String>, String> {
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to parse PEM certificate: {e}"))?;
+    let first = certs
+        .first()
+        .ok_or_else(|| "Certificate chain is empty".to_string())?;
+    let (_, x509) = x509_parser::parse_x509_certificate(first.as_ref())
+        .map_err(|e| format!("Failed to parse X.509 DER certificate: {e}"))?;
+    let san = x509
+        .subject_alternative_name()
+        .map_err(|e| format!("Failed to parse certificate SAN extension: {e}"))?
+        .ok_or_else(|| "Certificate has no Subject Alternative Name extension".to_string())?;
+    Ok(san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            x509_parser::extensions::GeneralName::DNSName(name) => {
+                Some(name.trim_end_matches('.').to_ascii_lowercase())
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// Whether the stored certificate's SAN set matches the configured domains.
+///
+/// Any added or removed domain requires a new order. Comparison is
+/// order-insensitive and normalizes case/trailing dots.
+fn certificate_covers_domains(cert_pem: &[u8], domains: &[String]) -> Result<bool, String> {
+    if domains.is_empty() {
+        return Ok(true);
+    }
+    let mut expected: Vec<String> = domains
+        .iter()
+        .map(|domain| domain.trim().trim_end_matches('.').to_ascii_lowercase())
+        .collect();
+    expected.sort_unstable();
+    expected.dedup();
+
+    let mut actual = certificate_dns_names(cert_pem)?;
+    actual.sort_unstable();
+    actual.dedup();
+    Ok(actual == expected)
+}
+
 /// Check whether the current certificate on disk needs to be acquired or renewed.
 pub fn certificate_needs_renewal(config: &AcmeServiceConfig) -> bool {
     let cert_path = config.storage_dir.join("cert.pem");
@@ -558,6 +610,21 @@ pub fn certificate_needs_renewal(config: &AcmeServiceConfig) -> bool {
     let Ok(cert_bytes) = std::fs::read(&cert_path) else {
         return true;
     };
+
+    match certificate_covers_domains(&cert_bytes, &config.domains) {
+        Ok(true) => {}
+        Ok(false) => {
+            info!(
+                "Stored ACME certificate SANs do not match acme.domains {:?}; renewal needed",
+                config.domains
+            );
+            return true;
+        }
+        Err(e) => {
+            warn!("Failed to compare ACME certificate SANs with acme.domains (will renew): {e}");
+            return true;
+        }
+    }
 
     match days_until_expiration(&cert_bytes) {
         Ok(days) => {
@@ -602,6 +669,10 @@ pub struct AcmeChallengeOptions {
 pub struct AcmeChallengeAvailability {
     tls_alpn_available: Arc<AtomicBool>,
     http01_available: Arc<AtomicBool>,
+    /// Whether ACME is enabled for this process (false makes readiness moot).
+    enabled: Arc<AtomicBool>,
+    /// Most recent issuance/renewal error, cleared on a successful check.
+    last_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl AcmeChallengeAvailability {
@@ -609,7 +680,17 @@ impl AcmeChallengeAvailability {
         Self {
             tls_alpn_available: Arc::new(AtomicBool::new(tls_alpn_available)),
             http01_available: Arc::new(AtomicBool::new(http01_available)),
+            enabled: Arc::new(AtomicBool::new(false)),
+            last_error: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
     }
 
     pub fn set_tls_alpn_available(&self, available: bool) {
@@ -625,6 +706,30 @@ impl AcmeChallengeAvailability {
             tls_alpn_available: self.tls_alpn_available.load(Ordering::Relaxed),
             http01_available: self.http01_available.load(Ordering::Relaxed),
         }
+    }
+
+    /// No configured challenge listener can answer either ACME challenge.
+    pub fn challenge_unavailable(&self) -> bool {
+        let options = self.options();
+        !options.tls_alpn_available && !options.http01_available
+    }
+
+    /// Record a failed issuance/renewal attempt for readiness reporting.
+    pub fn record_error(&self, error: impl Into<String>) {
+        if let Ok(mut slot) = self.last_error.lock() {
+            *slot = Some(error.into());
+        }
+    }
+
+    /// Clear the last error after a successful issuance check.
+    pub fn record_success(&self) {
+        if let Ok(mut slot) = self.last_error.lock() {
+            *slot = None;
+        }
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|slot| slot.clone())
     }
 }
 
@@ -944,6 +1049,7 @@ pub fn start_acme_manager(
     let managers = TlsManagerSet::from_doh(acceptor_mgr);
     let challenge_availability =
         AcmeChallengeAvailability::new(!managers.is_empty(), http01_challenges.is_some());
+    challenge_availability.set_enabled(true);
     start_acme_manager_for_transports(
         config,
         managers,
@@ -985,9 +1091,13 @@ pub fn start_acme_manager_for_transports(
         )
         .await
         {
-            Ok(_) => true,
+            Ok(_) => {
+                challenge_availability.record_success();
+                true
+            }
             Err(e) => {
                 warn!("Initial ACME certificate check failed: {e}");
+                challenge_availability.record_error(e.clone());
                 false
             }
         };
@@ -1019,11 +1129,13 @@ pub fn start_acme_manager_for_transports(
                         challenge_availability.options(),
                     ).await {
                         Ok(_) => {
+                            challenge_availability.record_success();
                             next_delay = ACME_CHECK_INTERVAL;
                             retry_delay = ACME_RETRY_INITIAL;
                         }
                         Err(e) => {
                             warn!("Periodic ACME renewal failed: {e}; retrying in {:?}", retry_delay);
+                            challenge_availability.record_error(e.clone());
                             next_delay = retry_delay;
                             retry_delay = (retry_delay * 2).min(ACME_RETRY_MAX);
                         }
@@ -1130,6 +1242,14 @@ mod tests {
         not_before: time::OffsetDateTime,
         not_after: time::OffsetDateTime,
     ) -> (String, String) {
+        generate_ca_signed_cert_with_domains(&[domain], not_before, not_after)
+    }
+
+    fn generate_ca_signed_cert_with_domains(
+        domains: &[&str],
+        not_before: time::OffsetDateTime,
+        not_after: time::OffsetDateTime,
+    ) -> (String, String) {
         let ca_key = rcgen::KeyPair::generate().expect("CA key");
         let mut ca_params = rcgen::CertificateParams::default();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -1139,8 +1259,13 @@ mod tests {
         let ca_cert = ca_params.self_signed(&ca_key).expect("CA cert");
 
         let key = rcgen::KeyPair::generate().expect("leaf key");
-        let mut params =
-            rcgen::CertificateParams::new(vec![domain.to_string()]).expect("leaf params");
+        let mut params = rcgen::CertificateParams::new(
+            domains
+                .iter()
+                .map(|domain| (*domain).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .expect("leaf params");
         params.not_before = not_before;
         params.not_after = not_after;
         let cert = params
@@ -1150,6 +1275,61 @@ mod tests {
             format!("{}{}", cert.pem(), ca_cert.pem()),
             key.serialize_pem(),
         )
+    }
+
+    /// Changing `acme.domains` must force a new order instead of waiting for
+    /// the old certificate's renewal window. Removing or adding a SAN both
+    /// count; reordering is not a change.
+    #[test]
+    fn test_certificate_needs_renewal_when_domains_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_domain_change_{}_{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let now = time::OffsetDateTime::now_utc();
+        let (cert_pem, key_pem) = generate_ca_signed_cert_with_domains(
+            &["a.example.com", "b.example.com"],
+            now,
+            now + time::Duration::days(90),
+        );
+        std::fs::write(dir.join("cert.pem"), &cert_pem).expect("write cert");
+        write_secret_file(&dir.join("key.pem"), key_pem.as_bytes()).expect("write key");
+        write_pair_metadata(&dir).expect("pair metadata");
+
+        let config = |domains: &[&str]| {
+            AcmeServiceConfig::new(
+                "admin@example.com".into(),
+                domains.iter().map(|domain| (*domain).to_string()).collect(),
+                dir.clone(),
+            )
+        };
+
+        assert!(
+            !certificate_needs_renewal(&config(&["b.example.com", "a.example.com"])),
+            "the same SAN set in a different order must not renew"
+        );
+        assert!(
+            certificate_needs_renewal(&config(&["a.example.com"])),
+            "removing a configured domain must trigger renewal"
+        );
+        assert!(
+            certificate_needs_renewal(&config(&[
+                "a.example.com",
+                "b.example.com",
+                "c.example.com"
+            ])),
+            "adding a configured domain must trigger renewal"
+        );
+        assert!(
+            certificate_needs_renewal(&config(&["other.example.com", "b.example.com"])),
+            "replacing a domain must trigger renewal"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Bootstrap detection must not flag a genuine CA-issued certificate.

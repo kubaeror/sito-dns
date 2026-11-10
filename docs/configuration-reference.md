@@ -75,7 +75,7 @@ allow_plaintext_doh = false
 | `doh3_port` | integer | `443` | DNS-over-HTTP/3 (DoH3) UDP port. `0` disables DoH3. |
 | `doh_dedicated_hostname` | string | `""` | When set, DoH/DoH3 requests whose Host/authority does not match are rejected with `421 Misdirected Request`. Empty allows any hostname. |
 | `dot_padding` | boolean | `false` | RFC 7830/8467 padding on DoT responses to mitigate traffic analysis. |
-| `tls` | table | `None` | Deprecated `[dns.tls]` alias for `[tls]` (same `cert`, `key`, `sni_certs` fields). `[dns.tls]` takes precedence over top-level `[tls]` when both exist; prefer `[tls]` for new configuration. |
+| `tls` | table | `None` | `[dns.tls]` is the effective TLS table and takes precedence over the top-level `[tls]` alias when both exist (same `cert`, `key`, `sni_certs` fields). Prefer `[dns.tls]` for new configuration; changing either table requires a restart. |
 | `edns_udp_size` | integer | `1232` | Maximum EDNS0 UDP buffer size (1232 bytes prevents IPv6 fragmentation). |
 | `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual source prefix (`0` disables rate limiting; maximum `1000000`). IPv4 budgets are keyed per `/24` and IPv6 per `/64`. |
 | `max_tcp_connections` | integer | `256` | Maximum concurrent TCP, DoT, and DoH client connections. |

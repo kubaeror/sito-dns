@@ -552,6 +552,7 @@ fn filter_status_metrics(status: &sito_filter::FilterStatus) -> sito_stats::Filt
         failed_lists: u64::try_from(status.failed_lists.len()).unwrap_or(u64::MAX),
         degraded_groups: u64::try_from(status.degraded_groups.len()).unwrap_or(u64::MAX),
         dropped_regex_patterns: u64::try_from(status.dropped_regex_patterns).unwrap_or(u64::MAX),
+        unavailable: u64::from(status.unavailable),
     }
 }
 
@@ -616,11 +617,23 @@ async fn init_runtime_components(
 
     // Initialize hosts filter. The observer records both the initial load and
     // every scheduled refresh in `sito_filter_compile_seconds`.
+    //
+    // Group custom rules are a real source even when global
+    // `filtering.lists`/`custom_rules` are empty; pass that hint so a
+    // group-only deployment does not initialize as unavailable/fail-closed.
+    let initial_clients = clients_from_config(config)?;
+    let has_group_sources = initial_clients.groups.values().any(|group| {
+        group
+            .custom_rules
+            .iter()
+            .any(|rule| !rule.trim().is_empty())
+    });
     let filter_engine = Arc::new(
-        HostsFilterEngine::init_with_observer(
+        HostsFilterEngine::init_with_observer_and_group_sources(
             config.filtering.clone(),
             config.server.data_dir.clone(),
             Some(metrics.compile_observer()),
+            has_group_sources,
         )
         .await,
     );
@@ -1247,6 +1260,11 @@ pub async fn run_server_full(
         pipeline: pipeline.clone(),
     });
 
+    // D12 readiness state shared with the API. Challenge flags are updated by
+    // `init_tls_and_acme`/`start_dns_listeners`; issuance errors by the ACME
+    // manager.
+    let acme_challenges = AcmeChallengeAvailability::new(false, false);
+
     let server_ctx = sito_api::ServerContext {
         config: config_arc.clone(),
         runtime: runtime.clone(),
@@ -1268,6 +1286,7 @@ pub async fn run_server_full(
         slave_tracker: slave_tracker.clone(),
         resync_sender,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(setup_pending)),
+        acme_challenges: Some(acme_challenges.clone()),
         dns_starter,
     };
 
@@ -1357,7 +1376,8 @@ pub async fn run_server_full(
         shutdown_rx: shutdown_rx.clone(),
     }));
 
-    let mut cert_watchers = init_tls_and_acme(&config, &shutdown_rx, &listener_acceptors).await?;
+    let mut cert_watchers =
+        init_tls_and_acme(&config, &shutdown_rx, &listener_acceptors, &acme_challenges).await?;
 
     if setup_pending {
         info!(
@@ -1374,7 +1394,14 @@ pub async fn run_server_full(
                 // the initial acceptors were built from the empty config.
                 // Re-initialize so DoT/DoH/DoQ listen immediately instead of
                 // requiring a restart.
-                match init_tls_and_acme(&current_cfg, &shutdown_rx, &listener_acceptors).await {
+                match init_tls_and_acme(
+                    &current_cfg,
+                    &shutdown_rx,
+                    &listener_acceptors,
+                    &acme_challenges,
+                )
+                .await
+                {
                     Ok(watchers) => cert_watchers.extend(watchers),
                     Err(e) => warn!(
                         error = %e,
@@ -1535,12 +1562,14 @@ async fn init_tls_and_acme(
     config: &Config,
     shutdown_rx: &watch::Receiver<bool>,
     listener_acceptors: &tokio::sync::Mutex<Option<ListenerAcceptors>>,
+    acme_challenges: &sito_transport::AcmeChallengeAvailability,
 ) -> anyhow::Result<Vec<sito_transport::CertWatcher>> {
     // ACME and TLS setup
     let acme_cfg = config.get_acme_config();
     let is_acme_enabled = acme_cfg
         .as_ref()
         .is_some_and(|a| a.enabled && !a.domains.is_empty());
+    acme_challenges.set_enabled(is_acme_enabled);
 
     let (cert_file, key_file, sni_tuples) = if let Some(tls_cfg) = config.get_tls_config() {
         if let (Some(cert), Some(key)) = (&tls_cfg.cert, &tls_cfg.key) {
@@ -1711,8 +1740,8 @@ async fn init_tls_and_acme(
         };
 
     // Live challenge state starts fail-safe: no TLS-ALPN-01 until a 443 DoH
-    // listener actually binds (done later by `start_dns_listeners`).
-    let acme_challenges = AcmeChallengeAvailability::new(false, false);
+    // listener actually binds (done later by `start_dns_listeners`). The
+    // caller owns the shared object so readiness can read it.
 
     // If ACME is enabled, start ACME renewal background manager
     if let (Some(service_cfg), Some(acme)) = (acme_service_cfg, acme_cfg.as_ref()) {
@@ -1767,7 +1796,7 @@ async fn init_tls_and_acme(
         doh: doh_acceptor_mgr,
         doq: doq_acceptor_mgr,
         doh3: doh3_acceptor_mgr,
-        acme_challenges,
+        acme_challenges: acme_challenges.clone(),
     });
 
     Ok(cert_watchers)
@@ -2660,7 +2689,8 @@ mod tests {
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let acceptors = tokio::sync::Mutex::new(None);
-        let result = init_tls_and_acme(&config, &shutdown_rx, &acceptors).await;
+        let challenges = AcmeChallengeAvailability::default();
+        let result = init_tls_and_acme(&config, &shutdown_rx, &acceptors, &challenges).await;
         assert!(
             result.is_err(),
             "unreadable certificate material must fail startup, not disable encrypted listeners"
@@ -2691,7 +2721,8 @@ mod tests {
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let acceptors = tokio::sync::Mutex::new(None);
-        let watchers = init_tls_and_acme(&config, &shutdown_rx, &acceptors)
+        let challenges = AcmeChallengeAvailability::default();
+        let watchers = init_tls_and_acme(&config, &shutdown_rx, &acceptors, &challenges)
             .await
             .expect("TLS initialization");
 

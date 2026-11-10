@@ -247,6 +247,11 @@ async fn health_handler(State(ctx): State<ServerContext>) -> impl IntoResponse {
     } else {
         Some("HA replication is not ready")
     };
+    // D12: expose a stable challenge/issuance reason code without leaking any
+    // filesystem path, ACME account detail or certificate error text. This
+    // endpoint is unauthenticated, so `last_error` stays on `/api/v1/status`.
+    let acme = ctx.acme_readiness(&cfg);
+    let acme_reason = acme.reason;
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -258,6 +263,11 @@ async fn health_handler(State(ctx): State<ServerContext>) -> impl IntoResponse {
                 "required": ha_required,
                 "ready": ha.ready,
                 "reason": ha_reason,
+            },
+            "acme": {
+                "enabled": acme.enabled,
+                "ready": acme.ready,
+                "reason": acme_reason,
             },
         })),
     )

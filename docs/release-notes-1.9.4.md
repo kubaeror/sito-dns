@@ -152,9 +152,12 @@ document is the operator-facing summary and upgrade guide.
   when the client asked for them.
 - QR=1 messages are dropped; zero/multi-question queries get FORMERR before any
   policy/cache/upstream work.
-- Rate limits are keyed per IPv4 `/24` and IPv6 `/64` with approximate-LRU
-  eviction. Per-source connection caps and maximum lifetimes apply to
-  TCP/DoT/DoH/DoQ/DoH3; accept loops back off on resource-exhaustion errors.
+- Rate limits are keyed per IPv4 `/24` and IPv6 `/64` (IPv4-mapped IPv6 peers
+  use the IPv4 bucket) with approximate-LRU eviction. Per-source connection
+  caps apply to TCP/DoT/DoH/DoQ/DoH3; TCP and DoH have explicit maximum
+  connection lifetimes, while DoT/DoQ/DoH3 rely on idle, handshake and request
+  deadlines rather than a separate maximum lifetime. Accept loops back off on
+  resource-exhaustion errors.
 - ACME HTTP-01 has connection/per-IP/rate/header/lifetime limits.
 - DoQ/DoH3 connection and request tasks are tracked and drained on shutdown.
 
@@ -187,8 +190,9 @@ document is the operator-facing summary and upgrade guide.
   Cosign itself is installed checksum-verified unless
   `SITO_INSTALL_COSIGN=0`.
 - Releases are gated on the required branch and green `ci-gate`/`cargo-deny`
-  checks; container images are Trivy-scanned (HIGH/CRITICAL unfixed fail) and
-  cosign-signed with provenance/SBOM attestations.
+  checks; container images are Trivy-scanned for fixed HIGH/CRITICAL
+  vulnerabilities (`--ignore-unfixed`; unfixed findings are reported but do not
+  fail the gate) and cosign-signed with provenance/SBOM attestations.
 - `invalidate_domain` works: cache invalidation closures are enabled, and a
   runtime error flushes the cache rather than reporting success while leaving
   stale entries.
@@ -249,6 +253,11 @@ documented residual risks:
 
 Additional deferred/unchanged items:
 
+- **DNAME (P1-1 residual).** The pinned `hickory-proto 0.26.3` has no DNAME
+  RDATA type, so DNAME responses are rejected/fail closed rather than
+  validated or followed. This is not an `AD=1` bypass, but signed DNAME
+  answers do not resolve until a hickory upgrade or local RDATA support lands
+  in Phase 1/2.
 - **RouterOS** remains an experimental, niche integration with the 1.9.x
   behavior; moving it behind an optional feature is a 2.0 item.
 - **Fuzzing** is not part of the 1.9.4 build or CI. The old `fuzz/Cargo.toml`
@@ -299,9 +308,11 @@ and GHCR and are covered by the static release-workflow policy test.
 - A first ACME issuance with `allow_bootstrap_cert = false` requires one restart
   before encrypted listeners start (they are not hot-created after the first
   certificate).
-- The ACME challenge-availability flag is refreshed on listener bind/rebind; a
-  failed 443 bind can still select TLS-ALPN-01 until the next attempt, which
-  then retries on the normal backoff.
+- ACME readiness is visible in `/health` (`acme.ready` and the stable reason
+  `acme_challenge_unavailable`) and in the authenticated `/api/v1/status`
+  response. When neither port 80 nor a TCP 443 TLS-ALPN listener is available,
+  issuance retries on the normal backoff while an existing certificate keeps
+  serving; it does not abort startup.
 - DoH returns HTTP 504 on its total request deadline while DoH3 aborts the
   stream; the parity difference is documented in the transport tests.
 - TCP/DoH 300 s maximum-lifetime paths are covered structurally but not by a
