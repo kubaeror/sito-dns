@@ -41,11 +41,76 @@ pub struct ServerContext {
     pub slave_tracker: Option<sito_ha::SlaveStatusTracker>,
     pub resync_sender: Option<tokio::sync::mpsc::Sender<()>>,
     pub setup_pending: Arc<AtomicBool>,
+    /// Live ACME challenge-listener state when ACME is enabled; used by
+    /// readiness reporting (D12 `acme_challenge_unavailable`).
+    pub acme_challenges: Option<sito_transport::AcmeChallengeAvailability>,
     pub dns_starter: Option<UnboundedSender<()>>,
     /// Serializes every configuration apply/persist path (HA applier, file
     /// watcher, REST/UI handlers) so a slower older document cannot overwrite
     /// a newer one after the newer push already reached the runtime.
     pub apply_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// ACME readiness derived from the live challenge-listener state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcmeReadiness {
+    /// ACME is enabled in the effective configuration.
+    pub enabled: bool,
+    /// A challenge path is available and the last issuance check succeeded.
+    pub ready: bool,
+    /// HTTP-01 listener bound.
+    pub http01_available: bool,
+    /// TCP 443 DoH listener bound with `acme-tls/1`.
+    pub tls_alpn_available: bool,
+    /// Stable reason code when not ready.
+    pub reason: Option<&'static str>,
+    /// Most recent issuance/renewal error, for the authenticated status view.
+    pub last_error: Option<String>,
+}
+
+/// Computes ACME readiness from the live challenge state and configuration.
+fn acme_readiness_for(
+    challenges: Option<&sito_transport::AcmeChallengeAvailability>,
+    config: &Config,
+) -> AcmeReadiness {
+    let enabled = config.get_acme_config().is_some_and(|acme| acme.enabled);
+    if !enabled {
+        return AcmeReadiness {
+            enabled: false,
+            ready: true,
+            http01_available: false,
+            tls_alpn_available: false,
+            reason: None,
+            last_error: None,
+        };
+    }
+    let Some(challenges) = challenges else {
+        return AcmeReadiness {
+            enabled: true,
+            ready: false,
+            http01_available: false,
+            tls_alpn_available: false,
+            reason: Some("acme_challenge_unavailable"),
+            last_error: None,
+        };
+    };
+    let options = challenges.options();
+    let last_error = challenges.last_error();
+    let (ready, reason) = if challenges.challenge_unavailable() {
+        (false, Some("acme_challenge_unavailable"))
+    } else if last_error.is_some() {
+        (false, Some("acme_issuance_failed"))
+    } else {
+        (true, None)
+    };
+    AcmeReadiness {
+        enabled,
+        ready,
+        http01_available: options.http01_available,
+        tls_alpn_available: options.tls_alpn_available,
+        reason,
+        last_error,
+    }
 }
 
 /// Whether the configuration makes HA replication part of the node's role.
@@ -99,6 +164,17 @@ impl ServerContext {
             ),
             _ => sito_ha::HaReadiness::ready(),
         }
+    }
+
+    /// Current ACME readiness.
+    ///
+    /// D12: when ACME is enabled but neither port 80 (HTTP-01) nor a TCP 443
+    /// DoH listener (TLS-ALPN-01) is available, readiness is false with the
+    /// stable reason `acme_challenge_unavailable`. A failed issuance is
+    /// reported separately so an existing certificate can still serve traffic.
+    #[must_use]
+    pub fn acme_readiness(&self, config: &Config) -> AcmeReadiness {
+        acme_readiness_for(self.acme_challenges.as_ref(), config)
     }
 
     /// Acquires the configuration apply/persist lock.
@@ -161,17 +237,79 @@ impl ServerContext {
 
     /// Publishes an updated HA configuration bundle to all connected replica slaves,
     /// incrementing the configuration version monotonic counter.
-    pub async fn publish_bundle(&self) {
+    ///
+    /// Returns the observable publish outcome. Sanitization/read/persist
+    /// failures are errors, never an empty bundle; an oversized envelope is
+    /// `TooLarge` because it is a configuration error the caller must surface
+    /// (and roll back). A failed publish is also recorded in HA readiness and
+    /// a bounded background retry is scheduled.
+    pub async fn publish_bundle(&self) -> Result<sito_ha::PublishOutcome, sito_ha::HaError> {
+        self.publish_bundle_with_retry().await.0
+    }
+
+    /// Like [`Self::publish_bundle`], but also reports the delay before the
+    /// first attempt of a newly scheduled background retry.
+    ///
+    /// `None` means no new retry loop was started (no HA coordinator, or one is
+    /// already running with its own backoff schedule). Callers that expose a
+    /// `retry_at` timestamp must omit it in that case instead of guessing.
+    pub async fn publish_bundle_with_retry(
+        &self,
+    ) -> (
+        Result<sito_ha::PublishOutcome, sito_ha::HaError>,
+        Option<std::time::Duration>,
+    ) {
+        let result = self.publish_bundle_inner().await;
+        let mut retry_delay = None;
+        if let Err(e) = &result {
+            // Some failures happen before the coordinator sees a bundle
+            // (unreadable/empty/sanitize/secret/version errors). They must
+            // still make HA readiness false, not only return an API error.
+            if let Some(ref coordinator) = self.master_coordinator {
+                coordinator.mark_publish_failed(e.to_string());
+            }
+            retry_delay = self.schedule_publish_retry();
+        }
+        (result, retry_delay)
+    }
+
+    async fn publish_bundle_inner(&self) -> Result<sito_ha::PublishOutcome, sito_ha::HaError> {
+        use sito_ha::HaError;
+
         let Some(ref coordinator) = self.master_coordinator else {
-            return;
+            return Ok(sito_ha::PublishOutcome::NoSlaves);
         };
 
         let config = self.config.load();
         let raw_toml = match tokio::fs::read_to_string(&self.config_path).await {
             Ok(raw) => raw,
-            Err(_) => toml::to_string_pretty(&**config).unwrap_or_default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::to_string_pretty(&**config)
+                .map_err(|e| {
+                    HaError::Serialization(format!(
+                        "Failed to serialize the running configuration for HA publication: {e}"
+                    ))
+                })?,
+            Err(e) => {
+                return Err(HaError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to read '{}' for HA publication: {e}",
+                        self.config_path.display()
+                    ),
+                )));
+            }
         };
-        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&raw_toml).unwrap_or_default();
+        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&raw_toml)?;
+        if sanitized_toml.trim().is_empty() {
+            return Err(HaError::Validation {
+                field: "config_toml".to_string(),
+                reason: format!(
+                    "Refusing to publish an empty HA bundle derived from '{}'; \
+                     check the configuration before retrying",
+                    self.config_path.display()
+                ),
+            });
+        }
         let list_metadata = config
             .filtering
             .lists
@@ -186,21 +324,22 @@ impl ServerContext {
 
         // Defense in depth: refuse to broadcast a bundle that embeds a known
         // secret in plaintext.
-        if let Some(ref ha_val) = self.config.load().ha
+        if let Some(ref ha_val) = config.ha
             && let Ok(ha_cfg) = sito_ha::HaConfig::from_toml_value(ha_val)
             && let Some(ref token) = ha_cfg.slave_token
-            && let Err(e) = sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])
         {
-            tracing::error!("Refusing to publish HA bundle: {e}");
-            return;
+            sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])?;
         }
 
-        let Some(new_version) = coordinator.get_current_version().checked_add(1) else {
-            tracing::error!(
-                "Refusing to publish HA bundle: the configuration version sequence is exhausted"
-            );
-            return;
-        };
+        let new_version = coordinator
+            .get_current_version()
+            .checked_add(1)
+            .ok_or_else(|| HaError::Validation {
+                field: "version".to_string(),
+                reason:
+                    "Refusing to publish HA bundle: the configuration version sequence is exhausted"
+                        .to_string(),
+            })?;
         #[allow(clippy::cast_sign_loss)]
         let bundle = sito_ha::ConfigBundle {
             version: new_version,
@@ -213,17 +352,67 @@ impl ServerContext {
             lists: list_metadata,
         };
 
-        if let Err(e) = coordinator.update_bundle_async(bundle).await {
-            tracing::error!(
-                version = new_version,
-                "Failed to update HA bundle and broadcast to slaves: {e}"
-            );
-        } else {
-            tracing::info!(
-                version = new_version,
-                "Updated HA bundle and broadcasted to slaves"
-            );
+        match coordinator.publish_bundle_async(bundle).await {
+            Ok(outcome) => {
+                tracing::info!(
+                    version = new_version,
+                    outcome = ?outcome,
+                    "Updated HA bundle"
+                );
+                Ok(outcome)
+            }
+            Err(e) => {
+                tracing::error!(
+                    version = new_version,
+                    "Failed to update HA bundle and broadcast to slaves: {e}"
+                );
+                Err(e)
+            }
         }
+    }
+
+    /// Schedules one bounded background retry loop with exponential backoff.
+    ///
+    /// The local configuration has already been persisted by the caller and
+    /// must not be rolled back because of an HA failure (D8). The coordinator
+    /// guard keeps a burst of failed API writes from spawning many loops.
+    ///
+    /// Returns the initial delay only when this call started a new loop;
+    /// `None` means an existing loop owns the schedule (or HA is not active).
+    fn schedule_publish_retry(&self) -> Option<std::time::Duration> {
+        let coordinator = self.master_coordinator.as_ref()?;
+        if !coordinator.begin_publish_retry() {
+            return None;
+        }
+        let initial_delay = std::time::Duration::from_secs(1);
+        let retry_ctx = self.clone();
+        let retry_coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            let mut delay = initial_delay;
+            for attempt in 1..=5 {
+                tokio::time::sleep(delay).await;
+                match retry_ctx.publish_bundle().await {
+                    Ok(outcome) => {
+                        tracing::info!(
+                            attempt,
+                            outcome = ?outcome,
+                            "HA publish retry completed"
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            attempt,
+                            error = %e,
+                            "HA publish retry failed; backing off"
+                        );
+                        delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                    }
+                }
+            }
+            retry_coordinator.end_publish_retry();
+        });
+        Some(initial_delay)
     }
 }
 
@@ -238,8 +427,10 @@ pub fn sanitize_clients_for_bundle(clients: Option<&toml::Value>) -> Option<toml
 }
 
 /// Helper function to publish an updated configuration bundle to replica slaves.
-pub async fn publish_bundle(ctx: &ServerContext) {
-    ctx.publish_bundle().await;
+pub async fn publish_bundle(
+    ctx: &ServerContext,
+) -> Result<sito_ha::PublishOutcome, sito_ha::HaError> {
+    ctx.publish_bundle().await
 }
 
 // Axum FromRef implementations for modular extractors
@@ -271,6 +462,57 @@ impl axum::extract::FromRef<ServerContext> for MetricsRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Deferred D4b review: `publish_bundle_with_retry` must report the delay
+    /// only for a newly started retry loop. A second failure while that loop is
+    /// still active returns `None`, so the REST `retry_at` is omitted instead
+    /// of advertising a duplicate schedule.
+    #[tokio::test]
+    async fn test_publish_bundle_with_retry_reports_only_new_loop_delay() {
+        let temp_dir = crate::test_support::temp_dir("sito_ha_retry_report");
+        let mut ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.master_coordinator = Some(sito_ha::MasterCoordinator::new(
+            "retry-report-test".to_string(),
+            0,
+            Arc::new(
+                sito_ha::Ed25519SigningKey::generate().expect("test signing key must generate"),
+            ),
+            ctx.metrics.clone(),
+        ));
+        // Force a deterministic pre-coordinator publish failure: reading the
+        // configured path as a file fails when it is a directory.
+        std::fs::create_dir_all(&ctx.config_path).expect("create directory at config path");
+
+        let (first, first_delay) = ctx.publish_bundle_with_retry().await;
+        assert!(first.is_err(), "the first publish must fail");
+        assert_eq!(
+            first_delay,
+            Some(Duration::from_secs(1)),
+            "the call that starts the retry loop reports its initial delay"
+        );
+        let first_report =
+            crate::config_apply::HaPublishReport::failed_with_retry("publish failed", first_delay);
+        assert!(
+            first_report.retry_at.is_some(),
+            "REST retry_at must be present for the newly scheduled loop"
+        );
+
+        let (second, second_delay) = ctx.publish_bundle_with_retry().await;
+        assert!(second.is_err(), "the second publish must fail too");
+        assert_eq!(
+            second_delay, None,
+            "an already-running retry loop must not report a second schedule"
+        );
+        let second_report =
+            crate::config_apply::HaPublishReport::failed_with_retry("publish failed", second_delay);
+        assert!(
+            second_report.retry_at.is_none(),
+            "REST retry_at must be omitted while the existing loop owns the schedule"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 
     #[test]
     fn test_sanitize_clients_for_bundle_strips_shared_secrets() {
@@ -297,5 +539,54 @@ mod tests {
         assert!(!sanitized.to_string().contains("super-secret"));
 
         assert!(sanitize_clients_for_bundle(None).is_none());
+    }
+
+    /// D12: an ACME deployment with neither a port 80 listener nor a TCP 443
+    /// TLS-ALPN challenge path must report `acme_challenge_unavailable`.
+    #[test]
+    fn test_acme_readiness_no_80_no_443() {
+        let mut config = Config::default();
+        config.acme = Some(sito_core::config::AcmeConfig {
+            enabled: true,
+            email: Some("admin@example.com".to_string()),
+            domains: vec!["dns.example.com".to_string()],
+            ..Default::default()
+        });
+
+        // No challenge listener at all (fresh defaults are fail-safe false).
+        let challenges = sito_transport::AcmeChallengeAvailability::new(false, false);
+        let readiness = acme_readiness_for(Some(&challenges), &config);
+        assert!(!readiness.ready);
+        assert_eq!(readiness.reason, Some("acme_challenge_unavailable"));
+
+        // Either bound listener makes ACME issuable.
+        let http = sito_transport::AcmeChallengeAvailability::new(false, true);
+        let readiness = acme_readiness_for(Some(&http), &config);
+        assert!(
+            readiness.ready,
+            "HTTP-01 on port 80 is a usable path: {readiness:?}"
+        );
+
+        let tls_alpn = sito_transport::AcmeChallengeAvailability::new(true, false);
+        let readiness = acme_readiness_for(Some(&tls_alpn), &config);
+        assert!(
+            readiness.ready,
+            "TLS-ALPN-01 on 443 is a usable path: {readiness:?}"
+        );
+
+        // A failed issuance is surfaced separately but does not claim the
+        // challenge path is missing.
+        tls_alpn.record_error("order failed");
+        let readiness = acme_readiness_for(Some(&tls_alpn), &config);
+        assert!(!readiness.ready);
+        assert_eq!(readiness.reason, Some("acme_issuance_failed"));
+        assert_eq!(readiness.last_error.as_deref(), Some("order failed"));
+
+        // Disabled ACME is always "ready" and produces no warning signal.
+        config.acme.as_mut().unwrap().enabled = false;
+        let readiness = acme_readiness_for(Some(&challenges), &config);
+        assert!(readiness.ready);
+        assert!(!readiness.enabled);
+        assert_eq!(readiness.reason, None);
     }
 }

@@ -12,6 +12,7 @@ use utoipa::OpenApi;
         crate::handlers::stats::get_upstream_stats,
         crate::handlers::querylog::get_querylog,
         crate::handlers::querylog::delete_querylog,
+        crate::handlers::filtering::get_filtering_status,
         crate::handlers::filtering::get_filter_lists,
         crate::handlers::filtering::add_filter_list,
         crate::handlers::filtering::update_filter_list,
@@ -46,6 +47,7 @@ use utoipa::OpenApi;
         crate::handlers::auth_handlers::login,
         crate::handlers::auth_handlers::verify_totp,
         crate::handlers::auth_handlers::logout,
+        crate::handlers::auth_handlers::reauth,
         crate::handlers::auth_handlers::get_totp_setup,
         crate::handlers::auth_handlers::enable_totp,
         crate::handlers::auth_handlers::disable_totp,
@@ -72,7 +74,9 @@ use utoipa::OpenApi;
             crate::handlers::update::ApplyUpdateResponse,
             crate::handlers::update::ApplyUpdatePayload,
             crate::models::StatusResponse,
+            crate::models::AcmeStatus,
             crate::models::StatsQuery,
+            crate::models::FilterStatusDto,
             crate::models::FilterListDto,
             crate::models::AddFilterListRequest,
             crate::models::UpdateFilterListRequest,
@@ -101,6 +105,8 @@ use utoipa::OpenApi;
             crate::models::RestoreConfirmRequest,
             crate::models::LoginRequest,
             crate::models::LoginResponse,
+            crate::models::ReauthRequest,
+            crate::models::ReauthResponse,
             crate::models::TotpVerifyRequest,
             crate::models::TotpConfirmRequest,
             crate::models::DisableTotpRequest,
@@ -142,7 +148,7 @@ use utoipa::OpenApi;
     info(
         title = "sito DNS Administrative API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Administrative REST API and OpenAPI 3.1 specification for the sito DNS server. Account, role, and API-token management plus TOTP status/disabling are available in the web UI (/users and /account); TOTP enrollment/setup remains REST-only. See docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
+        description = "Administrative REST API and OpenAPI 3.1 specification for the sito DNS server. Account, role, API-token management, and self-service TOTP enrollment are available in the web UI (/users and /account); sensitive TOTP changes require a fresh re-authentication ticket from POST /api/v1/auth/reauth. See docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
         license(name = "GPL-3.0-only")
     )
 )]

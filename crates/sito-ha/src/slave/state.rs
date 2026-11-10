@@ -55,6 +55,9 @@ pub struct SlaveStatusTracker {
     watermark: Arc<Mutex<Option<AppliedWatermark>>>,
     /// Path of the on-disk watermark, when persistence is configured.
     watermark_path: Arc<Mutex<Option<PathBuf>>>,
+    /// True when the on-disk configuration no longer matches the digest of the
+    /// document that was last applied from the master.
+    local_config_drift: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SlaveStatusTracker {
@@ -70,6 +73,7 @@ impl SlaveStatusTracker {
             master_url,
             watermark: Arc::new(Mutex::new(None)),
             watermark_path: Arc::new(Mutex::new(None)),
+            local_config_drift: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -159,6 +163,7 @@ impl SlaveStatusTracker {
             timestamp,
             forked: false,
             forked_at_version: 0,
+            applied_config_digest: None,
         });
         watermark.forked = true;
         watermark.forked_at_version = version;
@@ -195,6 +200,24 @@ impl SlaveStatusTracker {
         term: u64,
         payload_hash: &str,
     ) -> Result<(), HaError> {
+        self.persist_watermark_with_config_digest(version, term, payload_hash, None)
+    }
+
+    /// Persists the applied watermark together with the BLAKE3 digest of the
+    /// exact configuration document that was persisted for this bundle.
+    ///
+    /// The digest is what makes restart-time drift detection possible: a local
+    /// edit to a shared field (or a local revert) no longer matches and forces
+    /// a re-apply instead of an early `Synced` ACK. Passing `None` preserves
+    /// legacy callers and clears the drift flag because the caller explicitly
+    /// says it has no document to verify.
+    pub fn persist_watermark_with_config_digest(
+        &self,
+        version: u64,
+        term: u64,
+        payload_hash: &str,
+        config_digest: Option<&str>,
+    ) -> Result<(), HaError> {
         if version == u64::MAX {
             return Err(HaError::Validation {
                 field: "ha_watermark".to_string(),
@@ -216,6 +239,7 @@ impl SlaveStatusTracker {
             timestamp,
             forked: false,
             forked_at_version: 0,
+            applied_config_digest: config_digest.map(str::to_string),
         };
 
         if let Some(path) = self.watermark_path.lock().unwrap().clone() {
@@ -232,7 +256,64 @@ impl SlaveStatusTracker {
         }
 
         *self.watermark.lock().unwrap() = Some(watermark);
+        if config_digest.is_some() {
+            self.local_config_drift
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(())
+    }
+
+    /// Compares `document` with the digest persisted for the last applied
+    /// bundle.
+    ///
+    /// Returns `true` when drift was detected (and marks the tracker
+    /// `Degraded`/not-ready). A node with no watermark, or a watermark written
+    /// by a version that did not record a digest, cannot be verified and is
+    /// left alone; the very next master push establishes the digest.
+    pub fn verify_applied_config(&self, document: &str) -> Result<bool, HaError> {
+        let Some(expected) = self
+            .get_watermark()
+            .and_then(|watermark| watermark.applied_config_digest)
+        else {
+            return Ok(false);
+        };
+        let actual = crate::bundle::config_digest(document);
+        if actual == expected {
+            self.local_config_drift
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return Ok(false);
+        }
+
+        self.local_config_drift
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.mark_degraded(format!(
+            "Local configuration drift: config.toml digest {actual} no longer matches the last applied shared bundle digest {expected}. Replication must re-apply the master configuration; if the master is unreachable this node stays Degraded"
+        ));
+        Ok(true)
+    }
+
+    /// Whether the local configuration is known to differ from the last
+    /// applied shared bundle.
+    #[must_use]
+    pub fn has_local_config_drift(&self) -> bool {
+        self.local_config_drift
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether the next identical same-version push must be fully applied
+    /// instead of early-ACKed.
+    ///
+    /// This is true for detected local drift **and** for a watermark written
+    /// by 1.9.3 (or earlier) that has no applied-config digest. A legacy
+    /// watermark cannot prove the on-disk configuration still matches what was
+    /// applied, so the protection must not stay fail-open after an upgrade;
+    /// the first full apply records the digest and clears this condition.
+    #[must_use]
+    pub fn requires_full_apply(&self) -> bool {
+        self.has_local_config_drift()
+            || self
+                .get_watermark()
+                .is_some_and(|watermark| watermark.applied_config_digest.is_none())
     }
 
     /// Writes `payload` to `path` atomically (0600 temp file, fsync, rename).

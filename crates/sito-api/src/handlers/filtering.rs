@@ -5,7 +5,7 @@ use crate::config_apply::{FilterApply, apply_and_persist_config_locked};
 use crate::error::ProblemDetails;
 use crate::models::{
     AddFilterListRequest, CustomRulesDto, FilterCheckRequest, FilterCheckResponse, FilterListDto,
-    GenericMessageResponse, UpdateFilterListRequest,
+    FilterStatusDto, GenericMessageResponse, UpdateFilterListRequest,
 };
 use crate::state::ServerContext;
 use axum::Json;
@@ -64,6 +64,42 @@ async fn filter_list_dto(ctx: &ServerContext, list: &FilterListConfig) -> Filter
         rule_count,
         last_updated,
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/filtering/status",
+    responses(
+        (status = 200, description = "Filter engine lifecycle and per-list health", body = FilterStatusDto),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden")
+    ),
+    tag = "Filtering"
+)]
+#[allow(clippy::unused_async)]
+pub async fn get_filtering_status(
+    _viewer: RequireViewer,
+    State(ctx): State<ServerContext>,
+) -> Json<FilterStatusDto> {
+    let status = ctx.filter.status();
+    Json(FilterStatusDto {
+        state: match status.state {
+            sito_filter::FilterState::Disabled => "disabled",
+            sito_filter::FilterState::Loading => "loading",
+            sito_filter::FilterState::Ready => "ready",
+            sito_filter::FilterState::Failed => "failed",
+        }
+        .to_string(),
+        rule_count: status.rule_count,
+        loaded_lists: status.loaded_lists,
+        failed_lists: status.failed_lists,
+        degraded_lists: status.degraded_lists,
+        degraded_groups: status.degraded_groups,
+        dropped_regex_patterns: status.dropped_regex_patterns,
+        unavailable: status.unavailable,
+        last_error: status.last_error,
+        last_compile_ms: status.last_compile_ms,
+    })
 }
 
 #[utoipa::path(
@@ -419,6 +455,7 @@ mod tests {
         .unwrap();
 
         let mut config = (**ctx.config.load()).clone();
+        config.filtering.enabled = true;
         config.filtering.lists = vec![FilterListConfig {
             name: "Local".to_string(),
             url: format!("file://{}", list_path.display()),
@@ -455,6 +492,31 @@ mod tests {
         let missing = dtos.iter().find(|d| d.name == "Missing").unwrap();
         assert_eq!(local.rule_count, 3);
         assert_eq!(missing.rule_count, 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-0.5: the engine's loaded/failed/degraded state is exposed via the
+    /// API instead of being log-only.
+    #[tokio::test]
+    async fn test_filtering_status_is_exposed() {
+        let temp_dir = crate::test_support::temp_dir("sito_filter_status_api");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let Json(status) = get_filtering_status(
+            crate::auth::rbac::RequireViewer(AuthUser {
+                username: "viewer".to_string(),
+                role: Role::Viewer,
+                token_id: None,
+            }),
+            State(ctx.clone()),
+        )
+        .await;
+
+        assert_eq!(status.state, "disabled");
+        assert_eq!(status.rule_count, 0);
+        assert!(!status.unavailable);
+        assert_eq!(status.failed_lists.len(), 0);
+        assert_eq!(status.degraded_groups.len(), 0);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

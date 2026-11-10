@@ -13,8 +13,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-const MAX_FAILED_ATTEMPTS: u32 = 5;
-const LOCKOUT_DURATION: Duration = Duration::from_mins(15); // 15 minutes
+pub const MAX_FAILED_ATTEMPTS: u32 = 5;
+/// Lockout duration in seconds, shared by login, re-auth, and the tracker.
+pub const LOCKOUT_DURATION_SECS: u64 = 15 * 60; // 15 minutes
+const LOCKOUT_DURATION: Duration = Duration::from_secs(LOCKOUT_DURATION_SECS);
 pub const MAX_LOCKOUT_ENTRIES: usize = 10_000;
 pub const MAX_IP_RATE_ENTRIES: usize = 10_000;
 
@@ -83,10 +85,23 @@ impl LockoutTracker {
                     now.duration_since(r.last_attempt) <= LOCKOUT_DURATION && r.count > 0
                 }
             });
-            if map.len() >= MAX_LOCKOUT_ENTRIES
-                && let Some(oldest_key) = map.keys().next().cloned()
-            {
-                map.remove(&oldest_key);
+            // Evict the oldest entry that is *not* currently locked out.
+            // Removing an active lockout would let an attacker unlock a
+            // targeted account by spraying enough usernames to hit the cap.
+            if map.len() >= MAX_LOCKOUT_ENTRIES {
+                let victim = map
+                    .iter()
+                    .filter(|(_, record)| record.locked_until.is_none_or(|until| now >= until))
+                    .min_by_key(|(_, record)| record.last_attempt)
+                    .map(|(key, _)| key.clone());
+                match victim {
+                    Some(victim) => {
+                        map.remove(&victim);
+                    }
+                    // Every entry is actively locked. Refuse to grow the map
+                    // past the cap; the sprayed key is simply not tracked.
+                    None => return (false, MAX_FAILED_ATTEMPTS),
+                }
             }
         }
 
@@ -186,6 +201,20 @@ impl LockoutTracker {
     }
 
     #[cfg(test)]
+    pub fn attempt_keys(&self) -> Vec<String> {
+        lock(&self.attempts).keys().cloned().collect()
+    }
+
+    #[cfg(test)]
+    pub fn locked_len(&self) -> usize {
+        let now = Instant::now();
+        lock(&self.attempts)
+            .values()
+            .filter(|record| record.locked_until.is_some_and(|until| now < until))
+            .count()
+    }
+
+    #[cfg(test)]
     pub fn ip_rates_len(&self) -> usize {
         lock(&self.ip_rates).len()
     }
@@ -232,6 +261,32 @@ mod tests {
 
         // 6th attempt in the same minute is blocked
         assert!(!tracker.check_ip_rate_limit(ip, 5));
+    }
+
+    /// WP-0.7 (P1-20): filling the lockout map must never evict an entry whose
+    /// lockout is still active. Otherwise spraying usernames would unlock a
+    /// targeted account.
+    #[test]
+    fn test_active_lockout_is_not_evicted_at_capacity() {
+        let tracker = LockoutTracker::new();
+
+        // Fill the map with `MAX_LOCKOUT_ENTRIES` accounts that are all
+        // actively locked out.
+        for i in 0..MAX_LOCKOUT_ENTRIES {
+            let key = format!("locked-{i}");
+            for _ in 0..MAX_FAILED_ATTEMPTS {
+                tracker.record_failure(&key);
+            }
+        }
+        assert_eq!(tracker.locked_len(), MAX_LOCKOUT_ENTRIES);
+
+        // Eviction pressure from another key must not unlock any of them.
+        tracker.record_failure("sprayed");
+        assert_eq!(
+            tracker.locked_len(),
+            MAX_LOCKOUT_ENTRIES,
+            "an active lockout was evicted by username spraying"
+        );
     }
 
     #[test]

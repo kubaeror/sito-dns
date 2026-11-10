@@ -7,7 +7,9 @@ license.workspace = true
 description = "Query logging, persistent SQLite storage, and Prometheus metrics for sito"
 
 [dependencies]
+blake3.workspace = true
 chrono.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sito-core.workspace = true

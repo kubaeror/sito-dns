@@ -157,6 +157,170 @@ mod tests {
         (addr, query_count)
     }
 
+    /// Mock bootstrap server that only answers queries with RD=1, refusing
+    /// RD=0 like many recursive resolvers do.
+    fn spawn_rd_enforcing_bootstrap(
+        v4: Option<std::net::Ipv4Addr>,
+        v6: Option<std::net::Ipv6Addr>,
+    ) -> SocketAddr {
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let socket = tokio::net::UdpSocket::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok((len, peer)) = socket.recv_from(&mut buf).await else {
+                    break;
+                };
+                let Ok(query) = decode_message(&buf[..len]) else {
+                    continue;
+                };
+                let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                resp.queries = query.queries.clone();
+                if query.metadata.recursion_desired {
+                    resp.metadata.response_code = ResponseCode::NoError;
+                    match (query.queries[0].query_type(), v4, v6) {
+                        (RecordType::A, Some(v4), _) => {
+                            resp.answers.push(Record::from_rdata(
+                                query.queries[0].name().clone(),
+                                300,
+                                RData::A(A(v4)),
+                            ));
+                        }
+                        (RecordType::AAAA, _, Some(v6)) => {
+                            resp.answers.push(Record::from_rdata(
+                                query.queries[0].name().clone(),
+                                300,
+                                RData::AAAA(AAAA(v6)),
+                            ));
+                        }
+                        _ => {}
+                    }
+                } else {
+                    resp.metadata.response_code = ResponseCode::Refused;
+                }
+                if let Ok(encoded) = encode_message(&resp) {
+                    let _ = socket.send_to(&encoded, peer).await;
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_queries_set_recursion_desired() {
+        let mock_addr =
+            spawn_rd_enforcing_bootstrap(Some(std::net::Ipv4Addr::new(4, 4, 4, 4)), None);
+        let bootstrap = BootstrapResolver::new(vec![mock_addr.ip()], Duration::from_millis(1000))
+            .with_port(mock_addr.port());
+
+        let ips = bootstrap
+            .resolve_hostname("rd.example.com")
+            .await
+            .expect("bootstrap queries must set RD=1");
+        assert_eq!(
+            ips,
+            vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(4, 4, 4, 4))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_aaaa_query_sets_recursion_desired() {
+        let v6 = std::net::Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+        let mock_addr = spawn_rd_enforcing_bootstrap(None, Some(v6));
+        let bootstrap = BootstrapResolver::new(vec![mock_addr.ip()], Duration::from_millis(1000))
+            .with_port(mock_addr.port());
+
+        let ips = bootstrap
+            .resolve_hostname("rd-aaaa.example.com")
+            .await
+            .expect("AAAA bootstrap queries must set RD=1");
+        assert_eq!(ips, vec![std::net::IpAddr::V6(v6)]);
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_rejects_private_answers_by_default() {
+        let (mock_addr, _) =
+            spawn_bootstrap_server(Some(std::net::Ipv4Addr::new(10, 0, 0, 1)), None);
+        let bootstrap = BootstrapResolver::new(vec![mock_addr.ip()], Duration::from_millis(1000))
+            .with_port(mock_addr.port());
+
+        let result = bootstrap.resolve_hostname("private.example.com").await;
+        let error = result.expect_err("bootstrap must reject private answers by default");
+        assert!(
+            error.to_string().contains("allow_private_targets"),
+            "the error must tell the operator how to opt in: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_rejects_nat64_embedded_private_answers() {
+        // 64:ff9b::192.168.1.1 embeds a private IPv4 target; the shared SSRF
+        // helper unwraps it and must reject the answer by default.
+        let embedded = std::net::Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0xc0a8, 0x0101);
+        let (mock_addr, _) = spawn_bootstrap_server(None, Some(embedded));
+        let bootstrap = BootstrapResolver::new(vec![mock_addr.ip()], Duration::from_millis(1000))
+            .with_port(mock_addr.port());
+
+        let result = bootstrap.resolve_hostname("nat64.example.com").await;
+        assert!(
+            result.is_err(),
+            "NAT64-embedded private targets must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_allows_private_answers_when_opted_in() {
+        let (mock_addr, _) =
+            spawn_bootstrap_server(Some(std::net::Ipv4Addr::new(10, 0, 0, 1)), None);
+        let bootstrap = BootstrapResolver::new(vec![mock_addr.ip()], Duration::from_millis(1000))
+            .with_port(mock_addr.port())
+            .with_allow_private_targets(true);
+
+        let ips = bootstrap
+            .resolve_hostname("private.example.com")
+            .await
+            .expect("opt-in must allow private bootstrap targets");
+        assert_eq!(
+            ips,
+            vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_from_config_applies_allow_private_targets() {
+        let (mock_addr, _) =
+            spawn_bootstrap_server(Some(std::net::Ipv4Addr::new(10, 0, 0, 1)), None);
+
+        let denied_config = sito_core::config::UpstreamConfig {
+            bootstrap: vec![mock_addr.ip()],
+            timeout_ms: 1000,
+            ..Default::default()
+        };
+        let denied = BootstrapResolver::from_config(&denied_config).with_port(mock_addr.port());
+        assert!(
+            denied
+                .resolve_hostname("private.example.com")
+                .await
+                .is_err(),
+            "from_config must preserve the default deny policy"
+        );
+
+        let allowed_config = sito_core::config::UpstreamConfig {
+            allow_private_targets: true,
+            ..denied_config
+        };
+        let allowed = BootstrapResolver::from_config(&allowed_config).with_port(mock_addr.port());
+        assert_eq!(
+            allowed
+                .resolve_hostname("private.example.com")
+                .await
+                .unwrap(),
+            vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))]
+        );
+    }
+
     #[tokio::test]
     async fn test_bootstrap_resolves_hostname_mock() {
         let (mock_addr, _) =

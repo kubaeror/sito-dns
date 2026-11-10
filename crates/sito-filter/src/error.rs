@@ -40,6 +40,18 @@ pub enum FilterError {
     #[error("No filter list sources could be loaded ({failed} failed): {details}")]
     NoSourcesLoaded { failed: usize, details: String },
 
+    #[error("Filtering is enabled but no filter sources are configured")]
+    NoSourcesConfigured,
+
+    #[error("Configured filter sources yielded no usable rules: {details}")]
+    NoUsableRules { details: String },
+
+    #[error("Blocklist '{list}' returned an empty response")]
+    EmptyList { list: String },
+
+    #[error("Blocklist '{list}' returned an HTML/XML document instead of a rule list")]
+    HtmlResponse { list: String },
+
     #[error("Filter rule set exceeds the configured limit of {limit} rules (parsed: {count})")]
     TooManyRules { count: usize, limit: usize },
 

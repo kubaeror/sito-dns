@@ -335,11 +335,11 @@ fn is_client_excepted(client: &ClientContext, exceptions: &[String]) -> bool {
             return true;
         }
         // `client.id` may carry a client-supplied DoH path segment or SNI
-        // label when the client was NOT identified, so only honour it for
-        // clients that resolved to an entry (mirrors the Secret gate in the
-        // client registry). Otherwise `/dns-query/<exception>` could bypass a
-        // rewrite exception without authenticating.
-        if client.client_name.is_some()
+        // label. Only an id the registry authenticated (shared secret, or an
+        // entry selected by IP/CIDR/MAC/RouterOS) may satisfy an exception.
+        // Otherwise `/dns-query/<exception>` could bypass a rewrite exception
+        // without authenticating.
+        if client.id_authenticated
             && let Some(ref id) = client.id
             && exc.eq_ignore_ascii_case(id.as_str())
         {
@@ -883,6 +883,31 @@ entries = [
             table
                 .lookup(&qname_nas, RecordType::A, &identified)
                 .is_none()
+        );
+    }
+
+    /// P1-9: an identified client at a configured IP must not satisfy a
+    /// rewrite exception using a DoH-path id that was not registry-resolved.
+    #[test]
+    fn test_ip_identified_client_cannot_spoof_exception_with_untrusted_id() {
+        let table = sample_table();
+        let mut client = ClientContext::new(IpAddr::from_str("192.168.1.30").unwrap());
+        client.client_name = Some("kitchen".to_string());
+        client.id = Some(sito_core::ClientId::new("admin-laptop"));
+        // DoH/DoH3 path ids leave this false.
+        client.id_authenticated = false;
+
+        let qname_nas = Name::from_str("nas.home.arpa.").unwrap();
+        assert!(
+            table.lookup(&qname_nas, RecordType::A, &client).is_some(),
+            "an unauthenticated path id must not bypass a rewrite exception"
+        );
+
+        // Only the registry/secret-resolved flag may activate the id.
+        client.id_authenticated = true;
+        assert!(
+            table.lookup(&qname_nas, RecordType::A, &client).is_none(),
+            "an authenticated id may satisfy the exception"
         );
     }
 

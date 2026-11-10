@@ -45,6 +45,66 @@ fn query_has_do(query: &Message) -> bool {
         .is_some_and(|edns| edns.flags().dnssec_ok)
 }
 
+/// Maximum wall-clock time the pipeline spends on DNSSEC validation and its
+/// DNSKEY/DS chain fetches for one query.
+///
+/// The fetcher performs network I/O and an upstream can stall a response (or
+/// an attacker can black-hole DS/DNSKEY queries). A bound here keeps one query
+/// from pinning a worker for the upstream timeout times the chain depth.
+const DNSSEC_VALIDATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Validates a response under a hard wall-clock deadline.
+///
+/// On timeout strict (`Validate`) mode fails closed with SERVFAIL (never an
+/// unvalidated answer), while `LogOnly` keeps the response without AD, and
+/// `Disabled` never calls this helper.
+async fn validate_dnssec_with_deadline(
+    validator: &DnssecValidator,
+    response: &mut Message,
+    upstream: Option<&str>,
+    now: u32,
+    fetcher: &dyn sito_core::DnssecKeyFetcher,
+    deadline: std::time::Duration,
+) -> sito_dnssec::ValidationOutcome {
+    use sito_dnssec::{DnssecMode, ValidationOutcome};
+
+    // The chain walk appends fetched DNSKEY/DS helpers to the response. If the
+    // future is cancelled on timeout, drop anything it already appended so
+    // unvalidated helper records cannot leak to the client (or into a log-only
+    // cached response).
+    let original_additionals = response.additionals.len();
+    if let Ok(outcome) = tokio::time::timeout(
+        deadline,
+        validator.validate_with_key_fetcher(response, upstream, now, fetcher),
+    )
+    .await
+    {
+        return outcome;
+    }
+    response.additionals.truncate(original_additionals);
+
+    response.metadata.authentic_data = false;
+    if validator.mode == DnssecMode::Validate {
+        response.metadata.response_code = ResponseCode::ServFail;
+        response.answers.clear();
+        sito_dnssec::apply_ede(
+            response,
+            sito_dnssec::EDE_DNSSEC_BOGUS,
+            "DNSSEC validation timed out",
+        );
+        let outcome = ValidationOutcome::Bogus {
+            reason: "DNSSEC validation timed out".to_string(),
+            ede_code: sito_dnssec::EDE_DNSSEC_BOGUS,
+        };
+        validator.metrics.record_validation(&outcome);
+        outcome
+    } else {
+        let outcome = ValidationOutcome::Indeterminate;
+        validator.metrics.record_validation(&outcome);
+        outcome
+    }
+}
+
 /// Copies the query-derived metadata (ID/opcode are set by the caller) that
 /// every synthesized or error response must echo: RD, CD, the question and a
 /// minimal OPT record with the client's DO bit.
@@ -98,6 +158,57 @@ fn strip_dnssec_records(response: &mut Message) {
         edns.options_mut().remove(EdnsCode::DAU);
         edns.options_mut().remove(EdnsCode::DHU);
         edns.options_mut().remove(EdnsCode::N3U);
+    }
+}
+
+/// Single response-shaping path applied to every response before it leaves the
+/// pipeline.
+///
+/// DNS responses must echo the *current* client's question and RD/CD bits, not
+/// the stored/upstream question. EDNS is rebuilt from the client request so
+/// upstream-only options (COOKIE, NSID, ECS, padding, unknown options) cannot
+/// leak to another client, and a non-EDNS client never receives an OPT record
+/// (RFC 6891 §6.1.1). DNSSEC records are removed only when the client did not
+/// request them, and the DO bit is echoed exactly.
+///
+/// The RFC 8914 Extended DNS Error option (code 15) is retained as a
+/// non-client-specific diagnostic; it may come from local validation or the
+/// upstream. Every other option is dropped because it can be client-specific
+/// (COOKIE, ECS, NSID, padding).
+fn shape_response(query: &Message, response: &mut Message, client_wants_dnssec: bool) {
+    response.metadata.id = query.metadata.id;
+    response.metadata.op_code = query.metadata.op_code;
+    response.metadata.message_type = MessageType::Response;
+    response.metadata.authoritative = false;
+    response.metadata.recursion_desired = query.metadata.recursion_desired;
+    response.metadata.recursion_available = true;
+    response.metadata.checking_disabled = query.metadata.checking_disabled;
+    response.queries.clone_from(&query.queries);
+
+    let extended_error = response.edns.as_ref().and_then(|edns| {
+        edns.options()
+            .options
+            .iter()
+            .find(|(code, _)| u16::from(*code) == 15)
+            .map(|(_, option)| option.clone())
+    });
+
+    match &query.edns {
+        Some(client_edns) => {
+            let mut edns = Edns::new();
+            edns.set_max_payload(client_edns.max_payload());
+            edns.set_dnssec_ok(client_edns.flags().dnssec_ok);
+            if let Some(option) = extended_error {
+                edns.options_mut().insert(option);
+            }
+            response.set_edns(edns);
+        }
+        // RFC 6891: a response to a non-EDNS query must not contain an OPT RR.
+        None => response.edns = None,
+    }
+
+    if !client_wants_dnssec {
+        strip_dnssec_records(response);
     }
 }
 
@@ -194,10 +305,18 @@ fn validation_status(outcome: Option<&sito_dnssec::ValidationOutcome>) -> Valida
 /// Whether a cached entry may be served while local validation is active.
 ///
 /// `Unchecked` entries (CD=1 / validation disabled) must never be served when
-/// a CD=0 query expects the resolver to have validated the answer. Insecure
-/// and Indeterminate entries are legitimate but are always served with AD=0.
+/// a CD=0 query expects the resolver to have validated the answer.
+/// `Indeterminate` is not an authenticated decision either: in log-only mode a
+/// Bogus result is recorded that way, and strict mode answers it with SERVFAIL
+/// rather than serving the data. Only an authenticated `Secure`/`Insecure`
+/// decision may be served; both are returned with AD cleared when not
+/// `Secure`.
 fn cache_entry_servable(status: ValidationStatus, validation_active: bool) -> bool {
-    !validation_active || status != ValidationStatus::Unchecked
+    !validation_active
+        || matches!(
+            status,
+            ValidationStatus::Secure | ValidationStatus::Insecure
+        )
 }
 
 /// Whether a *stale* (RFC 8767) entry may be served while local validation is
@@ -480,31 +599,74 @@ struct FilterCandidates {
     block: Vec<u32>,
 }
 
+/// Precedence rank within one rule tier (important or standard).
+///
+/// The table is `Allow > Rewrite > Block`. The per-group overlay wins ties
+/// against the global set, so a group exception/rewrite has the same authority
+/// as any other group rule. Important rules always outrank standard rules
+/// because the caller evaluates that tier first.
+fn verdict_rank(verdict: &Verdict) -> u8 {
+    match verdict {
+        // `Allow(None)` is the "no rule matched" neutral verdict returned by
+        // the standard evaluators; only `Allow(Some(rule))` is a real allow.
+        Verdict::Allow(Some(_)) => 3,
+        Verdict::Rewrite(_) => 2,
+        Verdict::Block(_) => 1,
+        Verdict::Allow(None) => 0,
+    }
+}
+
+/// Combines one tier's global and per-group verdicts using [`verdict_rank`].
+fn combine_tier_verdicts(global: Option<Verdict>, group: Option<Verdict>) -> Option<Verdict> {
+    match (global, group) {
+        (None, None) => None,
+        (Some(global), None) => Some(global),
+        (None, Some(group)) => Some(group),
+        // Ignore a neutral `Allow(None)`; otherwise the group overlay wins
+        // equally-ranked verdicts and the higher-precedence verdict wins
+        // regardless of source.
+        (Some(global), Some(group)) => {
+            let global_rank = verdict_rank(&global);
+            let group_rank = verdict_rank(&group);
+            if group_rank == 0 {
+                Some(global)
+            } else if global_rank == 0 || group_rank >= global_rank {
+                Some(group)
+            } else {
+                Some(global)
+            }
+        }
+    }
+}
+
 /// Combines the global and per-group standard verdicts.
 ///
-/// Allow rules from either set win over block rules from the other set;
-/// rewrites apply when no allow matched; blocks from the global set take
-/// precedence in the returned reason.
+/// Precedence within the standard tier is `Allow > Rewrite > Block`; the
+/// group overlay wins ties. This lets a group `$dnsrewrite` override a global
+/// standard block, consistently with any group allow/block overlay.
 fn combine_standard_verdicts(global: Verdict, group: Option<Verdict>) -> Verdict {
-    let allow_rule_matched = |verdict: &Verdict| matches!(verdict, Verdict::Allow(Some(_)));
-    let global_allowed = allow_rule_matched(&global);
-    let group_allowed = group.as_ref().is_some_and(allow_rule_matched);
-    if global_allowed || group_allowed {
-        return Verdict::Allow(None);
+    combine_tier_verdicts(Some(global), group).unwrap_or(Verdict::Allow(None))
+}
+
+/// [`combine_tier_verdicts`] for the CNAME-target `$important` tier.
+///
+/// A `$dnsrewrite` cannot be applied on the CNAME-target path: the response is
+/// already resolved, so rewriting the target would require synthesizing a new
+/// answer. Drop rewrite verdicts entirely instead of converting them into
+/// `Allow(None)`, which callers would otherwise treat as a real allow and use
+/// to skip parental, service, and standard checks.
+fn combine_cname_target_tier_verdicts(
+    global: Option<Verdict>,
+    group: Option<Verdict>,
+) -> Option<Verdict> {
+    fn actionable(verdict: Option<Verdict>) -> Option<Verdict> {
+        match verdict {
+            Some(Verdict::Rewrite(_)) | None => None,
+            other => other,
+        }
     }
-    if let Some(Verdict::Rewrite(action)) = group {
-        return Verdict::Rewrite(action);
-    }
-    if let Verdict::Rewrite(action) = global {
-        return Verdict::Rewrite(action);
-    }
-    if let Verdict::Block(_) = global {
-        return global;
-    }
-    if let Some(block @ Verdict::Block(_)) = group {
-        return block;
-    }
-    Verdict::Allow(None)
+
+    combine_tier_verdicts(actionable(global), actionable(group))
 }
 
 /// Aggregates all matching `$dnsrewrite` rules from the global and per-group
@@ -960,32 +1122,58 @@ impl DnsPipeline {
                 candidates
             });
 
-            // 1. $important rules on the CNAME target
-            let mut imp = global_snapshot.evaluate_important_candidates(
+            // 1. $important rules on the CNAME target. Rewrites are dropped
+            //    because they cannot be applied to an already-resolved CNAME
+            //    target; a real allow still wins.
+            let global_imp = global_snapshot.evaluate_important_candidates(
                 &normalized,
                 qtype,
                 client,
                 &global_candidates.allow,
                 &global_candidates.block,
             );
-            if imp.is_none()
-                && let (Some(gs), Some(gc)) = (group_snapshot.as_ref(), group_candidates.as_ref())
-            {
-                imp = gs.evaluate_important_candidates(
-                    &normalized,
-                    qtype,
-                    client,
-                    &gc.allow,
-                    &gc.block,
-                );
-            }
-            if let Some(verdict) = imp {
+            let group_imp = group_snapshot
+                .as_ref()
+                .zip(group_candidates.as_ref())
+                .and_then(|(gs, gc)| {
+                    gs.evaluate_important_candidates(
+                        &normalized,
+                        qtype,
+                        client,
+                        &gc.allow,
+                        &gc.block,
+                    )
+                });
+            if let Some(verdict) = combine_cname_target_tier_verdicts(global_imp, group_imp) {
                 if verdict.is_blocked() {
                     return true;
                 }
-                if verdict.is_allowed() {
+                if matches!(verdict, Verdict::Allow(Some(_))) {
                     continue;
                 }
+            }
+            // The evaluator returns the first important match, so a rewrite
+            // can hide an important block later in candidate order. The
+            // rewrite is dropped above; detect the block independently.
+            let group_imp_block = group_snapshot
+                .as_ref()
+                .zip(group_candidates.as_ref())
+                .is_some_and(|(gs, gc)| {
+                    gs.important_block_candidates_contain_block(
+                        &normalized,
+                        qtype,
+                        client,
+                        &gc.block,
+                    )
+                });
+            let global_imp_block = global_snapshot.important_block_candidates_contain_block(
+                &normalized,
+                qtype,
+                client,
+                &global_candidates.block,
+            );
+            if global_imp_block || group_imp_block {
+                return true;
             }
 
             // 2. Parental control categories on the CNAME target
@@ -1012,29 +1200,48 @@ impl DnsPipeline {
                 return true;
             }
 
-            // 4. Standard filter rules (global + per-group combined)
-            let group_std =
-                group_snapshot
+            // 4. Standard filter rules (global + per-group combined). A
+            //    `$dnsrewrite` cannot be applied to an already-resolved CNAME
+            //    target, so check for a real allow first and then for any
+            //    matching non-rewrite block. Scanning block candidates
+            //    independently matters because the evaluator returns the first
+            //    match, and a rewrite can precede a block in candidate order.
+            let group_allow = group_snapshot
+                .as_ref()
+                .zip(group_candidates.as_ref())
+                .is_some_and(|(gs, gc)| {
+                    gs.evaluate_standard_allow_candidates(&normalized, qtype, client, &gc.allow)
+                        .is_some()
+                });
+            let global_allow = global_snapshot
+                .evaluate_standard_allow_candidates(
+                    &normalized,
+                    qtype,
+                    client,
+                    &global_candidates.allow,
+                )
+                .is_some();
+            if !global_allow && !group_allow {
+                let group_block = group_snapshot
                     .as_ref()
                     .zip(group_candidates.as_ref())
-                    .map(|(gs, gc)| {
-                        gs.evaluate_standard_candidates(
+                    .is_some_and(|(gs, gc)| {
+                        gs.standard_block_candidates_contain_block(
                             &normalized,
                             qtype,
                             client,
-                            &gc.allow,
                             &gc.block,
                         )
                     });
-            let global_std = global_snapshot.evaluate_standard_candidates(
-                &normalized,
-                qtype,
-                client,
-                &global_candidates.allow,
-                &global_candidates.block,
-            );
-            if combine_standard_verdicts(global_std, group_std).is_blocked() {
-                return true;
+                let global_block = global_snapshot.standard_block_candidates_contain_block(
+                    &normalized,
+                    qtype,
+                    client,
+                    &global_candidates.block,
+                );
+                if global_block || group_block {
+                    return true;
+                }
             }
         }
 
@@ -1043,12 +1250,12 @@ impl DnsPipeline {
 
     /// Cache lookup honouring the stored validation status.
     ///
-    /// While local validation is active, an `Unchecked` entry must never be
-    /// served (it was cached by a CD=1 query or while validation was off).
-    /// `Insecure`/`Indeterminate` entries are legitimate answers for unsigned
-    /// or inconclusive data: they are served to DNSSEC-aware clients with AD=0
-    /// instead of forcing an upstream re-resolution. DO=0 clients additionally
-    /// never see DNSSEC records.
+    /// While local validation is active, only an authenticated
+    /// `Secure`/`Insecure` decision may be served. `Unchecked` (CD=1 or
+    /// validation disabled) and `Indeterminate` (inconclusive, or Bogus in
+    /// log-only mode) entries force an upstream re-resolution so strict mode
+    /// can fail closed. `Insecure` answers are served with AD=0; DO=0 clients
+    /// additionally never see DNSSEC records.
     async fn cached_response(
         &self,
         cache_query: &Message,
@@ -1113,6 +1320,9 @@ impl DnsPipeline {
             // so a CD=1 query cannot poison cached answers for CD=0 clients.
             bg_query.metadata.checking_disabled = false;
             let bg_wants_dnssec = query_has_do(&bg_query);
+            // Same ordering rule as the query path: read the epoch before the
+            // validator so a reload always wins against an in-flight refresh.
+            let bg_policy_epoch = self.cache.policy_epoch();
             let dnssec_mode = self.dnssec.load().mode;
             let bg_validator = if dnssec_mode == sito_dnssec::DnssecMode::Disabled {
                 None
@@ -1136,23 +1346,30 @@ impl DnsPipeline {
                         .as_secs() as u32;
                     let key_fetcher =
                         sito_upstream::UpstreamKeyFetcher::new(Arc::clone(&bg_upstream));
-                    let outcome = validator
-                        .validate_with_key_fetcher(&mut resp, None, now, &key_fetcher)
-                        .await;
+                    let outcome = validate_dnssec_with_deadline(
+                        &validator,
+                        &mut resp,
+                        None,
+                        now,
+                        &key_fetcher,
+                        DNSSEC_VALIDATION_DEADLINE,
+                    )
+                    .await;
                     validation_status(Some(&outcome))
                 } else {
                     // No local validation ran: never trust an upstream AD bit.
                     resp.metadata.authentic_data = false;
                     ValidationStatus::Unchecked
                 };
-                if !bg_wants_dnssec {
-                    strip_dnssec_records(&mut resp);
-                }
+                // Store the same client-neutral shape that the normal path
+                // caches: the current question/flags, no client-specific EDNS
+                // options, and DNSSEC material only for a DO=1 key.
+                shape_response(&bg_query, &mut resp, bg_wants_dnssec);
                 if resp.metadata.response_code == ResponseCode::NoError
                     || resp.metadata.response_code == ResponseCode::NXDomain
                 {
                     bg_cache
-                        .insert_with_status(&bg_query, &resp, bg_status)
+                        .insert_with_status_at_epoch(&bg_query, &resp, bg_status, bg_policy_epoch)
                         .await;
                 }
             });
@@ -1183,6 +1400,38 @@ impl QueryHandler for DnsPipeline {
     async fn handle(&self, query: Message, client: ClientContext) -> Option<Message> {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         let _guard = InFlightGuard(Arc::clone(&self.in_flight));
+
+        // P2-18: a DNS response (QR=1) is never a query to resolve. Drop it
+        // instead of running it through policy/cache/upstream paths.
+        if query.metadata.message_type != MessageType::Query {
+            debug!("Dropping non-query DNS message (QR=1)");
+            return None;
+        }
+        // Multi-question messages are not resolvable by this pipeline (and
+        // are used by DoS probes to amplify work). Reject with FORMERR at the
+        // start; the question section is deliberately not echoed.
+        if query.queries.len() != 1 {
+            debug!(
+                questions = query.queries.len(),
+                "Rejecting multi-question DNS query with FORMERR"
+            );
+            let mut response = Message::new(
+                query.metadata.id,
+                MessageType::Response,
+                query.metadata.op_code,
+            );
+            response.metadata.response_code = ResponseCode::FormErr;
+            response.metadata.recursion_desired = query.metadata.recursion_desired;
+            response.metadata.recursion_available = true;
+            response.metadata.checking_disabled = query.metadata.checking_disabled;
+            if let Some(client_edns) = &query.edns {
+                let mut edns = Edns::new();
+                edns.set_max_payload(client_edns.max_payload());
+                edns.set_dnssec_ok(client_edns.flags().dnssec_ok);
+                response.set_edns(edns);
+            }
+            return Some(response);
+        }
 
         // One snapshot per query: config, clients and rewrites cannot be torn
         // apart by a concurrent hot reload.
@@ -1263,6 +1512,12 @@ impl QueryHandler for DnsPipeline {
                 return QueryOutcome::notimp(&query, domain_str, qtype);
             }
 
+            // Capture the cache policy epoch before loading the validator: if
+            // a reload swaps the validator after this point, the captured
+            // epoch no longer matches and the insert is rejected. Reading the
+            // epoch first therefore cannot pair a new epoch with an old
+            // validator.
+            let cache_policy_epoch = self.cache.policy_epoch();
             let dnssec_mode = self.dnssec.load().mode;
             let validation_active = !query.metadata.checking_disabled
                 && dnssec_mode != sito_dnssec::DnssecMode::Disabled;
@@ -1357,7 +1612,7 @@ impl QueryHandler for DnsPipeline {
 
             // ADR-0007 Stage 1: $important filter rules (takes precedence over local rewrites)
             let mut important_allowed = false;
-            let mut important_verdict = filter_snapshot.as_ref().and_then(|snapshot| {
+            let global_important = filter_snapshot.as_ref().and_then(|snapshot| {
                 snapshot.evaluate_important_candidates(
                     &normalized_domain,
                     qtype,
@@ -1366,18 +1621,23 @@ impl QueryHandler for DnsPipeline {
                     &filter_candidates.block,
                 )
             });
-            if important_verdict.is_none()
-                && let (Some(group), Some(candidates)) =
-                    (group_snapshot.as_ref(), group_candidates.as_ref())
-            {
-                important_verdict = group.evaluate_important_candidates(
-                    &normalized_domain,
-                    qtype,
-                    &client,
-                    &candidates.allow,
-                    &candidates.block,
-                );
-            }
+            let group_important = group_snapshot
+                .as_ref()
+                .zip(group_candidates.as_ref())
+                .and_then(|(group, candidates)| {
+                    group.evaluate_important_candidates(
+                        &normalized_domain,
+                        qtype,
+                        &client,
+                        &candidates.allow,
+                        &candidates.block,
+                    )
+                });
+            // Consistent precedence: within the important tier
+            // `Allow > Rewrite > Block`, group wins ties. A group
+            // `@@...$important` therefore overrides a global `$important`
+            // block instead of the global verdict short-circuiting the group.
+            let important_verdict = combine_tier_verdicts(global_important, group_important);
             if let Some(verdict) = important_verdict {
                 match verdict {
                     Verdict::Block(reason) => {
@@ -1650,14 +1910,15 @@ impl QueryHandler for DnsPipeline {
                         // Clone the validator for the awaited call so no ArcSwap
                         // guard is held across the await.
                         let validator = self.dnssec.load_full();
-                        let outcome = validator
-                            .validate_with_key_fetcher(
-                                &mut upstream_resp,
-                                Some(upstream_name.as_str()),
-                                now,
-                                &key_fetcher,
-                            )
-                            .await;
+                        let outcome = validate_dnssec_with_deadline(
+                            &validator,
+                            &mut upstream_resp,
+                            Some(upstream_name.as_str()),
+                            now,
+                            &key_fetcher,
+                            DNSSEC_VALIDATION_DEADLINE,
+                        )
+                        .await;
                         if let Some(ref m) = self.metrics {
                             if matches!(outcome, sito_dnssec::ValidationOutcome::Bogus { .. }) {
                                 m.inc_dnssec_bogus(&upstream_name);
@@ -1679,16 +1940,21 @@ impl QueryHandler for DnsPipeline {
 
                     // A DO=0 client must never receive DNSSEC records, and the
                     // stripped form is what gets cached under the DO=0 key.
-                    if !client_wants_dnssec {
-                        strip_dnssec_records(&mut upstream_resp);
-                    }
+                    // Shape before caching so the stored entry never carries
+                    // upstream-only EDNS options either.
+                    shape_response(&query, &mut upstream_resp, client_wants_dnssec);
 
                     if cache_enabled
                         && (upstream_resp.metadata.response_code == ResponseCode::NoError
                             || upstream_resp.metadata.response_code == ResponseCode::NXDomain)
                     {
                         self.cache
-                            .insert_with_status(&cache_query, &upstream_resp, cache_status)
+                            .insert_with_status_at_epoch(
+                                &cache_query,
+                                &upstream_resp,
+                                cache_status,
+                                cache_policy_epoch,
+                            )
                             .await;
                         if let Some(ref m) = self.metrics {
                             m.set_cache_size_bytes(
@@ -1768,6 +2034,7 @@ impl QueryHandler for DnsPipeline {
                             if let Some(ref m) = self.metrics {
                                 m.inc_cache_stale_served();
                             }
+                            shape_response(&query, &mut stale_resp, client_wants_dnssec);
                             stale_resp.metadata.id = query_id;
                             return QueryOutcome {
                                 response: Some(stale_resp),
@@ -1842,10 +2109,18 @@ impl QueryHandler for DnsPipeline {
             let _ = ql.try_send(entry);
         }
 
-        // Never assert AD for a client that did not signal DNSSEC awareness.
+        // Single shaping point for every response (cache hit, upstream, stale
+        // or synthesized): copy the current question/RD/CD, rebuild EDNS from
+        // this client, strip upstream-only options, and remove DNSSEC records
+        // only when the client did not request them.
         let mut response = outcome.response;
-        if !client_accepts_ad && let Some(resp) = response.as_mut() {
-            resp.metadata.authentic_data = false;
+        if let Some(resp) = response.as_mut() {
+            shape_response(&query, resp, client_wants_dnssec);
+            // Never assert AD for a client that did not signal DNSSEC
+            // awareness.
+            if !client_accepts_ad {
+                resp.metadata.authentic_data = false;
+            }
         }
         response
     }
@@ -1856,6 +2131,117 @@ mod tests {
     use super::*;
     use sito_core::client::ClientContext;
     use sito_core::config::FilteringConfig;
+
+    /// A fetcher that never answers, simulating a black-holed DS/DNSKEY
+    /// lookup. The deadline wrapper must not wait for it indefinitely.
+    struct BlockingFetcher;
+
+    #[async_trait::async_trait]
+    impl sito_core::DnssecKeyFetcher for BlockingFetcher {
+        async fn query(
+            &self,
+            _name: &Name,
+            _rtype: RecordType,
+        ) -> Result<Message, sito_core::error::UpstreamError> {
+            std::future::pending::<Result<Message, sito_core::error::UpstreamError>>().await
+        }
+    }
+
+    /// Builds an answer with eight CNAME hops and one relevant (unverifiable)
+    /// RRSIG, so validation reaches the blocking chain fetch.
+    fn cname_chain_needing_key_fetch(now: u32) -> Message {
+        use hickory_proto::dnssec::Algorithm;
+        use hickory_proto::dnssec::rdata::{RRSIG, SigInput};
+        use hickory_proto::op::Query;
+        use hickory_proto::rr::SerialNumber;
+
+        let origin = Name::from_str("timeout.example.").unwrap();
+        let qname = Name::from_str("h0.timeout.example.").unwrap();
+        let mut response = Message::new(7, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+        for hop in 0..8 {
+            let current = Name::from_str(&format!("h{hop}.timeout.example.")).unwrap();
+            let next = Name::from_str(&format!("h{}.timeout.example.", hop + 1)).unwrap();
+            response
+                .answers
+                .push(Record::from_rdata(current, 300, RData::CNAME(CNAME(next))));
+        }
+        response.answers.push(Record::from_rdata(
+            qname,
+            300,
+            RData::DNSSEC(hickory_proto::dnssec::rdata::DNSSECRData::RRSIG(
+                RRSIG::from_sig(
+                    SigInput {
+                        type_covered: RecordType::CNAME,
+                        algorithm: Algorithm::ECDSAP256SHA256,
+                        num_labels: 3,
+                        original_ttl: 300,
+                        sig_expiration: SerialNumber::new(now.saturating_add(300)),
+                        sig_inception: SerialNumber::new(now.saturating_sub(300)),
+                        key_tag: 1234,
+                        signer_name: origin,
+                    },
+                    vec![0u8; 64],
+                ),
+            )),
+        ));
+        response
+    }
+
+    #[tokio::test]
+    async fn test_dnssec_validation_deadline_fails_closed_in_validate_mode() {
+        let validator = DnssecValidator::new(sito_dnssec::DnssecMode::Validate, Vec::new());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+        let mut response = cname_chain_needing_key_fetch(now);
+
+        let outcome = validate_dnssec_with_deadline(
+            &validator,
+            &mut response,
+            Some("blocked"),
+            now,
+            &BlockingFetcher,
+            std::time::Duration::from_millis(25),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, sito_dnssec::ValidationOutcome::Bogus { .. }),
+            "a blocked key fetch must not produce an unvalidated answer: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+        assert_eq!(response.answers.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_dnssec_validation_deadline_keeps_log_only_response() {
+        let validator = DnssecValidator::new(sito_dnssec::DnssecMode::LogOnly, Vec::new());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+        let mut response = cname_chain_needing_key_fetch(now);
+
+        let outcome = validate_dnssec_with_deadline(
+            &validator,
+            &mut response,
+            Some("blocked"),
+            now,
+            &BlockingFetcher,
+            std::time::Duration::from_millis(25),
+        )
+        .await;
+
+        assert_eq!(outcome, sito_dnssec::ValidationOutcome::Indeterminate);
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(!response.metadata.authentic_data);
+        assert!(!response.answers.is_empty(), "log-only keeps the response");
+    }
 
     fn rewrite_rule(rcode: &str, rtype: Option<&str>, value: Option<&str>) -> DnsRewriteRule {
         DnsRewriteRule {
@@ -2396,6 +2782,414 @@ mod tests {
     }
 
     /// Builds a pipeline around `upstream` with the standard test registries.
+    /// A group-only filter configuration must resolve normal queries and block
+    /// only the group's rule. Before the fix, the empty global source set made
+    /// the engine unavailable and the pipeline SERVFAILed every client.
+    #[tokio::test]
+    async fn test_group_only_filter_configuration_resolves_end_to_end() {
+        use sito_clients::{ClientEntryConfig, ClientGroupConfig, ClientsConfig};
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+        use std::collections::HashMap;
+
+        let (mock_addr, calls) = spawn_mock_upstream(None).await;
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        config.filtering.enabled = true;
+        config.filtering.fail_closed = true;
+        config.filtering.lists.clear();
+        config.filtering.custom_rules.clear();
+        config.upstream.servers = vec![mock_addr.to_string()];
+
+        let clients = ClientsConfig {
+            entries: vec![ClientEntryConfig {
+                name: "kid".to_string(),
+                ids: vec!["127.0.0.1".to_string()],
+                group: "kids".to_string(),
+                ignore_query_log: false,
+                ignore_stats: false,
+                use_global_upstreams: true,
+                upstreams: None,
+                trusted: false,
+            }],
+            groups: HashMap::from([(
+                "kids".to_string(),
+                ClientGroupConfig {
+                    custom_rules: vec!["||fortnite.example^".to_string()],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let validator = sito_dnssec::DnssecValidator::from_config(&config.dns.dnssec);
+        let (pipeline, temp_dir) =
+            build_test_pipeline_with_clients(config, upstream, validator, clients).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+        let blocked = pipeline
+            .handle(
+                rewrite_query("fortnite.example.", RecordType::A),
+                client.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            blocked.answers.iter().any(
+                |record| matches!(record.data, RData::A(A(ip)) if ip == std::net::Ipv4Addr::UNSPECIFIED)
+            ),
+            "the group custom rule must block: {blocked:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a blocked group query must not reach upstream"
+        );
+
+        let allowed = pipeline
+            .handle(rewrite_query("example.org.", RecordType::A), client)
+            .await
+            .unwrap();
+        assert_eq!(
+            allowed.metadata.response_code,
+            ResponseCode::NoError,
+            "a group-only filter must not SERVFAIL unrelated queries"
+        );
+        assert_eq!(allowed.answers.len(), 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Deferred D3: a CNAME target blocked by a global standard rule stays
+    /// blocked when the client's group has a `$dnsrewrite` for the same
+    /// target. The rewrite cannot be applied to an already-resolved CNAME
+    /// target, so it must be treated as a no-match instead of suppressing the
+    /// block. A group allow still overrides the global block, and an important
+    /// rewrite must fall through to the standard checks rather than acting as
+    /// a real allow.
+    #[tokio::test]
+    async fn test_cname_target_group_rewrite_does_not_suppress_global_block_end_to_end() {
+        use sito_clients::{ClientEntryConfig, ClientGroupConfig, ClientsConfig};
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+        use std::collections::HashMap;
+
+        let (mock_addr, _calls) = spawn_mock_upstream(None).await;
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        config.filtering.enabled = true;
+        config.filtering.fail_closed = false;
+        config.filtering.lists.clear();
+        config.filtering.custom_rules = vec!["||blocked-target.example^".to_string()];
+        config.upstream.servers = vec![mock_addr.to_string()];
+
+        let clients = ClientsConfig {
+            entries: vec![
+                ClientEntryConfig {
+                    name: "kid".to_string(),
+                    ids: vec!["127.0.0.1".to_string()],
+                    group: "kids".to_string(),
+                    ignore_query_log: false,
+                    ignore_stats: false,
+                    use_global_upstreams: true,
+                    upstreams: None,
+                    trusted: false,
+                },
+                ClientEntryConfig {
+                    name: "friend".to_string(),
+                    ids: vec!["127.0.0.2".to_string()],
+                    group: "friends".to_string(),
+                    ignore_query_log: false,
+                    ignore_stats: false,
+                    use_global_upstreams: true,
+                    upstreams: None,
+                    trusted: false,
+                },
+                ClientEntryConfig {
+                    name: "important-kid".to_string(),
+                    ids: vec!["127.0.0.3".to_string()],
+                    group: "important_kids".to_string(),
+                    ignore_query_log: false,
+                    ignore_stats: false,
+                    use_global_upstreams: true,
+                    upstreams: None,
+                    trusted: false,
+                },
+            ],
+            groups: HashMap::from([
+                (
+                    "kids".to_string(),
+                    ClientGroupConfig {
+                        custom_rules: vec![
+                            "||blocked-target.example^$dnsrewrite=192.0.2.10".to_string(),
+                        ],
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "friends".to_string(),
+                    ClientGroupConfig {
+                        custom_rules: vec!["@@||blocked-target.example^".to_string()],
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "important_kids".to_string(),
+                    ClientGroupConfig {
+                        custom_rules: vec![
+                            "||blocked-target.example^$dnsrewrite=192.0.2.10,important".to_string(),
+                        ],
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let validator = sito_dnssec::DnssecValidator::from_config(&config.dns.dnssec);
+        let (pipeline, temp_dir) =
+            build_test_pipeline_with_clients(config, upstream, validator, clients).await;
+
+        let mut response = Message::new(42, MessageType::Response, OpCode::Query);
+        response.queries.push(hickory_proto::op::Query::query(
+            Name::from_str("alias.example.").unwrap(),
+            RecordType::A,
+        ));
+        response.answers.push(Record::from_rdata(
+            Name::from_str("alias.example.").unwrap(),
+            300,
+            RData::CNAME(CNAME(Name::from_str("blocked-target.example.").unwrap())),
+        ));
+
+        let snapshot = pipeline.runtime.snapshot();
+        let mut kid = ClientContext::new("127.0.0.1".parse().unwrap());
+        let kid_policy = snapshot.clients.resolve(&mut kid, snapshot.clients.now());
+        assert!(
+            pipeline.cname_target_blocked(&response, RecordType::A, &kid, &kid_policy),
+            "a group rewrite must not suppress a global block on a CNAME target"
+        );
+
+        let mut important_kid = ClientContext::new("127.0.0.3".parse().unwrap());
+        let important_kid_policy = snapshot
+            .clients
+            .resolve(&mut important_kid, snapshot.clients.now());
+        assert!(
+            pipeline.cname_target_blocked(
+                &response,
+                RecordType::A,
+                &important_kid,
+                &important_kid_policy,
+            ),
+            "an important rewrite must fall through to the standard block"
+        );
+
+        let mut friend = ClientContext::new("127.0.0.2".parse().unwrap());
+        let friend_policy = snapshot
+            .clients
+            .resolve(&mut friend, snapshot.clients.now());
+        assert!(
+            !pipeline.cname_target_blocked(&response, RecordType::A, &friend, &friend_policy),
+            "a group allow must still override the global block"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Deferred D3 follow-up: candidate order is structural, so a
+    /// `$dnsrewrite` can precede a block for the same CNAME target in one
+    /// snapshot. The block must still be detected independently of the
+    /// rewrite verdict.
+    #[tokio::test]
+    async fn test_cname_target_same_snapshot_rewrite_before_block_still_blocks() {
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+        let (mock_addr, _calls) = spawn_mock_upstream(None).await;
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        config.filtering.enabled = true;
+        config.filtering.fail_closed = false;
+        config.filtering.lists.clear();
+        config.filtering.custom_rules = vec![
+            "||blocked-target.example^$dnsrewrite=192.0.2.10".to_string(),
+            "||blocked-target.example^".to_string(),
+        ];
+        config.upstream.servers = vec![mock_addr.to_string()];
+
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+
+        let mut response = Message::new(43, MessageType::Response, OpCode::Query);
+        response.queries.push(hickory_proto::op::Query::query(
+            Name::from_str("alias.example.").unwrap(),
+            RecordType::A,
+        ));
+        response.answers.push(Record::from_rdata(
+            Name::from_str("alias.example.").unwrap(),
+            300,
+            RData::CNAME(CNAME(Name::from_str("blocked-target.example.").unwrap())),
+        ));
+
+        let snapshot = pipeline.runtime.snapshot();
+        let mut client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let policy = snapshot
+            .clients
+            .resolve(&mut client, snapshot.clients.now());
+        assert!(
+            pipeline.cname_target_blocked(&response, RecordType::A, &client, &policy),
+            "a rewrite that precedes a block must not hide the block"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Deferred D3 follow-up: the same-snapshot ordering problem applies to the
+    /// `$important` tier. An important rewrite before an important block must
+    /// not hide the block on the CNAME-target path.
+    #[tokio::test]
+    async fn test_cname_target_same_snapshot_important_rewrite_before_block_still_blocks() {
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+        let (mock_addr, _calls) = spawn_mock_upstream(None).await;
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        config.filtering.enabled = true;
+        config.filtering.fail_closed = false;
+        config.filtering.lists.clear();
+        config.filtering.custom_rules = vec![
+            "||blocked-target.example^$dnsrewrite=192.0.2.10,important".to_string(),
+            "||blocked-target.example^$important".to_string(),
+        ];
+        config.upstream.servers = vec![mock_addr.to_string()];
+
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+
+        let mut response = Message::new(44, MessageType::Response, OpCode::Query);
+        response.queries.push(hickory_proto::op::Query::query(
+            Name::from_str("alias.example.").unwrap(),
+            RecordType::A,
+        ));
+        response.answers.push(Record::from_rdata(
+            Name::from_str("alias.example.").unwrap(),
+            300,
+            RData::CNAME(CNAME(Name::from_str("blocked-target.example.").unwrap())),
+        ));
+
+        let snapshot = pipeline.runtime.snapshot();
+        let mut client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let policy = snapshot
+            .clients
+            .resolve(&mut client, snapshot.clients.now());
+        assert!(
+            pipeline.cname_target_blocked(&response, RecordType::A, &client, &policy),
+            "an important rewrite that precedes an important block must not hide the block"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// A group custom rule must not mask a configured global list that failed
+    /// to load: a non-group client gets SERVFAIL (fail closed), not allow-all.
+    #[tokio::test]
+    async fn test_group_rule_does_not_mask_failed_global_source_end_to_end() {
+        use sito_clients::{ClientEntryConfig, ClientGroupConfig, ClientsConfig};
+        use sito_core::config::FilterListConfig;
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+        use std::collections::HashMap;
+
+        let (mock_addr, calls) = spawn_mock_upstream(None).await;
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        config.filtering.enabled = true;
+        config.filtering.fail_closed = true;
+        config.filtering.custom_rules.clear();
+        config.filtering.lists = vec![FilterListConfig {
+            name: "dead".to_string(),
+            url: "http://127.0.0.1:1/blocklist.txt".to_string(),
+            enabled: true,
+            refresh_hours: None,
+        }];
+        config.upstream.servers = vec![mock_addr.to_string()];
+
+        let clients = ClientsConfig {
+            entries: vec![ClientEntryConfig {
+                name: "kid".to_string(),
+                ids: vec!["127.0.0.1".to_string()],
+                group: "kids".to_string(),
+                ignore_query_log: false,
+                ignore_stats: false,
+                use_global_upstreams: true,
+                upstreams: None,
+                trusted: false,
+            }],
+            groups: HashMap::from([(
+                "kids".to_string(),
+                ClientGroupConfig {
+                    custom_rules: vec!["||fortnite.example^".to_string()],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let validator = sito_dnssec::DnssecValidator::from_config(&config.dns.dnssec);
+        let (pipeline, temp_dir) =
+            build_test_pipeline_with_clients(config, upstream, validator, clients).await;
+
+        // 127.0.0.2 does not match the group entry.
+        let response = pipeline
+            .handle(
+                rewrite_query("unrelated.example.", RecordType::A),
+                ClientContext::new("127.0.0.2".parse().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::ServFail,
+            "a failed global source must fail closed even when a group rule exists"
+        );
+        assert!(
+            response.answers.is_empty(),
+            "fail-closed responses must not leak an unfiltered answer"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "fail-closed must stop before the upstream"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
     async fn build_test_pipeline(
         config: Config,
         upstream: std::sync::Arc<UpstreamManager>,
@@ -2407,11 +3201,28 @@ mod tests {
     /// Builds a pipeline with a caller-supplied DNSSEC validator (used by
     /// tests that need a specific trust anchor).
     async fn build_test_pipeline_with_validator(
-        mut config: Config,
+        config: Config,
         upstream: std::sync::Arc<UpstreamManager>,
         dnssec: sito_dnssec::DnssecValidator,
     ) -> (DnsPipeline, std::path::PathBuf) {
-        use sito_clients::{ClientRegistry, ClientsConfig, ParentalRegistry, ServiceRegistry};
+        build_test_pipeline_with_clients(
+            config,
+            upstream,
+            dnssec,
+            sito_clients::ClientsConfig::default(),
+        )
+        .await
+    }
+
+    /// Builds a pipeline with an explicit client registry, compiling group
+    /// rule sets from it (used by the group-only end-to-end test).
+    async fn build_test_pipeline_with_clients(
+        mut config: Config,
+        upstream: std::sync::Arc<UpstreamManager>,
+        dnssec: sito_dnssec::DnssecValidator,
+        clients: sito_clients::ClientsConfig,
+    ) -> (DnsPipeline, std::path::PathBuf) {
+        use sito_clients::{ClientRegistry, ParentalRegistry, ServiceRegistry};
         use sito_filter::HostsFilterEngine;
         use sito_rewrites::{RewriteTable, RewritesConfig};
         use std::sync::atomic::AtomicUsize;
@@ -2426,9 +3237,17 @@ mod tests {
         config.dns.cache.enabled = true;
 
         let cache = std::sync::Arc::new(DnsCache::new(config.dns.cache.clone()));
+        let group_rules = crate::server::group_rule_sets(&clients);
         let filter = std::sync::Arc::new(
-            HostsFilterEngine::init(config.filtering.clone(), config.server.data_dir.clone()).await,
+            HostsFilterEngine::init_with_observer_and_group_sources(
+                config.filtering.clone(),
+                config.server.data_dir.clone(),
+                None,
+                group_rules.clone(),
+            )
+            .await,
         );
+        filter.set_group_rules(group_rules);
         let pipeline = DnsPipeline::new(
             std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(config.clone()))),
             filter,
@@ -2436,7 +3255,7 @@ mod tests {
             upstream,
             std::sync::Arc::new(dnssec),
             std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(ClientRegistry::new(
-                ClientsConfig::default(),
+                clients,
             )))),
             std::sync::Arc::new(
                 ParentalRegistry::try_bundled().expect("bundled parental lists must load"),
@@ -2518,6 +3337,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.dnssec.validate = false;
         let fail = std::sync::Arc::new(AtomicBool::new(true));
         let (pipeline, server, calls, temp_dir) =
@@ -2590,6 +3410,7 @@ mod tests {
         use sito_upstream::UpstreamManager;
 
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.dnssec.validate = false;
         let upstream = std::sync::Arc::new(UpstreamManager::with_upstreams(
             Vec::new(),
@@ -2685,7 +3506,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_do_client_gets_insecure_cache_hit_with_ad_zero() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.filtering.enabled = false;
         let (pipeline, calls, temp_dir) = test_pipeline(config).await;
         let client = ClientContext::new("127.0.0.1".parse().unwrap());
         let name = Name::from_str("unsigned.example.").unwrap();
@@ -2721,7 +3543,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_do_client_never_served_unchecked_cache_entry() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.filtering.enabled = false;
         let (pipeline, calls, temp_dir) = test_pipeline(config).await;
         let client = ClientContext::new("127.0.0.1".parse().unwrap());
         let name = Name::from_str("unchecked.example.").unwrap();
@@ -2754,6 +3577,44 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
+    /// A fresh `Indeterminate` entry is not an authenticated decision (in
+    /// log-only mode a Bogus result is recorded that way). While validation is
+    /// active it must force re-resolution instead of being served, so strict
+    /// mode can return SERVFAIL.
+    #[tokio::test]
+    async fn test_do_client_never_served_indeterminate_cache_entry() {
+        let mut config = Config::default();
+        config.filtering.enabled = false;
+        let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("indeterminate.example.").unwrap();
+        let query = do_query(18, &name);
+
+        let mut cached = Message::response(18, OpCode::Query);
+        cached.queries = query.queries.clone();
+        cached.answers.push(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 18))),
+        ));
+        pipeline
+            .cache
+            .insert_with_status(&query, &cached, ValidationStatus::Indeterminate)
+            .await;
+
+        let resp = pipeline.handle(query, client).await.unwrap();
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "an Indeterminate entry must not be served while validation is active"
+        );
+        assert!(
+            !resp.metadata.authentic_data,
+            "an inconclusive entry must never assert AD"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
     /// RFC 8767 stale answers are not revalidated. An entry cached without
     /// local validation (`Unchecked`) must never be served to a client while
     /// validation is active, even when the upstream is down.
@@ -2762,6 +3623,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.cache.serve_stale_hours = 1;
         config.dns.cache.min_ttl = 1;
         config.dns.cache.max_ttl = 1;
@@ -2813,6 +3675,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.cache.serve_stale_hours = 1;
         config.dns.cache.min_ttl = 1;
         config.dns.cache.max_ttl = 1;
@@ -2860,6 +3723,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.cache.serve_stale_hours = 1;
         config.dns.cache.min_ttl = 1;
         config.dns.cache.max_ttl = 1;
@@ -2977,6 +3841,7 @@ mod tests {
         });
 
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.upstream.servers = vec![mock_addr.to_string()];
         config.dns.cache.serve_stale_hours = 0;
         let bootstrap =
@@ -3057,6 +3922,7 @@ mod tests {
     #[tokio::test]
     async fn test_do0_response_is_stripped_and_cache_key_stays_do0() {
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.dnssec.mode = "disabled".to_string();
         config.dns.dnssec.validate = false;
         let (pipeline, calls, temp_dir) = test_pipeline(config).await;
@@ -3096,6 +3962,7 @@ mod tests {
     #[tokio::test]
     async fn test_prefetch_clears_ad_when_no_validation_ran() {
         let mut config = Config::default();
+        config.filtering.enabled = false;
         config.dns.dnssec.mode = "disabled".to_string();
         config.dns.dnssec.validate = false;
         config.dns.cache.prefetch = true;
@@ -3191,6 +4058,287 @@ mod tests {
     }
 
     #[test]
+    fn test_response_shaping_strips_upstream_edns_and_opt_for_non_edns_clients() {
+        use hickory_proto::rr::rdata::NULL;
+
+        let name = Name::from_str("shape.example.").unwrap();
+        let mut query = Message::new(1, MessageType::Query, OpCode::Query);
+        query
+            .queries
+            .push(hickory_proto::op::Query::query(name.clone(), RecordType::A));
+
+        let mut response = Message::response(1, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.answers.push(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 50))),
+        ));
+        response.answers.push(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::Unknown {
+                code: RecordType::RRSIG,
+                rdata: NULL::default(),
+            },
+        ));
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(10, vec![1, 2, 3, 4])); // COOKIE
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(3, vec![b'x'])); // NSID
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(12, vec![0; 8])); // padding
+        response.set_edns(edns);
+
+        // A non-EDNS client must never receive an OPT record or DNSSEC data.
+        shape_response(&query, &mut response, false);
+        assert!(
+            response.edns.is_none(),
+            "a non-EDNS client must not receive an OPT record"
+        );
+        assert_eq!(response.answers.len(), 1, "RRSIG must be stripped");
+
+        // An EDNS client gets a fresh OPT with only the DO echo; upstream
+        // COOKIE/NSID/padding options are never replayed.
+        let mut edns_query = query.clone();
+        edns_query.set_edns(Edns::new());
+        let mut response = Message::response(1, OpCode::Query);
+        response.queries = query.queries.clone();
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(10, vec![1, 2, 3, 4]));
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(3, vec![b'x']));
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(12, vec![0; 8]));
+        response.set_edns(edns);
+
+        shape_response(&edns_query, &mut response, false);
+        let shaped = response.edns.expect("EDNS clients keep an OPT record");
+        assert!(
+            shaped.options().options.is_empty(),
+            "upstream-only EDNS options must be stripped: {:?}",
+            shaped.options().options
+        );
+        assert!(!shaped.flags().dnssec_ok, "DO must echo the client's bit");
+    }
+
+    #[test]
+    fn test_response_shaping_copies_question_flags_and_do() {
+        use hickory_proto::rr::rdata::NULL;
+
+        let stored_name = Name::from_str("mixed.example.").unwrap();
+        let current_name = Name::from_str("MiXeD.ExAmPle.").unwrap();
+
+        let mut query = Message::new(22, MessageType::Query, OpCode::Query);
+        query.queries.push(hickory_proto::op::Query::query(
+            current_name.clone(),
+            RecordType::A,
+        ));
+        query.metadata.recursion_desired = true;
+        query.metadata.checking_disabled = true;
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        query.set_edns(edns);
+
+        let mut response = Message::response(99, OpCode::Notify);
+        response.queries.push(hickory_proto::op::Query::query(
+            stored_name.clone(),
+            RecordType::A,
+        ));
+        response.metadata.authoritative = true;
+        response.metadata.recursion_desired = false;
+        response.metadata.checking_disabled = false;
+        response.answers.push(Record::from_rdata(
+            current_name.clone(),
+            300,
+            RData::Unknown {
+                code: RecordType::RRSIG,
+                rdata: NULL::default(),
+            },
+        ));
+
+        shape_response(&query, &mut response, true);
+        assert_eq!(
+            response.metadata.id, 22,
+            "the response ID must come from the current query"
+        );
+        assert_eq!(
+            response.metadata.op_code,
+            OpCode::Query,
+            "the response opcode must come from the current query"
+        );
+        assert!(
+            !response.metadata.authoritative,
+            "the recursive resolver must never set AA on a shaped response"
+        );
+        assert!(response.metadata.recursion_desired);
+        assert!(response.metadata.checking_disabled);
+        assert_eq!(response.queries.len(), 1);
+        assert_eq!(
+            response.queries[0].name().to_string(),
+            current_name.to_string(),
+            "the current client question must be echoed, not the stored one"
+        );
+        assert!(
+            response.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok),
+            "the DO bit must echo the current client's request"
+        );
+        assert_eq!(
+            response.answers.len(),
+            1,
+            "a DO=1 client keeps DNSSEC records"
+        );
+    }
+
+    /// P2-84: a cache hit must copy the current question and RD bit, and
+    /// must not replay the stored entry's (absent) EDNS state to a client
+    /// that sent OPT.
+    #[tokio::test]
+    async fn test_cache_hit_copies_current_question_and_flags() {
+        let mut config = Config::default();
+        config.filtering.enabled = false;
+        config.dns.dnssec.validate = false;
+        let (pipeline, _calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+        let stored_name = Name::from_str("cache-shape.example.").unwrap();
+        let mut stored_query = Message::new(1, MessageType::Query, OpCode::Query);
+        stored_query.queries.push(hickory_proto::op::Query::query(
+            stored_name.clone(),
+            RecordType::A,
+        ));
+        stored_query.metadata.checking_disabled = true;
+
+        let mut cached = Message::response(1, OpCode::Query);
+        cached.queries = stored_query.queries.clone();
+        cached.metadata.authoritative = true;
+        cached.metadata.recursion_desired = false;
+        cached.answers.push(Record::from_rdata(
+            stored_name.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 84))),
+        ));
+        pipeline
+            .cache
+            .insert_with_status(&stored_query, &cached, ValidationStatus::Insecure)
+            .await;
+
+        let current_name = Name::from_str("CaChE-ShApE.ExAmPlE.").unwrap();
+        let mut current_query = Message::new(2, MessageType::Query, OpCode::Query);
+        current_query.queries.push(hickory_proto::op::Query::query(
+            current_name.clone(),
+            RecordType::A,
+        ));
+        current_query.metadata.recursion_desired = true;
+        // CD is part of the cache key; keep it identical so this is a hit.
+        current_query.metadata.checking_disabled = true;
+        current_query.set_edns(Edns::new());
+
+        let resp = pipeline
+            .handle(current_query, client)
+            .await
+            .expect("cache hit response");
+
+        assert_eq!(
+            resp.metadata.id, 2,
+            "the response ID must come from the current query, not the cache entry"
+        );
+        assert_eq!(resp.metadata.op_code, OpCode::Query);
+        assert!(
+            !resp.metadata.authoritative,
+            "a cache hit must not replay the stored AA bit"
+        );
+        assert!(
+            resp.metadata.recursion_desired,
+            "RD must come from the query"
+        );
+        assert!(
+            resp.metadata.checking_disabled,
+            "CD must come from the query"
+        );
+        assert!(
+            resp.edns.is_some(),
+            "a cache hit for an EDNS client must include OPT"
+        );
+        assert_eq!(
+            resp.queries[0].name().to_string(),
+            current_name.to_string(),
+            "a cache hit must echo the current question, not the stored one"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P2-18: QR=1 messages are dropped and multi-question messages are
+    /// rejected with FORMERR before policy/cache/upstream work starts.
+    #[tokio::test]
+    async fn test_pipeline_rejects_qr1_and_multi_question_queries() {
+        use std::sync::atomic::Ordering;
+
+        let mut config = Config::default();
+        config.filtering.enabled = false;
+        config.dns.dnssec.validate = false;
+        let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let name = Name::from_str("reject.example.").unwrap();
+
+        let mut response_message = Message::new(9, MessageType::Response, OpCode::Query);
+        response_message
+            .queries
+            .push(hickory_proto::op::Query::query(name.clone(), RecordType::A));
+        assert!(
+            pipeline
+                .handle(response_message, client.clone())
+                .await
+                .is_none(),
+            "a QR=1 message must be dropped"
+        );
+
+        let mut multi = Message::new(10, MessageType::Query, OpCode::Query);
+        multi
+            .queries
+            .push(hickory_proto::op::Query::query(name.clone(), RecordType::A));
+        multi.queries.push(hickory_proto::op::Query::query(
+            Name::from_str("second.example.").unwrap(),
+            RecordType::AAAA,
+        ));
+        let resp = pipeline
+            .handle(multi, client.clone())
+            .await
+            .expect("multi-question queries get a FORMERR response");
+        assert_eq!(resp.metadata.response_code, ResponseCode::FormErr);
+        assert!(
+            resp.metadata.recursion_available,
+            "FORMERR must consistently advertise recursion availability"
+        );
+        assert!(
+            resp.queries.is_empty(),
+            "a multi-question FORMERR must not echo questions"
+        );
+
+        let zero = Message::new(11, MessageType::Query, OpCode::Query);
+        let resp = pipeline
+            .handle(zero, client)
+            .await
+            .expect("zero-question queries get a FORMERR response");
+        assert_eq!(resp.metadata.response_code, ResponseCode::FormErr);
+        assert!(
+            resp.metadata.recursion_available,
+            "zero-question FORMERR must set RA like the multi-question path"
+        );
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "rejected queries must not reach upstream"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[test]
     fn test_ecs_policy_off_strips_and_forward_clamps() {
         use hickory_proto::rr::rdata::opt::ClientSubnet;
         use sito_cache::CacheKey;
@@ -3251,5 +4399,118 @@ mod tests {
             CacheKey::from_query(&sibling_forwarded),
             "clamped ECS must deduplicate cache keys"
         );
+    }
+
+    /// P2-25: the global/group precedence table is consistent across tiers:
+    /// within a tier `Allow > Rewrite > Block`, the group overlay wins ties,
+    /// and `$important` always outranks standard rules.
+    #[test]
+    fn test_group_global_precedence_table() {
+        use sito_core::verdict::{BlockReason, RewriteAction, RuleRef};
+
+        let block = || {
+            Verdict::Block(BlockReason::Rule(RuleRef::new(
+                "||blocked.example^".to_string(),
+            )))
+        };
+        let allow = || Verdict::Allow(Some(RuleRef::new("@@||allowed.example^".to_string())));
+        let no_match = || Verdict::Allow(None);
+        let rewrite = || {
+            Verdict::Rewrite(RewriteAction::DnsRewrite {
+                rcode: "NOERROR".to_string(),
+                rtype: Some("A".to_string()),
+                value: Some("192.0.2.10".to_string()),
+            })
+        };
+
+        // Standard tier: a group rewrite overrides a global standard block.
+        assert!(matches!(
+            combine_standard_verdicts(block(), Some(rewrite())),
+            Verdict::Rewrite(_)
+        ));
+        // A group result with no matching rule must not erase a global block.
+        assert!(matches!(
+            combine_standard_verdicts(block(), Some(no_match())),
+            Verdict::Block(_)
+        ));
+        // Standard allow outranks a group rewrite.
+        assert!(matches!(
+            combine_standard_verdicts(allow(), Some(rewrite())),
+            Verdict::Allow(_)
+        ));
+        // Ties go to the group overlay.
+        assert!(matches!(
+            combine_standard_verdicts(block(), Some(block())),
+            Verdict::Block(_)
+        ));
+
+        // Important tier: a group `@@...$important` overrides a global
+        // `$important` block (the old code returned the global block first).
+        assert!(matches!(
+            combine_tier_verdicts(Some(block()), Some(allow())),
+            Some(Verdict::Allow(_))
+        ));
+        // A global important allow still beats a group important block.
+        assert!(matches!(
+            combine_tier_verdicts(Some(allow()), Some(block())),
+            Some(Verdict::Allow(_))
+        ));
+        // Important outranks standard because callers evaluate it first; the
+        // helper itself only compares within a tier.
+        assert!(combine_tier_verdicts(None, None).is_none());
+    }
+
+    /// Deferred D3 follow-up: on the CNAME-target path a `$dnsrewrite` is not
+    /// actionable. In the `$important` tier it must be dropped (not converted
+    /// to `Allow(None)`) so it cannot skip later parental/service/standard
+    /// checks, and it must not hide an important block.
+    #[test]
+    fn test_cname_target_important_rewrite_is_dropped() {
+        use sito_core::verdict::{BlockReason, RewriteAction, RuleRef};
+
+        let block = || {
+            Verdict::Block(BlockReason::Rule(RuleRef::new(
+                "||blocked-target.example^".to_string(),
+            )))
+        };
+        let allow = || {
+            Verdict::Allow(Some(RuleRef::new(
+                "@@||blocked-target.example^".to_string(),
+            )))
+        };
+        let rewrite = || {
+            Verdict::Rewrite(RewriteAction::DnsRewrite {
+                rcode: "NOERROR".to_string(),
+                rtype: Some("A".to_string()),
+                value: Some("192.0.2.10".to_string()),
+            })
+        };
+
+        // Critical regression: a lone important rewrite is no verdict at all,
+        // so the caller falls through to parental/service/standard checks.
+        assert!(
+            combine_cname_target_tier_verdicts(Some(rewrite()), None).is_none(),
+            "an important CNAME rewrite must not become a real allow"
+        );
+        // A rewrite cannot hide an important block in either position.
+        assert!(matches!(
+            combine_cname_target_tier_verdicts(Some(block()), Some(rewrite())),
+            Some(Verdict::Block(_))
+        ));
+        assert!(matches!(
+            combine_cname_target_tier_verdicts(Some(rewrite()), Some(block())),
+            Some(Verdict::Block(_))
+        ));
+        // A real allow still wins.
+        assert!(matches!(
+            combine_cname_target_tier_verdicts(Some(allow()), Some(rewrite())),
+            Some(Verdict::Allow(Some(_)))
+        ));
+        assert!(matches!(
+            combine_cname_target_tier_verdicts(Some(block()), Some(allow())),
+            Some(Verdict::Allow(Some(_)))
+        ));
+        // Two rewrites are also dropped.
+        assert!(combine_cname_target_tier_verdicts(Some(rewrite()), Some(rewrite())).is_none());
     }
 }

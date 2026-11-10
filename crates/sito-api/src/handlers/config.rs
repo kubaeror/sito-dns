@@ -18,7 +18,7 @@ use crate::auth::rbac::RequireAdmin;
 use crate::config_apply::{ApplyHooks, FilterApply, apply_and_persist_config, apply_full_config};
 use crate::error::ProblemDetails;
 use crate::models::{
-    BackupMetadata, ConfigResponse, ConfigUpdateResponse, GenericMessageResponse,
+    BackupMetadata, ConfigResponse, ConfigUpdateResponse, GenericMessageResponse, HaPublishStatus,
     RestoreConfirmRequest, RestorePreparedResponse, UpdateConfigRequest,
 };
 use crate::state::ServerContext;
@@ -234,7 +234,19 @@ pub async fn update_config(
     Ok(Json(ConfigUpdateResponse {
         message: "Configuration successfully updated".to_string(),
         restart_required: report.restart_required,
+        ha_publish: ha_publish_status(report.ha_publish),
     }))
+}
+
+/// Maps the internal apply report to the client-visible HA publish status.
+fn ha_publish_status(
+    report: Option<crate::config_apply::HaPublishReport>,
+) -> Option<HaPublishStatus> {
+    report.map(|report| HaPublishStatus {
+        status: report.status,
+        error: report.error,
+        retry_at: report.retry_at,
+    })
 }
 
 #[cfg(test)]
@@ -531,12 +543,51 @@ pub async fn reload_config(
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid configuration on disk: {e}")))?;
 
     // Same deep validation and apply routine as every other write path.
+    let previous = (**ctx.config.load()).clone();
     let report = apply_full_config(&ctx, &parsed, FilterApply::Sync, hooks.as_dyn()).await?;
-    ctx.publish_bundle().await;
+    let mut report = report;
+    let (publish_result, retry_delay) = ctx.publish_bundle_with_retry().await;
+    match publish_result {
+        Ok(sito_ha::PublishOutcome::TooLarge { bytes, limit }) => {
+            // The document is already on disk; refuse to serve an
+            // unreplicable configuration and roll the live apply back.
+            if let Err(e) =
+                apply_full_config(&ctx, &previous, FilterApply::Sync, hooks.as_dyn()).await
+            {
+                tracing::error!(
+                    error = %e.detail,
+                    "Failed to roll back an oversized HA reload"
+                );
+            }
+            if let Err(e) = ctx.publish_bundle().await {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to republish the restored configuration after an oversized HA reload"
+                );
+            }
+            return Err(ProblemDetails::bad_request(format!(
+                "The configuration produces a {bytes}-byte HA bundle, above the {limit}-byte WebSocket replication limit; the previous configuration remains active"
+            )));
+        }
+        Ok(outcome) => {
+            if ctx.master_coordinator.is_some() {
+                report.ha_publish =
+                    Some(crate::config_apply::HaPublishReport::from_outcome(outcome));
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "HA publication failed after a config reload");
+            report.ha_publish = Some(crate::config_apply::HaPublishReport::failed_with_retry(
+                e.to_string(),
+                retry_delay,
+            ));
+        }
+    }
 
     Ok(Json(ConfigUpdateResponse {
         message: "Configuration reloaded from disk and applied".to_string(),
         restart_required: report.restart_required,
+        ha_publish: ha_publish_status(report.ha_publish),
     }))
 }
 

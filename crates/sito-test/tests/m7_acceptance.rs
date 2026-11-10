@@ -62,9 +62,9 @@ async fn test_m7_doq_query_and_early_data_disabled() {
 
     let acceptor_mgr = TlsAcceptorManager::new(server_cfg);
 
-    let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let port = udp_socket.local_addr().unwrap().port();
-    drop(udp_socket);
+    let mut port_lease = sito_test::harness::reserve_udp_port().expect("reserve DoQ UDP port");
+    let port = port_lease.port();
+    port_lease.release_socket();
 
     let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
     let doq_config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
@@ -160,9 +160,9 @@ async fn test_m7_doh3_post_and_get_queries() {
         .expect("load server config");
     let acceptor_mgr = TlsAcceptorManager::new(server_cfg);
 
-    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let mut port_lease = sito_test::harness::reserve_udp_port().expect("reserve DoH3 UDP port");
+    let port = port_lease.port();
+    port_lease.release_socket();
 
     let bound_addr = SocketAddr::from(([127, 0, 0, 1], port));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -278,11 +278,8 @@ async fn test_m7_doh3_post_and_get_queries() {
 #[tokio::test]
 async fn test_m7_doh_alt_svc_header_advertisement() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-
-    let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
-    let local_addr = listener.local_addr().unwrap();
-    drop(listener);
+    let port = sito_test_support::reserve_port_number().expect("reserve DoH port");
+    let local_addr = SocketAddr::from(([127, 0, 0, 1], port));
 
     let doh_config = DohConfig::new(local_addr, None).with_alt_svc_port(Some(443));
 
@@ -349,8 +346,18 @@ async fn test_m7_anti_doh_bypass_filter_and_pipeline() {
     let querylog_writer = QueryLogWriter::spawn(stats_db, 100);
     let metrics = MetricsRegistry::new("0.1.0", "test");
 
-    let filter_engine =
-        Arc::new(HostsFilterEngine::init(Default::default(), temp_dir.clone()).await);
+    let filter_engine = Arc::new(
+        HostsFilterEngine::init(
+            // Keep filtering active with a never-matching rule: an enabled
+            // engine with zero sources now fails closed (P2-95).
+            sito_core::config::FilteringConfig {
+                custom_rules: vec!["||never-match.invalid^".to_string()],
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        )
+        .await,
+    );
     let cache = Arc::new(DnsCache::new(Default::default()));
     let bootstrap =
         BootstrapResolver::new(vec!["127.0.0.1".parse().unwrap()], Duration::from_secs(1));
@@ -491,11 +498,12 @@ async fn test_m7_anti_doh_bypass_filter_and_pipeline() {
 async fn test_m7_acme_certificate_management() {
     let (cert_pem, key_pem) = create_mock_tls_pair("example.com");
 
-    // Test expiration calculation
+    // Test expiration calculation. `generate_self_signed_cert` produces the
+    // short-lived bootstrap placeholder (WP-0.2), not a long-lived certificate.
     let days = days_until_expiration(cert_pem.as_bytes()).expect("calculate days until expiration");
     assert!(
-        days >= 30,
-        "Fresh certificate should have >= 30 days validity, got {days}"
+        (0..=7).contains(&days),
+        "Bootstrap certificate must be short-lived (<= 7 days), got {days}"
     );
 
     // Test TLS-ALPN-01 challenge cert generation (RFC 8737)

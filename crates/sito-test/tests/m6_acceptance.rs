@@ -110,6 +110,7 @@ async fn create_test_context() -> (ServerContext, PathBuf) {
         slave_tracker: None,
         resync_sender: None,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        acme_challenges: None,
         dns_starter: None,
     };
 
@@ -184,9 +185,16 @@ async fn test_embedded_ui_spa_routing_fallback() {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        // /login when authenticated redirects to /dashboard, other pages return 200 OK
+        // /login when authenticated redirects to /dashboard; the bootstrap
+        // wizard is closed after setup; other pages return 200 OK.
         if ui_path == "/login" {
             assert_eq!(resp.status(), StatusCode::SEE_OTHER, "Failed for {ui_path}");
+        } else if ui_path == "/wizard" {
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "the wizard must be bootstrap-only after setup"
+            );
         } else {
             assert_eq!(resp.status(), StatusCode::OK, "Failed for {ui_path}");
             let ct = resp
@@ -306,22 +314,17 @@ async fn test_wizard_gate_forbidden_after_setup() {
     let resp2 = app2.oneshot(req2).await.unwrap();
     assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
 
-    // 3. Unauthenticated GET /wizard redirects to /login
+    // 3. The wizard surface itself is bootstrap-only after setup
     let app3 = create_router(ctx.clone());
     let req3 = Request::builder()
         .uri("/wizard")
         .body(Body::empty())
         .unwrap();
     let resp3 = app3.oneshot(req3).await.unwrap();
-    assert_eq!(resp3.status(), StatusCode::SEE_OTHER);
     assert_eq!(
-        resp3
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        "/login"
+        resp3.status(),
+        StatusCode::FORBIDDEN,
+        "the wizard must not be reachable after setup"
     );
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
@@ -790,7 +793,11 @@ async fn test_custom_admin_restart_does_not_reengage_setup_gate() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "the bootstrap wizard must stay closed after setup, even for an Admin"
+    );
 
     let resp = app
         .oneshot(

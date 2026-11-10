@@ -38,7 +38,11 @@ serde_json.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
-reqwest.workspace = true
+# The DoH global-request-cap regression test needs a prior-knowledge HTTP/2
+# client. Keep the feature scoped to tests so production DoH upstream/filter
+# clients keep their current HTTP/1.1 negotiation.
+reqwest = { workspace = true, features = ["http2"] }
+sito-test-support.workspace = true
 
 [lints]
 workspace = true

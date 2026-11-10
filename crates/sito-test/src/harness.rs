@@ -37,111 +37,10 @@ pub struct TestServerInstance {
 /// released so tests run concurrently.
 static SPAWN_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
-/// Polls `condition` every 25 ms until it returns true or `timeout` elapses.
-///
-/// Prefer this over fixed sleeps so tests wait for the actual event (certificate
-/// reload, HA sync, ...) instead of depending on machine speed.
-pub async fn wait_until<F, Fut>(timeout: Duration, mut condition: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if condition().await {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-/// Ports currently held by live test instances in this binary.
-///
-/// The OS can hand a just-released ephemeral port to another test before the
-/// previous server's sockets are fully torn down; reserving ports for the
-/// lifetime of each instance (plus the spawn lock) removes that race.
-static RESERVED_PORTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
-    std::sync::OnceLock::new();
-
-fn reserve_port(port: u16) -> bool {
-    RESERVED_PORTS
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-        .lock()
-        .unwrap()
-        .insert(port)
-}
-
-fn release_reserved_ports(ports: &[u16]) {
-    if let Some(reserved) = RESERVED_PORTS.get() {
-        let mut guard = reserved.lock().unwrap();
-        for port in ports {
-            guard.remove(port);
-        }
-    }
-}
-
-/// RAII broker that reserves ephemeral ports and releases them if startup
-/// fails before the instance takes ownership.
-struct PortReservations {
-    ports: Vec<u16>,
-    armed: bool,
-}
-
-impl PortReservations {
-    fn new() -> Self {
-        Self {
-            ports: Vec::new(),
-            armed: true,
-        }
-    }
-
-    fn reserve_tcp(&mut self) -> std::io::Result<(std::net::TcpListener, u16)> {
-        for _ in 0..20 {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-            let port = listener.local_addr()?.port();
-            if reserve_port(port) {
-                self.ports.push(port);
-                return Ok((listener, port));
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            "no unreserved ephemeral TCP port after 20 attempts",
-        ))
-    }
-
-    fn reserve_udp(&mut self) -> std::io::Result<(std::net::UdpSocket, u16)> {
-        for _ in 0..20 {
-            let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
-            let port = socket.local_addr()?.port();
-            if reserve_port(port) {
-                self.ports.push(port);
-                return Ok((socket, port));
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            "no unreserved ephemeral UDP port after 20 attempts",
-        ))
-    }
-
-    /// Transfers ownership of the reserved ports to the caller.
-    fn commit(mut self) -> Vec<u16> {
-        self.armed = false;
-        std::mem::take(&mut self.ports)
-    }
-}
-
-impl Drop for PortReservations {
-    fn drop(&mut self) {
-        if self.armed {
-            release_reserved_ports(&self.ports);
-        }
-    }
-}
+pub use sito_test_support::{
+    PortReservations, ReservedPort, ReservedUdpPort, reserve_port, reserve_port_number,
+    reserve_udp_port, reserve_udp_port_number, wait_until,
+};
 
 impl TestServerInstance {
     /// Spawns a new server instance with the given configuration modifications,
@@ -177,6 +76,25 @@ impl TestServerInstance {
     }
 
     async fn try_spawn(mut config: Config, options: HarnessOptions) -> Result<Self, anyhow::Error> {
+        // An enabled engine with zero sources now fails closed (P2-95). Many
+        // acceptance tests exercise transports/DNSSEC/cache and leave the
+        // filtering section at its defaults; give those instances one
+        // never-matching rule so filtering stays active and unrelated stages
+        // (safe search, CNAME cloaking) behave as before. Tests that assert
+        // zero-source fail-closed behavior do so at the engine level.
+        let has_enabled_list = config.filtering.lists.iter().any(|list| list.enabled);
+        let has_custom_rules = config
+            .filtering
+            .custom_rules
+            .iter()
+            .any(|rule| !rule.trim().is_empty());
+        if config.filtering.enabled && !has_enabled_list && !has_custom_rules {
+            config
+                .filtering
+                .custom_rules
+                .push("||sito-test-harness.invalid^".to_string());
+        }
+
         // Allocate ephemeral ports through the broker so no two instances in
         // this binary can pick the same port.
         let mut reservations = PortReservations::new();
@@ -490,7 +408,7 @@ impl Drop for TestServerInstance {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
-        release_reserved_ports(&self.reserved_ports);
+        sito_test_support::release_ports(&self.reserved_ports);
         let dir = self.data_dir.clone();
         tokio::spawn(async move {
             let _ = tokio::fs::remove_dir_all(&dir).await;

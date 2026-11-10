@@ -106,22 +106,41 @@ fn denies_type(record: &Nsec3Record<'_>, qtype: RecordType) -> bool {
     !types.contains(RecordType::NS) || types.contains(RecordType::SOA)
 }
 
+/// True when the record is a parent-side delegation NSEC3: an NS RRset without
+/// the SOA bit that identifies a zone apex.
+fn is_delegation(record: &Nsec3Record<'_>) -> bool {
+    let types = record.rdata.type_set();
+    types.contains(RecordType::NS) && !types.contains(RecordType::SOA)
+}
+
 /// Enumerates an NSEC3 denial proof for a negative response.
 ///
 /// `nxdomain` selects the RFC 5155 NXDOMAIN proof (closest encloser plus
 /// covering records for the next closer name and the wildcard at the closest
 /// encloser) over the NODATA proofs (exact match or wildcard match denying the
-/// queried type). Only records whose zone contains `qname` are considered.
+/// queried type).
+///
+/// Only records signed by `signer_zone` itself are considered. NSEC3 owner
+/// names are hashes, so records from an ancestor zone (for example the parent
+/// of a signed delegation) are otherwise indistinguishable from child-zone
+/// records and could be used to prove denial below the cut (RFC 6840 §4.1).
 #[must_use]
 pub fn evaluate_nsec3_denial(
     records: &[Nsec3Record<'_>],
     qname: &Name,
     qtype: RecordType,
     nxdomain: bool,
+    signer_zone: &Name,
 ) -> Nsec3Denial {
+    if !signer_zone.zone_of(qname) {
+        return Nsec3Denial::Incomplete;
+    }
     let relevant: Vec<Nsec3Record<'_>> = records
         .iter()
-        .filter(|record| record.owner.base_name().zone_of(qname))
+        .filter(|record| {
+            let owner_zone = record.owner.base_name();
+            owner_zone == *signer_zone
+        })
         // RFC 9276: iterations above the cap are not accepted; ignoring them
         // yields an incomplete (never secure) proof.
         .filter(|record| record.rdata.iterations() <= MAX_ITERATIONS)
@@ -129,6 +148,32 @@ pub fn evaluate_nsec3_denial(
         .collect();
     if relevant.is_empty() {
         return Nsec3Denial::Incomplete;
+    }
+
+    // RFC 6840 §4.1: a parent-side NSEC3 that matches a delegation cannot be
+    // the closest encloser for a name below the cut. Allowing it would let the
+    // parent's hashed ranges prove NXDOMAIN inside a signed child zone. The
+    // same record may still prove NODATA for DS at the delegation owner.
+    let mut ancestor = qname.clone();
+    loop {
+        if signer_zone.zone_of(&ancestor)
+            && let Some(delegation) = relevant
+                .iter()
+                .find(|record| matches(record, &ancestor) && is_delegation(record))
+        {
+            if !nxdomain && qtype == RecordType::DS && ancestor == *qname {
+                return if denies_type(delegation, RecordType::DS) {
+                    Nsec3Denial::Secure
+                } else {
+                    Nsec3Denial::Incomplete
+                };
+            }
+            return Nsec3Denial::Incomplete;
+        }
+        if ancestor == *signer_zone || ancestor.is_root() {
+            break;
+        }
+        ancestor = ancestor.base_name();
     }
 
     // Walk from the qname towards the root to find the closest encloser.
@@ -173,15 +218,20 @@ pub fn evaluate_nsec3_denial(
         let Some(covering) = covering else {
             return Nsec3Denial::Incomplete;
         };
+        // RFC 5155 §9.2: an opt-out span on the next closer name means an
+        // unsigned delegation may exist there. It must be treated as insecure
+        // even when a wildcard at the closest encloser happens to deny the
+        // type; otherwise an attacker can hide an unsigned child behind a
+        // wildcard NODATA answer and still get AD=1.
+        if covering.rdata.opt_out() {
+            return Nsec3Denial::OptOut;
+        }
         if let Some(wildcard) = wildcard_of(&closest)
             && relevant
                 .iter()
                 .any(|record| matches(record, &wildcard) && denies_type(record, qtype))
         {
             return Nsec3Denial::Secure;
-        }
-        if covering.rdata.opt_out() {
-            return Nsec3Denial::OptOut;
         }
         return Nsec3Denial::Incomplete;
     }
@@ -265,7 +315,13 @@ mod tests {
             rdata: &rdata,
         }];
         assert_eq!(
-            evaluate_nsec3_denial(&records, &qname, RecordType::A, true),
+            evaluate_nsec3_denial(
+                &records,
+                &qname,
+                RecordType::A,
+                true,
+                &Name::from_ascii("example.").unwrap()
+            ),
             Nsec3Denial::OptOut
         );
     }
@@ -300,7 +356,13 @@ mod tests {
             rdata: &rdata,
         }];
         assert_eq!(
-            evaluate_nsec3_denial(&records, &qname, RecordType::A, false),
+            evaluate_nsec3_denial(
+                &records,
+                &qname,
+                RecordType::A,
+                false,
+                &Name::from_ascii("example.").unwrap()
+            ),
             Nsec3Denial::Secure
         );
         // The queried type is present in the bitmap -> not a denial.
@@ -317,7 +379,13 @@ mod tests {
             rdata: &with_a,
         }];
         assert_eq!(
-            evaluate_nsec3_denial(&records, &qname, RecordType::A, false),
+            evaluate_nsec3_denial(
+                &records,
+                &qname,
+                RecordType::A,
+                false,
+                &Name::from_ascii("example.").unwrap()
+            ),
             Nsec3Denial::Incomplete
         );
     }
@@ -326,7 +394,13 @@ mod tests {
     fn test_empty_records_are_incomplete() {
         let qname = Name::from_ascii("missing.example.").unwrap();
         assert_eq!(
-            evaluate_nsec3_denial(&[], &qname, RecordType::A, true),
+            evaluate_nsec3_denial(
+                &[],
+                &qname,
+                RecordType::A,
+                true,
+                &Name::from_ascii("example.").unwrap()
+            ),
             Nsec3Denial::Incomplete
         );
     }
@@ -365,7 +439,13 @@ mod tests {
                 rdata: &rdata,
             }];
             assert_eq!(
-                evaluate_nsec3_denial(&records, &qname, RecordType::A, true),
+                evaluate_nsec3_denial(
+                    &records,
+                    &qname,
+                    RecordType::A,
+                    true,
+                    &Name::from_ascii("example.").unwrap()
+                ),
                 expected,
                 "iterations={iterations}"
             );
@@ -428,7 +508,13 @@ mod tests {
         );
 
         assert_eq!(
-            evaluate_nsec3_denial(&[exact], &qname, RecordType::A, false),
+            evaluate_nsec3_denial(
+                &[exact],
+                &qname,
+                RecordType::A,
+                false,
+                &Name::from_ascii("example.").unwrap()
+            ),
             Nsec3Denial::Incomplete,
             "the exact-match/opt-out denial path must ignore over-cap records"
         );
@@ -472,7 +558,13 @@ mod tests {
             rdata: &with_cname,
         }];
         assert_eq!(
-            evaluate_nsec3_denial(&records, &qname, RecordType::A, false),
+            evaluate_nsec3_denial(
+                &records,
+                &qname,
+                RecordType::A,
+                false,
+                &Name::from_ascii("example.").unwrap()
+            ),
             Nsec3Denial::Incomplete
         );
 
@@ -490,7 +582,13 @@ mod tests {
             rdata: &without_cname,
         }];
         assert_eq!(
-            evaluate_nsec3_denial(&records, &qname, RecordType::A, false),
+            evaluate_nsec3_denial(
+                &records,
+                &qname,
+                RecordType::A,
+                false,
+                &Name::from_ascii("example.").unwrap()
+            ),
             Nsec3Denial::Secure
         );
     }
@@ -563,7 +661,13 @@ mod tests {
             },
         ];
         assert_eq!(
-            evaluate_nsec3_denial(&records, &qname, RecordType::A, false),
+            evaluate_nsec3_denial(
+                &records,
+                &qname,
+                RecordType::A,
+                false,
+                &Name::from_ascii("example.").unwrap()
+            ),
             Nsec3Denial::Secure,
             "a cover of the next closer name must complete the proof"
         );
@@ -594,7 +698,13 @@ mod tests {
             },
         ];
         assert_eq!(
-            evaluate_nsec3_denial(&records, &qname, RecordType::A, false),
+            evaluate_nsec3_denial(
+                &records,
+                &qname,
+                RecordType::A,
+                false,
+                &Name::from_ascii("example.").unwrap()
+            ),
             Nsec3Denial::Incomplete
         );
     }
@@ -647,7 +757,13 @@ mod tests {
             },
         ];
         assert_eq!(
-            evaluate_nsec3_denial(&without_wildcard, &qname, RecordType::A, true),
+            evaluate_nsec3_denial(
+                &without_wildcard,
+                &qname,
+                RecordType::A,
+                true,
+                &Name::from_ascii("example.").unwrap()
+            ),
             Nsec3Denial::Incomplete,
             "RFC 5155 §8.4 requires wildcard at closest encloser to be covered"
         );
@@ -676,9 +792,158 @@ mod tests {
             },
         ];
         assert_eq!(
-            evaluate_nsec3_denial(&with_wildcard, &qname, RecordType::A, true),
+            evaluate_nsec3_denial(
+                &with_wildcard,
+                &qname,
+                RecordType::A,
+                true,
+                &Name::from_ascii("example.").unwrap()
+            ),
             Nsec3Denial::Secure
         );
+    }
+
+    #[test]
+    fn test_opt_out_next_closer_wildcard_nodata_is_optout() {
+        // RFC 5155 §9.2: the next-closer covering NSEC3 being opt-out means an
+        // unsigned delegation may exist there, even if a wildcard at the
+        // closest encloser denies the type. The response must be Insecure.
+        let zone = Name::from_ascii("example.").unwrap();
+        let qname = Name::from_ascii("a.b.example.").unwrap();
+        let next_closer = Name::from_ascii("b.example.").unwrap();
+        let wildcard = Name::from_ascii("*.example.").unwrap();
+
+        let hash = |name: &Name| {
+            Nsec3HashAlgorithm::SHA1
+                .hash(&[], name, 0)
+                .unwrap()
+                .as_ref()
+                .to_vec()
+        };
+        let owner_of = |hashed: &[u8]| {
+            Name::from_ascii(format!("{}.example.", BASE32_DNSSEC.encode(hashed))).unwrap()
+        };
+
+        let encloser_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            increment(&hash(&zone)),
+            [RecordType::SOA, RecordType::RRSIG],
+        );
+        let encloser_owner = owner_of(&hash(&zone));
+        let wildcard_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            increment(&hash(&wildcard)),
+            [RecordType::SOA, RecordType::RRSIG],
+        );
+        let wildcard_owner = owner_of(&hash(&wildcard));
+        let cover_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            true,
+            0,
+            Vec::new(),
+            increment(&increment(&hash(&next_closer))),
+            [RecordType::SOA, RecordType::RRSIG],
+        );
+        let cover_owner = owner_of(&decrement(&decrement(&hash(&next_closer))));
+
+        let records = [
+            Nsec3Record {
+                owner: &encloser_owner,
+                rdata: &encloser_rdata,
+            },
+            Nsec3Record {
+                owner: &wildcard_owner,
+                rdata: &wildcard_rdata,
+            },
+            Nsec3Record {
+                owner: &cover_owner,
+                rdata: &cover_rdata,
+            },
+        ];
+        assert_eq!(
+            evaluate_nsec3_denial(&records, &qname, RecordType::A, false, &zone),
+            Nsec3Denial::OptOut,
+            "an opt-out next-closer cover must not be upgraded by wildcard NODATA"
+        );
+    }
+
+    #[test]
+    fn test_parent_delegation_nsec3_cannot_prove_nxdomain_below_cut() {
+        // Hostile parent-side NSEC3 data for child.example must not be able to
+        // act as the closest encloser (or cover the next closer/wildcard) for
+        // a name inside the child zone (RFC 6840 §4.1).
+        let zone = Name::from_ascii("example.").unwrap();
+        let child = Name::from_ascii("child.example.").unwrap();
+        let x = Name::from_ascii("x.child.example.").unwrap();
+        let wildcard = Name::from_ascii("*.child.example.").unwrap();
+        let child_qname = Name::from_ascii("*.x.child.example.").unwrap();
+
+        let hash = |name: &Name| {
+            Nsec3HashAlgorithm::SHA1
+                .hash(&[], name, 0)
+                .unwrap()
+                .as_ref()
+                .to_vec()
+        };
+        let owner_of = |hashed: &[u8]| {
+            Name::from_ascii(format!("{}.example.", BASE32_DNSSEC.encode(hashed))).unwrap()
+        };
+
+        let delegation_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            increment(&hash(&child)),
+            [RecordType::NS, RecordType::RRSIG],
+        );
+        let delegation_owner = owner_of(&hash(&child));
+        let cover_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            increment(&increment(&hash(&x))),
+            [RecordType::SOA, RecordType::RRSIG],
+        );
+        let cover_owner = owner_of(&decrement(&decrement(&hash(&x))));
+        let wildcard_cover_rdata = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            0,
+            Vec::new(),
+            increment(&increment(&hash(&wildcard))),
+            [RecordType::SOA, RecordType::RRSIG],
+        );
+        let wildcard_cover_owner = owner_of(&decrement(&decrement(&hash(&wildcard))));
+
+        let records = [
+            Nsec3Record {
+                owner: &delegation_owner,
+                rdata: &delegation_rdata,
+            },
+            Nsec3Record {
+                owner: &cover_owner,
+                rdata: &cover_rdata,
+            },
+            Nsec3Record {
+                owner: &wildcard_cover_owner,
+                rdata: &wildcard_cover_rdata,
+            },
+        ];
+        for qname in [&x, &child_qname] {
+            assert_eq!(
+                evaluate_nsec3_denial(&records, qname, RecordType::A, true, &zone),
+                Nsec3Denial::Incomplete,
+                "parent-side delegation NSEC3 must not prove NXDOMAIN for {qname}"
+            );
+        }
     }
 
     #[test]
@@ -704,11 +969,23 @@ mod tests {
             rdata: &delegation_rdata,
         }];
         assert_eq!(
-            evaluate_nsec3_denial(&records, &qname, RecordType::DS, false),
+            evaluate_nsec3_denial(
+                &records,
+                &qname,
+                RecordType::DS,
+                false,
+                &Name::from_ascii("example.").unwrap()
+            ),
             Nsec3Denial::Secure
         );
         assert_eq!(
-            evaluate_nsec3_denial(&records, &qname, RecordType::A, false),
+            evaluate_nsec3_denial(
+                &records,
+                &qname,
+                RecordType::A,
+                false,
+                &Name::from_ascii("example.").unwrap()
+            ),
             Nsec3Denial::Incomplete
         );
     }

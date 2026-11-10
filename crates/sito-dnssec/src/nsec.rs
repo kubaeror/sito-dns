@@ -64,6 +64,13 @@ fn denies_type(record: &NsecRecord<'_>, qtype: RecordType) -> bool {
     !types.contains(RecordType::NS) || types.contains(RecordType::SOA)
 }
 
+/// True when the record is a parent-side delegation NSEC: an NS RRset without
+/// the SOA bit that identifies a zone apex.
+fn is_delegation(record: &NsecRecord<'_>) -> bool {
+    let types = record.rdata.type_set();
+    types.contains(RecordType::NS) && !types.contains(RecordType::SOA)
+}
+
 /// Enumerates an NSEC denial proof for a negative response.
 ///
 /// Only records whose owner is inside `signer_zone` are considered.
@@ -92,6 +99,27 @@ pub fn evaluate_nsec_denial(
         .iter()
         .filter(|record| signer_zone.zone_of(record.owner))
         .collect();
+
+    // RFC 6840 §4.1: a parent-side NSEC at a delegation (NS without SOA)
+    // proves nothing about names below the cut. Without this check the
+    // delegation owner becomes the closest encloser and the parent's NSEC
+    // ranges can "prove" NXDOMAIN inside the child zone, even though the child
+    // is signed and would have to provide its own denial proof. The one
+    // exception is DS at the delegation owner itself: the same NSEC is the
+    // authenticated proof that no DS exists (RFC 6840 §4.4).
+    if let Some(delegation) = relevant
+        .iter()
+        .find(|record| is_delegation(record) && record.owner.zone_of(qname))
+    {
+        if !nxdomain && qtype == RecordType::DS && *delegation.owner == *qname {
+            return if denies_type(delegation, RecordType::DS) {
+                NsecDenial::Secure
+            } else {
+                NsecDenial::Incomplete
+            };
+        }
+        return NsecDenial::Incomplete;
+    }
 
     // Longest existing ancestor of `qname`: every ancestor of an existing NSEC
     // owner inside `signer_zone` exists (at least as an empty non-terminal),
@@ -480,6 +508,47 @@ mod tests {
             evaluate_nsec_denial(&records, &qname, RecordType::A, false, &zone),
             NsecDenial::Incomplete
         );
+    }
+
+    #[test]
+    fn test_parent_delegation_nsec_cannot_prove_nxdomain_below_cut() {
+        // Hostile response: the parent zone's signed NSEC chain is used to
+        // claim NXDOMAIN for a name inside a signed child delegation. RFC 6840
+        // §4.1 forbids using parent-side NSEC data below the cut, so the
+        // delegation owner must not become the closest encloser and the
+        // parent's ranges must not cover the qname or its wildcard.
+        let zone = Name::from_str("example.").unwrap();
+        let (delegation_owner, delegation) = nsec(
+            "child.example.",
+            "z.example.",
+            &[RecordType::NS, RecordType::NSEC, RecordType::RRSIG],
+        );
+        let (cover_owner, cover) = nsec(
+            "a.example.",
+            "z.example.",
+            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+        );
+        let records = [
+            NsecRecord {
+                owner: &delegation_owner,
+                rdata: &delegation,
+            },
+            NsecRecord {
+                owner: &cover_owner,
+                rdata: &cover,
+            },
+        ];
+
+        for qname in [
+            Name::from_str("x.child.example.").unwrap(),
+            Name::from_str("*.x.child.example.").unwrap(),
+        ] {
+            assert_eq!(
+                evaluate_nsec_denial(&records, &qname, RecordType::A, true, &zone),
+                NsecDenial::Incomplete,
+                "parent-side delegation NSEC must not prove NXDOMAIN for {qname}"
+            );
+        }
     }
 
     #[test]

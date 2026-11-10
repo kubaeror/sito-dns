@@ -15,17 +15,23 @@ published.
 | Job | What it proves | Depends on |
 | --- | --- | --- |
 | `verify-tag` | The tag matches the workspace version in `Cargo.toml` (`vX.Y.Z`) or is a prerelease of that version (`vX.Y.Z-<suffix>`). | — |
-| `build-binaries` | All three release archives build (x86_64, aarch64, armv7) and `contrib/install.sh` passes shellcheck. | `verify-tag` |
-| `sbom-and-release` | `SHA256SUMS`, the SPDX SBOM, and cosign keyless signatures are generated and published as a GitHub release. | `verify-tag`, `build-binaries` |
+| `release-gate` | The tagged commit is an ancestor of the required branch (`release/1.9.x` for 1.9.x, `main` for 2.0) and has a successful `ci-gate` check and `cargo-deny` security check. | `verify-tag` |
+| `build-binaries` | All three release archives build (x86_64, aarch64, armv7) and `contrib/install.sh` passes shellcheck. | `verify-tag`, `release-gate` |
+| `sbom-and-release` | `SHA256SUMS`, the SPDX SBOM, and cosign keyless signatures are generated and published as a GitHub release. | `verify-tag`, `release-gate`, `build-binaries` |
 | `artifact-e2e` | The published release is downloadable; checksums, the cosign identity (`release.yml@refs/tags/*`), `sito --version`, and `sito check-config` all pass. | `sbom-and-release` |
-| `docker-build-push` | The multi-arch image is pushed, then its digest, platform list, tags, provenance, and SBOM are verified. | `verify-tag`, `build-binaries`, `sbom-and-release`, `artifact-e2e` |
+| `docker-build-push` | The multi-arch image is pushed; its digest, platform list, tags, provenance, and SBOM are verified; the digest is scanned by a digest-pinned Trivy (fixed HIGH/CRITICAL gate; unfixed findings are ignored) and signed/verified with cosign keyless signing. | `verify-tag`, `release-gate`, `build-binaries`, `sbom-and-release`, `artifact-e2e` |
 
 Consequences:
 
 - A tag that does not match the workspace version fails in `verify-tag`, before
   a binary, release asset, or image is produced.
+- A tag whose commit is not on the required release branch, or whose CI or
+  `cargo-deny` check is missing/red, fails in `release-gate` before any artifact
+  is built.
 - A failed signature, SBOM, download, checksum, or artifact E2E check stops the
   workflow before the image is built.
+- A HIGH/CRITICAL image vulnerability or a missing image signature fails
+  `docker-build-push`.
 - `docker-build-push` is blocking. It is not optional and has no
   `continue-on-error`.
 

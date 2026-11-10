@@ -2,9 +2,12 @@
 
 use crate::downloader::{DEFAULT_DOWNLOAD_TIMEOUT, ListDownloader};
 use crate::error::FilterError;
-use crate::parser::{DnsRewriteRule, Pattern, Rule, RuleKind, parse_rules};
+use crate::parser::{
+    DnsRewriteRule, ParseError, ParseLimits, Pattern, Rule, RuleKind, parse_rules_with_limits,
+};
 use crate::structures::{
-    CompileBudget, CompileBudgetExceeded, CompiledRuleSet, LabelInterner, MAX_REGEX_PATTERN_BYTES,
+    CompileBudget, CompileBudgetExceeded, CompiledRuleSet, LabelInterner, MAX_AC_PATTERN_BYTES,
+    MAX_AC_PATTERNS, MAX_PREFIX_PATTERN_BYTES, MAX_PREFIX_PATTERNS, MAX_REGEX_PATTERN_BYTES,
     MAX_REGEX_PATTERNS, RuleSetBuilder,
 };
 use arc_swap::ArcSwap;
@@ -17,11 +20,15 @@ use sito_core::verdict::{BlockReason, RewriteAction, RuleRef, Verdict};
 use sito_proto::normalize_domain;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 /// Callback receiving the wall-clock duration of each parse+compile attempt.
 pub type CompileObserver = Arc<dyn Fn(f64) + Send + Sync>;
+
+/// Callback receiving every new [`FilterStatus`] snapshot (API/metrics sink).
+pub type StatusObserver = Arc<dyn Fn(&FilterStatus) + Send + Sync>;
 
 /// Lifecycle state of the filter engine's active snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -31,9 +38,12 @@ pub enum FilterState {
     /// The initial (or first) rule load has not produced a snapshot yet.
     #[default]
     Loading,
-    /// A snapshot is active (possibly empty when nothing is configured).
+    /// A snapshot is active. It is empty only when the operator explicitly
+    /// opted into empty lists (`allow_empty_list`).
     Ready,
-    /// Every configured source failed and no rules are active.
+    /// No usable snapshot is active, or a live apply was rejected while an
+    /// older snapshot was retained. Callers distinguish the two with
+    /// [`FilterStatus::unavailable`].
     Failed,
 }
 
@@ -46,13 +56,27 @@ pub struct FilterStatus {
     pub rule_count: usize,
     /// Number of configured lists that loaded successfully in the last reload.
     pub loaded_lists: usize,
-    /// Names of configured lists that failed to load in the last reload.
+    /// Names of configured lists that failed to load, yielded no rules, or
+    /// were rejected by the parse/pattern budgets in the last reload.
     pub failed_lists: Vec<String>,
     /// Most recent reload error, if any.
     pub last_error: Option<String>,
     /// Wall-clock duration of the last parse+compile attempt in milliseconds,
     /// set on success and failure.
     pub last_compile_ms: Option<u64>,
+    /// True when no usable snapshot is active (fail-closed mode answers
+    /// SERVFAIL). Mirrors [`FilterSnapshot::unavailable`] for observers that
+    /// cannot read the snapshot directly.
+    pub unavailable: bool,
+    /// Regex/wildcard patterns dropped from the active snapshot because they
+    /// could not be compiled.
+    pub dropped_regex_patterns: usize,
+    /// Groups whose snapshot was published without part of its rule class
+    /// (regex/wildcard or substring/prefix) after a budget/limit failure.
+    pub degraded_groups: Vec<String>,
+    /// Lists whose newest content was rejected (parse/limit/empty) while a
+    /// previous snapshot was retained.
+    pub degraded_lists: Vec<String>,
 }
 
 /// In-memory snapshot of compiled filter rules.
@@ -377,6 +401,90 @@ impl FilterSnapshot {
         Verdict::Allow(None)
     }
 
+    /// Stage 4 only: returns true when any matching standard block rule applies,
+    /// ignoring `$dnsrewrite` rules.
+    ///
+    /// [`Self::evaluate_standard_block_candidates`] returns the first matching
+    /// rule, so a `$dnsrewrite` that appears before a block in candidate order
+    /// hides the block. Callers that cannot apply a rewrite (for example the
+    /// CNAME-target re-check) use this to detect a block independently of the
+    /// rewrite verdict.
+    pub fn standard_block_candidates_contain_block(
+        &self,
+        domain: &str,
+        qtype: RecordType,
+        client: &ClientContext,
+        block_candidates: &[u32],
+    ) -> bool {
+        for &rule_id in block_candidates {
+            let rule = &self.rules[rule_id as usize];
+            if rule.modifiers.important {
+                continue;
+            }
+            if rule.modifiers.denyallow_matches(domain) {
+                continue;
+            }
+            if let Some(client_filter) = &rule.modifiers.client
+                && !client_filter.matches(client)
+            {
+                continue;
+            }
+            if let Some(dnstype_filter) = &rule.modifiers.dnstype
+                && !dnstype_filter.matches(qtype)
+            {
+                continue;
+            }
+            if rule.modifiers.dnsrewrite.is_some() {
+                continue;
+            }
+            return true;
+        }
+
+        false
+    }
+
+    /// Stage 2 only: returns true when any matching `$important` block rule
+    /// applies, ignoring `$dnsrewrite` rules.
+    ///
+    /// [`Self::evaluate_important_candidates`] returns the first matching
+    /// important rule, so an important `$dnsrewrite` that appears before an
+    /// important block in candidate order hides the block. Callers that cannot
+    /// apply a rewrite (for example the CNAME-target re-check) use this to
+    /// detect an important block independently of the rewrite verdict.
+    pub fn important_block_candidates_contain_block(
+        &self,
+        domain: &str,
+        qtype: RecordType,
+        client: &ClientContext,
+        block_candidates: &[u32],
+    ) -> bool {
+        for &rule_id in block_candidates {
+            let rule = &self.rules[rule_id as usize];
+            if !rule.modifiers.important {
+                continue;
+            }
+            if rule.modifiers.denyallow_matches(domain) {
+                continue;
+            }
+            if let Some(client_filter) = &rule.modifiers.client
+                && !client_filter.matches(client)
+            {
+                continue;
+            }
+            if let Some(dnstype_filter) = &rule.modifiers.dnstype
+                && !dnstype_filter.matches(qtype)
+            {
+                continue;
+            }
+            if rule.modifiers.dnsrewrite.is_some() {
+                continue;
+            }
+            return true;
+        }
+
+        false
+    }
+
     /// Evaluates a domain against only `$important` rules (Stages 1 and 2).
     /// Returns `Some(verdict)` if an `$important` rule matched, or `None` if no `$important` rule applied.
     pub fn evaluate_important(
@@ -656,35 +764,67 @@ fn refresh_schedule(
     (sleep_for, due)
 }
 
-/// Returns a reason when a parsed list's regex/wildcard load exceeds the
-/// per-set compilation limits; the list must then be rejected instead of
-/// letting a hostile list consume unbounded DFA compile resources.
-fn regex_load_exceeds_limits(rules: &[Rule]) -> Option<String> {
-    let mut count = 0usize;
-    let mut bytes = 0usize;
+/// Returns a reason when a parsed list's Aho-Corasick, prefix or regex load
+/// exceeds the per-set compilation limits; the list must then be rejected
+/// instead of letting a hostile list consume unbounded compile resources.
+fn pattern_load_exceeds_limits(rules: &[Rule]) -> Option<String> {
+    let mut regex_count = 0usize;
+    let mut regex_bytes = 0usize;
+    let mut ac_count = 0usize;
+    let mut ac_bytes = 0usize;
+    let mut prefix_count = 0usize;
+    let mut prefix_bytes = 0usize;
     for rule in rules {
         match &rule.pattern {
             Pattern::Regex(pattern) => {
-                count += 1;
-                bytes += pattern.len();
+                regex_count += 1;
+                regex_bytes += pattern.len();
             }
             Pattern::Wildcard(pattern) => {
-                count += 1;
+                regex_count += 1;
                 // Count the expanded regex size so the engine-side limit
                 // matches what the DFA builder would have to compile.
-                bytes += crate::structures::wildcard_to_regex(pattern).len();
+                regex_bytes += crate::structures::wildcard_to_regex(pattern).len();
+            }
+            Pattern::Substring(pattern) => {
+                ac_count += 1;
+                ac_bytes += pattern.len();
+            }
+            Pattern::Prefix(pattern) => {
+                prefix_count += 1;
+                prefix_bytes += pattern.len();
             }
             _ => {}
         }
     }
-    if count > MAX_REGEX_PATTERNS {
+    if regex_count > MAX_REGEX_PATTERNS {
         return Some(format!(
-            "{count} regex/wildcard patterns exceed the limit of {MAX_REGEX_PATTERNS}"
+            "{regex_count} regex/wildcard patterns exceed the limit of {MAX_REGEX_PATTERNS}"
         ));
     }
-    if bytes > MAX_REGEX_PATTERN_BYTES {
+    if regex_bytes > MAX_REGEX_PATTERN_BYTES {
         return Some(format!(
-            "{bytes} regex/wildcard pattern bytes exceed the limit of {MAX_REGEX_PATTERN_BYTES}"
+            "{regex_bytes} regex/wildcard pattern bytes exceed the limit of {MAX_REGEX_PATTERN_BYTES}"
+        ));
+    }
+    if ac_count > MAX_AC_PATTERNS {
+        return Some(format!(
+            "{ac_count} substring patterns exceed the limit of {MAX_AC_PATTERNS}"
+        ));
+    }
+    if ac_bytes > MAX_AC_PATTERN_BYTES {
+        return Some(format!(
+            "{ac_bytes} substring pattern bytes exceed the limit of {MAX_AC_PATTERN_BYTES}"
+        ));
+    }
+    if prefix_count > MAX_PREFIX_PATTERNS {
+        return Some(format!(
+            "{prefix_count} prefix patterns exceed the limit of {MAX_PREFIX_PATTERNS}"
+        ));
+    }
+    if prefix_bytes > MAX_PREFIX_PATTERN_BYTES {
+        return Some(format!(
+            "{prefix_bytes} prefix pattern bytes exceed the limit of {MAX_PREFIX_PATTERN_BYTES}"
         ));
     }
     None
@@ -747,6 +887,16 @@ pub struct HostsFilterEngine {
     /// Optional sink for compile durations (wired to the metrics registry by
     /// the server binary; the filter crate cannot depend on sito-stats).
     compile_observer: std::sync::RwLock<Option<CompileObserver>>,
+    /// Optional sink for status snapshots (API/metrics observability).
+    status_observer: std::sync::RwLock<Option<StatusObserver>>,
+    /// Incremented whenever `list_rules` changes. A group rebuild that started
+    /// from an older generation must not publish its stale snapshot.
+    list_generation: AtomicU64,
+    /// True when `clients.groups.*` contributes non-blank custom rules. The
+    /// global `filtering.lists`/`custom_rules` may be empty in a group-only
+    /// deployment; that must not mark the engine unavailable or fail every
+    /// query closed.
+    group_sources_configured: AtomicBool,
 }
 
 impl HostsFilterEngine {
@@ -770,6 +920,9 @@ impl HostsFilterEngine {
             group_defs: ArcSwap::new(Arc::new(Vec::new())),
             group_snapshots: ArcSwap::new(Arc::new(FnvHashMap::default())),
             compile_observer: std::sync::RwLock::new(None),
+            status_observer: std::sync::RwLock::new(None),
+            list_generation: AtomicU64::new(0),
+            group_sources_configured: AtomicBool::new(false),
         }
     }
 
@@ -780,6 +933,17 @@ impl HostsFilterEngine {
     pub fn set_compile_observer(&self, observer: CompileObserver) {
         *self
             .compile_observer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+    }
+
+    /// Installs the status observer (usually the metrics registry adapter).
+    ///
+    /// The observer runs synchronously whenever a new [`FilterStatus`] is
+    /// published, so API- and scheduler-driven reloads both update metrics.
+    pub fn set_status_observer(&self, observer: StatusObserver) {
+        *self
+            .status_observer
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
     }
@@ -795,17 +959,95 @@ impl HostsFilterEngine {
         }
     }
 
+    /// Whether any group defines non-blank custom rules. A `lists` reference
+    /// alone is not an independent source.
+    fn has_group_custom_rules(groups: &[GroupRuleSet]) -> bool {
+        groups.iter().any(|group| {
+            group
+                .custom_rules
+                .iter()
+                .any(|rule| !rule.trim().is_empty())
+        })
+    }
+
+    /// Cheap dry-run used only for the group-only initial decision: does at
+    /// least one group custom rule actually parse and compile to a non-empty
+    /// snapshot?
+    ///
+    /// Comment-only, invalid-only, or over-budget group rules must not make
+    /// the engine advertise an available empty snapshot. List references are
+    /// ignored here because they are not independent sources; they only work
+    /// when a global list of that name loaded.
+    fn group_custom_rules_compile(&self) -> bool {
+        let defs = self.group_defs.load();
+        if defs.is_empty() {
+            return false;
+        }
+        let config = self.config.load();
+        for def in defs.iter() {
+            let mut rules = Vec::new();
+            let mut over_budget = false;
+            for rule_text in &def.custom_rules {
+                let limits = ParseLimits::new(
+                    config.max_rules.saturating_sub(rules.len()),
+                    config.max_list_bytes,
+                );
+                if let Ok((parsed, _)) = parse_rules_with_limits(rule_text, "group", limits) {
+                    rules.extend(parsed);
+                } else {
+                    over_budget = true;
+                    break;
+                }
+            }
+            if over_budget || rules.is_empty() || rules.len() > config.max_rules {
+                continue;
+            }
+            if pattern_load_exceeds_limits(&rules).is_some() {
+                continue;
+            }
+            let budget = config
+                .regex_compile_budget_ms
+                .map(Duration::from_millis)
+                .map(CompileBudget::new);
+            if FilterSnapshot::compile_with_budget(rules, budget.as_ref())
+                .is_ok_and(|snapshot| snapshot.rule_count > 0)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Replaces the group rule definitions and rebuilds the per-group snapshots
     /// from the currently loaded lists. Called whenever clients/group policy or
     /// blocklists are (re)loaded.
     pub fn set_group_rules(&self, groups: Vec<GroupRuleSet>) {
+        // A group `lists` entry only selects a globally configured list; it is
+        // not an independent source (and an unloaded/disabled global list
+        // yields no rules). Only group `custom_rules` can make an otherwise
+        // source-less configuration non-empty.
+        let has_group_sources = Self::has_group_custom_rules(&groups);
+        self.group_sources_configured
+            .store(has_group_sources, Ordering::Release);
         self.group_defs.store(Arc::new(groups));
         let list_rules = self
             .list_rules
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
-        self.rebuild_group_snapshots(&list_rules);
+        if let Some(degraded) = self.rebuild_group_snapshots(&list_rules) {
+            self.update_group_status(degraded);
+        }
+    }
+
+    /// Updates only the group portion of the published status.
+    fn update_group_status(&self, degraded: Vec<String>) {
+        let mut status = self.status();
+        if status.degraded_groups == degraded {
+            return;
+        }
+        status.degraded_groups = degraded;
+        self.set_status(status);
     }
 
     /// Returns the compiled extra rule set for `group`, if the group defines any.
@@ -819,13 +1061,29 @@ impl HostsFilterEngine {
     /// Lists a group references but that are not loaded are skipped (the group
     /// still gets its custom rules); a group with no usable rules is removed so
     /// the pipeline does not evaluate an empty set.
-    fn rebuild_group_snapshots(&self, list_rules: &FnvHashMap<String, Vec<Rule>>) {
+    fn rebuild_group_snapshots(
+        &self,
+        list_rules: &FnvHashMap<String, Vec<Rule>>,
+    ) -> Option<Vec<String>> {
+        // Capture the list generation this rebuild is based on. A concurrent
+        // list reload bumps the generation; publishing a snapshot compiled
+        // from the older map must then be discarded.
+        let generation = self.list_generation.load(Ordering::SeqCst);
+        self.rebuild_group_snapshots_at(list_rules, generation)
+    }
+
+    fn rebuild_group_snapshots_at(
+        &self,
+        list_rules: &FnvHashMap<String, Vec<Rule>>,
+        generation: u64,
+    ) -> Option<Vec<String>> {
         let defs = self.group_defs.load();
         let config = self.config.load();
         let max_rules = config.max_rules;
         let compile_budget_ms = config.regex_compile_budget_ms;
         let previous = self.group_snapshots.load();
         let mut compiled = FnvHashMap::default();
+        let mut degraded_groups = Vec::new();
         for def in defs.iter() {
             let mut rules = Vec::new();
             for list_name in &def.lists {
@@ -839,20 +1097,43 @@ impl HostsFilterEngine {
                     );
                 }
             }
+            let source = format!("group:{}", def.name);
             for rule_text in &def.custom_rules {
-                let (parsed, rejected) = parse_rules(rule_text, &format!("group:{}", def.name));
-                if rejected > 0 {
-                    warn!(
-                        group = %def.name,
-                        "Rejected {} invalid rule(s) in group custom_rules",
-                        rejected
-                    );
+                let limits =
+                    ParseLimits::new(max_rules.saturating_sub(rules.len()), config.max_list_bytes);
+                match parse_rules_with_limits(rule_text, &source, limits) {
+                    Ok((parsed, rejected)) => {
+                        if rejected > 0 {
+                            warn!(
+                                group = %def.name,
+                                "Rejected {} invalid rule(s) in group custom_rules",
+                                rejected
+                            );
+                        }
+                        rules.extend(parsed);
+                    }
+                    Err(ParseError::TooManyRules { .. } | ParseError::TooManyBytes { .. }) => {
+                        error!(
+                            group = %def.name,
+                            "Group custom_rules exceed the parsing budget; truncating group rules"
+                        );
+                        degraded_groups.push(def.name.clone());
+                        if rules.is_empty() {
+                            // The group's only rules were the over-budget
+                            // custom rules. Carry over its previous snapshot
+                            // so a degraded group never disappears.
+                            if let Some(previous) = previous.get(&def.name) {
+                                compiled.insert(def.name.clone(), Arc::clone(previous));
+                            }
+                        }
+                        break;
+                    }
                 }
-                rules.extend(parsed);
             }
             if rules.is_empty() {
                 continue;
             }
+            let mut degraded = false;
             if rules.len() > max_rules {
                 error!(
                     group = %def.name,
@@ -861,22 +1142,45 @@ impl HostsFilterEngine {
                     "Group filter rule set exceeds filtering.max_rules; truncating to limit"
                 );
                 rules.truncate(max_rules);
+                degraded = true;
             }
-            if let Some(reason) = regex_load_exceeds_limits(&rules) {
+
+            // Never drop a whole group on a compile-limit failure: first
+            // remove only the offending class (regex/wildcard, then
+            // substring/prefix) so exact/domain/custom rules still apply.
+            if let Some(reason) = pattern_load_exceeds_limits(&rules) {
                 error!(
                     group = %def.name,
                     reason = %reason,
-                    "Group filter rule set exceeds regex compilation limits; skipping group regexes"
+                    "Group filter rule set exceeds regex compilation limits; publishing the non-regex subset"
                 );
                 rules.retain(|r| !matches!(r.pattern, Pattern::Regex(_) | Pattern::Wildcard(_)));
+                degraded = true;
+                if let Some(reason) = pattern_load_exceeds_limits(&rules) {
+                    error!(
+                        group = %def.name,
+                        reason = %reason,
+                        "Group substring/prefix load still exceeds limits; publishing only exact/domain rules"
+                    );
+                    rules.retain(|r| {
+                        !matches!(r.pattern, Pattern::Substring(_) | Pattern::Prefix(_))
+                    });
+                }
             }
             if rules.is_empty() {
+                // All rules were in a rejected class. Keep the previous
+                // snapshot when one exists and mark the group degraded so it
+                // never disappears silently.
+                degraded_groups.push(def.name.clone());
+                if let Some(previous) = previous.get(&def.name) {
+                    compiled.insert(def.name.clone(), Arc::clone(previous));
+                }
                 continue;
             }
             let budget = compile_budget_ms
                 .map(Duration::from_millis)
                 .map(CompileBudget::new);
-            match FilterSnapshot::compile_with_budget(rules, budget.as_ref()) {
+            match FilterSnapshot::compile_with_budget(rules.clone(), budget.as_ref()) {
                 Ok(snapshot) => {
                     compiled.insert(def.name.clone(), Arc::new(snapshot));
                 }
@@ -885,15 +1189,51 @@ impl HostsFilterEngine {
                         group = %def.name,
                         elapsed_ms = e.elapsed_ms,
                         limit_ms = e.limit_ms,
-                        "Group snapshot exceeded the regex compile budget; retaining the previous snapshot for this group"
+                        "Group snapshot exceeded the regex compile budget; publishing the non-regex subset"
                     );
-                    if let Some(previous) = previous.get(&def.name) {
-                        compiled.insert(def.name.clone(), Arc::clone(previous));
+                    degraded = true;
+                    rules
+                        .retain(|r| !matches!(r.pattern, Pattern::Regex(_) | Pattern::Wildcard(_)));
+                    if rules.is_empty() {
+                        if let Some(previous) = previous.get(&def.name) {
+                            compiled.insert(def.name.clone(), Arc::clone(previous));
+                        }
+                    } else {
+                        match FilterSnapshot::compile_with_budget(rules, None) {
+                            Ok(snapshot) => {
+                                compiled.insert(def.name.clone(), Arc::new(snapshot));
+                            }
+                            Err(e) => {
+                                error!(
+                                    group = %def.name,
+                                    elapsed_ms = e.elapsed_ms,
+                                    limit_ms = e.limit_ms,
+                                    "Group non-regex fallback compilation failed; retaining the previous snapshot"
+                                );
+                                if let Some(previous) = previous.get(&def.name) {
+                                    compiled.insert(def.name.clone(), Arc::clone(previous));
+                                }
+                            }
+                        }
                     }
                 }
             }
+            if degraded {
+                degraded_groups.push(def.name.clone());
+            }
         }
+
+        if self.list_generation.load(Ordering::SeqCst) != generation {
+            warn!(
+                generation,
+                "Discarding stale group snapshot rebuild; a list reload completed concurrently"
+            );
+            return None;
+        }
+        degraded_groups.sort_unstable();
+        degraded_groups.dedup();
         self.group_snapshots.store(Arc::new(compiled));
+        Some(degraded_groups)
     }
 
     /// Initializes and loads lists immediately (from download or disk cache).
@@ -912,7 +1252,30 @@ impl HostsFilterEngine {
         data_dir: PathBuf,
         observer: Option<CompileObserver>,
     ) -> Self {
+        Self::init_with_observer_and_group_sources(config, data_dir, observer, Vec::new()).await
+    }
+
+    /// Initializes and loads lists with the client group rule sets that will
+    /// apply before the first reload runs.
+    ///
+    /// The server loads `[clients]` after the filter engine, so passing the
+    /// group definitions here lets the initial reload tell a usable group-only
+    /// deployment (global `filtering.lists` empty but at least one group
+    /// `custom_rules` entry compiles) from a broken one. The hint is only used
+    /// when there is no configured global source; it must never mask a failed
+    /// or empty global source.
+    pub async fn init_with_observer_and_group_sources(
+        config: FilteringConfig,
+        data_dir: PathBuf,
+        observer: Option<CompileObserver>,
+        group_rules: Vec<GroupRuleSet>,
+    ) -> Self {
         let engine = Self::new(config, data_dir);
+        engine.group_sources_configured.store(
+            Self::has_group_custom_rules(&group_rules),
+            Ordering::Release,
+        );
+        engine.group_defs.store(Arc::new(group_rules));
         if let Some(observer) = observer {
             engine.set_compile_observer(observer);
         }
@@ -963,6 +1326,14 @@ impl HostsFilterEngine {
     }
 
     fn set_status(&self, status: FilterStatus) {
+        let observer = self
+            .status_observer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(observer) = observer {
+            observer(&status);
+        }
         self.status.store(Arc::new(status));
     }
 
@@ -1021,12 +1392,62 @@ impl HostsFilterEngine {
             return Ok(0);
         }
 
+        // P2-95: filtering enabled with nothing to load must fail closed, not
+        // advertise an empty `Ready` snapshot. Custom rules count as a source
+        // when at least one non-blank entry is configured.
+        let has_global_source = config.lists.iter().any(|list| list.enabled)
+            || config
+                .custom_rules
+                .iter()
+                .any(|rule| !rule.trim().is_empty());
+        // A group custom rule is only an alternative source when there is no
+        // configured global source at all. It must never mask a global list
+        // that was configured but failed/returned nothing.
+        let group_hint = self.group_sources_configured.load(Ordering::Acquire);
+        let has_source = has_global_source || group_hint;
+        if !has_source {
+            let prev_count = self.snapshot.load().rule_count;
+            if prev_count > 0 && !self.snapshot.load().unavailable {
+                // A configured-but-now-empty source set must not replace the
+                // last good snapshot, but it must not look healthy either:
+                // publish Failed (the snapshot stays usable, so `unavailable`
+                // remains false) and reject the config so a live apply does
+                // not commit a zero-source configuration.
+                let reason = "filtering.enabled has no configured sources; retained the previous filter snapshot".to_string();
+                error!("{reason}");
+                // Preserve the retained snapshot's observable status fields
+                // (loaded/failed/degraded lists, dropped-class counters and
+                // compile time); only the lifecycle state and error change.
+                let mut status = self.status();
+                status.state = FilterState::Failed;
+                status.rule_count = prev_count;
+                status.last_error = Some(reason);
+                status.unavailable = false;
+                self.set_status(status);
+                return Err(FilterError::NoSourcesConfigured);
+            }
+            self.snapshot.store(Arc::new(FilterSnapshot::unavailable()));
+            self.list_rules.lock().unwrap().clear();
+            self.set_status(FilterStatus {
+                state: FilterState::Failed,
+                rule_count: 0,
+                unavailable: true,
+                last_error: Some(
+                    "filtering.enabled is true but no filter lists or custom rules are configured"
+                        .to_string(),
+                ),
+                ..FilterStatus::default()
+            });
+            return Err(FilterError::NoSourcesConfigured);
+        }
+
         let mut list_contents = Vec::new();
         // Build the downloader from the configuration being applied instead of
         // caching one next to `self.config`: the two would otherwise be
         // independent values that a concurrent reload could observe as a
         // mismatched pair (new cap, old downloader or vice versa).
-        let downloader = ListDownloader::new(DEFAULT_DOWNLOAD_TIMEOUT, config.max_list_bytes);
+        let downloader = ListDownloader::new(DEFAULT_DOWNLOAD_TIMEOUT, config.max_list_bytes)
+            .with_allow_empty(config.allow_empty_list);
         // Names of lists whose content was fetched (from network or cache) in
         // this cycle. `loaded_lists` is derived from this set minus
         // `failed_lists` so a list can never be counted as both.
@@ -1066,6 +1487,8 @@ impl HostsFilterEngine {
 
         let custom_rules = config.custom_rules.clone();
         let max_rules = config.max_rules;
+        let max_list_bytes = config.max_list_bytes;
+        let allow_empty = config.allow_empty_list;
         let base_rules = self.list_rules.lock().unwrap().clone();
         let enabled_names: FnvHashSet<String> = config
             .lists
@@ -1087,30 +1510,96 @@ impl HostsFilterEngine {
             // Drop rules for lists that are no longer enabled/configured.
             map.retain(|name, _| enabled_names.contains(name));
 
+            // A fetched list replaces its previous entry only after parsing
+            // succeeds. Budget accounting therefore starts from the retained
+            // entries and any failures keep the old rules in place.
+            let fetched_names: FnvHashSet<String> =
+                list_contents.iter().map(|(name, _)| name.clone()).collect();
+            let mut candidate_total: usize = map
+                .iter()
+                .filter(|(name, _)| !fetched_names.contains(*name))
+                .map(|(_, rules)| rules.len())
+                .sum();
+
             let mut rejected = Vec::new();
             for (name, content) in list_contents {
-                let (rules, _) = parse_rules(&content, &name);
-                if let Some(reason) = regex_load_exceeds_limits(&rules) {
-                    error!(
+                let remaining = max_rules.saturating_sub(candidate_total);
+                let limits = ParseLimits::new(remaining, max_list_bytes);
+                let rules = match parse_rules_with_limits(&content, &name, limits) {
+                    Ok((rules, _)) => rules,
+                    Err(ParseError::TooManyRules { count, limit }) => {
+                        error!(
+                            list = %name,
+                            count,
+                            limit,
+                            "Rejecting blocklist that exceeds the parsing rule budget"
+                        );
+                        return Err(FilterError::TooManyRules {
+                            count: candidate_total.saturating_add(count),
+                            limit: max_rules,
+                        });
+                    }
+                    Err(e) => {
+                        error!(
+                            list = %name,
+                            error = %e,
+                            limit = max_list_bytes,
+                            "Rejecting blocklist that exceeds the parsing byte budget"
+                        );
+                        return Err(FilterError::CompileTaskFailed(format!("{name}: {e}")));
+                    }
+                };
+                if rules.is_empty() && !allow_empty {
+                    // An empty 200 response, an HTML error page that parsed
+                    // into nothing, or a zero-yield list must not replace the
+                    // previous rules with an empty set.
+                    warn!(
                         list = %name,
-                        reason = %reason,
-                        "Rejecting blocklist with excessive regex pattern load"
+                        bytes = content.len(),
+                        "Rejecting empty/zero-yield blocklist response"
                     );
                     rejected.push(name);
                     continue;
                 }
+                if let Some(reason) = pattern_load_exceeds_limits(&rules) {
+                    error!(
+                        list = %name,
+                        reason = %reason,
+                        "Rejecting blocklist with excessive pattern load"
+                    );
+                    rejected.push(name);
+                    continue;
+                }
+                candidate_total = candidate_total.saturating_add(rules.len());
                 map.insert(name, rules);
             }
 
             let mut parsed_custom = Vec::new();
             for rule_text in &custom_rules {
-                let (rules, _) = parse_rules(rule_text, "custom");
-                parsed_custom.extend(rules);
+                let remaining = max_rules.saturating_sub(candidate_total + parsed_custom.len());
+                match parse_rules_with_limits(
+                    rule_text,
+                    "custom",
+                    ParseLimits::new(remaining, max_list_bytes),
+                ) {
+                    Ok((rules, _)) => parsed_custom.extend(rules),
+                    Err(ParseError::TooManyRules { count, .. }) => {
+                        return Err(FilterError::TooManyRules {
+                            count: candidate_total
+                                .saturating_add(parsed_custom.len())
+                                .saturating_add(count),
+                            limit: max_rules,
+                        });
+                    }
+                    Err(e) => {
+                        return Err(FilterError::CompileTaskFailed(format!("custom: {e}")));
+                    }
+                }
             }
-            if let Some(reason) = regex_load_exceeds_limits(&parsed_custom) {
+            if let Some(reason) = pattern_load_exceeds_limits(&parsed_custom) {
                 error!(
                     reason = %reason,
-                    "Rejecting custom_rules with excessive regex pattern load"
+                    "Rejecting custom_rules with excessive pattern load"
                 );
                 return Err(FilterError::CompileTaskFailed(reason));
             }
@@ -1143,6 +1632,17 @@ impl HostsFilterEngine {
                 all_rules.extend(map[name].iter().cloned());
             }
             all_rules.extend(parsed_custom);
+            // Per-list checks cannot see two individually valid lists whose
+            // combined Aho-Corasick/prefix/regex load exceeds the budget. The
+            // builder would silently skip the whole class, so reject the
+            // reload instead and keep the previous snapshot.
+            if let Some(reason) = pattern_load_exceeds_limits(&all_rules) {
+                error!(
+                    reason = %reason,
+                    "Combined filter rule set exceeds pattern compilation limits"
+                );
+                return Err(FilterError::CompileTaskFailed(reason));
+            }
             let snapshot = FilterSnapshot::compile_with_budget(all_rules, budget.as_ref())
                 .map_err(|e| FilterError::CompileBudgetExceeded {
                     elapsed_ms: e.elapsed_ms,
@@ -1164,6 +1664,8 @@ impl HostsFilterEngine {
                 last_compile_ms: Some(
                     u64::try_from(compile_started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 ),
+                unavailable: self.snapshot.load().unavailable,
+                ..FilterStatus::default()
             });
             FilterError::CompileTaskFailed(e.to_string())
         })?;
@@ -1189,6 +1691,8 @@ impl HostsFilterEngine {
                         failed_lists: failed_lists.clone(),
                         last_error: Some(e.to_string()),
                         last_compile_ms: Some(compile_elapsed_ms),
+                        unavailable: true,
+                        ..FilterStatus::default()
                     });
                 } else {
                     self.set_status(FilterStatus {
@@ -1198,12 +1702,19 @@ impl HostsFilterEngine {
                         failed_lists: failed_lists.clone(),
                         last_error: Some(e.to_string()),
                         last_compile_ms: Some(compile_elapsed_ms),
+                        unavailable: false,
+                        dropped_regex_patterns: self.snapshot.load().dropped_regex_patterns,
+                        ..FilterStatus::default()
                     });
                 }
                 return Err(e);
             }
         };
 
+        // Lists whose newest content was rejected (empty/HTML/zero-yield or
+        // over the pattern budget) retain their previous rules but are
+        // reported as both failed (not refreshed) and degraded.
+        let degraded_lists = rejected_lists.clone();
         failed_lists.extend(rejected_lists);
         // A list rejected during compilation was already counted as fetched;
         // subtract it here so the status never reports it as both loaded and
@@ -1211,6 +1722,73 @@ impl HostsFilterEngine {
         let loaded_lists = count_loaded_lists(&fetched_lists, &failed_lists);
 
         let prev_count = self.snapshot.load().rule_count;
+        // A group-only configuration legitimately has zero global rules while
+        // the group snapshots hold the effective rules. Bypass the empty/failed
+        // branches only when:
+        //   * there is no configured global source at all, and
+        //   * at least one group custom rule actually parses/compiles.
+        // A failed global list always fails closed here, even when a group
+        // rule exists, so non-group clients are never silently unfiltered.
+        let group_only_sources =
+            !has_global_source && group_hint && self.group_custom_rules_compile();
+        // A raw group hint that did not compile is not a usable source. This
+        // must fail closed even when `allow_empty_list = true`: that option
+        // only permits an *intentional* empty global source set, never a
+        // configured-but-unparseable group-only configuration.
+        let group_only_unusable = !has_global_source && group_hint && !group_only_sources;
+        if count == 0 && !group_only_sources && (!allow_empty || group_only_unusable) {
+            // No usable rules were produced. This covers an empty/HTML/zero
+            // list on a reload as well as a comment-only source: never publish
+            // an empty snapshot that would silently disable filtering.
+            if prev_count > 0 {
+                let reason = if failed_lists.is_empty() {
+                    "new configuration yielded no rules; retained the previous filter snapshot"
+                        .to_string()
+                } else {
+                    format!(
+                        "new configuration yielded no usable rules ({} list(s) failed); retained the previous filter snapshot: {}",
+                        failed_lists.len(),
+                        failed_lists.join(", ")
+                    )
+                };
+                warn!("{reason}");
+                self.set_status(FilterStatus {
+                    state: FilterState::Ready,
+                    rule_count: prev_count,
+                    loaded_lists,
+                    failed_lists,
+                    last_error: Some(reason.clone()),
+                    last_compile_ms: Some(compile_elapsed_ms),
+                    unavailable: false,
+                    dropped_regex_patterns: self.snapshot.load().dropped_regex_patterns,
+                    ..FilterStatus::default()
+                });
+                return Err(FilterError::NoUsableRules { details: reason });
+            }
+            let details = if failed_lists.is_empty() {
+                "configured filter sources yielded no usable rules".to_string()
+            } else {
+                format!(
+                    "all {} configured filter source(s) failed to load or yielded no rules: {}",
+                    failed_lists.len(),
+                    failed_lists.join(", ")
+                )
+            };
+            error!(details = %details, "Refusing to advertise an enabled empty filter snapshot");
+            self.snapshot.store(Arc::new(FilterSnapshot::unavailable()));
+            self.set_status(FilterStatus {
+                state: FilterState::Failed,
+                rule_count: 0,
+                loaded_lists,
+                failed_lists: failed_lists.clone(),
+                last_error: Some(details.clone()),
+                last_compile_ms: Some(compile_elapsed_ms),
+                unavailable: true,
+                ..FilterStatus::default()
+            });
+            return Err(FilterError::NoUsableRules { details });
+        }
+
         if apply_drop_guard
             && prev_count > 0
             && (count == 0 || count.saturating_mul(2) < prev_count)
@@ -1232,11 +1810,14 @@ impl HostsFilterEngine {
                 failed_lists,
                 last_error: Some(reason),
                 last_compile_ms: Some(compile_elapsed_ms),
+                unavailable: false,
+                dropped_regex_patterns: self.snapshot.load().dropped_regex_patterns,
+                ..FilterStatus::default()
             });
             return Ok(prev_count);
         }
 
-        if count == 0 && !failed_lists.is_empty() && prev_count == 0 {
+        if count == 0 && !failed_lists.is_empty() && prev_count == 0 && !group_only_sources {
             let details = format!(
                 "all {} configured filter source(s) failed to load: {}",
                 failed_lists.len(),
@@ -1259,6 +1840,8 @@ impl HostsFilterEngine {
                 failed_lists: failed_lists.clone(),
                 last_error: Some(details.clone()),
                 last_compile_ms: Some(compile_elapsed_ms),
+                unavailable: true,
+                ..FilterStatus::default()
             });
             return Err(FilterError::NoSourcesLoaded {
                 failed: failed_lists.len(),
@@ -1272,18 +1855,40 @@ impl HostsFilterEngine {
                 "Some regex/wildcard blocking rules could not be compiled and are inactive"
             );
         }
+        let dropped_prefix_rules = new_snapshot.allowlist.dropped_prefix_rules
+            + new_snapshot.blocklist.dropped_prefix_rules;
+        if dropped_prefix_rules > 0 {
+            error!(
+                dropped = dropped_prefix_rules,
+                "Some prefix filtering rules could not be compiled and are inactive"
+            );
+        }
+        let dropped_substring_rules = new_snapshot.allowlist.dropped_substring_rules
+            + new_snapshot.blocklist.dropped_substring_rules;
+        if dropped_substring_rules > 0 {
+            error!(
+                dropped = dropped_substring_rules,
+                "Some substring filtering rules could not be compiled and are inactive"
+            );
+        }
         self.snapshot.store(Arc::new(new_snapshot));
         *self.list_rules.lock().unwrap() = new_list_rules;
+        // Bump the generation before rebuilding groups. A concurrent
+        // `set_group_rules` that started from the old list map will detect the
+        // change and discard its stale compilation instead of overwriting the
+        // fresh snapshot.
+        self.list_generation.fetch_add(1, Ordering::SeqCst);
         // Group rule sets are selected from the list rules, so they must track
         // the freshly loaded snapshot.
-        {
+        let degraded_groups = {
             let list_rules = self
                 .list_rules
                 .lock()
                 .map(|g| g.clone())
                 .unwrap_or_default();
-            self.rebuild_group_snapshots(&list_rules);
-        }
+            self.rebuild_group_snapshots(&list_rules)
+                .unwrap_or_default()
+        };
         let last_error = if failed_lists.is_empty() {
             None
         } else {
@@ -1300,6 +1905,10 @@ impl HostsFilterEngine {
             failed_lists,
             last_error,
             last_compile_ms: Some(compile_elapsed_ms),
+            unavailable: false,
+            dropped_regex_patterns: self.snapshot.load().dropped_regex_patterns,
+            degraded_groups,
+            degraded_lists,
         });
         info!(rule_count = count, "Filter snapshot compiled and loaded");
         Ok(count)
@@ -1483,6 +2092,115 @@ mod tests {
         // 4. Important allowlist overrides important block
         let q4 = Name::from_str("special.important.sub.blocked.example.").unwrap();
         assert!(engine.evaluate(&q4, RecordType::A, &client).is_allowed());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Deferred D3 follow-up: block presence must be detectable even when a
+    /// `$dnsrewrite` precedes the block in candidate order.
+    #[tokio::test]
+    async fn test_standard_block_presence_ignores_rewrite_order() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_block_presence_test_{}", std::process::id()));
+        let config = FilteringConfig {
+            custom_rules: vec![
+                "||target.example^$dnsrewrite=192.0.2.10".to_string(),
+                "||target.example^".to_string(),
+            ],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let snapshot = engine.snapshot();
+        let domain = "target.example";
+        let mut candidates = Vec::new();
+        snapshot
+            .blocklist
+            .collect_candidates(domain, &snapshot.interner, &mut candidates);
+        assert_ne!(
+            candidates.len(),
+            0,
+            "candidate collection must include the rewrite and block"
+        );
+        assert!(snapshot.standard_block_candidates_contain_block(
+            domain,
+            RecordType::A,
+            &client,
+            &candidates,
+        ));
+        // The result must not depend on structural candidate order.
+        candidates.reverse();
+        assert!(snapshot.standard_block_candidates_contain_block(
+            domain,
+            RecordType::A,
+            &client,
+            &candidates,
+        ));
+
+        // A rewrite-only snapshot has no block to report.
+        let rewrite_only = FilteringConfig {
+            custom_rules: vec!["||target.example^$dnsrewrite=192.0.2.10".to_string()],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(rewrite_only, temp_dir.clone()).await;
+        let snapshot = engine.snapshot();
+        let mut candidates = Vec::new();
+        snapshot
+            .blocklist
+            .collect_candidates(domain, &snapshot.interner, &mut candidates);
+        assert!(!snapshot.standard_block_candidates_contain_block(
+            domain,
+            RecordType::A,
+            &client,
+            &candidates,
+        ));
+
+        // Important tier: an important rewrite before an important block must
+        // not hide the block either.
+        let important_config = FilteringConfig {
+            custom_rules: vec![
+                "||target.example^$dnsrewrite=192.0.2.10,important".to_string(),
+                "||target.example^$important".to_string(),
+            ],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(important_config, temp_dir.clone()).await;
+        let snapshot = engine.snapshot();
+        let mut candidates = Vec::new();
+        snapshot
+            .blocklist
+            .collect_candidates(domain, &snapshot.interner, &mut candidates);
+        assert!(snapshot.important_block_candidates_contain_block(
+            domain,
+            RecordType::A,
+            &client,
+            &candidates,
+        ));
+        candidates.reverse();
+        assert!(snapshot.important_block_candidates_contain_block(
+            domain,
+            RecordType::A,
+            &client,
+            &candidates,
+        ));
+
+        // An important rewrite-only snapshot has no block to report.
+        let important_rewrite_only = FilteringConfig {
+            custom_rules: vec!["||target.example^$dnsrewrite=192.0.2.10,important".to_string()],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(important_rewrite_only, temp_dir.clone()).await;
+        let snapshot = engine.snapshot();
+        let mut candidates = Vec::new();
+        snapshot
+            .blocklist
+            .collect_candidates(domain, &snapshot.interner, &mut candidates);
+        assert!(!snapshot.important_block_candidates_contain_block(
+            domain,
+            RecordType::A,
+            &client,
+            &candidates,
+        ));
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
@@ -1863,25 +2581,409 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drop_guard_keeps_last_remaining_rule() {
+    async fn test_warm_zero_source_transition_is_failed_and_retains_snapshot() {
         let temp_dir =
-            std::env::temp_dir().join(format!("sito_drop_single_test_{}", std::process::id()));
+            std::env::temp_dir().join(format!("sito_warm_zero_source_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let list_path = temp_dir.join("only.txt");
+        // One valid rule plus an invalid regex that is dropped at compile time.
+        tokio::fs::write(&list_path, "||only.com^\n/^($/\n")
+            .await
+            .unwrap();
         let config = FilteringConfig {
-            custom_rules: vec!["0.0.0.0 only.com".to_string()],
+            lists: vec![
+                FilterListConfig {
+                    name: "only-list".to_string(),
+                    url: format!("file://{}", list_path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+                FilterListConfig {
+                    name: "failed-list".to_string(),
+                    url: format!("file://{}", temp_dir.join("missing.txt").display()),
+                    enabled: true,
+                    refresh_hours: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(config.clone(), temp_dir.clone()).await;
+        assert_eq!(engine.rule_count(), 2);
+        assert_eq!(engine.state(), FilterState::Ready);
+        let before = engine.status();
+        assert_eq!(before.loaded_lists, 1);
+        assert_eq!(before.failed_lists, vec!["failed-list".to_string()]);
+        assert_eq!(
+            before.dropped_regex_patterns, 1,
+            "the invalid regex must be counted as dropped"
+        );
+        assert!(before.last_compile_ms.is_some());
+
+        // A live (warm) apply that removes every source must be rejected and
+        // published as Failed while the last good snapshot stays active.
+        let zero_sources = FilteringConfig {
+            custom_rules: Vec::new(),
+            lists: Vec::new(),
+            ..config.clone()
+        };
+        let err = engine
+            .reload_with_config(&zero_sources)
+            .await
+            .expect_err("zero sources must reject a warm apply");
+        assert!(matches!(err, FilterError::NoSourcesConfigured));
+        assert_eq!(engine.rule_count(), 2, "the last rules must be retained");
+        assert_eq!(engine.state(), FilterState::Failed);
+        assert!(!engine.unavailable_for_fail_closed());
+        let after = engine.status();
+        assert_eq!(
+            after.rule_count, before.rule_count,
+            "the retained snapshot's rule count must be preserved"
+        );
+        assert!(!after.unavailable);
+        assert_eq!(
+            after.loaded_lists, before.loaded_lists,
+            "the retained snapshot's loaded-list count must be preserved"
+        );
+        assert_eq!(after.failed_lists, before.failed_lists);
+        assert_eq!(after.failed_lists.len(), 1);
+        assert_eq!(after.degraded_lists, before.degraded_lists);
+        assert_eq!(after.degraded_groups, before.degraded_groups);
+        assert_eq!(
+            after.dropped_regex_patterns, before.dropped_regex_patterns,
+            "dropped-class counters must survive a rejected zero-source apply"
+        );
+        assert_eq!(after.dropped_regex_patterns, 1);
+        assert_eq!(
+            after.last_compile_ms, before.last_compile_ms,
+            "the retained snapshot's compile time must be preserved"
+        );
+        assert!(after.last_error.is_some());
+        assert_eq!(
+            engine.config.load_full().lists.len(),
+            config.lists.len(),
+            "the rejected zero-source config must not be committed"
+        );
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            engine
+                .evaluate(
+                    &Name::from_str("only.com.").unwrap(),
+                    RecordType::A,
+                    &client
+                )
+                .is_blocked()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P2-95: `filtering.enabled` with zero sources must fail closed instead
+    /// of publishing an empty `Ready` snapshot.
+    #[tokio::test]
+    async fn test_zero_sources_fail_closed_not_ready() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_zero_sources_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let config = FilteringConfig {
+            enabled: true,
+            fail_closed: true,
+            lists: Vec::new(),
+            custom_rules: Vec::new(),
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+
+        assert_eq!(engine.state(), FilterState::Failed);
+        let status = engine.status();
+        assert!(status.unavailable, "the status must report unavailability");
+        assert!(
+            status.last_error.is_some(),
+            "the failure reason must be observable"
+        );
+
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let qname = Name::from_str("anything.example.").unwrap();
+        assert_eq!(
+            engine.evaluate(&qname, RecordType::A, &client),
+            Verdict::Block(BlockReason::FilterUnavailable),
+            "zero sources must fail closed"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-8: a list that loads successfully but yields zero rules must not
+    /// replace the previous snapshot when `allow_empty_list` is false.
+    #[tokio::test]
+    async fn test_zero_yield_list_retains_previous_snapshot() {
+        let temp_dir = std::env::temp_dir().join(format!("sito_zero_yield_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let path = temp_dir.join("list.txt");
+        tokio::fs::write(&path, "||keep.example^\n").await.unwrap();
+
+        let config = FilteringConfig {
+            lists: vec![FilterListConfig {
+                name: "source".to_string(),
+                url: format!("file://{}", path.display()),
+                enabled: true,
+                refresh_hours: None,
+            }],
             ..Default::default()
         };
         let engine = HostsFilterEngine::init(config.clone(), temp_dir.clone()).await;
         assert_eq!(engine.rule_count(), 1);
 
-        // Dropping the last rule is a 100% loss and must be guarded.
-        let mut dropped = config;
-        dropped.custom_rules.clear();
-        engine.config.store(Arc::new(dropped));
-        let count = engine.reload().await.unwrap();
-        assert_eq!(count, 1, "the last rule must survive the drop guard");
-        assert_eq!(engine.rule_count(), 1);
+        // Non-empty body that parses to zero rules (comments only).
+        tokio::fs::write(&path, "! comment only\n").await.unwrap();
+        let count = engine.reload_with_config(&config).await.unwrap();
+        assert_eq!(count, 1, "the previous rule must be retained");
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            engine
+                .evaluate(
+                    &Name::from_str("keep.example.").unwrap(),
+                    RecordType::A,
+                    &client
+                )
+                .is_blocked()
+        );
+        assert_eq!(engine.status().failed_lists, vec!["source".to_string()]);
+        assert_eq!(
+            engine.status().degraded_lists,
+            vec!["source".to_string()],
+            "a list that kept its previous rules must be reported as degraded"
+        );
+
+        // The explicit opt-in allows an empty snapshot.
+        let allow_empty = FilteringConfig {
+            allow_empty_list: true,
+            ..config
+        };
+        let count = engine.reload_with_config(&allow_empty).await.unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(engine.state(), FilterState::Ready);
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-8/P2-95: a zero-yield response on the initial load must leave the
+    /// engine failed and fail closed rather than advertising an empty `Ready`.
+    #[tokio::test]
+    async fn test_zero_yield_initial_load_fails_closed() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_zero_yield_init_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let path = temp_dir.join("empty.txt");
+        tokio::fs::write(&path, "! comment only\n").await.unwrap();
+
+        let engine = HostsFilterEngine::init(
+            FilteringConfig {
+                lists: vec![FilterListConfig {
+                    name: "empty".to_string(),
+                    url: format!("file://{}", path.display()),
+                    enabled: true,
+                    refresh_hours: None,
+                }],
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        )
+        .await;
+
+        assert_eq!(engine.state(), FilterState::Failed);
+        assert!(engine.unavailable_for_fail_closed());
+        assert_eq!(engine.status().failed_lists, vec!["empty".to_string()]);
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert_eq!(
+            engine.evaluate(
+                &Name::from_str("anything.example.").unwrap(),
+                RecordType::A,
+                &client
+            ),
+            Verdict::Block(BlockReason::FilterUnavailable)
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P2-24: a group compile-budget failure publishes the non-regex subset
+    /// instead of dropping the entire group.
+    #[tokio::test]
+    async fn test_group_budget_failure_publishes_non_regex_subset() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_degraded_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let engine = HostsFilterEngine::new(
+            FilteringConfig {
+                regex_compile_budget_ms: Some(1),
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        );
+        let mut custom_rules: Vec<String> = (0..2048)
+            .map(|i| format!("/^group-{i}\\..*\\.example$/"))
+            .collect();
+        custom_rules.push("||keep-group.example^".to_string());
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: Vec::new(),
+            custom_rules,
+        }]);
+
+        let snapshot = engine
+            .group_snapshot("kids")
+            .expect("the non-regex subset must still be published");
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            snapshot
+                .evaluate("keep-group.example", RecordType::A, &client)
+                .is_blocked(),
+            "non-regex/custom rules must survive a group budget failure"
+        );
+        assert!(
+            engine
+                .status()
+                .degraded_groups
+                .contains(&"kids".to_string()),
+            "the group must be reported as degraded"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Important 1: an over-budget group custom-rules reload must retain the
+    /// previous group snapshot, not silently remove the group.
+    #[tokio::test]
+    async fn test_group_parse_budget_failure_retains_previous_snapshot() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_parse_budget_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let engine = HostsFilterEngine::new(
+            FilteringConfig {
+                max_rules: 2,
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        );
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: Vec::new(),
+            custom_rules: vec!["||keep-group.example^".to_string()],
+        }]);
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            engine
+                .group_snapshot("kids")
+                .expect("initial group snapshot")
+                .evaluate("keep-group.example", RecordType::A, &client)
+                .is_blocked()
+        );
+
+        // Three rules exceed max_rules = 2; the group has no list rules, so
+        // the parse-budget arm leaves `rules` empty.
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: Vec::new(),
+            custom_rules: vec!["||a.example^\n||b.example^\n||c.example^".to_string()],
+        }]);
+        let snapshot = engine
+            .group_snapshot("kids")
+            .expect("the previous group snapshot must survive");
+        assert!(
+            snapshot
+                .evaluate("keep-group.example", RecordType::A, &client)
+                .is_blocked(),
+            "the retained group snapshot must stay active"
+        );
+        assert!(
+            engine
+                .status()
+                .degraded_groups
+                .contains(&"kids".to_string()),
+            "the retained group must still be reported degraded"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P2-26: a group rebuild that started before a list reload must not store
+    /// its stale snapshot after the reload publishes a newer generation.
+    #[tokio::test]
+    async fn test_stale_group_rebuild_is_discarded() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_stale_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: vec!["school".to_string()],
+            custom_rules: Vec::new(),
+        }]);
+        let old_generation = engine.list_generation.load(Ordering::SeqCst);
+
+        // Simulate the newer list reload: new list rules + generation bump.
+        let mut newer = FnvHashMap::default();
+        newer.insert(
+            "school".to_string(),
+            vec![parse_line_for_test("||new.example^")],
+        );
+        *engine.list_rules.lock().unwrap() = newer.clone();
+        engine.list_generation.fetch_add(1, Ordering::SeqCst);
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: vec!["school".to_string()],
+            custom_rules: Vec::new(),
+        }]);
+        let current = engine.group_snapshot("kids").expect("current group");
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            current
+                .evaluate("new.example", RecordType::A, &client)
+                .is_blocked()
+        );
+
+        // The stale rebuild (old list map + old generation) must be discarded
+        // and must not overwrite the newer snapshot.
+        let mut stale = FnvHashMap::default();
+        stale.insert(
+            "school".to_string(),
+            vec![parse_line_for_test("||stale.example^")],
+        );
+        assert!(
+            engine
+                .rebuild_group_snapshots_at(&stale, old_generation)
+                .is_none(),
+            "a stale generation must not publish"
+        );
+        let after = engine.group_snapshot("kids").expect("current group");
+        assert!(
+            after
+                .evaluate("new.example", RecordType::A, &client)
+                .is_blocked(),
+            "the newer snapshot must survive"
+        );
+        assert!(
+            after
+                .evaluate("stale.example", RecordType::A, &client)
+                .is_allowed(),
+            "the stale snapshot must not be installed"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    fn parse_line_for_test(line: &str) -> Rule {
+        crate::parser::parse_line(line, "test", 1).expect("valid test rule")
     }
 
     #[tokio::test]
@@ -2127,6 +3229,83 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
+    /// Two lists each below the per-list substring budget can jointly exceed
+    /// it. The reload must be rejected before the builder silently drops the
+    /// whole Aho-Corasick class, retaining the previous snapshot.
+    #[tokio::test]
+    async fn test_combined_multi_list_substring_budget_is_rejected() {
+        use std::fmt::Write as _;
+        let temp_dir = std::env::temp_dir().join(format!("sito_ac_combo_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let a_path = temp_dir.join("a.txt");
+        let b_path = temp_dir.join("b.txt");
+        let per_list = MAX_AC_PATTERNS / 2 + 1;
+        for (path, prefix) in [(&a_path, "a"), (&b_path, "b")] {
+            let mut body = String::new();
+            for i in 0..per_list {
+                let _ = writeln!(body, "{prefix}-sub-{i}");
+            }
+            tokio::fs::write(path, body).await.unwrap();
+        }
+
+        let engine = HostsFilterEngine::init(
+            FilteringConfig {
+                custom_rules: vec!["||keep.example^".to_string()],
+                ..Default::default()
+            },
+            temp_dir.clone(),
+        )
+        .await;
+        assert_eq!(engine.rule_count(), 1);
+
+        let lists = vec![
+            FilterListConfig {
+                name: "a".to_string(),
+                url: format!("file://{}", a_path.display()),
+                enabled: true,
+                refresh_hours: None,
+            },
+            FilterListConfig {
+                name: "b".to_string(),
+                url: format!("file://{}", b_path.display()),
+                enabled: true,
+                refresh_hours: None,
+            },
+        ];
+        let err = engine
+            .reload_with_config(&FilteringConfig {
+                custom_rules: vec!["||keep.example^".to_string()],
+                lists,
+                ..Default::default()
+            })
+            .await
+            .expect_err("the combined substring budget must reject the reload");
+        assert!(matches!(err, FilterError::CompileTaskFailed(_)));
+        assert_eq!(engine.rule_count(), 1, "previous snapshot retained");
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            engine
+                .evaluate(
+                    &Name::from_str("keep.example.").unwrap(),
+                    RecordType::A,
+                    &client
+                )
+                .is_blocked()
+        );
+        assert!(
+            engine
+                .status()
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("substring patterns exceed")),
+            "unexpected status: {:?}",
+            engine.status().last_error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
     /// Regression: fail-closed must survive a failed reload while the active
     /// config is enabled. A rejected disabled -> enabled transition must not
     /// be applied at all (WP-3.10 transactional reload), so the engine stays
@@ -2175,6 +3354,7 @@ mod tests {
         let good = FilteringConfig {
             enabled: true,
             fail_closed: true,
+            custom_rules: vec!["||good.example^".to_string()],
             ..Default::default()
         };
         engine.reload_with_config(&good).await.unwrap();
@@ -2183,14 +3363,253 @@ mod tests {
             engine.reload_with_config(&enabled).await.is_err(),
             "the dead list must still fail"
         );
+        // The rejected reload keeps the last good snapshot instead of
+        // publishing an empty one (P1-8), so the prior rule still applies.
+        assert!(!engine.unavailable_for_fail_closed());
+        assert!(
+            engine
+                .evaluate(
+                    &Name::from_str("good.example.").unwrap(),
+                    RecordType::A,
+                    &client
+                )
+                .is_blocked(),
+            "the previous snapshot must remain active"
+        );
+        assert!(engine.evaluate(&probe, RecordType::A, &client).is_allowed());
+    }
+
+    /// A group-only configuration (no global lists/custom rules, but group
+    /// `custom_rules`) must initialize as a usable empty base snapshot instead
+    /// of fail-closed/unavailable, and the group rules must block.
+    #[tokio::test]
+    async fn test_group_only_custom_rules_are_sources() {
+        let temp_dir = std::env::temp_dir().join(format!("sito_group_only_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let config = FilteringConfig {
+            enabled: true,
+            fail_closed: true,
+            lists: Vec::new(),
+            custom_rules: Vec::new(),
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init_with_observer_and_group_sources(
+            config,
+            temp_dir.clone(),
+            None,
+            vec![GroupRuleSet {
+                name: "kids".to_string(),
+                lists: Vec::new(),
+                custom_rules: vec!["||fortnite.example^".to_string()],
+            }],
+        )
+        .await;
+
+        assert_eq!(
+            engine.state(),
+            FilterState::Ready,
+            "group custom rules are a source even with empty globals"
+        );
+        assert!(
+            !engine.unavailable_for_fail_closed(),
+            "a group-only deployment must not fail closed for every query"
+        );
+
+        engine.set_group_rules(vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: Vec::new(),
+            custom_rules: vec!["||fortnite.example^".to_string()],
+        }]);
+        let snapshot = engine
+            .group_snapshot("kids")
+            .expect("group-only snapshot compiled");
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(matches!(
+            snapshot.evaluate("fortnite.example", RecordType::A, &client),
+            Verdict::Block(_)
+        ));
+        assert!(
+            engine
+                .evaluate(
+                    &Name::from_str("example.org.").unwrap(),
+                    RecordType::A,
+                    &client
+                )
+                .is_allowed(),
+            "queries outside the group must still resolve"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// A valid group rule must not mask a configured global list that failed
+    /// its first load: non-group clients stay fail-closed instead of being
+    /// silently unfiltered.
+    #[tokio::test]
+    async fn test_group_rule_does_not_mask_failed_global_source() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_failed_global_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let config = FilteringConfig {
+            enabled: true,
+            fail_closed: true,
+            lists: vec![FilterListConfig {
+                name: "dead".to_string(),
+                url: "http://127.0.0.1:1/list.txt".to_string(),
+                enabled: true,
+                refresh_hours: None,
+            }],
+            custom_rules: Vec::new(),
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init_with_observer_and_group_sources(
+            config,
+            temp_dir.clone(),
+            None,
+            vec![GroupRuleSet {
+                name: "kids".to_string(),
+                lists: Vec::new(),
+                custom_rules: vec!["||fortnite.example^".to_string()],
+            }],
+        )
+        .await;
+
+        assert_eq!(engine.state(), FilterState::Failed);
         assert!(
             engine.unavailable_for_fail_closed(),
-            "a failed load while enabled must still be fail-closed"
+            "a failed global source must fail closed even when a group rule exists"
         );
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
         assert_eq!(
-            engine.evaluate(&probe, RecordType::A, &client),
+            engine.evaluate(
+                &Name::from_str("unrelated.example.").unwrap(),
+                RecordType::A,
+                &client
+            ),
+            Verdict::Block(BlockReason::FilterUnavailable),
+            "non-group clients must get fail-closed, not allow-all"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Comment-only or invalid-only group rules must not make an otherwise
+    /// source-less configuration advertise a Ready/available snapshot.
+    #[tokio::test]
+    async fn test_invalid_only_group_rules_fail_closed() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_invalid_only_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let config = FilteringConfig {
+            enabled: true,
+            fail_closed: true,
+            lists: Vec::new(),
+            custom_rules: Vec::new(),
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init_with_observer_and_group_sources(
+            config,
+            temp_dir.clone(),
+            None,
+            vec![GroupRuleSet {
+                name: "kids".to_string(),
+                lists: Vec::new(),
+                custom_rules: vec![
+                    "# comment-only".to_string(),
+                    "!!! this is not a valid rule".to_string(),
+                ],
+            }],
+        )
+        .await;
+
+        assert_eq!(engine.state(), FilterState::Failed);
+        assert!(
+            engine.unavailable_for_fail_closed(),
+            "unparseable group rules must not count as a usable source"
+        );
+        assert!(
+            engine.group_snapshot("kids").is_none(),
+            "no usable group snapshot may be published"
+        );
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert_eq!(
+            engine.evaluate(
+                &Name::from_str("unrelated.example.").unwrap(),
+                RecordType::A,
+                &client
+            ),
             Verdict::Block(BlockReason::FilterUnavailable)
         );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// `allow_empty_list = true` permits an intentional empty global source
+    /// set, but it must not turn comment-only/invalid group-only rules into a
+    /// Ready/available empty snapshot.
+    #[tokio::test]
+    async fn test_invalid_only_group_rules_fail_closed_with_allow_empty_list() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_group_invalid_allow_empty_{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let config = FilteringConfig {
+            enabled: true,
+            fail_closed: true,
+            allow_empty_list: true,
+            lists: Vec::new(),
+            custom_rules: Vec::new(),
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init_with_observer_and_group_sources(
+            config,
+            temp_dir.clone(),
+            None,
+            vec![GroupRuleSet {
+                name: "kids".to_string(),
+                lists: Vec::new(),
+                custom_rules: vec![
+                    "# comment-only".to_string(),
+                    "!!! this is not a valid rule".to_string(),
+                ],
+            }],
+        )
+        .await;
+
+        assert_eq!(
+            engine.state(),
+            FilterState::Failed,
+            "allow_empty_list must not mask uncompiled group-only sources"
+        );
+        assert!(
+            engine.unavailable_for_fail_closed(),
+            "unparseable group rules must fail closed even with allow_empty_list"
+        );
+        assert!(
+            engine.group_snapshot("kids").is_none(),
+            "no usable group snapshot may be published"
+        );
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        assert_eq!(
+            engine.evaluate(
+                &Name::from_str("unrelated.example.").unwrap(),
+                RecordType::A,
+                &client
+            ),
+            Verdict::Block(BlockReason::FilterUnavailable),
+            "queries must SERVFAIL instead of being allowed unfiltered"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     /// Regression: group `lists`/`custom_rules` must actually be compiled and
@@ -2480,7 +3899,10 @@ mod tests {
         });
 
         let engine = HostsFilterEngine::init_with_observer(
-            FilteringConfig::default(),
+            FilteringConfig {
+                custom_rules: vec!["||observed.example^".to_string()],
+                ..Default::default()
+            },
             temp_dir.clone(),
             Some(observer),
         )

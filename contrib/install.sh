@@ -1,15 +1,34 @@
 #!/usr/bin/env bash
 # sito automated installer for Linux (x86_64, aarch64, armv7)
-set -euo pipefail
+set -Eeuo pipefail
 
 REPO="kubaeror/sito-dns"
 SITO_VERSION="${SITO_VERSION:-latest}"
 COSIGN_VERSION="${COSIGN_VERSION:-v2.6.5}"
-INSTALL_BIN="/usr/local/bin/sito"
-COSIGN_INSTALL_BIN="/usr/local/bin/cosign"
-CONFIG_DIR="/etc/sito"
-DATA_DIR="/var/lib/sito"
-SERVICE_PATH="/etc/systemd/system/sito.service"
+# Release signatures are required by default. Set SITO_REQUIRE_SIGNATURE=0 only
+# when a SHA-256-only install is explicitly intended (for example in an offline
+# mirror that cannot publish cosign assets).
+SITO_REQUIRE_SIGNATURE="${SITO_REQUIRE_SIGNATURE:-1}"
+case "${SITO_REQUIRE_SIGNATURE}" in
+    0 | 1) ;;
+    *)
+        echo "Error: SITO_REQUIRE_SIGNATURE must be 0 or 1 (got '${SITO_REQUIRE_SIGNATURE}')." >&2
+        exit 1
+        ;;
+esac
+# Production defaults. Tests override these paths and the systemctl binary so
+# the installer E2E can run unprivileged without touching the real system.
+INSTALL_BIN="${SITO_INSTALL_BIN:-/usr/local/bin/sito}"
+COSIGN_INSTALL_BIN="${SITO_INSTALL_COSIGN_BIN:-/usr/local/bin/cosign}"
+CONFIG_DIR="${SITO_CONFIG_DIR:-/etc/sito}"
+DATA_DIR="${SITO_DATA_DIR:-/var/lib/sito}"
+SERVICE_PATH="${SITO_SERVICE_PATH:-/etc/systemd/system/sito.service}"
+SYSTEMCTL="${SITO_SYSTEMCTL:-systemctl}"
+CONFIG_FILE="${CONFIG_DIR}/config.toml"
+BACKUP_BIN="${INSTALL_BIN}.bak"
+CONFIG_BACKUP="${CONFIG_FILE}.bak"
+SERVICE_STOPPED=0
+INSTALL_COMMITTED=0
 
 UNINSTALL=0
 for arg in "$@"; do
@@ -23,27 +42,49 @@ for arg in "$@"; do
             echo "  SITO_VERSION=<version>  Pin a specific release version (default: latest)"
             echo "  SITO_INSTALL_COSIGN=0   Skip automatic cosign installation"
             echo "  COSIGN_VERSION=<tag>    Pin the cosign release (default: v2.6.5)"
+            echo "  SITO_REQUIRE_SIGNATURE=0  Allow an unsigned (SHA-256 only) release"
             exit 0
             ;;
     esac
 done
 
-# 1. Root check
-if [ "$(id -u)" -ne 0 ]; then
+# systemctl is resolved through SITO_SYSTEMCTL so tests can substitute a fake
+# implementation. Production leaves it at the PATH entry `systemctl`.
+have_systemctl() {
+    command -v "${SYSTEMCTL}" >/dev/null 2>&1
+}
+
+run_systemctl() {
+    "${SYSTEMCTL}" "$@"
+}
+
+# If an unexpected failure happens after the service was stopped but before a
+# successful install is committed, put the existing service back into service.
+restart_after_failed_install() {
+    if [ "${SERVICE_STOPPED}" -eq 1 ] && [ "${INSTALL_COMMITTED}" -eq 0 ] && have_systemctl; then
+        echo "Warning: install failed after stopping sito; restarting the existing service." >&2
+        run_systemctl restart sito || true
+    fi
+}
+trap restart_after_failed_install ERR
+
+# 1. Root check. SITO_ALLOW_NON_ROOT exists only for the behavioral installer
+# tests; production installs still require root.
+if [ "$(id -u)" -ne 0 ] && [ "${SITO_ALLOW_NON_ROOT:-0}" != "1" ]; then
     echo "Error: This installer must be run as root (use sudo)." >&2
     exit 1
 fi
 
 if [ "${UNINSTALL}" -eq 1 ]; then
     echo "Uninstalling sito..."
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl stop sito || true
-        systemctl disable sito || true
+    if have_systemctl; then
+        run_systemctl stop sito || true
+        run_systemctl disable sito || true
         rm -f "${SERVICE_PATH}"
-        systemctl daemon-reload || true
-        systemctl reset-failed sito 2>/dev/null || true
+        run_systemctl daemon-reload || true
+        run_systemctl reset-failed sito 2>/dev/null || true
     fi
-    rm -f "${INSTALL_BIN}" "${INSTALL_BIN}.bak"
+    rm -f "${INSTALL_BIN}" "${BACKUP_BIN}" "${CONFIG_BACKUP}"
     echo "Removed ${INSTALL_BIN} and ${SERVICE_PATH}."
 
     # Remove the dedicated system user/group when possible. Config and data are
@@ -101,6 +142,95 @@ resolve_latest_version() {
         exit 1
     fi
     printf '%s\n' "${tag#v}"
+}
+
+# Restores executable permissions and file capabilities. Called after every
+# install (fresh, upgrade and rollback) so a replacement never loses the
+# capability needed to bind privileged DNS ports.
+apply_capabilities() {
+    chmod 755 "${INSTALL_BIN}"
+    # Grant ambient capabilities to bind privileged ports (53, 443, 853)
+    if command -v setcap >/dev/null 2>&1; then
+        setcap 'cap_net_bind_service=+ep' "${INSTALL_BIN}" || true
+    fi
+}
+
+# Installs `src` as `${INSTALL_BIN}` atomically. A temp file is created in the
+# destination directory, flushed, then renamed over the target. Never writes
+# through the destination inode: `cp -f` over a running executable fails with
+# ETXTBSY on Linux, while rename replaces the directory entry atomically.
+install_binary_atomic() {
+    local src="$1"
+    local dest="${2:-${INSTALL_BIN}}"
+    local dir tmp
+
+    if [ ! -f "${src}" ]; then
+        echo "Error: binary '${src}' does not exist." >&2
+        return 1
+    fi
+
+    dir="$(dirname -- "${dest}")"
+    mkdir -p "${dir}" || return 1
+    tmp="$(mktemp "${dir}/.sito-install.XXXXXX")" || return 1
+    if ! install -m 0755 "${src}" "${tmp}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    # Flush the file contents before the rename makes it visible.
+    if command -v sync >/dev/null 2>&1; then
+        sync -- "${tmp}" 2>/dev/null || sync || true
+    fi
+    if ! mv -f -- "${tmp}" "${dest}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    # Persist the directory-entry replacement as well as the file contents.
+    if command -v sync >/dev/null 2>&1; then
+        sync -- "${dir}" 2>/dev/null || sync || true
+    fi
+}
+
+# Stops the service (best effort) before the binary is replaced. If systemd is
+# unavailable the caller still installs the binary; there is no running unit to
+# stop in that case.
+stop_service_for_install() {
+    if have_systemctl; then
+        run_systemctl stop sito >/dev/null 2>&1 || true
+        SERVICE_STOPPED=1
+    fi
+}
+
+backup_config_if_present() {
+    if [ -f "${CONFIG_FILE}" ]; then
+        if ! cp -pf "${CONFIG_FILE}" "${CONFIG_BACKUP}"; then
+            echo "Error: failed to back up ${CONFIG_FILE} to ${CONFIG_BACKUP}." >&2
+            return 1
+        fi
+    fi
+}
+
+# Restores the previous binary and configuration backup after a failed health
+# check. The restore itself is atomic so the service can be started again even
+# if the new binary is still executing.
+rollback_install() {
+    if [ -f "${BACKUP_BIN}" ]; then
+        echo "Restoring previous binary from ${BACKUP_BIN}..." >&2
+        if install_binary_atomic "${BACKUP_BIN}"; then
+            apply_capabilities
+        else
+            echo "Error: failed to restore ${BACKUP_BIN}." >&2
+        fi
+    fi
+    if [ -f "${CONFIG_BACKUP}" ]; then
+        echo "Restoring previous configuration from ${CONFIG_BACKUP}..." >&2
+        if ! cp -pf "${CONFIG_BACKUP}" "${CONFIG_FILE}"; then
+            echo "Error: failed to restore ${CONFIG_FILE} from ${CONFIG_BACKUP}." >&2
+            return 1
+        fi
+    fi
+    if have_systemctl; then
+        run_systemctl restart sito || true
+    fi
 }
 
 # A locally built binary can be installed without any network access, in which
@@ -161,20 +291,25 @@ case "${ARCH}" in
 esac
 echo "Detected architecture: ${ARCH} (target: ${TARGET})"
 
-# 3. Create dedicated system user and group if missing
-if ! getent group sito >/dev/null 2>&1; then
-    echo "Creating system group 'sito'..."
-    groupadd --system sito
-fi
+# 3. Create dedicated system user and group if missing. Test runs are
+# unprivileged and use paths owned by the invoking user.
+if [ "$(id -u)" -eq 0 ]; then
+    if ! getent group sito >/dev/null 2>&1; then
+        echo "Creating system group 'sito'..."
+        groupadd --system sito
+    fi
 
-if ! id -u sito >/dev/null 2>&1; then
-    echo "Creating system user 'sito'..."
-    useradd --system -g sito -d "${DATA_DIR}" -s /usr/sbin/nologin sito
+    if ! id -u sito >/dev/null 2>&1; then
+        echo "Creating system user 'sito'..."
+        useradd --system -g sito -d "${DATA_DIR}" -s /usr/sbin/nologin sito
+    fi
 fi
 
 # 4. Create directories
 mkdir -p "${CONFIG_DIR}" "${DATA_DIR}"
-chown -R sito:sito "${CONFIG_DIR}" "${DATA_DIR}"
+if [ "$(id -u)" -eq 0 ]; then
+    chown -R sito:sito "${CONFIG_DIR}" "${DATA_DIR}"
+fi
 chmod 750 "${CONFIG_DIR}" "${DATA_DIR}"
 
 # 5. Detect upgrade vs fresh install and backup existing binary
@@ -184,13 +319,15 @@ if [ -x "${INSTALL_BIN}" ]; then
     if [ -n "${PREV_VERSION}" ]; then
         IS_UPGRADE=1
         echo "Detected existing installation: ${PREV_VERSION}"
-        echo "Backing up existing binary to ${INSTALL_BIN}.bak..."
-        cp -f "${INSTALL_BIN}" "${INSTALL_BIN}.bak"
+        echo "Backing up existing binary to ${BACKUP_BIN}..."
+        cp -pf "${INSTALL_BIN}" "${BACKUP_BIN}"
+        backup_config_if_present
         echo "Upgrading sito ${PREV_VERSION} → v${SITO_VERSION}..."
     fi
 fi
 if [ "${IS_UPGRADE}" -eq 0 ]; then
     echo "Fresh install of sito v${SITO_VERSION}..."
+    backup_config_if_present
 fi
 
 # 6. Obtain and verify binary
@@ -306,42 +443,52 @@ install_cosign_if_missing() {
     echo "Installed cosign to ${COSIGN_INSTALL_BIN}."
 }
 
+# Best-effort download of an optional artifact. Unlike download_file it does
+# not retry or print noisy progress: a missing signature must fail closed.
+try_download_file() {
+    local url="$1"
+    local output="$2"
+    rm -f "${output}"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${url}" -o "${output}" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q "${url}" -O "${output}" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
 # Support installing a locally built binary only when explicitly requested
 # (verification cannot be performed for local builds).
 if [ "${USE_LOCAL_BINARY}" -eq 1 ]; then
     echo "Using existing local release binary target/release/sito (verification skipped)..."
-    cp -f "target/release/sito" "${INSTALL_BIN}"
+    stop_service_for_install
+    install_binary_atomic "target/release/sito"
 else
     install_cosign_if_missing
+
+    if [ "${SITO_REQUIRE_SIGNATURE}" = "1" ] && ! command -v cosign >/dev/null 2>&1; then
+        echo "Error: release signatures are required but 'cosign' is not installed." >&2
+        echo "Install cosign, allow the installer to install it (SITO_INSTALL_COSIGN=1)," >&2
+        echo "or opt out explicitly with SITO_REQUIRE_SIGNATURE=0." >&2
+        exit 1
+    fi
 
     download_file "${DOWNLOAD_URL}" "${TMP_DIR}/${TARBALL_NAME}"
     download_file "${CHECKSUMS_URL}" "${TMP_DIR}/SHA256SUMS"
 
-    # Optional keyless signature verification with cosign
     HAVE_SIG=0
-    if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL "${SIG_URL}" -o "${TMP_DIR}/${SIG_NAME}" 2>/dev/null && \
-           curl -fsSL "${CERT_URL}" -o "${TMP_DIR}/${CERT_NAME}" 2>/dev/null; then
-            HAVE_SIG=1
-        fi
-    elif command -v wget >/dev/null 2>&1; then
-        if wget -q "${SIG_URL}" -O "${TMP_DIR}/${SIG_NAME}" 2>/dev/null && \
-           wget -q "${CERT_URL}" -O "${TMP_DIR}/${CERT_NAME}" 2>/dev/null; then
-            HAVE_SIG=1
-        fi
+    if try_download_file "${SIG_URL}" "${TMP_DIR}/${SIG_NAME}" && \
+       try_download_file "${CERT_URL}" "${TMP_DIR}/${CERT_NAME}"; then
+        HAVE_SIG=1
     fi
 
-    # Optional strict signature enforcement
-    if [ "${SITO_REQUIRE_SIGNATURE:-0}" = "1" ]; then
-        if [ "${HAVE_SIG}" -eq 0 ]; then
-            echo "Error: SITO_REQUIRE_SIGNATURE=1 but no cosign signature artifacts were found." >&2
-            exit 1
-        fi
-        if ! command -v cosign >/dev/null 2>&1; then
-            echo "Error: SITO_REQUIRE_SIGNATURE=1 but 'cosign' is not installed." >&2
-            echo "Install cosign or re-run this installer without SITO_INSTALL_COSIGN=0." >&2
-            exit 1
-        fi
+    if [ "${SITO_REQUIRE_SIGNATURE}" = "1" ] && [ "${HAVE_SIG}" -eq 0 ]; then
+        echo "Error: release signatures are required but ${SIG_NAME} and/or ${CERT_NAME}" >&2
+        echo "were not found for v${SITO_VERSION}." >&2
+        echo "Refusing to install from a release channel without cosign assets." >&2
+        echo "Set SITO_REQUIRE_SIGNATURE=0 only if you intentionally accept SHA-256-only integrity." >&2
+        exit 1
     fi
 
     if [ "${HAVE_SIG}" -eq 1 ] && command -v cosign >/dev/null 2>&1; then
@@ -359,11 +506,11 @@ else
         fi
     else
         if [ "${HAVE_SIG}" -eq 0 ]; then
-            echo "Notice: No cosign signature artifacts found for release v${SITO_VERSION}."
-            echo "Warning: Relying solely on SHA-256 checksum verification. Releases with signatures are strongly recommended."
+            echo "Warning: SITO_REQUIRE_SIGNATURE=0: no cosign signature artifacts found for release v${SITO_VERSION}." >&2
+            echo "Warning: Relying solely on SHA-256 checksum verification." >&2
         elif ! command -v cosign >/dev/null 2>&1; then
-            echo "Notice: Release ships cosign signatures, but 'cosign' tool is not installed."
-            echo "Warning: Relying solely on SHA-256 checksum verification. Consider installing cosign for supply chain security."
+            echo "Warning: SITO_REQUIRE_SIGNATURE=0: release ships cosign signatures, but 'cosign' is not installed." >&2
+            echo "Warning: Relying solely on SHA-256 checksum verification." >&2
             echo "Warning: 'sito update' will refuse to run until cosign is installed or" >&2
             echo "Warning: server.update_require_signature is set to false." >&2
         fi
@@ -392,18 +539,9 @@ else
         echo "Error: 'sito' binary not found inside ${TARBALL_NAME}." >&2
         exit 1
     fi
-    cp -f "${TMP_DIR}/sito" "${INSTALL_BIN}"
+    stop_service_for_install
+    install_binary_atomic "${TMP_DIR}/sito"
 fi
-
-# Restores executable permissions and file capabilities. Called after a
-# successful install and again after a rollback restored the backup binary.
-apply_capabilities() {
-    chmod 755 "${INSTALL_BIN}"
-    # Grant ambient capabilities to bind privileged ports (53, 443, 853)
-    if command -v setcap >/dev/null 2>&1; then
-        setcap 'cap_net_bind_service=+ep' "${INSTALL_BIN}" || true
-    fi
-}
 
 if [ -f "${INSTALL_BIN}" ]; then
     apply_capabilities
@@ -412,7 +550,7 @@ fi
 # 7. Install systemd service. Prefer the unit shipped in the release archive
 # (contrib/systemd/sito.service) so it cannot drift from the source of truth;
 # fall back to the embedded copy below when running via `curl | bash`.
-if command -v systemctl >/dev/null 2>&1; then
+if have_systemctl; then
     UNIT_SRC=""
     if [ -n "${SCRIPT_DIR}" ]; then
         for candidate in "${SCRIPT_DIR}/systemd/sito.service" "${SCRIPT_DIR}/contrib/systemd/sito.service"; do
@@ -423,6 +561,7 @@ if command -v systemctl >/dev/null 2>&1; then
         done
     fi
 
+    mkdir -p "$(dirname -- "${SERVICE_PATH}")"
     if [ -n "${UNIT_SRC}" ]; then
         echo "Installing packaged systemd service unit from ${UNIT_SRC}..."
         install -m 0644 "${UNIT_SRC}" "${SERVICE_PATH}"
@@ -466,10 +605,10 @@ WantedBy=multi-user.target
 EOF
     fi
 
-    systemctl daemon-reload
-    systemctl enable sito || true
+    run_systemctl daemon-reload
+    run_systemctl enable sito || true
     echo "Starting sito service..."
-    systemctl restart sito || true
+    run_systemctl start sito || true
 
     # Post-install health check. The systemd service and the DNS listener are
     # the primary checks; the HTTP probe is advisory because the web UI can be
@@ -515,7 +654,6 @@ EOF
         ' "$1"
     }
 
-    CONFIG_FILE="${CONFIG_DIR}/config.toml"
     DNS_PORT=53
     WEB_ENABLED="true"
     WEB_BIND="0.0.0.0"
@@ -526,7 +664,7 @@ EOF
     WEB_PORT="${SITO_WEB_PORT:-${CONFIG_WEB_PORT:-8080}}"
 
     HEALTH_OK=1
-    if ! systemctl is-active --quiet sito 2>/dev/null; then
+    if ! run_systemctl is-active --quiet sito 2>/dev/null; then
         HEALTH_OK=0
         echo "Error: sito service failed to start or is not active!" >&2
     fi
@@ -579,17 +717,17 @@ EOF
         echo "Troubleshooting hints:" >&2
         echo " - Check if port ${DNS_PORT} or port ${WEB_PORT} is already in use: ss -tulpn | grep -E ':(${DNS_PORT}|${WEB_PORT})'" >&2
         echo " - Check system logs: journalctl -u sito -e" >&2
-        echo " - Restoring previous binary from ${INSTALL_BIN}.bak (if present)..." >&2
-        if [ -f "${INSTALL_BIN}.bak" ]; then
-            cp -f "${INSTALL_BIN}.bak" "${INSTALL_BIN}"
-            apply_capabilities
-            systemctl restart sito || true
+        echo " - Restoring previous binary and configuration backup (if present)..." >&2
+        if ! rollback_install; then
+            echo "Error: rollback did not complete cleanly; inspect the service manually." >&2
         fi
         exit 1
     else
         echo "sito service is active and responding."
     fi
 fi
+
+INSTALL_COMMITTED=1
 
 HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")"
 if [ -z "${HOST_IP}" ]; then

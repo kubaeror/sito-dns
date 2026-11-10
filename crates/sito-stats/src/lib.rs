@@ -21,7 +21,7 @@ pub use db::{
 };
 pub use entry::QueryLogEntry;
 pub use error::StatsError;
-pub use metrics::MetricsRegistry;
+pub use metrics::{FilterStatusMetrics, MetricsRegistry};
 pub use writer::{DEFAULT_CHANNEL_CAPACITY, QueryLogSender, QueryLogWriter};
 
 #[cfg(test)]
@@ -267,7 +267,7 @@ mod tests {
         db.insert_batch(&entries).await.unwrap();
 
         // Prune logs older than 90 days
-        let report = db.cleanup_retention(90).await.unwrap();
+        let report = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(report.deleted_records, 1);
         assert_eq!(report.aggregated_hours, 1);
 
@@ -491,7 +491,7 @@ mod tests {
         db.insert_batch(&[entry1, entry2]).await.unwrap();
 
         // 1st aggregation: entries are older than 90 days
-        let rep1 = db.cleanup_retention(90).await.unwrap();
+        let rep1 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep1.aggregated_hours, 1);
         assert_eq!(rep1.deleted_records, 2);
 
@@ -516,8 +516,8 @@ mod tests {
         assert_eq!(queries, 2);
         assert_eq!(blocked, 1);
 
-        // Run cleanup_retention again - should aggregate 0 hours because watermark prevents double counting
-        let rep2 = db.cleanup_retention(90).await.unwrap();
+        // Run cleanup_detailed_retention again - should aggregate 0 hours because watermark prevents double counting
+        let rep2 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep2.aggregated_hours, 0);
         assert_eq!(rep2.deleted_records, 0);
 
@@ -550,7 +550,7 @@ mod tests {
         db.insert_batch(&[entry3]).await.unwrap();
 
         // 3rd cleanup should only aggregate entry3 (1 new query, not re-aggregating entry1 and entry2)
-        let rep3 = db.cleanup_retention(90).await.unwrap();
+        let rep3 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep3.aggregated_hours, 1);
         assert_eq!(rep3.deleted_records, 1);
 
@@ -696,7 +696,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rep1 = db.cleanup_retention(90).await.unwrap();
+        let rep1 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep1.aggregated_hours, 1);
         assert_eq!(rep1.deleted_records, 2);
 
@@ -721,7 +721,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rep2 = db.cleanup_retention(90).await.unwrap();
+        let rep2 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep2.aggregated_hours, 1);
         assert_eq!(rep2.deleted_records, 1);
 
@@ -761,7 +761,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = db.cleanup_retention(90).await;
+        let err = db.cleanup_detailed_retention(90).await;
         assert!(err.is_err(), "cleanup must surface the aggregation failure");
 
         // Aggregate, watermark update and delete share one transaction, so the
@@ -829,7 +829,7 @@ mod tests {
         assert_eq!(stats.cached_queries, 2);
         assert_eq!(stats.blocked_queries, 1);
 
-        let report = db.cleanup_retention(90).await.unwrap();
+        let report = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(report.aggregated_hours, 1);
         let (cached, blocked): (i64, i64) = sqlx::query_as(
             "SELECT cached, blocked FROM stats_hourly WHERE hour = (1000000000000 / 3600000) * 3600000",
@@ -875,7 +875,11 @@ mod tests {
     /// answered from the rollups instead of silently under-reporting.
     #[tokio::test]
     async fn test_retention_populates_rollups_and_long_window_merges_them() {
-        let db = StatsDb::in_memory().await.unwrap();
+        // Client names are opt-in; enable them to verify the merge path. The
+        // raw IP must still never appear in the rollup.
+        let db = StatsDb::in_memory_with_rollup_client_names(true)
+            .await
+            .unwrap();
         // Older than the 90-day retention period, but inside the 365-day
         // statistics window used below.
         let old_ts = chrono::Utc::now().timestamp_millis() - 100 * 86_400_000;
@@ -899,7 +903,7 @@ mod tests {
         }
         db.insert_batch(&entries).await.unwrap();
 
-        let report = db.cleanup_retention(90).await.unwrap();
+        let report = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(report.deleted_records, 8);
 
         // The hourly rollup carries bounded top lists (previously always '[]').
@@ -933,10 +937,26 @@ mod tests {
         let clients = db.get_client_stats(365 * 86_400_000).await.unwrap();
         let archived = clients
             .iter()
-            .find(|c| c.client_ip == "10.9.9.9")
+            .find(|c| c.client_name.as_deref() == Some("archived-host"))
             .expect("archived client must be merged into a long window");
-        assert_eq!(archived.client_name.as_deref(), Some("archived-host"));
+        assert!(
+            archived.client_ip.starts_with("blake3:"),
+            "rollup client IP must be a keyed hash, got {}",
+            archived.client_ip
+        );
         assert_eq!(archived.total_queries, 5);
+
+        // No raw client IP may survive in the rollup payload.
+        let raw_payload: String = sqlx::query_scalar(
+            "SELECT COALESCE(GROUP_CONCAT(top_clients, ''), '') FROM stats_hourly",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            !raw_payload.contains("10.9.9.9") && !raw_payload.contains("10.8.8.8"),
+            "raw client IPs must not be stored in stats_hourly: {raw_payload}"
+        );
 
         let upstreams = db.get_upstream_stats(365 * 86_400_000).await.unwrap();
         let tls = upstreams
@@ -956,7 +976,7 @@ mod tests {
         db.insert_batch(&[retention_entry(hour_ts, "first.test", "allowed", None)])
             .await
             .unwrap();
-        let rep1 = db.cleanup_retention(90).await.unwrap();
+        let rep1 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep1.aggregated_hours, 1);
 
         db.insert_batch(&[retention_entry(
@@ -967,7 +987,7 @@ mod tests {
         )])
         .await
         .unwrap();
-        let rep2 = db.cleanup_retention(90).await.unwrap();
+        let rep2 = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(rep2.aggregated_hours, 1);
 
         let (top_domains,): (String,) = sqlx::query_as(
@@ -988,10 +1008,10 @@ mod tests {
         );
     }
 
-    /// WP-7.2: clearing the query log folds rows into `stats_hourly` so totals
-    /// survive the clear.
+    /// P1-19: the default “clear query log” erases both detailed rows and
+    /// aggregate rollups.
     #[tokio::test]
-    async fn test_delete_query_logs_folds_rows_into_hourly_rollups() {
+    async fn test_delete_query_logs_default_clears_rollups() {
         let db = StatsDb::in_memory().await.unwrap();
         let now = chrono::Utc::now().timestamp_millis();
         db.insert_batch(&[
@@ -1010,10 +1030,42 @@ mod tests {
             remaining.entries
         );
 
+        let rollups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_hourly")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rollups, 0, "default clear must delete stats_hourly");
+        let stats = db.get_global_stats(86_400_000).await.unwrap();
+        assert_eq!(stats.total_queries, 0);
+    }
+
+    /// P1-19: `--keep-aggregates` folds rows into `stats_hourly` so totals
+    /// survive the clear.
+    #[tokio::test]
+    async fn test_delete_query_logs_keep_aggregates_preserves_rollups() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        db.insert_batch(&[
+            retention_entry(now - 1_000, "keep-total.example", "allowed", None),
+            retention_entry(now - 900, "keep-total.example", "blocked", None),
+        ])
+        .await
+        .unwrap();
+
+        let deleted = db.delete_query_logs_keep_aggregates().await.unwrap();
+        assert_eq!(deleted, 2);
+        let remaining = db.query_logs(&QueryLogFilter::default()).await.unwrap();
+        assert_eq!(remaining.entries.len(), 0);
+
+        let rollups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_hourly")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rollups, 1, "keep-aggregates must preserve rollups");
         let stats = db.get_global_stats(86_400_000).await.unwrap();
         assert_eq!(
             stats.total_queries, 2,
-            "clearing the log must not reset aggregate totals"
+            "keep-aggregates must not reset aggregate totals"
         );
         assert_eq!(stats.blocked_queries, 1);
         assert_eq!(
@@ -1022,7 +1074,7 @@ mod tests {
         );
     }
 
-    /// WP-7.2: `cleanup_retention` vacuums after a large sweep so pages freed
+    /// WP-7.2: `cleanup_detailed_retention` vacuums after a large sweep so pages freed
     /// by the delete are returned to the filesystem.
     #[tokio::test]
     async fn test_retention_vacuum_shrinks_database_after_large_delete() {
@@ -1048,7 +1100,7 @@ mod tests {
         db.insert_batch(&entries).await.unwrap();
 
         let before = db.db_size_bytes().await.unwrap();
-        let report = db.cleanup_retention(90).await.unwrap();
+        let report = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(report.deleted_records, 3_000);
         let after = db.db_size_bytes().await.unwrap();
         assert!(
@@ -1264,7 +1316,7 @@ mod tests {
         }
         db.insert_batch(&entries).await.unwrap();
 
-        let report = db.cleanup_retention(90).await.unwrap();
+        let report = db.cleanup_detailed_retention(90).await.unwrap();
         assert_eq!(report.deleted_records, 120 * 3 + 2);
 
         let stats = db.get_global_stats(365 * 86_400_000).await.unwrap();
@@ -1289,7 +1341,7 @@ mod tests {
         )])
         .await
         .unwrap();
-        db.delete_query_logs().await.unwrap();
+        db.delete_query_logs_keep_aggregates().await.unwrap();
         db.insert_batch(&[retention_entry(
             now - 500,
             "same-hour.example",
@@ -1390,5 +1442,932 @@ mod tests {
         );
 
         sender.shutdown().await;
+    }
+
+    /// P1-19: rollups store keyed hashes, never raw client IPs, and client
+    /// names are omitted unless explicitly enabled.
+    #[tokio::test]
+    async fn test_rollup_pii_hashes_client_ip_and_omits_names_by_default() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let first_hour = now - 100 * 86_400_000;
+        let second_hour = first_hour + 3_600_000;
+
+        let mut first = retention_entry(first_hour, "pii.example", "allowed", None);
+        first.client_ip = "192.168.1.42".into();
+        first.client_name = Some("secret-laptop".into());
+        let mut second = retention_entry(second_hour, "pii.example", "allowed", None);
+        second.client_ip = "192.168.1.42".into();
+        second.client_name = Some("secret-laptop".into());
+        db.insert_batch(&[first, second]).await.unwrap();
+
+        db.cleanup_detailed_retention(90).await.unwrap();
+
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT hour, top_clients FROM stats_hourly ORDER BY hour ASC")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let mut hashes = Vec::new();
+        for (_, payload) in &rows {
+            assert!(
+                !payload.contains("192.168.1.42"),
+                "raw IP leaked: {payload}"
+            );
+            assert!(
+                !payload.contains("secret-laptop"),
+                "client name leaked: {payload}"
+            );
+            let tops: Vec<(String, Option<String>, i64, i64, i64)> =
+                serde_json::from_str(payload).unwrap();
+            assert_eq!(tops.len(), 1);
+            assert!(tops[0].0.starts_with("blake3:"));
+            assert!(tops[0].1.is_none(), "names are opt-in");
+            hashes.push(tops[0].0.clone());
+        }
+        assert_eq!(
+            hashes[0], hashes[1],
+            "the same client IP must hash stably across hours"
+        );
+
+        let clients = db.get_client_stats(365 * 86_400_000).await.unwrap();
+        assert_eq!(clients.len(), 1);
+        assert!(clients[0].client_ip.starts_with("blake3:"));
+        assert!(clients[0].client_name.is_none());
+    }
+
+    /// P1-19: rollups (and their domains) are deleted after
+    /// `rollup_retention_days`, independently of detailed-log retention.
+    #[tokio::test]
+    async fn test_rollup_retention_deletes_expired_domains_and_rows() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let expired = now - 400 * 86_400_000;
+        let retained = now - 100 * 86_400_000;
+
+        db.insert_batch(&[
+            retention_entry(expired, "expired-domain.example", "allowed", None),
+            retention_entry(retained, "retained-domain.example", "allowed", None),
+        ])
+        .await
+        .unwrap();
+
+        let report = db
+            .cleanup_retention_with_policy(90, 365, false)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_records, 2);
+        assert_eq!(report.rollup_deleted_records, 1);
+
+        let domains: String = sqlx::query_scalar(
+            "SELECT COALESCE(GROUP_CONCAT(top_domains, ''), '') FROM stats_hourly",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(!domains.contains("expired-domain.example"));
+        assert!(domains.contains("retained-domain.example"));
+    }
+
+    /// Deferred D4a: the compatibility `cleanup_retention` wrapper now applies
+    /// the default rollup retention instead of silently pruning detailed rows
+    /// only.
+    #[allow(deprecated)]
+    #[tokio::test]
+    async fn test_compat_cleanup_retention_applies_default_rollup_retention() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let expired_hour = ((now - 400 * 86_400_000) / 3_600_000) * 3_600_000;
+        sqlx::query(
+            "INSERT INTO stats_hourly (hour, queries, blocked, cached) VALUES (?, 1, 0, 0)",
+        )
+        .bind(expired_hour)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let report = db.cleanup_retention(90).await.unwrap();
+        assert_eq!(
+            report.rollup_deleted_records, 1,
+            "the compatibility wrapper must apply the default rollup retention"
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_hourly")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    /// P1-24: retention commits bounded chunks and records a startup
+    /// catch-up timestamp.
+    #[tokio::test]
+    async fn test_retention_uses_bounded_chunks_and_records_success() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let start = now - 200 * 86_400_000;
+
+        let mut entries = Vec::new();
+        for hour in 0..60 {
+            entries.push(retention_entry(
+                start + hour * 3_600_000,
+                "chunk.example",
+                "allowed",
+                None,
+            ));
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        assert!(db.retention_last_success_ms().await.unwrap().is_none());
+        let report = db
+            .cleanup_retention_with_policy(90, 365, false)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_records, 60);
+        assert!(
+            report.chunks >= 2,
+            "a multi-hour backlog must be split into bounded transactions, got {}",
+            report.chunks
+        );
+        assert!(db.retention_last_success_ms().await.unwrap().is_some());
+
+        // A second sweep has nothing left but still refreshes the marker.
+        let second = db
+            .cleanup_retention_with_policy(90, 365, false)
+            .await
+            .unwrap();
+        assert_eq!(second.deleted_records, 0);
+        assert_eq!(second.chunks, 0);
+        assert!(db.retention_last_success_ms().await.unwrap().is_some());
+    }
+
+    /// P1-24: the query-log writer must not drop a batch while a bounded
+    /// retention sweep is running.
+    #[tokio::test]
+    async fn test_retention_concurrent_insert_does_not_drop_batches() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let start = now - 200 * 86_400_000;
+
+        let mut old_entries = Vec::new();
+        for hour in 0..50 {
+            for offset in 0..20 {
+                old_entries.push(retention_entry(
+                    start + hour * 3_600_000 + offset,
+                    "backlog.example",
+                    "allowed",
+                    None,
+                ));
+            }
+        }
+        db.insert_batch(&old_entries).await.unwrap();
+
+        let writer = QueryLogWriter::spawn(db.clone(), 10_000);
+        let sender = writer.sender();
+
+        let send = async {
+            for i in 0..500 {
+                assert!(
+                    sender.try_send(retention_entry(
+                        now - 1_000 + i,
+                        "concurrent.example",
+                        "allowed",
+                        None,
+                    )),
+                    "channel must not overflow"
+                );
+            }
+            sender.flush().await;
+        };
+
+        let (report, ()) = tokio::join!(db.cleanup_retention_with_policy(90, 365, false), send);
+        let report = report.unwrap();
+        assert_eq!(report.deleted_records, 1_000);
+        assert_eq!(
+            sender.dropped_total(),
+            0,
+            "a bounded sweep must not drop query-log batches"
+        );
+        sender.shutdown().await;
+
+        let page = db
+            .query_logs(&QueryLogFilter {
+                limit: Some(1_000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 500);
+        assert!(page.entries.iter().all(|e| e.qname == "concurrent.example"));
+    }
+
+    /// P1-23: the live query-log refresh can skip the filtered `COUNT(*)`.
+    #[tokio::test]
+    async fn test_query_logs_include_total_is_optional() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        db.insert_batch(&[
+            retention_entry(now, "total.example", "allowed", None),
+            retention_entry(now + 1, "total.example", "allowed", None),
+        ])
+        .await
+        .unwrap();
+
+        let page = db
+            .query_logs(&QueryLogFilter {
+                include_total: Some(false),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.total_count, None);
+
+        let with_total = db.query_logs(&QueryLogFilter::default()).await.unwrap();
+        assert_eq!(with_total.total_count, Some(2));
+    }
+
+    /// P1-23: dashboard aggregates are cached briefly and clear/retention
+    /// invalidates the cache immediately.
+    #[tokio::test]
+    async fn test_dashboard_cache_serves_within_ttl_and_clear_invalidates() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        db.insert_batch(&[retention_entry(now, "cache.example", "allowed", None)])
+            .await
+            .unwrap();
+
+        let first = db.get_global_stats_cached(86_400_000).await.unwrap();
+        assert_eq!(first.total_queries, 1);
+
+        // A write inside the TTL is not observed by the cached dashboard read.
+        db.insert_batch(&[retention_entry(now + 1, "cache.example", "allowed", None)])
+            .await
+            .unwrap();
+        let cached = db.get_global_stats_cached(86_400_000).await.unwrap();
+        assert_eq!(cached.total_queries, 1);
+
+        // Clearing invalidates immediately.
+        db.delete_query_logs().await.unwrap();
+        let cleared = db.get_global_stats_cached(86_400_000).await.unwrap();
+        assert_eq!(cleared.total_queries, 0);
+    }
+
+    /// P1-19: a v1.9 database (no `stats_meta`, raw rollup payloads) is
+    /// upgraded additively; the old binary's schema/migrator view stays valid.
+    #[tokio::test]
+    async fn test_migration_from_v19_schema_hashes_rollups_and_stays_old_compatible() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito-stats-v19-migration-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        for sql in [
+            include_str!("../migrations/20260905000000_init.sql"),
+            include_str!("../migrations/20260906000000_watermark.sql"),
+            include_str!("../migrations/20260913000000_client_ip_index.sql"),
+        ] {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let hour = ((now - 100 * 86_400_000) / 3_600_000) * 3_600_000;
+        sqlx::query(
+            "INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients) \
+             VALUES (?, 5, 1, 0, ?, ?)",
+        )
+        .bind(hour)
+        .bind(r#"[["legacy.example",5,1]]"#)
+        .bind(r#"[["10.9.9.9","legacy-host",5,1,123]]"#)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO query_log (ts, client_ip, client_name, qname, qtype, rcode, verdict, proto) \
+             VALUES (?, '10.9.9.9', 'legacy-host', 'legacy.example', 1, 0, 'allowed', 'udp')",
+        )
+        .bind(now - 1_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = StatsDb::open(&db_path).await.unwrap();
+
+        // One-time backfill hashed the raw IP and dropped the name.
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(!payload.contains("10.9.9.9"));
+        assert!(!payload.contains("legacy-host"));
+        assert!(payload.contains("blake3:"));
+
+        // The new metadata table exists but is not recorded as a sqlx
+        // migration, so an old 1.9.3 migrator does not see an unknown version.
+        let has_meta: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='stats_meta'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(has_meta, 1);
+        let versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            versions,
+            vec![
+                20_260_905_000_000i64,
+                20_260_906_000_000,
+                20_260_913_000_000,
+                20_260_922_000_000,
+            ],
+            "no new sqlx migration version may be visible to 1.9.3"
+        );
+
+        // Old 1.9.3-style access (old columns only) still works.
+        let old_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_log")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(old_rows, 1);
+        sqlx::query(
+            "INSERT INTO query_log (ts, client_ip, client_name, qname, qtype, rcode, verdict, proto) \
+             VALUES (?, '10.0.0.1', NULL, 'old-code.example', 1, 0, 'allowed', 'udp')",
+        )
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let (ts, qname): (i64, String) =
+            sqlx::query_as("SELECT ts, qname FROM query_log ORDER BY id DESC LIMIT 1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(ts, now);
+        assert_eq!(qname, "old-code.example");
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_stats_files_are_private_and_loose_permissions_are_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-stats-perms-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let salt_path = temp_dir.join("stats-salt");
+        std::fs::write(&salt_path, [0u8; 32]).unwrap();
+        std::fs::set_permissions(&salt_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let db = StatsDb::open(&db_path).await.unwrap();
+        db.insert_batch(&[retention_entry(
+            chrono::Utc::now().timestamp_millis(),
+            "perms.example",
+            "allowed",
+            None,
+        )])
+        .await
+        .unwrap();
+        db.repair_permissions().unwrap();
+
+        for path in [
+            db_path.clone(),
+            salt_path.clone(),
+            temp_dir.join("stats.db-wal"),
+            temp_dir.join("stats.db-shm"),
+        ] {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} must be 0600, got {mode:o}", path.display());
+        }
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    async fn create_legacy_db(path: &std::path::Path) -> sqlx::SqlitePool {
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        for sql in [
+            include_str!("../migrations/20260905000000_init.sql"),
+            include_str!("../migrations/20260906000000_watermark.sql"),
+            include_str!("../migrations/20260913000000_client_ip_index.sql"),
+        ] {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        }
+        pool
+    }
+
+    /// P1-19 Important 2: a real IPv6 literal with the legacy `b3:` prefix must
+    /// still be hashed, not mistaken for a stored digest.
+    #[tokio::test]
+    async fn test_b3_ipv6_literal_is_hashed_not_treated_as_digest() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut entry = retention_entry(
+            now - 100 * 86_400_000,
+            "ipv6-prefix.example",
+            "allowed",
+            None,
+        );
+        entry.client_ip = "b3::1".into();
+        db.insert_batch(&[entry]).await.unwrap();
+        db.cleanup_detailed_retention(90).await.unwrap();
+
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            !payload.contains("\"b3::1\""),
+            "IPv6 literal must not be stored raw: {payload}"
+        );
+        let tops: Vec<(String, Option<String>, i64, i64, i64)> =
+            serde_json::from_str(&payload).unwrap();
+        assert!(tops[0].0.starts_with("blake3:"));
+    }
+
+    /// P1-19 Important 3: malformed legacy payloads are neutralized before the
+    /// backfill marker is written.
+    #[tokio::test]
+    async fn test_backfill_neutralizes_malformed_rollup_payload() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-stats-malformed-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let pool = create_legacy_db(&db_path).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let hour = ((now - 100 * 86_400_000) / 3_600_000) * 3_600_000;
+        sqlx::query(
+            "INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients) \
+             VALUES (?, 5, 1, 0, '[]', ?)",
+        )
+        .bind(hour)
+        .bind("not-json 10.9.9.9 legacy-host")
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = StatsDb::open(&db_path).await.unwrap();
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(payload, "[]", "malformed payload must be neutralized");
+        let marker: Option<String> =
+            sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'rollup_pii_v2'")
+                .fetch_optional(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(marker.as_deref(), Some("1"));
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-19 Important 4: switching `rollup_client_names` true -> false scrubs
+    /// names from already-written rollups on the next startup.
+    #[tokio::test]
+    async fn test_rollup_client_names_true_to_false_scrubs_existing_names() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito-stats-name-transition-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut entry = retention_entry(now - 100 * 86_400_000, "names.example", "allowed", None);
+        entry.client_ip = "10.7.7.7".into();
+        entry.client_name = Some("named-device".into());
+
+        {
+            let db = StatsDb::open_with_rollup_client_names(&db_path, true)
+                .await
+                .unwrap();
+            db.insert_batch(&[entry]).await.unwrap();
+            db.cleanup_detailed_retention(90).await.unwrap();
+            let payload: String =
+                sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert!(payload.contains("named-device"));
+        }
+
+        let db = StatsDb::open_with_rollup_client_names(&db_path, false)
+            .await
+            .unwrap();
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(!payload.contains("named-device"));
+        assert!(!payload.contains("10.7.7.7"));
+        assert!(payload.contains("blake3:"));
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-19: names are preserved by a legacy backfill when explicitly enabled.
+    #[tokio::test]
+    async fn test_backfill_preserves_names_when_enabled() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito-stats-backfill-names-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let pool = create_legacy_db(&db_path).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let hour = ((now - 100 * 86_400_000) / 3_600_000) * 3_600_000;
+        sqlx::query(
+            "INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients) \
+             VALUES (?, 5, 1, 0, '[]', ?)",
+        )
+        .bind(hour)
+        .bind(r#"[["10.9.9.9","legacy-host",5,1,123]]"#)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = StatsDb::open_with_rollup_client_names(&db_path, true)
+            .await
+            .unwrap();
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(payload.contains("legacy-host"));
+        assert!(!payload.contains("10.9.9.9"));
+        assert!(payload.contains("blake3:"));
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-19: the salt persists across restarts and a corrupt salt is rejected.
+    #[tokio::test]
+    async fn test_salt_persists_and_corrupt_salt_is_rejected() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-stats-salt-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let salt_path = temp_dir.join("stats-salt");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut entry = retention_entry(now - 100 * 86_400_000, "salt.example", "allowed", None);
+        entry.client_ip = "10.6.6.6".into();
+
+        let first_hash = {
+            let db = StatsDb::open(&db_path).await.unwrap();
+            db.insert_batch(&[entry.clone()]).await.unwrap();
+            db.cleanup_detailed_retention(90).await.unwrap();
+            let payload: String =
+                sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            let tops: Vec<(String, Option<String>, i64, i64, i64)> =
+                serde_json::from_str(&payload).unwrap();
+            tops[0].0.clone()
+        };
+        assert_eq!(std::fs::metadata(&salt_path).unwrap().len(), 32);
+
+        {
+            let db = StatsDb::open(&db_path).await.unwrap();
+            let mut second = entry;
+            second.ts += 3_600_000;
+            db.insert_batch(&[second]).await.unwrap();
+            db.cleanup_detailed_retention(90).await.unwrap();
+            let payloads: Vec<String> =
+                sqlx::query_scalar("SELECT top_clients FROM stats_hourly ORDER BY hour")
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap();
+            let hashes: Vec<String> = payloads
+                .iter()
+                .map(|payload| {
+                    let tops: Vec<(String, Option<String>, i64, i64, i64)> =
+                        serde_json::from_str(payload).unwrap();
+                    tops[0].0.clone()
+                })
+                .collect();
+            assert!(hashes.iter().all(|hash| hash == &first_hash));
+        }
+
+        std::fs::write(&salt_path, [0u8; 31]).unwrap();
+        assert!(
+            StatsDb::open(&db_path).await.is_err(),
+            "a short salt must be rejected instead of silently regenerated"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-19: default clear vacuums a large deletion and keeps
+    /// `secure_delete=ON`.
+    #[tokio::test]
+    async fn test_clear_query_log_vacuums_and_secure_delete_is_on() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-stats-clear-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let db = StatsDb::open(&db_path).await.unwrap();
+
+        let padding = "x".repeat(200);
+        let old_ts = 1_000_000_000_000i64;
+        let mut entries = Vec::new();
+        for i in 0..3_000i64 {
+            let mut entry = retention_entry(old_ts + i, "clear.test", "allowed", None);
+            entry.rule = Some(format!("{padding}-{i}"));
+            entries.push(entry);
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let before = db.db_size_bytes().await.unwrap();
+        let deleted = db.delete_query_logs().await.unwrap();
+        assert_eq!(deleted, 3_000);
+        let after = db.db_size_bytes().await.unwrap();
+        assert!(
+            after < before,
+            "large clear must vacuum (before={before}, after={after})"
+        );
+
+        let secure_delete: i64 = sqlx::query_scalar("PRAGMA secure_delete")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(secure_delete, 1, "secure_delete must be enabled");
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-24 Important 7: a single busy hour is sub-chunked by row count.
+    #[tokio::test]
+    async fn test_large_single_hour_is_row_bounded() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let hour = ((now - 200 * 86_400_000) / 3_600_000) * 3_600_000;
+        let mut entries = Vec::new();
+        for i in 0..12_000i64 {
+            entries.push(retention_entry(
+                hour + i,
+                "busy-hour.example",
+                "allowed",
+                None,
+            ));
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let report = db
+            .cleanup_retention_with_policy(90, 365, false)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_records, 12_000);
+        assert_eq!(
+            report.chunks, 3,
+            "12,000 rows must be split into 5,000-row chunks"
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_log")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    /// P1-24 Important 5: hour discovery uses the `ts` index instead of a
+    /// full-range `GROUP BY` scan.
+    #[tokio::test]
+    async fn test_retention_hour_discovery_uses_ts_index() {
+        use sqlx::Row;
+        let db = StatsDb::in_memory().await.unwrap();
+        let rows = sqlx::query("EXPLAIN QUERY PLAN SELECT MIN(ts) FROM query_log WHERE ts < ?")
+            .bind(0i64)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        let plan = rows
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains("idx_ql_ts"),
+            "hour discovery must use idx_ql_ts: {plan}"
+        );
+    }
+
+    /// P1-24 Important 7: chunk boundary, aggregate and delete predicates use
+    /// the `(ts, id)` index and do not sort the whole hour.
+    #[tokio::test]
+    async fn test_retention_chunk_queries_use_ts_id_index() {
+        use sqlx::Row;
+        let db = StatsDb::in_memory().await.unwrap();
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_ql_ts_id'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(index_count, 1, "(ts, id) index must be created");
+
+        let boundary = sqlx::query(
+            r"
+            EXPLAIN QUERY PLAN
+            SELECT ts, id FROM query_log INDEXED BY idx_ql_ts_id
+            WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+            ORDER BY ts ASC, id ASC LIMIT 1 OFFSET ?
+            ",
+        )
+        .bind(0i64)
+        .bind(0i64)
+        .bind(1i64)
+        .bind(0i64)
+        .bind(5_000i64)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let boundary_plan = boundary
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let bytecode = sqlx::query(
+            r"
+            EXPLAIN SELECT ts, id FROM query_log INDEXED BY idx_ql_ts_id
+            WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+            ORDER BY ts ASC, id ASC LIMIT 1 OFFSET ?
+            ",
+        )
+        .bind(0i64)
+        .bind(0i64)
+        .bind(1i64)
+        .bind(0i64)
+        .bind(5_000i64)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let opcodes: Vec<String> = bytecode
+            .iter()
+            .map(|row| row.get::<String, _>("opcode"))
+            .collect();
+        assert!(
+            opcodes.iter().any(|op| op == "SeekGE") && opcodes.iter().any(|op| op == "IdxGT"),
+            "chunk boundary must use a range seek on idx_ql_ts_id, not a full scan: {opcodes:?}"
+        );
+        assert!(
+            boundary_plan.contains("idx_ql_ts_id"),
+            "chunk boundary must use idx_ql_ts_id: {boundary_plan}"
+        );
+        assert!(
+            !boundary_plan.contains("TEMP B-TREE"),
+            "chunk boundary must not sort the whole hour: {boundary_plan}"
+        );
+
+        let aggregate = sqlx::query(
+            r"
+            EXPLAIN QUERY PLAN
+            SELECT COUNT(*) FROM query_log INDEXED BY idx_ql_ts_id
+            WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+            ",
+        )
+        .bind(0i64)
+        .bind(0i64)
+        .bind(1i64)
+        .bind(0i64)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let aggregate_plan = aggregate
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            aggregate_plan.contains("idx_ql_ts_id"),
+            "chunk aggregate must use idx_ql_ts_id: {aggregate_plan}"
+        );
+    }
+
+    /// Important 7: a large same-timestamp hour is still split into bounded
+    /// chunks by the `(ts, id)` cursor.
+    #[tokio::test]
+    async fn test_large_same_timestamp_hour_is_row_bounded() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let hour = ((now - 200 * 86_400_000) / 3_600_000) * 3_600_000;
+        let ts = hour + 1_234;
+        let mut entries = Vec::new();
+        for _ in 0..12_000 {
+            entries.push(retention_entry(ts, "same-ts.example", "allowed", None));
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let report = db
+            .cleanup_retention_with_policy(90, 365, false)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_records, 12_000);
+        assert_eq!(
+            report.chunks, 3,
+            "same-timestamp rows must still be split into 5,000-row chunks"
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_log")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    /// Important regression: a heavy hitter spread across many chunks must not
+    /// be lost because each chunk's top-N is computed separately.
+    #[tokio::test]
+    async fn test_rollup_top_n_preserves_heavy_hitter_across_chunks() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let hour = ((now - 200 * 86_400_000) / 3_600_000) * 3_600_000;
+        let mut entries = Vec::new();
+        let mut ts = hour;
+
+        // Three blocks of 5,000 rows each. Each block has 100 distinct
+        // distractors with 10 hits and 9 hits for the target. The target is
+        // below every chunk's top-100 but is the global heavy hitter (27 hits).
+        for block in 0..3 {
+            for i in 0..100 {
+                for _ in 0..10 {
+                    entries.push(retention_entry(
+                        ts,
+                        &format!("distract-{block}-{i}.example"),
+                        "allowed",
+                        None,
+                    ));
+                    ts += 1;
+                }
+            }
+            for _ in 0..9 {
+                entries.push(retention_entry(ts, "heavy.example", "allowed", None));
+                ts += 1;
+            }
+            for i in 0..3_991 {
+                entries.push(retention_entry(
+                    ts,
+                    &format!("filler-{block}-{i}.example"),
+                    "allowed",
+                    None,
+                ));
+                ts += 1;
+            }
+        }
+        assert_eq!(entries.len(), 15_000);
+        db.insert_batch(&entries).await.unwrap();
+
+        let report = db
+            .cleanup_retention_with_policy(90, 365, false)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_records, 15_000);
+        assert!(
+            report.chunks >= 3,
+            "expected multiple row-bounded chunks, got {}",
+            report.chunks
+        );
+
+        let payload: String =
+            sqlx::query_scalar("SELECT top_domains FROM stats_hourly WHERE hour = ?")
+                .bind(hour)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let tops: Vec<(String, i64, i64)> = serde_json::from_str(&payload).unwrap();
+        let heavy = tops
+            .iter()
+            .find(|(qname, _, _)| qname == "heavy.example")
+            .expect("heavy hitter must survive the per-hour rollup");
+        assert_eq!(
+            heavy.1, 27,
+            "heavy hitter count must be exact across chunks: {tops:?}"
+        );
     }
 }

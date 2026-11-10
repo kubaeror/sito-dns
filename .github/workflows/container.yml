@@ -81,6 +81,11 @@ jobs:
           [web]
           enabled = false
 
+          # Filtering defaults to enabled and fail-closed; with no lists it would
+          # answer SERVFAIL. The smoke run only asserts a local rewrite.
+          [filtering]
+          enabled = false
+
           # A plain upstream keeps the smoke run independent of TLS/DoH setup;
           # the asserted name below is answered from a local rewrite anyway.
           [upstream]

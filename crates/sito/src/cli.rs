@@ -5,6 +5,7 @@ use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 use rand::RngExt;
 use sito_core::config::Config;
+use sito_stats::StatsDb;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -199,6 +200,21 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Clear the persisted query log
+    ClearQueryLog {
+        /// Optional path to configuration file (defaults to main --config)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Preserve hourly rollups (aggregate totals, top domains, hashed
+        /// client identifiers). By default both query_log and stats_hourly are
+        /// erased.
+        #[arg(long)]
+        keep_aggregates: bool,
+        /// Allow clearing while the server is running. The running process
+        /// keeps its SQLite connections; stop the service when possible.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -324,6 +340,58 @@ pub fn run_check_config(path: &Path) -> Result<(), anyhow::Error> {
     );
 
     Ok(())
+}
+
+/// Executes the `clear-query-log` subcommand.
+///
+/// Takes the service lease and refuses a live server unless `--force` is
+/// given. When stopped, the lease is held for the whole database operation so
+/// a supervisor cannot start the server mid-clear.
+pub async fn run_clear_query_log(
+    config_path: &Path,
+    keep_aggregates: bool,
+    force: bool,
+) -> Result<u64, anyhow::Error> {
+    let content = std::fs::read_to_string(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read configuration file '{}': {}",
+            config_path.display(),
+            e
+        )
+    })?;
+    let config = Config::from_toml_str(&content)
+        .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    let access = begin_reset(
+        &config.server.data_dir,
+        "clear the query log",
+        force,
+        CLEAR_QUERY_LOG_FORCE_HINT,
+    )?;
+    let db_path = config.server.data_dir.join("stats.db");
+    if !db_path.is_file() {
+        anyhow::bail!(
+            "Stats database '{}' does not exist (nothing to clear)",
+            db_path.display()
+        );
+    }
+
+    let stats = config.get_stats_config();
+    let db = StatsDb::open_with_rollup_client_names(&db_path, stats.rollup_client_names).await?;
+    let deleted = db
+        .delete_query_logs_with_policy(keep_aggregates, stats.rollup_client_names)
+        .await?;
+    if keep_aggregates {
+        println!("Deleted {deleted} query log entries; hourly rollups were preserved.");
+    } else {
+        println!("Deleted {deleted} query log entries and all hourly rollups.");
+    }
+    if let ResetAccess::Running { pid } = &access {
+        println!(
+            "{}",
+            running_service_warning(*pid, CLEAR_QUERY_LOG_LIVE_STATE)
+        );
+    }
+    Ok(deleted)
 }
 
 /// Executes the `healthcheck` subcommand by sending a test DNS query.
@@ -776,6 +844,28 @@ pub fn prepare_no_setup_bootstrap(
     }
     config.set_web_config(web);
 
+    // Built-in defaults enable filtering with zero sources. Since P2-95 that
+    // fails closed and would SERVFAIL every query until the operator adds a
+    // list, which contradicts `--no-setup`'s "boot immediately" contract.
+    // Disable filtering explicitly (instead of inventing a benign block rule)
+    // and say so, so resolution works and the operator knows to configure a
+    // source before it protects anything.
+    if config.filtering.enabled
+        && !config.filtering.lists.iter().any(|list| list.enabled)
+        && !config
+            .filtering
+            .custom_rules
+            .iter()
+            .any(|rule| !rule.trim().is_empty())
+    {
+        config.filtering.enabled = false;
+        eprintln!(
+            "WARNING: --no-setup has no filter list or custom rule configured; \
+             filtering is disabled so DNS resolution works. Configure filtering \
+             in the web UI before relying on blocking."
+        );
+    }
+
     // Never silently rotate credentials that already exist on this node.
     if config.server.data_dir.join("users.toml").exists() {
         return Ok(NoSetupBootstrap::KeptExistingUsers);
@@ -1005,6 +1095,10 @@ const ADMIN_FORCE_HINT: &str = "Use --force only if you understand that existing
      accepted until then.";
 const SESSIONS_FORCE_HINT: &str = "Use --force only if you understand that existing web sessions and \
      API tokens remain valid until the service is restarted.";
+const CLEAR_QUERY_LOG_FORCE_HINT: &str = "Use --force only if you understand that the running server \
+     keeps its open SQLite connections; stop the service when possible.";
+const CLEAR_QUERY_LOG_LIVE_STATE: &str = "The running server keeps its open SQLite connections and \
+     may have cached dashboard aggregates until they expire";
 
 const ADMIN_LIVE_STATE: &str = "Existing web sessions and API tokens remain valid, and the running \
      server still accepts the old admin password and rejects the new one";
@@ -1225,6 +1319,27 @@ mod tests {
             cli_custom.config,
             Some(PathBuf::from("/etc/sito/custom.toml"))
         );
+    }
+
+    #[test]
+    fn test_cli_clear_query_log_keep_aggregates_flag() {
+        let cli = Cli::try_parse_from(["sito", "clear-query-log", "--keep-aggregates"])
+            .expect("parse clear-query-log");
+        match cli.command {
+            Some(Commands::ClearQueryLog {
+                keep_aggregates, ..
+            }) => assert!(keep_aggregates),
+            other => panic!("expected clear-query-log, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["sito", "clear-query-log"])
+            .expect("parse clear-query-log default");
+        match cli.command {
+            Some(Commands::ClearQueryLog {
+                keep_aggregates, ..
+            }) => assert!(!keep_aggregates),
+            other => panic!("expected clear-query-log, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1528,6 +1643,10 @@ mod tests {
         assert!(
             config.get_web_config().bind.is_loopback(),
             "admin UI must bind loopback when no config exists"
+        );
+        assert!(
+            !config.filtering.enabled,
+            "--no-setup without sources must disable filtering instead of SERVFAILing every query"
         );
 
         let users_file = dir.join("users.toml");

@@ -1,7 +1,7 @@
 //! Status endpoint handler.
 
 use crate::auth::RequireViewer;
-use crate::models::StatusResponse;
+use crate::models::{AcmeStatus, StatusResponse};
 use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::State;
@@ -35,10 +35,21 @@ pub async fn get_status(
         }
     }
 
+    let acme_readiness = ctx.acme_readiness(&cfg);
+    let acme = acme_readiness.enabled.then(|| AcmeStatus {
+        enabled: acme_readiness.enabled,
+        ready: acme_readiness.ready,
+        http01_available: acme_readiness.http01_available,
+        tls_alpn_available: acme_readiness.tls_alpn_available,
+        reason: acme_readiness.reason.map(str::to_string),
+        last_error: acme_readiness.last_error,
+    });
+
     Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: uptime,
         role: cfg.server.role.clone(),
         listeners,
+        acme,
     })
 }

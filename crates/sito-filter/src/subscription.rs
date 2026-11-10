@@ -83,6 +83,53 @@ pub(crate) fn is_denied_target_ip(ip: IpAddr) -> bool {
     sito_core::is_denied_target_ip(ip)
 }
 
+/// Returns true when a body looks like an HTML/XML error page rather than a
+/// filter list. CDNs commonly serve these with HTTP 200.
+fn looks_like_html(content: &str) -> bool {
+    // Only inspect the prefix; a rule list may legitimately contain the
+    // literal text `<html` much later in a substring rule.
+    let prefix: String = content.trim_start().chars().take(512).collect();
+    looks_like_html_prefix(&prefix)
+}
+
+fn looks_like_html_prefix(prefix: &str) -> bool {
+    let lower = prefix
+        .chars()
+        .take(16)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    lower.starts_with("<!doctype html")
+        || lower.starts_with("<html")
+        || lower.starts_with("<?xml")
+        || lower.starts_with("<head")
+        || lower.starts_with("<body")
+}
+
+/// Rejects empty and HTML/XML list bodies unless the operator explicitly
+/// opted into empty lists.
+fn reject_invalid_content(
+    list_name: &str,
+    content: &str,
+    content_type: Option<&str>,
+    allow_empty: bool,
+) -> Result<(), FilterError> {
+    if content.trim().is_empty() && !allow_empty {
+        return Err(FilterError::EmptyList {
+            list: list_name.to_string(),
+        });
+    }
+    let declared_html = content_type.is_some_and(|value| {
+        let lower = value.to_ascii_lowercase();
+        lower.contains("text/html") || lower.contains("application/xhtml")
+    });
+    if declared_html || looks_like_html(content) {
+        return Err(FilterError::HtmlResponse {
+            list: list_name.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Returns true when `path` (canonical) is inside `root`.
 fn path_is_within(path: &Path, root: &Path) -> bool {
     let absolute_root = if root.is_absolute() {
@@ -117,6 +164,29 @@ fn build_client(
     })
 }
 
+/// Removes a cache file and its metadata after an integrity failure so the
+/// corrupt pair is not re-read on every refresh cycle.
+async fn quarantine_cache(cache_path: &Path, meta_path: &Path, list_name: &str, reason: &str) {
+    warn!(
+        list = %list_name,
+        path = %cache_path.display(),
+        reason,
+        "Quarantining corrupt blocklist cache"
+    );
+    for path in [cache_path, meta_path] {
+        if let Err(e) = tokio::fs::remove_file(path).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                list = %list_name,
+                path = %path.display(),
+                error = %e,
+                "Failed to remove corrupt blocklist cache file"
+            );
+        }
+    }
+}
+
 /// Reads a verified blocklist from disk cache, returning `error` when
 /// unavailable or when the cache fails its integrity check.
 async fn load_cache_or(
@@ -124,10 +194,19 @@ async fn load_cache_or(
     meta_path: &Path,
     list_name: &str,
     max_bytes: usize,
+    allow_empty: bool,
     error: FilterError,
 ) -> Result<String, FilterError> {
     match read_cache_verified(cache_path, meta_path, list_name, max_bytes).await {
         Ok(cached) => {
+            // Older versions could cache an HTML error page or an empty body
+            // as a successful list. Never hand that to the engine: HTML lines
+            // often parse into non-zero substring rules and would replace a
+            // good list.
+            if let Err(rejected) = reject_invalid_content(list_name, &cached, None, allow_empty) {
+                quarantine_cache(cache_path, meta_path, list_name, &rejected.to_string()).await;
+                return Err(rejected);
+            }
             info!(
                 list = %list_name,
                 path = %cache_path.display(),
@@ -137,6 +216,13 @@ async fn load_cache_or(
             Ok(cached)
         }
         Err(cache_err) => {
+            // Missing/legacy metadata and length/line-count mismatches make
+            // the cache permanently unusable. Drop both files so the next
+            // refresh downloads a fresh copy instead of re-reading the same
+            // corrupt pair on every cycle.
+            if matches!(&cache_err, FilterError::CacheCorrupted { .. }) {
+                quarantine_cache(cache_path, meta_path, list_name, &cache_err.to_string()).await;
+            }
             warn!(
                 list = %list_name,
                 cache_error = %cache_err,
@@ -159,6 +245,10 @@ pub struct SubscriptionFetcher {
     /// Extra directories (beyond the server data directory) from which
     /// `file://` lists may be read.
     file_allowlist: Vec<PathBuf>,
+    /// When true, an empty list body is accepted instead of rejected. This is
+    /// an explicit operator opt-in (`filtering.allow_empty_list`) for sources
+    /// that legitimately resolve to no rules.
+    allow_empty: bool,
     /// Unit-test hook enabling loopback targets for local mock servers.
     /// Always `false` in production builds.
     #[cfg(test)]
@@ -193,6 +283,7 @@ impl SubscriptionFetcher {
             max_retries,
             initial_backoff,
             file_allowlist: Vec::new(),
+            allow_empty: false,
             #[cfg(test)]
             allow_private_targets: false,
         }
@@ -202,6 +293,13 @@ impl SubscriptionFetcher {
     #[must_use]
     pub fn with_file_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.file_allowlist.push(root.into());
+        self
+    }
+
+    /// Accepts an empty list body instead of rejecting it.
+    #[must_use]
+    pub fn with_allow_empty(mut self, allow_empty: bool) -> Self {
+        self.allow_empty = allow_empty;
         self
     }
 
@@ -409,7 +507,28 @@ impl SubscriptionFetcher {
         if url.trim().to_ascii_lowercase().starts_with("file://") {
             debug!(list = %list_name, url = %url, "Reading blocklist from local file");
             return match self.read_file_list(list_name, url, data_dir).await {
-                Ok(content) => Ok(content),
+                Ok(content) => {
+                    match reject_invalid_content(list_name, &content, None, self.allow_empty) {
+                        Ok(()) => Ok(content),
+                        Err(e) => {
+                            warn!(
+                                list = %list_name,
+                                url = %url,
+                                error = %e,
+                                "Rejecting empty/HTML local blocklist; attempting disk cache fallback"
+                            );
+                            load_cache_or(
+                                &cache_path,
+                                &meta_path,
+                                list_name,
+                                self.max_bytes,
+                                self.allow_empty,
+                                e,
+                            )
+                            .await
+                        }
+                    }
+                }
                 Err(e) => {
                     warn!(
                         list = %list_name,
@@ -417,7 +536,15 @@ impl SubscriptionFetcher {
                         error = %e,
                         "Refusing local blocklist; attempting disk cache fallback"
                     );
-                    load_cache_or(&cache_path, &meta_path, list_name, self.max_bytes, e).await
+                    load_cache_or(
+                        &cache_path,
+                        &meta_path,
+                        list_name,
+                        self.max_bytes,
+                        self.allow_empty,
+                        e,
+                    )
+                    .await
                 }
             };
         }
@@ -443,7 +570,15 @@ impl SubscriptionFetcher {
                     error = %e,
                     "Refusing blocklist URL target; attempting disk cache fallback"
                 );
-                return load_cache_or(&cache_path, &meta_path, list_name, self.max_bytes, e).await;
+                return load_cache_or(
+                    &cache_path,
+                    &meta_path,
+                    list_name,
+                    self.max_bytes,
+                    self.allow_empty,
+                    e,
+                )
+                .await;
             }
         };
         let client = match pinned.as_ref() {
@@ -488,12 +623,51 @@ impl SubscriptionFetcher {
                         )
                         .await
                         {
-                            Ok(content) => return Ok(content),
+                            Ok(content) => {
+                                match reject_invalid_content(
+                                    list_name,
+                                    &content,
+                                    None,
+                                    self.allow_empty,
+                                ) {
+                                    Ok(()) => return Ok(content),
+                                    Err(e) => {
+                                        warn!(
+                                            list = %list_name,
+                                            error = %e,
+                                            "Cached blocklist is empty/HTML despite HTTP 304; quarantining and retrying without conditional headers"
+                                        );
+                                        quarantine_cache(
+                                            &cache_path,
+                                            &meta_path,
+                                            list_name,
+                                            &e.to_string(),
+                                        )
+                                        .await;
+                                        last_error = Some(e);
+                                        conditional = None;
+                                        if attempt < self.max_retries {
+                                            continue;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
                             Err(e) => {
-                                // The server claims "not modified" but we have
-                                // no local copy. Retry unconditionally so the
+                                // The server claims "not modified" but our
+                                // cache failed its integrity check. Drop the
+                                // corrupt pair and retry unconditionally so the
                                 // full content is downloaded instead of
-                                // aborting the whole source.
+                                // re-reading it every cycle.
+                                if matches!(&e, FilterError::CacheCorrupted { .. }) {
+                                    quarantine_cache(
+                                        &cache_path,
+                                        &meta_path,
+                                        list_name,
+                                        &e.to_string(),
+                                    )
+                                    .await;
+                                }
                                 warn!(
                                     list = %list_name,
                                     error = %e,
@@ -533,7 +707,13 @@ impl SubscriptionFetcher {
                         });
                     }
 
-                    // Extract ETag and Last-Modified headers before consuming body
+                    // Extract ETag/Last-Modified/Content-Type headers before
+                    // consuming the body.
+                    let content_type = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
                     let new_etag = resp
                         .headers()
                         .get("etag")
@@ -593,6 +773,31 @@ impl SubscriptionFetcher {
                             reason: "Blocklist content is not valid UTF-8".to_string(),
                         });
                     };
+
+                    // A 200 response with an empty body or a CDN HTML error
+                    // page must not replace a previously good list.
+                    if let Err(e) = reject_invalid_content(
+                        list_name,
+                        &content,
+                        content_type.as_deref(),
+                        self.allow_empty,
+                    ) {
+                        warn!(
+                            list = %list_name,
+                            url = %url,
+                            error = %e,
+                            "Rejecting empty/HTML blocklist response; attempting disk cache fallback"
+                        );
+                        return load_cache_or(
+                            &cache_path,
+                            &meta_path,
+                            list_name,
+                            self.max_bytes,
+                            self.allow_empty,
+                            e,
+                        )
+                        .await;
+                    }
 
                     // Save to disk cache. Metadata is only refreshed when the
                     // cache write succeeded: pairing a new ETag/size with an
@@ -655,6 +860,7 @@ impl SubscriptionFetcher {
             &meta_path,
             list_name,
             self.max_bytes,
+            self.allow_empty,
             fallback_error,
         )
         .await
@@ -1061,6 +1267,261 @@ mod tests {
             requests[1]
         );
 
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// A 304 that serves an empty/HTML cache must quarantine that cache too,
+    /// otherwise the rejected pair is re-read on every refresh cycle.
+    #[tokio::test]
+    async fn test_304_empty_or_html_cache_is_quarantined() {
+        let data_dir = temp_dir("sito_304_html_cache");
+        let list_name = "etag-list";
+        let cache_path = cache_path_for_list(&data_dir, list_name);
+        let meta_path = meta_path_for_list(&data_dir, list_name);
+        let cached_html = "<html><body>CDN error</body></html>\n";
+        save_to_cache(&cache_path, cached_html).await.unwrap();
+        save_metadata(
+            &meta_path,
+            &ListMetadata {
+                etag: Some("\"v1\"".to_string()),
+                content_len: Some(cached_html.len() as u64),
+                line_count: Some(cached_html.lines().count()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let responses = vec![
+            "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        ];
+        let (addr, _captured, server) = spawn_http_server(responses).await;
+
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            0,
+            Duration::from_millis(10),
+        );
+        fetcher.allow_private_targets = true;
+
+        let err = fetcher
+            .fetch_or_cached(list_name, &format!("http://{addr}/list.txt"), &data_dir)
+            .await
+            .expect_err("an HTML cache served under HTTP 304 must be rejected");
+        assert!(
+            matches!(err, FilterError::HtmlResponse { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !cache_path.exists(),
+            "the rejected 304 cache must be quarantined"
+        );
+        assert!(
+            !meta_path.exists(),
+            "the rejected 304 cache metadata must be quarantined"
+        );
+
+        server.await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// P1-8: an empty HTTP 200 body must not be accepted as a successful list.
+    #[tokio::test]
+    async fn test_empty_200_body_is_rejected() {
+        let data_dir = temp_dir("sito_empty_200");
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+        let (addr, _captured, server) = spawn_http_server(vec![response]).await;
+
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            0,
+            Duration::from_millis(10),
+        );
+        fetcher.allow_private_targets = true;
+
+        let err = fetcher
+            .fetch_or_cached("empty", &format!("http://{addr}/list.txt"), &data_dir)
+            .await
+            .expect_err("an empty 200 response must be rejected");
+        assert!(
+            matches!(err, FilterError::EmptyList { .. }),
+            "unexpected error: {err}"
+        );
+
+        server.await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// P1-8: a CDN HTML error page served with HTTP 200 must be rejected.
+    #[tokio::test]
+    async fn test_html_200_body_is_rejected() {
+        let data_dir = temp_dir("sito_html_200");
+        let body = "<!DOCTYPE html><html><body>error</body></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (addr, _captured, server) = spawn_http_server(vec![response]).await;
+
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            0,
+            Duration::from_millis(10),
+        );
+        fetcher.allow_private_targets = true;
+
+        let err = fetcher
+            .fetch_or_cached("html", &format!("http://{addr}/list.txt"), &data_dir)
+            .await
+            .expect_err("an HTML 200 response must be rejected");
+        assert!(
+            matches!(err, FilterError::HtmlResponse { .. }),
+            "unexpected error: {err}"
+        );
+
+        server.await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// A legacy disk cache containing an HTML error page must not be served as
+    /// a fallback after the fresh response is rejected; it is quarantined.
+    #[tokio::test]
+    async fn test_html_cache_fallback_is_rejected_and_quarantined() {
+        let data_dir = temp_dir("sito_html_cache");
+        let list_name = "html-cache";
+        let cache_path = cache_path_for_list(&data_dir, list_name);
+        let meta_path = meta_path_for_list(&data_dir, list_name);
+        let cached_html = "<html><body>CDN error</body></html>\n";
+        save_to_cache(&cache_path, cached_html).await.unwrap();
+        save_metadata(
+            &meta_path,
+            &ListMetadata {
+                content_len: Some(cached_html.len() as u64),
+                line_count: Some(cached_html.lines().count()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let body = "<!DOCTYPE html><html><body>fresh error</body></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (addr, _captured, server) = spawn_http_server(vec![response]).await;
+
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            0,
+            Duration::from_millis(10),
+        );
+        fetcher.allow_private_targets = true;
+
+        let err = fetcher
+            .fetch_or_cached(list_name, &format!("http://{addr}/list.txt"), &data_dir)
+            .await
+            .expect_err("the HTML cache fallback must be rejected");
+        assert!(
+            matches!(err, FilterError::HtmlResponse { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !cache_path.exists(),
+            "the rejected HTML cache must be quarantined"
+        );
+        assert!(
+            !meta_path.exists(),
+            "the rejected cache metadata must be quarantined"
+        );
+
+        server.await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// Regression (deferred D2): a cache that fails its integrity check
+    /// (length/line-count mismatch, missing or legacy metadata) used to be
+    /// logged and retried on every refresh cycle. It must be quarantined so
+    /// the next refresh downloads a fresh copy.
+    #[tokio::test]
+    async fn test_corrupt_cache_integrity_failure_is_quarantined() {
+        let data_dir = temp_dir("sito_corrupt_cache");
+        let list_name = "corrupt-cache";
+        let cache_path = cache_path_for_list(&data_dir, list_name);
+        let meta_path = meta_path_for_list(&data_dir, list_name);
+        let content = "0.0.0.0 one.example\n0.0.0.0 two.example\n";
+        save_to_cache(&cache_path, content).await.unwrap();
+        save_metadata(
+            &meta_path,
+            &ListMetadata {
+                // Record a longer body than the file actually contains.
+                content_len: Some(content.len() as u64 + 10),
+                line_count: Some(content.lines().count()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = load_cache_or(
+            &cache_path,
+            &meta_path,
+            list_name,
+            DEFAULT_MAX_LIST_BYTES,
+            false,
+            FilterError::InvalidUrl {
+                url: "http://example.invalid/list".to_string(),
+                reason: "simulated download failure".to_string(),
+            },
+        )
+        .await
+        .expect_err("a corrupt cache must not be served");
+        assert!(
+            matches!(err, FilterError::InvalidUrl { .. }),
+            "the original download error must be preserved: {err}"
+        );
+        assert!(
+            !cache_path.exists(),
+            "the corrupt cache file must be quarantined"
+        );
+        assert!(
+            !meta_path.exists(),
+            "the corrupt cache metadata must be quarantined"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// The explicit `allow_empty_list` opt-in permits an empty body.
+    #[tokio::test]
+    async fn test_empty_body_is_accepted_when_explicitly_allowed() {
+        let data_dir = temp_dir("sito_empty_allowed");
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+        let (addr, _captured, server) = spawn_http_server(vec![response]).await;
+
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            0,
+            Duration::from_millis(10),
+        )
+        .with_allow_empty(true);
+        fetcher.allow_private_targets = true;
+
+        let content = fetcher
+            .fetch_or_cached("empty", &format!("http://{addr}/list.txt"), &data_dir)
+            .await
+            .unwrap();
+        assert_eq!(content, "");
+
+        server.await.unwrap();
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 }

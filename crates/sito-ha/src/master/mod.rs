@@ -3,5 +3,5 @@
 pub mod coordinator;
 pub mod tracker;
 
-pub use coordinator::{MasterCoordinator, ResyncOutcome, spawn_master_server};
+pub use coordinator::{MasterCoordinator, PublishOutcome, ResyncOutcome, spawn_master_server};
 pub use tracker::{ActiveSlave, SlaveStatsSummary, SlaveSummary};

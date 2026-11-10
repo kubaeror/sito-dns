@@ -74,4 +74,11 @@ If validation passes, the command exits with code `0` and prints
    # Should return: 0.0.0.0
    ```
 4. **Access Dashboard:**
-   Navigate to `http://<server-ip>:8080` and complete the first-time setup wizard (or log in with the bootstrap credentials `admin` / `adminadmin` if `--no-setup` was used, then change the password immediately).
+   Navigate to `http://<server-ip>:8080` and complete the first-time setup wizard.
+   On a **first boot with no `config.toml`**, `--no-setup` instead generates a
+   random administrator password, prints it once, and binds the admin panel to
+   loopback; it does **not** leave an `admin` / `adminadmin` login. This guide
+   writes `config.toml` in step 1, so adding `--no-setup` here neither creates
+   nor rotates credentials; use `sito reset-admin` for recovery. If credentials
+   are lost, stop the service and run `sito reset-admin` as described in the
+   [installation guide](installation.md#5-post-installation-verification).

@@ -3,8 +3,9 @@
 sito keeps its accounts in `<data_dir>/users.toml` (mode `0600`) and has no
 self-registration or e-mail-based password reset. Accounts, roles, and API
 tokens can be managed from the web panel (`/users` and `/account`) or through
-the administrative REST API under `/api/v1/auth/*`. TOTP status and disabling
-are available in the web UI; TOTP enrollment/setup remains API-only.
+the administrative REST API under `/api/v1/auth/*`. TOTP enrollment, replacement,
+and disabling are available to every role from the Account page and the REST
+API.
 
 ## Web UI
 
@@ -15,7 +16,7 @@ Navigation links are role-aware: **Users** is shown only to Admins and
 | Page | Who can open it | What it does |
 |---|---|---|
 | `/users` | Admin only | Lists local accounts with role and TOTP status; creates accounts; changes roles; deletes accounts with last-admin protection. |
-| `/account` | Any authenticated user | Shows profile and TOTP status; changes the caller's own password; creates, lists, and revokes the caller's own API tokens; disables the caller's own TOTP. |
+| `/account` | Any authenticated user | Shows profile and TOTP status; changes the caller's own password; creates, lists, and revokes the caller's own API tokens; enrolls, replaces, and disables the caller's own TOTP after re-authentication. |
 
 - **Visibility.** Operators and Viewers receive `403 Forbidden` from `/users`.
   Anonymous requests to either page redirect to `/login`.
@@ -31,9 +32,9 @@ Navigation links are role-aware: **Users** is shown only to Admins and
   and TOTP disable revoke all sessions for the account, so they return to
   `/login`. A newly created token's plaintext is shown exactly once; reloading
   `/account` never reveals it again.
-- **TOTP.** The Account page can disable TOTP after re-authentication with the
-  current password and a valid TOTP or backup code. Initial TOTP setup/enable
-  remains an API workflow (section 7).
+- **TOTP.** The Account page can enroll, replace, and disable TOTP after
+  re-authentication with the current password and a valid TOTP or backup code.
+  The same workflows are available through the REST API (section 7).
 - The **Clients** page shows the operator-only “Discovered but unidentified”
   table, matching `GET /api/v1/clients/unidentified`. Viewers see only the
   configured clients.
@@ -48,14 +49,17 @@ export TOKEN='sito_...'   # an Admin API token, or use a session cookie instead
 ## 1. Account Lifecycle
 
 1. **Bootstrap.** On a fresh installation the first administrator is created by
-   the setup wizard at `/wizard` (or, for headless installs, by
-   `sito --no-setup`, which generates a random password and binds the panel to
-   loopback). The bootstrap account is named `admin`. While the first-boot setup
-   token is active, or `admin/adminadmin` is still the stored bootstrap
-   credential, login, `/api/v1/auth/*`, API tokens and every non-wizard route are
-   disabled. Only `/wizard`, `/ui/wizard/*`, static assets, `/health` and
-   `/status` are reachable; the wizard requires the one-time token printed in
-   the server logs (or an authenticated Admin session).
+   the setup wizard at `/wizard`. For headless installs with no `config.toml`,
+   `sito --no-setup` generates a random password, prints it once, and binds the
+   panel to loopback. When a config file already exists, `--no-setup` neither
+   creates nor rotates credentials. The bootstrap account is named `admin`.
+   While the first-boot setup token is active, or `admin/adminadmin` is still the
+   stored bootstrap credential, login, `/api/v1/auth/*`, API tokens and every
+   non-wizard routes are disabled. Only `/wizard`, `/ui/wizard/*`, static assets,
+   `/health` and `/status` are reachable; the wizard requires the one-time token
+   printed in the server logs. The wizard is bootstrap-only and returns `403`
+   after setup completes, even for an Admin session; use the authenticated
+   account flow for later password changes.
 2. **Create** additional accounts with `POST /api/v1/auth/users` or the Admin
    **Users** page at `/users`.
 3. **Operate.** Users sign in at `/login` (session cookie) or authenticate with
@@ -329,14 +333,44 @@ session.
 
 ## 7. TOTP Two-Factor Authentication
 
-TOTP is per-account and managed by the signed-in user. Initial setup/enable is
-an API workflow (Admin session required by the current API guards); the
-**Account** page at `/account` can show the current status and disable TOTP.
+TOTP is per-account and self-service for every role (Viewer, Operator, and
+Admin). The **Account** page at `/account` provides a password-confirmed
+enrollment flow (QR code, secret, and one-time backup codes); the REST API can
+be used instead. API bearer tokens cannot manage TOTP — a real user session is
+required.
 
-1. Start setup:
+> **CSRF for session-cookie scripts.** The curl examples below authenticate
+> with the `sito_session` cookie, so every mutating request also needs the
+> session-bound double-submit token. Read the non-HttpOnly `sito_csrf` cookie
+> from the login response and send it both as a cookie and as
+> `X-CSRF-Token`; also send an `Origin` header matching the configured admin
+> URL (missing `Origin` fails closed for cookie sessions). Bearer-token clients
+> are not browser-ambient and do not need the cookie/CSRF pair, but API tokens
+> cannot manage TOTP.
+
+1. Re-authenticate for a short-lived ticket (5 minutes). The current password is
+   required; when TOTP is already enabled, a current TOTP or backup code is
+   required too:
 
    ```bash
-   curl -sS -H "Cookie: sito_session=<session-id>" \
+   curl -sS -X POST "$SITO/api/v1/auth/reauth" \
+     -H "Origin: $SITO" \
+     -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
+     -H "X-CSRF-Token: <csrf-token>" \
+     -H 'Content-Type: application/json' \
+     -d '{"password":"NewCorrectHorse2","code":"123456"}'
+   ```
+
+   The response contains `reauth_token` and `expires_in`. The ticket is bound to
+   the session and credential state that requested it.
+
+2. Start setup with the ticket in `X-Reauth-Token`:
+
+   ```bash
+   curl -sS -H "Origin: $SITO" \
+     -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
+     -H "X-CSRF-Token: <csrf-token>" \
+     -H "X-Reauth-Token: <reauth-token>" \
      "$SITO/api/v1/auth/totp/setup"
    ```
 
@@ -344,31 +378,45 @@ an API workflow (Admin session required by the current API guards); the
    URL for authenticator apps, and single-use backup codes. The pending setup
    expires after 10 minutes.
 
-2. Confirm with a current code (or a backup code):
+3. Confirm with a current code (or a backup code) and the same ticket:
 
    ```bash
    curl -sS -X POST "$SITO/api/v1/auth/totp/enable" \
-     -H "Cookie: sito_session=<session-id>" \
+     -H "Origin: $SITO" \
+     -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
+     -H "X-CSRF-Token: <csrf-token>" \
+     -H "X-Reauth-Token: <reauth-token>" \
      -H 'Content-Type: application/json' \
      -d '{"code":"123456"}'
    ```
 
-3. Subsequent logins return `200 OK` with `"totp_required": true` and a
+   An absent, expired, or differently-bound ticket returns `401`. Replacing an
+   existing authenticator requires a fresh re-auth that proves the current
+   password and second factor.
+
+4. Subsequent logins return `202 Accepted` with `"totp_required": true` and a
    short-lived partial token. Browser clients receive it as an HttpOnly cookie;
    API clients can send `X-Sito-Token-Delivery: body` to receive it in the JSON
    response. Finish the login with `POST /api/v1/auth/totp/verify`. Partial
    tokens expire after 5 minutes and allow at most 5 wrong codes before the
    account is locked.
 
-4. Disable TOTP by re-authenticating with the password and a valid TOTP or
-   backup code:
+5. Disable TOTP with a fresh re-authentication ticket (the same
+   password + current TOTP/backup-code proof as step 1):
 
    ```bash
    curl -sS -X POST "$SITO/api/v1/auth/totp/disable" \
-     -H "Cookie: sito_session=<session-id>" \
+     -H "Origin: $SITO" \
+     -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
+     -H "X-CSRF-Token: <csrf-token>" \
+     -H "X-Reauth-Token: <reauth-token>" \
      -H 'Content-Type: application/json' \
      -d '{"password":"NewCorrectHorse2","code":"123456"}'
    ```
+
+   The body credentials are retained for compatibility but are not trusted; the
+   re-authentication ticket is what authorizes the change. An absent, expired,
+   or differently-bound ticket returns `401`.
 
 Enabling or disabling TOTP revokes all sessions of the account **and every API
 token it owns**, because either change to the second factor is a credential
@@ -394,9 +442,15 @@ on the next start (see section 1).
   up and start empty.
 * Login attempts are rate-limited per IP (`auth.login_rate_limit`, default 5
   per minute). After five failed attempts for one account, that account is
-  locked for 15 minutes.
+  locked for 15 minutes. Usernames over 64 bytes and passwords over 1024 bytes
+  are rejected before lockout bookkeeping or password hashing. Lockout keys are
+  BLAKE3 digests (the raw username is never retained), and username spraying
+  cannot evict an account whose lockout is still active.
 * Expired tokens are rejected immediately and removed from memory; their
   on-disk snapshot is rewritten by the background pruner within 60 seconds.
+* The legacy `?token=` query parameter is accepted only on a WebSocket upgrade
+  with no `Authorization` header, logs a deprecation warning, and is scheduled
+  for removal in 2.0. Use `Authorization: Bearer` or a session cookie.
 
 ## 9. Audit Trail
 

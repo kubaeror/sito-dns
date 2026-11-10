@@ -18,12 +18,12 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 
 ## 📊 Feature Comparison: sito vs. AdGuard Home vs. Pi-hole
 
-| Feature / Capability | **sito** (v1.9) | **AdGuard Home** | **Pi-hole (FTL)** |
+| Feature / Capability | **sito** (v1.9.x) | **AdGuard Home** | **Pi-hole (FTL)** |
 |---|---|---|---|
 | **Language & Runtime** | **Rust (edition 2024, zero GC, zero Node.js)** | Go (GC overhead under load) | C (FTL) + PHP Web UI |
-| **Max Cache Throughput** | **≥ 500,000 QPS** (measured 584k) | ~100,000 QPS | ~50,000 QPS |
-| **Cache Hit Latency (p99)** | **< 1.0 ms** (measured 0.34 ms) | 2 – 5 ms | 2 – 5 ms |
-| **Memory @ 1M Rules** | **~ 285 MB RSS** (Trie + Interning) | 400 – 800 MB RSS | ~ 350 MB RSS |
+| **Max Cache Throughput** | **≥ 500,000 QPS** (v1.0 reference run: 584k) | ~100,000 QPS | ~50,000 QPS |
+| **Cache Hit Latency (p99)** | **< 1.0 ms** (v1.0 reference run: 0.34 ms) | 2 – 5 ms | 2 – 5 ms |
+| **Memory @ 1M Rules** | **~ 285 MB RSS** (v1.0 reference run; Trie + Interning) | 400 – 800 MB RSS | ~ 350 MB RSS |
 | **Encrypted Transports** | **DoT, DoH (H2), DoQ, DoH3** | DoT, DoH, DoQ | Plain only (requires proxy) |
 | **High Availability (HA)** | **Native mTLS WebSocket Push (<2s)** | External tool (adguardhome-sync) | External tool (gravity-sync) |
 | **Filter Rule Engine** | **ABP/AdGuard syntax (see [compatibility matrix](docs/compatibility.md); qtype-aware `$dnsrewrite`)** | Full ABP + modifiers | Domain regex & wildcards |
@@ -33,16 +33,21 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 | **Distribution** | **Single standalone binary (HTMX + Askama UI embedded)** | Single standalone binary | Multiple packages / lighttpd |
 | **Config Format** | **Single TOML (`config.toml`)** | Single YAML | Multiple conf files + SQLite |
 
+> Throughput, latency, and memory figures are from the v1.0.0 reference-hardware
+> run recorded in [docs/benchmarks.md](docs/benchmarks.md); they are not
+> re-measured for every 1.9.x release. The weekly workflow runs `cargo bench`
+> and uploads estimates, but it has no pass/fail performance threshold.
+
 ---
 
 ## ⚡ Key Highlights
 
-- **Blazing Fast Hot Path:** Zero garbage collection pauses, multi-socket `SO_REUSEPORT` listeners, concurrent UDP query workers, single-pass candidate filter evaluation, and concurrent `moka` caching delivering **> 580k QPS** with **0.34 ms p99 latency** on reference hardware ([ADR-008](docs/adr/0008-performance-budget.md)).
+- **Blazing Fast Hot Path:** Zero garbage collection pauses, multi-socket `SO_REUSEPORT` listeners, concurrent UDP query workers, single-pass candidate filter evaluation, and concurrent `moka` caching delivering **> 580k QPS** with **0.34 ms p99 latency** on reference hardware at v1.0.0 ([ADR-008](docs/adr/0008-performance-budget.md); see [benchmarks](docs/benchmarks.md)).
 - **Zero-Downtime Hot Reloading:** ArcSwap-backed query pipeline and live upstream reloading pick up configuration, upstream resolvers, local rewrites, and client group changes immediately without dropping persistent transport connections or restarting the daemon.
 - **Zero-Node.js Embedded Web Console:** Lightweight, reactive admin panel powered by Axum, Askama compile-time templates, HTMX, and Alpine.js embedded directly into the standalone binary via `rust-embed` (zero npm/Node.js build or runtime dependencies, <1 MB footprint).
 - **AdGuard / ABP Syntax Compatibility:** High-throughput `SuffixTrie` with string interning, Aho-Corasick substring matching, and backtracking-free regex DFAs.
 - **Modern Encryption:** Native support for plain UDP/TCP, DNS-over-TLS (DoT/853), DNS-over-HTTPS (DoH/443, H2), DNS-over-QUIC (DoQ/853), and DNS-over-HTTP/3 (DoH3/443).
-- **Zero-Consensus High Availability:** Real-time master/slave push replication over mTLS WebSockets with Ed25519 cryptographic signatures, mandatory certificate pinning, shared token authentication, and instant mutation push.
+- **Zero-Consensus High Availability:** Real-time master/slave push replication over mTLS WebSockets with Ed25519 cryptographic signatures, certificate pinning by default (`allow_unpinned_tls` is an explicit insecure opt-out), shared token authentication, master-loss heartbeat detection, and instant mutation push.
 - **Hardened Security & RBAC:** Audited security posture including setup wizard credential validation, default-authenticated Prometheus `/metrics` (`metrics_auth = true`), trusted proxy X-Forwarded-For verification, Argon2id/TOTP bounded auth maps with active background pruners, strict SHA-256 self-updater verification, constant-time authentication via `subtle`, parameterized SQL query builders, SSRF protection, ReDoS protection via dense DFA compilation bounds, and systemd sandbox directives.
 - **Robust Telemetry:** Non-blocking query logging to SQLite in WAL mode with real upstream identification and querylog privacy anonymization, Prometheus metrics exposition ([ADR-003](docs/adr/0003-log-store-sqlite-wal.md)), and Grafana dashboard.
 - **Unix & Linux Platform Support:** Engineered for Unix-based operating systems (Linux kernel 5.4+ strongly recommended for production; macOS supported for development) utilizing `SO_REUSEPORT`, `IP_PKTINFO`, and raw POSIX socket file descriptors. Windows is not supported natively.
@@ -88,25 +93,34 @@ Client Query ──▶ [sito-transport] (UDP / TCP / DoT / DoH / DoQ / DoH3)
 
 ### Option 1: Automated One-Line Installer (Linux)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/main/contrib/install.sh | sudo bash
+# Download and inspect the pinned installer, then run it for the same version.
+curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/v1.9.4/contrib/install.sh -o sito-install.sh
+sed -n '1,120p' sito-install.sh
+sudo SITO_VERSION=1.9.4 bash sito-install.sh
 ```
+
+The installer verifies the cosign signature of the release assets by default;
+a missing signature or cosign binary fails closed. See
+[the installation guide](docs/installation.md#6-verifying-releases) and
+[release verification](docs/release-verification.md). Replace `v1.9.4` with a
+newer tag deliberately instead of piping a mutable `main` script.
 
 ### Network exposure (read before exposing the host)
 
-The 1.9.3 defaults are intended for a trusted LAN: the admin UI listens on
+The 1.9.4 defaults are intended for a trusted LAN: the admin UI listens on
 `0.0.0.0:8080` over plain HTTP, and DNS listens on `0.0.0.0`/`::` with no
 client allow-list. **Do not expose port 8080 to the internet.** Restrict DNS to
 your LAN with a host firewall, or bind `dns.bind` to your LAN address. For
 remote admin access, bind `web.bind = "127.0.0.1"` and use an SSH tunnel or a
 TLS reverse proxy. The server logs a startup warning for each exposed listener.
 The loopback-by-default change and a DNS client ACL are planned for 1.10.0;
-existing configurations keep working in 1.9.3.
+existing configurations keep working in 1.9.4.
 
 ### Option 2: Docker / Docker Compose
 ```yaml
 services:
   sito:
-    image: ghcr.io/kubaeror/sito-dns:latest
+    image: ghcr.io/kubaeror/sito-dns:1.9.4
     container_name: sito
     restart: unless-stopped
     cap_add:
@@ -118,7 +132,7 @@ services:
       - "853:853/udp"     # DoQ (dns.doq_port, default 0 = disabled)
       - "443:443/tcp"     # DoH (dns.doh_port, default 443)
       - "443:443/udp"     # DoH3 (dns.doh3_port, default 443)
-      - "8080:8080/tcp"   # Web UI / REST API (web.port, default 8080)
+      - "127.0.0.1:8080:8080/tcp"   # Web UI / REST API (loopback; use SSH tunnel/TLS proxy)
     volumes:
       # Host bind mounts must be handed to the container user once:
       #   sudo chown -R 65532:65532 ./config
@@ -135,6 +149,13 @@ volumes:
   sito-data:
 ```
 
+Pin an explicit image tag in production; `latest` is mutable. The `ports`
+mapping controls **host** exposure while `web.bind` controls the listener
+**inside** the container. Keep `web.bind = "0.0.0.0"` inside the container so
+Docker can forward the port, and publish it only on loopback:
+`-p 127.0.0.1:8080:8080`. Use an SSH tunnel or a TLS reverse proxy for remote
+access. See [Docker Compose deployment](docs/installation.md#4-docker-compose-deployment).
+
 ### Option 3: Manual Binary Build
 ```bash
 # Build release binary with embedded Web UI and mimalloc allocator
@@ -146,7 +167,9 @@ cargo build --release --locked --features "embed-ui,mimalloc"
 # Start daemon (if config is missing, boots into setup wizard mode on port 8080)
 ./target/release/sito --config /etc/sito/config.toml
 
-# For headless environments, skip the wizard and boot immediately with secure defaults:
+# For headless environments on a first boot with no config.toml, skip the
+# wizard and boot immediately. This generates a random admin password (printed
+# once), binds the panel to loopback, and does not enable admin/adminadmin:
 ./target/release/sito --no-setup
 ```
 
@@ -194,8 +217,8 @@ Swagger UI / OpenAPI documentation is available at `http://localhost:8080/api/do
 * **[User Management & Authentication](docs/user-management.md):** Accounts, roles/RBAC, password changes, API tokens, TOTP 2FA, last-admin protection, and recovery — including the Admin **Users** page (`/users`), the per-user **Account** page (`/account`), and the Operator-only unidentified-clients table in the web panel.
 * **[Migrating from AdGuard Home](docs/migration-adguard.md):** Migration instructions and automated converter script (`contrib/adguard_to_sito.py`).
 * **[High-Availability Runbook](docs/runbook-ha.md):** Deployment architectures, mTLS certificates, failover, and slave promotion.
-* **[1.9.3 Release Notes](docs/release-notes-1.9.3.md):** User-visible behavior changes, upgrade notes, and known issues for 1.9.3.
-* **[Changelog](CHANGELOG.md):** Release notes for v1.9.3 and complete history of phases M0 through M9.
+* **[1.9.4 Release Notes](docs/release-notes-1.9.4.md):** Security and behavior changes, upgrade actions, and known issues for 1.9.4.
+* **[Changelog](CHANGELOG.md):** Release notes for v1.9.4 and complete history of phases M0 through M9.
 
 ---
 

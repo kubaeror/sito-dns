@@ -17,11 +17,11 @@ use sito_dnssec::DnssecValidator;
 use sito_filter::HostsFilterEngine;
 use sito_stats::{MetricsRegistry, QueryLogWriter, StatsDb};
 use sito_transport::{
-    AcmeServiceConfig, CertWatcher, Doh3Config, DohConfig, DoqConfig, DotConfig, TcpConfig,
-    TlsAcceptorManager, UdpConfig, generate_self_signed_cert, load_server_config,
-    load_server_config_with_challenges, start_acme_manager, start_doh_listener,
-    start_doh3_listener, start_doq_listener, start_dot_listener, start_tcp_listener,
-    start_udp_listener,
+    AcmeChallengeAvailability, AcmeServiceConfig, CertWatcher, Doh3Config, DohConfig, DoqConfig,
+    DotConfig, TcpConfig, TlsAcceptorManager, TlsManagerSet, UdpConfig, generate_self_signed_cert,
+    load_server_config, load_server_config_with_challenges, record_bootstrap_cert,
+    start_acme_manager_for_transports, start_doh_listener, start_doh3_listener, start_doq_listener,
+    start_dot_listener, start_tcp_listener, start_udp_listener, write_secret_file,
 };
 use sito_upstream::{BootstrapResolver, UpstreamManager};
 
@@ -106,6 +106,12 @@ const QUERYLOG_METRICS_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stats retention sweep interval (retention_days is re-read every cycle).
 const RETENTION_INTERVAL: Duration = Duration::from_hours(24);
+/// Maximum random delay before the startup catch-up sweep so a fleet of
+/// restarted nodes does not all compact SQLite at once.
+const RETENTION_STARTUP_JITTER_MAX_SECS: u64 = 60;
+/// Even when the persisted last success is recent, run a bounded catch-up
+/// within this window so restart-heavy deployments still retain data.
+const RETENTION_STARTUP_CATCHUP_MAX_DELAY_MS: i64 = 5 * 60 * 1000;
 /// Debounce window for config file watcher events.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(100);
 /// Periodic flush interval for the persistent DNSSEC chain cache.
@@ -141,8 +147,11 @@ fn sanitized_configs_equal(a: &str, b: &str) -> bool {
 }
 
 /// Builds one protocol's hot-reloadable TLS acceptor and starts its certificate
-/// watcher. Returns `None` (with a warning) when the certificate material cannot
-/// be loaded, matching the previous per-protocol behaviour.
+/// watcher.
+///
+/// Errors are fatal: a configured encrypted listener must never silently fall
+/// back to "not running" because its certificate material is unreadable,
+/// expired, or does not match the key.
 #[allow(clippy::too_many_arguments)]
 fn build_tls_acceptor(
     protocol: &str,
@@ -152,40 +161,112 @@ fn build_tls_acceptor(
     alpn: &[Vec<u8>],
     challenge_keys: Option<Arc<dashmap::DashMap<String, Arc<rustls::sign::CertifiedKey>>>>,
     cert_watchers: &mut Vec<sito_transport::CertWatcher>,
-) -> Option<TlsAcceptorManager> {
+) -> anyhow::Result<TlsAcceptorManager> {
     let config = match challenge_keys.clone() {
         Some(keys) => {
             load_server_config_with_challenges(cert, key, sni_tuples, alpn.to_vec(), keys)
         }
         None => load_server_config(cert, key, sni_tuples, alpn.to_vec()),
-    };
-    match config {
-        Ok(config) => {
-            let manager = match challenge_keys {
-                Some(keys) => TlsAcceptorManager::with_challenge_keys(config, keys),
-                None => TlsAcceptorManager::new(config),
-            };
-            match CertWatcher::start(cert, key, sni_tuples, alpn, manager.clone()) {
-                Ok(watcher) => cert_watchers.push(watcher),
-                Err(e) => warn!(protocol, "Certificate watcher failed to start: {e}"),
-            }
-            Some(manager)
-        }
-        Err(e) => {
-            warn!(protocol, "Failed to initialize TLS configuration: {e}");
-            None
-        }
     }
+    .map_err(|e| anyhow::anyhow!("Failed to initialize {protocol} TLS configuration: {e}"))?;
+
+    let manager = match challenge_keys {
+        Some(keys) => TlsAcceptorManager::with_challenge_keys(config, keys),
+        None => TlsAcceptorManager::new(config),
+    };
+    match CertWatcher::start(cert, key, sni_tuples, alpn, manager.clone()) {
+        Ok(watcher) => cert_watchers.push(watcher),
+        Err(e) => warn!(protocol, "Certificate watcher failed to start: {e}"),
+    }
+    Ok(manager)
+}
+
+/// What encrypted listeners should do with the material found at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TlsStartupMaterial {
+    /// Serve this certificate/key pair.
+    Pair(PathBuf, PathBuf),
+    /// No usable pair exists; write a short-lived bootstrap pair.
+    GenerateBootstrap,
+    /// No trusted pair and bootstrap serving is not opted in.
+    Disabled,
+}
+
+/// Selects the startup action for encrypted listeners.
+///
+/// When ACME is enabled, a usable CA-issued certificate stored on disk takes
+/// precedence over static `[tls]` files so a restart cannot silently revert
+/// DoH/DoT/DoQ/DoH3 to stale static material. A bootstrap placeholder never
+/// wins over a real static pair. If no trusted pair exists, a bootstrap is
+/// generated only when the operator opted in with
+/// `acme.allow_bootstrap_cert = true`; otherwise encrypted listeners stay
+/// disabled until a real certificate is available.
+fn choose_tls_material(
+    static_pair: Option<(PathBuf, PathBuf)>,
+    acme_pair: Option<(PathBuf, PathBuf)>,
+    acme_pair_usable: bool,
+    acme_enabled: bool,
+    allow_bootstrap_cert: bool,
+) -> TlsStartupMaterial {
+    if !acme_enabled {
+        return static_pair.map_or(TlsStartupMaterial::Disabled, |(cert, key)| {
+            TlsStartupMaterial::Pair(cert, key)
+        });
+    }
+
+    if let Some((cert, key)) = acme_pair
+        && acme_pair_usable
+    {
+        return TlsStartupMaterial::Pair(cert, key);
+    }
+    if let Some((cert, key)) = static_pair {
+        return TlsStartupMaterial::Pair(cert, key);
+    }
+    if allow_bootstrap_cert {
+        TlsStartupMaterial::GenerateBootstrap
+    } else {
+        TlsStartupMaterial::Disabled
+    }
+}
+
+/// Whether the stored ACME certificate/key pair should be selected at startup.
+///
+/// Factored out of [`init_tls_and_acme`] so the wiring (`pair.is_some()` AND
+/// `stored_pair_is_usable()`) is testable without binding listeners.
+fn acme_startup_pair_usable(pair_exists: bool, config: &AcmeServiceConfig) -> bool {
+    pair_exists && config.stored_pair_is_usable()
+}
+
+/// Record whether a TCP DoH listener actually bound port 443 with the
+/// `acme-tls/1` ALPN. Called after every bind/rebind so ACME challenge
+/// selection reflects reality rather than configuration intent.
+fn record_doh_listener_binding(
+    availability: &AcmeChallengeAvailability,
+    config: &Config,
+    doh_manager: Option<&TlsAcceptorManager>,
+    doh_bound: bool,
+) {
+    let advertises_acme_alpn = doh_manager.is_some_and(|manager| {
+        manager
+            .alpn_protocols()
+            .iter()
+            .any(|protocol| protocol.as_slice() == b"acme-tls/1")
+    });
+    availability
+        .set_tls_alpn_available(doh_bound && config.dns.doh_port == 443 && advertises_acme_alpn);
 }
 
 /// Builds per-client upstream managers, reusing existing managers by key so a
 /// hot reload does not re-resolve unchanged upstream scopes.
 async fn build_scoped_upstreams(
     config: &Config,
-    bootstrap: &BootstrapResolver,
     clients: &sito_clients::ClientsConfig,
     existing: &HashMap<String, Arc<UpstreamManager>>,
 ) -> HashMap<String, Arc<UpstreamManager>> {
+    // Build from the current config on every call. Capturing a startup resolver
+    // here would leave scoped upstreams on old bootstrap/allow_private_targets
+    // settings after a hot reload.
+    let bootstrap = BootstrapResolver::from_config(&config.upstream);
     let mut scoped: HashMap<String, Arc<UpstreamManager>> = HashMap::new();
     for entry in &clients.entries {
         if entry.use_global_upstreams {
@@ -197,7 +278,7 @@ async fn build_scoped_upstreams(
         if servers.is_empty() {
             continue;
         }
-        let key = servers.join(",");
+        let key = scoped_upstream_key(config, servers);
         if scoped.contains_key(&key) {
             continue;
         }
@@ -208,7 +289,7 @@ async fn build_scoped_upstreams(
         let mut upstream_cfg = config.upstream.clone();
         upstream_cfg.servers.clone_from(servers);
         upstream_cfg.per_domain.clear();
-        match UpstreamManager::from_config(&upstream_cfg, bootstrap).await {
+        match UpstreamManager::from_config(&upstream_cfg, &bootstrap).await {
             Ok(manager) => {
                 info!(
                     client = %entry.name,
@@ -225,6 +306,25 @@ async fn build_scoped_upstreams(
         }
     }
     scoped
+}
+
+/// Reuse key for a per-client upstream scope.
+///
+/// Includes every inherited `[upstream]` setting that affects manager
+/// construction, not just the server list. Otherwise a reload that only changes
+/// the bootstrap, timeout, strategy, pool size or `allow_private_targets` would
+/// keep the stale manager (and its old SSRF policy) alive.
+fn scoped_upstream_key(config: &Config, servers: &[String]) -> String {
+    let up = &config.upstream;
+    format!(
+        "{}|bootstrap={:?}|timeout_ms={}|strategy={:?}|pool_size={}|allow_private_targets={}",
+        servers.join(","),
+        up.bootstrap,
+        up.timeout_ms,
+        up.strategy,
+        up.pool_size,
+        up.allow_private_targets
+    )
 }
 
 /// High-availability role setup produced by [`init_ha`].
@@ -297,14 +397,26 @@ fn init_ha(
         // recoverable state starts a fresh v1 sequence.
         let restored_version = coordinator.restore_state()?;
 
-        let initial_toml = std::fs::read_to_string(config_path)
-            .unwrap_or_else(|_| toml::to_string_pretty(config).unwrap_or_default());
+        let initial_toml = match std::fs::read_to_string(config_path) {
+            Ok(raw) => raw,
+            Err(_) => toml::to_string_pretty(config).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to serialize the running configuration for the initial HA bundle: {e}"
+                )
+            })?,
+        };
         let sanitized_toml = sito_ha::sanitize_config_for_bundle(&initial_toml).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to sanitize '{}' for the HA bundle: {e}",
                 config_path.display()
             )
         })?;
+        if sanitized_toml.trim().is_empty() {
+            anyhow::bail!(
+                "Refusing to publish an empty initial HA bundle derived from '{}'",
+                config_path.display()
+            );
+        }
         if let Some(ref token) = ha_config.slave_token
             && let Err(e) = sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])
         {
@@ -399,6 +511,21 @@ fn init_ha(
             ha_config.master_url.clone(),
         )
         .with_watermark_path(config.server.data_dir.join("ha_watermark.toml"))?;
+        // A local edit/revert while the process was stopped must not let the
+        // next identical push take the same-version early-ACK path. Compare the
+        // on-disk document with the digest recorded when the bundle was applied.
+        if let Ok(document) = std::fs::read_to_string(config_path) {
+            tracker
+                .verify_applied_config(&document)
+                .map_err(|e| anyhow::anyhow!("Failed to verify applied HA configuration: {e}"))?;
+            if tracker.requires_full_apply() {
+                tracing::warn!(
+                    path = %config_path.display(),
+                    local_drift = tracker.has_local_config_drift(),
+                    "Local HA configuration is unverified or drifted from the last applied bundle; a full apply is required before an early Synced ACK"
+                );
+            }
+        }
         let (resync_tx, resync_rx) = tokio::sync::mpsc::channel(4);
         (None, Some(tracker), Some(resync_tx), Some(resync_rx))
     };
@@ -418,7 +545,6 @@ struct RuntimeComponents {
     metrics: MetricsRegistry,
     querylog_writer: QueryLogWriter,
     querylog_sender: sito_stats::QueryLogSender,
-    bootstrap: BootstrapResolver,
     upstream_manager: Arc<UpstreamManager>,
     cache: Arc<DnsCache>,
     filter_engine: Arc<HostsFilterEngine>,
@@ -426,6 +552,79 @@ struct RuntimeComponents {
 
 /// Opens the stats database and initializes metrics, query logging, upstreams,
 /// cache and the filter engine together with their background tasks.
+/// Maps the filter crate's status into the metrics crate's primitive view
+/// (the filter crate cannot depend on `sito-stats`).
+fn filter_status_metrics(status: &sito_filter::FilterStatus) -> sito_stats::FilterStatusMetrics {
+    sito_stats::FilterStatusMetrics {
+        state: match status.state {
+            sito_filter::FilterState::Disabled => 0,
+            sito_filter::FilterState::Loading => 1,
+            sito_filter::FilterState::Ready => 2,
+            sito_filter::FilterState::Failed => 3,
+        },
+        loaded_lists: u64::try_from(status.loaded_lists).unwrap_or(u64::MAX),
+        failed_lists: u64::try_from(status.failed_lists.len()).unwrap_or(u64::MAX),
+        degraded_groups: u64::try_from(status.degraded_groups.len()).unwrap_or(u64::MAX),
+        dropped_regex_patterns: u64::try_from(status.dropped_regex_patterns).unwrap_or(u64::MAX),
+        unavailable: u64::from(status.unavailable),
+    }
+}
+
+/// Delay before the first retention sweep after startup.
+///
+/// Normally this is the time remaining until `last_success + interval`, but it
+/// is capped so a process that restarts more often than the interval still
+/// runs a bounded catch-up within [`RETENTION_STARTUP_CATCHUP_MAX_DELAY_MS`].
+/// `None`/an old timestamp means run immediately (subject only to jitter).
+fn retention_startup_delay_ms(last_success_ms: Option<i64>, now_ms: i64, interval_ms: i64) -> i64 {
+    let Some(last) = last_success_ms else {
+        return 0;
+    };
+    last.saturating_add(interval_ms)
+        .saturating_sub(now_ms)
+        .clamp(0, RETENTION_STARTUP_CATCHUP_MAX_DELAY_MS)
+}
+
+/// Runs one retention sweep and publishes its outcome to Prometheus.
+async fn run_stats_retention_sweep(
+    db: &StatsDb,
+    config: &ArcSwap<Config>,
+    metrics: &MetricsRegistry,
+) {
+    let stats = config.load().get_stats_config();
+    let started = Instant::now();
+    match db
+        .cleanup_retention_with_policy(
+            stats.retention_days,
+            stats.rollup_retention_days,
+            stats.rollup_client_names,
+        )
+        .await
+    {
+        Ok(report) => {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            metrics.record_retention_success(
+                elapsed_ms,
+                report.deleted_records,
+                report.rollup_deleted_records,
+                stats.rollup_retention_days,
+            );
+            info!(
+                deleted = report.deleted_records,
+                rollup_deleted = report.rollup_deleted_records,
+                chunks = report.chunks,
+                elapsed_ms,
+                "stats retention sweep completed"
+            );
+        }
+        Err(e) => {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            metrics.record_retention_failure(elapsed_ms);
+            warn!("Error during stats retention cleanup: {e}");
+        }
+    }
+}
+
 async fn init_runtime_components(
     config: &Config,
     shutdown_rx: &watch::Receiver<bool>,
@@ -435,13 +634,27 @@ async fn init_runtime_components(
 
     // Initialize Stats SQLite DB
     let db_path = config.server.data_dir.join("stats.db");
-    let stats_db = StatsDb::open(&db_path).await?;
+    let stats_config = config.get_stats_config();
+    let stats_db =
+        StatsDb::open_with_rollup_client_names(&db_path, stats_config.rollup_client_names).await?;
 
     // Initialize Prometheus metrics registry with 18 metrics per Table 14.2
     let metrics = MetricsRegistry::new(
         env!("CARGO_PKG_VERSION"),
         option_env!("SITO_BUILD_COMMIT").unwrap_or("unknown"),
     );
+    metrics.set_rollup_retention_days(stats_config.rollup_retention_days);
+    if let Ok(Some(last_success_ms)) = stats_db.retention_last_success_ms().await {
+        metrics
+            .set_retention_last_success_seconds(u64::try_from(last_success_ms / 1000).unwrap_or(0));
+    }
+    if stats_config.rollup_retention_days < stats_config.retention_days {
+        warn!(
+            retention_days = stats_config.retention_days,
+            rollup_retention_days = stats_config.rollup_retention_days,
+            "stats.rollup_retention_days is shorter than stats.retention_days; archived totals will expire before detailed rows"
+        );
+    }
 
     // Initialize QueryLogWriter (10k buffer per M5.1)
     let querylog_writer = QueryLogWriter::spawn_with_anonymize(
@@ -477,10 +690,7 @@ async fn init_runtime_components(
     }
 
     // Initialize upstream manager with bootstrap resolver
-    let bootstrap = BootstrapResolver::new(
-        config.upstream.bootstrap.clone(),
-        Duration::from_millis(config.upstream.timeout_ms),
-    );
+    let bootstrap = BootstrapResolver::from_config(&config.upstream);
     let upstream_manager =
         Arc::new(UpstreamManager::from_config(&config.upstream, &bootstrap).await?);
     let _health_handle = upstream_manager.start_health_prober(shutdown_rx.clone());
@@ -490,14 +700,31 @@ async fn init_runtime_components(
 
     // Initialize hosts filter. The observer records both the initial load and
     // every scheduled refresh in `sito_filter_compile_seconds`.
+    //
+    // Group custom rules are a real source even when global
+    // `filtering.lists`/`custom_rules` are empty; pass the actual group rule
+    // sets so the initial reload can verify at least one compiles, instead of
+    // trusting raw text that may be comment-only or invalid.
+    let initial_clients = clients_from_config(config)?;
+    let initial_group_rules = group_rule_sets(&initial_clients);
     let filter_engine = Arc::new(
-        HostsFilterEngine::init_with_observer(
+        HostsFilterEngine::init_with_observer_and_group_sources(
             config.filtering.clone(),
             config.server.data_dir.clone(),
             Some(metrics.compile_observer()),
+            initial_group_rules,
         )
         .await,
     );
+    // Publish the initial load result and then keep the gauges in sync with
+    // every API/scheduled reload.
+    metrics.set_filter_status(filter_status_metrics(&filter_engine.status()));
+    {
+        let metrics = metrics.clone();
+        filter_engine.set_status_observer(Arc::new(move |status| {
+            metrics.set_filter_status(filter_status_metrics(status));
+        }));
+    }
     let _refresh_handle = filter_engine
         .clone()
         .spawn_refresh_task(shutdown_rx.clone());
@@ -507,7 +734,6 @@ async fn init_runtime_components(
         metrics,
         querylog_writer,
         querylog_sender,
-        bootstrap,
         upstream_manager,
         cache,
         filter_engine,
@@ -533,7 +759,6 @@ struct ServerApplyHooks {
     /// hot reload must not forget that a zone was proven signed/unsigned.
     dnssec_chain_cache: Arc<sito_dnssec::ChainCache>,
     scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>>,
-    bootstrap: BootstrapResolver,
     rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
     listener_manager: Arc<tokio::sync::Mutex<Option<DnsListenerManager>>>,
     listener_acceptors: Arc<tokio::sync::Mutex<Option<ListenerAcceptors>>>,
@@ -571,7 +796,7 @@ impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
             // upstream set is unchanged.
             let rebuilt_scoped = {
                 let existing = self.scoped_upstreams.load_full();
-                build_scoped_upstreams(cfg, &self.bootstrap, clients, &existing).await
+                build_scoped_upstreams(cfg, clients, &existing).await
             };
             self.scoped_upstreams.store(Arc::new(rebuilt_scoped));
 
@@ -957,7 +1182,6 @@ pub async fn run_server_full(
     let metrics = components.metrics;
     let querylog_writer = components.querylog_writer;
     let querylog_sender = components.querylog_sender;
-    let bootstrap = components.bootstrap;
     let upstream_manager = components.upstream_manager;
     let cache = components.cache;
     let filter_engine = components.filter_engine;
@@ -986,7 +1210,7 @@ pub async fn run_server_full(
     // Build per-client upstream managers for entries that opt out of the globals.
     let scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>> =
         Arc::new(ArcSwap::from(Arc::new(
-            build_scoped_upstreams(&config, &bootstrap, &clients_config, &HashMap::new()).await,
+            build_scoped_upstreams(&config, &clients_config, &HashMap::new()).await,
         )));
 
     let client_registry = Arc::new(sito_clients::ClientRegistry::new(clients_config));
@@ -1109,12 +1333,16 @@ pub async fn run_server_full(
         dnssec: dnssec_swap.clone(),
         dnssec_chain_cache: dnssec_chain_cache.clone(),
         scoped_upstreams: scoped_upstreams.clone(),
-        bootstrap: bootstrap.clone(),
         rate_limiters: rate_limiters.clone(),
         listener_manager: listener_manager.clone(),
         listener_acceptors: listener_acceptors.clone(),
         pipeline: pipeline.clone(),
     });
+
+    // D12 readiness state shared with the API. Challenge flags are updated by
+    // `init_tls_and_acme`/`start_dns_listeners`; issuance errors by the ACME
+    // manager.
+    let acme_challenges = AcmeChallengeAvailability::new(false, false);
 
     let server_ctx = sito_api::ServerContext {
         config: config_arc.clone(),
@@ -1137,6 +1365,7 @@ pub async fn run_server_full(
         slave_tracker: slave_tracker.clone(),
         resync_sender,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(setup_pending)),
+        acme_challenges: Some(acme_challenges.clone()),
         dns_starter,
     };
 
@@ -1168,12 +1397,47 @@ pub async fn run_server_full(
     }
 
     // Periodic stats retention cleanup task (every 24h).
-    // `retention_days` is read on every cycle so config hot-reload applies.
+    // `retention_days`, `rollup_retention_days` and `rollup_client_names` are
+    // read on every cycle so config hot-reload applies. A bounded catch-up
+    // sweep runs on every startup after a short delay (capped at 5 minutes)
+    // plus jitter, so restart-heavy deployments still retain data.
     let retention_db = stats_db.clone();
     let retention_config = config_arc.clone();
+    let retention_metrics = metrics.clone();
     let mut retention_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let last_success = retention_db
+            .retention_last_success_ms()
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Could not read last stats retention timestamp: {e}");
+                None
+            });
+        let interval_ms = i64::try_from(RETENTION_INTERVAL.as_millis()).unwrap_or(i64::MAX);
+        let base_delay_ms = retention_startup_delay_ms(last_success, now_ms, interval_ms);
+        let jitter_ms = (rand::random::<u64>() % (RETENTION_STARTUP_JITTER_MAX_SECS * 1000 + 1))
+            .try_into()
+            .unwrap_or(i64::MAX);
+        let delay_ms = base_delay_ms.saturating_add(jitter_ms).max(0);
+        let delay = Duration::from_millis(u64::try_from(delay_ms).unwrap_or(u64::MAX));
+
+        // Always run one bounded catch-up at startup. The delay only avoids
+        // duplicate work when the last sweep is recent; it is capped so a
+        // restart-heavy process still runs retention within a few minutes.
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            res = retention_shutdown_rx.changed() => {
+                if res.is_err() || *retention_shutdown_rx.borrow() {
+                    return;
+                }
+            }
+        }
+        run_stats_retention_sweep(&retention_db, &retention_config, &retention_metrics).await;
+
         let mut interval = tokio::time::interval(RETENTION_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate first tick; the startup catch-up above ran.
         interval.tick().await;
         loop {
             tokio::select! {
@@ -1183,10 +1447,11 @@ pub async fn run_server_full(
                     }
                 }
                 _ = interval.tick() => {
-                    let retention_days = retention_config.load().get_stats_config().retention_days;
-                    if let Err(e) = retention_db.cleanup_retention(retention_days).await {
-                        warn!("Error during stats retention cleanup: {e}");
-                    }
+                    run_stats_retention_sweep(
+                        &retention_db,
+                        &retention_config,
+                        &retention_metrics,
+                    ).await;
                 }
             }
         }
@@ -1226,7 +1491,8 @@ pub async fn run_server_full(
         shutdown_rx: shutdown_rx.clone(),
     }));
 
-    let mut cert_watchers = init_tls_and_acme(&config, &shutdown_rx, &listener_acceptors).await?;
+    let mut cert_watchers =
+        init_tls_and_acme(&config, &shutdown_rx, &listener_acceptors, &acme_challenges).await?;
 
     if setup_pending {
         info!(
@@ -1243,7 +1509,14 @@ pub async fn run_server_full(
                 // the initial acceptors were built from the empty config.
                 // Re-initialize so DoT/DoH/DoQ listen immediately instead of
                 // requiring a restart.
-                match init_tls_and_acme(&current_cfg, &shutdown_rx, &listener_acceptors).await {
+                match init_tls_and_acme(
+                    &current_cfg,
+                    &shutdown_rx,
+                    &listener_acceptors,
+                    &acme_challenges,
+                )
+                .await
+                {
                     Ok(watchers) => cert_watchers.extend(watchers),
                     Err(e) => warn!(
                         error = %e,
@@ -1259,6 +1532,7 @@ pub async fn run_server_full(
                         doh: None,
                         doq: None,
                         doh3: None,
+                        acme_challenges: AcmeChallengeAvailability::default(),
                     });
                 for warning in
                     exposure_warnings_for_phase(&current_cfg, ExposurePhase::DnsListeners)
@@ -1303,6 +1577,7 @@ pub async fn run_server_full(
                 doh: None,
                 doq: None,
                 doh3: None,
+                acme_challenges: AcmeChallengeAvailability::default(),
             });
         // Start from the current configuration (the watcher may already have
         // applied a file change during startup), not the stale startup copy.
@@ -1402,12 +1677,14 @@ async fn init_tls_and_acme(
     config: &Config,
     shutdown_rx: &watch::Receiver<bool>,
     listener_acceptors: &tokio::sync::Mutex<Option<ListenerAcceptors>>,
+    acme_challenges: &sito_transport::AcmeChallengeAvailability,
 ) -> anyhow::Result<Vec<sito_transport::CertWatcher>> {
     // ACME and TLS setup
     let acme_cfg = config.get_acme_config();
     let is_acme_enabled = acme_cfg
         .as_ref()
         .is_some_and(|a| a.enabled && !a.domains.is_empty());
+    acme_challenges.set_enabled(is_acme_enabled);
 
     let (cert_file, key_file, sni_tuples) = if let Some(tls_cfg) = config.get_tls_config() {
         if let (Some(cert), Some(key)) = (&tls_cfg.cert, &tls_cfg.key) {
@@ -1418,118 +1695,20 @@ async fn init_tls_and_acme(
     } else {
         (None, None, Vec::new())
     };
-
-    // If static cert/key not provided, but ACME is enabled, establish ACME storage directory and bootstrap cert
-    let (effective_cert, effective_key) = match (cert_file, key_file) {
-        (Some(c), Some(k)) => (Some(c), Some(k)),
-        _ if is_acme_enabled => {
-            let Some(acme) = acme_cfg.as_ref() else {
-                // `is_acme_enabled` is derived from `acme_cfg`; this guard
-                // keeps the startup path panic-free even if that changes.
-                anyhow::bail!("ACME is enabled but the ACME configuration is missing");
-            };
-            let storage_dir = acme
-                .cache_dir
-                .clone()
-                .unwrap_or_else(|| config.server.data_dir.join("acme"));
-            let cert_path = storage_dir.join("cert.pem");
-            let key_path = storage_dir.join("key.pem");
-
-            if !cert_path.exists() || !key_path.exists() {
-                let _ = tokio::fs::create_dir_all(&storage_dir).await;
-                match generate_self_signed_cert(&acme.domains) {
-                    Ok((cert_pem, key_pem)) => {
-                        let cert_target = cert_path.clone();
-                        let key_target = key_path.clone();
-                        let written =
-                            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                                std::fs::write(&cert_target, cert_pem)?;
-                                // The bootstrap private key must be 0600: local
-                                // users must not read it before ACME replaces it.
-                                sito_transport::write_secret_file(&key_target, key_pem.as_bytes())?;
-                                Ok(())
-                            })
-                            .await;
-                        match written {
-                            Ok(Ok(())) => info!(
-                                "Generated bootstrap self-signed certificate in {:?}",
-                                storage_dir
-                            ),
-                            Ok(Err(e)) => {
-                                warn!("Failed to write bootstrap self-signed certificate: {e}");
-                            }
-                            Err(e) => {
-                                warn!("Bootstrap certificate task failed: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to generate bootstrap self-signed certificate: {e}");
-                    }
-                }
-            }
-            if cert_path.exists() && key_path.exists() {
-                (Some(cert_path), Some(key_path))
-            } else {
-                (None, None)
-            }
-        }
-        _ => (None, None),
+    let static_pair = match (cert_file, key_file) {
+        (Some(cert), Some(key)) => Some((cert, key)),
+        _ => None,
     };
 
-    let http01_challenges = Arc::new(dashmap::DashMap::<String, String>::new());
-    let challenge_keys = Arc::new(dashmap::DashMap::new());
-    // Kept alive for the lifetime of the server so certificate hot-reload works.
-    let mut cert_watchers: Vec<sito_transport::CertWatcher> = Vec::new();
-
-    let (dot_acceptor_mgr, doh_acceptor_mgr, doq_acceptor_mgr, doh3_acceptor_mgr) =
-        if let (Some(cert), Some(key)) = (&effective_cert, &effective_key) {
-            let doh_mgr = build_tls_acceptor(
-                "doh",
-                cert,
-                key,
-                &sni_tuples,
-                &[b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()],
-                Some(challenge_keys.clone()),
-                &mut cert_watchers,
-            );
-            let dot_mgr = build_tls_acceptor(
-                "dot",
-                cert,
-                key,
-                &sni_tuples,
-                &[b"dot".to_vec()],
-                None,
-                &mut cert_watchers,
-            );
-            let doq_mgr = build_tls_acceptor(
-                "doq",
-                cert,
-                key,
-                &sni_tuples,
-                &[b"doq".to_vec()],
-                None,
-                &mut cert_watchers,
-            );
-            let doh3_mgr = build_tls_acceptor(
-                "doh3",
-                cert,
-                key,
-                &sni_tuples,
-                &[b"h3".to_vec()],
-                None,
-                &mut cert_watchers,
-            );
-            (dot_mgr, doh_mgr, doq_mgr, doh3_mgr)
-        } else {
-            (None, None, None, None)
+    // Build the ACME service configuration once; it is also used to decide
+    // whether an existing stored certificate should take precedence over
+    // static `[tls]` material at startup.
+    let acme_service_cfg = if is_acme_enabled {
+        let Some(acme) = acme_cfg.as_ref() else {
+            // `is_acme_enabled` is derived from `acme_cfg`; this guard
+            // keeps the startup path panic-free even if that changes.
+            anyhow::bail!("ACME is enabled but the ACME configuration is missing");
         };
-
-    // If ACME is enabled, start ACME renewal background manager
-    if let Some(acme) = acme_cfg
-        && acme.enabled
-        && !acme.domains.is_empty()
-    {
         let email = if let Some(email) = acme.email.clone() {
             email
         } else {
@@ -1542,11 +1721,148 @@ async fn init_tls_and_acme(
             .cache_dir
             .clone()
             .unwrap_or_else(|| config.server.data_dir.join("acme"));
-        let doh_alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()];
-        let service_cfg =
-            AcmeServiceConfig::new(email, acme.domains, storage_dir).with_staging(acme.staging);
+        Some(
+            AcmeServiceConfig::new(email, acme.domains.clone(), storage_dir)
+                .with_staging(acme.staging),
+        )
+    } else {
+        None
+    };
 
+    let (acme_pair, acme_pair_usable) = if let Some(service_cfg) = &acme_service_cfg {
+        let cert_path = service_cfg.storage_dir.join("cert.pem");
+        let key_path = service_cfg.storage_dir.join("key.pem");
+        let pair = (cert_path.exists() && key_path.exists()).then_some((cert_path, key_path));
+        // Fail closed on unreadable/unparseable material: a truncated
+        // certificate or key must never be selected and then abort startup in
+        // the TLS builder while a valid static pair is available.
+        let usable = acme_startup_pair_usable(pair.is_some(), service_cfg);
+        (pair, usable)
+    } else {
+        (None, false)
+    };
+
+    // D12: bootstrap serving is opt-in and defaults to fail-closed.
+    let allow_bootstrap_cert = acme_cfg
+        .as_ref()
+        .is_some_and(|acme| acme.enabled && acme.allow_bootstrap_cert);
+    let material = match choose_tls_material(
+        static_pair,
+        acme_pair,
+        acme_pair_usable,
+        is_acme_enabled,
+        allow_bootstrap_cert,
+    ) {
+        TlsStartupMaterial::Pair(cert, key) => Some((cert, key)),
+        TlsStartupMaterial::Disabled => None,
+        TlsStartupMaterial::GenerateBootstrap => {
+            let Some(service_cfg) = &acme_service_cfg else {
+                anyhow::bail!(
+                    "Bootstrap certificate was requested but ACME configuration is missing"
+                );
+            };
+            std::fs::create_dir_all(&service_cfg.storage_dir).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create ACME storage directory {}: {e}",
+                    service_cfg.storage_dir.display()
+                )
+            })?;
+            let (cert_pem, key_pem) = generate_self_signed_cert(&service_cfg.domains)
+                .map_err(|e| anyhow::anyhow!("Failed to generate bootstrap certificate: {e}"))?;
+            let cert_path = service_cfg.storage_dir.join("cert.pem");
+            let key_path = service_cfg.storage_dir.join("key.pem");
+            std::fs::write(&cert_path, cert_pem).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to write bootstrap certificate to {}: {e}",
+                    cert_path.display()
+                )
+            })?;
+            // The bootstrap private key must be 0600: local users must not
+            // read it before ACME replaces it.
+            write_secret_file(&key_path, key_pem.as_bytes()).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to write bootstrap key to {}: {e}",
+                    key_path.display()
+                )
+            })?;
+            record_bootstrap_cert(&service_cfg.storage_dir).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to record bootstrap certificate in {}: {e}",
+                    service_cfg.storage_dir.display()
+                )
+            })?;
+            info!(
+                "Generated bootstrap self-signed certificate in {:?} (allow_bootstrap_cert = true)",
+                service_cfg.storage_dir
+            );
+            Some((cert_path, key_path))
+        }
+    };
+
+    if material.is_none() && is_acme_enabled {
+        warn!(
+            "ACME is enabled but no trusted certificate is available and \
+             acme.allow_bootstrap_cert is false; encrypted listeners are disabled \
+             until ACME issuance completes and the server is restarted"
+        );
+    }
+
+    let http01_challenges = Arc::new(dashmap::DashMap::<String, String>::new());
+    let challenge_keys = Arc::new(dashmap::DashMap::new());
+    // Kept alive for the lifetime of the server so certificate hot-reload works.
+    let mut cert_watchers: Vec<sito_transport::CertWatcher> = Vec::new();
+
+    let (dot_acceptor_mgr, doh_acceptor_mgr, doq_acceptor_mgr, doh3_acceptor_mgr) =
+        if let Some((cert, key)) = &material {
+            let doh_mgr = build_tls_acceptor(
+                "doh",
+                cert,
+                key,
+                &sni_tuples,
+                &[b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()],
+                Some(challenge_keys.clone()),
+                &mut cert_watchers,
+            )?;
+            let dot_mgr = build_tls_acceptor(
+                "dot",
+                cert,
+                key,
+                &sni_tuples,
+                &[b"dot".to_vec()],
+                None,
+                &mut cert_watchers,
+            )?;
+            let doq_mgr = build_tls_acceptor(
+                "doq",
+                cert,
+                key,
+                &sni_tuples,
+                &[b"doq".to_vec()],
+                None,
+                &mut cert_watchers,
+            )?;
+            let doh3_mgr = build_tls_acceptor(
+                "doh3",
+                cert,
+                key,
+                &sni_tuples,
+                &[b"h3".to_vec()],
+                None,
+                &mut cert_watchers,
+            )?;
+            (Some(dot_mgr), Some(doh_mgr), Some(doq_mgr), Some(doh3_mgr))
+        } else {
+            (None, None, None, None)
+        };
+
+    // Live challenge state starts fail-safe: no TLS-ALPN-01 until a 443 DoH
+    // listener actually binds (done later by `start_dns_listeners`). The
+    // caller owns the shared object so readiness can read it.
+
+    // If ACME is enabled, start ACME renewal background manager
+    if let (Some(service_cfg), Some(acme)) = (acme_service_cfg, acme_cfg.as_ref()) {
         // Dedicated plaintext HTTP-01 listener (ACME validators always use port 80).
+        let mut http01_available = false;
         if acme.http_port > 0 {
             let acme_http_addr = SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -1560,6 +1876,7 @@ async fn init_tls_and_acme(
             .await
             {
                 Ok(_handle) => {
+                    http01_available = true;
                     info!(
                         port = acme.http_port,
                         "ACME HTTP-01 challenge listener active"
@@ -1573,11 +1890,18 @@ async fn init_tls_and_acme(
             }
         }
 
-        let _acme_handle = start_acme_manager(
+        acme_challenges.set_http01_available(http01_available);
+        let managers = TlsManagerSet {
+            dot: dot_acceptor_mgr.clone(),
+            doh: doh_acceptor_mgr.clone(),
+            doq: doq_acceptor_mgr.clone(),
+            doh3: doh3_acceptor_mgr.clone(),
+        };
+        let _acme_handle = start_acme_manager_for_transports(
             service_cfg,
-            doh_acceptor_mgr.clone(),
+            managers,
             Some(http01_challenges.clone()),
-            doh_alpn,
+            acme_challenges.clone(),
             shutdown_rx.clone(),
         );
     }
@@ -1588,6 +1912,7 @@ async fn init_tls_and_acme(
         doh: doh_acceptor_mgr,
         doq: doq_acceptor_mgr,
         doh3: doh3_acceptor_mgr,
+        acme_challenges: acme_challenges.clone(),
     });
 
     Ok(cert_watchers)
@@ -1674,6 +1999,8 @@ struct ListenerAcceptors {
     doh: Option<TlsAcceptorManager>,
     doq: Option<TlsAcceptorManager>,
     doh3: Option<TlsAcceptorManager>,
+    /// Live ACME challenge-listener state, updated after every DNS bind.
+    acme_challenges: AcmeChallengeAvailability,
 }
 
 /// Settings that determine how the DNS listeners are constructed. Changing
@@ -1728,6 +2055,7 @@ impl DnsListenerManager {
         rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>>,
     ) -> anyhow::Result<Self> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let acme_challenges = acceptors.acme_challenges.clone();
         let (handles, limiters) = start_dns_listeners(
             config,
             pipeline,
@@ -1736,6 +2064,7 @@ impl DnsListenerManager {
             acceptors.doh,
             acceptors.doq,
             acceptors.doh3,
+            acme_challenges,
         )
         .await?;
 
@@ -1824,12 +2153,16 @@ async fn start_dns_listeners(
     doh_acceptor_mgr: Option<TlsAcceptorManager>,
     doq_acceptor_mgr: Option<TlsAcceptorManager>,
     doh3_acceptor_mgr: Option<TlsAcceptorManager>,
+    acme_challenges: AcmeChallengeAvailability,
 ) -> anyhow::Result<(
     Vec<tokio::task::JoinHandle<()>>,
     Vec<Arc<sito_transport::RateLimiter>>,
 )> {
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let mut handles = Vec::new();
+    // No TLS-ALPN-01 until a 443 DoH listener actually binds in this pass.
+    acme_challenges.set_tls_alpn_available(false);
+    let mut doh_443_bound = false;
 
     // One limiter per client IP shared by every listener (all bind addresses
     // and protocols), so an attacker cannot multiply the budget by switching
@@ -1915,6 +2248,9 @@ async fn start_dns_listeners(
                 let doh_handle =
                     start_doh_listener(doh_config, pipeline.clone(), shutdown_rx.clone()).await?;
                 handles.push(doh_handle);
+                if config.dns.doh_port == 443 {
+                    doh_443_bound = true;
+                }
             }
         }
 
@@ -1953,6 +2289,13 @@ async fn start_dns_listeners(
             }
         }
     }
+
+    record_doh_listener_binding(
+        &acme_challenges,
+        config,
+        doh_acceptor_mgr.as_ref(),
+        doh_443_bound,
+    );
 
     Ok((handles, rate_limiters))
 }
@@ -2012,6 +2355,28 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn test_retention_startup_delay_schedules_recent_success() {
+        let interval_ms = 24 * 3600 * 1000;
+        let now = 1_700_000_000_000i64;
+
+        // No prior success: run immediately.
+        assert_eq!(retention_startup_delay_ms(None, now, interval_ms), 0);
+
+        // Recent success: normally wait until last_success + interval, but cap
+        // the delay so a process restarting more often still runs retention.
+        let recent = now - 12 * 3600 * 1000;
+        let delay = retention_startup_delay_ms(Some(recent), now, interval_ms);
+        assert_eq!(delay, RETENTION_STARTUP_CATCHUP_MAX_DELAY_MS);
+
+        // Success older than the interval: run immediately.
+        let old = now - interval_ms - 1;
+        assert_eq!(retention_startup_delay_ms(Some(old), now, interval_ms), 0);
+
+        // A recent success schedules a sweep (delay is not "skip forever").
+        assert!(delay > 0);
+    }
+
+    #[test]
     fn test_canonical_config_path_for_relative_default() {
         let resolved = canonical_config_path(Path::new("config.toml"));
         assert!(
@@ -2041,6 +2406,79 @@ mod tests {
             Some(std::ffi::OsStr::new("config.toml"))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scoped_clients(servers: &[&str]) -> sito_clients::ClientsConfig {
+        let mut clients = sito_clients::ClientsConfig::default();
+        clients.entries.push(sito_clients::ClientEntryConfig {
+            name: "corp".to_string(),
+            ids: Vec::new(),
+            group: "default".to_string(),
+            ignore_query_log: false,
+            ignore_stats: false,
+            use_global_upstreams: false,
+            upstreams: Some(servers.iter().map(|server| (*server).to_string()).collect()),
+            trusted: false,
+        });
+        clients
+    }
+
+    /// Important 3: changing a global upstream setting such as
+    /// `allow_private_targets` must rebuild per-client scoped managers on a hot
+    /// reload instead of reusing the old SSRF policy.
+    #[tokio::test]
+    async fn test_scoped_upstream_reload_rebuilds_on_allow_private_targets_change() {
+        let mut config = Config::default();
+        config.upstream.servers = vec!["1.1.1.1".to_string()];
+        let clients = scoped_clients(&["udp://127.0.0.1:53"]);
+
+        let first = build_scoped_upstreams(&config, &clients, &HashMap::new()).await;
+        assert_eq!(first.len(), 1);
+        let first_key = first.keys().next().unwrap().clone();
+        let first_manager = first.values().next().unwrap().clone();
+
+        config.upstream.allow_private_targets = true;
+        let second = build_scoped_upstreams(&config, &clients, &first).await;
+        assert_eq!(second.len(), 1);
+        let second_key = second.keys().next().unwrap().clone();
+        let second_manager = second.values().next().unwrap().clone();
+
+        assert_ne!(
+            first_key, second_key,
+            "the reuse key must include allow_private_targets"
+        );
+        assert!(
+            !Arc::ptr_eq(&first_manager, &second_manager),
+            "a changed SSRF policy must not reuse the stale scoped manager"
+        );
+    }
+
+    /// The reuse key must also change when inherited connection settings change,
+    /// not only when the server list changes.
+    #[test]
+    fn test_scoped_upstream_key_includes_inherited_settings() {
+        let mut config = Config::default();
+        let servers = vec!["tls://dns.example".to_string()];
+        let base = scoped_upstream_key(&config, &servers);
+
+        config.upstream.bootstrap = vec!["1.1.1.1".parse().unwrap()];
+        assert_ne!(base, scoped_upstream_key(&config, &servers));
+
+        let mut config = Config::default();
+        config.upstream.timeout_ms += 1;
+        assert_ne!(base, scoped_upstream_key(&config, &servers));
+
+        let mut config = Config::default();
+        config.upstream.strategy = sito_core::config::UpstreamStrategy::Parallel;
+        assert_ne!(base, scoped_upstream_key(&config, &servers));
+
+        let mut config = Config::default();
+        config.upstream.pool_size += 1;
+        assert_ne!(base, scoped_upstream_key(&config, &servers));
+
+        let mut config = Config::default();
+        config.upstream.allow_private_targets = true;
+        assert_ne!(base, scoped_upstream_key(&config, &servers));
     }
 
     /// I5 regression: the production `init_ha` call site records the
@@ -2173,6 +2611,308 @@ mod tests {
         );
     }
 
+    /// Regression (P1-12/Important 2): TLS-ALPN-01 must only be offered when
+    /// DoH actually bound TCP 443. A failed/absent bind or a custom DoH port
+    /// must fall back to HTTP-01.
+    #[test]
+    fn test_acme_challenge_availability_requires_bound_443() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_bind_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let (cert_pem, key_pem) =
+            generate_self_signed_cert(&["localhost".to_string()]).expect("self-signed cert");
+        std::fs::write(&cert, cert_pem).unwrap();
+        std::fs::write(&key, key_pem).unwrap();
+        let manager = TlsAcceptorManager::new(
+            load_server_config(&cert, &key, &[], vec![b"acme-tls/1".to_vec()]).expect("TLS config"),
+        );
+
+        let mut config = Config::default();
+        config.dns.doh_port = 443;
+        let availability = AcmeChallengeAvailability::default();
+
+        // The ACME manager starts before the DNS bind: nothing is available.
+        assert!(!availability.options().tls_alpn_available);
+
+        record_doh_listener_binding(&availability, &config, Some(&manager), false);
+        assert!(
+            !availability.options().tls_alpn_available,
+            "a failed/absent 443 bind must not enable TLS-ALPN-01"
+        );
+
+        config.dns.doh_port = 8443;
+        record_doh_listener_binding(&availability, &config, Some(&manager), true);
+        assert!(
+            !availability.options().tls_alpn_available,
+            "TLS-ALPN-01 needs port 443, not just any bound TLS listener"
+        );
+
+        config.dns.doh_port = 443;
+        record_doh_listener_binding(&availability, &config, Some(&manager), true);
+        assert!(
+            availability.options().tls_alpn_available,
+            "a bound 443 DoH listener with acme-tls/1 enables TLS-ALPN-01"
+        );
+
+        record_doh_listener_binding(&availability, &config, None, true);
+        assert!(!availability.options().tls_alpn_available);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (P1-12/P2-13): a restart must prefer the stored ACME
+    /// certificate over static `[tls]` files, but a bootstrap placeholder must
+    /// not displace a real static pair.
+    #[test]
+    fn test_choose_tls_material_prefers_acme_certificate_on_restart() {
+        let static_pair = Some((
+            PathBuf::from("/etc/sito/static-cert.pem"),
+            PathBuf::from("/etc/sito/static-key.pem"),
+        ));
+        let acme_pair = Some((
+            PathBuf::from("/var/lib/sito/acme/cert.pem"),
+            PathBuf::from("/var/lib/sito/acme/key.pem"),
+        ));
+        let static_pair_value = static_pair.clone().expect("static pair");
+        let acme_pair_value = acme_pair.clone().expect("acme pair");
+
+        assert_eq!(
+            choose_tls_material(static_pair.clone(), acme_pair.clone(), true, true, false),
+            TlsStartupMaterial::Pair(acme_pair_value.0.clone(), acme_pair_value.1.clone()),
+            "a usable ACME certificate must win over static material after restart"
+        );
+        assert_eq!(
+            choose_tls_material(static_pair.clone(), acme_pair.clone(), false, true, true),
+            TlsStartupMaterial::Pair(static_pair_value.0.clone(), static_pair_value.1.clone()),
+            "a bootstrap placeholder must not displace a real static pair"
+        );
+        assert_eq!(
+            choose_tls_material(None, acme_pair.clone(), false, true, false),
+            TlsStartupMaterial::Disabled,
+            "D12: bootstrap must not be served by default"
+        );
+        assert_eq!(
+            choose_tls_material(None, acme_pair.clone(), false, true, true),
+            TlsStartupMaterial::GenerateBootstrap,
+            "opting in allows a fresh bootstrap while ACME issues"
+        );
+        assert_eq!(
+            choose_tls_material(None, None, false, true, false),
+            TlsStartupMaterial::Disabled,
+            "ACME-only with no certificate is fail-closed by default"
+        );
+        assert_eq!(
+            choose_tls_material(None, None, false, true, true),
+            TlsStartupMaterial::GenerateBootstrap,
+            "ACME-only with the opt-in generates a bootstrap certificate"
+        );
+        assert_eq!(
+            choose_tls_material(static_pair.clone(), None, false, true, false),
+            TlsStartupMaterial::Pair(static_pair_value.0.clone(), static_pair_value.1.clone()),
+            "without ACME material the static pair is used while issuance runs"
+        );
+        assert_eq!(
+            choose_tls_material(static_pair.clone(), acme_pair.clone(), false, false, false),
+            TlsStartupMaterial::Pair(static_pair_value.0.clone(), static_pair_value.1.clone()),
+            "with ACME disabled only static material is used"
+        );
+    }
+
+    /// Regression (deferred D2): unparseable ACME material must not be
+    /// selected at startup. It must fall back to a valid static pair when one
+    /// exists, and otherwise take the bootstrap/renewal path instead of
+    /// passing the pair to the TLS builder (which would abort startup).
+    #[test]
+    fn test_unparseable_acme_material_falls_back_to_static_pair() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_truncated_startup_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let acme_cert = dir.join("cert.pem");
+        let acme_key = dir.join("key.pem");
+        std::fs::write(&acme_cert, b"-----BEGIN CERTIFICATE-----\ntruncated\n")
+            .expect("write truncated cert");
+        write_secret_file(&acme_key, b"not a private key").expect("write bad key");
+
+        let config = AcmeServiceConfig::new(
+            "admin@example.test".to_string(),
+            vec!["dns.example.test".to_string()],
+            dir.clone(),
+        );
+        assert!(
+            !config.stored_pair_is_usable(),
+            "truncated ACME material must never be considered usable"
+        );
+        assert!(
+            !acme_startup_pair_usable(false, &config),
+            "a missing pair must not be selected"
+        );
+        assert!(
+            !acme_startup_pair_usable(true, &config),
+            "an existing but unusable pair must not be selected"
+        );
+        assert!(
+            sito_transport::certificate_needs_renewal(&config),
+            "the renewal path must still run for truncated material"
+        );
+
+        let acme_pair = Some((acme_cert, acme_key));
+        let static_pair = Some((
+            PathBuf::from("/etc/sito/static-cert.pem"),
+            PathBuf::from("/etc/sito/static-key.pem"),
+        ));
+        let static_value = static_pair.clone().expect("static pair");
+        assert_eq!(
+            choose_tls_material(
+                static_pair.clone(),
+                acme_pair.clone(),
+                config.stored_pair_is_usable(),
+                true,
+                false
+            ),
+            TlsStartupMaterial::Pair(static_value.0.clone(), static_value.1.clone()),
+            "unparseable ACME material must not displace a valid static pair"
+        );
+        assert_eq!(
+            choose_tls_material(None, acme_pair.clone(), false, true, false),
+            TlsStartupMaterial::Disabled,
+            "ACME-only with unusable material is fail-closed without the opt-in"
+        );
+        assert_eq!(
+            choose_tls_material(None, acme_pair, false, true, true),
+            TlsStartupMaterial::GenerateBootstrap,
+            "the opt-in replaces unusable material with a fresh bootstrap pair"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Critical 1 regression: a CA-issued certificate with only ~5 days left
+    /// has a ~90-day lifetime. It must not be classified as a bootstrap
+    /// placeholder and must not be overwritten during startup selection.
+    #[test]
+    fn test_short_remaining_validity_does_not_trigger_bootstrap_replacement() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_short_remaining_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let ca_key = rcgen::KeyPair::generate().expect("CA key");
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "sito test CA");
+        let now = time::OffsetDateTime::now_utc();
+        let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+        let mut leaf_params = rcgen::CertificateParams::new(vec!["dns.example.test".to_string()])
+            .expect("leaf params");
+        leaf_params.not_before = now - time::Duration::days(85);
+        leaf_params.not_after = now + time::Duration::days(5);
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
+            .expect("leaf cert");
+
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, leaf_cert.pem()).expect("write cert");
+        write_secret_file(&key_path, leaf_key.serialize_pem().as_bytes()).expect("write key");
+
+        let config = AcmeServiceConfig::new(
+            "admin@example.test".to_string(),
+            vec!["dns.example.test".to_string()],
+            dir.clone(),
+        )
+        .with_renew_before_days(30);
+        assert!(
+            !config.is_bootstrap_cert(),
+            "remaining validity must not classify a CA certificate as bootstrap"
+        );
+
+        let acme_pair = Some((cert_path.clone(), key_path.clone()));
+        let acme_pair_value = acme_pair.clone().expect("acme pair");
+        assert!(
+            acme_startup_pair_usable(true, &config),
+            "a still-valid CA-issued pair must be selected at startup"
+        );
+        let acme_pair_usable = acme_startup_pair_usable(true, &config);
+        assert_eq!(
+            choose_tls_material(None, acme_pair.clone(), acme_pair_usable, true, false),
+            TlsStartupMaterial::Pair(acme_pair_value.0.clone(), acme_pair_value.1.clone()),
+            "a still-valid CA certificate must be retained even though renewal is due"
+        );
+
+        // An actually expired CA certificate is not served, but is not
+        // overwritten either: encrypted listeners are disabled by default.
+        let expired_key = rcgen::KeyPair::generate().expect("expired leaf key");
+        let mut expired_params =
+            rcgen::CertificateParams::new(vec!["dns.example.test".to_string()])
+                .expect("expired leaf params");
+        expired_params.not_before = now - time::Duration::days(90);
+        expired_params.not_after = now - time::Duration::hours(1);
+        let expired_cert = expired_params
+            .signed_by(
+                &expired_key,
+                &rcgen::Issuer::from_params(&ca_params, &ca_key),
+            )
+            .expect("expired leaf cert");
+        std::fs::write(&cert_path, expired_cert.pem()).expect("write expired cert");
+        write_secret_file(&key_path, expired_key.serialize_pem().as_bytes())
+            .expect("write expired key");
+        assert!(
+            config.stored_cert_is_expired(),
+            "the expired certificate must be detected"
+        );
+        assert_eq!(
+            choose_tls_material(None, acme_pair, false, true, false),
+            TlsStartupMaterial::Disabled,
+            "an expired CA certificate must not be replaced or served without opt-in"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (P0-1): invalid configured certificate material must abort
+    /// startup for the encrypted listeners instead of silently running without
+    /// them.
+    #[tokio::test]
+    async fn test_invalid_tls_material_is_fatal() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_tls_fatal_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = Config::default();
+        config.tls = Some(sito_core::config::TlsConfig {
+            cert: Some(dir.join("missing-cert.pem")),
+            key: Some(dir.join("missing-key.pem")),
+            sni_certs: Vec::new(),
+        });
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let acceptors = tokio::sync::Mutex::new(None);
+        let challenges = AcmeChallengeAvailability::default();
+        let result = init_tls_and_acme(&config, &shutdown_rx, &acceptors, &challenges).await;
+        assert!(
+            result.is_err(),
+            "unreadable certificate material must fail startup, not disable encrypted listeners"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn test_tls_acceptors_rebuilt_from_updated_config() {
         // The setup wizard can configure TLS after startup; re-initializing
@@ -2195,7 +2935,8 @@ mod tests {
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let acceptors = tokio::sync::Mutex::new(None);
-        let watchers = init_tls_and_acme(&config, &shutdown_rx, &acceptors)
+        let challenges = AcmeChallengeAvailability::default();
+        let watchers = init_tls_and_acme(&config, &shutdown_rx, &acceptors, &challenges)
             .await
             .expect("TLS initialization");
 

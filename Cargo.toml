@@ -15,11 +15,14 @@ members = [
     "crates/sito-stats",
     "crates/sito-ha",
     "crates/sito-test",
+    "crates/sito-test-support",
     "crates/sito-runtime",
 ]
+# Vendored as a path dependency below, not a workspace member.
+exclude = ["vendor/sqlx-sqlite"]
 
 [workspace.package]
-version = "1.9.3"
+version = "1.9.4"
 edition = "2024"
 rust-version = "1.99.1"
 license = "GPL-3.0-only"
@@ -57,7 +60,7 @@ aho-corasick = "1.1"
 regex-automata = { version = "0.4", features = ["dfa-build", "syntax", "hybrid"] }
 criterion = "0.8"
 rustls-pki-types = { version = "1.15", features = ["std"] }
-rcgen = "0.14"
+rcgen = { version = "0.14", features = ["x509-parser"] }
 base64 = "0.23"
 notify = "8.2"
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "matched-path", "query", "ws", "form", "json"] }
@@ -85,21 +88,29 @@ tar = "0.4"
 utoipa = { version = "6.0", features = ["axum_extras"] }
 
 # Internal workspace dependencies
-sito = { path = "crates/sito", version = "1.9.3" }
-sito-core = { path = "crates/sito-core", version = "1.9.3" }
-sito-proto = { path = "crates/sito-proto", version = "1.9.3" }
-sito-transport = { path = "crates/sito-transport", version = "1.9.3" }
-sito-upstream = { path = "crates/sito-upstream", version = "1.9.3" }
-sito-cache = { path = "crates/sito-cache", version = "1.9.3" }
-sito-filter = { path = "crates/sito-filter", version = "1.9.3" }
-sito-dnssec = { path = "crates/sito-dnssec", version = "1.9.3" }
-sito-clients = { path = "crates/sito-clients", version = "1.9.3" }
-sito-rewrites = { path = "crates/sito-rewrites", version = "1.9.3" }
-sito-api = { path = "crates/sito-api", version = "1.9.3" }
-sito-stats = { path = "crates/sito-stats", version = "1.9.3" }
-sito-runtime = { path = "crates/sito-runtime", version = "1.9.3" }
-sito-ha = { path = "crates/sito-ha", version = "1.9.3" }
-sito-test = { path = "crates/sito-test", version = "1.9.3" }
+sito = { path = "crates/sito", version = "1.9.4" }
+sito-core = { path = "crates/sito-core", version = "1.9.4" }
+sito-proto = { path = "crates/sito-proto", version = "1.9.4" }
+sito-transport = { path = "crates/sito-transport", version = "1.9.4" }
+sito-upstream = { path = "crates/sito-upstream", version = "1.9.4" }
+sito-cache = { path = "crates/sito-cache", version = "1.9.4" }
+sito-filter = { path = "crates/sito-filter", version = "1.9.4" }
+sito-dnssec = { path = "crates/sito-dnssec", version = "1.9.4" }
+sito-clients = { path = "crates/sito-clients", version = "1.9.4" }
+sito-rewrites = { path = "crates/sito-rewrites", version = "1.9.4" }
+sito-api = { path = "crates/sito-api", version = "1.9.4" }
+sito-stats = { path = "crates/sito-stats", version = "1.9.4" }
+sito-runtime = { path = "crates/sito-runtime", version = "1.9.4" }
+sito-ha = { path = "crates/sito-ha", version = "1.9.4" }
+sito-test = { path = "crates/sito-test", version = "1.9.4" }
+sito-test-support = { path = "crates/sito-test-support", version = "1.9.4" }
+
+# sqlx-sqlite 0.9.0 caps libsqlite3-sys at <0.38.0, which bundles SQLite
+# < 3.54.0 (RUSTSEC-2026-0459). The vendored copy only widens that range to
+# <0.40.0 so the patched bundled SQLite (0.39.1) can be selected. Remove this
+# patch once upstream sqlx-sqlite accepts libsqlite3-sys 0.39.
+[patch.crates-io]
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }
 
 [workspace.lints.rust]
 # Future Rust lints can be specified here
