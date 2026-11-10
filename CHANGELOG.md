@@ -65,8 +65,9 @@ guidance and residual risks.
   enforced before allocation; malformed modifier tokens reject the whole rule;
   rewrite exceptions require registry-authenticated ids; a `$dnsrewrite` on a
   CNAME target is a no-match at both precedence tiers, so it cannot hide a
-  parental/service/standard block even when it precedes the block in candidate
-  order.
+  parental/service/standard/important block even when it precedes the block in
+  candidate order (including an important rewrite before an important block in
+  the same snapshot).
 - **Transport:** DoQ flow-control/stream/task caps and pre-read admission;
   DoH/DoH3 pre-body admission, global request caps, deadlines/lifetimes, and H2
   stream caps; a DoH3 total-deadline expiry returns HTTP 504 (or resets the

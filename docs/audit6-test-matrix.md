@@ -68,7 +68,7 @@ named by the command.
 
 | Finding | Named test / check | Focused command |
 |---|---|---|
-| CNAME target rewrite/block precedence | `test_cname_target_important_rewrite_is_dropped`, `test_cname_target_group_rewrite_does_not_suppress_global_block_end_to_end`, `test_cname_target_same_snapshot_rewrite_before_block_still_blocks`, `test_standard_block_presence_ignores_rewrite_order` | `cargo test -p sito test_cname_target_`; `cargo test -p sito-filter test_standard_block_presence_ignores_rewrite_order` |
+| CNAME target rewrite/block precedence | `test_cname_target_important_rewrite_is_dropped`, `test_cname_target_group_rewrite_does_not_suppress_global_block_end_to_end`, `test_cname_target_same_snapshot_rewrite_before_block_still_blocks`, `test_cname_target_same_snapshot_important_rewrite_before_block_still_blocks`, `test_standard_block_presence_ignores_rewrite_order` | `cargo test -p sito test_cname_target_`; `cargo test -p sito-filter test_standard_block_presence_ignores_rewrite_order` |
 | DoH3 deadline parity (504) | `test_doh3_total_request_deadline_returns_gateway_timeout` | `cargo test -p sito-transport test_doh3_total_request_deadline_returns_gateway_timeout` |
 | Stats 429 retry hint | `test_stats_rate_limit_response_has_retry_after` | `cargo test -p sito-api test_stats_rate_limit_response_has_retry_after` |
 | Stats large-hour/index commands | `test_large_single_hour_is_row_bounded`, `test_large_same_timestamp_hour_is_row_bounded`, `test_retention_hour_discovery_uses_ts_index`, `test_retention_chunk_queries_use_ts_id_index` | `cargo test -p sito-stats large_single_hour`; `cargo test -p sito-stats same_timestamp`; `cargo test -p sito-stats retention_hour_discovery`; `cargo test -p sito-stats retention_chunk_queries` |

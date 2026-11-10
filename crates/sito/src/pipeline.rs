@@ -1152,6 +1152,29 @@ impl DnsPipeline {
                     continue;
                 }
             }
+            // The evaluator returns the first important match, so a rewrite
+            // can hide an important block later in candidate order. The
+            // rewrite is dropped above; detect the block independently.
+            let group_imp_block = group_snapshot
+                .as_ref()
+                .zip(group_candidates.as_ref())
+                .is_some_and(|(gs, gc)| {
+                    gs.important_block_candidates_contain_block(
+                        &normalized,
+                        qtype,
+                        client,
+                        &gc.block,
+                    )
+                });
+            let global_imp_block = global_snapshot.important_block_candidates_contain_block(
+                &normalized,
+                qtype,
+                client,
+                &global_candidates.block,
+            );
+            if global_imp_block || group_imp_block {
+                return true;
+            }
 
             // 2. Parental control categories on the CNAME target
             if policy.parental
@@ -3031,6 +3054,57 @@ mod tests {
         assert!(
             pipeline.cname_target_blocked(&response, RecordType::A, &client, &policy),
             "a rewrite that precedes a block must not hide the block"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Deferred D3 follow-up: the same-snapshot ordering problem applies to the
+    /// `$important` tier. An important rewrite before an important block must
+    /// not hide the block on the CNAME-target path.
+    #[tokio::test]
+    async fn test_cname_target_same_snapshot_important_rewrite_before_block_still_blocks() {
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+        let (mock_addr, _calls) = spawn_mock_upstream(None).await;
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        config.filtering.enabled = true;
+        config.filtering.fail_closed = false;
+        config.filtering.lists.clear();
+        config.filtering.custom_rules = vec![
+            "||blocked-target.example^$dnsrewrite=192.0.2.10,important".to_string(),
+            "||blocked-target.example^$important".to_string(),
+        ];
+        config.upstream.servers = vec![mock_addr.to_string()];
+
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+
+        let mut response = Message::new(44, MessageType::Response, OpCode::Query);
+        response.queries.push(hickory_proto::op::Query::query(
+            Name::from_str("alias.example.").unwrap(),
+            RecordType::A,
+        ));
+        response.answers.push(Record::from_rdata(
+            Name::from_str("alias.example.").unwrap(),
+            300,
+            RData::CNAME(CNAME(Name::from_str("blocked-target.example.").unwrap())),
+        ));
+
+        let snapshot = pipeline.runtime.snapshot();
+        let mut client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let policy = snapshot
+            .clients
+            .resolve(&mut client, snapshot.clients.now());
+        assert!(
+            pipeline.cname_target_blocked(&response, RecordType::A, &client, &policy),
+            "an important rewrite that precedes an important block must not hide the block"
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;

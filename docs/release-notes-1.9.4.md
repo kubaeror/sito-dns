@@ -135,9 +135,10 @@ document is the operator-facing summary and upgrade guide.
 - A `$dnsrewrite` on a CNAME target is treated as a no-match because the
   response is already resolved and the rewrite cannot be applied. This applies
   to `$important` and standard rules across the global and group snapshots, so
-  a rewrite cannot hide a parental, service, or standard block; a block is
-  still detected when the rewrite precedes it in candidate order. `@@` allow
-  rules still override the block.
+  a rewrite cannot hide a parental, service, standard, or important block; a
+  block is still detected when the rewrite precedes it in candidate order,
+  including an important rewrite before an important block in the same
+  snapshot. `@@` allow rules still override the block.
 - `GET /api/v1/filtering/status` and new Prometheus gauges expose
   loaded/failed/degraded lists, degraded groups, dropped regex patterns,
   unavailability, and compile time.

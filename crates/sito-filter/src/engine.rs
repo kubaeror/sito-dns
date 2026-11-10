@@ -443,6 +443,48 @@ impl FilterSnapshot {
         false
     }
 
+    /// Stage 2 only: returns true when any matching `$important` block rule
+    /// applies, ignoring `$dnsrewrite` rules.
+    ///
+    /// [`Self::evaluate_important_candidates`] returns the first matching
+    /// important rule, so an important `$dnsrewrite` that appears before an
+    /// important block in candidate order hides the block. Callers that cannot
+    /// apply a rewrite (for example the CNAME-target re-check) use this to
+    /// detect an important block independently of the rewrite verdict.
+    pub fn important_block_candidates_contain_block(
+        &self,
+        domain: &str,
+        qtype: RecordType,
+        client: &ClientContext,
+        block_candidates: &[u32],
+    ) -> bool {
+        for &rule_id in block_candidates {
+            let rule = &self.rules[rule_id as usize];
+            if !rule.modifiers.important {
+                continue;
+            }
+            if rule.modifiers.denyallow_matches(domain) {
+                continue;
+            }
+            if let Some(client_filter) = &rule.modifiers.client
+                && !client_filter.matches(client)
+            {
+                continue;
+            }
+            if let Some(dnstype_filter) = &rule.modifiers.dnstype
+                && !dnstype_filter.matches(qtype)
+            {
+                continue;
+            }
+            if rule.modifiers.dnsrewrite.is_some() {
+                continue;
+            }
+            return true;
+        }
+
+        false
+    }
+
     /// Evaluates a domain against only `$important` rules (Stages 1 and 2).
     /// Returns `Some(verdict)` if an `$important` rule matched, or `None` if no `$important` rule applied.
     pub fn evaluate_important(
@@ -2090,6 +2132,53 @@ mod tests {
             .blocklist
             .collect_candidates(domain, &snapshot.interner, &mut candidates);
         assert!(!snapshot.standard_block_candidates_contain_block(
+            domain,
+            RecordType::A,
+            &client,
+            &candidates,
+        ));
+
+        // Important tier: an important rewrite before an important block must
+        // not hide the block either.
+        let important_config = FilteringConfig {
+            custom_rules: vec![
+                "||target.example^$dnsrewrite=192.0.2.10,important".to_string(),
+                "||target.example^$important".to_string(),
+            ],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(important_config, temp_dir.clone()).await;
+        let snapshot = engine.snapshot();
+        let mut candidates = Vec::new();
+        snapshot
+            .blocklist
+            .collect_candidates(domain, &snapshot.interner, &mut candidates);
+        assert!(snapshot.important_block_candidates_contain_block(
+            domain,
+            RecordType::A,
+            &client,
+            &candidates,
+        ));
+        candidates.reverse();
+        assert!(snapshot.important_block_candidates_contain_block(
+            domain,
+            RecordType::A,
+            &client,
+            &candidates,
+        ));
+
+        // An important rewrite-only snapshot has no block to report.
+        let important_rewrite_only = FilteringConfig {
+            custom_rules: vec!["||target.example^$dnsrewrite=192.0.2.10,important".to_string()],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(important_rewrite_only, temp_dir.clone()).await;
+        let snapshot = engine.snapshot();
+        let mut candidates = Vec::new();
+        snapshot
+            .blocklist
+            .collect_candidates(domain, &snapshot.interner, &mut candidates);
+        assert!(!snapshot.important_block_candidates_contain_block(
             domain,
             RecordType::A,
             &client,
