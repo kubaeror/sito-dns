@@ -132,10 +132,12 @@ document is the operator-facing summary and upgrade guide.
   registry authenticated them (`/dns-query/<name>` cannot spoof a client).
 - Group compile-budget failures publish the non-regex subset and report the
   group degraded instead of dropping it; stale group rebuilds are discarded.
-- A CNAME target blocked by a global standard rule is no longer unblocked by a
-  per-group `$dnsrewrite` for the same target. Rewrites cannot be applied on the
-  already-resolved CNAME-target path, so they are treated as a no-match there;
-  `@@` allow rules still override the block.
+- A `$dnsrewrite` on a CNAME target is treated as a no-match because the
+  response is already resolved and the rewrite cannot be applied. This applies
+  to `$important` and standard rules across the global and group snapshots, so
+  a rewrite cannot hide a parental, service, or standard block; a block is
+  still detected when the rewrite precedes it in candidate order. `@@` allow
+  rules still override the block.
 - `GET /api/v1/filtering/status` and new Prometheus gauges expose
   loaded/failed/degraded lists, degraded groups, dropped regex patterns,
   unavailability, and compile time.
@@ -283,9 +285,10 @@ Additional deferred/unchanged items:
   upgrade or local RDATA support lands in Phase 1/2.
 - **Lockout capacity fail-open (residual).** The account lockout map is bounded
   at 10,000 entries. If every entry is an active lockout, a new key is not
-  tracked and relies on the per-IP login rate limit instead. This is a
-  deliberate bounded-memory trade-off; the tracker never evicts an active
-  lockout to make room.
+  tracked and relies on the per-IP login rate limit when
+  `auth.login_rate_limit > 0` (setting it to `0` disables that fallback too).
+  This is a deliberate bounded-memory trade-off; the tracker never evicts an
+  active lockout to make room.
 - **RouterOS** remains an experimental, niche integration with the 1.9.x
   behavior; moving it behind an optional feature is a 2.0 item.
 - **Fuzzing** is not part of the 1.9.4 build or CI. The old `fuzz/Cargo.toml`

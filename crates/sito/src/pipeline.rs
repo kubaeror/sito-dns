@@ -648,38 +648,25 @@ fn combine_standard_verdicts(global: Verdict, group: Option<Verdict>) -> Verdict
     combine_tier_verdicts(Some(global), group).unwrap_or(Verdict::Allow(None))
 }
 
-/// Treats a `$dnsrewrite` as a neutral no-match on the CNAME-target path.
-fn neutralize_cname_target_rewrite(verdict: Verdict) -> Verdict {
-    match verdict {
-        Verdict::Rewrite(_) => Verdict::Allow(None),
-        other => other,
-    }
-}
-
-/// Combines the global and per-group standard verdicts for a CNAME target.
+/// [`combine_tier_verdicts`] for the CNAME-target `$important` tier.
 ///
 /// A `$dnsrewrite` cannot be applied on the CNAME-target path: the response is
 /// already resolved, so rewriting the target would require synthesizing a new
-/// answer. Treat a rewrite as a neutral no-match instead of letting it outrank
-/// a block. `Allow` still has precedence over both, preserving the normal
-/// exception behavior.
-fn combine_cname_target_verdicts(global: Verdict, group: Option<Verdict>) -> Verdict {
-    combine_standard_verdicts(
-        neutralize_cname_target_rewrite(global),
-        group.map(neutralize_cname_target_rewrite),
-    )
-}
-
-/// [`combine_tier_verdicts`] for the CNAME-target `$important` tier, where a
-/// rewrite is likewise not actionable and must not hide a block.
+/// answer. Drop rewrite verdicts entirely instead of converting them into
+/// `Allow(None)`, which callers would otherwise treat as a real allow and use
+/// to skip parental, service, and standard checks.
 fn combine_cname_target_tier_verdicts(
     global: Option<Verdict>,
     group: Option<Verdict>,
 ) -> Option<Verdict> {
-    combine_tier_verdicts(
-        global.map(neutralize_cname_target_rewrite),
-        group.map(neutralize_cname_target_rewrite),
-    )
+    fn actionable(verdict: Option<Verdict>) -> Option<Verdict> {
+        match verdict {
+            Some(Verdict::Rewrite(_)) | None => None,
+            other => other,
+        }
+    }
+
+    combine_tier_verdicts(actionable(global), actionable(group))
 }
 
 /// Aggregates all matching `$dnsrewrite` rules from the global and per-group
@@ -1135,9 +1122,9 @@ impl DnsPipeline {
                 candidates
             });
 
-            // 1. $important rules on the CNAME target (same precedence table
-            //    as the main query path: Allow > Rewrite > Block, group wins
-            //    ties).
+            // 1. $important rules on the CNAME target. Rewrites are dropped
+            //    because they cannot be applied to an already-resolved CNAME
+            //    target; a real allow still wins.
             let global_imp = global_snapshot.evaluate_important_candidates(
                 &normalized,
                 qtype,
@@ -1161,7 +1148,7 @@ impl DnsPipeline {
                 if verdict.is_blocked() {
                     return true;
                 }
-                if verdict.is_allowed() {
+                if matches!(verdict, Verdict::Allow(Some(_))) {
                     continue;
                 }
             }
@@ -1190,29 +1177,48 @@ impl DnsPipeline {
                 return true;
             }
 
-            // 4. Standard filter rules (global + per-group combined)
-            let group_std =
-                group_snapshot
+            // 4. Standard filter rules (global + per-group combined). A
+            //    `$dnsrewrite` cannot be applied to an already-resolved CNAME
+            //    target, so check for a real allow first and then for any
+            //    matching non-rewrite block. Scanning block candidates
+            //    independently matters because the evaluator returns the first
+            //    match, and a rewrite can precede a block in candidate order.
+            let group_allow = group_snapshot
+                .as_ref()
+                .zip(group_candidates.as_ref())
+                .is_some_and(|(gs, gc)| {
+                    gs.evaluate_standard_allow_candidates(&normalized, qtype, client, &gc.allow)
+                        .is_some()
+                });
+            let global_allow = global_snapshot
+                .evaluate_standard_allow_candidates(
+                    &normalized,
+                    qtype,
+                    client,
+                    &global_candidates.allow,
+                )
+                .is_some();
+            if !global_allow && !group_allow {
+                let group_block = group_snapshot
                     .as_ref()
                     .zip(group_candidates.as_ref())
-                    .map(|(gs, gc)| {
-                        gs.evaluate_standard_candidates(
+                    .is_some_and(|(gs, gc)| {
+                        gs.standard_block_candidates_contain_block(
                             &normalized,
                             qtype,
                             client,
-                            &gc.allow,
                             &gc.block,
                         )
                     });
-            let global_std = global_snapshot.evaluate_standard_candidates(
-                &normalized,
-                qtype,
-                client,
-                &global_candidates.allow,
-                &global_candidates.block,
-            );
-            if combine_cname_target_verdicts(global_std, group_std).is_blocked() {
-                return true;
+                let global_block = global_snapshot.standard_block_candidates_contain_block(
+                    &normalized,
+                    qtype,
+                    client,
+                    &global_candidates.block,
+                );
+                if global_block || group_block {
+                    return true;
+                }
             }
         }
 
@@ -2842,7 +2848,9 @@ mod tests {
     /// blocked when the client's group has a `$dnsrewrite` for the same
     /// target. The rewrite cannot be applied to an already-resolved CNAME
     /// target, so it must be treated as a no-match instead of suppressing the
-    /// block. A group allow still overrides the global block.
+    /// block. A group allow still overrides the global block, and an important
+    /// rewrite must fall through to the standard checks rather than acting as
+    /// a real allow.
     #[tokio::test]
     async fn test_cname_target_group_rewrite_does_not_suppress_global_block_end_to_end() {
         use sito_clients::{ClientEntryConfig, ClientGroupConfig, ClientsConfig};
@@ -2880,6 +2888,16 @@ mod tests {
                     upstreams: None,
                     trusted: false,
                 },
+                ClientEntryConfig {
+                    name: "important-kid".to_string(),
+                    ids: vec!["127.0.0.3".to_string()],
+                    group: "important_kids".to_string(),
+                    ignore_query_log: false,
+                    ignore_stats: false,
+                    use_global_upstreams: true,
+                    upstreams: None,
+                    trusted: false,
+                },
             ],
             groups: HashMap::from([
                 (
@@ -2895,6 +2913,15 @@ mod tests {
                     "friends".to_string(),
                     ClientGroupConfig {
                         custom_rules: vec!["@@||blocked-target.example^".to_string()],
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "important_kids".to_string(),
+                    ClientGroupConfig {
+                        custom_rules: vec![
+                            "||blocked-target.example^$dnsrewrite=192.0.2.10,important".to_string(),
+                        ],
                         ..Default::default()
                     },
                 ),
@@ -2931,6 +2958,20 @@ mod tests {
             "a group rewrite must not suppress a global block on a CNAME target"
         );
 
+        let mut important_kid = ClientContext::new("127.0.0.3".parse().unwrap());
+        let important_kid_policy = snapshot
+            .clients
+            .resolve(&mut important_kid, snapshot.clients.now());
+        assert!(
+            pipeline.cname_target_blocked(
+                &response,
+                RecordType::A,
+                &important_kid,
+                &important_kid_policy,
+            ),
+            "an important rewrite must fall through to the standard block"
+        );
+
         let mut friend = ClientContext::new("127.0.0.2".parse().unwrap());
         let friend_policy = snapshot
             .clients
@@ -2938,6 +2979,58 @@ mod tests {
         assert!(
             !pipeline.cname_target_blocked(&response, RecordType::A, &friend, &friend_policy),
             "a group allow must still override the global block"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Deferred D3 follow-up: candidate order is structural, so a
+    /// `$dnsrewrite` can precede a block for the same CNAME target in one
+    /// snapshot. The block must still be detected independently of the
+    /// rewrite verdict.
+    #[tokio::test]
+    async fn test_cname_target_same_snapshot_rewrite_before_block_still_blocks() {
+        use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+        let (mock_addr, _calls) = spawn_mock_upstream(None).await;
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        config.filtering.enabled = true;
+        config.filtering.fail_closed = false;
+        config.filtering.lists.clear();
+        config.filtering.custom_rules = vec![
+            "||blocked-target.example^$dnsrewrite=192.0.2.10".to_string(),
+            "||blocked-target.example^".to_string(),
+        ];
+        config.upstream.servers = vec![mock_addr.to_string()];
+
+        let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+        let upstream = std::sync::Arc::new(
+            UpstreamManager::from_config(&config.upstream, &bootstrap)
+                .await
+                .unwrap(),
+        );
+        let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+
+        let mut response = Message::new(43, MessageType::Response, OpCode::Query);
+        response.queries.push(hickory_proto::op::Query::query(
+            Name::from_str("alias.example.").unwrap(),
+            RecordType::A,
+        ));
+        response.answers.push(Record::from_rdata(
+            Name::from_str("alias.example.").unwrap(),
+            300,
+            RData::CNAME(CNAME(Name::from_str("blocked-target.example.").unwrap())),
+        ));
+
+        let snapshot = pipeline.runtime.snapshot();
+        let mut client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let policy = snapshot
+            .clients
+            .resolve(&mut client, snapshot.clients.now());
+        assert!(
+            pipeline.cname_target_blocked(&response, RecordType::A, &client, &policy),
+            "a rewrite that precedes a block must not hide the block"
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
@@ -4269,11 +4362,12 @@ mod tests {
         assert!(combine_tier_verdicts(None, None).is_none());
     }
 
-    /// Deferred D3: a group `$dnsrewrite` must not hide a global block on the
-    /// CNAME-target path, where rewrites cannot be applied. An `Allow` still
-    /// overrides the block.
+    /// Deferred D3 follow-up: on the CNAME-target path a `$dnsrewrite` is not
+    /// actionable. In the `$important` tier it must be dropped (not converted
+    /// to `Allow(None)`) so it cannot skip later parental/service/standard
+    /// checks, and it must not hide an important block.
     #[test]
-    fn test_cname_target_group_rewrite_does_not_suppress_global_block() {
+    fn test_cname_target_important_rewrite_is_dropped() {
         use sito_core::verdict::{BlockReason, RewriteAction, RuleRef};
 
         let block = || {
@@ -4286,7 +4380,6 @@ mod tests {
                 "@@||blocked-target.example^".to_string(),
             )))
         };
-        let no_match = || Verdict::Allow(None);
         let rewrite = || {
             Verdict::Rewrite(RewriteAction::DnsRewrite {
                 rcode: "NOERROR".to_string(),
@@ -4295,46 +4388,31 @@ mod tests {
             })
         };
 
-        // Global block + group rewrite: the CNAME target stays blocked.
-        assert!(matches!(
-            combine_cname_target_verdicts(block(), Some(rewrite())),
-            Verdict::Block(_)
-        ));
-        // A global rewrite cannot hide a group block either.
-        assert!(matches!(
-            combine_cname_target_verdicts(rewrite(), Some(block())),
-            Verdict::Block(_)
-        ));
-        // A global allow still overrides a group rewrite.
-        assert!(matches!(
-            combine_cname_target_verdicts(allow(), Some(rewrite())),
-            Verdict::Allow(_)
-        ));
-        // A group allow still overrides a global block.
-        assert!(matches!(
-            combine_cname_target_verdicts(block(), Some(allow())),
-            Verdict::Allow(_)
-        ));
-        // Two rewrites are simply a no-match on this path.
-        assert!(matches!(
-            combine_cname_target_verdicts(rewrite(), Some(rewrite())),
-            Verdict::Allow(None)
-        ));
-        // A group with no matching rule must not erase a global block.
-        assert!(matches!(
-            combine_cname_target_verdicts(block(), Some(no_match())),
-            Verdict::Block(_)
-        ));
-
-        // The `$important` tier follows the same rule: a rewrite is not
-        // actionable on this path, so it cannot hide an important block.
+        // Critical regression: a lone important rewrite is no verdict at all,
+        // so the caller falls through to parental/service/standard checks.
+        assert!(
+            combine_cname_target_tier_verdicts(Some(rewrite()), None).is_none(),
+            "an important CNAME rewrite must not become a real allow"
+        );
+        // A rewrite cannot hide an important block in either position.
         assert!(matches!(
             combine_cname_target_tier_verdicts(Some(block()), Some(rewrite())),
             Some(Verdict::Block(_))
         ));
         assert!(matches!(
-            combine_cname_target_tier_verdicts(Some(allow()), Some(rewrite())),
-            Some(Verdict::Allow(_))
+            combine_cname_target_tier_verdicts(Some(rewrite()), Some(block())),
+            Some(Verdict::Block(_))
         ));
+        // A real allow still wins.
+        assert!(matches!(
+            combine_cname_target_tier_verdicts(Some(allow()), Some(rewrite())),
+            Some(Verdict::Allow(Some(_)))
+        ));
+        assert!(matches!(
+            combine_cname_target_tier_verdicts(Some(block()), Some(allow())),
+            Some(Verdict::Allow(Some(_)))
+        ));
+        // Two rewrites are also dropped.
+        assert!(combine_cname_target_tier_verdicts(Some(rewrite()), Some(rewrite())).is_none());
     }
 }

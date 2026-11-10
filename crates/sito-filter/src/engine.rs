@@ -401,6 +401,48 @@ impl FilterSnapshot {
         Verdict::Allow(None)
     }
 
+    /// Stage 4 only: returns true when any matching standard block rule applies,
+    /// ignoring `$dnsrewrite` rules.
+    ///
+    /// [`Self::evaluate_standard_block_candidates`] returns the first matching
+    /// rule, so a `$dnsrewrite` that appears before a block in candidate order
+    /// hides the block. Callers that cannot apply a rewrite (for example the
+    /// CNAME-target re-check) use this to detect a block independently of the
+    /// rewrite verdict.
+    pub fn standard_block_candidates_contain_block(
+        &self,
+        domain: &str,
+        qtype: RecordType,
+        client: &ClientContext,
+        block_candidates: &[u32],
+    ) -> bool {
+        for &rule_id in block_candidates {
+            let rule = &self.rules[rule_id as usize];
+            if rule.modifiers.important {
+                continue;
+            }
+            if rule.modifiers.denyallow_matches(domain) {
+                continue;
+            }
+            if let Some(client_filter) = &rule.modifiers.client
+                && !client_filter.matches(client)
+            {
+                continue;
+            }
+            if let Some(dnstype_filter) = &rule.modifiers.dnstype
+                && !dnstype_filter.matches(qtype)
+            {
+                continue;
+            }
+            if rule.modifiers.dnsrewrite.is_some() {
+                continue;
+            }
+            return true;
+        }
+
+        false
+    }
+
     /// Evaluates a domain against only `$important` rules (Stages 1 and 2).
     /// Returns `Some(verdict)` if an `$important` rule matched, or `None` if no `$important` rule applied.
     pub fn evaluate_important(
@@ -1991,6 +2033,68 @@ mod tests {
         // 4. Important allowlist overrides important block
         let q4 = Name::from_str("special.important.sub.blocked.example.").unwrap();
         assert!(engine.evaluate(&q4, RecordType::A, &client).is_allowed());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// Deferred D3 follow-up: block presence must be detectable even when a
+    /// `$dnsrewrite` precedes the block in candidate order.
+    #[tokio::test]
+    async fn test_standard_block_presence_ignores_rewrite_order() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_block_presence_test_{}", std::process::id()));
+        let config = FilteringConfig {
+            custom_rules: vec![
+                "||target.example^$dnsrewrite=192.0.2.10".to_string(),
+                "||target.example^".to_string(),
+            ],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(config, temp_dir.clone()).await;
+        let client = ClientContext::new("127.0.0.1".parse().unwrap());
+        let snapshot = engine.snapshot();
+        let domain = "target.example";
+        let mut candidates = Vec::new();
+        snapshot
+            .blocklist
+            .collect_candidates(domain, &snapshot.interner, &mut candidates);
+        assert_ne!(
+            candidates.len(),
+            0,
+            "candidate collection must include the rewrite and block"
+        );
+        assert!(snapshot.standard_block_candidates_contain_block(
+            domain,
+            RecordType::A,
+            &client,
+            &candidates,
+        ));
+        // The result must not depend on structural candidate order.
+        candidates.reverse();
+        assert!(snapshot.standard_block_candidates_contain_block(
+            domain,
+            RecordType::A,
+            &client,
+            &candidates,
+        ));
+
+        // A rewrite-only snapshot has no block to report.
+        let rewrite_only = FilteringConfig {
+            custom_rules: vec!["||target.example^$dnsrewrite=192.0.2.10".to_string()],
+            ..Default::default()
+        };
+        let engine = HostsFilterEngine::init(rewrite_only, temp_dir.clone()).await;
+        let snapshot = engine.snapshot();
+        let mut candidates = Vec::new();
+        snapshot
+            .blocklist
+            .collect_candidates(domain, &snapshot.interner, &mut candidates);
+        assert!(!snapshot.standard_block_candidates_contain_block(
+            domain,
+            RecordType::A,
+            &client,
+            &candidates,
+        ));
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

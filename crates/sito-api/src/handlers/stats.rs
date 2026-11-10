@@ -73,12 +73,12 @@ fn total_count_header(total: i64) -> HeaderMap {
 /// of retrying immediately. Other failures remain plain RFC 7807 problem
 /// details.
 #[derive(Debug)]
-pub enum StatsError {
+pub enum StatsHandlerError {
     Problem(ProblemDetails),
     RateLimited(ProblemDetails),
 }
 
-impl StatsError {
+impl StatsHandlerError {
     fn rate_limited() -> Self {
         Self::RateLimited(ProblemDetails::too_many_requests(
             "Too many statistics requests. Please slow down.",
@@ -86,13 +86,13 @@ impl StatsError {
     }
 }
 
-impl From<ProblemDetails> for StatsError {
+impl From<ProblemDetails> for StatsHandlerError {
     fn from(problem: ProblemDetails) -> Self {
         Self::Problem(problem)
     }
 }
 
-impl IntoResponse for StatsError {
+impl IntoResponse for StatsHandlerError {
     fn into_response(self) -> Response {
         match self {
             Self::Problem(problem) => problem.into_response(),
@@ -153,7 +153,9 @@ pub fn parse_window_ms(window: Option<&str>) -> Result<i64, ProblemDetails> {
         (status = 200, description = "Global statistics retrieved", body = GlobalStats),
         (status = 400, description = "Invalid window", body = ProblemDetails),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 429, description = "Rate limited", body = ProblemDetails,
+            headers(("Retry-After", description = "Seconds to wait before retrying")))
     ),
     tag = "Stats"
 )]
@@ -161,9 +163,9 @@ pub async fn get_stats(
     viewer: RequireViewer,
     State(ctx): State<ServerContext>,
     Query(query): Query<StatsQuery>,
-) -> Result<Json<GlobalStats>, StatsError> {
+) -> Result<Json<GlobalStats>, StatsHandlerError> {
     if stats_rate_limited(&viewer.0.username, "global") {
-        return Err(StatsError::rate_limited());
+        return Err(StatsHandlerError::rate_limited());
     }
     let window_ms = parse_window_ms(query.window.as_deref())?;
     let stats = ctx
@@ -183,7 +185,9 @@ pub async fn get_stats(
             headers(("X-Total-Count", description = "Number of distinct matching rows before the response limit"))),
         (status = 400, description = "Invalid window", body = ProblemDetails),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 429, description = "Rate limited", body = ProblemDetails,
+            headers(("Retry-After", description = "Seconds to wait before retrying")))
     ),
     tag = "Stats"
 )]
@@ -191,9 +195,9 @@ pub async fn get_client_stats(
     viewer: RequireViewer,
     State(ctx): State<ServerContext>,
     Query(query): Query<StatsQuery>,
-) -> Result<(HeaderMap, Json<Vec<ClientStats>>), StatsError> {
+) -> Result<(HeaderMap, Json<Vec<ClientStats>>), StatsHandlerError> {
     if stats_rate_limited(&viewer.0.username, "clients") {
-        return Err(StatsError::rate_limited());
+        return Err(StatsHandlerError::rate_limited());
     }
     let window_ms = parse_window_ms(query.window.as_deref())?;
     let total = ctx
@@ -218,7 +222,9 @@ pub async fn get_client_stats(
             headers(("X-Total-Count", description = "Number of distinct matching rows before the response limit"))),
         (status = 400, description = "Invalid window", body = ProblemDetails),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 429, description = "Rate limited", body = ProblemDetails,
+            headers(("Retry-After", description = "Seconds to wait before retrying")))
     ),
     tag = "Stats"
 )]
@@ -226,9 +232,9 @@ pub async fn get_upstream_stats(
     viewer: RequireViewer,
     State(ctx): State<ServerContext>,
     Query(query): Query<StatsQuery>,
-) -> Result<(HeaderMap, Json<Vec<UpstreamStats>>), StatsError> {
+) -> Result<(HeaderMap, Json<Vec<UpstreamStats>>), StatsHandlerError> {
     if stats_rate_limited(&viewer.0.username, "upstreams") {
-        return Err(StatsError::rate_limited());
+        return Err(StatsHandlerError::rate_limited());
     }
     let window_ms = parse_window_ms(query.window.as_deref())?;
     let total = ctx

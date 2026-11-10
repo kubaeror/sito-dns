@@ -63,8 +63,10 @@ guidance and residual risks.
 - **Filter:** empty/HTML/zero-yield lists are rejected unless explicitly
   allowed; zero-source filtering fails closed; parser/compiler budgets are
   enforced before allocation; malformed modifier tokens reject the whole rule;
-  rewrite exceptions require registry-authenticated ids; a group `$dnsrewrite`
-  no longer hides a global block on the CNAME-target path.
+  rewrite exceptions require registry-authenticated ids; a `$dnsrewrite` on a
+  CNAME target is a no-match at both precedence tiers, so it cannot hide a
+  parental/service/standard block even when it precedes the block in candidate
+  order.
 - **Transport:** DoQ flow-control/stream/task caps and pre-read admission;
   DoH/DoH3 pre-body admission, global request caps, deadlines/lifetimes, and H2
   stream caps; a DoH3 total-deadline expiry returns HTTP 504 (or resets the
@@ -112,8 +114,8 @@ guidance and residual risks.
   item. Fuzzing remains removed; the old `fuzz/Cargo.toml` commands in the
   1.9.2/1.9.3 notes are marked historical. Weekly benchmarks upload estimates
   but do not gate performance. The bounded account-lockout map's capacity
-  fallback (new keys rely on per-IP limiting when every slot is an active lock)
-  is documented as a residual.
+  fallback (new keys rely on per-IP limiting when every slot is an active lock
+  and `auth.login_rate_limit > 0`) is documented as a residual.
 
 ### Upgrade notes
 - ACME users who relied on the bootstrap certificate must set
