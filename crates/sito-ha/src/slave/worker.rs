@@ -985,6 +985,19 @@ async fn connect_and_run(
     }
 }
 
+/// Marks the replication link as not ready after a master-liveness loss.
+///
+/// A `Degraded` state is preserved: it records a failed apply and is only
+/// cleared by a successful apply (or an early ACK for the already-running
+/// version). Overwriting it with `Connecting` would hide the operator's
+/// apply-failure reason from `/ha/status`.
+fn record_master_liveness_loss(tracker: &SlaveStatusTracker, reason: String) {
+    tracker.set_connection_error(Some(reason));
+    if tracker.get_state() != SlaveState::Degraded {
+        tracker.set_state(SlaveState::Connecting);
+    }
+}
+
 async fn run_ws_session<S>(
     mut ws_stream: tokio_tungstenite::WebSocketStream<S>,
     ha_config: &HaConfig,
@@ -1064,8 +1077,7 @@ where
                         last_frame.elapsed(),
                         liveness_deadline
                     );
-                    tracker.set_connection_error(Some(reason.clone()));
-                    tracker.set_state(SlaveState::Connecting);
+                    record_master_liveness_loss(tracker, reason.clone());
                     return Err(HaError::Timeout(reason));
                 }
             }
@@ -3130,6 +3142,55 @@ ttl = 60
         );
         assert!(started.elapsed() >= SLAVE_HANDSHAKE_TIMEOUT);
         stall.abort();
+    }
+
+    /// Regression (deferred D2): the liveness-timeout branch used to set
+    /// `Connecting` unconditionally, erasing the `Degraded` reason recorded by
+    /// a failed apply. It must mirror the reconnect loop's guard.
+    #[test]
+    fn test_master_liveness_loss_preserves_degraded_reason() {
+        let tracker = SlaveStatusTracker::new("slave-degraded".to_string(), 4, None);
+        tracker.mark_degraded("previous apply failed".to_string());
+
+        record_master_liveness_loss(&tracker, "master heartbeat timed out".to_string());
+
+        assert_eq!(
+            tracker.get_state(),
+            SlaveState::Degraded,
+            "a liveness timeout must not clear a failed-apply state"
+        );
+        assert_eq!(
+            tracker.degraded_reason.lock().unwrap().as_deref(),
+            Some("previous apply failed"),
+            "the operator must keep the apply-failure reason"
+        );
+        let readiness = tracker.readiness();
+        assert!(
+            !readiness.ready,
+            "the transport failure must still be reported as not ready: {readiness:?}"
+        );
+        assert!(
+            readiness
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("heartbeat timed out")),
+            "the transport failure must remain visible: {readiness:?}"
+        );
+    }
+
+    /// A healthy session that loses the master must drop out of `Synced`.
+    #[test]
+    fn test_master_liveness_loss_marks_connecting_when_not_degraded() {
+        let tracker = SlaveStatusTracker::new("slave-synced".to_string(), 4, None);
+        tracker.mark_synced(4);
+
+        record_master_liveness_loss(&tracker, "master heartbeat timed out".to_string());
+
+        assert_eq!(tracker.get_state(), SlaveState::Connecting);
+        assert!(
+            !tracker.readiness().ready,
+            "a master-liveness loss must not report replication ready"
+        );
     }
 
     /// A failed apply must survive reconnects: `Degraded` is not cleared by a

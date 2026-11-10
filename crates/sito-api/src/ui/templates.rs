@@ -74,7 +74,11 @@ pub struct UserViewItem {
 }
 
 /// Pending TOTP enrollment material shown once on the account page.
-#[derive(Debug, Clone)]
+///
+/// The fields are intentionally secret-bearing. `Debug` is redacted (like
+/// `TotpSetupResponse`) so enrollment material cannot leak through logging or
+/// error formatting.
+#[derive(Clone)]
 pub struct TotpSetupView {
     pub secret: String,
     pub otpauth_url: String,
@@ -83,6 +87,21 @@ pub struct TotpSetupView {
     pub backup_codes: Vec<String>,
     /// Short-lived, session-bound ticket required to confirm the enrollment.
     pub reauth_token: String,
+}
+
+impl std::fmt::Debug for TotpSetupView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpSetupView")
+            .field("secret", &"<redacted>")
+            .field("otpauth_url", &"<redacted>")
+            .field("qr_code", &"<redacted>")
+            .field(
+                "backup_codes",
+                &format_args!("<{} redacted>", self.backup_codes.len()),
+            )
+            .field("reauth_token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// One API-token row on the account page.
@@ -330,4 +349,41 @@ pub struct WizardTemplate<'a> {
     pub setup_required: bool,
     /// Setup token supplied by the requester (never revealed on its own).
     pub setup_token: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TotpSetupView;
+
+    /// Regression (deferred D2): the view used to derive `Debug` over the TOTP
+    /// secret, otpauth URL, QR payload, backup codes and re-auth ticket.
+    #[test]
+    fn test_totp_setup_view_debug_redacts_enrollment_material() {
+        let view = TotpSetupView {
+            secret: "JBSWY3DPEHPK3PXP".to_string(),
+            otpauth_url: "otpauth://totp/sito:admin?secret=JBSWY3DPEHPK3PXP".to_string(),
+            qr_code: "iVBORw0KGgoAAAANSUhEUg".to_string(),
+            backup_codes: vec!["AAAA-BBBB".to_string(), "CCCC-DDDD".to_string()],
+            reauth_token: "reauth-ticket-secret".to_string(),
+        };
+
+        let rendered = format!("{view:?}");
+        for secret in [
+            "JBSWY3DPEHPK3PXP",
+            "otpauth://",
+            "iVBORw0KGgoAAAANSUhEUg",
+            "AAAA-BBBB",
+            "CCCC-DDDD",
+            "reauth-ticket-secret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "Debug output leaked enrollment material '{secret}': {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("2 redacted"),
+            "the backup-code count may be shown but not the codes: {rendered}"
+        );
+    }
 }

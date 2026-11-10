@@ -164,6 +164,29 @@ fn build_client(
     })
 }
 
+/// Removes a cache file and its metadata after an integrity failure so the
+/// corrupt pair is not re-read on every refresh cycle.
+async fn quarantine_cache(cache_path: &Path, meta_path: &Path, list_name: &str, reason: &str) {
+    warn!(
+        list = %list_name,
+        path = %cache_path.display(),
+        reason,
+        "Quarantining corrupt blocklist cache"
+    );
+    for path in [cache_path, meta_path] {
+        if let Err(e) = tokio::fs::remove_file(path).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                list = %list_name,
+                path = %path.display(),
+                error = %e,
+                "Failed to remove corrupt blocklist cache file"
+            );
+        }
+    }
+}
+
 /// Reads a verified blocklist from disk cache, returning `error` when
 /// unavailable or when the cache fails its integrity check.
 async fn load_cache_or(
@@ -181,22 +204,7 @@ async fn load_cache_or(
             // often parse into non-zero substring rules and would replace a
             // good list.
             if let Err(rejected) = reject_invalid_content(list_name, &cached, None, allow_empty) {
-                warn!(
-                    list = %list_name,
-                    path = %cache_path.display(),
-                    error = %rejected,
-                    "Cached blocklist is empty/HTML; quarantining cache"
-                );
-                if let Err(e) = tokio::fs::remove_file(cache_path).await
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!(list = %list_name, error = %e, "Failed to remove rejected list cache");
-                }
-                if let Err(e) = tokio::fs::remove_file(meta_path).await
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!(list = %list_name, error = %e, "Failed to remove rejected list metadata");
-                }
+                quarantine_cache(cache_path, meta_path, list_name, &rejected.to_string()).await;
                 return Err(rejected);
             }
             info!(
@@ -208,6 +216,13 @@ async fn load_cache_or(
             Ok(cached)
         }
         Err(cache_err) => {
+            // Missing/legacy metadata and length/line-count mismatches make
+            // the cache permanently unusable. Drop both files so the next
+            // refresh downloads a fresh copy instead of re-reading the same
+            // corrupt pair on every cycle.
+            if matches!(&cache_err, FilterError::CacheCorrupted { .. }) {
+                quarantine_cache(cache_path, meta_path, list_name, &cache_err.to_string()).await;
+            }
             warn!(
                 list = %list_name,
                 cache_error = %cache_err,
@@ -632,10 +647,20 @@ impl SubscriptionFetcher {
                                 }
                             }
                             Err(e) => {
-                                // The server claims "not modified" but we have
-                                // no local copy. Retry unconditionally so the
+                                // The server claims "not modified" but our
+                                // cache failed its integrity check. Drop the
+                                // corrupt pair and retry unconditionally so the
                                 // full content is downloaded instead of
-                                // aborting the whole source.
+                                // re-reading it every cycle.
+                                if matches!(&e, FilterError::CacheCorrupted { .. }) {
+                                    quarantine_cache(
+                                        &cache_path,
+                                        &meta_path,
+                                        list_name,
+                                        &e.to_string(),
+                                    )
+                                    .await;
+                                }
                                 warn!(
                                     list = %list_name,
                                     error = %e,
@@ -1353,6 +1378,59 @@ mod tests {
         );
 
         server.await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// Regression (deferred D2): a cache that fails its integrity check
+    /// (length/line-count mismatch, missing or legacy metadata) used to be
+    /// logged and retried on every refresh cycle. It must be quarantined so
+    /// the next refresh downloads a fresh copy.
+    #[tokio::test]
+    async fn test_corrupt_cache_integrity_failure_is_quarantined() {
+        let data_dir = temp_dir("sito_corrupt_cache");
+        let list_name = "corrupt-cache";
+        let cache_path = cache_path_for_list(&data_dir, list_name);
+        let meta_path = meta_path_for_list(&data_dir, list_name);
+        let content = "0.0.0.0 one.example\n0.0.0.0 two.example\n";
+        save_to_cache(&cache_path, content).await.unwrap();
+        save_metadata(
+            &meta_path,
+            &ListMetadata {
+                // Record a longer body than the file actually contains.
+                content_len: Some(content.len() as u64 + 10),
+                line_count: Some(content.lines().count()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = load_cache_or(
+            &cache_path,
+            &meta_path,
+            list_name,
+            DEFAULT_MAX_LIST_BYTES,
+            false,
+            FilterError::InvalidUrl {
+                url: "http://example.invalid/list".to_string(),
+                reason: "simulated download failure".to_string(),
+            },
+        )
+        .await
+        .expect_err("a corrupt cache must not be served");
+        assert!(
+            matches!(err, FilterError::InvalidUrl { .. }),
+            "the original download error must be preserved: {err}"
+        );
+        assert!(
+            !cache_path.exists(),
+            "the corrupt cache file must be quarantined"
+        );
+        assert!(
+            !meta_path.exists(),
+            "the corrupt cache metadata must be quarantined"
+        );
+
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 

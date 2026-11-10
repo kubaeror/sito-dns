@@ -1725,9 +1725,10 @@ async fn init_tls_and_acme(
         let cert_path = service_cfg.storage_dir.join("cert.pem");
         let key_path = service_cfg.storage_dir.join("key.pem");
         let pair = (cert_path.exists() && key_path.exists()).then_some((cert_path, key_path));
-        let usable = pair.is_some()
-            && !service_cfg.is_bootstrap_cert()
-            && !service_cfg.stored_cert_is_expired();
+        // Fail closed on unreadable/unparseable material: a truncated
+        // certificate or key must never be selected and then abort startup in
+        // the TLS builder while a valid static pair is available.
+        let usable = pair.is_some() && service_cfg.stored_pair_is_usable();
         (pair, usable)
     } else {
         (None, false)
@@ -2712,6 +2713,70 @@ mod tests {
             TlsStartupMaterial::Pair(static_pair_value.0.clone(), static_pair_value.1.clone()),
             "with ACME disabled only static material is used"
         );
+    }
+
+    /// Regression (deferred D2): unparseable ACME material must not be
+    /// selected at startup. It must fall back to a valid static pair when one
+    /// exists, and otherwise take the bootstrap/renewal path instead of
+    /// passing the pair to the TLS builder (which would abort startup).
+    #[test]
+    fn test_unparseable_acme_material_falls_back_to_static_pair() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_truncated_startup_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let acme_cert = dir.join("cert.pem");
+        let acme_key = dir.join("key.pem");
+        std::fs::write(&acme_cert, b"-----BEGIN CERTIFICATE-----\ntruncated\n")
+            .expect("write truncated cert");
+        write_secret_file(&acme_key, b"not a private key").expect("write bad key");
+
+        let config = AcmeServiceConfig::new(
+            "admin@example.test".to_string(),
+            vec!["dns.example.test".to_string()],
+            dir.clone(),
+        );
+        assert!(
+            !config.stored_pair_is_usable(),
+            "truncated ACME material must never be considered usable"
+        );
+        assert!(
+            sito_transport::certificate_needs_renewal(&config),
+            "the renewal path must still run for truncated material"
+        );
+
+        let acme_pair = Some((acme_cert, acme_key));
+        let static_pair = Some((
+            PathBuf::from("/etc/sito/static-cert.pem"),
+            PathBuf::from("/etc/sito/static-key.pem"),
+        ));
+        let static_value = static_pair.clone().expect("static pair");
+        assert_eq!(
+            choose_tls_material(
+                static_pair.clone(),
+                acme_pair.clone(),
+                config.stored_pair_is_usable(),
+                true,
+                false
+            ),
+            TlsStartupMaterial::Pair(static_value.0.clone(), static_value.1.clone()),
+            "unparseable ACME material must not displace a valid static pair"
+        );
+        assert_eq!(
+            choose_tls_material(None, acme_pair.clone(), false, true, false),
+            TlsStartupMaterial::Disabled,
+            "ACME-only with unusable material is fail-closed without the opt-in"
+        );
+        assert_eq!(
+            choose_tls_material(None, acme_pair, false, true, true),
+            TlsStartupMaterial::GenerateBootstrap,
+            "the opt-in replaces unusable material with a fresh bootstrap pair"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Critical 1 regression: a CA-issued certificate with only ~5 days left

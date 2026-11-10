@@ -2030,6 +2030,13 @@ impl DnssecValidator {
     }
 
     /// Whether `name` is inside a zone proven to be an unsigned delegation.
+    ///
+    /// A configured non-root anchor island below that unsigned delegation
+    /// re-establishes trust at or below the anchor, so the parent's DS denial
+    /// must not classify names inside the island as Insecure. This mirrors the
+    /// anchor guard in [`Self::cached_unsigned_zone`], but is scoped to the
+    /// queried name: sibling names outside the island still legitimately use
+    /// the parent's unsigned proof.
     fn insecure_zone_covers(&self, name: &LowerName, now: u32) -> bool {
         if self.insecure_zones.len() > SIGNED_ZONE_MAX_ENTRIES {
             self.insecure_zones.retain(|_, expiry| *expiry >= now);
@@ -2037,9 +2044,22 @@ impl DnssecValidator {
                 self.insecure_zones.clear();
             }
         }
-        self.insecure_zones
-            .iter()
-            .any(|entry| *entry.value() >= now && entry.key().zone_of(name))
+        self.insecure_zones.iter().any(|entry| {
+            *entry.value() >= now
+                && entry.key().zone_of(name)
+                && !self.anchor_island_covers(entry.key(), name)
+        })
+    }
+
+    /// Whether a configured non-root anchor island at or below `unsigned_zone`
+    /// covers `name`, contradicting the cached unsigned delegation for that
+    /// name.
+    fn anchor_island_covers(&self, unsigned_zone: &LowerName, name: &LowerName) -> bool {
+        self.anchor_zones.iter().any(|entry| {
+            !entry.key().is_root()
+                && unsigned_zone.zone_of(entry.key())
+                && entry.key().zone_of(name)
+        })
     }
 
     /// Whether a configured non-root anchor is at or below the cached
@@ -7707,6 +7727,72 @@ mod tests {
             matches!(outcome, ValidationOutcome::Bogus { .. }),
             "a newly anchored zone must fail closed: {outcome:?}"
         );
+    }
+
+    /// Regression (deferred D2): a non-root anchor island below an
+    /// authenticated unsigned delegation must not be shadowed by the parent's
+    /// Insecure status. `cached_unsigned_zone` already honored the anchor, but
+    /// `insecure_zone_covers` did not, so a stripped response under the island
+    /// could take the Insecure shortcut without probing the anchor.
+    #[tokio::test]
+    async fn test_anchor_island_under_unsigned_delegation_is_not_insecure() {
+        let (_unsigned_parent, _parent_key, _parent_signer) = create_test_signer("signed.example.");
+        let unsigned_cut = Name::from_str("unsigned.signed.example.").expect("cut");
+        let (island_origin, island_key, island_signer) =
+            create_test_signer("island.unsigned.signed.example.");
+        let qname = Name::from_str("www.island.unsigned.signed.example.").expect("qname");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&island_key, LowerName::from(&island_origin));
+        // An earlier sibling query authenticated the parent-side DS denial for
+        // the unsigned delegation. The in-memory status survives until expiry.
+        validator
+            .insecure_zones
+            .insert(LowerName::from(&unsigned_cut), now.saturating_add(3600));
+        assert!(
+            !validator.insecure_zone_covers(&LowerName::from(&qname), now),
+            "the parent's unsigned status must not cover the anchored island"
+        );
+
+        // Sibling names outside the island still legitimately use the
+        // authenticated parent-side denial.
+        let sibling =
+            LowerName::from(&Name::from_str("www.unsigned.signed.example.").expect("sibling"));
+        assert!(
+            validator.insecure_zone_covers(&sibling, now),
+            "names outside the anchor island must remain Insecure"
+        );
+
+        // A stripped answer under the island must fail closed instead of
+        // being accepted as an unsigned delegation.
+        let in_zone = signed_nsec_response(
+            &island_origin,
+            &qname,
+            &nsec_next(&island_origin),
+            &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+            &qname,
+            &island_key,
+            &island_signer,
+            ResponseCode::NoError,
+        );
+        let fetcher = StaticFetcher::new()
+            .with(
+                &island_origin,
+                RecordType::DNSKEY,
+                anchored_dnskey_message(&island_origin, &island_key, &island_signer),
+            )
+            .with(&qname, RecordType::DS, in_zone);
+        let mut response = stripped_response(&qname);
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a stripped response under an anchored island must be Bogus: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
     }
 
     /// The `AddedAnchors` arm of `from_config_with_cache` must prune only the

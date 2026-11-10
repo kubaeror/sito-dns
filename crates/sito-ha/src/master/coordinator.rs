@@ -965,6 +965,31 @@ impl MasterCoordinator {
         notified
     }
 
+    /// Queues `msg` for `instance` and records its wire size in the per-slave
+    /// byte budget when the queue accepted it.
+    ///
+    /// Every non-broadcast send path (initial push, resync, catch-up repush)
+    /// must go through this helper so the coalesced-delivery budget reflects
+    /// all bytes queued for a slave, not only broadcast traffic.
+    fn try_queue_accounted(
+        &self,
+        instance: &str,
+        sender: &mpsc::Sender<HaMessage>,
+        msg: HaMessage,
+    ) -> Result<(), String> {
+        let wire_size = msg.to_json().map_or(0, |json| json.len());
+        // Hold the accounting lock across `try_send` and the increment: the
+        // session loop subtracts under the same lock, and releasing it in
+        // between would let the subtract observe the old value and turn the
+        // later increment into phantom bytes.
+        let mut queued = self.queued_bytes.lock().unwrap();
+        sender.try_send(msg).map_err(|e| e.to_string())?;
+        if wire_size > 0 {
+            *queued.entry(instance.to_string()).or_insert(0) += wire_size;
+        }
+        Ok(())
+    }
+
     /// Schedules at most one coalesced delivery task per slave.
     fn schedule_coalesced_delivery(&self, slave: &ActiveSlave, fallback_msg: &HaMessage) {
         let instance = slave.instance.clone();
@@ -1043,7 +1068,7 @@ impl MasterCoordinator {
         if let Some(push) = self.active_push.lock().unwrap().clone() {
             let slaves = self.slaves.lock().unwrap();
             if let Some(slave) = slaves.get(instance)
-                && let Err(e) = slave.sender.try_send(push)
+                && let Err(e) = self.try_queue_accounted(instance, &slave.sender, push)
             {
                 warn!(instance = %instance, "Catch-up push could not be queued: {e}");
             }
@@ -1327,7 +1352,7 @@ impl MasterCoordinator {
                 cur_v,
                 "Pushing current configuration bundle to newly connected slave"
             );
-            if let Err(e) = tx.try_send(push.clone()) {
+            if let Err(e) = self.try_queue_accounted(&slave_instance, &tx, push.clone()) {
                 warn!(instance = %slave_instance, "Initial HA push could not be queued: {e}");
             }
         }
@@ -1716,7 +1741,8 @@ impl MasterCoordinator {
                     let slaves = self.slaves.lock().unwrap();
                     if let Some(s) = slaves.get(slave_instance)
                         && s.connection_id == connection_id
-                        && let Err(e) = s.sender.try_send(push.clone())
+                        && let Err(e) =
+                            self.try_queue_accounted(slave_instance, &s.sender, push.clone())
                     {
                         warn!(instance = %slave_instance, "Resync push could not be queued: {e}");
                     }
@@ -2713,6 +2739,142 @@ mod tests {
             .expect("coalesced delivery timed out")
             .expect("channel closed");
         assert!(matches!(delivered, HaMessage::ConfigPush { .. }));
+    }
+
+    /// Regression (deferred D2): every non-broadcast send path must account
+    /// its bytes, and a rejected send must not inflate the budget.
+    #[tokio::test]
+    async fn test_try_queue_accounted_tracks_bytes_and_rejects_full_queue() {
+        let coordinator = test_coordinator();
+        let (tx, mut rx) = mpsc::channel::<HaMessage>(1);
+        let msg = HaMessage::Ping { ts: 7 };
+        let size = msg.to_json().unwrap().len();
+
+        coordinator
+            .try_queue_accounted("slave-1", &tx, msg.clone())
+            .expect("queue has room");
+        assert_eq!(
+            coordinator
+                .queued_bytes
+                .lock()
+                .unwrap()
+                .get("slave-1")
+                .copied(),
+            Some(size),
+            "a queued message must be accounted"
+        );
+
+        // The single-slot channel is full: a rejected send must not add bytes.
+        assert!(
+            coordinator
+                .try_queue_accounted("slave-1", &tx, msg.clone())
+                .is_err()
+        );
+        assert_eq!(
+            coordinator
+                .queued_bytes
+                .lock()
+                .unwrap()
+                .get("slave-1")
+                .copied(),
+            Some(size),
+            "a rejected send must not change the accounting"
+        );
+
+        let _ = rx.recv().await;
+        drop(rx);
+        // A closed channel must not add bytes either.
+        assert!(
+            coordinator
+                .try_queue_accounted("slave-1", &tx, msg)
+                .is_err()
+        );
+        assert_eq!(
+            coordinator
+                .queued_bytes
+                .lock()
+                .unwrap()
+                .get("slave-1")
+                .copied(),
+            Some(size)
+        );
+    }
+
+    /// Regression (deferred D2): a reconnecting instance used to inherit the
+    /// superseded session's `queued_bytes`, so the coalesced-delivery loop
+    /// could spin until phantom accounting cleared. Registration must reset it.
+    #[tokio::test]
+    async fn test_reconnect_resets_per_slave_queue_accounting() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+        let coordinator = test_coordinator();
+        // No active bundle: registration has nothing to enqueue, so any
+        // remaining value after registration is phantom accounting.
+        coordinator
+            .queued_bytes
+            .lock()
+            .unwrap()
+            .insert("slave-1".to_string(), MAX_SLAVE_QUEUE_BYTES);
+
+        let (server_socket, client_socket) = tokio::io::duplex(64 * 1024);
+        let server_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            server_socket,
+            Role::Server,
+            Some(WebSocketConfig::default()),
+        )
+        .await;
+        let mut client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            client_socket,
+            Role::Client,
+            Some(WebSocketConfig::default()),
+        )
+        .await;
+
+        let coord = coordinator.clone();
+        let session = tokio::spawn(async move {
+            coord
+                .handle_connection(server_ws, "127.0.0.1:1000".parse().unwrap())
+                .await;
+        });
+
+        let hello = HaMessage::Hello {
+            instance: "slave-1".to_string(),
+            have_version: 0,
+            have_term: 0,
+            capabilities: vec![],
+            token: None,
+            role: Some("slave".to_string()),
+            protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        };
+        client_ws
+            .send(WsMessage::Text(hello.to_json().unwrap().into()))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if coordinator.slaves.lock().unwrap().contains_key("slave-1") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the reconnecting session must register");
+
+        assert_eq!(
+            coordinator
+                .queued_bytes
+                .lock()
+                .unwrap()
+                .get("slave-1")
+                .copied(),
+            None,
+            "phantom accounting from the superseded session must be reset"
+        );
+
+        session.abort();
     }
 
     #[test]

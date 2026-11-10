@@ -137,29 +137,84 @@ impl AcmeServiceConfig {
     /// Total lifetime is deliberately not used: short-lived CA-issued
     /// certificates exist, and a CA-issued certificate must never be replaced
     /// by a self-signed placeholder.
+    ///
+    /// Missing, unreadable or unparseable material is treated as a bootstrap
+    /// placeholder. Such material cannot be a usable CA-issued certificate,
+    /// and reporting it as "not bootstrap" would let startup select it and
+    /// abort in the TLS builder even when a valid static pair exists.
     pub fn is_bootstrap_cert(&self) -> bool {
         if bootstrap_marker_path(&self.storage_dir).exists() {
             return true;
         }
         let Ok(cert_bytes) = std::fs::read(self.storage_dir.join("cert.pem")) else {
-            return false;
+            return true;
         };
-        is_self_signed(&cert_bytes)
+        // `is_self_signed` returns `None` for unparseable PEM/X.509 input;
+        // treat that as unusable rather than as a CA-issued certificate.
+        is_self_signed(&cert_bytes).unwrap_or(true)
     }
 
-    /// Whether the certificate currently stored for ACME is already expired.
+    /// Whether the certificate currently stored for ACME is already expired
+    /// or otherwise cannot be proven valid.
     ///
     /// An expired CA certificate must not be served, but it also must not be
     /// silently overwritten by a bootstrap certificate unless the operator
-    /// explicitly opted in.
+    /// explicitly opted in. Missing, unreadable or unparseable material is
+    /// reported as expired for the same reason: it must never be served.
     pub fn stored_cert_is_expired(&self) -> bool {
         let Ok(cert_bytes) = std::fs::read(self.storage_dir.join("cert.pem")) else {
-            return false;
+            return true;
         };
         // Compare seconds, not whole days: `days_until_expiration` truncates
         // toward zero, so a certificate that expired one hour ago still has a
         // day count of 0.
-        seconds_until_expiration(&cert_bytes).is_ok_and(|seconds| seconds <= 0)
+        match seconds_until_expiration(&cert_bytes) {
+            Ok(seconds) => seconds <= 0,
+            Err(_) => true,
+        }
+    }
+
+    /// Whether the stored ACME certificate/key pair can actually be served.
+    ///
+    /// Startup must never hand an unusable pair to the TLS builder: a single
+    /// truncated `cert.pem` or a malformed `key.pem` would otherwise abort the
+    /// whole process even when valid static `[tls]` material exists. This is
+    /// stricter than [`Self::is_bootstrap_cert`]/[`Self::stored_cert_is_expired`]
+    /// because it also parses the private key and verifies that the key belongs
+    /// to the certificate.
+    #[must_use]
+    pub fn stored_pair_is_usable(&self) -> bool {
+        let cert_path = self.storage_dir.join("cert.pem");
+        let key_path = self.storage_dir.join("key.pem");
+        if self.is_bootstrap_cert() || self.stored_cert_is_expired() {
+            return false;
+        }
+        let Ok(certs) = crate::tls::load_certificates(&cert_path) else {
+            warn!(
+                path = %cert_path.display(),
+                "Stored ACME certificate is unreadable or invalid; falling back to other TLS material"
+            );
+            return false;
+        };
+        let Ok(key) = crate::tls::load_private_key(&key_path) else {
+            warn!(
+                path = %key_path.display(),
+                "Stored ACME private key is unreadable or invalid; falling back to other TLS material"
+            );
+            return false;
+        };
+        match crate::tls::create_certified_key(certs, &key) {
+            Ok(_) => true,
+            Err(e) => {
+                warn!(
+                    cert = %cert_path.display(),
+                    key = %key_path.display(),
+                    error = %e,
+                    "Stored ACME certificate/key pair is unusable; falling back to other TLS material"
+                );
+                false
+            }
+        }
     }
 
     /// Determine the directory URL to use.
@@ -499,17 +554,17 @@ fn clear_bootstrap_marker(storage_dir: &Path) {
 }
 
 /// Whether the first certificate in `cert_pem` is self-signed.
-fn is_self_signed(cert_pem: &[u8]) -> bool {
-    let Ok(certs) = CertificateDer::pem_slice_iter(cert_pem).collect::<Result<Vec<_>, _>>() else {
-        return false;
-    };
-    let Some(first) = certs.first() else {
-        return false;
-    };
-    let Ok((_, x509)) = x509_parser::parse_x509_certificate(first.as_ref()) else {
-        return false;
-    };
-    x509.tbs_certificate.subject == x509.tbs_certificate.issuer
+///
+/// Returns `None` when the PEM or X.509 material cannot be parsed: callers
+/// must treat unparseable material as unusable, never as a trusted
+/// certificate.
+fn is_self_signed(cert_pem: &[u8]) -> Option<bool> {
+    let certs = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let first = certs.first()?;
+    let (_, x509) = x509_parser::parse_x509_certificate(first.as_ref()).ok()?;
+    Some(x509.tbs_certificate.subject == x509.tbs_certificate.issuer)
 }
 
 /// Whether the stored pair fingerprint matches the certificate and key files.
@@ -1370,7 +1425,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Critical regression: a legitimate CA certificate that is merely close
+    /// Regression (deferred D2): truncated ACME material used to be reported
+    /// as neither bootstrap nor expired, so startup selected it and the TLS
+    /// builder aborted even when a valid static pair existed. Unreadable or
+    /// unparseable material must be unusable.
+    #[test]
+    fn test_truncated_certificate_is_treated_as_unusable() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_truncated_{}_{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let (_, key_pem) = generate_ca_signed_cert("acme.example.com");
+        write_secret_file(&dir.join("key.pem"), key_pem.as_bytes()).expect("write key");
+        std::fs::write(
+            dir.join("cert.pem"),
+            b"-----BEGIN CERTIFICATE-----\nnot a certificate\n",
+        )
+        .expect("write truncated cert");
+
+        let config = AcmeServiceConfig::new(
+            "admin@example.com".into(),
+            vec!["acme.example.com".into()],
+            dir.clone(),
+        );
+        assert!(
+            config.is_bootstrap_cert(),
+            "unparseable material must never be treated as a CA-issued certificate"
+        );
+        assert!(
+            config.stored_cert_is_expired(),
+            "unparseable material must be treated as unusable, not valid"
+        );
+        assert!(
+            !config.stored_pair_is_usable(),
+            "the startup path must reject an unparseable pair"
+        );
+        assert!(
+            certificate_needs_renewal(&config),
+            "unparseable material must still trigger ACME issuance"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A valid certificate with an unparseable key must not be selected for
+    /// serving either: the TLS builder rejects the pair and startup would
+    /// abort.
+    #[test]
+    fn test_unparseable_key_is_not_usable() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_badkey_{}_{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let (cert_pem, _) = generate_ca_signed_cert("acme.example.com");
+        std::fs::write(dir.join("cert.pem"), cert_pem).expect("write cert");
+        write_secret_file(&dir.join("key.pem"), b"not a private key").expect("write key");
+
+        let config = AcmeServiceConfig::new(
+            "admin@example.com".into(),
+            vec!["acme.example.com".into()],
+            dir.clone(),
+        );
+        assert!(
+            !config.is_bootstrap_cert(),
+            "a valid CA certificate is not a bootstrap placeholder"
+        );
+        assert!(
+            !config.stored_cert_is_expired(),
+            "a valid CA certificate is not expired"
+        );
+        assert!(
+            !config.stored_pair_is_usable(),
+            "an unparseable private key makes the pair unusable"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A legitimate CA certificate that is merely close
     /// to expiry must still be treated as a real certificate. Its total
     /// lifetime is 90 days even though only 5 days remain.
     #[test]
