@@ -54,11 +54,10 @@ const DASHBOARD_CACHE_TTL: Duration = Duration::from_secs(45);
 /// Rows per transaction in the one-time legacy rollup PII backfill.
 const ROLLUP_PII_BACKFILL_BATCH: i64 = 1_000;
 
-/// One row-bounded retention chunk: hour range plus `(ts, id)` cursor bounds.
+/// One row-bounded retention chunk: hour plus `(ts, id)` cursor bounds.
 #[derive(Clone, Copy)]
 struct RetentionChunk {
-    start: i64,
-    end: i64,
+    hour: i64,
     lower: (i64, i64),
     upper: (i64, i64),
 }
@@ -1888,6 +1887,8 @@ impl StatsDb {
         let mut report = RetentionReport::default();
         let mut conn = self.pool.acquire().await?;
         Self::ensure_retention_temp_tables(&mut conn).await?;
+        // A previous failed sweep may have left rows on this pooled connection.
+        Self::clear_retention_temp_all(&mut conn).await?;
 
         // Find the next expired timestamp with an index seek (`MIN(ts)` over
         // `idx_ql_ts`), process that hour in row-bounded `(ts, id)` chunks, then
@@ -1901,7 +1902,9 @@ impl StatsDb {
                     .await?;
             let Some(next_ts) = next_ts else { break };
 
-            let hour = (next_ts / 3_600_000) * 3_600_000;
+            // `div_euclid` floors negative timestamps too, so a negative `ts`
+            // row cannot produce an hour bucket above the row and spin forever.
+            let hour = next_ts.div_euclid(3_600_000) * 3_600_000;
             let end = hour.saturating_add(3_600_000).min(cutoff);
             if end <= hour {
                 break;
@@ -1911,37 +1914,40 @@ impl StatsDb {
             // a heavy hitter that is not in any single chunk's top-N survives.
             Self::clear_retention_temp_hour(&mut conn, hour).await?;
 
+            // Snapshot the pre-sweep top lists once. Each chunk writes
+            // `pre_sweep + cumulative temp counts` (replacing the previous
+            // chunk's value), so writing every chunk is crash-safe without
+            // double counting.
+            let existing_rollups = load_existing_rollups(&mut conn, &[hour]).await?;
+            let existing_tops = existing_rollups.get(&hour).cloned().unwrap_or_default();
+
             let mut lower = (hour, 0i64);
             loop {
                 // The first `(ts, id)` row past this chunk, if any. The
                 // `(ts, id)` index supports this cursor without a temp B-tree.
+                let hour_upper = (end, i64::MIN);
                 let boundary: Option<(i64, i64)> = sqlx::query_as(
                     r"
                     SELECT ts, id FROM query_log INDEXED BY idx_ql_ts_id
-                    WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?)
+                    WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
                     ORDER BY ts ASC, id ASC
                     LIMIT 1 OFFSET ?
                     ",
                 )
-                .bind(hour)
-                .bind(end)
                 .bind(lower.0)
                 .bind(lower.1)
+                .bind(hour_upper.0)
+                .bind(hour_upper.1)
                 .bind(RETENTION_ROWS_PER_CHUNK)
                 .fetch_optional(&mut *conn)
                 .await?;
-                let (upper, done) =
-                    boundary.map_or(((end, i64::MIN), true), |cursor| (cursor, false));
+                let (upper, done) = boundary.map_or((hour_upper, true), |cursor| (cursor, false));
 
                 let deleted = self
                     .rollup_and_delete_chunk(
                         &mut conn,
-                        &RetentionChunk {
-                            start: hour,
-                            end,
-                            lower,
-                            upper,
-                        },
+                        &RetentionChunk { hour, lower, upper },
+                        &existing_tops,
                         done,
                         rollup_client_names,
                     )
@@ -2055,6 +2061,19 @@ impl StatsDb {
         ] {
             sqlx::query(sql).execute(&mut *conn).await?;
         }
+        Ok(())
+    }
+
+    async fn clear_retention_temp_all(conn: &mut SqliteConnection) -> Result<(), StatsError> {
+        sqlx::query("DELETE FROM retention_domain_counts")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("DELETE FROM retention_client_counts")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("DELETE FROM retention_upstream_counts")
+            .execute(&mut *conn)
+            .await?;
         Ok(())
     }
 
@@ -2297,22 +2316,18 @@ impl StatsDb {
         })
     }
 
-    /// Aggregates and deletes one row-bounded `(ts, id)` chunk. Top lists are
-    /// written only for the final chunk, using the full-hour lists computed
-    /// before any deletion.
+    /// Aggregates and deletes one row-bounded `(ts, id)` chunk. The exact
+    /// accumulated top lists are written on every chunk so a crash cannot lose
+    /// contributions from already-deleted rows.
     async fn rollup_and_delete_chunk(
         &self,
         conn: &mut SqliteConnection,
         chunk: &RetentionChunk,
+        existing_tops: &(Option<String>, Option<String>, Option<String>),
         final_hour: bool,
         rollup_client_names: bool,
     ) -> Result<u64, StatsError> {
-        let RetentionChunk {
-            start,
-            end,
-            lower,
-            upper,
-        } = *chunk;
+        let RetentionChunk { hour, lower, upper } = *chunk;
         // `BEGIN IMMEDIATE` takes the write lock up front so concurrent writers
         // wait instead of failing the aggregate/delete with `SQLITE_BUSY`.
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
@@ -2326,11 +2341,9 @@ impl StatsDb {
                 MAX(id) as max_id,
                 MAX(ts) as max_ts
             FROM query_log INDEXED BY idx_ql_ts_id
-            WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+            WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
             ",
         )
-        .bind(start)
-        .bind(end)
         .bind(lower.0)
         .bind(lower.1)
         .bind(upper.0)
@@ -2338,7 +2351,6 @@ impl StatsDb {
         .fetch_one(&mut *tx)
         .await?;
 
-        let hour = (start / 3_600_000) * 3_600_000;
         let queries: i64 = row.get::<Option<i64>, _>("queries").unwrap_or(0);
         let blocked: i64 = row.get::<Option<i64>, _>("blocked").unwrap_or(0);
         let cached: i64 = row.get::<Option<i64>, _>("cached").unwrap_or(0);
@@ -2353,7 +2365,7 @@ impl StatsDb {
             INSERT INTO retention_domain_counts (hour, qname, total, blocked)
             SELECT ?, qname, COUNT(*), SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END)
             FROM query_log INDEXED BY idx_ql_ts_id
-            WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+            WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
             GROUP BY qname
             ON CONFLICT(hour, qname) DO UPDATE SET
                 total = total + excluded.total,
@@ -2361,8 +2373,6 @@ impl StatsDb {
             ",
         )
         .bind(hour)
-        .bind(start)
-        .bind(end)
         .bind(lower.0)
         .bind(lower.1)
         .bind(upper.0)
@@ -2376,7 +2386,7 @@ impl StatsDb {
             SELECT ?, client_ip, COALESCE(MAX(client_name), ''), COUNT(*),
                    SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END), MAX(ts)
             FROM query_log INDEXED BY idx_ql_ts_id
-            WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+            WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
             GROUP BY client_ip
             ON CONFLICT(hour, client_ip) DO UPDATE SET
                 total = total + excluded.total,
@@ -2391,8 +2401,6 @@ impl StatsDb {
             ",
         )
         .bind(hour)
-        .bind(start)
-        .bind(end)
         .bind(lower.0)
         .bind(lower.1)
         .bind(upper.0)
@@ -2407,7 +2415,7 @@ impl StatsDb {
                    SUM(CASE WHEN rcode IS NOT NULL AND rcode != 0 THEN 1 ELSE 0 END),
                    SUM(COALESCE(elapsed_us, 0))
             FROM query_log INDEXED BY idx_ql_ts_id
-            WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+            WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
               AND upstream IS NOT NULL
             GROUP BY upstream
             ON CONFLICT(hour, upstream) DO UPDATE SET
@@ -2417,8 +2425,6 @@ impl StatsDb {
             ",
         )
         .bind(hour)
-        .bind(start)
-        .bind(end)
         .bind(lower.0)
         .bind(lower.1)
         .bind(upper.0)
@@ -2426,59 +2432,40 @@ impl StatsDb {
         .execute(&mut *tx)
         .await?;
 
-        if final_hour {
-            let tops = Self::load_temp_hour_tops(&mut tx, hour).await?;
-            let existing = load_existing_rollups(&mut tx, &[hour]).await?;
-            let existing = existing.get(&hour).cloned().unwrap_or_default();
-            let merged = self.merge_hour_rollup(existing, tops, rollup_client_names);
-            sqlx::query(
-                r"
-                INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients, top_upstreams)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(hour) DO UPDATE SET
-                    queries = queries + excluded.queries,
-                    blocked = blocked + excluded.blocked,
-                    cached = cached + excluded.cached,
-                    top_domains = excluded.top_domains,
-                    top_clients = excluded.top_clients,
-                    top_upstreams = excluded.top_upstreams
-                ",
-            )
-            .bind(hour)
-            .bind(queries)
-            .bind(blocked)
-            .bind(cached)
-            .bind(encode_tops(&merged.domains))
-            .bind(encode_tops(&merged.clients))
-            .bind(encode_tops(&merged.upstreams))
-            .execute(&mut *tx)
-            .await?;
-        } else {
-            sqlx::query(
-                r"
-                INSERT INTO stats_hourly (hour, queries, blocked, cached)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(hour) DO UPDATE SET
-                    queries = queries + excluded.queries,
-                    blocked = blocked + excluded.blocked,
-                    cached = cached + excluded.cached
-                ",
-            )
-            .bind(hour)
-            .bind(queries)
-            .bind(blocked)
-            .bind(cached)
-            .execute(&mut *tx)
-            .await?;
-        }
+        // Write the accumulated top lists on every chunk, not only the final
+        // one. If the process dies after a non-final chunk, the top-list
+        // contributions of the deleted rows are already durable; the next
+        // sweep merges the remaining rows into them.
+        let tops = Self::load_temp_hour_tops(&mut tx, hour).await?;
+        let merged = self.merge_hour_rollup(existing_tops.clone(), tops, rollup_client_names);
+        sqlx::query(
+            r"
+            INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients, top_upstreams)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(hour) DO UPDATE SET
+                queries = queries + excluded.queries,
+                blocked = blocked + excluded.blocked,
+                cached = cached + excluded.cached,
+                top_domains = excluded.top_domains,
+                top_clients = excluded.top_clients,
+                top_upstreams = excluded.top_upstreams
+            ",
+        )
+        .bind(hour)
+        .bind(queries)
+        .bind(blocked)
+        .bind(cached)
+        .bind(encode_tops(&merged.domains))
+        .bind(encode_tops(&merged.clients))
+        .bind(encode_tops(&merged.upstreams))
+        .execute(&mut *tx)
+        .await?;
 
         // Delete exactly the rows that were aggregated above (same predicate in
         // the same transaction).
         let del_res = sqlx::query(
-            "DELETE FROM query_log INDEXED BY idx_ql_ts_id WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?) AND (ts, id) < (?, ?)",
+            "DELETE FROM query_log INDEXED BY idx_ql_ts_id WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)",
         )
-        .bind(start)
-        .bind(end)
         .bind(lower.0)
         .bind(lower.1)
         .bind(upper.0)

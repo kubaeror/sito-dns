@@ -2168,13 +2168,13 @@ mod tests {
             r"
             EXPLAIN QUERY PLAN
             SELECT ts, id FROM query_log INDEXED BY idx_ql_ts_id
-            WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?)
+            WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
             ORDER BY ts ASC, id ASC LIMIT 1 OFFSET ?
             ",
         )
         .bind(0i64)
-        .bind(1i64)
         .bind(0i64)
+        .bind(1i64)
         .bind(0i64)
         .bind(5_000i64)
         .fetch_all(db.pool())
@@ -2185,6 +2185,29 @@ mod tests {
             .map(|row| row.get::<String, _>("detail"))
             .collect::<Vec<_>>()
             .join(" | ");
+        let bytecode = sqlx::query(
+            r"
+            EXPLAIN SELECT ts, id FROM query_log INDEXED BY idx_ql_ts_id
+            WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+            ORDER BY ts ASC, id ASC LIMIT 1 OFFSET ?
+            ",
+        )
+        .bind(0i64)
+        .bind(0i64)
+        .bind(1i64)
+        .bind(0i64)
+        .bind(5_000i64)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let opcodes: Vec<String> = bytecode
+            .iter()
+            .map(|row| row.get::<String, _>("opcode"))
+            .collect();
+        assert!(
+            opcodes.iter().any(|op| op == "SeekGE") && opcodes.iter().any(|op| op == "IdxGT"),
+            "chunk boundary must use a range seek on idx_ql_ts_id, not a full scan: {opcodes:?}"
+        );
         assert!(
             boundary_plan.contains("idx_ql_ts_id"),
             "chunk boundary must use idx_ql_ts_id: {boundary_plan}"
@@ -2198,11 +2221,9 @@ mod tests {
             r"
             EXPLAIN QUERY PLAN
             SELECT COUNT(*) FROM query_log INDEXED BY idx_ql_ts_id
-            WHERE ts >= ? AND ts < ? AND (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
+            WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)
             ",
         )
-        .bind(0i64)
-        .bind(1i64)
         .bind(0i64)
         .bind(0i64)
         .bind(1i64)
@@ -2219,6 +2240,36 @@ mod tests {
             aggregate_plan.contains("idx_ql_ts_id"),
             "chunk aggregate must use idx_ql_ts_id: {aggregate_plan}"
         );
+    }
+
+    /// Important 7: a large same-timestamp hour is still split into bounded
+    /// chunks by the `(ts, id)` cursor.
+    #[tokio::test]
+    async fn test_large_same_timestamp_hour_is_row_bounded() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let hour = ((now - 200 * 86_400_000) / 3_600_000) * 3_600_000;
+        let ts = hour + 1_234;
+        let mut entries = Vec::new();
+        for _ in 0..12_000 {
+            entries.push(retention_entry(ts, "same-ts.example", "allowed", None));
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let report = db
+            .cleanup_retention_with_policy(90, 365, false)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_records, 12_000);
+        assert_eq!(
+            report.chunks, 3,
+            "same-timestamp rows must still be split into 5,000-row chunks"
+        );
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_log")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     /// Important regression: a heavy hitter spread across many chunks must not

@@ -443,7 +443,13 @@ anonymize_querylog = false
 > rollups are hashed once on startup by the database backfill; existing raw
 > `query_log` rows are not retroactively anonymized. `sito clear-query-log`
 > takes the service lease and refuses a running server unless `--force` is
-> given.
+> given. Retention accumulates exact per-hour counts in per-connection SQLite
+> temp tables; those temp rows can transiently contain raw client IPs during a
+> sweep and are cleared at sweep start and after each hour. Top lists are
+> merged into `stats_hourly` after every chunk, so a crash after a chunk keeps
+> the contributions of already-deleted rows. The final per-hour top-N sort runs
+> inside the chunk transaction and can be expensive for a pathological hour
+> with very many distinct domains/clients.
 
 > Query logging is always enabled when `[stats]` is present. Prometheus metrics
 > are exposed at `/metrics` and require a Viewer-or-higher bearer token or
@@ -650,7 +656,7 @@ and `POST /api/v1/config/reload`.
 | `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
 | `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |
 | `privacy.anonymize_querylog` | Query-log writer updated. |
-| `stats.retention_days`, `stats.rollup_retention_days`, `stats.rollup_client_names` | Re-read on the next retention sweep (every 24 h). |
+| `stats.retention_days`, `stats.rollup_retention_days`, `stats.rollup_client_names` | Re-read at each retention sweep: a bounded catch-up on startup (within 5 minutes) and every 24 h thereafter. |
 
 ### 16.2 Requires a restart
 

@@ -237,6 +237,9 @@ filter status); existing clients ignore unknown fields.
    configured, include the LAN IP/hostname in the SAN.
 7. **No data migration is required.** Existing configs, SQLite databases,
    sessions/tokens, and HA state files load; additive fields default safely.
+   The first stats DB open after upgrade synchronously builds the additive
+   `idx_ql_ts_id` index; a very large `query_log` can make that first startup
+   take longer.
 8. **Pin releases.** Use `SITO_VERSION=1.9.4`/tag-pinned installer scripts and
    the `1.9.4` image tag instead of mutable `main`/`latest` in production.
 
