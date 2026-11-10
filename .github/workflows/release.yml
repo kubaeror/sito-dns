@@ -268,7 +268,7 @@ jobs:
     name: Verify release artifacts
     needs: [sbom-and-release]
     # The release is still a draft here, and drafts are only visible to tokens
-    # with write access, so `gh release download` needs contents: write.
+    # with write access, so `gh release download` needs a write-capable token.
     permissions:
       contents: write
     uses: ./.github/workflows/artifact-e2e.yml

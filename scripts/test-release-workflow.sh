@@ -86,7 +86,7 @@ expect_job_match "${RELEASE}" "publish-release" 'gh release edit' "publish job e
 expect_job_match "${RELEASE}" "publish-release" '\-\-draft=false' "publish job flips the draft"
 expect_job_match "${RELEASE}" "publish-release" 'contents: write' "publish job can publish the release"
 expect_job_absent "${RELEASE}" "publish-release" 'continue-on-error' "release publication cannot continue on error"
-expect_job_match "${RELEASE}" "artifact-e2e" 'contents: write' "artifact E2E can read the staged draft"
+expect_job_match "${RELEASE}" "artifact-e2e" '^      contents: write$' "artifact E2E can read the staged draft"
 expect_match "${ARTIFACT_E2E}" '^  contents: write' "artifact E2E workflow requests draft access"
 expect_match "${ARTIFACT_E2E}" 'could not remove.*cannot overwrite digest' "image removal failure is reported"
 

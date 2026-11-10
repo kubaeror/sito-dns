@@ -29,8 +29,10 @@ Consequences:
 - A tag whose commit is not on the required release branch, or whose CI or
   `cargo-deny` check is missing/red, fails in `release-gate` before any artifact
   is built.
-- A failed signature, SBOM, download, checksum, or artifact E2E check stops the
-  workflow before the image is built; the staged release remains a draft.
+- A failed download, checksum, or artifact E2E check stops the workflow before
+  the image is built; the staged release remains a draft. A failed signature or
+  SBOM generation fails earlier in `sbom-and-release`, before the draft is
+  created.
 - A HIGH/CRITICAL image vulnerability or a missing image signature fails
   `docker-build-push`, and the staged release remains a draft.
 - `docker-build-push` and `publish-release` are blocking. Neither is optional
@@ -228,10 +230,13 @@ Expected: both checksum checks print `OK`, `cosign verify-blob` prints
 - **`verify-tag` failed**: nothing was published. Delete the incorrect tag and
   push a tag that matches `Cargo.toml`, or bump the workspace version. Never
   reuse a tag that already produced release assets.
-- **A release/signature/SBOM verification failed**: nothing reaches
-  `docker-build-push`, so no image is published and the staged release stays a
-  draft. Fix the cause and use a new tag (for example a new patch or prerelease
-  suffix).
+- **A download, checksum, or artifact E2E verification failed**: nothing
+  reaches `docker-build-push`, so no image is published and the staged release
+  stays a draft. Fix the cause and use a new tag (for example a new patch or
+  prerelease suffix).
+- **A signature or SBOM generation failed**: the failure is in
+  `sbom-and-release`, before the draft is created, so nothing is published at
+  all. Fix the cause and use a new tag.
 - **Post-push verification failed**: the image may already be in GHCR, but the
   workflow is red and the release stays a draft. Treat the image as unpublished:
   remove the affected tag(s)/digest from GHCR, fix the problem, and publish

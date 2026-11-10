@@ -1,13 +1,13 @@
 name: Artifact E2E
 
-# Verifies an already-published release end to end: the unified checksum file,
-# the cosign keyless signature identity, and that every packaged binary accepts
-# the configuration shipped inside its archive.
+# Verifies a staged release end to end: the unified checksum file, the cosign
+# keyless signature identity, and that every packaged binary accepts the
+# configuration shipped inside its archive.
 #
-# - `workflow_call`: invoked by release.yml after the tag-only release has been
-#   published. It is a job in that workflow rather than a `release: published`
-#   trigger because GitHub does not start workflows for releases created with
-#   the repository's GITHUB_TOKEN.
+# - `workflow_call`: invoked by release.yml while the release is still a draft,
+#   before publish-release flips it public. It is a job in that workflow rather
+#   than a `release: published` trigger because GitHub does not start workflows
+#   for releases created with the repository's GITHUB_TOKEN.
 # - `workflow_dispatch`: re-verify any existing release without publishing.
 on:
   workflow_call:

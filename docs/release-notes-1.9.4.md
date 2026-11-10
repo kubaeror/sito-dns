@@ -265,8 +265,9 @@ filter status); existing clients ignore unknown fields.
    The first stats DB open after upgrade synchronously builds the additive
    `idx_ql_ts_id` index; a very large `query_log` can make that first startup
    take longer.
-8. **Pin releases.** Use `SITO_VERSION=1.9.4`/tag-pinned installer scripts and
-   the `1.9.4` image tag instead of mutable `main`/`latest` in production.
+8. **Pin releases.** Use `SITO_VERSION=1.9.4`/tag-pinned installer scripts
+   instead of mutable `main`/`latest` in production. No 1.9.4 container image
+   was published; use the `1.9.5` image once it is available.
 
 ## Stats privacy, retention, and polling
 
