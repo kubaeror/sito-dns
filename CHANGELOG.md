@@ -5,6 +5,39 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [1.9.5] - 2026-11-10
+
+Release-engineering patch. There are no runtime, configuration, API, database,
+or HA changes; 1.9.5 is functionally identical to 1.9.4. It fixes the
+multi-platform artifact E2E failure so the release pipeline publishes the
+container image that the v1.9.4 run skipped. The 1.9.4 release assets remain
+valid. See the [1.9.5 release notes](docs/release-notes-1.9.5.md).
+
+### Fixed
+- **Artifact E2E works across platforms.** The shipped-configuration check runs
+  each archive in the digest-pinned distroless runtime image for
+  `linux/amd64`, `linux/arm64`, and `linux/arm/v7`. Docker keeps a single local
+  reference per digest, so after the first platform's pull the next
+  `--platform` pull failed with `cannot overwrite digest`. The loop now removes
+  the local image after each platform's `--version` and `check-config` runs,
+  forcing a fresh pull for the next platform while keeping `RUNTIME_IMAGE`
+  digest-pinned.
+- **The container image is published again.** `docker-build-push` depends on
+  `artifact-e2e`, so the v1.9.4 E2E failure skipped the image job. With the E2E
+  fix, 1.9.5 publishes the multi-arch image with its scan, signature, and
+  attestations.
+
+### Upgrade notes
+- No action is required. Configuration, databases, sessions, HA state, and API
+  contracts are unchanged from 1.9.4.
+- Operators already on 1.9.4 do not need to upgrade for product behavior.
+  Upgrade if you want a fully green tag-triggered release pipeline and a
+  published `1.9.5` container image.
+- The 1.9.4 release artifacts and image remain valid; 1.9.5 only fixes the
+  release tooling.
+
+---
+
 ## [1.9.4] - 2026-11-10
 
 Phase 0 safety-gate security patch. Closes the release-blocking P0 and directly

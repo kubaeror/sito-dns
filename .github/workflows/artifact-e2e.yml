@@ -182,4 +182,10 @@ jobs:
               --entrypoint "/assets/${dir}/sito" \
               -v "${PWD}:/assets:ro" \
               "${RUNTIME_IMAGE}" check-config --config "/assets/${dir}/config.example.toml"
+            # The image is referenced by digest, and Docker keeps a single
+            # local reference per digest. Without removing it, the next
+            # --platform pull fails with "cannot overwrite digest"; drop the
+            # local image so the next platform can be pulled while
+            # RUNTIME_IMAGE stays digest-pinned.
+            docker image rm "${RUNTIME_IMAGE}" >/dev/null 2>&1 || true
           done <<< "${TARGETS}"

@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v1.9.4**.
+This document is the exhaustive configuration reference for **sito v1.9.5**.
 
 `sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the `DNSD_SECRET_<name>` environment variable, then a bare `<name>` environment variable; there is no on-disk local secret store, and a placeholder that cannot be resolved rejects the whole pushed configuration.
 
@@ -82,7 +82,7 @@ allow_plaintext_doh = false
 | `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
 > [!WARNING]
-> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 1.9.4 has **no DNS client allow-list**.
+> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 1.9.5 has **no DNS client allow-list**.
 > `rate_limit_per_ip` only limits rate; it does not authorize clients. A wildcard bind therefore accepts recursive queries from any source
 > that can reach the host. Restrict the DNS ports to your LAN with a host
 > firewall, or bind specific LAN addresses. The server emits a startup warning
@@ -358,7 +358,7 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 > the UI is reachable beyond loopback unless an `https://` `web.public_url` (or
 > `web.tls_terminated_by_proxy = true` with no public URL) declares a TLS
 > reverse proxy. For remote access, bind `web.bind = "127.0.0.1"` and use an SSH
-> tunnel or reverse proxy. The loopback default is planned for 1.10.0; 1.9.4
+> tunnel or reverse proxy. The loopback default is planned for 1.10.0; 1.9.5
 > keeps the historical default so existing configurations keep working.
 
 
