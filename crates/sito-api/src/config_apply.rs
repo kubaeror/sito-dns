@@ -21,26 +21,64 @@ use crate::config_writer::save_config_document_atomic;
 use crate::error::ProblemDetails;
 use crate::state::ServerContext;
 use sito_core::config::Config;
-use sito_upstream::BootstrapResolver;
+use sito_filter::PreparedFilterSnapshot;
+use sito_runtime::{ApplyError, ApplyPlan, DnssecPolicy, RuntimeGeneration, TransportPolicy};
+use sito_upstream::{BootstrapResolver, PreparedUpstream};
+use std::any::Any;
 use std::sync::Arc;
 
-/// Future returned by [`ConfigApplyHooks::apply`] (boxed so the trait stays
-/// object-safe without an extra macro dependency in the server binary).
+/// Future returned by the apply hooks (boxed so the trait stays object-safe
+/// without an extra macro dependency in the server binary).
 pub type ApplyFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProblemDetails>> + Send + 'a>>;
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ApplyError>> + Send + 'a>>;
+
+/// Future returned by [`ConfigApplyHooks::prepare`].
+pub type PrepareFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<PreparedHooks, ApplyError>> + Send + 'a>,
+>;
+
+/// Hook-owned components prepared for a staged apply but not yet live.
+///
+/// `commit` is opaque to `sito-api` so the server binary can carry DNSSEC,
+/// per-client upstream, rate-limiter and listener state without the API crate
+/// depending on every transport type. It is typed as `Any` only for
+/// downcasting in the single implementation; it is never inspected here.
+pub struct PreparedHooks {
+    /// DNSSEC policy and validator the plan publishes.
+    pub dnssec_policy: DnssecPolicy,
+    /// Opaque, fully prepared commit payload.
+    pub commit: Box<dyn Any + Send + Sync>,
+}
+
+impl std::fmt::Debug for PreparedHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedHooks")
+            .field("dnssec_policy", &self.dnssec_policy)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Components owned by the server binary rather than [`ServerContext`]
 /// (DNSSEC validator, per-client scoped upstreams, rate limiters, DNS listener
 /// rebind, log level). Implemented in `crates/sito/src/server.rs` and shared
 /// with the API through an axum `Extension`.
+///
+/// `prepare` must not change any live component; `commit` installs the
+/// prepared state and is the only fallible step that may still reject the
+/// apply (for example a listener cannot rebind). Neither method publishes the
+/// runtime snapshot: [`sito_runtime::RuntimeState::apply`] is the only writer.
 pub trait ConfigApplyHooks: Send + Sync {
-    /// Applies the hook-owned components for `cfg`. Returning an error makes
-    /// the whole apply fail and triggers a rollback.
-    fn apply<'a>(
+    /// Prepares the hook-owned components for `cfg`/`clients` without
+    /// publishing them.
+    fn prepare<'a>(
         &'a self,
         cfg: &'a Config,
         clients: &'a sito_clients::ClientsConfig,
-    ) -> ApplyFuture<'a>;
+    ) -> PrepareFuture<'a>;
+
+    /// Installs the prepared components. Called only after every other stage
+    /// succeeded and before the runtime snapshot is published.
+    fn commit(&self, prepared: PreparedHooks) -> ApplyFuture<'_>;
 }
 
 /// Router extension carrying the optional apply hooks. `None` in unit tests
@@ -198,8 +236,25 @@ pub async fn apply_full_config(
     apply_full_config_locked(ctx, candidate, filter_apply, hooks).await
 }
 
+/// Fully staged apply: every component was validated/prepared and no live
+/// state has changed yet.
+struct StagedApply {
+    plan: ApplyPlan,
+    prepared_filter: PreparedFilterSnapshot,
+    prepared_upstream: PreparedUpstream,
+    prepared_hooks: Option<PreparedHooks>,
+    /// Generation observed before staging; `apply_expecting` rejects the plan
+    /// if a concurrent writer published in between.
+    expected: RuntimeGeneration,
+}
+
 /// Apply implementation that must be called with [`ServerContext::apply_lock`]
 /// already held.
+///
+/// WP-1.4: nothing is published until every stage succeeded. The only
+/// fallible commit step is the hook-owned listener rebind, which runs before
+/// the runtime snapshot store; a failure there leaves the previous generation
+/// (`ctx.runtime.snapshot()`) untouched.
 async fn apply_full_config_locked(
     ctx: &ServerContext,
     candidate: &Config,
@@ -209,25 +264,73 @@ async fn apply_full_config_locked(
     validate_full_config(candidate)?;
 
     let previous = (**ctx.config.load()).clone();
+    // Box both large stages so an admin handler's future stays small. The
+    // staged plan owns the compiled filter and upstream generation; keeping it
+    // in the caller's async state would balloon every handler future.
+    let staged = Box::pin(stage_config(ctx, candidate, filter_apply, hooks)).await?;
+    Box::pin(commit_staged(ctx, staged, hooks, previous, candidate)).await
+}
 
-    match apply_inner(ctx, candidate, filter_apply, hooks).await {
-        Ok(()) => Ok(AppliedReport {
-            restart_required: restart_required_fields(&previous, candidate),
-            ha_publish: None,
-        }),
+/// Commits a fully staged plan: hook-owned components, upstream generation,
+/// then the single runtime snapshot publish.
+async fn commit_staged(
+    ctx: &ServerContext,
+    staged: StagedApply,
+    hooks: Option<&dyn ConfigApplyHooks>,
+    previous: Config,
+    candidate: &Config,
+) -> Result<AppliedReport, ProblemDetails> {
+    let StagedApply {
+        plan,
+        prepared_filter,
+        prepared_upstream,
+        prepared_hooks,
+        expected,
+    } = staged;
+    let anonymize = plan.config.privacy.anonymize_querylog;
+
+    // The generation check and every commit run inside
+    // `RuntimeState::apply_expecting_with`'s critical section. A filter refresh
+    // cannot advance the config generation, and another config apply cannot
+    // interleave, so a conflict can no longer be reported after the listener
+    // rebind or upstream publish.
+    let before_publish = async {
+        if let (Some(hooks), Some(prepared)) = (hooks, prepared_hooks) {
+            // Listener rebind is the only fallible higher-layer step. It runs
+            // first; DNSSEC/scoped-upstream installs after it are infallible.
+            hooks.commit(prepared).await?;
+        }
+        // Upstream publication is infallible (all construction/validation was
+        // staged).
+        ctx.upstream.publish(prepared_upstream);
+        Ok(())
+    };
+    let _generation = ctx
+        .runtime
+        .apply_expecting_with(plan, Some(expected), before_publish)
+        .await
+        .map_err(problem_from_apply)?;
+
+    // Publish the filter to the engine for status/API/scheduled-refresh
+    // bookkeeping. The query path already reads the snapshot published above,
+    // so this cannot tear a query. The prepared guard is still held here, so a
+    // refresh cannot publish an older filter in between.
+    match ctx.filter.publish_prepared(prepared_filter) {
+        Ok(rule_count) => ctx.metrics.set_filter_rules(rule_count),
         Err(e) => {
-            // Roll the components applied so far back to the previous
-            // configuration, using the same filter mode as the failed apply.
-            // Best effort: a failed rollback is logged loudly.
-            if let Err(rollback_err) = apply_inner(ctx, &previous, filter_apply, hooks).await {
-                tracing::error!(
-                    error = %rollback_err.detail,
-                    "Failed to roll back configuration apply; runtime may be partially updated"
-                );
-            }
-            Err(e)
+            tracing::error!(
+                error = %e,
+                "Applied runtime generation, but the filter engine rejected the staged snapshot"
+            );
+            ctx.metrics.set_filter_rules(ctx.filter.rule_count());
         }
     }
+    ctx.querylog_sender.set_anonymize(anonymize);
+
+    Ok(AppliedReport {
+        restart_required: restart_required_fields(&previous, candidate),
+        ha_publish: None,
+    })
 }
 
 /// Applies `candidate` and persists it only after the apply succeeded. A
@@ -540,83 +643,110 @@ pub async fn apply_config_document_event(
     }
 }
 
-async fn apply_inner(
+/// Stages every component for `candidate` without changing live state.
+async fn stage_config(
     ctx: &ServerContext,
-    cfg: &Config,
+    candidate: &Config,
     filter_apply: FilterApply,
     hooks: Option<&dyn ConfigApplyHooks>,
-) -> Result<(), ProblemDetails> {
-    // 1. Upstream manager: constructing it validates every configured server
-    //    (including per-domain scopes) before anything is swapped.
-    let bootstrap = BootstrapResolver::from_config(&cfg.upstream);
-    ctx.upstream
-        .reload(&cfg.upstream, &bootstrap)
+) -> Result<StagedApply, ProblemDetails> {
+    let expected = ctx.runtime.generation();
+
+    // Typed dependent-crate sections are validated by the single validator
+    // (`validate_full_config` above); here they are converted for the plan.
+    let clients = clients_from_config(candidate)?;
+    let rewrites = rewrites_from_config(candidate)?;
+
+    // Filter: compile/fetch on a staging engine. On failure the live snapshot
+    // and status are untouched and the apply returns before any publish.
+    let prepared_filter = match filter_apply {
+        FilterApply::Sync => {
+            ctx.filter
+                .prepare_with_groups(
+                    &candidate.filtering,
+                    Some(sito_runtime::group_rule_sets(&clients)),
+                )
+                .await
+        }
+        FilterApply::Deferred => {
+            ctx.filter
+                .prepare_current_with_groups(Some(sito_runtime::group_rule_sets(&clients)))
+                .await
+        }
+    };
+    if let Some(error) = prepared_filter.error.as_ref() {
+        return Err(ProblemDetails::internal_error(format!(
+            "Failed to apply filter configuration: {error}"
+        )));
+    }
+
+    // Upstream: construct and validate every server (including per-domain
+    // scopes) into a prepared manager that is not live yet.
+    let bootstrap = BootstrapResolver::from_config(&candidate.upstream);
+    let prepared_upstream = ctx
+        .upstream
+        .prepare(&candidate.upstream, &bootstrap)
         .await
-        .map_err(|e| ProblemDetails::bad_request(format!("Invalid upstream configuration: {e}")))?;
+        .map_err(|e| problem_from_apply(ApplyError::Upstream(e)))?;
 
-    let clients = clients_from_config(cfg)?;
-    let rewrites = rewrites_from_config(cfg)?;
-
-    // Capture the DNSSEC policy before the runtime snapshot is replaced; the
-    // comparison below must be against the live pre-apply configuration.
-    let previous_dnssec = ctx.config.load().dns.dnssec.clone();
-
-    // 2. Publish the coherent runtime snapshot (config/clients/rewrites) and
-    //    cache policy BEFORE the filter engine becomes active. Queries may
-    //    briefly see the new config with the old filter snapshot (safe: the
-    //    filter reload then installs the matching rules), but must never see
-    //    the old config with the new filter snapshot.
-    ctx.cache.update_config(cfg.dns.cache.clone()).await;
-    ctx.querylog_sender
-        .set_anonymize(cfg.privacy.anonymize_querylog);
-    let current_clients = ctx.clients.load();
-    let clients_registry = sito_clients::ClientRegistry::with_stores(
-        clients.clone(),
-        current_clients.routeros_leases_store(),
-        current_clients.unidentified_store(),
+    // Hook-owned components: DNSSEC validator, scoped upstreams, listener
+    // plan. Prepare must not mutate anything.
+    let prepared_hooks = match hooks {
+        Some(hooks) => Some(
+            hooks
+                .prepare(candidate, &clients)
+                .await
+                .map_err(problem_from_apply)?,
+        ),
+        None => None,
+    };
+    let dnssec_policy = prepared_hooks.as_ref().map_or_else(
+        || DnssecPolicy::from_config(&candidate.dns.dnssec),
+        |p| p.dnssec_policy.clone(),
     );
-    drop(current_clients);
-    ctx.runtime.replace(sito_runtime::RuntimeSnapshot {
-        config: Arc::new(cfg.clone()),
-        clients: Arc::new(clients_registry),
-        rewrites: Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
-    });
 
-    // 3. Hook-owned components (DNSSEC, scoped upstreams, rate limiters,
-    //    listener rebind, log level). A failure here is rolled back by the
-    //    caller; the filter engine has not been touched yet.
-    if let Some(hooks) = hooks {
-        hooks.apply(cfg, &clients).await?;
+    let plan = ApplyPlan {
+        config: candidate.clone(),
+        clients,
+        rewrites,
+        filter: Some(Arc::clone(&prepared_filter.snapshot)),
+        group_filters: Arc::clone(&prepared_filter.group_snapshots),
+        dnssec_policy,
+        cache_policy: candidate.dns.cache.clone(),
+        transport_policy: TransportPolicy::from(candidate),
+    };
+
+    Ok(StagedApply {
+        plan,
+        prepared_filter,
+        prepared_upstream,
+        prepared_hooks,
+        expected,
+    })
+}
+
+/// Maps an apply error to the REST problem document.
+pub(crate) fn problem_from_apply(error: ApplyError) -> ProblemDetails {
+    match error {
+        ApplyError::Validation(e) => {
+            ProblemDetails::bad_request(format!("Configuration error: {e}"))
+        }
+        ApplyError::Upstream(e) => {
+            ProblemDetails::bad_request(format!("Invalid upstream configuration: {e}"))
+        }
+        ApplyError::Filter(e) => {
+            ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
+        }
+        ApplyError::Tls(e) => {
+            ProblemDetails::internal_error(format!("Failed to prepare TLS/listeners: {e}"))
+        }
+        ApplyError::Internal(reason) => {
+            ProblemDetails::internal_error(format!("Configuration apply failed: {reason}"))
+        }
+        ApplyError::GenerationConflict { expected, actual } => ProblemDetails::conflict(format!(
+            "configuration generation changed while the write was staged (expected {expected}, current {actual}); retry the write"
+        )),
     }
-
-    // A DNSSEC mode/validate/anchor/NTA change invalidates every cached
-    // validation decision. The hook above already installed the new validator;
-    // advancing the cache policy epoch immediately makes every old entry
-    // invisible and rejects inserts from queries that captured the old epoch
-    // before the swap. Do this before the filter reload so no query can serve
-    // an old-policy validation decision after the validator swap.
-    if previous_dnssec != cfg.dns.dnssec {
-        ctx.cache.advance_policy_epoch();
-        ctx.cache.flush();
-    }
-
-    // 4. Filter engine last (unless the caller queues the list fetch), so the
-    //    filter snapshot always corresponds to an already-published runtime
-    //    configuration. A reload failure keeps the previous snapshot and
-    //    causes the caller to roll the runtime snapshot back.
-    if filter_apply == FilterApply::Sync {
-        ctx.filter
-            .reload_with_config(&cfg.filtering)
-            .await
-            .map_err(|e| {
-                ProblemDetails::internal_error(format!("Failed to apply filter configuration: {e}"))
-            })?;
-        ctx.metrics.set_filter_rules(ctx.filter.rule_count());
-        // Filter rules changed: drop cached answers that may now be blocked.
-        ctx.cache.flush();
-    }
-
-    Ok(())
 }
 
 fn clients_from_config(cfg: &Config) -> Result<sito_clients::ClientsConfig, ProblemDetails> {
@@ -648,21 +778,74 @@ pub fn queue_filter_refresh(
     let engine = ctx.filter.clone();
     let metrics = ctx.metrics.clone();
     let cache = ctx.cache.clone();
+    let runtime = ctx.runtime.clone();
     tokio::spawn(async move {
-        match engine.reload_with_config(&filtering).await {
+        // Capture the generation the caller's `filtering` value belongs to
+        // before staging. The helper re-checks both the generation and the
+        // filtering config after acquiring the engine guard: an apply that
+        // committed before this task started makes the refresh stale even
+        // though the generation read here is already the new one.
+        let expected = runtime.generation();
+        match apply_filter_refresh(&engine, &runtime, &filtering, expected).await {
             Ok(_) => {
-                metrics.set_filter_rules(engine.rule_count());
                 cache.flush();
+                metrics.set_filter_rules(engine.rule_count());
                 tracing::info!("Background blocklist refresh completed");
             }
-            Err(e) => {
+            Err(ApplyError::GenerationConflict { .. }) => {
+                tracing::debug!(
+                    "Discarding a background blocklist refresh compiled for an older configuration"
+                );
+            }
+            Err(error) => {
                 tracing::error!(
                     "Background blocklist refresh failed; the filter engine keeps its previous \
-                     snapshot: {e}"
+                     snapshot: {error}"
                 );
             }
         }
     })
+}
+
+/// Stages and publishes one filter refresh, tied to `expected` (the config
+/// generation the caller captured together with `filtering`).
+///
+/// Both the generation **and** the filtering configuration are re-checked after
+/// the engine guard is acquired. A refresh whose `filtering` value came from an
+/// older config therefore cannot overwrite the newer generation's filter, even
+/// when its own generation read happened after that apply committed.
+pub(crate) async fn apply_filter_refresh(
+    engine: &sito_filter::HostsFilterEngine,
+    runtime: &sito_runtime::RuntimeState,
+    filtering: &sito_core::config::FilteringConfig,
+    expected: RuntimeGeneration,
+) -> Result<usize, ApplyError> {
+    let mut prepared = engine.prepare(filtering).await;
+
+    // The prepared value holds the engine reload guard. While it is held no
+    // config apply can stage/publish a new filter, so this check is stable.
+    let live = runtime.snapshot();
+    if live.generation != expected || &live.config.filtering != filtering {
+        // Dropping `prepared` releases the guard without publishing either the
+        // engine state or the runtime snapshot.
+        return Err(ApplyError::GenerationConflict {
+            expected,
+            actual: live.generation,
+        });
+    }
+
+    if let Some(error) = prepared.error.take() {
+        // Keep the previous rules; publish the failure status only.
+        let _ = engine.publish_prepared(prepared);
+        return Err(ApplyError::Filter(error));
+    }
+
+    let snapshot = prepared.snapshot.clone();
+    let groups = prepared.group_snapshots.clone();
+    runtime.publish_filter(Some(snapshot), groups, expected)?;
+    engine
+        .publish_prepared(prepared)
+        .map_err(ApplyError::Filter)
 }
 
 /// Settings that are only read at process start; changing them needs a
@@ -1330,30 +1513,38 @@ acme_enabled = false
     }
 
     impl ConfigApplyHooks for RuntimeProbeHook {
-        fn apply<'a>(
+        fn prepare<'a>(
             &'a self,
-            _cfg: &'a Config,
+            cfg: &'a Config,
             _clients: &'a sito_clients::ClientsConfig,
-        ) -> ApplyFuture<'a> {
+        ) -> PrepareFuture<'a> {
             Box::pin(async move {
+                // A prepare stage must observe the previous generation.
                 self.seen_filter_enabled.store(
                     self.runtime.snapshot().config.filtering.enabled,
                     std::sync::atomic::Ordering::SeqCst,
                 );
                 if self.fail {
-                    return Err(ProblemDetails::internal_error("injected hook failure"));
+                    return Err(ApplyError::Internal("injected hook failure".to_string()));
                 }
-                Ok(())
+                Ok(PreparedHooks {
+                    dnssec_policy: DnssecPolicy::from_config(&cfg.dns.dnssec),
+                    commit: Box::new(()),
+                })
             })
+        }
+
+        fn commit(&self, _prepared: PreparedHooks) -> ApplyFuture<'_> {
+            Box::pin(async { Ok(()) })
         }
     }
 
-    /// P1-26: the runtime config/clients/rewrites snapshot must be published
-    /// BEFORE the filter engine is reloaded. Otherwise enabling filtering runs
-    /// with the new filter snapshot and the old `filtering.enabled=false`
-    /// runtime config.
+    /// WP-1.4: config, clients, rewrites and the compiled filter snapshot are
+    /// staged first and published together. A prepare hook observes the old
+    /// generation; after apply a reader observes the new config and the new
+    /// rules from one snapshot.
     #[tokio::test]
-    async fn test_runtime_snapshot_is_published_before_filter_reload() {
+    async fn test_apply_publishes_config_and_filter_together_after_staging() {
         let temp_dir = crate::test_support::temp_dir("sito_cfg_filter_order");
         let ctx = crate::test_support::mock_context(&temp_dir).await;
 
@@ -1378,13 +1569,19 @@ acme_enabled = false
             .unwrap();
 
         assert!(
-            seen.load(std::sync::atomic::Ordering::SeqCst),
-            "the new runtime config must be published before hooks/filter reload"
+            !seen.load(std::sync::atomic::Ordering::SeqCst),
+            "prepare must observe the previous generation, not the candidate"
         );
+        let snapshot = ctx.runtime.snapshot();
         assert_eq!(
-            ctx.runtime.snapshot().config.filtering.custom_rules,
+            snapshot.config.filtering.custom_rules,
             vec!["||ordered.example^".to_string()]
         );
+        let filter = snapshot
+            .filter
+            .as_ref()
+            .expect("the applied generation carries the compiled filter");
+        assert_eq!(filter.rule_count, 1);
         assert_eq!(ctx.filter.rule_count(), 1);
         assert_eq!(ctx.filter.status().state, sito_filter::FilterState::Ready);
 
@@ -1837,6 +2034,380 @@ acme_enabled = false
                 "restart-only field '{name}' has no reachable mutation; the matrix is not truthful"
             );
         }
+    }
+
+    /// WP-1.4 acceptance: the admin API, HA push and file watcher all execute
+    /// the same staged apply and publish exactly one runtime generation.
+    #[tokio::test]
+    async fn test_api_ha_and_watcher_share_one_apply_function() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_apply_parity");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut api_config = (**ctx.config.load()).clone();
+        api_config.upstream.servers = vec!["1.1.1.1".to_string()];
+        let generation = ctx.runtime.generation();
+        let applies = ctx.runtime.apply_count();
+        apply_and_persist_config(&ctx, &api_config, FilterApply::Deferred, None)
+            .await
+            .expect("admin API apply");
+        assert_eq!(ctx.runtime.apply_count(), applies + 1, "API applies once");
+        assert_eq!(
+            ctx.runtime.generation(),
+            generation.next(),
+            "API advances the generation"
+        );
+        assert_eq!(
+            ctx.runtime.snapshot().config.upstream.servers,
+            vec!["1.1.1.1"]
+        );
+
+        // HA slave push: same function, exact document preserved.
+        let mut ha_config = api_config.clone();
+        ha_config.upstream.servers = vec!["9.9.9.9".to_string()];
+        let ha_document = toml::to_string_pretty(&ha_config).unwrap();
+        let generation = ctx.runtime.generation();
+        let applies = ctx.runtime.apply_count();
+        apply_and_persist_document_rejecting_restart(
+            &ctx,
+            &ha_config,
+            &ha_document,
+            FilterApply::Deferred,
+            None,
+        )
+        .await
+        .expect("HA apply");
+        assert_eq!(ctx.runtime.apply_count(), applies + 1, "HA applies once");
+        assert_eq!(
+            ctx.runtime.generation(),
+            generation.next(),
+            "HA advances the generation"
+        );
+        assert_eq!(
+            ctx.runtime.snapshot().config.upstream.servers,
+            vec!["9.9.9.9"]
+        );
+
+        // File watcher: same function again.
+        let mut watched = ha_config.clone();
+        watched.upstream.servers = vec!["1.0.0.1".to_string()];
+        let watched_document = toml::to_string_pretty(&watched).unwrap();
+        tokio::fs::write(&ctx.config_path, &watched_document)
+            .await
+            .unwrap();
+        let generation = ctx.runtime.generation();
+        let applies = ctx.runtime.apply_count();
+        match apply_config_document_event(&ctx, &watched_document, FilterApply::Deferred, None)
+            .await
+        {
+            ConfigFileApplyOutcome::Applied(_) => {}
+            other => panic!("watcher must apply the changed document, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.runtime.apply_count(),
+            applies + 1,
+            "watcher applies once"
+        );
+        assert_eq!(
+            ctx.runtime.generation(),
+            generation.next(),
+            "watcher advances the generation"
+        );
+        assert_eq!(
+            ctx.runtime.snapshot().config.upstream.servers,
+            vec!["1.0.0.1"]
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Source guard: no entry point may publish runtime components directly.
+    /// The single publish is `RuntimeState::apply`; every path stages a plan
+    /// and calls it with an expected generation.
+    #[test]
+    fn test_no_entry_point_publishes_runtime_components_directly() {
+        let source = include_str!("config_apply.rs");
+        let direct_replace = concat!("runtime", ".replace(");
+        assert!(
+            !source.contains(direct_replace),
+            "config_apply must publish through RuntimeState::apply, not replace()"
+        );
+        assert!(
+            source.contains("stage_config(") && source.contains("apply_expecting_with("),
+            "every apply path must stage a plan and call apply_expecting_with"
+        );
+    }
+
+    /// End-to-end variant of the torn-read test: a reader thread observes the
+    /// API apply through `ServerContext::runtime`, and every snapshot must pair
+    /// the config with the filter compiled for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_end_to_end_reader_never_sees_torn_config_and_filter() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_e2e_torn");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut seed = (**ctx.config.load()).clone();
+        seed.filtering.enabled = true;
+        seed.filtering.custom_rules = vec!["||old-e2e.example^".to_string()];
+        apply_and_persist_config(&ctx, &seed, FilterApply::Sync, None)
+            .await
+            .expect("seed apply");
+
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_read = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let new_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pairs = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<(
+            String,
+            Option<String>,
+        )>::new()));
+        let reader_runtime = Arc::clone(&ctx.runtime);
+        let reader_start = Arc::clone(&start);
+        let reader_stop = Arc::clone(&stop);
+        let reader_first = Arc::clone(&first_read);
+        let reader_new = Arc::clone(&new_seen);
+        let reader_pairs = Arc::clone(&pairs);
+        let reader = std::thread::spawn(move || {
+            reader_start.wait();
+            while !reader_stop.load(std::sync::atomic::Ordering::Acquire) {
+                let snapshot = reader_runtime.snapshot();
+                let config_rule = snapshot.config.filtering.custom_rules.first().cloned();
+                let filter_rule = snapshot
+                    .filter
+                    .as_ref()
+                    .and_then(|filter| filter.rules.first().map(|rule| rule.raw.clone()));
+                let config_rule = config_rule.unwrap_or_default();
+                if config_rule == "||new-e2e.example^" {
+                    reader_new.store(true, std::sync::atomic::Ordering::Release);
+                }
+                reader_pairs
+                    .lock()
+                    .unwrap()
+                    .insert((config_rule, filter_rule));
+                reader_first.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+
+        start.wait();
+        while !first_read.load(std::sync::atomic::Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        let mut next = seed.clone();
+        next.filtering.custom_rules = vec!["||new-e2e.example^".to_string()];
+        apply_and_persist_config(&ctx, &next, FilterApply::Sync, None)
+            .await
+            .expect("new generation apply");
+        // The apply has returned, so the new snapshot is live. Wait until the
+        // reader has actually observed it before stopping, otherwise this test
+        // depends on thread scheduling.
+        while !new_seen.load(std::sync::atomic::Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        reader.join().expect("reader thread");
+
+        let pairs = pairs.lock().unwrap();
+        assert!(
+            pairs.contains(&(
+                "||old-e2e.example^".to_string(),
+                Some("||old-e2e.example^".to_string())
+            )),
+            "the reader must observe the old generation: {pairs:?}"
+        );
+        assert!(
+            pairs.contains(&(
+                "||new-e2e.example^".to_string(),
+                Some("||new-e2e.example^".to_string())
+            )),
+            "the reader must observe the new generation: {pairs:?}"
+        );
+        for (config_rule, filter_rule) in pairs.iter() {
+            assert_eq!(
+                filter_rule.as_deref(),
+                Some(config_rule.as_str()),
+                "config and filter must be from the same generation"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Finding 4 regression: a background refresh whose `filtering` value was
+    /// captured before a newer config apply must be discarded even when its
+    /// generation read happens after that apply committed.
+    #[tokio::test]
+    async fn test_stale_filter_refresh_cannot_overwrite_newer_generation() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_stale_refresh");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut old = (**ctx.config.load()).clone();
+        old.filtering.enabled = true;
+        old.filtering.custom_rules = vec!["||old-refresh.example^".to_string()];
+        apply_and_persist_config(&ctx, &old, FilterApply::Sync, None)
+            .await
+            .expect("old generation");
+        let stale_filtering = old.filtering.clone();
+        let stale_expected = ctx.runtime.generation();
+
+        let mut new = old.clone();
+        new.filtering.custom_rules = vec!["||new-config.example^".to_string()];
+        apply_and_persist_config(&ctx, &new, FilterApply::Sync, None)
+            .await
+            .expect("new generation");
+        let after_apply = ctx.runtime.snapshot();
+        assert_eq!(
+            after_apply.config.filtering.custom_rules,
+            vec!["||new-config.example^".to_string()]
+        );
+
+        let error = crate::config_apply::apply_filter_refresh(
+            &ctx.filter,
+            &ctx.runtime,
+            &stale_filtering,
+            stale_expected,
+        )
+        .await
+        .expect_err("a refresh compiled for the older filtering config must be discarded");
+        assert!(
+            matches!(error, ApplyError::GenerationConflict { .. }),
+            "got {error:?}"
+        );
+
+        let after_refresh = ctx.runtime.snapshot();
+        assert_eq!(
+            after_refresh.config.filtering.custom_rules,
+            vec!["||new-config.example^".to_string()],
+            "the newer config must survive the stale refresh"
+        );
+        assert_eq!(
+            after_refresh
+                .filter
+                .as_ref()
+                .unwrap()
+                .rules
+                .first()
+                .map(|rule| rule.raw.as_str()),
+            Some("||new-config.example^"),
+            "the newer filter must survive the stale refresh"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// A failure in the hook commit step (e.g. a listener cannot rebind) must
+    /// leave the runtime snapshot, filter engine and upstream manager on the
+    /// previous generation.
+    struct CommitFailHook;
+
+    impl ConfigApplyHooks for CommitFailHook {
+        fn prepare<'a>(
+            &'a self,
+            cfg: &'a Config,
+            _clients: &'a sito_clients::ClientsConfig,
+        ) -> PrepareFuture<'a> {
+            Box::pin(async move {
+                Ok(PreparedHooks {
+                    dnssec_policy: DnssecPolicy::from_config(&cfg.dns.dnssec),
+                    commit: Box::new(()),
+                })
+            })
+        }
+
+        fn commit(&self, _prepared: PreparedHooks) -> ApplyFuture<'_> {
+            Box::pin(async {
+                Err(ApplyError::Internal(
+                    "injected listener commit failure".to_string(),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_failure_leaves_every_component_on_the_old_generation() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_commit_fail");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut seed = (**ctx.config.load()).clone();
+        seed.upstream.servers = vec!["1.1.1.1".to_string()];
+        seed.filtering.enabled = true;
+        seed.filtering.custom_rules = vec!["||keep.example^".to_string()];
+        apply_and_persist_config(&ctx, &seed, FilterApply::Sync, None)
+            .await
+            .expect("seed apply");
+
+        let before = ctx.runtime.snapshot();
+        let generation = before.generation;
+        let upstream_before = ctx.upstream.statuses().await;
+        let rules_before = ctx.filter.rule_count();
+
+        let mut candidate = seed.clone();
+        candidate.upstream.servers = vec!["9.9.9.9".to_string()];
+        candidate.filtering.custom_rules = vec!["||must-not-stick.example^".to_string()];
+        let error = apply_full_config(&ctx, &candidate, FilterApply::Sync, Some(&CommitFailHook))
+            .await
+            .expect_err("the injected commit failure must reject the apply");
+        assert_eq!(error.status, 500);
+
+        assert_eq!(ctx.runtime.generation(), generation);
+        assert_eq!(
+            ctx.runtime.snapshot().config.filtering.custom_rules,
+            vec!["||keep.example^".to_string()]
+        );
+        assert_eq!(ctx.config.load().upstream.servers, vec!["1.1.1.1"]);
+        assert_eq!(
+            ctx.upstream.statuses().await,
+            upstream_before,
+            "the staged upstream set must not be published on commit failure"
+        );
+        assert_eq!(
+            ctx.filter.rule_count(),
+            rules_before,
+            "the staged filter must not be published on commit failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// A Deferred apply (clients API/UI save) must rebuild the per-group
+    /// snapshots from the already-loaded rules; otherwise a new group rule is
+    /// not enforced until the next scheduled refresh.
+    #[tokio::test]
+    async fn test_deferred_apply_rebuilds_group_snapshots() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_deferred_groups");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut clients = sito_clients::ClientsConfig::default();
+        clients.groups.insert(
+            "kids".to_string(),
+            sito_clients::ClientGroupConfig {
+                custom_rules: vec!["||blocked-by-group.example^".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let mut candidate = (**ctx.config.load()).clone();
+        candidate.clients = Some(toml::Value::try_from(&clients).unwrap());
+        apply_and_persist_config(&ctx, &candidate, FilterApply::Deferred, None)
+            .await
+            .expect("deferred clients save");
+
+        let snapshot = ctx.runtime.snapshot();
+        let group_snapshot = snapshot
+            .group_filters
+            .get("kids")
+            .expect("the deferred apply must compile the new group rules");
+        let client = sito_core::client::ClientContext::new("127.0.0.1".parse().unwrap());
+        assert!(
+            group_snapshot
+                .evaluate(
+                    "blocked-by-group.example",
+                    sito_proto::RecordType::A,
+                    &client
+                )
+                .is_blocked(),
+            "the new group rule must be enforced immediately"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// D11: an admin write that changes a restart-only field returns 409 and

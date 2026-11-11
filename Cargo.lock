@@ -3239,9 +3239,16 @@ name = "sito-runtime"
 version = "2.0.0-alpha.1"
 dependencies = [
  "arc-swap",
+ "sito-cache",
  "sito-clients",
  "sito-core",
+ "sito-dnssec",
+ "sito-filter",
+ "sito-proto",
  "sito-rewrites",
+ "sito-transport",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

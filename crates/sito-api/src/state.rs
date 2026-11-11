@@ -187,22 +187,29 @@ impl ServerContext {
         self.apply_lock.clone().lock_owned().await
     }
 
-    /// Publishes a new configuration to the pipeline and UI atomically.
+    /// Publishes a mirror config handle for startup/test helpers.
     ///
-    /// Only for startup/restore paths that cannot use the runtime apply
-    /// pipeline; admin write handlers must go through
+    /// This is not an apply: it does not advance the runtime generation, does
+    /// not update the DNSSEC validator/cache epoch, and does not publish the
+    /// filter. Admin writes, the watcher, restore and HA must go through
     /// [`crate::config_apply::apply_and_persist_config`] or its `_locked`
-    /// variant.
+    /// variant. Retained for test/bootstrap code only.
     pub fn set_config(&self, config: Config) {
         self.runtime.set_config(config);
     }
 
-    /// Publishes a new client registry to the pipeline and UI atomically.
+    /// Publishes a mirror client-registry handle for startup/test helpers.
+    ///
+    /// Not an apply; production client changes go through the config apply
+    /// pipeline so the registry and the published config generation agree.
     pub fn set_clients(&self, clients: ClientRegistry) {
         self.runtime.set_clients(clients);
     }
 
-    /// Publishes a new rewrite table to the pipeline and UI atomically.
+    /// Publishes a mirror rewrite-table handle for startup/test helpers.
+    ///
+    /// Not an apply; production rewrite changes go through the config apply
+    /// pipeline.
     pub fn set_rewrites(&self, rewrites: RewriteTable) {
         self.runtime.set_rewrites(rewrites);
     }

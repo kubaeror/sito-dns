@@ -30,6 +30,13 @@ pub type CompileObserver = Arc<dyn Fn(f64) + Send + Sync>;
 /// Callback receiving every new [`FilterStatus`] snapshot (API/metrics sink).
 pub type StatusObserver = Arc<dyn Fn(&FilterStatus) + Send + Sync>;
 
+/// Callback receiving the rules published by a scheduled/partial list refresh.
+///
+/// The server wires it to the runtime snapshot so a background refresh cannot
+/// leave queries on an older rule set indefinitely.
+pub type SnapshotObserver =
+    Arc<dyn Fn(Arc<FilterSnapshot>, Arc<crate::GroupSnapshots>) + Send + Sync>;
+
 /// Lifecycle state of the filter engine's active snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterState {
@@ -852,6 +859,43 @@ fn normalized_query_domain(qname: &Name) -> String {
     })
 }
 
+/// Fully staged filter state that is not visible to queries yet.
+///
+/// Produced by [`HostsFilterEngine::prepare`] and installed by
+/// [`HostsFilterEngine::publish_prepared`]. The staging engine holds the
+/// engine's reload lock until the prepared value is published or dropped, so a
+/// concurrent scheduled refresh cannot interleave between staging and publish.
+pub struct PreparedFilterSnapshot {
+    /// Compiled global rules for the candidate configuration.
+    pub snapshot: Arc<FilterSnapshot>,
+    /// Per-group rules compiled against the same candidate.
+    pub group_snapshots: Arc<FnvHashMap<String, Arc<FilterSnapshot>>>,
+    /// Observable status after the candidate load.
+    pub status: FilterStatus,
+    /// Filtering configuration the snapshot was compiled from. On a failed
+    /// load this is the previous configuration, because the candidate was not
+    /// committed.
+    pub config: FilteringConfig,
+    /// Group definitions the snapshots were compiled for.
+    pub group_defs: Vec<GroupRuleSet>,
+    /// Staged load error. A failed preparation is not published by the apply
+    /// path; the scheduled/API refresh path publishes its status so the
+    /// failure is observable.
+    pub error: Option<FilterError>,
+    /// Held until publish; serializes staging with scheduled refreshes.
+    guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl std::fmt::Debug for PreparedFilterSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedFilterSnapshot")
+            .field("rule_count", &self.snapshot.rule_count)
+            .field("state", &self.status.state)
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Thread-safe filtering engine implementing AdGuard ABP and hosts blocking.
 /// Extra filtering rules contributed by a client-group policy.
 ///
@@ -876,8 +920,10 @@ pub struct HostsFilterEngine {
     /// Parsed rules per list, used to refresh individual lists without refetching all.
     list_rules: std::sync::Mutex<FnvHashMap<String, Vec<Rule>>>,
     /// Serializes reload/refresh cycles so concurrent scheduled and API-driven
-    /// reloads cannot interleave their list-state reads and writes.
-    reload_lock: tokio::sync::Mutex<()>,
+    /// reloads cannot interleave their list-state reads and writes. Held across
+    /// staging and publish so a staged snapshot is never overwritten by a
+    /// concurrent scheduled refresh.
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
     /// Observability state (loading/ready/failed, per-list failures).
     status: ArcSwap<FilterStatus>,
     /// Group policies to compile extra rule sets for (refreshed on config reload).
@@ -889,6 +935,8 @@ pub struct HostsFilterEngine {
     compile_observer: std::sync::RwLock<Option<CompileObserver>>,
     /// Optional sink for status snapshots (API/metrics observability).
     status_observer: std::sync::RwLock<Option<StatusObserver>>,
+    /// Optional sink for the rules published by a list refresh.
+    snapshot_observer: std::sync::RwLock<Option<SnapshotObserver>>,
     /// Incremented whenever `list_rules` changes. A group rebuild that started
     /// from an older generation must not publish its stale snapshot.
     list_generation: AtomicU64,
@@ -915,12 +963,13 @@ impl HostsFilterEngine {
             config: ArcSwap::new(Arc::new(config)),
             data_dir,
             list_rules: std::sync::Mutex::new(FnvHashMap::default()),
-            reload_lock: tokio::sync::Mutex::new(()),
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             status: ArcSwap::new(Arc::new(status)),
             group_defs: ArcSwap::new(Arc::new(Vec::new())),
             group_snapshots: ArcSwap::new(Arc::new(FnvHashMap::default())),
             compile_observer: std::sync::RwLock::new(None),
             status_observer: std::sync::RwLock::new(None),
+            snapshot_observer: std::sync::RwLock::new(None),
             list_generation: AtomicU64::new(0),
             group_sources_configured: AtomicBool::new(false),
         }
@@ -935,6 +984,27 @@ impl HostsFilterEngine {
             .compile_observer
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+    }
+
+    /// Installs the observer that receives rules published by a scheduled or
+    /// partial list refresh. Config applies publish through the runtime plan
+    /// and do not call it.
+    pub fn set_snapshot_observer(&self, observer: SnapshotObserver) {
+        *self
+            .snapshot_observer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+    }
+
+    fn observe_snapshot(&self) {
+        let observer = self
+            .snapshot_observer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(observer) = observer {
+            observer(self.snapshot(), self.group_snapshots());
+        }
     }
 
     /// Installs the status observer (usually the metrics registry adapter).
@@ -1033,8 +1103,8 @@ impl HostsFilterEngine {
         let list_rules = self
             .list_rules
             .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if let Some(degraded) = self.rebuild_group_snapshots(&list_rules) {
             self.update_group_status(degraded);
         }
@@ -1294,6 +1364,167 @@ impl HostsFilterEngine {
         self.snapshot.load_full()
     }
 
+    /// Per-client-group compiled snapshots for the active generation.
+    #[must_use]
+    pub fn group_snapshots(&self) -> Arc<FnvHashMap<String, Arc<FilterSnapshot>>> {
+        self.group_snapshots.load_full()
+    }
+
+    /// Stages a load of `config` without changing the live filter snapshot.
+    ///
+    /// The candidate is fetched and compiled on a private staging engine that
+    /// starts from the live rules, exactly like [`Self::reload_with_config`],
+    /// so parse/download/compile failures leave the live state untouched. The
+    /// engine's reload lock is held until the returned value is published or
+    /// dropped, which makes staging+publish atomic with respect to scheduled
+    /// refreshes. Inspect [`PreparedFilterSnapshot::error`] before publishing a
+    /// config apply.
+    pub async fn prepare(&self, config: &FilteringConfig) -> PreparedFilterSnapshot {
+        self.prepare_with_groups(config, None).await
+    }
+
+    /// Like [`Self::prepare`] but compiles `groups` as the candidate client
+    /// group policy instead of the live group definitions.
+    pub async fn prepare_with_groups(
+        &self,
+        config: &FilteringConfig,
+        groups: Option<Vec<GroupRuleSet>>,
+    ) -> PreparedFilterSnapshot {
+        let guard = self.reload_lock.clone().lock_owned().await;
+        let staged = self.staging_engine(groups);
+        let result = staged.reload_internal(config, false, None).await;
+        if result.is_ok() {
+            staged.config.store(Arc::new(config.clone()));
+        }
+
+        PreparedFilterSnapshot {
+            snapshot: staged.snapshot(),
+            group_snapshots: staged.group_snapshots(),
+            status: staged.status(),
+            config: (*staged.config.load_full()).clone(),
+            group_defs: (*staged.group_defs.load_full()).clone(),
+            error: result.err(),
+            guard,
+        }
+    }
+
+    /// Stages the current live filter state without compiling anything.
+    ///
+    /// Used by deferred applies (wizard first boot) where the list fetch is
+    /// queued after the request returns; the snapshot still carries a coherent
+    /// filter value for the new configuration.
+    pub async fn prepare_current(&self) -> PreparedFilterSnapshot {
+        self.prepare_current_with_groups(None).await
+    }
+
+    /// Like [`Self::prepare_current`] but adopts candidate client-group
+    /// definitions for the deferred refresh that follows.
+    pub async fn prepare_current_with_groups(
+        &self,
+        groups: Option<Vec<GroupRuleSet>>,
+    ) -> PreparedFilterSnapshot {
+        let guard = self.reload_lock.clone().lock_owned().await;
+        let mut status = self.status();
+        let (group_snapshots, group_defs) = match groups {
+            Some(groups) => {
+                // Rebuild group snapshots from the already-loaded rules. This
+                // is cheap (no downloads) and is required by the Deferred path:
+                // a clients/groups save must enforce the new group rules now,
+                // not at the next scheduled refresh.
+                let staged = self.staging_engine(Some(groups));
+                let list_rules = staged
+                    .list_rules
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(degraded) = staged.rebuild_group_snapshots(&list_rules) {
+                    status.degraded_groups = degraded;
+                }
+                (
+                    staged.group_snapshots(),
+                    (*staged.group_defs.load_full()).clone(),
+                )
+            }
+            None => (
+                self.group_snapshots(),
+                (*self.group_defs.load_full()).clone(),
+            ),
+        };
+        PreparedFilterSnapshot {
+            snapshot: self.snapshot(),
+            group_snapshots,
+            status,
+            config: (*self.config.load_full()).clone(),
+            group_defs,
+            error: None,
+            guard,
+        }
+    }
+
+    /// Installs a prepared snapshot and returns the compiled rule count.
+    ///
+    /// A staged failure is published (status/snapshot) and returned as an
+    /// error; the live configuration is retained by the staging engine on
+    /// failure, so the previous rules stay active.
+    pub fn publish_prepared(&self, prepared: PreparedFilterSnapshot) -> Result<usize, FilterError> {
+        let PreparedFilterSnapshot {
+            snapshot,
+            group_snapshots,
+            status,
+            config,
+            group_defs,
+            error,
+            guard,
+        } = prepared;
+
+        self.config.store(Arc::new(config));
+        self.group_defs.store(Arc::new(group_defs));
+        self.snapshot.store(snapshot);
+        self.group_snapshots.store(group_snapshots);
+        self.list_generation.fetch_add(1, Ordering::SeqCst);
+        let rule_count = status.rule_count;
+        self.set_status(status);
+        drop(guard);
+
+        match error {
+            Some(error) => Err(error),
+            None => Ok(rule_count),
+        }
+    }
+
+    /// Builds a private engine seeded from the live state for staging.
+    fn staging_engine(&self, groups: Option<Vec<GroupRuleSet>>) -> Self {
+        let group_defs = groups.unwrap_or_else(|| (*self.group_defs.load_full()).clone());
+        let has_group_sources = Self::has_group_custom_rules(&group_defs);
+        Self {
+            snapshot: ArcSwap::new(self.snapshot()),
+            config: ArcSwap::new(self.config.load_full()),
+            data_dir: self.data_dir.clone(),
+            list_rules: std::sync::Mutex::new(
+                self.list_rules
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            status: ArcSwap::new(Arc::new(self.status())),
+            group_defs: ArcSwap::new(Arc::new(group_defs)),
+            group_snapshots: ArcSwap::new(self.group_snapshots()),
+            compile_observer: std::sync::RwLock::new(
+                self.compile_observer
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
+            // Staging must not publish metrics/status before the snapshot is
+            // committed; the live engine's observer fires in `publish_prepared`.
+            status_observer: std::sync::RwLock::new(None),
+            snapshot_observer: std::sync::RwLock::new(None),
+            list_generation: AtomicU64::new(self.list_generation.load(Ordering::SeqCst)),
+            group_sources_configured: AtomicBool::new(has_group_sources),
+        }
+    }
+
     /// Current number of active loaded blocking rules.
     pub fn rule_count(&self) -> usize {
         self.snapshot.load().rule_count
@@ -1351,21 +1582,38 @@ impl HostsFilterEngine {
     /// rejected config must not become the source for the next scheduled
     /// refresh (which would otherwise apply it later, behind the caller's
     /// back).
+    ///
+    /// This installs engine state only. It does not publish a runtime
+    /// snapshot, so it is not a query-visible path; config applies and
+    /// scheduled/manual refreshes use [`Self::prepare`] +
+    /// [`Self::publish_prepared`] while holding the engine guard, and publish
+    /// the runtime snapshot before releasing it.
     pub async fn reload_with_config(&self, config: &FilteringConfig) -> Result<usize, FilterError> {
-        // Staged load: `self.config` still holds the previous configuration
-        // for the whole attempt, so a rejected candidate is simply dropped.
-        // The downloader is derived from the candidate config inside the
-        // reload, so a changed byte cap applies to this reload before it is
-        // committed and there is no second value to keep in sync.
-        let count = self.reload_internal(config, false, None).await?;
-        self.config.store(Arc::new(config.clone()));
-        Ok(count)
+        // Stage on a private engine and publish in one step. The reload lock
+        // is held from the start of staging until the prepared state is
+        // installed, so a rejected candidate never becomes the source for the
+        // next scheduled refresh.
+        let prepared = self.prepare(config).await;
+        self.publish_prepared(prepared)
     }
 
     /// Refreshes only the named blocklists, keeping rules from all other lists.
+    ///
+    /// The engine guard is held while the runtime observer publishes the new
+    /// filter, so a config apply cannot stage/publish a newer generation
+    /// between the engine reload and the runtime snapshot update.
     pub async fn reload_lists(&self, names: &[String]) -> Result<usize, FilterError> {
+        let guard = self.reload_lock.clone().lock_owned().await;
         let config = self.config.load_full();
-        self.reload_internal(&config, true, Some(names)).await
+        let result = self
+            .reload_internal_locked(&config, true, Some(names))
+            .await;
+        // A scheduled/partial refresh publishes rules outside a config apply;
+        // hand the new coherent filter generation to the runtime observer
+        // while the guard is still held.
+        self.observe_snapshot();
+        drop(guard);
+        result
     }
 
     async fn reload_internal(
@@ -1378,7 +1626,17 @@ impl HostsFilterEngine {
         // refresh and API reload previously raced on `list_rules` and could
         // overwrite freshly merged lists with a stale map.
         let _reload_guard = self.reload_lock.lock().await;
+        self.reload_internal_locked(config, apply_drop_guard, only_lists)
+            .await
+    }
 
+    /// Reload body; the caller must hold the engine reload guard.
+    async fn reload_internal_locked(
+        &self,
+        config: &FilteringConfig,
+        apply_drop_guard: bool,
+        only_lists: Option<&[String]>,
+    ) -> Result<usize, FilterError> {
         if !config.enabled {
             // A disabled engine answers normally; the placeholder keeps
             // `unavailable_for_fail_closed` false while disabled and forces a

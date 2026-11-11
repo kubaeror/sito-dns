@@ -716,6 +716,7 @@ pub(crate) mod test_support {
                         previous.clients.unidentified_store(),
                     )),
                     rewrites: Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
+                    ..(*previous).clone()
                 });
 
                 if let Some(path) = self.config_path.as_deref()

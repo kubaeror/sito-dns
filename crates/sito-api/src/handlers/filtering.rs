@@ -280,12 +280,31 @@ pub async fn refresh_filtering(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
-    let cfg = ctx.config.load();
+    // Serialize with config applies and keep the prepared engine guard until
+    // both the runtime snapshot and the engine state are published. A refresh
+    // compiled for an older config generation is rejected instead of
+    // overwriting the newer generation's filter.
+    let _apply_guard = ctx.lock_config_apply().await;
+    let cfg = ctx.config.load_full();
+    let prepared = ctx.filter.prepare(&cfg.filtering).await;
+    if let Some(error) = prepared.error.as_ref() {
+        let error = error.to_string();
+        let _ = ctx.filter.publish_prepared(prepared);
+        return Err(ProblemDetails::internal_error(format!(
+            "Refresh failed: {error}"
+        )));
+    }
+    let expected = ctx.runtime.generation();
+    let snapshot = prepared.snapshot.clone();
+    let groups = prepared.group_snapshots.clone();
+    ctx.runtime
+        .publish_filter(Some(snapshot), groups, expected)
+        .map_err(crate::config_apply::problem_from_apply)?;
     let count = ctx
         .filter
-        .reload_with_config(&cfg.filtering)
-        .await
+        .publish_prepared(prepared)
         .map_err(|e| ProblemDetails::internal_error(format!("Refresh failed: {e}")))?;
+    ctx.metrics.set_filter_rules(count);
     ctx.cache.flush();
     Ok(Json(GenericMessageResponse {
         message: format!("Successfully refreshed filter lists ({count} active rules compiled)"),

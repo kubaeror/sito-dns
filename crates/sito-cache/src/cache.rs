@@ -14,7 +14,7 @@ use sito_proto::{
     DNSClass, Message, MessageType, Name, RData, Record, RecordType, ResponseCode, encode_message,
 };
 
-use crate::entry::{CacheEntry, ValidationStatus};
+use crate::entry::{CacheEntry, PolicyEpoch, ValidationStatus};
 use crate::key::CacheKey;
 
 /// TTL (seconds) clamped onto records served from stale cache per RFC 8767 §5.
@@ -78,30 +78,39 @@ impl DnsCache {
             cache: ArcSwap::from_pointee(cache),
             config: ArcSwap::new(Arc::new(config)),
             // Start at 1 so an entry always carries a meaningful generation.
-            policy_epoch: AtomicU64::new(1),
+            policy_epoch: AtomicU64::new(PolicyEpoch::INITIAL.get()),
             flights: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Current DNSSEC policy generation.
     ///
-    /// Pipeline queries capture this before loading the validator and pass it
-    /// to [`Self::insert_with_status_at_epoch`]; a policy change advances the
-    /// generation, so a query that validated under the old policy cannot
-    /// insert its status after the flush.
+    /// A query must **not** read this live: it captures
+    /// `RuntimeSnapshot::generation` together with the validator, and passes
+    /// that value to [`Self::insert_with_status_at_epoch`]. A config apply
+    /// advances this counter with the validator swap, so the two can never come
+    /// from different generations.
     #[must_use]
-    pub fn policy_epoch(&self) -> u64 {
-        self.policy_epoch.load(Ordering::Acquire)
+    pub fn policy_epoch(&self) -> PolicyEpoch {
+        PolicyEpoch::new(self.policy_epoch.load(Ordering::Acquire))
     }
 
     /// Advances the DNSSEC policy generation and returns the new value.
     ///
-    /// Call this after the new validator is installed (so a query that reads
-    /// the new epoch also observes the new validator) and before/with the
-    /// cache flush. Existing entries are filtered by `get` immediately; the
-    /// flush only reclaims their memory.
-    pub fn advance_policy_epoch(&self) -> u64 {
-        self.policy_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    /// The runtime calls this once per successful config apply, immediately
+    /// before publishing the snapshot that carries the prepared validator. A
+    /// query therefore sees the old validator with the old epoch, or the new
+    /// validator with the new epoch. Existing entries are filtered by `get`
+    /// immediately; the flush only reclaims their memory. Filter-only
+    /// refreshes do not call it.
+    pub fn advance_policy_epoch(&self) -> PolicyEpoch {
+        // Applies are serialized by the runtime write lock; a concurrent
+        // reader still observes either the old or the new generation.
+        PolicyEpoch::new(
+            self.policy_epoch
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1),
+        )
     }
 
     /// Applies hot-reloaded cache settings, rebuilding the cache when
@@ -251,7 +260,7 @@ impl DnsCache {
 
         // A policy change makes every entry from an older generation
         // unservable immediately, even before the flush reclaims it.
-        if entry.policy_epoch != self.policy_epoch() {
+        if entry.policy_epoch != self.policy_epoch().get() {
             trace!(
                 "Ignoring cache entry for {} from DNSSEC policy epoch {} (current {})",
                 key.qname,
@@ -366,7 +375,7 @@ impl DnsCache {
         let cache = self.cache.load_full();
         let entry = cache.get(key).await?;
 
-        if entry.policy_epoch != self.policy_epoch() {
+        if entry.policy_epoch != self.policy_epoch().get() {
             trace!(
                 "Ignoring stale cache entry for {} from DNSSEC policy epoch {} (current {})",
                 key.qname,
@@ -481,15 +490,15 @@ impl DnsCache {
     /// Insert a response only when `policy_epoch` is still current.
     ///
     /// Returns `true` when the entry was stored and `false` when a DNSSEC
-    /// policy change made the caller's validation decision stale. The epoch
-    /// must be captured before the validator that produced
-    /// `validation_status` is loaded (see [`DnsCache::policy_epoch`]).
+    /// policy change made the caller's validation decision stale. Pass
+    /// `RuntimeSnapshot::generation` from the same snapshot that supplied the
+    /// validator; never read `policy_epoch()` live in a query.
     pub async fn insert_with_status_at_epoch(
         &self,
         query: &Message,
         response: &Message,
         validation_status: ValidationStatus,
-        policy_epoch: u64,
+        policy_epoch: PolicyEpoch,
     ) -> bool {
         let Some(key) = CacheKey::from_query(query) else {
             return false;
@@ -669,8 +678,8 @@ impl DnsCache {
         if policy_epoch != self.policy_epoch() {
             debug!(
                 qname = %key.qname,
-                policy_epoch,
-                current = self.policy_epoch(),
+                policy_epoch = %policy_epoch,
+                current = %self.policy_epoch(),
                 "Discarding cache insert from an older DNSSEC policy generation"
             );
             return false;
@@ -684,7 +693,7 @@ impl DnsCache {
             authority_ttls,
             additional_ttls,
             validation_status,
-            policy_epoch,
+            policy_epoch: policy_epoch.get(),
             hits: Arc::new(AtomicU32::new(0)),
             estimated_bytes,
         };

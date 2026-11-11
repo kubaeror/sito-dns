@@ -1276,6 +1276,18 @@ mod tests {
         let mut blocked = config.filtering.clone();
         blocked.custom_rules = vec!["||adnetwork.com^".to_string()];
         filter.reload_with_config(&blocked).await.unwrap();
+        // The query path reads the filter from the coherent runtime snapshot;
+        // a direct engine reload is only complete once that snapshot is
+        // re-published (the config apply path does both).
+        let generation = pipeline.runtime().generation();
+        pipeline
+            .runtime()
+            .publish_filter(
+                Some(filter.snapshot()),
+                filter.group_snapshots(),
+                generation,
+            )
+            .expect("filter refresh for the current generation");
 
         // Cache hit must still run the CNAME uncloaking check.
         let second = pipeline.handle(make_query(2), client).await.unwrap();

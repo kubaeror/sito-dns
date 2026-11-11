@@ -50,6 +50,7 @@ impl SlaveConfigApplier for TestApplier {
                 config: Arc::new(cfg.clone()),
                 clients: previous.clients.clone(),
                 rewrites: previous.rewrites.clone(),
+                ..(*previous).clone()
             });
             if let Some(path) = self.config_path.as_deref()
                 && let Err(e) = tokio::fs::write(path, document).await

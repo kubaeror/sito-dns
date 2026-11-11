@@ -106,6 +106,7 @@ impl SlaveConfigApplier for HarnessApplier {
                     previous.clients.routeros_leases_store(),
                 )),
                 rewrites: Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
+                ..(*previous).clone()
             });
             if let Some(path) = self.config_path.as_deref()
                 && let Err(e) = tokio::fs::write(path, document).await
@@ -1339,16 +1340,34 @@ struct RecordingDnssecHooks {
 }
 
 impl ConfigApplyHooks for RecordingDnssecHooks {
-    fn apply<'a>(
+    fn prepare<'a>(
         &'a self,
         cfg: &'a Config,
         _clients: &'a sito_clients::ClientsConfig,
-    ) -> ApplyFuture<'a> {
+    ) -> sito_api::config_apply::PrepareFuture<'a> {
         Box::pin(async move {
+            // Record the staged policy but do not install the validator; the
+            // runtime snapshot publishes it with the rest of the generation.
             *self.observed_nta.lock().unwrap() = cfg.dns.dnssec.nta.clone();
+            Ok(sito_api::config_apply::PreparedHooks {
+                dnssec_policy: sito_runtime::DnssecPolicy::from_config(&cfg.dns.dnssec),
+                commit: Box::new(()),
+            })
+        })
+    }
+
+    fn commit<'a>(&'a self, prepared: sito_api::config_apply::PreparedHooks) -> ApplyFuture<'a> {
+        Box::pin(async move {
+            if prepared.commit.downcast::<()>().is_err() {
+                return Err(sito_runtime::ApplyError::Internal(
+                    "unexpected prepared payload".to_string(),
+                ));
+            }
+            // Keep the test's external validator handle in sync with the
+            // published policy for the assertions in this test.
             self.validator
                 .store(Arc::new(sito_dnssec::DnssecValidator::from_config(
-                    &cfg.dns.dnssec,
+                    &prepared.dnssec_policy.config,
                 )));
             Ok(())
         })

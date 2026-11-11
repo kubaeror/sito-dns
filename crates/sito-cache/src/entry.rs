@@ -5,6 +5,54 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
+/// Monotonic generation that tags cached validation decisions.
+///
+/// The same value is the cache's DNSSEC policy epoch and the runtime's
+/// `RuntimeGeneration`: there is exactly one counter, owned here, so a query
+/// cannot pair a cache epoch with a different runtime generation. Every
+/// successful runtime apply advances it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PolicyEpoch(u64);
+
+impl PolicyEpoch {
+    /// The generation a fresh process starts at.
+    pub const INITIAL: Self = Self(1);
+
+    /// Wraps a raw counter value.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// The underlying counter value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The next generation.
+    ///
+    /// A counter overflow is not representable in practice (2^64 applies);
+    /// saturating keeps the value monotonic instead of wrapping back to a
+    /// generation that still has live entries.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
+impl Default for PolicyEpoch {
+    fn default() -> Self {
+        Self::INITIAL
+    }
+}
+
+impl std::fmt::Display for PolicyEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// DNSSEC validation state recorded when a response was cached.
 ///
 /// The status lets the pipeline decide whether a cached entry may be served

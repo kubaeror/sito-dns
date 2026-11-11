@@ -8,7 +8,7 @@ pub mod entry;
 pub mod key;
 
 pub use cache::{DnsCache, SingleFlightGuard};
-pub use entry::{CacheEntry, ValidationStatus};
+pub use entry::{CacheEntry, PolicyEpoch, ValidationStatus};
 pub use key::CacheKey;
 
 #[cfg(test)]
@@ -555,7 +555,7 @@ mod tests {
             .await
             .expect("new-generation entry");
         assert_eq!(status, ValidationStatus::Insecure);
-        assert_eq!(epoch, new_epoch);
+        assert_eq!(epoch, new_epoch.get());
     }
 
     /// `min_ttl` is a cache policy floor for unvalidated data only. Raising a

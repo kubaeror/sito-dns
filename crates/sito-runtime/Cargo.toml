@@ -4,13 +4,23 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Atomic runtime snapshot of hot-reloadable sito configuration state"
+description = "Atomic runtime snapshot and staged configuration apply for sito"
 
 [dependencies]
 sito-core.workspace = true
 sito-clients.workspace = true
 sito-rewrites.workspace = true
+sito-cache.workspace = true
+sito-filter.workspace = true
+sito-dnssec.workspace = true
+sito-transport.workspace = true
 arc-swap.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+sito-proto.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true

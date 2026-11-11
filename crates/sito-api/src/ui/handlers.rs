@@ -934,14 +934,37 @@ pub async fn filtering_update_all_handler(
     if user.role < Role::Operator {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let cfg = ctx.config.load();
-    if let Err(e) = ctx.filter.reload_with_config(&cfg.filtering).await {
+    // Hold the apply lock and the prepared filter guard across both publishes.
+    let _apply_guard = ctx.lock_config_apply().await;
+    let cfg = ctx.config.load_full();
+    let prepared = ctx.filter.prepare(&cfg.filtering).await;
+    if let Some(error) = prepared.error.as_ref() {
+        let error = error.to_string();
+        let _ = ctx.filter.publish_prepared(prepared);
+        tracing::error!("Failed to refresh filter lists: {error}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to refresh filter lists: {error}"),
+        );
+    }
+    let expected = ctx.runtime.generation();
+    let snapshot = prepared.snapshot.clone();
+    let groups = prepared.group_snapshots.clone();
+    if let Err(error) = ctx.runtime.publish_filter(Some(snapshot), groups, expected) {
+        tracing::error!("Failed to refresh filter lists: {error}");
+        return error_response(
+            StatusCode::CONFLICT,
+            &format!("Failed to refresh filter lists: {error}"),
+        );
+    }
+    if let Err(e) = ctx.filter.publish_prepared(prepared) {
         tracing::error!("Failed to refresh filter lists: {e}");
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("Failed to refresh filter lists: {e}"),
         );
     }
+    ctx.metrics.set_filter_rules(ctx.filter.rule_count());
     ctx.cache.flush();
     Redirect::to("/filtering").into_response()
 }

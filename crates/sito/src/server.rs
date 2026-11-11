@@ -39,27 +39,6 @@ pub(crate) fn clients_from_config(config: &Config) -> anyhow::Result<sito_client
     }
 }
 
-/// Maps client-group policy onto the filter engine's per-group rule sets.
-///
-/// Groups that define neither `lists` nor `custom_rules` are skipped so the
-/// engine does not compile empty snapshots.
-pub(crate) fn group_rule_sets(
-    clients: &sito_clients::ClientsConfig,
-) -> Vec<sito_filter::GroupRuleSet> {
-    let mut groups: Vec<sito_filter::GroupRuleSet> = clients
-        .groups
-        .iter()
-        .filter(|(_, group)| !group.lists.is_empty() || !group.custom_rules.is_empty())
-        .map(|(name, group)| sito_filter::GroupRuleSet {
-            name: name.clone(),
-            lists: group.lists.clone(),
-            custom_rules: group.custom_rules.clone(),
-        })
-        .collect();
-    groups.sort_by(|a, b| a.name.cmp(&b.name));
-    groups
-}
-
 /// Parses the optional `[rewrites]` section, surfacing type errors.
 pub(crate) fn rewrites_from_config(
     config: &Config,
@@ -706,7 +685,7 @@ async fn init_runtime_components(
     // sets so the initial reload can verify at least one compiles, instead of
     // trusting raw text that may be comment-only or invalid.
     let initial_clients = clients_from_config(config)?;
-    let initial_group_rules = group_rule_sets(&initial_clients);
+    let initial_group_rules = sito_runtime::group_rule_sets(&initial_clients);
     let filter_engine = Arc::new(
         HostsFilterEngine::init_with_observer_and_group_sources(
             config.filtering.clone(),
@@ -753,7 +732,6 @@ struct ConfigWatcher {
 /// rebind and the log level. Shared by the file watcher and the API/UI config
 /// write paths through [`sito_api::config_apply::ConfigApplyHooks`].
 struct ServerApplyHooks {
-    filter: Arc<HostsFilterEngine>,
     dnssec: Arc<ArcSwap<DnssecValidator>>,
     /// Authenticated DNSSEC chain statuses shared across validator swaps. A
     /// hot reload must not forget that a zone was proven signed/unsigned.
@@ -765,77 +743,111 @@ struct ServerApplyHooks {
     pipeline: Arc<DnsPipeline>,
 }
 
+/// Hook-owned components prepared for one staged apply, not yet installed.
+struct PreparedServerComponents {
+    /// Candidate configuration this payload was prepared from. Commit must
+    /// use it: the live config handle is still the previous generation.
+    config: Config,
+    dnssec_validator: Arc<DnssecValidator>,
+    scoped_upstreams: HashMap<String, Arc<UpstreamManager>>,
+}
+
 impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
-    fn apply<'a>(
+    fn prepare<'a>(
         &'a self,
         cfg: &'a Config,
         clients: &'a sito_clients::ClientsConfig,
-    ) -> sito_api::config_apply::ApplyFuture<'a> {
+    ) -> sito_api::config_apply::PrepareFuture<'a> {
         Box::pin(async move {
-            if crate::logging::reload_level(&cfg.server.log_level) {
-                info!(
-                    level = %cfg.server.log_level,
-                    "Applied hot-reloaded log level"
-                );
-            }
+            // DNSSEC: build the validator with the shared chain cache, but do
+            // not install it. The prepared validator travels in the plan and
+            // becomes visible with the runtime snapshot.
+            let validator = Arc::new(DnssecValidator::from_config_with_cache(
+                &cfg.dns.dnssec,
+                Some(self.dnssec_chain_cache.clone()),
+            ));
+            let dnssec_policy =
+                sito_runtime::DnssecPolicy::from_validator(&cfg.dns.dnssec, Arc::clone(&validator));
 
-            // Per-group rule sets must follow the client policy snapshot.
-            self.filter.set_group_rules(group_rule_sets(clients));
-
-            // DNSSEC settings are not read through the config snapshot at query
-            // time; swap the validator so mode/anchors/NTAs apply immediately.
-            // The chain cache is reused so a reload does not lose authenticated
-            // signed/unsigned zone evidence.
-            self.dnssec
-                .store(Arc::new(DnssecValidator::from_config_with_cache(
-                    &cfg.dns.dnssec,
-                    Some(self.dnssec_chain_cache.clone()),
-                )));
-
-            // Rebuild per-client upstream scopes, reusing managers whose
-            // upstream set is unchanged.
-            let rebuilt_scoped = {
+            // Per-client upstream scopes, reusing managers whose upstream set
+            // is unchanged. Built here so a bad scope fails the apply before
+            // anything is published.
+            let scoped_upstreams = {
                 let existing = self.scoped_upstreams.load_full();
                 build_scoped_upstreams(cfg, clients, &existing).await
             };
-            self.scoped_upstreams.store(Arc::new(rebuilt_scoped));
 
-            if let Ok(limiters) = self.rate_limiters.lock() {
-                for limiter in limiters.iter() {
-                    limiter.set_rate(cfg.dns.rate_limit_per_ip);
-                }
+            Ok(sito_api::config_apply::PreparedHooks {
+                dnssec_policy,
+                commit: Box::new(PreparedServerComponents {
+                    config: cfg.clone(),
+                    dnssec_validator: validator,
+                    scoped_upstreams,
+                }),
+            })
+        })
+    }
+
+    fn commit(
+        &self,
+        prepared: sito_api::config_apply::PreparedHooks,
+    ) -> sito_api::config_apply::ApplyFuture<'_> {
+        Box::pin(async move {
+            let prepared = prepared
+                .commit
+                .downcast::<PreparedServerComponents>()
+                .map_err(|_| {
+                    sito_runtime::ApplyError::Internal(
+                        "server apply hook received an unexpected prepared payload".to_string(),
+                    )
+                })?;
+
+            // Rebind listeners first: this is the only fallible commit step.
+            // A failure leaves every other component and the runtime snapshot
+            // on the previous generation.
+            let listener_config = prepared.config;
+            if crate::logging::reload_level(&listener_config.server.log_level) {
+                info!(
+                    level = %listener_config.server.log_level,
+                    "Applied hot-reloaded log level"
+                );
             }
-
-            // Rebind listeners when bind/port/related settings change. The
-            // manager stays in the slot across failures so a later event can
-            // retry instead of orphaning the server.
             {
                 let mut slot = self.listener_manager.lock().await;
                 if let Some(manager) = slot.as_mut()
-                    && manager.needs_restart(cfg)
+                    && manager.needs_restart(&listener_config)
                 {
                     let acceptors = self.listener_acceptors.lock().await.clone();
                     if let Some(acceptors) = acceptors {
                         info!("DNS listener bindings changed; rebinding in-process");
-                        if let Err(e) = manager
+                        manager
                             .restart(
-                                cfg,
+                                &listener_config,
                                 self.pipeline.clone(),
                                 acceptors,
                                 self.rate_limiters.clone(),
                             )
                             .await
-                        {
-                            return Err(sito_api::error::ProblemDetails::internal_error(format!(
-                                "Failed to rebind DNS listeners: {e}"
-                            )));
-                        }
+                            .map_err(|e| {
+                                sito_runtime::ApplyError::Tls(sito_transport::TlsError::Config(
+                                    format!("Failed to rebind DNS listeners: {e}"),
+                                ))
+                            })?;
                     } else {
                         warn!("Listener TLS acceptors unavailable; keeping current listeners");
                     }
                 }
             }
 
+            // Infallible component installs.
+            self.dnssec.store(prepared.dnssec_validator);
+            self.scoped_upstreams
+                .store(Arc::new(prepared.scoped_upstreams));
+            if let Ok(limiters) = self.rate_limiters.lock() {
+                for limiter in limiters.iter() {
+                    limiter.set_rate(listener_config.dns.rate_limit_per_ip);
+                }
+            }
             Ok(())
         })
     }
@@ -1199,7 +1211,7 @@ pub async fn run_server_full(
     let clients_config = clients_from_config(&config)?;
     // Compile per-group rule sets so group `lists`/`custom_rules` actually
     // apply (previously they were stored but never evaluated).
-    filter_engine.set_group_rules(group_rule_sets(&clients_config));
+    filter_engine.set_group_rules(sito_runtime::group_rule_sets(&clients_config));
 
     // Build per-client upstream managers for entries that opt out of the globals.
     let scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>> =
@@ -1256,11 +1268,38 @@ pub async fn run_server_full(
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config.clone())));
     let clients_arc = Arc::new(ArcSwap::new(client_registry.clone()));
     let rewrites_arc = Arc::new(ArcSwap::new(rewrite_table.clone()));
-    let runtime = Arc::new(sito_runtime::RuntimeState::new(
-        config_arc.clone(),
-        clients_arc.clone(),
-        rewrites_arc.clone(),
-    ));
+    let runtime = Arc::new(
+        sito_runtime::RuntimeState::new(
+            config_arc.clone(),
+            clients_arc.clone(),
+            rewrites_arc.clone(),
+        )
+        .with_cache(cache.clone()),
+    );
+    // Seed the coherent snapshot with the components created above. This is
+    // startup bootstrap, not an apply, so the generation is not advanced.
+    runtime.bootstrap_components(
+        Some(filter_engine.snapshot()),
+        filter_engine.group_snapshots(),
+        sito_runtime::DnssecPolicy::from_validator(&config.dns.dnssec, dnssec_swap.load_full()),
+        sito_runtime::TransportPolicy::from(&config),
+    );
+    // Scheduled/partial list refreshes publish outside a config apply; keep
+    // the runtime snapshot (and therefore the query path) on the new rules.
+    {
+        let refresh_runtime = Arc::clone(&runtime);
+        filter_engine.set_snapshot_observer(Arc::new(move |snapshot, groups| {
+            // Called while the filter engine holds its reload guard, so the
+            // config generation cannot change between the read and publish.
+            let expected = refresh_runtime.generation();
+            if let Err(error) = refresh_runtime.publish_filter(Some(snapshot), groups, expected) {
+                tracing::debug!(
+                    error = %error,
+                    "Discarding a scheduled blocklist refresh that raced a config apply"
+                );
+            }
+        }));
+    }
 
     // Construct pipeline with query logging and Prometheus metrics
     let pipeline = Arc::new(
@@ -1278,7 +1317,6 @@ pub async fn run_server_full(
         )
         .with_runtime(runtime.clone())
         .with_runtime_lists(runtime_lists.clone())
-        .with_shared_dnssec(dnssec_swap.clone())
         .with_shared_scoped_upstreams(scoped_upstreams.clone())
         .with_stats(querylog_sender.clone(), metrics.clone()),
     );
@@ -1327,7 +1365,6 @@ pub async fn run_server_full(
         Arc::new(tokio::sync::Mutex::new(None));
 
     let apply_hooks = Arc::new(ServerApplyHooks {
-        filter: filter_engine.clone(),
         dnssec: dnssec_swap.clone(),
         dnssec_chain_cache: dnssec_chain_cache.clone(),
         scoped_upstreams: scoped_upstreams.clone(),

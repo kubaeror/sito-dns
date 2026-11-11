@@ -733,12 +733,9 @@ fn normalized_query_domain(qname: &Name) -> String {
 /// The core DNS query resolution pipeline.
 pub struct DnsPipeline {
     runtime: Arc<RuntimeState>,
-    filter: Arc<HostsFilterEngine>,
     anti_bypass: Arc<AntiBypassRegistry>,
     cache: Arc<DnsCache>,
     upstream: Arc<UpstreamManager>,
-    /// Swappable so DNSSEC settings (mode, anchors, NTAs) hot-reload.
-    dnssec: Arc<ArcSwap<DnssecValidator>>,
     lists: Arc<RuntimeLists>,
     in_flight: Arc<AtomicUsize>,
     prefetch_semaphore: Arc<tokio::sync::Semaphore>,
@@ -750,7 +747,9 @@ pub struct DnsPipeline {
 }
 
 impl DnsPipeline {
-    #[allow(clippy::too_many_arguments)]
+    // `filter` is kept by value for source compatibility with every existing
+    // call site; it is only used to seed the snapshot.
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     pub fn new(
         config: Arc<ArcSwap<Config>>,
         filter: Arc<HostsFilterEngine>,
@@ -763,11 +762,18 @@ impl DnsPipeline {
         rewrites: Arc<ArcSwap<RewriteTable>>,
         in_flight: Arc<AtomicUsize>,
     ) -> Self {
-        let runtime = Arc::new(RuntimeState::new(config, clients, rewrites));
+        let initial_config = config.load_full();
+        let runtime =
+            Arc::new(RuntimeState::new(config, clients, rewrites).with_cache(cache.clone()));
+        runtime.bootstrap_components(
+            Some(filter.snapshot()),
+            filter.group_snapshots(),
+            sito_runtime::DnssecPolicy::from_validator(&initial_config.dns.dnssec, dnssec),
+            sito_runtime::TransportPolicy::from(&*initial_config),
+        );
         let lists = Arc::new(RuntimeLists::from_arcs(parental, services));
         Self {
             runtime,
-            filter,
             anti_bypass: Arc::new(AntiBypassRegistry::try_bundled().unwrap_or_else(|e| {
                 error!(
                     error = %e,
@@ -777,7 +783,6 @@ impl DnsPipeline {
             })),
             cache,
             upstream,
-            dnssec: Arc::new(ArcSwap::from(dnssec)),
             lists,
             in_flight,
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
@@ -819,14 +824,6 @@ impl DnsPipeline {
         self
     }
 
-    /// Shares the swappable DNSSEC validator handle with the server so config
-    /// changes can replace it without a restart.
-    #[must_use]
-    pub fn with_shared_dnssec(mut self, dnssec: Arc<ArcSwap<DnssecValidator>>) -> Self {
-        self.dnssec = dnssec;
-        self
-    }
-
     /// Shares the swappable per-client upstream map with the server.
     #[must_use]
     pub fn with_shared_scoped_upstreams(
@@ -850,6 +847,15 @@ impl DnsPipeline {
 }
 
 impl DnsPipeline {
+    /// The cache/DNSSEC epoch paired with a query snapshot.
+    ///
+    /// It is the snapshot generation, never a live `cache.policy_epoch()`
+    /// read: the validator that produced the entry came from the same
+    /// snapshot, so the epoch must too (P1-27).
+    fn cache_epoch_for(snapshot: &sito_runtime::RuntimeSnapshot) -> sito_cache::PolicyEpoch {
+        snapshot.generation
+    }
+
     /// Builds a blocked response for the configured blocking mode.
     fn blocked_outcome(
         query: &Message,
@@ -1065,8 +1071,24 @@ impl DnsPipeline {
     /// global/group filter rules, parental controls, or service blocking.
     /// Cached and stale entries are re-checked because rules can change after
     /// the response was stored.
+    #[cfg(test)]
     fn cname_target_blocked(
         &self,
+        response: &Message,
+        qtype: RecordType,
+        client: &ClientContext,
+        policy: &EffectivePolicy,
+    ) -> bool {
+        let snapshot = self.runtime.snapshot();
+        self.cname_target_blocked_with(&snapshot, response, qtype, client, policy)
+    }
+
+    /// The query-path form: re-check a CNAME target against the same snapshot
+    /// that produced the response, so the config and rules cannot be swapped
+    /// halfway through one query.
+    fn cname_target_blocked_with(
+        &self,
+        runtime_snapshot: &sito_runtime::RuntimeSnapshot,
         response: &Message,
         qtype: RecordType,
         client: &ClientContext,
@@ -1080,9 +1102,16 @@ impl DnsPipeline {
             return false;
         }
 
-        let global_snapshot = self.filter.snapshot();
+        let Some(global_snapshot) = runtime_snapshot.filter.as_ref().map(Arc::clone) else {
+            // No compiled rules in this generation: the query path already
+            // failed closed before reaching the CNAME re-check.
+            return false;
+        };
         let group_snapshot = if !policy.lists.is_empty() || !policy.custom_rules.is_empty() {
-            self.filter.group_snapshot(&policy.group_name)
+            runtime_snapshot
+                .group_filters
+                .get(&policy.group_name)
+                .cloned()
         } else {
             None
         };
@@ -1284,6 +1313,7 @@ impl DnsPipeline {
         domain_str: String,
         bypass_check_needed: bool,
         config: &Config,
+        runtime_snapshot: &sito_runtime::RuntimeSnapshot,
         effective_upstream: &Arc<UpstreamManager>,
     ) -> QueryOutcome {
         if bypass_check_needed
@@ -1316,12 +1346,12 @@ impl DnsPipeline {
             let bg_wants_dnssec = query_has_do(&bg_query);
             // Same ordering rule as the query path: read the epoch before the
             // validator so a reload always wins against an in-flight refresh.
-            let bg_policy_epoch = self.cache.policy_epoch();
-            let dnssec_mode = self.dnssec.load().mode;
+            let bg_policy_epoch = Self::cache_epoch_for(runtime_snapshot);
+            let dnssec_mode = runtime_snapshot.dnssec_policy.mode();
             let bg_validator = if dnssec_mode == sito_dnssec::DnssecMode::Disabled {
                 None
             } else {
-                Some(self.dnssec.load_full())
+                Some(Arc::clone(&runtime_snapshot.dnssec_policy.validator))
             };
             let bg_resolve_query = build_upstream_query(
                 &bg_query,
@@ -1369,7 +1399,8 @@ impl DnsPipeline {
             });
         }
         cached_resp.metadata.id = query_id;
-        let cached_dnssec = if self.dnssec.load().mode == sito_dnssec::DnssecMode::Disabled
+        let cached_dnssec = if runtime_snapshot.dnssec_policy.mode()
+            == sito_dnssec::DnssecMode::Disabled
             || !cached_resp.metadata.authentic_data
         {
             None
@@ -1511,8 +1542,8 @@ impl QueryHandler for DnsPipeline {
             // epoch no longer matches and the insert is rejected. Reading the
             // epoch first therefore cannot pair a new epoch with an old
             // validator.
-            let cache_policy_epoch = self.cache.policy_epoch();
-            let dnssec_mode = self.dnssec.load().mode;
+            let cache_policy_epoch = Self::cache_epoch_for(&runtime_snapshot);
+            let dnssec_mode = runtime_snapshot.dnssec_policy.mode();
             let validation_active = !query.metadata.checking_disabled
                 && dnssec_mode != sito_dnssec::DnssecMode::Disabled;
             // Cache lookups/inserts use the same ECS policy as the upstream
@@ -1531,7 +1562,22 @@ impl QueryHandler for DnsPipeline {
             // skip the work entirely.
             let (normalized_domain, filter_snapshot, filter_candidates) = if is_filtering_active {
                 let normalized = normalized_query_domain(qname);
-                let snapshot = self.filter.snapshot();
+                // The filter snapshot travels with the same generation as the
+                // config, so enabling filtering and installing rules cannot be
+                // observed half-applied.
+                let snapshot = match runtime_snapshot.filter.as_ref() {
+                    Some(snapshot) => Arc::clone(snapshot),
+                    None if config.filtering.fail_closed => {
+                        debug!(
+                            domain = %normalized,
+                            "Filtering enabled but the generation has no compiled rules; failing closed"
+                        );
+                        return QueryOutcome::servfail(&query, domain_str, qtype);
+                    }
+                    // `fail_closed = false` is the documented opt-out: an
+                    // empty generation allows the query.
+                    None => Arc::new(FilterSnapshot::default()),
+                };
                 // Fail closed when filtering was never able to load its
                 // rules: an initial download failure must not silently
                 // turn into an allow-all resolver.
@@ -1566,7 +1612,7 @@ impl QueryHandler for DnsPipeline {
             let (group_snapshot, group_candidates) = if is_filtering_active
                 && (!policy.lists.is_empty() || !policy.custom_rules.is_empty())
             {
-                match self.filter.group_snapshot(&policy.group_name) {
+                match runtime_snapshot.group_filters.get(&policy.group_name).cloned() {
                     Some(snapshot) => {
                         let mut candidates = FilterCandidates::default();
                         snapshot.allowlist.collect_candidates(
@@ -1751,7 +1797,7 @@ impl QueryHandler for DnsPipeline {
                     .await
                 {
                     if cname_uncloaking_active
-                        && self.cname_target_blocked(&cached_resp, qtype, &client, &policy)
+                        && self.cname_target_blocked_with(&runtime_snapshot, &cached_resp, qtype, &client, &policy)
                     {
                         info!(
                             qname = %qname,
@@ -1778,6 +1824,7 @@ impl QueryHandler for DnsPipeline {
                             domain_str,
                             bypass_check_needed,
                             config,
+                            &runtime_snapshot,
                             &effective_upstream,
                         )
                         .await;
@@ -1796,7 +1843,7 @@ impl QueryHandler for DnsPipeline {
                 {
                     // A concurrent query populated the entry while we waited.
                     if cname_uncloaking_active
-                        && self.cname_target_blocked(&cached_resp, qtype, &client, &policy)
+                        && self.cname_target_blocked_with(&runtime_snapshot, &cached_resp, qtype, &client, &policy)
                     {
                         info!(
                             qname = %qname,
@@ -1823,6 +1870,7 @@ impl QueryHandler for DnsPipeline {
                             domain_str,
                             bypass_check_needed,
                             config,
+                            &runtime_snapshot,
                             &effective_upstream,
                         )
                         .await;
@@ -1872,7 +1920,7 @@ impl QueryHandler for DnsPipeline {
 
                     // 7. CNAME uncloaking: inspect any CNAME targets against active filter stages
                     if cname_uncloaking_active
-                        && self.cname_target_blocked(&upstream_resp, qtype, &client, &policy)
+                        && self.cname_target_blocked_with(&runtime_snapshot, &upstream_resp, qtype, &client, &policy)
                     {
                         info!(
                             qname = %qname,
@@ -1901,9 +1949,9 @@ impl QueryHandler for DnsPipeline {
                             .as_secs() as u32;
                         let key_fetcher =
                             sito_upstream::UpstreamKeyFetcher::new(Arc::clone(&effective_upstream));
-                        // Clone the validator for the awaited call so no ArcSwap
-                        // guard is held across the await.
-                        let validator = self.dnssec.load_full();
+                        // Clone the validator from this generation's snapshot.
+                        let validator =
+                            Arc::clone(&runtime_snapshot.dnssec_policy.validator);
                         let outcome = validate_dnssec_with_deadline(
                             &validator,
                             &mut upstream_resp,
@@ -2005,7 +2053,7 @@ impl QueryHandler for DnsPipeline {
                                 return outcome;
                             }
                             if cname_uncloaking_active
-                                && self.cname_target_blocked(&stale_resp, qtype, &client, &policy)
+                                && self.cname_target_blocked_with(&runtime_snapshot, &stale_resp, qtype, &client, &policy)
                             {
                                 info!(
                                     qname = %qname,
@@ -3231,7 +3279,7 @@ mod tests {
         config.dns.cache.enabled = true;
 
         let cache = std::sync::Arc::new(DnsCache::new(config.dns.cache.clone()));
-        let group_rules = crate::server::group_rule_sets(&clients);
+        let group_rules = sito_runtime::group_rule_sets(&clients);
         let filter = std::sync::Arc::new(
             HostsFilterEngine::init_with_observer_and_group_sources(
                 config.filtering.clone(),
@@ -4506,5 +4554,95 @@ mod tests {
         ));
         // Two rewrites are also dropped.
         assert!(combine_cname_target_tier_verdicts(Some(rewrite()), Some(rewrite())).is_none());
+    }
+    /// P1-27 regression: the DNSSEC insert epoch must come from the same
+    /// runtime snapshot as the validator. A query that loaded the old snapshot
+    /// cannot insert under the new epoch after an apply.
+    #[tokio::test]
+    async fn test_pipeline_uses_snapshot_generation_for_dnssec_cache_insert() {
+        let mut config = Config::default();
+        config.dns.dnssec.validate = false;
+        let (pipeline, _calls, temp_dir) = test_pipeline(config.clone()).await;
+
+        let old_snapshot = pipeline.runtime().snapshot();
+        let old_generation = old_snapshot.generation;
+
+        let mut next = config.clone();
+        next.dns.dnssec.mode = "log_only".to_string();
+        let plan = sito_runtime::ApplyPlan {
+            config: next.clone(),
+            clients: Default::default(),
+            rewrites: Default::default(),
+            filter: old_snapshot.filter.clone(),
+            group_filters: old_snapshot.group_filters.clone(),
+            dnssec_policy: sito_runtime::DnssecPolicy::from_config(&next.dns.dnssec),
+            cache_policy: next.dns.cache.clone(),
+            transport_policy: sito_runtime::TransportPolicy::from(&next),
+        };
+        pipeline
+            .runtime()
+            .apply(plan)
+            .await
+            .expect("policy change apply");
+        assert!(pipeline.runtime().generation() > old_generation);
+
+        // The epoch used for an insert must be the snapshot's generation, not
+        // a fresh live read that a concurrent apply already advanced.
+        assert_eq!(DnsPipeline::cache_epoch_for(&old_snapshot), old_generation);
+        assert_ne!(
+            DnsPipeline::cache_epoch_for(&old_snapshot),
+            pipeline.cache.policy_epoch()
+        );
+
+        let name = Name::from_str("generation.example.").unwrap();
+        let mut query = Message::new(9, MessageType::Query, OpCode::Query);
+        query
+            .queries
+            .push(hickory_proto::op::Query::query(name.clone(), RecordType::A));
+        let mut response = Message::response(9, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.answers.push(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 9))),
+        ));
+
+        // The in-flight query used the old snapshot's validator and captured
+        // its generation; the insert must be rejected.
+        assert!(
+            !pipeline
+                .cache
+                .insert_with_status_at_epoch(
+                    &query,
+                    &response,
+                    ValidationStatus::Insecure,
+                    old_generation,
+                )
+                .await,
+            "an insert tagged with the old snapshot generation must be rejected"
+        );
+        assert!(
+            pipeline
+                .cache
+                .get(&name, RecordType::A, sito_proto::DNSClass::IN)
+                .await
+                .is_none()
+        );
+
+        // The current generation is accepted.
+        let current = pipeline.runtime().generation();
+        assert!(
+            pipeline
+                .cache
+                .insert_with_status_at_epoch(
+                    &query,
+                    &response,
+                    ValidationStatus::Insecure,
+                    current,
+                )
+                .await
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
