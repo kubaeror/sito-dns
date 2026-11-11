@@ -8,9 +8,9 @@ pub mod pipeline;
 pub mod server;
 pub mod service_lock;
 
-pub use cli::{Cli, Commands, run_check_config, run_healthcheck};
+pub use cli::{Cli, Commands, run_check_config};
 pub use pipeline::DnsPipeline;
-pub use server::{run_server, run_server_full, run_server_with_shutdown};
+pub use server::{run_server_full, run_server_with_shutdown};
 
 #[cfg(test)]
 mod tests {

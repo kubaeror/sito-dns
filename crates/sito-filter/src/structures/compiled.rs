@@ -54,8 +54,18 @@ pub const MAX_PREFIX_PATTERN_BYTES: usize = 2 * 1024 * 1024;
 /// count, so the pattern set is partitioned into small batches first; a batch
 /// that still cannot be compiled is bisected down to the offending pattern.
 pub const REGEX_BATCH_SIZE: usize = 128;
-/// Upper bound on the number of compiled DFA batches per rule set.
-pub const MAX_REGEX_BATCHES: usize = 512;
+/// Total DFA memory ceiling per compiled rule set (six times the per-DFA
+/// ceiling, 60 MiB).
+///
+/// `MAX_REGEX_BATCHES` used to cap the batch count at 512, which was neither
+/// reachable in the normal path (`MAX_REGEX_PATTERNS / REGEX_BATCH_SIZE` = 79)
+/// nor derived from a resource budget: it only fired after pathological DFA
+/// bisection. The batch count is now bounded by actual compiled memory, so a
+/// hostile list that fragments into many DFAs cannot multiply allocations past
+/// this budget. A DFA that would cross the limit is discarded; peak transient
+/// memory is at most one `MAX_DFA_SIZE_BYTES` above the budget, and the
+/// discarded patterns are counted as dropped.
+pub const MAX_DFA_TOTAL_BYTES: usize = 6 * MAX_DFA_SIZE_BYTES;
 
 /// Wall-clock budget for regex/wildcard DFA compilation.
 ///
@@ -107,6 +117,27 @@ pub struct CompileBudgetExceeded {
     pub limit_ms: u64,
 }
 
+/// Accumulated DFA memory for one compiled rule set, plus its limit.
+///
+/// Keeping the accounting in a struct both bounds the function arity and lets
+/// the unit tests exercise the enforcement branch with a tiny limit instead of
+/// compiling tens of megabytes of DFAs.
+struct DfaMemoryBudget {
+    total_bytes: usize,
+    limit: usize,
+    exhausted: bool,
+}
+
+impl DfaMemoryBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            total_bytes: 0,
+            limit,
+            exhausted: false,
+        }
+    }
+}
+
 /// Builds a bounded regex DFA batch, bisecting on failure so one invalid or
 /// oversized pattern cannot drop its neighbours.
 fn build_regex_batch(
@@ -115,8 +146,13 @@ fn build_regex_batch(
     batches: &mut Vec<RegexBatch>,
     dropped: &mut usize,
     budget: Option<&CompileBudget>,
+    memory: &mut DfaMemoryBudget,
 ) -> Result<(), CompileBudgetExceeded> {
     if patterns.is_empty() {
+        return Ok(());
+    }
+    if memory.exhausted {
+        *dropped += patterns.len();
         return Ok(());
     }
     if let Some(budget) = budget
@@ -134,6 +170,16 @@ fn build_regex_batch(
         builder
     };
     if let Ok(dfa) = make_builder().build_many(patterns) {
+        let bytes = dfa.memory_usage();
+        if memory.total_bytes.saturating_add(bytes) > memory.limit {
+            // Building the DFA first is unavoidable (its size is only known
+            // afterwards), but it is discarded immediately; no further batch
+            // is allocated for this rule set.
+            *dropped += patterns.len();
+            memory.exhausted = true;
+            return Ok(());
+        }
+        memory.total_bytes += bytes;
         batches.push(RegexBatch {
             dfa,
             pattern_to_rules: rules.to_vec(),
@@ -149,8 +195,22 @@ fn build_regex_batch(
         return Ok(());
     }
     let mid = patterns.len() / 2;
-    build_regex_batch(&patterns[..mid], &rules[..mid], batches, dropped, budget)?;
-    build_regex_batch(&patterns[mid..], &rules[mid..], batches, dropped, budget)
+    build_regex_batch(
+        &patterns[..mid],
+        &rules[..mid],
+        batches,
+        dropped,
+        budget,
+        memory,
+    )?;
+    build_regex_batch(
+        &patterns[mid..],
+        &rules[mid..],
+        batches,
+        dropped,
+        budget,
+        memory,
+    )
 }
 
 /// Converts an ABP wildcard string into an anchored regex pattern.
@@ -500,6 +560,7 @@ impl RuleSetBuilder {
             } else {
                 let mut batches = Vec::new();
                 let mut dropped_in_batches = 0usize;
+                let mut dfa_memory = DfaMemoryBudget::new(MAX_DFA_TOTAL_BYTES);
                 for (patterns, rules) in pat_strings
                     .chunks(REGEX_BATCH_SIZE)
                     .zip(pat_to_rules.chunks(REGEX_BATCH_SIZE))
@@ -511,26 +572,28 @@ impl RuleSetBuilder {
                     {
                         return Err(budget.exceeded());
                     }
+                    if dfa_memory.exhausted {
+                        // Keep the patterns that already compiled; do not
+                        // allocate more DFAs for a hostile, highly fragmented
+                        // rule set.
+                        dropped_in_batches += patterns.len();
+                        continue;
+                    }
                     build_regex_batch(
                         patterns,
                         rules,
                         &mut batches,
                         &mut dropped_in_batches,
                         budget,
+                        &mut dfa_memory,
                     )?;
                 }
-                if batches.len() > MAX_REGEX_BATCHES {
-                    let extra: usize = batches[MAX_REGEX_BATCHES..]
-                        .iter()
-                        .map(|batch| batch.pattern_to_rules.len())
-                        .sum();
+                if dfa_memory.exhausted {
                     error!(
-                        batches = batches.len(),
-                        limit = MAX_REGEX_BATCHES,
-                        "Regex batch budget exceeded; dropping the remaining patterns"
+                        dfa_bytes = dfa_memory.total_bytes,
+                        limit = dfa_memory.limit,
+                        "Regex DFA memory budget exceeded; dropping the remaining patterns"
                     );
-                    batches.truncate(MAX_REGEX_BATCHES);
-                    dropped_in_batches += extra;
                 }
                 (batches, dropped + dropped_in_batches)
             }
@@ -928,6 +991,84 @@ mod tests {
         candidates.clear();
         compiled.collect_candidates("valid-two.example", &interner, &mut candidates);
         assert!(candidates.contains(&3), "got candidates: {candidates:?}");
+    }
+
+    #[test]
+    fn test_multi_batch_regex_set_stays_within_total_dfa_budget() {
+        let mut interner = LabelInterner::new();
+        let mut builder = RuleSetBuilder::new();
+        for i in 0..(REGEX_BATCH_SIZE * 8) {
+            builder.add_regex(format!("^budget-{i}\\..*\\.example$"), i as u32);
+        }
+        let compiled = builder.build(&mut interner);
+        assert!(compiled.has_regex());
+        assert_eq!(compiled.dropped_regex_patterns, 0);
+        assert!(
+            compiled.regex_batches.len() > 1,
+            "the test must exercise more than one DFA batch"
+        );
+        let bytes: usize = compiled
+            .regex_batches
+            .iter()
+            .map(|batch| batch.dfa.memory_usage())
+            .sum();
+        assert!(bytes > 0, "compiled DFAs must account for memory");
+        assert!(
+            bytes <= MAX_DFA_TOTAL_BYTES,
+            "a normal multi-batch rule set must stay within the total DFA budget"
+        );
+    }
+
+    #[test]
+    fn test_total_dfa_budget_discards_crossing_batch_and_exhausts() {
+        let patterns = vec!["^budget-limit\\.example$".to_string()];
+        let rules = vec![vec![7u32]];
+        let mut batches = Vec::new();
+        let mut dropped = 0usize;
+        // Any compiled DFA is larger than one byte, so starting one byte below
+        // the limit forces the enforcement branch without building 60 MiB of
+        // DFAs in the test.
+        let mut memory = DfaMemoryBudget::new(MAX_DFA_TOTAL_BYTES);
+        memory.total_bytes = MAX_DFA_TOTAL_BYTES - 1;
+
+        build_regex_batch(
+            &patterns,
+            &rules,
+            &mut batches,
+            &mut dropped,
+            None,
+            &mut memory,
+        )
+        .expect("an exhausted budget is not a compile error");
+
+        assert!(memory.exhausted, "the crossing DFA must exhaust the budget");
+        assert_eq!(
+            dropped, 1,
+            "the crossing pattern must be counted as dropped"
+        );
+        assert!(batches.is_empty(), "the crossing DFA must be discarded");
+        assert_eq!(
+            memory.total_bytes,
+            MAX_DFA_TOTAL_BYTES - 1,
+            "a discarded DFA must not be charged to the budget"
+        );
+
+        // Once exhausted, later patterns are dropped by the short-circuit
+        // without attempting another DFA build. Use a huge limit: if the
+        // short-circuit were removed, this DFA would fit and be pushed.
+        let more = vec!["^also-over-budget\\.example$".to_string()];
+        memory.limit = usize::MAX;
+        build_regex_batch(&more, &rules, &mut batches, &mut dropped, None, &mut memory)
+            .expect("an exhausted budget is not a compile error");
+        assert_eq!(
+            dropped, 2,
+            "the short-circuit must count later patterns as dropped"
+        );
+        assert!(
+            batches.is_empty(),
+            "an exhausted budget must short-circuit even when the DFA would fit"
+        );
+        assert_eq!(memory.total_bytes, MAX_DFA_TOTAL_BYTES - 1);
     }
 
     #[test]

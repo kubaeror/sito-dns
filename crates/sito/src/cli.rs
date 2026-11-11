@@ -394,11 +394,6 @@ pub async fn run_clear_query_log(
     Ok(deleted)
 }
 
-/// Executes the `healthcheck` subcommand by sending a test DNS query.
-pub async fn run_healthcheck(addr: SocketAddr, timeout_ms: u64) -> Result<(), anyhow::Error> {
-    probe_dns(addr, timeout_ms).await
-}
-
 /// Whether the configuration makes HA replication part of this node's role.
 ///
 /// Mirrors the server's readiness gate so the healthcheck fails closed only

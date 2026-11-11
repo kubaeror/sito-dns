@@ -32,10 +32,11 @@ pub fn validate_typed_sections(config: &Config) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("invalid [rewrites] configuration: {e}"))?;
     }
     if let Some(value) = config.integrations.as_ref() {
-        let _: sito_clients::IntegrationsConfig = value
+        let integrations: sito_clients::IntegrationsConfig = value
             .clone()
             .try_into()
             .map_err(|e| anyhow::anyhow!("invalid [integrations] configuration: {e}"))?;
+        validate_integrations(&integrations, cfg!(feature = "routeros"))?;
     }
     if let Some(value) = config.web.as_ref() {
         let _: sito_core::config::WebConfig = value
@@ -89,6 +90,50 @@ pub fn validate_typed_sections(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Rejects an enabled RouterOS integration when this build cannot honour it.
+///
+/// The `routeros` feature is a property of the `sito` binary, propagated to
+/// this crate so the startup/`check-config`/API validation paths fail closed
+/// instead of silently ignoring the knob. The capability is a parameter so the
+/// behaviour is testable in every feature combination.
+fn validate_integrations(
+    integrations: &sito_clients::IntegrationsConfig,
+    routeros_supported: bool,
+) -> anyhow::Result<()> {
+    if !routeros_supported
+        && integrations
+            .mikrotik
+            .as_ref()
+            .is_some_and(|mikrotik| mikrotik.enabled)
+    {
+        return Err(anyhow::anyhow!(
+            "invalid [integrations.mikrotik] configuration: enabled = true requires the \
+             optional RouterOS integration, which this build does not include; rebuild \
+             sito with `cargo build -p sito --features routeros` or set enabled = false"
+        ));
+    }
+    if let Some(mikrotik) = integrations.mikrotik.as_ref()
+        && mikrotik.enabled
+    {
+        // A plaintext http:// URL is allowed (lab opt-out) but never grants
+        // client identity; every other scheme is rejected so a typo cannot
+        // silently disable the integration.
+        let url = reqwest::Url::parse(&mikrotik.url).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid [integrations.mikrotik] url '{0}': {e}",
+                mikrotik.url
+            )
+        })?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(anyhow::anyhow!(
+                "invalid [integrations.mikrotik] url '{}': scheme must be http:// or https://",
+                mikrotik.url
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +155,58 @@ mod tests {
         )
         .expect("parses");
         validate_typed_sections(&config).expect("valid sections");
+    }
+
+    /// RouterOS is an optional integration. A build without the `routeros`
+    /// feature must reject `integrations.mikrotik.enabled = true` instead of
+    /// silently ignoring the knob at startup. The capability is exercised
+    /// directly so the test runs in every feature combination.
+    #[test]
+    fn test_rejects_enabled_mikrotik_without_routeros_feature() {
+        let integrations: sito_clients::IntegrationsConfig =
+            toml::from_str("[mikrotik]\nenabled = true\n").expect("parses [integrations]");
+        let err = validate_integrations(&integrations, false)
+            .expect_err("enabled RouterOS integration requires the routeros feature");
+        let message = err.to_string();
+        assert!(
+            message.contains("routeros") && message.contains("[integrations.mikrotik]"),
+            "the error must name the feature and the section: {message}"
+        );
+
+        // The same config is accepted by a build that contains the feature.
+        validate_integrations(&integrations, true).expect("feature-enabled build accepts it");
+    }
+
+    /// The knob is not silently ignored when it is disabled: a disabled
+    /// `[integrations.mikrotik]` section is valid in every build.
+    #[test]
+    fn test_accepts_disabled_mikrotik_without_routeros_feature() {
+        let config = Config::from_toml_str(
+            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[integrations.mikrotik]\nenabled = false\n",
+        )
+        .expect("parses");
+        validate_typed_sections(&config).expect("a disabled RouterOS section must be accepted");
+    }
+
+    #[test]
+    fn test_rejects_non_http_mikrotik_url_but_accepts_plaintext_lab_opt_out() {
+        let unsupported: sito_clients::IntegrationsConfig =
+            toml::from_str("[mikrotik]\nenabled = true\nurl = \"ftp://router.lan\"\n")
+                .expect("parses [integrations]");
+        let err = validate_integrations(&unsupported, true)
+            .expect_err("a non-HTTP(S) URL must fail closed");
+        assert!(
+            err.to_string()
+                .contains("scheme must be http:// or https://"),
+            "unexpected error: {err}"
+        );
+
+        // Plaintext http:// is a documented lab opt-out: accepted, but the
+        // RouterOS client marks its leases unverified (display-only).
+        let plaintext: sito_clients::IntegrationsConfig =
+            toml::from_str("[mikrotik]\nenabled = true\nurl = \"http://router.lan\"\n")
+                .expect("parses [integrations]");
+        validate_integrations(&plaintext, true).expect("plaintext lab opt-out is accepted");
     }
 
     #[test]

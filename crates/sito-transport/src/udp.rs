@@ -70,7 +70,6 @@ pub fn create_reuseport_udp_socket(addr: &SocketAddr) -> std::io::Result<std::ne
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
     socket.set_reuse_address(true)?;
-    #[cfg(unix)]
     unsafe {
         let opt: libc::c_int = 1;
         let rc = libc::setsockopt(

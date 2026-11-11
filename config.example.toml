@@ -162,6 +162,9 @@ anonymize_querylog = false
 # url = "https://lists.example.com/services.json"
 
 # RouterOS DHCP lease discovery for client identification.
+# Optional and experimental: not compiled into the default binary. Build with
+# `cargo build -p sito --features routeros`; enabling it in a build without
+# that feature fails startup instead of silently ignoring the setting.
 # [integrations.mikrotik]
 # enabled = false
 # url = "https://192.168.1.1"

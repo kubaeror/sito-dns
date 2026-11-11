@@ -3018,7 +3018,6 @@ dependencies = [
  "rand 0.10.3",
  "rcgen",
  "rustls",
- "serde",
  "serde_json",
  "sito-api",
  "sito-cache",
@@ -3029,6 +3028,7 @@ dependencies = [
  "sito-ha",
  "sito-proto",
  "sito-rewrites",
+ "sito-routeros",
  "sito-runtime",
  "sito-stats",
  "sito-transport",
@@ -3105,7 +3105,6 @@ dependencies = [
  "blake3",
  "chrono",
  "croner",
- "reqwest",
  "serde",
  "serde_json",
  "sito-core",
@@ -3119,7 +3118,6 @@ dependencies = [
 name = "sito-core"
 version = "2.0.0-alpha.1"
 dependencies = [
- "arc-swap",
  "async-trait",
  "base64 0.23.1",
  "hickory-proto",
@@ -3172,7 +3170,6 @@ dependencies = [
 name = "sito-ha"
 version = "2.0.0-alpha.1"
 dependencies = [
- "anyhow",
  "arc-swap",
  "base64 0.23.1",
  "blake3",
@@ -3183,7 +3180,6 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "sito-clients",
@@ -3218,11 +3214,23 @@ version = "2.0.0-alpha.1"
 dependencies = [
  "hickory-proto",
  "serde",
- "serde_json",
  "sito-core",
  "sito-proto",
- "thiserror",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "sito-routeros"
+version = "2.0.0-alpha.1"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sito-clients",
+ "sito-core",
+ "thiserror",
+ "tokio",
  "tracing",
 ]
 
@@ -3261,7 +3269,6 @@ dependencies = [
  "arc-swap",
  "axum",
  "base64 0.23.1",
- "blake3",
  "bytes",
  "chrono",
  "criterion",
@@ -3302,7 +3309,6 @@ dependencies = [
  "tower",
  "tracing",
  "utoipa",
- "webpki-roots",
 ]
 
 [[package]]
@@ -3363,7 +3369,6 @@ dependencies = [
  "rustls",
  "sito-core",
  "sito-proto",
- "thiserror",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -3785,7 +3790,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

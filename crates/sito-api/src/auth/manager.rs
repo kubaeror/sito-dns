@@ -1666,7 +1666,8 @@ impl AuthManager {
     }
 
     /// Number of accounts with the Admin role.
-    pub fn admin_count(&self) -> usize {
+    #[cfg(test)]
+    fn admin_count(&self) -> usize {
         lock(&self.users)
             .values()
             .filter(|u| u.role == Role::Admin)

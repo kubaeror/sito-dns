@@ -34,7 +34,7 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 | **Filter Rule Engine** | **ABP/AdGuard syntax (see [compatibility matrix](docs/compatibility.md); qtype-aware `$dnsrewrite`)** | Full ABP + modifiers | Domain regex & wildcards |
 | **ReDoS Defense** | **Pure Dense DFA (no backtracking)** | RE2 linear time | POSIX regex (risk of backtrack) |
 | **ACME Certificates** | **Native TLS-ALPN-01 & HTTP-01** | Built-in ACME | External (Certbot) |
-| **RouterOS Integration** | **Optional experimental DHCP Lease Sync** (`--features routeros`; not in the default build) | None | None |
+| **RouterOS Integration** | **Optional experimental DHCP Lease Sync** (build with `cargo build -p sito --features routeros`; not in the default build) | None | None |
 | **Distribution** | **Single standalone binary (HTMX + Askama UI embedded)** | Single standalone binary | Multiple packages / lighttpd |
 | **Config Format** | **Single TOML (`config.toml`)** | Single YAML | Multiple conf files + SQLite |
 

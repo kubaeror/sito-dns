@@ -874,6 +874,7 @@ mod tests {
                 ip: Some(*ip),
                 hostname: Some(format!("host-{ip}")),
                 comment: None,
+                verified: true,
             }]);
             let mut client = sito_core::client::ClientContext::new(*ip);
             let _ = registry.resolve(&mut client, registry.timezone().at_utc(*last_seen));

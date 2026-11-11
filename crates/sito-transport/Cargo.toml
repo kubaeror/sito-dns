@@ -9,7 +9,7 @@ description = "Multi-protocol DNS transport listeners for sito"
 [dependencies]
 sito-core.workspace = true
 sito-proto.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "time", "sync", "net", "io-util"] }
 socket2.workspace = true
 libc.workspace = true
 dashmap.workspace = true

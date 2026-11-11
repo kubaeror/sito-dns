@@ -1758,9 +1758,9 @@ acme_enabled = false
             let _ = std::fs::remove_dir_all(&temp_dir);
         }
 
-        /// Guard against re-introducing a direct `save_config_atomic` call in
-        /// an admin handler: every write must acquire `apply_lock` and persist
-        /// through the apply pipeline.
+        /// Guard against re-introducing a direct config write in an admin
+        /// handler: every write must acquire `apply_lock` and persist through
+        /// the apply pipeline.
         ///
         /// Startup/restore-only code that cannot use the runtime pipeline may
         /// be whitelisted by adding its `src/...` path here with a comment.
@@ -1788,9 +1788,10 @@ acme_enabled = false
                     .display()
                     .to_string();
                 for (index, line) in content.lines().enumerate() {
-                    if line.contains("save_config_atomic(")
-                        && !allowlist.contains(&relative.as_str())
-                    {
+                    // `config_writer::save_config_document_atomic` is the only
+                    // persistence primitive; handlers must go through
+                    // `config_apply` instead of calling it directly.
+                    if line.contains("save_config") && !allowlist.contains(&relative.as_str()) {
                         offenders.push(format!("{relative}:{}", index + 1));
                     }
                 }

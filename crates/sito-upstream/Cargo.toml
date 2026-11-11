@@ -9,9 +9,8 @@ description = "Upstream server forwarding, health checking, and pooling for sito
 [dependencies]
 sito-core.workspace = true
 sito-proto.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "time", "sync", "net", "io-util"] }
 tracing.workspace = true
-thiserror.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true

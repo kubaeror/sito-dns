@@ -11,6 +11,7 @@ members = [
     "crates/sito-dnssec",
     "crates/sito-clients",
     "crates/sito-rewrites",
+    "crates/sito-routeros",
     "crates/sito-api",
     "crates/sito-stats",
     "crates/sito-ha",
@@ -33,7 +34,7 @@ homepage = "https://github.com/kubaeror/sito-dns"
 [workspace.dependencies]
 askama = "0.16"
 clap = { version = "4.6", features = ["derive"] }
-tokio = { version = "1.54", features = ["full"] }
+tokio = { version = "1.54", default-features = false, features = ["rt"] }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 arc-swap = "1.9"
 dashmap = "6.2"
@@ -98,6 +99,7 @@ sito-filter = { path = "crates/sito-filter", version = "2.0.0-alpha.1" }
 sito-dnssec = { path = "crates/sito-dnssec", version = "2.0.0-alpha.1" }
 sito-clients = { path = "crates/sito-clients", version = "2.0.0-alpha.1" }
 sito-rewrites = { path = "crates/sito-rewrites", version = "2.0.0-alpha.1" }
+sito-routeros = { path = "crates/sito-routeros", version = "2.0.0-alpha.1" }
 sito-api = { path = "crates/sito-api", version = "2.0.0-alpha.1" }
 sito-stats = { path = "crates/sito-stats", version = "2.0.0-alpha.1" }
 sito-runtime = { path = "crates/sito-runtime", version = "2.0.0-alpha.1" }

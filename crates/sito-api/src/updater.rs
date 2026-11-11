@@ -86,7 +86,7 @@ pub struct UpdateInfo {
 }
 
 /// Detects whether the current process is running inside a Docker or OCI container.
-pub fn is_running_in_docker() -> bool {
+fn is_running_in_docker() -> bool {
     if Path::new("/.dockerenv").exists() {
         return true;
     }
@@ -108,7 +108,7 @@ pub fn is_running_in_docker() -> bool {
 }
 
 /// Maps the current host CPU architecture to the release target triple.
-pub fn current_target_triple() -> &'static str {
+fn current_target_triple() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "x86_64-unknown-linux-gnu",
         "aarch64" => "aarch64-unknown-linux-gnu",
@@ -120,7 +120,7 @@ pub fn current_target_triple() -> &'static str {
 /// Parses a strict `major.minor.patch` semver core (optionally `v`-prefixed,
 /// optional pre-release/build metadata after `-`/`+`). Returns `None` for any
 /// other shape so callers never claim "newer" based on a loose comparison.
-pub fn parse_version_tuple(v: &str) -> Option<(u64, u64, u64)> {
+fn parse_version_tuple(v: &str) -> Option<(u64, u64, u64)> {
     let clean = v.trim().trim_start_matches('v');
     let core = clean.split(['-', '+']).next().unwrap_or(clean);
     let mut parts = core.split('.');
@@ -135,7 +135,7 @@ pub fn parse_version_tuple(v: &str) -> Option<(u64, u64, u64)> {
 
 /// Compares two versions. `None` means at least one side is unparseable
 /// (unknown outcome) and no ordering can be asserted.
-pub fn compare_versions(latest: &str, current: &str) -> Option<std::cmp::Ordering> {
+fn compare_versions(latest: &str, current: &str) -> Option<std::cmp::Ordering> {
     let latest = parse_version_tuple(latest)?;
     let current = parse_version_tuple(current)?;
     Some(latest.cmp(&current))
@@ -143,12 +143,12 @@ pub fn compare_versions(latest: &str, current: &str) -> Option<std::cmp::Orderin
 
 /// Returns true only when both versions parse and `latest` is strictly newer
 /// than `current`. Unparseable versions are never reported as newer.
-pub fn is_version_newer(latest: &str, current: &str) -> bool {
+fn is_version_newer(latest: &str, current: &str) -> bool {
     compare_versions(latest, current) == Some(std::cmp::Ordering::Greater)
 }
 
 /// True when both versions parse as semver.
-pub fn versions_comparable(latest: &str, current: &str) -> bool {
+fn versions_comparable(latest: &str, current: &str) -> bool {
     parse_version_tuple(latest).is_some() && parse_version_tuple(current).is_some()
 }
 
@@ -243,7 +243,7 @@ pub async fn check_for_update(repo: Option<&str>) -> Result<UpdateInfo, UpdateEr
 }
 
 /// Parses expected SHA256 checksum for a specific archive from SHA256SUMS file content.
-pub fn parse_checksum_from_sums(sums_content: &str, archive_name: &str) -> Option<String> {
+fn parse_checksum_from_sums(sums_content: &str, archive_name: &str) -> Option<String> {
     for line in sums_content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -309,7 +309,8 @@ fn hash_reader_sha256<R: Read>(reader: &mut R) -> std::io::Result<String> {
 /// This retains the in-memory API for callers that already hold the bytes;
 /// [`verify_archive_checksum_file`] is the streaming variant used by the
 /// updater.
-pub fn verify_archive_checksum(
+#[cfg(test)]
+fn verify_archive_checksum(
     archive_bytes: &[u8],
     archive_name: &str,
     sums_content: Option<&str>,
@@ -321,7 +322,7 @@ pub fn verify_archive_checksum(
 }
 
 /// Verifies an archive on disk without reading it into memory.
-pub async fn verify_archive_checksum_file(
+async fn verify_archive_checksum_file(
     archive_path: &Path,
     archive_name: &str,
     sums_content: Option<&str>,
@@ -459,7 +460,7 @@ impl SignatureVerifier for CosignVerifier {
 }
 
 /// Locates the detached signature and certificate assets for an archive.
-pub fn find_signature_assets(
+fn find_signature_assets(
     assets: &[ReleaseAsset],
     archive_name: &str,
 ) -> (Option<ReleaseAsset>, Option<ReleaseAsset>) {
@@ -475,7 +476,7 @@ pub fn find_signature_assets(
 /// * A signature that is present must verify, regardless of `required`.
 /// * If no signature is present (or no verifier is installed), verification is
 ///   only skipped when `required` is false; otherwise an error is returned.
-pub async fn verify_release_signature(
+async fn verify_release_signature(
     artifact: &Path,
     signature: Option<&Path>,
     certificate: Option<&Path>,
@@ -662,7 +663,7 @@ async fn apply_signature_policy(
 /// `reader`, enforcing a per-entry decompression cap so a tar bomb cannot
 /// exhaust memory even when the compressed archive passed the download-size
 /// check.
-pub fn extract_binary_from_reader<R: Read>(reader: R) -> Result<Vec<u8>, UpdateError> {
+fn extract_binary_from_reader<R: Read>(reader: R) -> Result<Vec<u8>, UpdateError> {
     let gz = GzDecoder::new(reader);
     let mut tar = tar::Archive::new(gz);
     let mut binary_content = Vec::new();
@@ -710,12 +711,13 @@ pub fn extract_binary_from_reader<R: Read>(reader: R) -> Result<Vec<u8>, UpdateE
 }
 
 /// In-memory compatibility wrapper around [`extract_binary_from_reader`].
-pub fn extract_binary_from_archive(archive_bytes: &[u8]) -> Result<Vec<u8>, UpdateError> {
+#[cfg(test)]
+fn extract_binary_from_archive(archive_bytes: &[u8]) -> Result<Vec<u8>, UpdateError> {
     extract_binary_from_reader(archive_bytes)
 }
 
 /// Extracts the binary from an archive on disk without buffering the archive.
-pub async fn extract_binary_from_file(archive_path: &Path) -> Result<Vec<u8>, UpdateError> {
+async fn extract_binary_from_file(archive_path: &Path) -> Result<Vec<u8>, UpdateError> {
     let path = archive_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)?;

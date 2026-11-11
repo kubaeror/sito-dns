@@ -1104,12 +1104,6 @@ fn load_bundled_registries() -> anyhow::Result<(
     Ok((Arc::new(parental), Arc::new(services)))
 }
 
-/// Runs the complete sito DNS server with graceful shutdown handling.
-pub async fn run_server(config: Config) -> anyhow::Result<()> {
-    let config_path = config.server.data_dir.join("config.toml");
-    run_server_full(config, config_path, None, false).await
-}
-
 /// Runs the DNS server with an optional custom shutdown receiver (useful for testing).
 pub async fn run_server_with_shutdown(
     config: Config,
@@ -1242,12 +1236,16 @@ pub async fn run_server_full(
     let rewrites_config = rewrites_from_config(&config)?;
     let rewrite_table = Arc::new(sito_rewrites::RewriteTable::new(rewrites_config));
 
-    // Initialize MikroTik RouterOS integration if configured
+    // Initialize MikroTik RouterOS integration if configured. The HTTP stack
+    // lives in the optional `sito-routeros` crate; a build without the
+    // `routeros` feature rejects an enabled integration during config
+    // validation instead of silently ignoring it.
+    #[cfg(feature = "routeros")]
     if let Some(integrations) = integrations
         && let Some(mikrotik_cfg) = integrations.mikrotik
         && mikrotik_cfg.enabled
     {
-        let _routeros_handle = sito_clients::spawn_routeros_sync(
+        let _routeros_handle = sito_routeros::spawn_routeros_sync(
             mikrotik_cfg,
             client_registry.clone(),
             shutdown_rx.clone(),

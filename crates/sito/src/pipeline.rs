@@ -838,12 +838,6 @@ impl DnsPipeline {
     }
 
     #[must_use]
-    pub fn with_anti_bypass(mut self, anti_bypass: Arc<AntiBypassRegistry>) -> Self {
-        self.anti_bypass = anti_bypass;
-        self
-    }
-
-    #[must_use]
     pub fn with_stats(
         mut self,
         querylog: sito_stats::QueryLogSender,

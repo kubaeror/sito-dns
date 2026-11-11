@@ -441,7 +441,9 @@ services:
 > writable by uid/gid 65532 once:
 > `sudo chown -R 65532:65532 ./master-config ./slave-config`. The full macvlan
 > reference deployment, including certificate handling and the RouterOS DHCP
-> hints, is in `docker-compose.ha.yml`.
+> hints, is in `docker-compose.ha.yml`. RouterOS lease sync is an optional,
+> experimental integration: the default binary does not include it. Build with
+> `cargo build -p sito --features routeros` to enable it.
 
 ---
 

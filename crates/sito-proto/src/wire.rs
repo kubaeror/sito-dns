@@ -3,7 +3,7 @@
 use crate::error::ProtoError;
 use hickory_proto::op::{Edns, Message, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
-use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_proto::rr::{Name, RData, Record, RecordType};
 use sito_core::config::BlockingMode;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -16,13 +16,6 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtoError> {
 pub fn encode_message(msg: &Message) -> Result<Vec<u8>, ProtoError> {
     msg.to_vec()
         .map_err(|e| ProtoError::EncodeError(e.to_string()))
-}
-
-/// Extract primary query question information (Name, RecordType, DNSClass).
-pub fn extract_query_info(msg: &Message) -> Option<(Name, RecordType, DNSClass)> {
-    msg.queries
-        .first()
-        .map(|q| (q.name().clone(), q.query_type(), q.query_class()))
 }
 
 /// Get the maximum UDP payload size advertised by the client via EDNS(0).

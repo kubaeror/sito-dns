@@ -216,19 +216,6 @@ impl Config {
         WebConfig::default()
     }
 
-    /// Returns operator-facing warnings for listeners reachable beyond
-    /// loopback without an explicit transport-security declaration.
-    ///
-    /// The messages contain only bind addresses, ports and configuration key
-    /// names; they never include credentials, tokens or URL userinfo.
-    #[must_use]
-    pub fn network_exposure_warnings(&self) -> Vec<String> {
-        self.web_exposure_warning()
-            .into_iter()
-            .chain(self.dns_exposure_warning())
-            .collect()
-    }
-
     /// Returns the admin-UI exposure warning, if the UI is reachable beyond
     /// loopback over plain HTTP without a declared TLS reverse proxy.
     ///
@@ -1624,6 +1611,17 @@ impl PrivacyConfig {
 mod tests {
     use super::*;
 
+    /// Test-only aggregation of the two startup warnings. The production code
+    /// emits them separately per startup phase, so the combined helper lives
+    /// here instead of the public API.
+    fn network_exposure_warnings(config: &Config) -> Vec<String> {
+        config
+            .web_exposure_warning()
+            .into_iter()
+            .chain(config.dns_exposure_warning())
+            .collect()
+    }
+
     #[test]
     fn test_parse_section_15_example() {
         let toml_str = r#"
@@ -2182,7 +2180,7 @@ key = "/path/to/key.pem"
     /// reachable beyond loopback (fail-closed visibility, truthful default).
     #[test]
     fn test_default_config_reports_web_and_dns_exposure() {
-        let warnings = Config::default().network_exposure_warnings();
+        let warnings = network_exposure_warnings(&Config::default());
         assert_eq!(
             warnings.len(),
             2,
@@ -2212,7 +2210,7 @@ key = "/path/to/key.pem"
         web.bind = IpAddr::from_str("127.0.0.1").expect("valid loopback");
         config.set_web_config(web);
         assert_eq!(
-            config.network_exposure_warnings(),
+            network_exposure_warnings(&config),
             Vec::<String>::new(),
             "loopback-only listeners must not warn"
         );
@@ -2224,7 +2222,7 @@ key = "/path/to/key.pem"
         web.bind = IpAddr::from_str("0.0.0.0").expect("valid wildcard");
         disabled.set_web_config(web);
         assert!(
-            disabled.network_exposure_warnings().is_empty(),
+            network_exposure_warnings(&disabled).is_empty(),
             "a disabled web UI must not warn about admin exposure"
         );
     }
@@ -2240,7 +2238,7 @@ key = "/path/to/key.pem"
         );
         let config = Config::from_toml_str(&https_proxy).expect("valid config");
         assert!(
-            config.network_exposure_warnings().is_empty(),
+            network_exposure_warnings(&config).is_empty(),
             "HTTPS reverse proxy declaration must suppress the plaintext warning"
         );
 
@@ -2249,7 +2247,7 @@ key = "/path/to/key.pem"
         );
         let config = Config::from_toml_str(&proxy_flag_only).expect("valid config");
         assert!(
-            config.network_exposure_warnings().is_empty(),
+            network_exposure_warnings(&config).is_empty(),
             "tls_terminated_by_proxy without public_url must suppress the warning"
         );
 
@@ -2258,8 +2256,7 @@ key = "/path/to/key.pem"
         );
         let config = Config::from_toml_str(&http_public_url).expect("valid config");
         assert!(
-            config
-                .network_exposure_warnings()
+            network_exposure_warnings(&config)
                 .iter()
                 .any(|w| w.contains("admin web UI")),
             "an explicit http:// public URL must still warn even with the proxy flag"
@@ -2291,7 +2288,7 @@ key = "/path/to/key.pem"
             "{TEST_BASE}[dns]\nbind = [\"0.0.0.0\"]\n[web]\nbind = \"0.0.0.0\"\npublic_url = \"http://secret-user:secret-pass@example.test:8080\"\n[ha]\nslave_token = \"top-secret-token\"\n"
         ))
         .expect("valid config");
-        let rendered = config.network_exposure_warnings().join("\n");
+        let rendered = network_exposure_warnings(&config).join("\n");
         for secret in ["secret-user", "secret-pass", "top-secret-token"] {
             assert!(
                 !rendered.contains(secret),

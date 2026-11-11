@@ -51,6 +51,14 @@ pub struct RouterOsLease {
     pub ip: Option<IpAddr>,
     pub hostname: Option<String>,
     pub comment: Option<String>,
+    /// True only when the lease came from an `https://` URL with certificate
+    /// verification enabled (`allow_invalid_certs = false`).
+    ///
+    /// D10/D15: a lease from a plaintext `http://` RouterOS API, or from an
+    /// API with TLS verification disabled, is display-only. It must never
+    /// grant a client entry's group, trusted flag, or MAC identity, because
+    /// any host on the path could forge it.
+    pub verified: bool,
 }
 
 /// Precomputed lookup tables for the static parts of the identification chain.
@@ -241,7 +249,7 @@ impl ClientRegistry {
             return Some(mac);
         }
         if let Ok(leases) = self.routeros_leases.read()
-            && let Some(lease) = leases.iter().find(|l| l.ip == Some(ip))
+            && let Some(lease) = leases.iter().find(|l| l.verified && l.ip == Some(ip))
         {
             return Some(lease.mac.clone());
         }
@@ -380,6 +388,9 @@ impl ClientRegistry {
         let leases = self.routeros_leases.read().unwrap();
 
         for lease in leases.iter() {
+            if !lease.verified {
+                continue;
+            }
             let matches_ip = lease.ip == Some(ctx.ip);
             let matches_mac = ctx
                 .mac
@@ -939,6 +950,38 @@ group = "hex"
     }
 
     #[test]
+    fn test_unverified_routeros_lease_never_identifies_a_client() {
+        let reg = ClientRegistry::new(sample_config());
+        let ip = IpAddr::from_str("192.168.1.99").unwrap();
+        let lease = |verified| RouterOsLease {
+            mac: "AA:BB:CC:DD:EE:FF".to_string(),
+            ip: Some(ip),
+            hostname: Some("janes-phone".to_string()),
+            comment: None,
+            verified,
+        };
+
+        // A lease fetched with TLS verification disabled is display-only.
+        reg.update_routeros_leases(vec![lease(false)]);
+        let mut unverified_ctx = ClientContext::new(ip);
+        let policy = reg.resolve(&mut unverified_ctx, reg.now());
+        assert_eq!(policy.group_name, "default");
+        assert!(!policy.trusted);
+        assert_eq!(
+            unverified_ctx.mac, None,
+            "an unverified lease must not populate MAC identity"
+        );
+
+        // The same lease over a verified TLS connection identifies the entry.
+        reg.update_routeros_leases(vec![lease(true)]);
+        let mut verified_ctx = ClientContext::new(ip);
+        let policy = reg.resolve(&mut verified_ctx, reg.now());
+        assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
+        assert_eq!(policy.group_name, "kids");
+        assert_eq!(verified_ctx.mac.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
+    }
+
+    #[test]
     fn test_routeros_lease_name_not_trusted_by_default() {
         let reg = ClientRegistry::new(sample_config());
         let ip = IpAddr::from_str("192.168.1.150").unwrap();
@@ -948,6 +991,7 @@ group = "hex"
             ip: Some(ip),
             hostname: Some("admin-laptop".to_string()),
             comment: Some("Director laptop".to_string()),
+            verified: true,
         };
         reg.update_routeros_leases(vec![lease]);
 
@@ -974,6 +1018,7 @@ group = "hex"
             ip: Some(ip),
             hostname: Some("admin-laptop".to_string()),
             comment: Some("Director laptop".to_string()),
+            verified: true,
         };
         reg.update_routeros_leases(vec![lease]);
 
@@ -1003,6 +1048,7 @@ group = "known"
             ip: Some(ip),
             hostname: Some("attacker-chosen".to_string()),
             comment: None,
+            verified: true,
         }]);
 
         let mut ctx = ClientContext::new(ip);
@@ -1046,6 +1092,7 @@ group = "known"
             ip: None,
             hostname: Some("leased-host".to_string()),
             comment: None,
+            verified: true,
         }]);
 
         // A lease written through the pre-reload registry is visible to the
@@ -1065,6 +1112,7 @@ group = "known"
             ip: Some(ip),
             hostname: Some("discovered-host".to_string()),
             comment: None,
+            verified: true,
         }]);
         let mut ctx = ClientContext::new(ip);
         let _ = old.resolve(&mut ctx, old.now());
@@ -1144,6 +1192,7 @@ schedule = "0 0 15-21 * * MON-FRI"
             ip: Some(ip),
             hostname: hostname.map(str::to_string),
             comment: None,
+            verified: true,
         }
     }
 

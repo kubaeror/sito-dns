@@ -576,7 +576,15 @@ cannot overwrite newer configuration even if its version counter is higher.
 
 ---
 
-## 14. `[integrations.mikrotik]` — RouterOS Integration
+## 14. `[integrations.mikrotik]` — RouterOS Integration (optional, experimental)
+
+> **Not in the default build.** RouterOS DHCP lease synchronization lives in
+> the optional `sito-routeros` crate. Build it with
+> `cargo build -p sito --features routeros` (or
+> `cargo install --path crates/sito --features routeros`). A build without the
+> feature rejects `enabled = true` at startup, in `check-config`, and on API
+> writes with an error naming the missing feature; it never silently ignores
+> the setting.
 
 ```toml
 [integrations.mikrotik]
@@ -589,12 +597,12 @@ interval_s = 300
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Enable automated client discovery from RouterOS DHCP server. |
-| `url` | string | `"https://192.168.1.1"` | Base URL of RouterOS REST API (`https://router.lan`). |
-| `token_env` | string | `None` | Environment variable containing the RouterOS API token. When unset, no bearer-token authentication is attempted (use `username`/`password_env` instead). |
+| `url` | string | `"https://192.168.1.1"` | Base URL of the RouterOS REST API (`https://router.lan`). Only `https://` with certificate verification grants client identity; a plaintext `http://` URL is a lab opt-out whose leases are display-only. Non-HTTP(S) schemes are rejected when `enabled = true`. |
+| `token_env` | string | `None` | Environment variable containing the RouterOS API token. When unset, no bearer-token authentication is attempted (use `username`/`password_env` instead). If set but unresolved or empty, sync fails instead of silently falling back to basic authentication. |
 | `username` | string | `None` | Username for HTTP basic authentication when no token is used. |
 | `password` | string | `None` | Password for HTTP basic authentication (prefer `password_env` to keep secrets out of the config). |
 | `password_env` | string | `None` | Environment variable containing the RouterOS password. |
-| `allow_invalid_certs` | boolean | `false` | Accept untrusted/self-signed RouterOS TLS certificates (insecure; lab use only). |
+| `allow_invalid_certs` | boolean | `false` | Accept untrusted/self-signed RouterOS TLS certificates (insecure; lab use only). Leases fetched this way are marked unverified: they are display-only and never grant a client entry's group, trusted flag, or MAC identity. |
 | `interval_s` | integer | `300` | Polling interval in seconds to refresh active DHCP lease table. |
 
 ---

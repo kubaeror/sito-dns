@@ -28,7 +28,6 @@ use crate::tls::{TlsAcceptorManager, TlsManagerSet, create_certified_key};
 /// `OpenOptions::mode` only applies when a file is created, so files that
 /// already exist (e.g. account credentials written by an older version) need
 /// this explicit fix-up.
-#[cfg(unix)]
 fn enforce_secret_file_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
@@ -39,36 +38,26 @@ fn enforce_secret_file_permissions(path: &Path) {
     }
 }
 
-#[cfg(not(unix))]
-fn enforce_secret_file_permissions(_path: &Path) {}
-
 /// Writes a file containing key material with owner-only permissions (0600).
 ///
 /// `mode` only applies when the file is created; existing files are re-chmodded
 /// and a failure to restrict permissions is returned as an error (fail closed).
 pub fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        drop(file);
-        // `mode` only applies at creation; fail closed if existing perms
-        // cannot be restricted.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)
-    }
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    // `mode` only applies at creation; fail closed if existing perms cannot
+    // be restricted. The crate is Unix-only (see lib.rs `compile_error!`).
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 /// Configuration for ACME certificate management.
