@@ -1,6 +1,7 @@
 //! Domain name normalization and verification.
 
 use crate::error::ProtoError;
+use sito_core::domain::{DomainError, NormalizedDomain};
 
 /// Converts a domain that may contain raw Unicode characters (IDN) into its
 /// normalized ASCII/punycode form.
@@ -9,16 +10,14 @@ use crate::error::ProtoError;
 /// names and compiled matching structures are always punycode. Normalizing
 /// both sides through this function keeps matching and cache invalidation
 /// working for IDNs.
+///
+/// The canonical implementation lives in
+/// [`sito_core::domain::NormalizedDomain`]; this wrapper preserves the
+/// historical `sito_proto::ProtoError` contract.
 pub fn normalize_domain_or_idna(raw: &str) -> Result<String, ProtoError> {
-    match normalize_domain(raw) {
-        Ok(normalized) => Ok(normalized),
-        Err(ProtoError::InvalidIdn(_)) => {
-            let ascii = idna::domain_to_ascii(raw.trim())
-                .map_err(|_| ProtoError::InvalidIdn(raw.to_string()))?;
-            normalize_domain(&ascii)
-        }
-        Err(e) => Err(e),
-    }
+    NormalizedDomain::parse_idna(raw)
+        .map(NormalizedDomain::into_string)
+        .map_err(ProtoError::from)
 }
 
 /// Normalize and validate a domain name string:
@@ -27,75 +26,30 @@ pub fn normalize_domain_or_idna(raw: &str) -> Result<String, ProtoError> {
 /// - Reject non-ASCII Unicode characters (IDN must be punycode encoded)
 /// - Verify valid punycode for labels starting with "xn--"
 /// - Reject empty labels and invalid characters
+///
+/// Delegates to [`sito_core::domain::NormalizedDomain::parse_ascii`], which is
+/// the canonical implementation.
 pub fn normalize_domain(raw: &str) -> Result<String, ProtoError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(ProtoError::EmptyLabel(raw.to_string()));
-    }
+    NormalizedDomain::parse_ascii(raw)
+        .map(NormalizedDomain::into_string)
+        .map_err(ProtoError::from)
+}
 
-    // Reject non-ASCII characters directly (raw IDN)
-    for ch in trimmed.chars() {
-        if !ch.is_ascii() {
-            return Err(ProtoError::InvalidIdn(raw.to_string()));
-        }
-    }
-
-    // Strip trailing dot
-    let without_trailing_dot = trimmed.strip_suffix('.').unwrap_or(trimmed);
-
-    if without_trailing_dot.is_empty() {
-        return Err(ProtoError::EmptyLabel(raw.to_string()));
-    }
-
-    if without_trailing_dot.len() > 253 {
-        return Err(ProtoError::DomainTooLong {
-            domain: raw.to_string(),
-            length: without_trailing_dot.len(),
-        });
-    }
-
-    let lowercase = without_trailing_dot.to_ascii_lowercase();
-    let labels: Vec<&str> = lowercase.split('.').collect();
-
-    for label in &labels {
-        if label.is_empty() {
-            return Err(ProtoError::EmptyLabel(raw.to_string()));
-        }
-        if label.len() > 63 {
-            return Err(ProtoError::LabelTooLong {
-                domain: raw.to_string(),
-                length: label.len(),
-            });
-        }
-
-        // Validate characters: standard hostname characters are a-z, 0-9, hyphen, underscore
-        for ch in label.chars() {
-            if !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_') {
-                return Err(ProtoError::InvalidCharacter {
-                    domain: raw.to_string(),
-                    character: ch,
-                });
+impl From<DomainError> for ProtoError {
+    fn from(error: DomainError) -> Self {
+        match error {
+            DomainError::InvalidIdn(value) => Self::InvalidIdn(value),
+            DomainError::InvalidCharacter { domain, character } => {
+                Self::InvalidCharacter { domain, character }
             }
-        }
-
-        // Punycode verification for IDNA labels starting with "xn--"
-        if let Some(punycode_part) = label.strip_prefix("xn--") {
-            if punycode_part.is_empty() {
-                return Err(ProtoError::InvalidPunycode {
-                    label: (*label).to_string(),
-                    reason: "empty punycode payload".to_string(),
-                });
-            }
-            if idna::punycode::decode_to_string(punycode_part).is_none() {
-                return Err(ProtoError::InvalidPunycode {
-                    label: (*label).to_string(),
-                    reason: "failed to decode punycode".to_string(),
-                });
+            DomainError::DomainTooLong { domain, length } => Self::DomainTooLong { domain, length },
+            DomainError::LabelTooLong { domain, length } => Self::LabelTooLong { domain, length },
+            DomainError::EmptyLabel(value) => Self::EmptyLabel(value),
+            DomainError::InvalidPunycode { label, reason } => {
+                Self::InvalidPunycode { label, reason }
             }
         }
     }
-
-    Ok(lowercase)
 }
 
 #[cfg(test)]

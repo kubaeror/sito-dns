@@ -2,7 +2,8 @@
 
 use hickory_proto::rr::RecordType;
 use sito_core::client::ClientContext;
-use sito_proto::normalize_domain;
+use sito_core::domain::NormalizedDomain;
+use sito_core::net::IpNetwork;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
@@ -218,7 +219,7 @@ pub enum Pattern {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClientMatcher {
     Ip(IpAddr),
-    Cidr { ip: IpAddr, prefix: u8 },
+    Cidr(IpNetwork),
     Name(String),
 }
 
@@ -226,22 +227,28 @@ impl ClientMatcher {
     pub fn matches(&self, ctx: &ClientContext) -> bool {
         match self {
             Self::Ip(ip) => ctx.ip == *ip,
-            Self::Cidr { ip, prefix } => cidr_matches(*ip, *prefix, ctx.ip),
-            // Only identity fields populated by `ClientRegistry::resolve` are
-            // trusted here. `ctx.id`/`ctx.sni` are wire-claimed (DoH path, DoT
-            // SNI) and must not satisfy a `$client=` matcher on their own.
+            Self::Cidr(network) => network.contains(ctx.ip),
+            // Only a provenance-bearing, authenticated identity may satisfy a
+            // `$client=` name/group/MAC matcher. `ctx.id`/`ctx.sni` are
+            // wire-claimed (DoH path, DoT SNI) and must never be used here.
             Self::Name(name) => {
-                if let Some(client_name) = &ctx.client_name
+                let Some(identity) = ctx.identity_ref() else {
+                    return false;
+                };
+                if !identity.may_match_client_exception() {
+                    return false;
+                }
+                if let Some(client_name) = identity.name
                     && client_name.eq_ignore_ascii_case(name)
                 {
                     return true;
                 }
-                if let Some(group) = &ctx.group
+                if let Some(group) = identity.group
                     && group.eq_ignore_ascii_case(name)
                 {
                     return true;
                 }
-                if let Some(mac) = &ctx.mac
+                if let Some(mac) = identity.mac
                     && mac.eq_ignore_ascii_case(name)
                 {
                     return true;
@@ -256,7 +263,7 @@ impl fmt::Display for ClientMatcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ip(ip) => write!(f, "{ip}"),
-            Self::Cidr { ip, prefix } => write!(f, "{ip}/{prefix}"),
+            Self::Cidr(network) => write!(f, "{network}"),
             Self::Name(name) => {
                 // Quote names that contain separators or characters with a
                 // special meaning in a modifier list so the canonical form
@@ -284,45 +291,6 @@ fn needs_client_quoting(name: &str) -> bool {
         || name
             .chars()
             .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\' | ',' | '|'))
-}
-
-/// Verifies whether `target` IP falls within `net_ip/prefix` CIDR block.
-pub fn cidr_matches(net_ip: IpAddr, prefix: u8, target: IpAddr) -> bool {
-    match (net_ip, target) {
-        (IpAddr::V4(net), IpAddr::V4(tgt)) => {
-            if prefix > 32 {
-                return false;
-            }
-            if prefix == 0 {
-                return true;
-            }
-            let net_u32 = u32::from(net);
-            let tgt_u32 = u32::from(tgt);
-            let mask = if prefix == 32 {
-                u32::MAX
-            } else {
-                !((1u32 << (32 - prefix)) - 1)
-            };
-            (net_u32 & mask) == (tgt_u32 & mask)
-        }
-        (IpAddr::V6(net), IpAddr::V6(tgt)) => {
-            if prefix > 128 {
-                return false;
-            }
-            if prefix == 0 {
-                return true;
-            }
-            let net_u128 = u128::from(net);
-            let tgt_u128 = u128::from(tgt);
-            let mask = if prefix == 128 {
-                u128::MAX
-            } else {
-                !((1u128 << (128 - prefix)) - 1)
-            };
-            (net_u128 & mask) == (tgt_u128 & mask)
-        }
-        _ => false,
-    }
 }
 
 /// Evaluator for `$client` modifier.
@@ -424,7 +392,7 @@ pub struct RuleModifiers {
     pub badfilter: bool,
     pub client: Option<ClientFilter>,
     pub dnstype: Option<DnstypeFilter>,
-    pub denyallow: Option<Vec<String>>,
+    pub denyallow: Option<Vec<NormalizedDomain>>,
     pub dnsrewrite: Option<DnsRewriteRule>,
 }
 
@@ -435,7 +403,7 @@ impl RuleModifiers {
             let lower = fqdn.to_ascii_lowercase();
             let domain = lower.strip_suffix('.').unwrap_or(&lower);
             for d in list {
-                if sito_core::matches_domain_suffix(domain, d) {
+                if sito_core::matches_domain_suffix(domain, d.as_str()) {
                     return true;
                 }
             }
@@ -498,8 +466,8 @@ pub fn compute_canonical(kind: RuleKind, pattern: &Pattern, modifiers: &RuleModi
         opts.push(format!("client={client}"));
     }
     if let Some(denyallow) = &modifiers.denyallow {
-        let mut sorted = denyallow.clone();
-        sorted.sort();
+        let mut sorted: Vec<&str> = denyallow.iter().map(NormalizedDomain::as_str).collect();
+        sorted.sort_unstable();
         opts.push(format!("denyallow={}", sorted.join("|")));
     }
     if let Some(dnstype) = &modifiers.dnstype {
@@ -691,23 +659,7 @@ fn parse_client_filter(value: &str) -> Option<ClientFilter> {
         let item = parse_client_token(item_raw)?;
 
         let matcher = if item.contains('/') {
-            // CIDR
-            let mut parts = item.split('/');
-            let ip_str = parts.next()?;
-            let prefix_str = parts.next()?;
-            if parts.next().is_some() {
-                return None;
-            }
-            let ip = ip_str.parse::<IpAddr>().ok()?;
-            let prefix = prefix_str.parse::<u8>().ok()?;
-            let max_prefix = match ip {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            };
-            if prefix > max_prefix {
-                return None;
-            }
-            ClientMatcher::Cidr { ip, prefix }
+            ClientMatcher::Cidr(IpNetwork::parse(&item).ok()?)
         } else if let Ok(ip) = item.parse::<IpAddr>() {
             ClientMatcher::Ip(ip)
         } else {
@@ -778,15 +730,20 @@ fn parse_dnstype_filter(value: &str) -> Option<DnstypeFilter> {
 /// Parses a `$denyallow` modifier value (e.g. `sub.example.com|other.com`).
 ///
 /// Values are separated with `|`; the enclosing modifier list uses commas.
-/// Like `$dnstype`, one invalid token rejects the entire modifier.
-fn parse_denyallow(value: &str) -> Option<Vec<String>> {
+/// Like `$dnstype`, one invalid token rejects the entire modifier. Domains are
+/// normalized to canonical punycode so matching and `$badfilter` canonical
+/// forms are stable.
+fn parse_denyallow(value: &str) -> Option<Vec<NormalizedDomain>> {
     let mut domains = Vec::new();
     for item in value.split('|') {
         let item = item.trim();
         if item.is_empty() {
             continue;
         }
-        let normalized = normalize_domain(item).ok()?;
+        let normalized = NormalizedDomain::parse(item).ok()?;
+        if normalized.is_root() {
+            return None;
+        }
         domains.push(normalized);
     }
     if domains.is_empty() {
@@ -794,6 +751,57 @@ fn parse_denyallow(value: &str) -> Option<Vec<String>> {
     } else {
         Some(domains)
     }
+}
+
+/// Normalizes an operator/list-provided domain to canonical punycode.
+///
+/// Unlike the historical wire helper this accepts raw IDN input (the "IDN
+/// gap"). The root and wildcard labels are rejected because exact
+/// host/pattern keys cannot match a wildcard on the query path.
+fn normalize_rule_domain(raw: &str) -> Option<String> {
+    let domain = NormalizedDomain::parse(raw).ok()?;
+    if domain.is_root() || domain.has_wildcard_labels() {
+        return None;
+    }
+    Some(domain.into_string())
+}
+
+/// Normalizes the domain-shaped part of a wildcard or prefix pattern.
+///
+/// Whole-label wildcards (`*`) are preserved; labels without a wildcard are
+/// encoded through IDNA so the compiled regex matches punycode query names.
+/// A label that mixes `*` with non-ASCII text cannot be punycode-encoded
+/// without destroying the wildcard, so only its ASCII form is lowercased
+/// (such patterns are inherently not representable as a punycode prefix).
+fn normalize_pattern_domain(raw: &str) -> String {
+    let trailing_dot = raw.ends_with('.');
+    let body = raw.trim_end_matches('.');
+    let mut normalized = String::with_capacity(raw.len());
+    for (index, label) in body.split('.').enumerate() {
+        if index > 0 {
+            normalized.push('.');
+        }
+        if label.is_ascii() || label.contains('*') {
+            normalized.push_str(&label.to_ascii_lowercase());
+        } else {
+            match NormalizedDomain::parse(label) {
+                Ok(label) => normalized.push_str(label.as_str()),
+                Err(_) => normalized.push_str(&label.to_ascii_lowercase()),
+            }
+        }
+    }
+    if trailing_dot {
+        normalized.push('.');
+    }
+    normalized
+}
+
+/// Validates a `$dnsrewrite` target domain: IDN is accepted, but wildcards and
+/// the root are not valid wire record targets.
+fn normalize_rewrite_target(raw: &str) -> Option<String> {
+    NormalizedDomain::parse_idna(raw)
+        .ok()
+        .map(NormalizedDomain::into_string)
 }
 
 /// Response codes accepted in `$dnsrewrite` rules (AdGuard-compatible).
@@ -819,7 +827,7 @@ fn infer_rewrite_type(value: &str) -> Option<(String, String)> {
     }
     // A CNAME target must be a syntactically valid domain; never emit a
     // bogus CNAME for arbitrary junk.
-    normalize_domain(value).ok()?;
+    normalize_rewrite_target(value)?;
     Some(("CNAME".to_string(), value.to_string()))
 }
 
@@ -871,7 +879,7 @@ fn validate_rewrite(
                     value.parse::<Ipv6Addr>().ok()?;
                 }
                 "CNAME" | "PTR" => {
-                    normalize_domain(&value).ok()?;
+                    normalize_rewrite_target(&value)?;
                 }
                 "TXT" => {
                     if value.is_empty() {
@@ -1076,7 +1084,7 @@ pub fn parse_line(line: &str, source: &str, line_number: u32) -> Option<Rule> {
         if IGNORED_HOSTNAMES.contains(&stripped) {
             return None;
         }
-        let normalized = normalize_domain(domain_token).ok()?;
+        let normalized = normalize_rule_domain(domain_token)?;
         let pattern = Pattern::Exact(normalized);
         let modifiers = RuleModifiers::default();
         let canonical = compute_canonical(RuleKind::Block, &pattern, &modifiers);
@@ -1160,7 +1168,7 @@ fn parse_pattern(raw_pattern: &str) -> Option<Pattern> {
     // Exact domain anchor: `|domain|`
     if p.starts_with('|') && p.ends_with('|') && p.len() >= 3 && !p[1..].starts_with('|') {
         let inner = &p[1..p.len() - 1];
-        let normalized = normalize_domain(inner).ok()?;
+        let normalized = normalize_rule_domain(inner)?;
         return Some(Pattern::Exact(normalized));
     }
 
@@ -1173,18 +1181,19 @@ fn parse_pattern(raw_pattern: &str) -> Option<Pattern> {
             return None;
         }
         if domain_cleaned.contains('*') {
-            // Query domains are lowercased; keep wildcard anchors in the same
-            // case space so matching stays case-insensitive. Keep the `||`
-            // prefix when the pattern does not already start with `*` so
-            // `wildcard_to_regex` anchors at either the domain start or a
-            // subdomain dot boundary (`^(?:.*\.)?`).
-            let lower = domain_cleaned.to_ascii_lowercase();
-            if lower.starts_with('*') {
-                return Some(Pattern::Wildcard(lower));
+            // Query domains are lowercased/punycode; normalize the domain
+            // labels (including IDN) while keeping wildcard semantics so the
+            // compiled regex can match. Keep the `||` prefix when the pattern
+            // does not already start with `*` so `wildcard_to_regex` anchors
+            // at either the domain start or a subdomain dot boundary
+            // (`^(?:.*\.)?`).
+            let normalized = normalize_pattern_domain(domain_cleaned);
+            if normalized.starts_with('*') {
+                return Some(Pattern::Wildcard(normalized));
             }
-            return Some(Pattern::Wildcard(format!("||{lower}")));
+            return Some(Pattern::Wildcard(format!("||{normalized}")));
         }
-        let normalized = normalize_domain(domain_cleaned).ok()?;
+        let normalized = normalize_rule_domain(domain_cleaned)?;
         return Some(Pattern::Domain(normalized));
     }
 
@@ -1196,14 +1205,14 @@ fn parse_pattern(raw_pattern: &str) -> Option<Pattern> {
         if let Some(exact_part) = prefix_part.strip_suffix('^')
             && !exact_part.contains('*')
         {
-            let normalized = normalize_domain(exact_part).ok()?;
+            let normalized = normalize_rule_domain(exact_part)?;
             return Some(Pattern::Exact(normalized));
         }
         if prefix_part.contains('*') {
             let cleaned = prefix_part.strip_suffix('^').unwrap_or(prefix_part);
-            return Some(Pattern::Wildcard(cleaned.to_ascii_lowercase()));
+            return Some(Pattern::Wildcard(normalize_pattern_domain(cleaned)));
         }
-        return Some(Pattern::Prefix(prefix_part.to_ascii_lowercase()));
+        return Some(Pattern::Prefix(normalize_pattern_domain(prefix_part)));
     }
 
     // Wildcard: contains `*`
@@ -1215,7 +1224,7 @@ fn parse_pattern(raw_pattern: &str) -> Option<Pattern> {
                 return Some(Pattern::Substring(inner.to_ascii_lowercase()));
             }
         }
-        return Some(Pattern::Wildcard(p.to_ascii_lowercase()));
+        return Some(Pattern::Wildcard(normalize_pattern_domain(p)));
     }
 
     // Plain rule: a bare domain blocks the exact host only (AdGuard semantics:
@@ -1223,7 +1232,7 @@ fn parse_pattern(raw_pattern: &str) -> Option<Pattern> {
     // path cannot match at DNS level and stay inert.
     if p.contains('.') && !p.contains('/') {
         let stripped = p.strip_suffix('^').unwrap_or(p);
-        if let Ok(normalized) = normalize_domain(stripped) {
+        if let Some(normalized) = normalize_rule_domain(stripped) {
             return Some(Pattern::Exact(normalized));
         }
     }
@@ -1335,7 +1344,7 @@ pub fn parse_rules_with_limits(
                         limit: limits.max_rules,
                     });
                 }
-                if let Ok(normalized) = normalize_domain(domain_token) {
+                if let Some(normalized) = normalize_rule_domain(domain_token) {
                     let pattern = Pattern::Exact(normalized);
                     let modifiers = RuleModifiers::default();
                     let canonical = compute_canonical(RuleKind::Block, &pattern, &modifiers);
@@ -1406,6 +1415,54 @@ mod tests {
     }
 
     #[test]
+    fn test_wildcard_and_prefix_patterns_normalize_idn() {
+        let wildcard = parse_line("||*.münchen.de^", "test", 1).unwrap();
+        assert_eq!(
+            wildcard.pattern,
+            Pattern::Wildcard("*.xn--mnchen-3ya.de".to_string()),
+            "whole-label IDN wildcards must be stored as punycode"
+        );
+
+        let prefix = parse_line("|münchen.de", "test", 2).unwrap();
+        assert_eq!(
+            prefix.pattern,
+            Pattern::Prefix("xn--mnchen-3ya.de".to_string()),
+            "prefix patterns must be stored as punycode"
+        );
+
+        let prefixed_wildcard = parse_line("||bad*.MÜNCHEN.de^", "test", 3).unwrap();
+        assert_eq!(
+            prefixed_wildcard.pattern,
+            Pattern::Wildcard("||bad*.xn--mnchen-3ya.de".to_string()),
+            "partial wildcards must still normalize their IDN labels"
+        );
+
+        let anchored_wildcard = parse_line("|*.münchen.de", "test", 4).unwrap();
+        assert_eq!(
+            anchored_wildcard.pattern,
+            Pattern::Wildcard("*.xn--mnchen-3ya.de".to_string())
+        );
+
+        let bare_wildcard = parse_line("*.münchen.de", "test", 5).unwrap();
+        assert_eq!(
+            bare_wildcard.pattern,
+            Pattern::Wildcard("*.xn--mnchen-3ya.de".to_string())
+        );
+    }
+
+    #[test]
+    fn test_exact_patterns_reject_wildcard_labels() {
+        assert!(
+            parse_line("|*.example.com|", "test", 1).is_none(),
+            "an exact anchor cannot contain a wildcard label"
+        );
+        assert!(
+            parse_line("0.0.0.0 *", "test", 2).is_none(),
+            "a hosts line cannot claim a wildcard as an exact host"
+        );
+    }
+
+    #[test]
     fn test_parse_modifiers_important_and_badfilter() {
         let line = "||example.com^$important";
         let rule = parse_line(line, "test", 1).unwrap();
@@ -1446,6 +1503,66 @@ mod tests {
 
         let ctx_nomatch = ClientContext::new("172.16.0.1".parse().unwrap());
         assert!(!client_filter.matches(&ctx_nomatch));
+    }
+
+    #[test]
+    fn test_client_name_requires_authenticated_identity() {
+        use sito_core::IdentitySource;
+
+        let matcher = ClientMatcher::Name("laptop".to_string());
+
+        // An operator-configured identity may match.
+        let mut trusted =
+            ClientContext::new("192.168.1.10".parse().unwrap()).with_client_name("laptop");
+        trusted.identity_source = Some(IdentitySource::Ip);
+        assert!(matcher.matches(&trusted));
+
+        // A display-only SNI/DoH identity must not, even if a display layer
+        // populated the name field.
+        let mut untrusted =
+            ClientContext::new("192.168.1.10".parse().unwrap()).with_client_name("laptop");
+        untrusted.identity_source = Some(IdentitySource::TlsSni);
+        assert!(
+            !matcher.matches(&untrusted),
+            "untrusted identity must not satisfy $client"
+        );
+
+        let mut doh =
+            ClientContext::new("192.168.1.10".parse().unwrap()).with_client_name("laptop");
+        doh.identity_source = Some(IdentitySource::DohPath);
+        assert!(!matcher.matches(&doh));
+    }
+
+    #[test]
+    fn test_filter_patterns_and_denyallow_normalize_idn() {
+        let rule = parse_line("||MÜNCHEN.de^", "test", 1).unwrap();
+        assert_eq!(
+            rule.pattern,
+            Pattern::Domain("xn--mnchen-3ya.de".to_string()),
+            "raw Unicode domains must be normalized to punycode"
+        );
+
+        let hosts = parse_line("0.0.0.0 MÜNCHEN.de", "test", 2).unwrap();
+        assert_eq!(
+            hosts.pattern,
+            Pattern::Exact("xn--mnchen-3ya.de".to_string())
+        );
+
+        let deny = parse_line(
+            "||example.org^$denyallow=MÜNCHEN.de|Example.COM.",
+            "test",
+            3,
+        )
+        .unwrap();
+        assert!(deny.modifiers.denyallow_matches("sub.xn--mnchen-3ya.de"));
+        assert!(deny.modifiers.denyallow_matches("example.com"));
+        assert!(!deny.modifiers.denyallow_matches("xn--mnchen-3ya.de.evil"));
+        assert!(
+            deny.canonical
+                .contains("denyallow=example.com|xn--mnchen-3ya.de"),
+            "canonical form must use normalized input: {}",
+            deny.canonical
+        );
     }
 
     #[test]
@@ -1618,7 +1735,8 @@ mod tests {
         // Pipe-separated denyallow values reach the value parser intact.
         let deny = parse_line("||ad.com^$denyallow=a.com|b.com", "test", 2).unwrap();
         let domains = deny.modifiers.denyallow.unwrap();
-        assert_eq!(domains, vec!["a.com".to_string(), "b.com".to_string()]);
+        let domains: Vec<&str> = domains.iter().map(NormalizedDomain::as_str).collect();
+        assert_eq!(domains, vec!["a.com", "b.com"]);
 
         // A comma inside a value would have been split as a modifier; the
         // unknown fragment must make the whole rule fail safe (skip), never

@@ -3121,7 +3121,9 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "hickory-proto",
+ "idna",
  "serde",
+ "serde_json",
  "thiserror",
  "toml",
  "tracing",
@@ -3203,7 +3205,6 @@ name = "sito-proto"
 version = "2.0.0-alpha.1"
 dependencies = [
  "hickory-proto",
- "idna",
  "sito-core",
  "thiserror",
 ]
@@ -3215,7 +3216,6 @@ dependencies = [
  "hickory-proto",
  "serde",
  "sito-core",
- "sito-proto",
  "toml",
  "tracing",
 ]

@@ -1,12 +1,14 @@
 //! DNS rewrite table implementation supporting exact, wildcard, CNAME chains, and auto-PTR.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, PTR, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use sito_core::client::ClientContext;
+use sito_core::domain::NormalizedDomain;
+use sito_core::net::IpNetwork;
 use tracing::warn;
 
 use crate::config::RewritesConfig;
@@ -28,7 +30,7 @@ pub enum LocalRecordData {
 
 #[derive(Debug, Clone)]
 struct StoredRule {
-    wildcard_suffix: Option<String>,
+    wildcard_suffix: Option<NormalizedDomain>,
     record_type: RecordType,
     data: LocalRecordData,
     exception_clients: Vec<String>,
@@ -69,15 +71,31 @@ impl RewriteTable {
                 continue;
             };
 
-            let norm_domain = normalize_domain_key(&entry.domain);
-            let is_wildcard = norm_domain.starts_with("*.");
+            let Some(norm_domain) = normalize_domain_key(&entry.domain) else {
+                warn!(
+                    domain = %entry.domain,
+                    "invalid rewrite domain; entry skipped"
+                );
+                continue;
+            };
+            let wildcard_suffix = match norm_domain.as_str().strip_prefix("*.") {
+                Some(rest) => match NormalizedDomain::parse(rest) {
+                    Ok(suffix) => Some(suffix),
+                    Err(error) => {
+                        warn!(
+                            domain = %entry.domain,
+                            %error,
+                            "invalid rewrite wildcard domain; entry skipped"
+                        );
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let is_wildcard = wildcard_suffix.is_some();
 
             let rule = StoredRule {
-                wildcard_suffix: if is_wildcard {
-                    Some(norm_domain["*.".len()..].to_string())
-                } else {
-                    None
-                },
+                wildcard_suffix,
                 record_type,
                 data: rdata.clone(),
                 exception_clients: entry.exception_clients.clone(),
@@ -87,7 +105,7 @@ impl RewriteTable {
                 wildcards.push(rule.clone());
             } else {
                 exact
-                    .entry((norm_domain.clone(), record_type))
+                    .entry((norm_domain.clone().into_string(), record_type))
                     .or_default()
                     .push(rule.clone());
 
@@ -168,16 +186,17 @@ impl RewriteTable {
             return None;
         }
 
-        let qname_str = normalize_domain_key(&qname.to_ascii());
-        if visited.iter().any(|seen| seen == &qname_str) {
+        let qname_key = normalize_domain_key(&qname.to_ascii())?;
+        let qname_str = qname_key.as_str();
+        if visited.iter().any(|seen| seen == qname_str) {
             // CNAME loop detected; stop resolving to avoid unbounded recursion.
             return None;
         }
-        visited.push(qname_str.clone());
+        visited.push(qname_str.to_string());
 
         // 1. Exact match: return every non-excepted rule for (qname, qtype)
         //    in configuration order.
-        if let Some(rules) = self.exact.get(&(qname_str.clone(), qtype)) {
+        if let Some(rules) = self.exact.get(&(qname_str.to_string(), qtype)) {
             let answers: Vec<Record> = rules
                 .iter()
                 .filter(|rule| !is_client_excepted(client, &rule.exception_clients))
@@ -190,7 +209,7 @@ impl RewriteTable {
 
         // 2. Check exact CNAME (when qtype == CNAME, step 1 already returned it)
         if qtype != RecordType::CNAME
-            && let Some(rules) = self.exact.get(&(qname_str.clone(), RecordType::CNAME))
+            && let Some(rules) = self.exact.get(&(qname_str.to_string(), RecordType::CNAME))
         {
             for rule in rules {
                 if !is_client_excepted(client, &rule.exception_clients)
@@ -203,7 +222,7 @@ impl RewriteTable {
 
         // 3. Check auto-PTR table (for PTR queries)
         if qtype == RecordType::PTR
-            && let Some(rule) = self.auto_ptr.get(&qname_str)
+            && let Some(rule) = self.auto_ptr.get(qname_str)
             && !is_client_excepted(client, &rule.exception_clients)
         {
             return Some(vec![self.build_record(qname, &rule.data)]);
@@ -227,15 +246,15 @@ impl RewriteTable {
             let Some(ref suffix) = rule.wildcard_suffix else {
                 continue;
             };
-            if !matches_wildcard(&qname_str, suffix) {
+            if !matches_wildcard(&qname_key, suffix) {
                 continue;
             }
 
             match best_suffix_len {
-                Some(len) if suffix.len() < len => continue,
-                Some(len) if suffix.len() == len => {}
+                Some(len) if suffix.as_str().len() < len => continue,
+                Some(len) if suffix.as_str().len() == len => {}
                 _ => {
-                    best_suffix_len = Some(suffix.len());
+                    best_suffix_len = Some(suffix.as_str().len());
                     matched.clear();
                 }
             }
@@ -281,7 +300,7 @@ impl RewriteTable {
         visited: &mut Vec<String>,
         depth: usize,
     ) -> Option<Vec<Record>> {
-        let target_key = normalize_domain_key(&target.to_string());
+        let target_key = normalize_domain_key(&target.to_ascii())?.into_string();
         if visited.iter().any(|seen| seen == &target_key) {
             warn!(
                 qname = %qname,
@@ -317,113 +336,64 @@ fn is_client_excepted(client: &ClientContext, exceptions: &[String]) -> bool {
     }
 
     let client_ip_str = client.ip.to_string();
+    // Only an authenticated, provenance-bearing identity may satisfy a
+    // client-specific exception. A wire-claimed DoH path/SNI id or an
+    // untrusted identity never bypasses a rewrite.
+    let trusted_identity = client
+        .identity_ref()
+        .filter(sito_core::ClientIdentityRef::may_match_client_exception);
 
     for exc in exceptions {
         // CIDR exceptions (e.g. `10.0.0.0/8`, `fd00::/8`) match by address
         // range; they are checked before the exact-string comparisons.
-        if let Some((network, prefix)) = parse_cidr(exc)
-            && ip_in_cidr(network, prefix, client.ip)
+        if let Ok(network) = IpNetwork::parse(exc)
+            && network.contains(client.ip)
         {
             return true;
         }
         if exc.eq_ignore_ascii_case(&client_ip_str) {
             return true;
         }
-        if let Some(ref name) = client.client_name
-            && exc.eq_ignore_ascii_case(name)
-        {
-            return true;
-        }
-        // `client.id` may carry a client-supplied DoH path segment or SNI
-        // label. Only an id the registry authenticated (shared secret, or an
-        // entry selected by IP/CIDR/MAC/RouterOS) may satisfy an exception.
-        // Otherwise `/dns-query/<exception>` could bypass a rewrite exception
-        // without authenticating.
-        if client.id_authenticated
-            && let Some(ref id) = client.id
-            && exc.eq_ignore_ascii_case(id.as_str())
-        {
-            return true;
-        }
-        if let Some(ref group) = client.group
-            && exc.eq_ignore_ascii_case(group)
-        {
-            return true;
-        }
-        if let Some(ref mac) = client.mac
-            && exc.eq_ignore_ascii_case(mac)
-        {
-            return true;
+        if let Some(identity) = &trusted_identity {
+            if let Some(name) = identity.name
+                && exc.eq_ignore_ascii_case(name)
+            {
+                return true;
+            }
+            if let Some(group) = identity.group
+                && exc.eq_ignore_ascii_case(group)
+            {
+                return true;
+            }
+            if let Some(mac) = identity.mac
+                && exc.eq_ignore_ascii_case(mac)
+            {
+                return true;
+            }
         }
     }
 
     false
 }
 
-/// Parses `address/prefix` CIDR notation into an IP address and prefix length.
-fn parse_cidr(value: &str) -> Option<(IpAddr, u8)> {
-    let (addr, prefix) = value.split_once('/')?;
-    let addr = addr.trim().parse::<IpAddr>().ok()?;
-    let prefix = prefix.trim().parse::<u8>().ok()?;
-    let max_prefix = match addr {
-        IpAddr::V4(_) => 32,
-        IpAddr::V6(_) => 128,
-    };
-    if prefix > max_prefix {
-        return None;
-    }
-    Some((addr, prefix))
-}
-
-/// Checks whether `target` falls inside `network/prefix`.
-fn ip_in_cidr(network: IpAddr, prefix: u8, target: IpAddr) -> bool {
-    match (network, target) {
-        (IpAddr::V4(net), IpAddr::V4(tgt)) => {
-            if prefix == 0 {
-                return true;
-            }
-            let mask = if prefix >= 32 {
-                u32::MAX
-            } else {
-                u32::MAX << (32 - prefix)
-            };
-            (u32::from(net) & mask) == (u32::from(tgt) & mask)
-        }
-        (IpAddr::V6(net), IpAddr::V6(tgt)) => {
-            if prefix == 0 {
-                return true;
-            }
-            let mask = if prefix >= 128 {
-                u128::MAX
-            } else {
-                u128::MAX << (128 - prefix)
-            };
-            (u128::from(net) & mask) == (u128::from(tgt) & mask)
-        }
-        _ => false,
-    }
-}
-
-/// Normalizes a rewrite domain to the same ASCII/punycode form the filter
-/// engine and cache use.
+/// Normalizes a rewrite domain to the same canonical ASCII/punycode form the
+/// filter engine and cache use.
 ///
 /// Queries are matched through `Name::to_ascii()`, so a config entry written
 /// as Unicode must become punycode and a config entry written as punycode must
-/// stay as-is; previously Unicode config matched only by accident (via the
-/// UTS46-decoded `Name::to_string()`) and punycode entries never matched.
-fn normalize_domain_key(domain: &str) -> String {
-    let trimmed = domain.trim().trim_end_matches('.');
-    if let Some(rest) = trimmed.strip_prefix("*.") {
-        let ascii = sito_proto::normalize_domain_or_idna(rest)
-            .unwrap_or_else(|_| rest.to_ascii_lowercase());
-        return format!("*.{ascii}");
+/// stay as-is. Invalid entries are rejected by the caller instead of being
+/// silently compared in their raw form.
+fn normalize_domain_key(domain: &str) -> Option<NormalizedDomain> {
+    let trimmed = domain.trim();
+    if trimmed.is_empty() {
+        return None;
     }
-    sito_proto::normalize_domain_or_idna(trimmed).unwrap_or_else(|_| trimmed.to_ascii_lowercase())
+    NormalizedDomain::parse(trimmed).ok()
 }
 
-fn matches_wildcard(candidate: &str, suffix: &str) -> bool {
+fn matches_wildcard(candidate: &NormalizedDomain, suffix: &NormalizedDomain) -> bool {
     // `*.example.com` matches subdomains only, not the apex itself.
-    sito_core::matches_strict_subdomain(candidate, suffix)
+    candidate.is_strict_subdomain_of(suffix)
 }
 
 fn parse_entry_record(rtype: &str, answer: &str) -> Option<(RecordType, LocalRecordData)> {
@@ -890,6 +860,8 @@ entries = [
     /// rewrite exception using a DoH-path id that was not registry-resolved.
     #[test]
     fn test_ip_identified_client_cannot_spoof_exception_with_untrusted_id() {
+        use sito_core::IdentitySource;
+
         let table = sample_table();
         let mut client = ClientContext::new(IpAddr::from_str("192.168.1.30").unwrap());
         client.client_name = Some("kitchen".to_string());
@@ -903,11 +875,71 @@ entries = [
             "an unauthenticated path id must not bypass a rewrite exception"
         );
 
-        // Only the registry/secret-resolved flag may activate the id.
+        // Even a registry-authenticated raw id is not a policy identity: the
+        // exception names the registry-resolved client name, not the secret.
         client.id_authenticated = true;
+        client.identity_source = Some(IdentitySource::Secret);
+        assert!(
+            table.lookup(&qname_nas, RecordType::A, &client).is_some(),
+            "policy must never match the raw registered id"
+        );
+
+        // The registry-resolved identity name may satisfy the exception.
+        client.client_name = Some("admin-laptop".to_string());
         assert!(
             table.lookup(&qname_nas, RecordType::A, &client).is_none(),
-            "an authenticated id may satisfy the exception"
+            "an authenticated identity name may satisfy the exception"
+        );
+    }
+
+    #[test]
+    fn test_exception_requires_authenticated_identity() {
+        use sito_core::IdentitySource;
+
+        let table = sample_table();
+        let qname = Name::from_str("nas.home.arpa.").unwrap();
+
+        let mut client = ClientContext::new(IpAddr::from_str("192.168.1.30").unwrap());
+        client.client_name = Some("admin-laptop".to_string());
+
+        // A display-only SNI/DoH identity cannot satisfy an exception.
+        client.identity_source = Some(IdentitySource::TlsSni);
+        assert!(
+            table.lookup(&qname, RecordType::A, &client).is_some(),
+            "untrusted identity must not bypass a rewrite exception"
+        );
+        client.identity_source = Some(IdentitySource::DohPath);
+        assert!(table.lookup(&qname, RecordType::A, &client).is_some());
+
+        // The same name from an authenticated identity may.
+        client.identity_source = Some(IdentitySource::Ip);
+        assert!(table.lookup(&qname, RecordType::A, &client).is_none());
+    }
+
+    #[test]
+    fn test_idn_and_trailing_dot_rewrite_domains_match_punycode_queries() {
+        let config: RewritesConfig = toml::from_str(
+            r#"
+entries = [
+    { domain = "MÜNCHEN.de.", type = "A", answer = "192.0.2.10" },
+    { domain = "*.BÜCHER.example.", type = "A", answer = "192.0.2.11" },
+]
+"#,
+        )
+        .unwrap();
+        let table = RewriteTable::new(config);
+        let client = ClientContext::new(IpAddr::from_str("192.168.1.30").unwrap());
+
+        let exact = Name::from_str("xn--mnchen-3ya.de.").unwrap();
+        assert!(
+            table.lookup(&exact, RecordType::A, &client).is_some(),
+            "raw Unicode rewrite domains must match punycode queries"
+        );
+
+        let wildcard = Name::from_str("shop.xn--bcher-kva.example.").unwrap();
+        assert!(
+            table.lookup(&wildcard, RecordType::A, &client).is_some(),
+            "wildcard IDN rewrite domains must match punycode queries"
         );
     }
 

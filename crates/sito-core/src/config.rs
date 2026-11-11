@@ -1008,7 +1008,7 @@ impl DnssecConfig {
         let d = domain.trim_end_matches('.').to_lowercase();
         for anchor in self.ntp.iter().chain(self.nta.iter()) {
             let a = anchor.trim_end_matches('.').to_lowercase();
-            if d == a || d.ends_with(&format!(".{a}")) {
+            if crate::domain::matches_domain_suffix(&d, &a) {
                 return true;
             }
         }

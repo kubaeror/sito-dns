@@ -848,9 +848,7 @@ impl UpstreamManager {
             let qname_clean = qname_str.trim_end_matches('.');
             for (domains, group) in &inner.per_domain_rules {
                 for d in domains {
-                    if let Some(prefix) = qname_clean.strip_suffix(d.as_str())
-                        && (prefix.is_empty() || prefix.ends_with('.'))
-                    {
+                    if sito_core::matches_domain_suffix(qname_clean, d) {
                         debug!(
                             "Routing query for {} to per-domain upstreams {:?}",
                             qname_str, domains

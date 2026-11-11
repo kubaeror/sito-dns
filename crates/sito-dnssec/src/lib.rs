@@ -1953,7 +1953,7 @@ impl DnssecValidator {
                 return true;
             }
             let n = raw.trim_end_matches('.').to_ascii_lowercase();
-            norm == n || norm.ends_with(&format!(".{n}"))
+            sito_core::matches_domain_suffix(&norm, &n)
         })
     }
 

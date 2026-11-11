@@ -422,6 +422,40 @@ mod tests {
         }
     }
 
+    /// The cache API supplies Unicode names (`Name::to_string()`), while
+    /// cache keys are punycode (`Name::to_ascii()`). Invalidation must normalize
+    /// the request through IDNA or an IDN entry can never be evicted.
+    #[tokio::test]
+    async fn test_invalidate_domain_evicts_idn_punycode_entries() {
+        let config = make_test_config(10, 3600, 1800);
+        let cache = DnsCache::new(config);
+
+        insert_answer(&cache, 51, "xn--mnchen-3ya.de.").await;
+        insert_answer(&cache, 52, "www.xn--mnchen-3ya.de.").await;
+        insert_answer(&cache, 53, "other.example.").await;
+
+        cache.invalidate_domain("münchen.de");
+
+        for name in ["xn--mnchen-3ya.de.", "www.xn--mnchen-3ya.de."] {
+            let qname = Name::from_ascii(name).unwrap();
+            assert!(
+                cache
+                    .get(&qname, RecordType::A, DNSClass::IN)
+                    .await
+                    .is_none(),
+                "{name} must be invalidated by the Unicode name"
+            );
+        }
+        let other = Name::from_ascii("other.example.").unwrap();
+        assert!(
+            cache
+                .get(&other, RecordType::A, DNSClass::IN)
+                .await
+                .is_some(),
+            "unrelated entries must survive"
+        );
+    }
+
     #[tokio::test]
     async fn test_validation_status_round_trips_through_cache() {
         let config = make_test_config(10, 3600, 1800);

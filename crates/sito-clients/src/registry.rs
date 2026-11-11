@@ -16,7 +16,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 
-use sito_core::client::{ClientContext, ClientId};
+use sito_core::client::{ClientContext, ClientId, IdentitySource};
+use sito_core::net::IpNetwork;
 
 use crate::config::{ClientEntryConfig, ClientsConfig};
 use crate::mac::{MacResolver, normalize_mac_id};
@@ -70,7 +71,7 @@ struct ClientIndex {
     /// Exact IP address -> entry position.
     exact_ips: HashMap<IpAddr, usize>,
     /// CIDR blocks -> entry position, in configuration order.
-    subnets: Vec<(IpAddr, u8, usize)>,
+    subnets: Vec<(IpNetwork, usize)>,
     /// Normalized MAC -> entry position (explicit MAC format only).
     macs: HashMap<String, usize>,
     /// Shared client-id secret -> entry position.
@@ -221,7 +222,7 @@ impl ClientRegistry {
     /// wall clock.
     pub fn resolve(&self, ctx: &mut ClientContext, now: DateTime<FixedOffset>) -> EffectivePolicy {
         // 1. Identify client entry
-        if let Some(entry) = self.identify(ctx, now) {
+        if let Some((entry, source)) = self.identify(ctx, now) {
             ctx.client_name = Some(entry.name.clone());
             ctx.group = Some(entry.group.clone());
             if ctx.id.is_none() {
@@ -231,6 +232,7 @@ impl ClientRegistry {
                 // SNI value and keeps whatever flag `identify` set.
                 ctx.id_authenticated = true;
             }
+            ctx.identity_source = Some(source);
             if ctx.mac.is_none() {
                 ctx.mac = self.resolve_known_mac(ctx.ip, entry);
             }
@@ -238,7 +240,19 @@ impl ClientRegistry {
             return self.build_effective_policy(Some(entry), now);
         }
 
-        // 2. Unknown client fallback
+        // 2. Unknown client fallback. Wire-claimed labels are recorded so
+        //    display/statistics can show them, but they are never
+        //    authenticated policy identity. An ARP MAC that does not belong to
+        //    an operator-configured entry is display-only as well.
+        if ctx.identity_source.is_none() {
+            ctx.identity_source = if ctx.sni.is_some() {
+                Some(IdentitySource::TlsSni)
+            } else if ctx.id.is_some() {
+                Some(IdentitySource::DohPath)
+            } else {
+                None
+            };
+        }
         self.build_effective_policy(None, now)
     }
 
@@ -260,7 +274,7 @@ impl ClientRegistry {
         &self,
         ctx: &mut ClientContext,
         now: DateTime<FixedOffset>,
-    ) -> Option<&ClientEntryConfig> {
+    ) -> Option<(&ClientEntryConfig, IdentitySource)> {
         // 1. Shared-secret ClientID from DoH path or DoT/DoQ SNI subdomain.
         //    Only secrets configured in `clients.client_id_secrets` count;
         //    display names and arbitrary SNI labels never identify a client.
@@ -277,12 +291,12 @@ impl ClientRegistry {
             // RouterOS matches below do not authenticate a pre-existing
             // client-supplied id.
             ctx.id_authenticated = true;
-            return Some(matched);
+            return Some((matched, IdentitySource::Secret));
         }
 
         // 2. Static IP / CIDR matching (most specific prefix wins)
-        if let Some(matched) = self.match_by_ip_or_cidr(ctx.ip) {
-            return Some(matched);
+        if let Some((matched, source)) = self.match_by_ip_or_cidr(ctx.ip) {
+            return Some((matched, source));
         }
 
         // 3. Local MAC matching. Skipped entirely when no entry declares a MAC
@@ -293,13 +307,13 @@ impl ClientRegistry {
         {
             ctx.mac = Some(mac.clone());
             if let Some(matched) = self.match_by_mac(&mac) {
-                return Some(matched);
+                return Some((matched, IdentitySource::Mac));
             }
         }
 
-        // 4. RouterOS lease table match
+        // 4. RouterOS lease table match (verified leases only)
         if let Some(matched) = self.match_by_routeros(ctx, now) {
-            return Some(matched);
+            return Some((matched, IdentitySource::RouterOs));
         }
 
         None
@@ -347,25 +361,37 @@ impl ClientRegistry {
         None
     }
 
-    fn match_by_ip_or_cidr(&self, client_ip: IpAddr) -> Option<&ClientEntryConfig> {
+    fn match_by_ip_or_cidr(
+        &self,
+        client_ip: IpAddr,
+    ) -> Option<(&ClientEntryConfig, IdentitySource)> {
         // An exact host address is the most specific match possible.
         if let Some(&idx) = self.index.exact_ips.get(&client_ip) {
-            return self.config.entries.get(idx);
+            return self
+                .config
+                .entries
+                .get(idx)
+                .map(|entry| (entry, IdentitySource::Ip));
         }
 
         // Otherwise use the longest matching prefix; ties keep the first
         // configured entry so behavior is deterministic.
         let mut best: Option<(u8, usize)> = None;
-        for &(network, prefix, idx) in &self.index.subnets {
-            if !ip_in_subnet(network, prefix, client_ip) {
+        for (network, idx) in &self.index.subnets {
+            if !network.contains(client_ip) {
                 continue;
             }
             match best {
-                Some((best_prefix, _)) if best_prefix >= prefix => {}
-                _ => best = Some((prefix, idx)),
+                Some((best_prefix, _)) if best_prefix >= network.prefix() => {}
+                _ => best = Some((network.prefix(), *idx)),
             }
         }
-        best.and_then(|(_, idx)| self.config.entries.get(idx))
+        best.and_then(|(_, idx)| {
+            self.config
+                .entries
+                .get(idx)
+                .map(|entry| (entry, IdentitySource::Cidr))
+        })
     }
 
     fn match_by_mac(&self, mac: &str) -> Option<&ClientEntryConfig> {
@@ -434,8 +460,16 @@ impl ClientRegistry {
                 // Detected but undefined client
                 self.record_unidentified(ctx.ip, lease, now);
 
-                if trust_names && ctx.client_name.is_none() {
-                    ctx.client_name.clone_from(&lease.hostname);
+                if trust_names
+                    && ctx.client_name.is_none()
+                    && let Some(ref hostname) = lease.hostname
+                {
+                    ctx.client_name = Some(hostname.clone());
+                    // The name came from a verified lease and the operator
+                    // opted into trusting lease names: record the actual
+                    // provenance instead of letting the generic legacy
+                    // fallback label it as an IP identity.
+                    ctx.identity_source = Some(IdentitySource::RouterOs);
                 }
             }
         }
@@ -590,8 +624,8 @@ fn build_client_index(config: &ClientsConfig) -> ClientIndex {
         for id in &entry.ids {
             if let Ok(ip) = id.trim().parse::<IpAddr>() {
                 index.exact_ips.entry(ip).or_insert(entry_idx);
-            } else if let Some((network, prefix)) = parse_cidr(id) {
-                index.subnets.push((network, prefix, entry_idx));
+            } else if let Ok(network) = IpNetwork::parse(id) {
+                index.subnets.push((network, entry_idx));
             }
             if let Some(mac) = normalize_mac_id(id) {
                 index.macs.entry(mac).or_insert(entry_idx);
@@ -626,50 +660,6 @@ fn build_client_index(config: &ClientsConfig) -> ClientIndex {
     }
 
     index
-}
-
-/// Parses `address/prefix` CIDR notation into an IP address and prefix length.
-fn parse_cidr(cidr_str: &str) -> Option<(IpAddr, u8)> {
-    let (ip_str, prefix_str) = cidr_str.split_once('/')?;
-    let net_ip = ip_str.trim().parse::<IpAddr>().ok()?;
-    let prefix = prefix_str.trim().parse::<u8>().ok()?;
-    let max_prefix = match net_ip {
-        IpAddr::V4(_) => 32,
-        IpAddr::V6(_) => 128,
-    };
-    if prefix > max_prefix {
-        return None;
-    }
-    Some((net_ip, prefix))
-}
-
-/// Checks if `target_ip` is contained within `network/prefix`.
-fn ip_in_subnet(network: IpAddr, prefix: u8, target_ip: IpAddr) -> bool {
-    match (network, target_ip) {
-        (IpAddr::V4(net), IpAddr::V4(tgt)) => {
-            if prefix == 0 {
-                return true;
-            }
-            let mask = if prefix >= 32 {
-                u32::MAX
-            } else {
-                u32::MAX << (32 - prefix)
-            };
-            (u32::from(net) & mask) == (u32::from(tgt) & mask)
-        }
-        (IpAddr::V6(net), IpAddr::V6(tgt)) => {
-            if prefix == 0 {
-                return true;
-            }
-            let mask = if prefix >= 128 {
-                u128::MAX
-            } else {
-                u128::MAX << (128 - prefix)
-            };
-            (u128::from(net) & mask) == (u128::from(tgt) & mask)
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -1263,6 +1253,137 @@ schedule = "0 0 15-21 * * MON-FRI"
         let policy = reg.resolve(&mut ctx, reg.now());
         assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
         assert_eq!(ctx.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+    }
+
+    #[test]
+    fn test_trusted_routeros_hostname_without_entry_keeps_routeros_provenance() {
+        use sito_core::IdentitySource;
+
+        let mut cfg = sample_config();
+        cfg.trust_routeros_lease_names = true;
+        let reg = ClientRegistry::new(cfg);
+        let ip = "192.168.1.160".parse().unwrap();
+        reg.update_routeros_leases(vec![RouterOsLease {
+            mac: "11:22:33:44:55:77".to_string(),
+            ip: Some(ip),
+            hostname: Some("unmapped-host".to_string()),
+            comment: None,
+            verified: true,
+        }]);
+
+        let mut ctx = ClientContext::new(ip);
+        reg.resolve(&mut ctx, reg.now());
+        assert_eq!(ctx.client_name.as_deref(), Some("unmapped-host"));
+        assert_eq!(
+            ctx.identity_source,
+            Some(IdentitySource::RouterOs),
+            "a trusted verified lease name must keep RouterOS provenance"
+        );
+        assert!(ctx.may_match_client_exception());
+    }
+
+    #[test]
+    fn test_identity_source_is_recorded_for_authenticated_matches() {
+        use sito_core::IdentitySource;
+
+        let reg = ClientRegistry::new(sample_config());
+
+        // Exact IP.
+        let mut ip_ctx = ClientContext::new("192.168.1.20".parse().unwrap());
+        reg.resolve(&mut ip_ctx, reg.now());
+        assert_eq!(ip_ctx.identity_source, Some(IdentitySource::Ip));
+        assert!(ip_ctx.may_match_client_exception());
+
+        // CIDR.
+        let mut cidr_ctx = ClientContext::new("10.0.0.55".parse().unwrap());
+        reg.resolve(&mut cidr_ctx, reg.now());
+        assert_eq!(cidr_ctx.identity_source, Some(IdentitySource::Cidr));
+        assert!(cidr_ctx.may_match_client_exception());
+
+        // Configured shared secret.
+        let mut secret_ctx =
+            ClientContext::with_id("172.16.0.5".parse().unwrap(), "jane-secret-a1");
+        reg.resolve(&mut secret_ctx, reg.now());
+        assert_eq!(secret_ctx.identity_source, Some(IdentitySource::Secret));
+        assert!(secret_ctx.may_match_secret_rules());
+
+        // MAC from ARP for an operator-configured MAC entry.
+        let mut mac_ctx = ClientContext::new("192.168.1.99".parse().unwrap());
+        let mut arp = HashMap::new();
+        arp.insert(
+            "192.168.1.99".parse().unwrap(),
+            "aa:bb:cc:dd:ee:ff".to_string(),
+        );
+        reg.mac_resolver().set_mock_arp(arp);
+        reg.resolve(&mut mac_ctx, reg.now());
+        assert_eq!(mac_ctx.identity_source, Some(IdentitySource::Mac));
+        assert!(mac_ctx.may_match_client_exception());
+
+        // Verified RouterOS lease.
+        let lease_ip = "192.168.1.151".parse().unwrap();
+        reg.update_routeros_leases(vec![RouterOsLease {
+            mac: "AA:BB:CC:DD:EE:FF".to_string(),
+            ip: Some(lease_ip),
+            hostname: None,
+            comment: None,
+            verified: true,
+        }]);
+        let mut routeros_ctx = ClientContext::new(lease_ip);
+        reg.resolve(&mut routeros_ctx, reg.now());
+        assert_eq!(routeros_ctx.identity_source, Some(IdentitySource::RouterOs));
+        assert!(routeros_ctx.may_match_client_exception());
+    }
+
+    #[test]
+    fn test_identity_source_is_untrusted_for_wire_claims_and_unverified_leases() {
+        use sito_core::IdentitySource;
+
+        let reg = ClientRegistry::new(sample_config());
+
+        // Unmatched DoH path label.
+        let mut doh_ctx = ClientContext::with_id("8.8.8.8".parse().unwrap(), "guessable");
+        reg.resolve(&mut doh_ctx, reg.now());
+        assert_eq!(doh_ctx.identity_source, Some(IdentitySource::DohPath));
+        assert!(!doh_ctx.may_match_client_exception());
+        assert!(!doh_ctx.may_match_secret_rules());
+
+        // Unmatched TLS SNI label.
+        let mut sni_ctx =
+            ClientContext::with_sni("8.8.8.8".parse().unwrap(), "guessable.dns.example");
+        reg.resolve(&mut sni_ctx, reg.now());
+        assert_eq!(sni_ctx.identity_source, Some(IdentitySource::TlsSni));
+        assert!(!sni_ctx.may_match_client_exception());
+
+        // An unverified RouterOS lease never grants an authenticated source.
+        let lease_ip = "192.168.1.152".parse().unwrap();
+        reg.update_routeros_leases(vec![RouterOsLease {
+            mac: "AA:BB:CC:DD:EE:FF".to_string(),
+            ip: Some(lease_ip),
+            hostname: Some("janes-phone".to_string()),
+            comment: None,
+            verified: false,
+        }]);
+        let mut ctx = ClientContext::new(lease_ip);
+        reg.resolve(&mut ctx, reg.now());
+        assert_ne!(
+            ctx.identity_source,
+            Some(IdentitySource::RouterOs),
+            "an unverified lease must not authenticate identity"
+        );
+        assert!(!ctx.may_match_client_exception());
+
+        // An ARP MAC that is not listed on any entry is display-only: it does
+        // not become a policy identity (D10: MAC identity is operator
+        // configured; this tree has no `trust_arp` opt-in).
+        let arp_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
+        let mut arp = HashMap::new();
+        arp.insert(arp_ip, "00:11:22:33:44:55".to_string());
+        reg.mac_resolver().set_mock_arp(arp);
+        let mut mac_ctx = ClientContext::new(arp_ip);
+        reg.resolve(&mut mac_ctx, reg.now());
+        assert_eq!(mac_ctx.mac.as_deref(), Some("00:11:22:33:44:55"));
+        assert_eq!(mac_ctx.identity_source, None);
+        assert!(!mac_ctx.may_match_client_exception());
     }
 
     #[test]

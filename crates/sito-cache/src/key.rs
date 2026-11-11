@@ -132,7 +132,8 @@ mod tests {
     #[test]
     fn test_idn_query_is_keyed_by_punycode() {
         // `münchen.de` on the wire is `xn--mnchen-3ya.de`; the key must use
-        // the punycode form so `invalidate_domain("münchen.de")` can evict it.
+        // the punycode form so `invalidate_domain("münchen.de")` (normalized
+        // with IDNA) can evict it.
         let name = Name::from_str("xn--mnchen-3ya.de.").unwrap();
         let key = CacheKey::new(&name, RecordType::A, DNSClass::IN);
         assert_eq!(key.qname, "xn--mnchen-3ya.de");

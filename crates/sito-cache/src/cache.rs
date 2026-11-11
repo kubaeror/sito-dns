@@ -709,8 +709,8 @@ impl DnsCache {
     /// all strict subdomains).
     ///
     /// This is an O(n) scan of the live cache because moka has no secondary
-    /// index; the suffix string is precomputed so the scan performs no
-    /// per-entry formatting.
+    /// index. The predicate uses the shared suffix matcher, so the scan
+    /// performs no per-entry formatting.
     pub fn invalidate_domain(&self, domain: &str) {
         let trimmed = domain.trim();
         // The root name is an ancestor of every cached name, so invalidating
@@ -720,13 +720,15 @@ impl DnsCache {
             self.flush();
             return;
         }
-        let normalized = sito_proto::normalize_domain(trimmed)
+        // The API passes `Name::to_string()` (UTS46-decoded Unicode), while
+        // cache keys are `Name::to_ascii()` punycode. Normalize with IDNA so
+        // `invalidate_domain("münchen.de")` evicts `xn--mnchen-3ya.de`.
+        let normalized = sito_proto::normalize_domain_or_idna(trimmed)
             .unwrap_or_else(|_| trimmed.trim_end_matches('.').to_ascii_lowercase());
-        let subdomain_suffix = format!(".{normalized}");
         let match_name = normalized.clone();
         let cache = self.cache.load();
         if let Err(error) = cache.invalidate_entries_if(move |k, _v| {
-            k.qname == match_name || k.qname.ends_with(&subdomain_suffix)
+            k.qname == match_name || sito_core::matches_domain_suffix(&k.qname, &match_name)
         }) {
             // This should be unreachable because `build_cache` enables
             // invalidation closures. Flush instead of silently claiming the

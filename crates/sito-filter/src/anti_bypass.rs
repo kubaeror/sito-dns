@@ -4,6 +4,7 @@
 //! public DoH/DoT providers (Cloudflare, Google, Quad9, AdGuard, NextDNS, etc.).
 
 use serde::{Deserialize, Serialize};
+use sito_core::domain::NormalizedDomain;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -21,7 +22,7 @@ pub struct DohResolverEntry {
 #[derive(Debug, Clone)]
 pub struct AntiBypassRegistry {
     exact_domains: HashSet<String>,
-    suffix_domains: Vec<String>,
+    suffix_domains: Vec<NormalizedDomain>,
     ips: HashSet<IpAddr>,
 }
 
@@ -69,12 +70,29 @@ impl AntiBypassRegistry {
     /// Add an entry to the registry.
     pub fn add_entry(&mut self, entry: &DohResolverEntry) {
         for domain in &entry.domains {
-            let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-            if let Some(suffix) = d.strip_prefix("*.") {
-                self.suffix_domains.push(format!(".{suffix}"));
+            let normalized = match NormalizedDomain::parse(domain.trim()) {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    error!(
+                        domain = %domain,
+                        %error,
+                        "Skipping invalid anti-bypass resolver domain"
+                    );
+                    continue;
+                }
+            };
+            if let Some(rest) = normalized.as_str().strip_prefix("*.") {
+                match NormalizedDomain::parse(rest) {
+                    Ok(suffix) => self.suffix_domains.push(suffix),
+                    Err(error) => error!(
+                        domain = %domain,
+                        %error,
+                        "Skipping invalid anti-bypass wildcard domain"
+                    ),
+                }
             } else {
-                self.exact_domains.insert(d.clone());
-                self.suffix_domains.push(format!(".{d}"));
+                self.exact_domains.insert(normalized.as_str().to_string());
+                self.suffix_domains.push(normalized);
             }
         }
         for ip_str in &entry.ips {
@@ -86,16 +104,15 @@ impl AntiBypassRegistry {
 
     /// Check if a domain matches any known public DoH/DoT resolver.
     pub fn matches_domain(&self, domain: &str) -> bool {
-        let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-        if self.exact_domains.contains(&d) {
+        let Ok(domain) = NormalizedDomain::parse(domain) else {
+            return false;
+        };
+        if self.exact_domains.contains(domain.as_str()) {
             return true;
         }
-        for suffix in &self.suffix_domains {
-            if d.ends_with(suffix) {
-                return true;
-            }
-        }
-        false
+        self.suffix_domains
+            .iter()
+            .any(|suffix| domain.is_strict_subdomain_of(suffix))
     }
 
     /// Check if an IP address matches any known public DoH/DoT resolver.
