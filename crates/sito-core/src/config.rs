@@ -1,13 +1,26 @@
 //! Configuration structures, deserialization, and validation.
 
+use crate::config_schema;
+use crate::domain::NormalizedDomain;
 use crate::error::ConfigError;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 
+pub use crate::config_migrate::{
+    MigrationChange, MigrationOptions, MigrationOutcome, MigrationReport,
+};
+
+/// Config schema version accepted by this build. Frozen at WP-1.3 (D4).
+pub const CONFIG_VERSION: u32 = 2;
+
+/// The v1 schema version understood by `sito config migrate`.
+pub const CONFIG_VERSION_V1: u32 = 1;
+
 /// Top-level configuration container for sito.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_config_version")]
     pub config_version: u32,
@@ -44,13 +57,13 @@ pub struct Config {
 }
 
 fn default_config_version() -> u32 {
-    1
+    CONFIG_VERSION
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            config_version: 1,
+            config_version: CONFIG_VERSION,
             server: ServerConfig::default(),
             dns: DnsConfig::default(),
             upstream: UpstreamConfig::default(),
@@ -71,33 +84,75 @@ impl Default for Config {
 
 impl Config {
     /// Parse configuration from a TOML string.
+    ///
+    /// This is the single configuration entry point: it rejects unknown keys
+    /// and non-v2 documents, then runs [`Config::validate_full`].
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
+        let table: toml::Table =
+            toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
+
+        // Check the version before the schema walk so a v1 document gets the
+        // actionable migration message rather than a list of v1/v2
+        // differences. `config_version` was optional in 1.9, so an unversioned
+        // file is a v1 document and must be migrated; only `Config::default()`
+        // (new installs) starts at v2.
+        let version = match table.get("config_version") {
+            Some(value) => {
+                u32::try_from(value.as_integer().unwrap_or(i64::MAX)).unwrap_or(u32::MAX)
+            }
+            None => CONFIG_VERSION_V1,
+        };
+        if version != CONFIG_VERSION {
+            return Err(ConfigError::UnsupportedVersion {
+                found: version,
+                supported: CONFIG_VERSION,
+            });
+        }
+
+        // D5: reject unknown keys/tables before serde sees them, so the error
+        // names the exact dotted path and a typo cannot silently fall back to
+        // a default.
+        config_schema::schema().validate_v2_document(&table)?;
+
         let config: Self = toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        config.validate()?;
+        config.validate_full()?;
         Ok(config)
     }
 
-    /// Validate configuration fields and logic constraints.
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.config_version != 1 {
-            return Err(ConfigError::validation(
-                "config_version",
-                format!(
-                    "unsupported config_version {}, expected 1",
-                    self.config_version
-                ),
-            ));
+    /// The single full configuration validator (WP-1.3).
+    ///
+    /// Startup, `check-config`, API writes, restore and HA apply all reach
+    /// this method. [`Config::validate`] is a compatibility alias and runs the
+    /// same rules.
+    pub fn validate_full(&self) -> Result<(), ConfigError> {
+        if self.config_version != CONFIG_VERSION {
+            return Err(ConfigError::UnsupportedVersion {
+                found: self.config_version,
+                supported: CONFIG_VERSION,
+            });
         }
 
         self.server.validate()?;
+        if self.server.data_dir.as_os_str().is_empty() {
+            return Err(ConfigError::cross_section(
+                "server.data_dir",
+                "data_dir cannot be empty: persistent state (stats.db, users.toml, TLS and HA state) needs a directory",
+            ));
+        }
         self.dns.validate()?;
         self.upstream.validate()?;
+        self.validate_upstream_targets()?;
         self.filtering.validate()?;
         self.privacy.validate()?;
         if let Some(ref tls) = self.tls {
             tls.validate()?;
         }
-        if let Some(ref acme) = self.get_acme_config() {
+        if let Some(ref acme) = self.acme {
+            acme.validate()?;
+        }
+        // Legacy `[web] acme_*` aliases resolve through the same typed config
+        // and get the same validation for one 2.0 alpha.
+        if let Some(acme) = self.get_acme_config() {
             acme.validate()?;
         }
 
@@ -138,7 +193,371 @@ impl Config {
             }
         }
 
+        self.validate_legacy_sections()?;
+        self.validate_listener_conflicts()
+    }
+
+    /// Compatibility alias for [`Config::validate_full`].
+    ///
+    /// Kept so existing callers keep compiling; it does **not** apply a
+    /// different rule set.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_full()
+    }
+
+    /// Validates every upstream target in every scope (global and per-domain).
+    fn validate_upstream_targets(&self) -> Result<(), ConfigError> {
+        for (index, server) in self.upstream.servers.iter().enumerate() {
+            validate_upstream_target(server).map_err(|reason| {
+                ConfigError::cross_section(
+                    format!("upstream.servers[{index}]"),
+                    format!("invalid upstream target '{server}': {reason}"),
+                )
+            })?;
+        }
+        for (rule_index, rule) in self.upstream.per_domain.iter().enumerate() {
+            for (server_index, server) in rule.servers.iter().enumerate() {
+                validate_upstream_target(server).map_err(|reason| {
+                    ConfigError::cross_section(
+                        format!("upstream.per_domain[{rule_index}].servers[{server_index}]"),
+                        format!("invalid per-domain upstream target '{server}': {reason}"),
+                    )
+                })?;
+            }
+        }
         Ok(())
+    }
+
+    /// Rejects unknown/removed keys in the raw legacy sections and validates
+    /// the parts of their schemas that live in dependent crates.
+    fn validate_legacy_sections(&self) -> Result<(), ConfigError> {
+        let mut table = toml::Table::new();
+        for (name, section) in [
+            ("clients", &self.clients),
+            ("rewrites", &self.rewrites),
+            ("web", &self.web),
+            ("auth", &self.auth),
+            ("stats", &self.stats),
+            ("ha", &self.ha),
+            ("integrations", &self.integrations),
+        ] {
+            if let Some(value) = section {
+                table.insert(name.to_string(), value.clone());
+            }
+        }
+        // `web`, `auth` and `stats` are also deserialized into typed structs,
+        // which reject unknown fields; the map walk gives all sections the
+        // same precise error and catches the legacy raw tables.
+        config_schema::schema().validate_v2_document(&table)?;
+
+        self.validate_clients_section()?;
+        self.validate_integrations_section()
+    }
+
+    fn validate_clients_section(&self) -> Result<(), ConfigError> {
+        let Some(value) = self.clients.as_ref() else {
+            return Ok(());
+        };
+        let table = value
+            .as_table()
+            .ok_or_else(|| ConfigError::validation("clients", "[clients] must be a table"))?;
+        let Some(entries) = table.get("entries") else {
+            return Ok(());
+        };
+        let entries = entries.as_array().ok_or_else(|| {
+            ConfigError::validation(
+                "clients.entries",
+                "invalid [clients] configuration: entries must be an array",
+            )
+        })?;
+
+        let mut names = std::collections::HashSet::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let entry = entry.as_table().ok_or_else(|| {
+                ConfigError::validation(
+                    format!("clients.entries[{index}]"),
+                    "each clients.entries item must be a table",
+                )
+            })?;
+            let name = entry
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| {
+                    ConfigError::validation(
+                        format!("clients.entries[{index}].name"),
+                        "client entry name is required and must be a string",
+                    )
+                })?;
+            if name.trim().is_empty() {
+                return Err(ConfigError::validation(
+                    format!("clients.entries[{index}].name"),
+                    "client entry name cannot be empty",
+                ));
+            }
+            if !names.insert(name.to_string()) {
+                return Err(ConfigError::validation(
+                    format!("clients.entries[{index}].name"),
+                    format!("duplicate client entry name '{name}'"),
+                ));
+            }
+            if let Some(ids) = entry.get("ids") {
+                let ids = ids.as_array().ok_or_else(|| {
+                    ConfigError::validation(
+                        format!("clients.entries[{index}].ids"),
+                        "clients.entries[].ids must be an array of strings",
+                    )
+                })?;
+                for (id_index, id) in ids.iter().enumerate() {
+                    let id = id.as_str().ok_or_else(|| {
+                        ConfigError::validation(
+                            format!("clients.entries[{index}].ids[{id_index}]"),
+                            "client ids must be strings",
+                        )
+                    })?;
+                    // An IP-prefixed CIDR id must parse; the registry would
+                    // otherwise silently ignore a typo and the client would
+                    // fall back to the default policy. DoH path labels such
+                    // as `/dns-query/foo` are not CIDRs.
+                    let cidr_like = id.split_once('/').is_some_and(|(address, prefix)| {
+                        address.parse::<IpAddr>().is_ok() && !prefix.is_empty()
+                    });
+                    if cidr_like {
+                        crate::net::IpNetwork::parse(id).map_err(|e| {
+                            ConfigError::cross_section(
+                                format!("clients.entries[{index}].ids[{id_index}]"),
+                                format!("invalid client CIDR id '{id}': {e}"),
+                            )
+                        })?;
+                    }
+                }
+            }
+            if let Some(upstreams) = entry.get("upstreams") {
+                let upstreams = upstreams.as_array().ok_or_else(|| {
+                    ConfigError::validation(
+                        format!("clients.entries[{index}].upstreams"),
+                        "clients.entries[].upstreams must be an array of strings",
+                    )
+                })?;
+                for (upstream_index, upstream) in upstreams.iter().enumerate() {
+                    let upstream = upstream.as_str().ok_or_else(|| {
+                        ConfigError::validation(
+                            format!("clients.entries[{index}].upstreams[{upstream_index}]"),
+                            "client upstream targets must be strings",
+                        )
+                    })?;
+                    validate_upstream_target(upstream).map_err(|reason| {
+                        ConfigError::cross_section(
+                            format!("clients.entries[{index}].upstreams[{upstream_index}]"),
+                            format!("invalid per-client upstream target '{upstream}': {reason}"),
+                        )
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_integrations_section(&self) -> Result<(), ConfigError> {
+        let Some(value) = self.integrations.as_ref() else {
+            return Ok(());
+        };
+        let table = value.as_table().ok_or_else(|| {
+            ConfigError::validation("integrations", "[integrations] must be a table")
+        })?;
+
+        if let Some(lists) = table.get("lists") {
+            let lists = lists.as_table().ok_or_else(|| {
+                ConfigError::validation(
+                    "integrations.lists",
+                    "[integrations.lists] must be a table",
+                )
+            })?;
+            if let Some(default_refresh) = lists.get("refresh_hours") {
+                let refresh = default_refresh.as_integer().ok_or_else(|| {
+                    ConfigError::validation(
+                        "integrations.lists.refresh_hours",
+                        "refresh_hours must be an integer",
+                    )
+                })?;
+                if refresh <= 0 {
+                    return Err(ConfigError::cross_section(
+                        "integrations.lists.refresh_hours",
+                        "refresh_hours must be greater than 0",
+                    ));
+                }
+            }
+            if let Some(categories) = lists.get("categories") {
+                let categories = categories.as_table().ok_or_else(|| {
+                    ConfigError::validation(
+                        "integrations.lists.categories",
+                        "categories must be a table",
+                    )
+                })?;
+                for (category, source) in categories {
+                    let source = source.as_table().ok_or_else(|| {
+                        ConfigError::validation(
+                            format!("integrations.lists.categories.{category}"),
+                            "each category source must be a table",
+                        )
+                    })?;
+                    let url = source
+                        .get("url")
+                        .and_then(toml::Value::as_str)
+                        .ok_or_else(|| {
+                            ConfigError::validation(
+                                format!("integrations.lists.categories.{category}.url"),
+                                "category source url is required",
+                            )
+                        })?;
+                    let allowed = ["https://", "http://", "file://"]
+                        .iter()
+                        .any(|scheme| url.starts_with(scheme));
+                    if !allowed {
+                        return Err(ConfigError::cross_section(
+                            format!("integrations.lists.categories.{category}.url"),
+                            "url must use http://, https:// or file://",
+                        ));
+                    }
+                    if let Some(refresh) = source.get("refresh_hours") {
+                        let refresh = refresh.as_integer().ok_or_else(|| {
+                            ConfigError::validation(
+                                format!("integrations.lists.categories.{category}.refresh_hours"),
+                                "refresh_hours must be an integer",
+                            )
+                        })?;
+                        if refresh <= 0 {
+                            return Err(ConfigError::cross_section(
+                                format!("integrations.lists.categories.{category}.refresh_hours"),
+                                "refresh_hours must be greater than 0",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(mikrotik) = table.get("mikrotik") {
+            let mikrotik = mikrotik.as_table().ok_or_else(|| {
+                ConfigError::validation(
+                    "integrations.mikrotik",
+                    "[integrations.mikrotik] must be a table",
+                )
+            })?;
+            let enabled = mikrotik
+                .get("enabled")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+            if enabled {
+                // A missing url uses the typed default (https://192.168.1.1);
+                // only an explicitly configured invalid scheme fails closed.
+                if let Some(url) = mikrotik.get("url").and_then(toml::Value::as_str) {
+                    let allowed = url.starts_with("https://") || url.starts_with("http://");
+                    if !allowed {
+                        return Err(ConfigError::cross_section(
+                            "integrations.mikrotik.url",
+                            "url must use http:// or https://",
+                        ));
+                    }
+                }
+                if let Some(interval) = mikrotik.get("interval_s") {
+                    let interval = interval.as_integer().ok_or_else(|| {
+                        ConfigError::validation(
+                            "integrations.mikrotik.interval_s",
+                            "interval_s must be an integer",
+                        )
+                    })?;
+                    if interval <= 0 {
+                        return Err(ConfigError::cross_section(
+                            "integrations.mikrotik.interval_s",
+                            "interval_s must be greater than 0",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Rejects two listeners that would contend for the same address:port.
+    fn validate_listener_conflicts(&self) -> Result<(), ConfigError> {
+        let web = self.get_web_config();
+        if web.enabled {
+            let web_conflict = |port: u16| port > 0 && port == web.port;
+            let dns_tcp_ports = [
+                ("dns.port", self.dns.port),
+                ("dns.dot_port", self.dns.dot_port),
+                ("dns.doh_port", self.dns.doh_port),
+            ];
+            for (field, port) in dns_tcp_ports {
+                if web_conflict(port) && self.web_shares_dns_bind(&web.bind) {
+                    return Err(ConfigError::cross_section(
+                        "web.port",
+                        format!(
+                            "web.port {} conflicts with {field} {} on the same bind address; use distinct ports",
+                            web.port, port
+                        ),
+                    ));
+                }
+            }
+            if let Some(acme) = self.get_acme_config()
+                && acme.enabled
+                && acme.http_port > 0
+                && acme.http_port == web.port
+            {
+                return Err(ConfigError::cross_section(
+                    "web.port",
+                    format!(
+                        "web.port {} conflicts with acme.http_port {}; the ACME HTTP-01 listener and the admin UI cannot share a port",
+                        web.port, acme.http_port
+                    ),
+                ));
+            }
+        }
+
+        // The ACME HTTP-01 listener binds TCP independently of the admin UI.
+        if let Some(acme) = self.get_acme_config()
+            && acme.enabled
+            && acme.http_port > 0
+        {
+            for (field, port) in [
+                ("dns.port", self.dns.port),
+                ("dns.dot_port", self.dns.dot_port),
+                ("dns.doh_port", self.dns.doh_port),
+            ] {
+                if port > 0 && port == acme.http_port {
+                    return Err(ConfigError::cross_section(
+                        "acme.http_port",
+                        format!(
+                            "acme.http_port {} conflicts with {field} {port}; the ACME HTTP-01 listener and a DNS TCP listener cannot share a port on the same bind addresses",
+                            acme.http_port
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the admin bind can overlap any DNS listener bind. A wildcard
+    /// bind (or the dual-stack `::` wildcard) covers the other addresses.
+    fn web_shares_dns_bind(&self, web_bind: &IpAddr) -> bool {
+        self.dns
+            .bind
+            .iter()
+            .any(|dns_bind| listener_binds_overlap(*dns_bind, *web_bind))
+    }
+
+    /// Migrates a config v1 TOML document to validated config v2 (D4).
+    ///
+    /// `sito config migrate --from v1 --to v2 --backup` calls this. The
+    /// migration is behavior-preserving unless `adopt_safe_defaults` is set;
+    /// unknown keys are errors unless `ignore_unknown_keys` is set, in which
+    /// case each dropped key is reported.
+    pub fn migrate_v1_to_v2(
+        source: &str,
+        options: &crate::config_migrate::MigrationOptions,
+    ) -> Result<crate::config_migrate::MigrationOutcome, ConfigError> {
+        crate::config_migrate::migrate(source, *options)
     }
 
     /// Resolves the effective TLS configuration (checking `dns.tls` first, then top-level `tls`).
@@ -336,8 +755,132 @@ impl Config {
     }
 }
 
+/// Whether two listener addresses can contend for the same `addr:port`.
+///
+/// Equal addresses overlap, a wildcard covers every address of its family,
+/// and the IPv6 unspecified address is treated as dual-stack because a
+/// default socket accepts IPv4-mapped connections on most platforms.
+fn listener_binds_overlap(first: IpAddr, second: IpAddr) -> bool {
+    if first == second {
+        return true;
+    }
+    let first_wildcard = first.is_unspecified() && first.is_ipv4() == second.is_ipv4();
+    let second_wildcard = second.is_unspecified() && second.is_ipv4() == first.is_ipv4();
+    let dual_stack = |addr: IpAddr| matches!(addr, IpAddr::V6(v6) if v6.is_unspecified());
+    first_wildcard
+        || second_wildcard
+        || (dual_stack(first) && second.is_ipv4())
+        || (dual_stack(second) && first.is_ipv4())
+}
+
+/// Validates a single upstream target: `host`, `ip[:port]`, `[v6][:port]` or a
+/// `udp://`/`tls://`/`https://`/`quic://` URL.
+///
+/// Lives in `sito-core` so startup, `check-config`, the API, restore and HA
+/// all use the same validator (WP-1.3).
+pub fn validate_upstream_target(target: &str) -> Result<(), String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("target is empty".to_string());
+    }
+
+    let mut rest = target;
+    if let Some((scheme, after)) = target.split_once("://") {
+        let scheme = scheme.to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "udp" | "tls" | "https" | "quic") {
+            return Err(format!(
+                "unsupported scheme '{scheme}://' (supported: udp://, tls://, https://, quic://)"
+            ));
+        }
+        if after.is_empty() {
+            return Err("missing host".to_string());
+        }
+        rest = after;
+    }
+
+    // Drop a URL path for DoH-style targets.
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.is_empty() {
+        return Err("missing host".to_string());
+    }
+
+    let (host, port) = if let Some(after_bracket) = authority.strip_prefix('[') {
+        let Some((host, tail)) = after_bracket.split_once(']') else {
+            return Err("unterminated IPv6 literal".to_string());
+        };
+        let port = match tail.strip_prefix(':') {
+            Some(port) => Some(port),
+            None if tail.is_empty() => None,
+            None => return Err("unexpected characters after IPv6 literal".to_string()),
+        };
+        (host.to_string(), port)
+    } else if authority.matches(':').count() >= 2 && authority.parse::<std::net::Ipv6Addr>().is_ok()
+    {
+        (authority.to_string(), None)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.contains(':') {
+            // More than one colon but not a valid bare IPv6 literal.
+            return Err("invalid IPv6 literal (bracket it as [addr])".to_string());
+        }
+        (host.to_string(), Some(port))
+    } else {
+        (authority.to_string(), None)
+    };
+
+    if host.is_empty() {
+        return Err("missing host".to_string());
+    }
+    if let Some(port) = port {
+        let port: u16 = port.parse().map_err(|_| format!("invalid port '{port}'"))?;
+        if port == 0 {
+            return Err("port must not be 0".to_string());
+        }
+    }
+
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    validate_hostname(&host)
+}
+
+/// Hostnames must be FQDN-like (at least one dot). A single-label name such as
+/// `oops-typo` is rejected as a typo instead of being resolved through the
+/// bootstrap resolver.
+fn validate_hostname(host: &str) -> Result<(), String> {
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        return Err("missing host".to_string());
+    }
+    if !host.contains('.') {
+        return Err(format!(
+            "'{host}' is not an IP address or fully-qualified hostname"
+        ));
+    }
+    if host.len() > 253 {
+        return Err("hostname is longer than 253 characters".to_string());
+    }
+    for label in host.split('.') {
+        if label.is_empty() {
+            return Err("hostname contains an empty label".to_string());
+        }
+        if label.len() > 63 {
+            return Err("hostname label is longer than 63 characters".to_string());
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!("hostname label '{label}' starts or ends with '-'"));
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(format!(
+                "hostname label '{label}' contains invalid characters"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Web administrative server parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebConfig {
     #[serde(default = "default_web_enabled")]
     pub enabled: bool,
@@ -352,6 +895,31 @@ pub struct WebConfig {
     pub trusted_proxies: Vec<IpAddr>,
     #[serde(default = "default_metrics_auth")]
     pub metrics_auth: bool,
+    /// Explicit external URL of the admin UI. The scheme decides Secure
+    /// cookies/HSTS; only `http://` and `https://` are accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
+    /// A trusted reverse proxy terminates TLS in front of the admin UI.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tls_terminated_by_proxy: bool,
+
+    // Deprecated v1 aliases, accepted for one 2.0 alpha. The migration moves
+    // them into typed `[acme]`; new configuration must use `[acme]`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub acme_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme_email: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acme_domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub acme_staging: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme_cache_dir: Option<PathBuf>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_metrics_auth() -> bool {
@@ -363,7 +931,10 @@ fn default_web_enabled() -> bool {
 }
 
 fn default_web_bind() -> IpAddr {
-    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    // 2.0 safe default: the admin UI is plain HTTP, so it binds loopback until
+    // the operator explicitly exposes it (D4/§12). Migrated v1 documents keep
+    // their old bind unless `--adopt-safe-defaults` is passed.
+    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
 }
 
 fn default_web_port() -> u16 {
@@ -378,6 +949,13 @@ impl Default for WebConfig {
             port: default_web_port(),
             trusted_proxies: Vec::new(),
             metrics_auth: default_metrics_auth(),
+            public_url: None,
+            tls_terminated_by_proxy: false,
+            acme_enabled: false,
+            acme_email: None,
+            acme_domains: Vec::new(),
+            acme_staging: false,
+            acme_cache_dir: None,
         }
     }
 }
@@ -390,12 +968,38 @@ impl WebConfig {
                 "port must be greater than 0 (0 would request an ephemeral port that clients cannot discover)",
             ));
         }
+        if let Some(url) = self.public_url.as_deref() {
+            let valid = url.split_once("://").is_some_and(|(scheme, rest)| {
+                !rest.is_empty()
+                    && (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+            });
+            if !valid {
+                return Err(ConfigError::validation(
+                    "web.public_url",
+                    format!("public_url '{url}' must start with http:// or https://"),
+                ));
+            }
+        }
+        // Deprecated [web] acme_* aliases share the typed [acme] rules.
+        if self.acme_enabled || !self.acme_domains.is_empty() || self.acme_email.is_some() {
+            AcmeConfig {
+                enabled: self.acme_enabled,
+                email: self.acme_email.clone(),
+                domains: self.acme_domains.clone(),
+                staging: self.acme_staging,
+                cache_dir: self.acme_cache_dir.clone(),
+                http_port: default_acme_http_port(),
+                allow_bootstrap_cert: false,
+            }
+            .validate()?;
+        }
         Ok(())
     }
 }
 
 /// Query statistics and retention parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StatsConfig {
     /// Days to keep detailed per-query records before pruning/rollup.
     ///
@@ -453,6 +1057,7 @@ impl StatsConfig {
 
 /// Administrative authentication and session parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Web session lifetime in hours. Must be greater than 0: a session
     /// created with a zero TTL is already expired and can never be used.
@@ -512,6 +1117,7 @@ impl AuthConfig {
 
 /// Server operational parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_server_role")]
     pub role: String,
@@ -600,6 +1206,7 @@ impl ServerConfig {
 
 /// DNS server listening and protocol parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DnsConfig {
     /// Addresses every listener binds (UDP/TCP DNS, DoT, DoH, DoQ, DoH3).
     #[serde(default = "default_dns_bind")]
@@ -754,6 +1361,17 @@ impl DnsConfig {
                 "bind address list cannot be empty",
             ));
         }
+        let mut seen_binds = std::collections::HashSet::new();
+        for bind in &self.bind {
+            if !seen_binds.insert(*bind) {
+                return Err(ConfigError::cross_section(
+                    "dns.bind",
+                    format!(
+                        "duplicate bind address {bind}; listing one address twice makes the listener fail to bind"
+                    ),
+                ));
+            }
+        }
         if self.edns_udp_size < 512 || self.edns_udp_size > 4096 {
             return Err(ConfigError::validation(
                 "dns.edns_udp_size",
@@ -812,6 +1430,7 @@ impl DnsConfig {
 
 /// Cache settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -961,6 +1580,7 @@ fn default_dnssec_mode() -> String {
 
 /// DNSSEC settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DnssecConfig {
     #[serde(default = "default_dnssec_mode")]
     pub mode: String,
@@ -1018,6 +1638,7 @@ impl DnssecConfig {
 
 /// TLS configuration for DoT, DoH, and encrypted listeners.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     #[serde(default)]
     pub cert: Option<PathBuf>,
@@ -1029,6 +1650,7 @@ pub struct TlsConfig {
 
 /// SNI-to-certificate mapping configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SniCertConfig {
     pub domain: String,
     pub cert: PathBuf,
@@ -1081,6 +1703,12 @@ impl TlsConfig {
                     "SNI domain cannot be empty",
                 ));
             }
+            NormalizedDomain::parse(&sni.domain).map_err(|e| {
+                ConfigError::validation(
+                    format!("tls.sni_certs[{idx}].domain"),
+                    format!("invalid SNI domain '{}': {e}", sni.domain),
+                )
+            })?;
             if sni.cert.as_os_str().is_empty() {
                 return Err(ConfigError::validation(
                     format!("tls.sni_certs[{idx}].cert"),
@@ -1091,6 +1719,22 @@ impl TlsConfig {
                 return Err(ConfigError::validation(
                     format!("tls.sni_certs[{idx}].key"),
                     "SNI key path cannot be empty",
+                ));
+            }
+        }
+
+        let mut seen_domains = std::collections::HashSet::new();
+        for (idx, sni) in self.sni_certs.iter().enumerate() {
+            let normalized = NormalizedDomain::parse(&sni.domain).map_err(|e| {
+                ConfigError::validation(
+                    format!("tls.sni_certs[{idx}].domain"),
+                    format!("invalid SNI domain '{}': {e}", sni.domain),
+                )
+            })?;
+            if !seen_domains.insert(normalized.into_string()) {
+                return Err(ConfigError::cross_section(
+                    format!("tls.sni_certs[{idx}].domain"),
+                    format!("duplicate SNI domain '{}'", sni.domain),
                 ));
             }
         }
@@ -1126,6 +1770,7 @@ pub enum UpstreamEcs {
 
 /// Per-domain upstream forwarder routing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PerDomainUpstream {
     pub domains: Vec<String>,
     pub servers: Vec<String>,
@@ -1133,6 +1778,7 @@ pub struct PerDomainUpstream {
 
 /// Upstream resolvers and forwarding configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     #[serde(default = "default_upstream_servers")]
     pub servers: Vec<String>,
@@ -1366,6 +2012,7 @@ impl<'de> Deserialize<'de> for BlockingMode {
 
 /// A filter list definition to download and compile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FilterListConfig {
     pub name: String,
     pub url: String,
@@ -1380,6 +2027,7 @@ pub struct FilterListConfig {
 
 /// Filtering and blocklist configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FilteringConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -1545,6 +2193,7 @@ impl FilteringConfig {
 
 /// ACME automated certificate configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -1573,20 +2222,40 @@ fn default_acme_http_port() -> u16 {
 
 impl AcmeConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.enabled {
-            if self.domains.is_empty() {
+        if self.enabled && self.domains.is_empty() {
+            return Err(ConfigError::validation(
+                "acme.domains",
+                "acme.domains cannot be empty when ACME is enabled",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (idx, domain) in self.domains.iter().enumerate() {
+            let field = format!("acme.domains[{idx}]");
+            let normalized = NormalizedDomain::parse(domain).map_err(|e| {
+                ConfigError::validation(
+                    field.clone(),
+                    format!("invalid ACME domain '{domain}': {e}"),
+                )
+            })?;
+            if normalized.has_wildcard_labels() {
                 return Err(ConfigError::validation(
-                    "acme.domains",
-                    "acme.domains cannot be empty when ACME is enabled",
+                    field,
+                    format!(
+                        "ACME domain '{domain}' cannot be a wildcard; issue one certificate per exact name"
+                    ),
                 ));
             }
-            for (idx, domain) in self.domains.iter().enumerate() {
-                if domain.trim().is_empty() {
-                    return Err(ConfigError::validation(
-                        format!("acme.domains[{idx}]"),
-                        "ACME domain cannot be empty",
-                    ));
-                }
+            if normalized.is_root() {
+                return Err(ConfigError::validation(
+                    field,
+                    "the DNS root cannot be an ACME domain",
+                ));
+            }
+            if !seen.insert(normalized.as_str().to_string()) {
+                return Err(ConfigError::validation(
+                    field,
+                    format!("duplicate ACME domain '{domain}' (names are case-insensitive)"),
+                ));
             }
         }
         Ok(())
@@ -1595,6 +2264,7 @@ impl AcmeConfig {
 
 /// Privacy and anonymization configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PrivacyConfig {
     /// Mask client IP addresses in query log database (/24 for IPv4, /56 for IPv6).
     #[serde(default, alias = "anonymize_client_ip")]
@@ -1625,7 +2295,7 @@ mod tests {
     #[test]
     fn test_parse_section_15_example() {
         let toml_str = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "master"
@@ -1705,7 +2375,7 @@ enabled = false
 "#;
         let config =
             Config::from_toml_str(toml_str).expect("section 15 config should parse cleanly");
-        assert_eq!(config.config_version, 1);
+        assert_eq!(config.config_version, 2);
         assert_eq!(config.server.role, "master");
         assert_eq!(config.dns.port, 53);
         assert_eq!(config.dns.cache.size_mb, 64);
@@ -1717,16 +2387,19 @@ enabled = false
 
     #[test]
     fn test_reject_invalid_config() {
-        // Bad config version
-        let bad_ver = "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]";
+        // Bad config version: v1 must be rejected with the migration hint.
+        let bad_ver = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]";
         let err = Config::from_toml_str(bad_ver).unwrap_err();
         match err {
-            ConfigError::Validation { field, .. } => assert_eq!(field, "config_version"),
-            other => panic!("expected validation error on config_version, got: {other:?}"),
+            ConfigError::UnsupportedVersion {
+                found: 1,
+                supported: 2,
+            } => {}
+            other => panic!("expected unsupported config_version, got: {other:?}"),
         }
 
         // Empty upstream servers
-        let empty_up = "config_version = 1\n[upstream]\nservers = []";
+        let empty_up = "config_version = 2\n[upstream]\nservers = []";
         let err = Config::from_toml_str(empty_up).unwrap_err();
         match err {
             ConfigError::Validation { field, .. } => assert_eq!(field, "upstream.servers"),
@@ -1734,7 +2407,7 @@ enabled = false
         }
 
         // Bad min/max ttl
-        let bad_ttl = "config_version = 1\n[dns.cache]\nmin_ttl = 500\nmax_ttl = 100\n[upstream]\nservers = [\"1.1.1.1\"]";
+        let bad_ttl = "config_version = 2\n[dns.cache]\nmin_ttl = 500\nmax_ttl = 100\n[upstream]\nservers = [\"1.1.1.1\"]";
         let err = Config::from_toml_str(bad_ttl).unwrap_err();
         match err {
             ConfigError::Validation { field, .. } => assert_eq!(field, "dns.cache.min_ttl"),
@@ -1744,7 +2417,7 @@ enabled = false
 
     #[test]
     fn test_upstream_ecs_policy_defaults_off_and_parses_forward() {
-        let base = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+        let base = "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n";
         let default = Config::from_toml_str(base).expect("default config");
         assert_eq!(default.upstream.ecs, UpstreamEcs::Off);
 
@@ -1761,7 +2434,7 @@ enabled = false
     #[test]
     fn test_filtering_rejects_duplicate_list_names() {
         let toml_str = r#"
-config_version = 1
+config_version = 2
 [upstream]
 servers = ["1.1.1.1"]
 
@@ -1781,7 +2454,7 @@ lists = [
 
         // Distinct names in the same positions stay accepted.
         let ok = r#"
-config_version = 1
+config_version = 2
 [upstream]
 servers = ["1.1.1.1"]
 
@@ -1796,22 +2469,22 @@ lists = [
 
     #[test]
     fn test_blocking_mode_deserialization() {
-        let toml_null = "config_version = 1\n[filtering]\nblocking_mode = \"null_rdata\"\n[upstream]\nservers = [\"1.1.1.1\"]";
+        let toml_null = "config_version = 2\n[filtering]\nblocking_mode = \"null_rdata\"\n[upstream]\nservers = [\"1.1.1.1\"]";
         let cfg = Config::from_toml_str(toml_null).unwrap();
         assert_eq!(cfg.filtering.blocking_mode, BlockingMode::NullRdata);
 
-        let toml_custom = "config_version = 1\n[filtering]\nblocking_mode = \"custom_ip:192.168.1.50\"\n[upstream]\nservers = [\"1.1.1.1\"]";
+        let toml_custom = "config_version = 2\n[filtering]\nblocking_mode = \"custom_ip:192.168.1.50\"\n[upstream]\nservers = [\"1.1.1.1\"]";
         let cfg = Config::from_toml_str(toml_custom).unwrap();
         assert_eq!(
             cfg.filtering.blocking_mode,
             BlockingMode::CustomIp("192.168.1.50".parse().unwrap())
         );
 
-        let toml_refused = "config_version = 1\n[filtering]\nblocking_mode = \"refused\"\n[upstream]\nservers = [\"1.1.1.1\"]";
+        let toml_refused = "config_version = 2\n[filtering]\nblocking_mode = \"refused\"\n[upstream]\nservers = [\"1.1.1.1\"]";
         let cfg = Config::from_toml_str(toml_refused).unwrap();
         assert_eq!(cfg.filtering.blocking_mode, BlockingMode::Refused);
 
-        let toml_nxdomain = "config_version = 1\n[filtering]\nblocking_mode = \"nxdomain\"\n[upstream]\nservers = [\"1.1.1.1\"]";
+        let toml_nxdomain = "config_version = 2\n[filtering]\nblocking_mode = \"nxdomain\"\n[upstream]\nservers = [\"1.1.1.1\"]";
         let cfg = Config::from_toml_str(toml_nxdomain).unwrap();
         assert_eq!(cfg.filtering.blocking_mode, BlockingMode::Nxdomain);
     }
@@ -1833,7 +2506,7 @@ lists = [
     #[test]
     fn test_tls_config_validation() {
         let toml_missing_key = r#"
-config_version = 1
+config_version = 2
 [upstream]
 servers = ["1.1.1.1"]
 [tls]
@@ -1846,7 +2519,7 @@ cert = "/path/to/cert.pem"
         }
 
         let toml_valid_tls = r#"
-config_version = 1
+config_version = 2
 [upstream]
 servers = ["1.1.1.1"]
 [dns.tls]
@@ -1885,7 +2558,7 @@ key = "/path/to/key.pem"
             "API tokens must expire by default instead of living forever"
         );
         // Explicit opt-out (no expiry) still parses.
-        let cfg = Config::from_toml_str("config_version = 1\n[auth]\ntoken_default_ttl_days = 0\n")
+        let cfg = Config::from_toml_str("config_version = 2\n[auth]\ntoken_default_ttl_days = 0\n")
             .unwrap();
         let parsed: AuthConfig = cfg.auth.unwrap().try_into().unwrap();
         assert_eq!(parsed.token_default_ttl_days, 0);
@@ -1905,7 +2578,7 @@ key = "/path/to/key.pem"
 
     #[test]
     fn test_trust_anchor_validation_rejects_malformed_entries() {
-        let base = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+        let base = "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n";
 
         for (anchor, needle) in [
             ("", "must be 'zone:algorithm:base64'"),
@@ -1938,7 +2611,7 @@ key = "/path/to/key.pem"
     }
 
     /// Base TOML with the required upstream section.
-    const TEST_BASE: &str = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+    const TEST_BASE: &str = "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n";
 
     fn expect_validation_field(toml: &str, expected: &str) {
         let err = Config::from_toml_str(toml)
@@ -2134,7 +2807,7 @@ key = "/path/to/key.pem"
         );
 
         let opted_in =
-            Config::from_toml_str("config_version = 1\n[upstream]\nallow_private_targets = true\n")
+            Config::from_toml_str("config_version = 2\n[upstream]\nallow_private_targets = true\n")
                 .expect("the additive opt-in must parse");
         assert!(opted_in.upstream.allow_private_targets);
     }
@@ -2144,14 +2817,14 @@ key = "/path/to/key.pem"
     #[test]
     fn test_upstream_probe_domain_validated() {
         expect_validation_field(
-            "config_version = 1\n[upstream]\nprobe_domain = \"\"\n",
+            "config_version = 2\n[upstream]\nprobe_domain = \"\"\n",
             "upstream.probe_domain",
         );
         expect_validation_field(
-            "config_version = 1\n[upstream]\nprobe_domain = \"bad..name\"\n",
+            "config_version = 2\n[upstream]\nprobe_domain = \"bad..name\"\n",
             "upstream.probe_domain",
         );
-        Config::from_toml_str("config_version = 1\n[upstream]\nprobe_domain = \"example.com\"\n")
+        Config::from_toml_str("config_version = 2\n[upstream]\nprobe_domain = \"example.com\"\n")
             .expect("a valid probe domain must be accepted");
     }
 
@@ -2181,22 +2854,29 @@ key = "/path/to/key.pem"
     #[test]
     fn test_default_config_reports_web_and_dns_exposure() {
         let warnings = network_exposure_warnings(&Config::default());
+        // 2.0 safe default: the admin UI binds loopback, so only the wildcard
+        // DNS listeners are exposed. An operator who exposes the UI still gets
+        // the admin warning (covered by the TLS/proxy tests below).
         assert_eq!(
             warnings.len(),
-            2,
-            "defaults must warn for both exposed services: {warnings:?}"
-        );
-        assert!(
-            warnings.iter().any(|w| w.contains("admin web UI")
-                && w.contains("0.0.0.0:8080")
-                && w.contains("plain HTTP")),
-            "missing admin UI exposure warning: {warnings:?}"
+            1,
+            "only the wildcard DNS listener is exposed by default: {warnings:?}"
         );
         assert!(
             warnings.iter().any(|w| w.contains("DNS listeners")
                 && w.contains("0.0.0.0")
                 && w.contains("any source")),
             "missing DNS exposure warning: {warnings:?}"
+        );
+        let mut exposed = Config::default();
+        let mut web = exposed.get_web_config();
+        web.bind = IpAddr::from_str("0.0.0.0").expect("valid wildcard");
+        exposed.set_web_config(web);
+        assert!(
+            network_exposure_warnings(&exposed)
+                .iter()
+                .any(|w| w.contains("admin web UI") && w.contains("0.0.0.0:8080")),
+            "an explicitly wildcard admin bind must still warn"
         );
     }
 
@@ -2293,6 +2973,284 @@ key = "/path/to/key.pem"
             assert!(
                 !rendered.contains(secret),
                 "warning leaked '{secret}': {rendered}"
+            );
+        }
+    }
+
+    /// Builds a valid v2 document that sets every field known to the schema.
+    /// Kept in the test module so the map-drift test cannot silently skip a
+    /// section.
+    const SCHEMA_FIXTURE: &str = r#"
+config_version = 2
+
+[server]
+role = "master"
+instance_name = "sito-main"
+data_dir = "/var/lib/sito"
+log_level = "info"
+log_format = "json"
+update_require_signature = true
+
+[dns]
+bind = ["127.0.0.1"]
+port = 5353
+dot_port = 853
+doh_port = 8443
+doq_port = 8853
+doh3_port = 8444
+doh_dedicated_hostname = "dns.example.com"
+dot_padding = true
+allow_plaintext_doh = false
+edns_udp_size = 1232
+rate_limit_per_ip = 20
+max_tcp_connections = 256
+
+[dns.cache]
+enabled = true
+size_mb = 64
+min_ttl = 60
+max_ttl = 86400
+negative_ttl_max = 3600
+prefetch = true
+serve_stale_hours = 12
+
+[dns.dnssec]
+mode = "validate"
+validate = true
+ntp = ["ntp.example.com"]
+nta = ["nta.example.com"]
+trust_anchors = ["example.:13:AQIDBA=="]
+
+[dns.tls]
+cert = "/etc/sito/cert.pem"
+key = "/etc/sito/key.pem"
+
+[[dns.tls.sni_certs]]
+domain = "dot.example.com"
+cert = "/etc/sito/sni.pem"
+key = "/etc/sito/sni.key"
+
+[tls]
+cert = "/etc/sito/cert.pem"
+key = "/etc/sito/key.pem"
+
+[[tls.sni_certs]]
+domain = "tls.example.com"
+cert = "/etc/sito/sni.pem"
+key = "/etc/sito/sni.key"
+
+[acme]
+enabled = true
+email = "ops@example.com"
+domains = ["dns.example.com"]
+staging = false
+cache_dir = "/var/lib/sito/acme"
+http_port = 8180
+allow_bootstrap_cert = false
+
+[upstream]
+servers = ["tls://dns.quad9.net"]
+bootstrap = ["9.9.9.9"]
+strategy = "failover"
+timeout_ms = 5000
+probe_domain = "example.com"
+pool_size = 4
+allow_private_targets = false
+ecs = "off"
+
+[[upstream.per_domain]]
+domains = ["lan"]
+servers = ["192.168.1.1"]
+
+[filtering]
+enabled = true
+refresh_interval_hours = 24
+blocking_mode = "zero_ip"
+blocking_ttl = 10
+cname_cloaking = true
+fail_closed = true
+anti_doh_bypass = "off"
+max_rules = 2000000
+max_list_bytes = 67108864
+allow_empty_list = false
+custom_rules = ["0.0.0.0 ads.example.com"]
+regex_compile_budget_ms = 250
+
+[[filtering.lists]]
+name = "ads"
+url = "https://example.com/hosts.txt"
+enabled = true
+refresh_hours = 24
+
+[privacy]
+anonymize_querylog = false
+
+[web]
+enabled = true
+bind = "127.0.0.1"
+port = 9090
+trusted_proxies = ["10.0.0.1"]
+metrics_auth = true
+public_url = "https://dns.example.com"
+tls_terminated_by_proxy = true
+acme_enabled = true
+acme_email = "legacy@example.com"
+acme_domains = ["legacy.example.com"]
+acme_staging = false
+acme_cache_dir = "/var/lib/sito/legacy-acme"
+
+[auth]
+session_ttl_hours = 24
+login_rate_limit = 5
+session_persist = true
+token_default_ttl_days = 90
+
+[stats]
+retention_days = 90
+rollup_retention_days = 365
+rollup_client_names = false
+
+[clients]
+timezone = "UTC"
+trust_routeros_lease_names = false
+
+[[clients.entries]]
+name = "phone"
+ids = ["192.168.1.20"]
+group = "kids"
+ignore_query_log = false
+ignore_stats = false
+use_global_upstreams = true
+upstreams = ["1.1.1.1"]
+trusted = false
+
+[clients.groups.kids]
+description = "children"
+filtering = true
+lists = ["ads"]
+custom_rules = ["||fortnite.com^"]
+safe_search = true
+safe_search_youtube = "strict"
+parental = true
+parental_categories = ["adult"]
+schedule_enabled = true
+schedule = "0 0 15-21 * * MON-FRI"
+
+[[clients.groups.kids.blocked_services]]
+service = "tiktok"
+schedule = "0 0 15-21 * * MON-FRI"
+
+[clients.client_id_secrets]
+phone = "change-me"
+
+[rewrites]
+auto_ptr = true
+ttl = 60
+
+[[rewrites.entries]]
+domain = "printer.lan"
+id = "r1"
+type = "A"
+answer = "192.168.1.50"
+exception_clients = ["phone"]
+
+[ha]
+replication_port = 8953
+listen_addr = "0.0.0.0"
+master_url = "wss://192.168.1.10:8953"
+master_fingerprint = "blake3:abc"
+master_pubkey = "abc"
+cert = "/etc/sito/ha.crt"
+key = "/etc/sito/ha.key"
+ca = "/etc/sito/ha-ca.crt"
+pinned_slave_fingerprints = ["blake3:def"]
+slave_token = "token"
+allow_unpinned_tls = false
+allow_insecure_ws = false
+stats_interval_secs = 30
+ping_interval_secs = 15
+
+[integrations.mikrotik]
+enabled = false
+url = "https://192.168.1.1"
+token_env = "MIKROTIK_API_TOKEN"
+username = "api"
+password = "secret"
+password_env = "MIKROTIK_PASSWORD"
+interval_s = 300
+allow_invalid_certs = false
+
+[integrations.lists]
+refresh_hours = 24
+
+[integrations.lists.categories.adult]
+url = "https://lists.example.com/adult.txt"
+refresh_hours = 24
+license = "CC0-1.0"
+"#;
+
+    fn collect_leaf_paths(prefix: &str, value: &toml::Value, out: &mut Vec<String>) {
+        match value {
+            toml::Value::Table(table) => {
+                for (key, child) in table {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    collect_leaf_paths(&path, child, out);
+                }
+            }
+            toml::Value::Array(items) => {
+                if items.iter().any(toml::Value::is_table) {
+                    let path = format!("{prefix}[]");
+                    for item in items {
+                        collect_leaf_paths(&path, item, out);
+                    }
+                } else {
+                    out.push(prefix.to_string());
+                }
+            }
+            _ => out.push(prefix.to_string()),
+        }
+    }
+
+    /// WP-1.3 acceptance: the checked-in map and the serde schema must not
+    /// diverge. Every serialized field needs a map entry, and every `kept`
+    /// entry must be reachable from the comprehensive fixture.
+    #[test]
+    fn test_config_map_covers_every_serde_field() {
+        use crate::config_schema::{FieldStatus, schema};
+
+        let config = Config::from_toml_str(SCHEMA_FIXTURE).expect("schema fixture is valid v2");
+        let document = toml::to_string_pretty(&config).expect("serialize config");
+        let table: toml::Table = toml::from_str(&document).expect("valid TOML");
+        let mut paths = Vec::new();
+        collect_leaf_paths("", &toml::Value::Table(table), &mut paths);
+
+        let map = schema();
+        for path in &paths {
+            let Some(field) = map.matching_field(path) else {
+                panic!(
+                    "serde field '{path}' is missing from config-v1-to-v2-map.toml; add a [[field]] entry and document it"
+                );
+            };
+            assert!(
+                matches!(field.status, FieldStatus::Kept | FieldStatus::Deprecated),
+                "serde field '{path}' has v2-incompatible map status {:?}",
+                field.status
+            );
+        }
+        for field in map.fields() {
+            if field.status != FieldStatus::Kept {
+                continue;
+            }
+            assert!(
+                paths.iter().any(|path| map
+                    .matching_field(path)
+                    .is_some_and(|m| m.path == field.path)),
+                "map field '{}' is not produced by the schema fixture; add it to the fixture (and the Rust struct)",
+                field.path
             );
         }
     }

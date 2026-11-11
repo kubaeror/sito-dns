@@ -574,7 +574,7 @@ mod tests {
     fn test_legacy_bundle_without_term_verifies_as_term_zero() {
         let signing_key = Ed25519SigningKey::generate().unwrap();
         // A payload produced by a pre-term master: no `term` field.
-        let payload = r#"{"version":7,"timestamp":1,"config_toml":"config_version = 1\n[server]\nrole = \"slave\"\n","custom_rules":[],"lists":[]}"#;
+        let payload = r#"{"version":7,"timestamp":1,"config_toml":"config_version = 2\n[server]\nrole = \"slave\"\n","custom_rules":[],"lists":[]}"#;
         let hash = blake3::hash(payload.as_bytes());
         let hash_hex = hash.to_hex().to_string();
         let sig = signing_key.sign(hash.as_bytes());
@@ -599,7 +599,7 @@ mod tests {
     #[test]
     fn test_bundle_sanitization_and_secret_redaction() {
         let master_toml = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "master"
@@ -687,7 +687,7 @@ password = "mikrotik_secret_password"
             version: 7,
             term: 0,
             timestamp: 123,
-            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec![],
             rewrites: None,
             clients: Some(toml::Value::Table(clients)),
@@ -726,7 +726,7 @@ password = "mikrotik_secret_password"
             version: 10,
             term: 0,
             timestamp: 123_456_789,
-            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec!["||example.org^".to_string()],
             rewrites: None,
             clients: None,
@@ -762,7 +762,7 @@ password = "mikrotik_secret_password"
             version: 10,
             term: 0,
             timestamp: 123_456_789,
-            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec![],
             rewrites: None,
             clients: None,
@@ -836,5 +836,54 @@ password = "mikrotik_secret_password"
         )
         .unwrap_err();
         assert!(matches!(err, HaError::Validation { .. }));
+    }
+
+    /// WP-1.3/D11: the sanitizer output is a valid config v2 document. A v2
+    /// parser rejects removed legacy keys, so the sanitizer must strip them
+    /// before the slave ever parses the bundle.
+    #[test]
+    fn test_sanitized_bundle_parses_as_config_v2() {
+        let master_toml = r#"
+config_version = 2
+
+[server]
+role = "master"
+instance_name = "master-prod"
+data_dir = "/var/lib/sito"
+
+[upstream]
+servers = ["1.1.1.1"]
+
+[ha]
+replication_port = 8953
+
+[auth]
+session_ttl_hours = 12
+admin_password_hash = "$argon2id$legacy"
+tokens = ["legacy"]
+
+[clients]
+client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
+
+[integrations.mikrotik]
+url = "https://192.168.1.1"
+token = "legacy-token"
+password = "legacy-password"
+"#;
+        let sanitized = sanitize_config_for_bundle(master_toml).expect("sanitize");
+        let parsed = sito_core::config::Config::from_toml_str(&sanitized)
+            .expect("sanitized HA bundle must parse as config v2");
+        assert_eq!(parsed.server.role, "slave");
+        assert_eq!(parsed.config_version, 2);
+        assert!(parsed.ha.is_none());
+        assert!(
+            parsed.clients.is_none()
+                || parsed
+                    .clients
+                    .as_ref()
+                    .unwrap()
+                    .get("client_id_secrets")
+                    .is_none()
+        );
     }
 }

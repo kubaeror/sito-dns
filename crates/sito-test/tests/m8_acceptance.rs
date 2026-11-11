@@ -362,7 +362,7 @@ async fn test_m8_mtls_handshake_rejects_foreign_cert() {
 #[test]
 fn test_m8_secret_redaction_security_scanner() {
     let sensitive_raw_toml = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "master"
@@ -446,7 +446,7 @@ fn test_m8_monotonicity_guard_rejects_replay() {
         version: 5,
         term: 0,
         timestamp: 2000,
-        config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+        config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec!["||replay-test.com^".to_string()],
         rewrites: None,
         clients: None,
@@ -1282,7 +1282,7 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
         version: 2,
         term: 0,
         timestamp: 12345,
-        config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+        config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec!["||blocked-fast.test^".to_string()],
         rewrites: None,
         clients: None,
@@ -1401,7 +1401,7 @@ async fn test_m8_push_applies_upstream_and_dnssec_without_watcher() {
     };
 
     let config_toml = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "slave"
@@ -1563,7 +1563,7 @@ async fn test_m8_push_restart_only_field_is_not_acked_as_applied() {
     // hot-appliable upstream change that must not be applied either, because
     // the push as a whole cannot take effect without a restart.
     let config_toml = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "slave"
@@ -1659,7 +1659,7 @@ async fn test_m8_push_default_auth_policy_is_not_rejected() {
     // Master example: explicit `[auth]` with exactly the default values.
     // Slave: no `[auth]` section at all.
     let default_auth_toml = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "slave"
@@ -1780,7 +1780,7 @@ async fn test_m8_push_before_listeners_fails_and_retries_after_ready() {
             version: 2,
             term: 0,
             timestamp: 1,
-            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n\n[filtering]\nenabled = false\n\n[upstream]\nservers = [\"9.9.9.9\"]\n".to_string(),
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n\n[filtering]\nenabled = false\n\n[upstream]\nservers = [\"9.9.9.9\"]\n".to_string(),
             custom_rules: vec![],
             rewrites: None,
             clients: None,
@@ -1921,7 +1921,7 @@ async fn test_m8_chaos_master_mid_push_kill() {
         version: 2,
         term: 0,
         timestamp: 424_242,
-        config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+        config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec!["||mid-push.test^".to_string()],
         rewrites: None,
         clients: None,
@@ -1995,7 +1995,7 @@ async fn test_m8_slave_to_master_promotion_procedure() {
         version: 3,
         term: 1,
         timestamp: 99999,
-        config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+        config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec!["||promoted-master-rule.net^".to_string()],
         rewrites: None,
         clients: None,
@@ -2009,7 +2009,7 @@ async fn test_m8_slave_to_master_promotion_procedure() {
         version: 3,
         term: 1,
         timestamp: 100_000,
-        config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+        config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec![],
         rewrites: None,
         clients: None,
@@ -2026,7 +2026,7 @@ async fn test_m8_slave_to_master_promotion_procedure() {
         version: 4,
         term: 0,
         timestamp: 100_001,
-        config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+        config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec![],
         rewrites: None,
         clients: None,

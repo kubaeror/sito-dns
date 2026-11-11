@@ -68,7 +68,7 @@ jobs:
         run: |
           mkdir -p ci-smoke/config
           cat > ci-smoke/config/config.toml <<'EOF'
-          config_version = 1
+          config_version = 2
 
           [dns]
           bind = ["0.0.0.0"]

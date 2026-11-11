@@ -449,7 +449,7 @@ mod tests {
             version,
             term: 0,
             timestamp: 1,
-            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec![],
             rewrites: None,
             clients: None,

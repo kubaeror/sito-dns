@@ -2099,7 +2099,7 @@ mod tests {
             version,
             term: 0,
             timestamp: 1,
-            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec![],
             rewrites: None,
             clients: None,
@@ -2250,7 +2250,7 @@ mod tests {
 
         // State written before terms existed has no `term` field and must load
         // as epoch 0.
-        let legacy = r#"{"version":6,"timestamp":1,"config_toml":"config_version = 1\n[server]\nrole = \"slave\"\n","custom_rules":[],"lists":[]}"#;
+        let legacy = r#"{"version":6,"timestamp":1,"config_toml":"config_version = 2\n[server]\nrole = \"slave\"\n","custom_rules":[],"lists":[]}"#;
         std::fs::write(&state_path, legacy).unwrap();
         let legacy_restored = MasterCoordinator::new(
             "test-master".to_string(),

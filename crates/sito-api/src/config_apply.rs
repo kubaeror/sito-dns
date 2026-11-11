@@ -165,124 +165,22 @@ pub fn validate_full_config(cfg: &Config) -> Result<(), ProblemDetails> {
 
 /// Synchronous core of [`validate_full_config`] for callers that cannot await
 /// (archive pre-validation, `check-config`).
+///
+/// This is the single full validator pipeline: core v2 rules (including
+/// unknown-key rejection and upstream targets) followed by the dependent-crate
+/// typed sections.
 pub fn validate_full_config_sync(cfg: &Config) -> Result<(), String> {
-    validate_typed_sections(cfg).map_err(|e| e.to_string())?;
-    for server in &cfg.upstream.servers {
-        validate_upstream_target(server)
-            .map_err(|e| format!("Invalid upstream server '{server}': {e}"))?;
-    }
-    for per_domain in &cfg.upstream.per_domain {
-        if per_domain.servers.is_empty() {
-            return Err("Each [upstream.per_domain] entry needs at least one server".to_string());
-        }
-        for server in &per_domain.servers {
-            validate_upstream_target(server)
-                .map_err(|e| format!("Invalid per-domain upstream server '{server}': {e}"))?;
-        }
-    }
-    Ok(())
+    cfg.validate_full().map_err(|e| e.to_string())?;
+    validate_typed_sections(cfg).map_err(|e| e.to_string())
 }
 
 /// Validates a single upstream target: `host`, `ip[:port]`, `[v6][:port]` or a
 /// `udp://`/`tls://`/`https://`/`quic://` URL.
+///
+/// Compatibility wrapper around the `sito-core` validator so existing API
+/// callers keep their path while every entry point shares one implementation.
 pub fn validate_upstream_target(target: &str) -> Result<(), String> {
-    let target = target.trim();
-    if target.is_empty() {
-        return Err("target is empty".to_string());
-    }
-
-    let mut rest = target;
-    if let Some((scheme, after)) = target.split_once("://") {
-        let scheme = scheme.to_ascii_lowercase();
-        if !matches!(scheme.as_str(), "udp" | "tls" | "https" | "quic") {
-            return Err(format!(
-                "unsupported scheme '{scheme}://' (supported: udp://, tls://, https://, quic://)"
-            ));
-        }
-        if after.is_empty() {
-            return Err("missing host".to_string());
-        }
-        rest = after;
-    }
-
-    // Drop a URL path for DoH-style targets.
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if authority.is_empty() {
-        return Err("missing host".to_string());
-    }
-
-    let (host, port) = if let Some(after_bracket) = authority.strip_prefix('[') {
-        let Some((host, tail)) = after_bracket.split_once(']') else {
-            return Err("unterminated IPv6 literal".to_string());
-        };
-        let port = match tail.strip_prefix(':') {
-            Some(port) => Some(port),
-            None if tail.is_empty() => None,
-            None => return Err("unexpected characters after IPv6 literal".to_string()),
-        };
-        (host.to_string(), port)
-    } else if authority.matches(':').count() >= 2 && authority.parse::<std::net::Ipv6Addr>().is_ok()
-    {
-        (authority.to_string(), None)
-    } else if let Some((host, port)) = authority.rsplit_once(':') {
-        if host.contains(':') {
-            // More than one colon but not a valid bare IPv6 literal.
-            return Err("invalid IPv6 literal (bracket it as [addr])".to_string());
-        }
-        (host.to_string(), Some(port))
-    } else {
-        (authority.to_string(), None)
-    };
-
-    if host.is_empty() {
-        return Err("missing host".to_string());
-    }
-    if let Some(port) = port {
-        let port: u16 = port.parse().map_err(|_| format!("invalid port '{port}'"))?;
-        if port == 0 {
-            return Err("port must not be 0".to_string());
-        }
-    }
-
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Ok(());
-    }
-    validate_hostname(&host)
-}
-
-/// Hostnames must be FQDN-like (at least one dot). A single-label name such as
-/// `oops-typo` is rejected as a typo instead of being resolved through the
-/// bootstrap resolver.
-fn validate_hostname(host: &str) -> Result<(), String> {
-    let host = host.trim_end_matches('.');
-    if host.is_empty() {
-        return Err("missing host".to_string());
-    }
-    if !host.contains('.') {
-        return Err(format!(
-            "'{host}' is not an IP address or fully-qualified hostname"
-        ));
-    }
-    if host.len() > 253 {
-        return Err("hostname is longer than 253 characters".to_string());
-    }
-    for label in host.split('.') {
-        if label.is_empty() {
-            return Err("hostname contains an empty label".to_string());
-        }
-        if label.len() > 63 {
-            return Err("hostname label is longer than 63 characters".to_string());
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return Err(format!("hostname label '{label}' starts or ends with '-'"));
-        }
-        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err(format!(
-                "hostname label '{label}' contains invalid characters"
-            ));
-        }
-    }
-    Ok(())
+    sito_core::config::validate_upstream_target(target)
 }
 
 /// Applies `candidate` to the live server, rolling back on failure.
@@ -342,7 +240,34 @@ pub async fn apply_and_persist_config(
     hooks: Option<&dyn ConfigApplyHooks>,
 ) -> Result<AppliedReport, ProblemDetails> {
     let _apply_guard = ctx.lock_config_apply().await;
+    // D11: an admin write that changes a restart-only field is a 409 and is
+    // not persisted. Do this under the apply lock so the comparison cannot
+    // race a concurrent apply.
+    let previous = (**ctx.config.load()).clone();
+    ensure_no_restart_required(&previous, candidate)?;
     apply_and_persist_config_locked(ctx, candidate, filter_apply, hooks).await
+}
+
+/// Rejects a candidate that changes a restart-only field (D11).
+///
+/// The error is a 409 Conflict carrying `restart_required`; callers must not
+/// apply or persist the candidate. Startup-only settings never produce a
+/// silent no-op write.
+pub fn ensure_no_restart_required(
+    previous: &Config,
+    candidate: &Config,
+) -> Result<(), ProblemDetails> {
+    let restart_required = restart_required_fields(previous, candidate);
+    if restart_required.is_empty() {
+        return Ok(());
+    }
+    Err(ProblemDetails::conflict_with_restart(
+        restart_required.clone(),
+        format!(
+            "restart_required: configuration changes restart-only fields ({}); nothing was applied or persisted. Edit config.toml and restart the service (or use the installer). GET /api/v1/config/restart-required lists the matrix",
+            restart_required.join(", ")
+        ),
+    ))
 }
 
 /// Applies `candidate` and persists it, assuming the caller already holds
@@ -399,13 +324,7 @@ pub async fn apply_and_persist_document_rejecting_restart(
 ) -> Result<AppliedReport, ProblemDetails> {
     let _apply_guard = ctx.apply_lock.lock().await;
     let previous = (**ctx.config.load()).clone();
-    let restart_required = restart_required_fields(&previous, candidate);
-    if !restart_required.is_empty() {
-        return Err(ProblemDetails::bad_request(format!(
-            "restart_required: this push changes restart-only fields ({}); restart the slave with the new configuration or update them locally",
-            restart_required.join(", ")
-        )));
-    }
+    ensure_no_restart_required(&previous, candidate)?;
     apply_and_persist_document_locked(ctx, candidate, document, filter_apply, hooks).await
 }
 
@@ -831,6 +750,28 @@ pub fn restart_required_fields(old: &Config, new: &Config) -> Vec<String> {
         &mut fields,
     );
     fields
+}
+
+/// The complete restart-only matrix (D11), in the order reported by
+/// [`restart_required_fields`].
+///
+/// `GET /api/v1/config/restart-required` publishes this list so the UI can
+/// show which edits require a process restart. Keep it in sync with the
+/// comparisons above; the parity test asserts every name is reachable.
+#[must_use]
+pub fn restart_required_field_names() -> Vec<&'static str> {
+    vec![
+        "server.role",
+        "server.instance_name",
+        "server.data_dir",
+        "server.log_format",
+        "auth",
+        "web",
+        "tls",
+        "acme",
+        "ha",
+        "integrations",
+    ]
 }
 
 #[cfg(test)]
@@ -1268,7 +1209,7 @@ mod tests {
     fn test_restart_web_ignores_preserved_node_local_identity() {
         let live = Config::from_toml_str(
             r#"
-config_version = 1
+config_version = 2
 
 [web]
 enabled = false
@@ -1287,7 +1228,7 @@ tls_terminated_by_proxy = true
         // keys survive.
         let preserved = Config::from_toml_str(
             r#"
-config_version = 1
+config_version = 2
 
 [web]
 enabled = false
@@ -1802,5 +1743,168 @@ acme_enabled = false
                 "direct config writes bypass the apply lock: {offenders:?}"
             );
         }
+    }
+
+    /// D11: the preview matrix must cover exactly the fields the comparison
+    /// can report. Each name is reachable with a minimal mutation.
+    #[test]
+    fn test_restart_matrix_names_are_all_reachable() {
+        let old = Config::default();
+        let names = restart_required_field_names();
+        let mut seen = std::collections::HashSet::new();
+
+        let mutations: Vec<(&str, Config)> = vec![
+            ("server.role", {
+                let mut c = old.clone();
+                c.server.role = "slave".to_string();
+                c
+            }),
+            ("server.instance_name", {
+                let mut c = old.clone();
+                c.server.instance_name = "other".to_string();
+                c
+            }),
+            ("server.data_dir", {
+                let mut c = old.clone();
+                c.server.data_dir = std::path::PathBuf::from("/srv/sito");
+                c
+            }),
+            ("server.log_format", {
+                let mut c = old.clone();
+                c.server.log_format = "pretty".to_string();
+                c
+            }),
+            ("auth", {
+                let mut c = old.clone();
+                c.auth = Some(toml::from_str::<toml::Value>("session_ttl_hours = 1").unwrap());
+                c
+            }),
+            ("web", {
+                let mut c = old.clone();
+                c.web = Some(toml::from_str::<toml::Value>("port = 9090").unwrap());
+                c
+            }),
+            ("tls", {
+                let mut c = old.clone();
+                c.dns.tls = Some(
+                    toml::from_str::<sito_core::config::TlsConfig>(
+                        "cert = \"/etc/sito/cert.pem\"\nkey = \"/etc/sito/key.pem\"",
+                    )
+                    .unwrap(),
+                );
+                c
+            }),
+            ("acme", {
+                let mut c = old.clone();
+                c.acme = Some(sito_core::config::AcmeConfig {
+                    enabled: true,
+                    domains: vec!["dns.example.com".to_string()],
+                    ..Default::default()
+                });
+                c
+            }),
+            ("ha", {
+                let mut c = old.clone();
+                c.ha = Some(toml::from_str::<toml::Value>("replication_port = 8954").unwrap());
+                c
+            }),
+            ("integrations", {
+                let mut c = old.clone();
+                c.integrations =
+                    Some(toml::from_str::<toml::Value>("[lists]\nrefresh_hours = 12").unwrap());
+                c
+            }),
+        ];
+
+        for (expected, candidate) in mutations {
+            let fields = restart_required_fields(&old, &candidate);
+            assert!(
+                fields.iter().any(|field| field == expected),
+                "mutation should report '{expected}': {fields:?}"
+            );
+            for field in fields {
+                assert!(
+                    names.contains(&field.as_str()),
+                    "reported field '{field}' is missing from the preview matrix"
+                );
+                seen.insert(field);
+            }
+        }
+
+        for name in names {
+            assert!(
+                seen.contains(name),
+                "restart-only field '{name}' has no reachable mutation; the matrix is not truthful"
+            );
+        }
+    }
+
+    /// D11: an admin write that changes a restart-only field returns 409 and
+    /// must not apply or persist anything.
+    #[tokio::test]
+    async fn test_restart_only_write_is_conflict_and_not_persisted() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_restart_conflict");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let original = (**ctx.config.load()).clone();
+
+        let mut candidate = original.clone();
+        candidate.server.role = "slave".to_string();
+
+        let err = apply_and_persist_config(&ctx, &candidate, FilterApply::Deferred, None)
+            .await
+            .expect_err("restart-only write must be rejected");
+        assert_eq!(err.status, 409);
+        assert!(
+            err.restart_required
+                .as_deref()
+                .is_some_and(|fields| fields == &["server.role".to_string()])
+        );
+        assert_eq!(ctx.config.load().server.role, "master");
+        assert!(
+            !ctx.config_path.exists(),
+            "a rejected restart-only write must not persist a file"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// D11 parity: the HA push path uses the same matrix and returns 409
+    /// without applying or persisting.
+    #[tokio::test]
+    async fn test_ha_restart_only_push_is_conflict_and_not_persisted() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_ha_restart_conflict");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let original = (**ctx.config.load()).clone();
+        tokio::fs::write(&ctx.config_path, toml::to_string_pretty(&original).unwrap())
+            .await
+            .unwrap();
+
+        let mut candidate = original.clone();
+        candidate.server.data_dir = std::path::PathBuf::from("/srv/other");
+        let document = toml::to_string_pretty(&candidate).unwrap();
+
+        let err = apply_and_persist_document_rejecting_restart(
+            &ctx,
+            &candidate,
+            &document,
+            FilterApply::Deferred,
+            None,
+        )
+        .await
+        .expect_err("HA push must reject restart-only fields");
+        assert_eq!(err.status, 409);
+        assert!(
+            err.restart_required
+                .as_deref()
+                .is_some_and(|fields| fields.contains(&"server.data_dir".to_string()))
+        );
+        assert_eq!(ctx.config.load().server.data_dir, original.server.data_dir);
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            toml::to_string_pretty(&original).unwrap(),
+            "the HA file must keep the previous document"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

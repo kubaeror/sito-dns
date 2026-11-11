@@ -546,15 +546,21 @@ async fn test_acceptance_m10_restore_preview_is_masked() {
         .token;
 
     let secret_toml = r#"
-[server]
+config_version = 2
+[ha]
+replication_port = 0
 slave_token = "supersecret-token-value"
 
 [tls]
 key = "private-key-material"
 cert = "public-cert.pem"
 
-[web]
-headers = { api_token = "inline-secret-token", accept = "text/html" }
+[integrations.mikrotik]
+enabled = false
+password = "inline-secret-token"
+
+[clients.client_id_secrets]
+phone = "table-secret-value"
 "#;
     let archive = sito_api::handlers::config::create_backup_archive(secret_toml).unwrap();
     let req = Request::builder()
@@ -577,7 +583,11 @@ headers = { api_token = "inline-secret-token", accept = "text/html" }
     );
     assert!(
         !body.contains("inline-secret-token"),
-        "inline table secret leaked: {body}"
+        "integration secret leaked: {body}"
+    );
+    assert!(
+        !body.contains("table-secret-value"),
+        "client secret table leaked: {body}"
     );
     assert!(
         body.contains("\"***\"") || body.contains("***"),

@@ -118,6 +118,35 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
             },
+            Commands::Config { command } => match command {
+                sito::cli::ConfigCommands::Migrate {
+                    config,
+                    from,
+                    to,
+                    backup,
+                    adopt_safe_defaults,
+                    ignore_unknown_keys,
+                    json,
+                } => {
+                    // Accept both the global `--config` and the subcommand form.
+                    let config_path = config.unwrap_or(default_config_path.clone());
+                    if let Err(e) = sito::cli::run_config_migrate(
+                        &config_path,
+                        &from,
+                        &to,
+                        sito::cli::ConfigMigrateOptions {
+                            backup,
+                            adopt_safe_defaults,
+                            ignore_unknown_keys,
+                            json,
+                        },
+                    ) {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
+            },
             Commands::Update {
                 config,
                 check,

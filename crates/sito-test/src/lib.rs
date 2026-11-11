@@ -225,7 +225,7 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let bad_field_config = temp_dir.join("bad_port.toml");
-        std::fs::write(&bad_field_config, "config_version = 1\n[dns]\nport = 0\n").unwrap();
+        std::fs::write(&bad_field_config, "config_version = 2\n[dns]\nport = 0\n").unwrap();
 
         let err = sito::cli::run_check_config(&bad_field_config).unwrap_err();
         let err_msg = err.to_string();
@@ -237,7 +237,7 @@ mod tests {
         let bad_ttl_config = temp_dir.join("bad_ttl.toml");
         std::fs::write(
             &bad_ttl_config,
-            "config_version = 1\n[dns.cache]\nmin_ttl = 500\nmax_ttl = 100\n",
+            "config_version = 2\n[dns.cache]\nmin_ttl = 500\nmax_ttl = 100\n",
         )
         .unwrap();
 
@@ -1541,7 +1541,7 @@ mod tests {
 
         let bad_cron_path = temp_dir.join("bad_cron.toml");
         let toml_content = r#"
-config_version = 1
+config_version = 2
 [server]
 role = "master"
 

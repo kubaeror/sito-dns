@@ -1,0 +1,718 @@
+# config-v1-to-v2-map.toml
+#
+# Machine-checked inventory of every configuration field in the config v2
+# schema. `crates/sito-core/src/config_schema.rs` embeds this in-package file
+# at compile time and uses it to:
+#
+#   * reject unknown keys/tables in the parser (D5);
+#   * drive the v1 -> v2 migration (`sito config migrate`); and
+#   * report moved/removed/dead keys.
+#
+# A test in `config_schema.rs` fails when this map and the serde schema
+# diverge. When you add a field:
+#
+#   1. add the serde field to the Rust struct;
+#   2. add a `[[field]]` entry below with the same dotted path;
+#   3. run `cargo test -p sito-core config_schema` and fix any drift report;
+#   4. document the field in `docs/configuration-reference.md`.
+#
+# Path syntax
+# -----------
+#   section.key            a plain field
+#   section.key.leaf       nested table field
+#   section.items[].field  array-of-tables element field
+#   section.map.*.field    arbitrary map key (one segment)
+#
+# Status values
+# -------------
+#   kept        same path and meaning in v2; no migration needed
+#   deprecated  accepted in v2 for one 2.0 alpha; migration rewrites it to `to`
+#   removed     no longer accepted in v2; migration drops it and reports it
+#   dead        parsed historically but never used; migration drops it
+
+schema_version = 2
+from_version = 1
+to_version = 2
+
+# ---------------------------------------------------------------------------
+# Top level
+# ---------------------------------------------------------------------------
+[[field]]
+path = "config_version"
+status = "kept"
+
+# ---------------------------------------------------------------------------
+# [server]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "server.role"
+status = "kept"
+
+[[field]]
+path = "server.instance_name"
+status = "kept"
+
+[[field]]
+path = "server.data_dir"
+status = "kept"
+
+[[field]]
+path = "server.log_level"
+status = "kept"
+
+[[field]]
+path = "server.log_format"
+status = "kept"
+
+[[field]]
+path = "server.update_require_signature"
+status = "kept"
+
+# ---------------------------------------------------------------------------
+# [dns]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "dns.bind"
+status = "kept"
+
+[[field]]
+path = "dns.port"
+status = "kept"
+
+[[field]]
+path = "dns.dot_port"
+status = "kept"
+
+[[field]]
+path = "dns.doh_port"
+status = "kept"
+
+[[field]]
+path = "dns.doq_port"
+status = "kept"
+
+[[field]]
+path = "dns.doh3_port"
+status = "kept"
+
+[[field]]
+path = "dns.doh_dedicated_hostname"
+status = "kept"
+
+[[field]]
+path = "dns.dot_padding"
+status = "kept"
+
+[[field]]
+path = "dns.allow_plaintext_doh"
+status = "kept"
+
+[[field]]
+path = "dns.edns_udp_size"
+status = "kept"
+
+[[field]]
+path = "dns.rate_limit_per_ip"
+status = "kept"
+
+[[field]]
+path = "dns.max_tcp_connections"
+status = "kept"
+
+[[field]]
+path = "dns.tls.cert"
+status = "deprecated"
+to = "tls.cert"
+
+[[field]]
+path = "dns.tls.key"
+status = "deprecated"
+to = "tls.key"
+
+[[field]]
+path = "dns.tls.sni_certs[].domain"
+status = "deprecated"
+to = "tls.sni_certs[].domain"
+
+[[field]]
+path = "dns.tls.sni_certs[].cert"
+status = "deprecated"
+to = "tls.sni_certs[].cert"
+
+[[field]]
+path = "dns.tls.sni_certs[].key"
+status = "deprecated"
+to = "tls.sni_certs[].key"
+
+# ---------------------------------------------------------------------------
+# [dns.cache]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "dns.cache.enabled"
+status = "kept"
+
+[[field]]
+path = "dns.cache.size_mb"
+status = "kept"
+
+[[field]]
+path = "dns.cache.min_ttl"
+status = "kept"
+
+[[field]]
+path = "dns.cache.max_ttl"
+status = "kept"
+
+[[field]]
+path = "dns.cache.negative_ttl_max"
+status = "kept"
+
+[[field]]
+path = "dns.cache.prefetch"
+status = "kept"
+
+[[field]]
+path = "dns.cache.serve_stale_hours"
+status = "kept"
+
+# ---------------------------------------------------------------------------
+# [dns.dnssec]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "dns.dnssec.mode"
+status = "kept"
+
+[[field]]
+path = "dns.dnssec.validate"
+status = "kept"
+
+[[field]]
+path = "dns.dnssec.ntp"
+status = "kept"
+
+[[field]]
+path = "dns.dnssec.nta"
+status = "kept"
+
+[[field]]
+path = "dns.dnssec.trust_anchors"
+status = "kept"
+
+# ---------------------------------------------------------------------------
+# [tls]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "tls.cert"
+status = "kept"
+
+[[field]]
+path = "tls.key"
+status = "kept"
+
+[[field]]
+path = "tls.sni_certs[].domain"
+status = "kept"
+
+[[field]]
+path = "tls.sni_certs[].cert"
+status = "kept"
+
+[[field]]
+path = "tls.sni_certs[].key"
+status = "kept"
+
+# ---------------------------------------------------------------------------
+# [acme]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "acme.enabled"
+status = "kept"
+
+[[field]]
+path = "acme.email"
+status = "kept"
+
+[[field]]
+path = "acme.domains"
+status = "kept"
+
+[[field]]
+path = "acme.staging"
+status = "kept"
+
+[[field]]
+path = "acme.cache_dir"
+status = "kept"
+
+[[field]]
+path = "acme.http_port"
+status = "kept"
+
+[[field]]
+path = "acme.allow_bootstrap_cert"
+status = "kept"
+
+# ---------------------------------------------------------------------------
+# [upstream]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "upstream.servers"
+status = "kept"
+
+[[field]]
+path = "upstream.bootstrap"
+status = "kept"
+
+[[field]]
+path = "upstream.strategy"
+status = "kept"
+
+[[field]]
+path = "upstream.timeout_ms"
+status = "kept"
+
+[[field]]
+path = "upstream.probe_domain"
+status = "kept"
+
+[[field]]
+path = "upstream.pool_size"
+status = "kept"
+
+[[field]]
+path = "upstream.allow_private_targets"
+status = "kept"
+
+[[field]]
+path = "upstream.ecs"
+status = "kept"
+
+[[field]]
+path = "upstream.per_domain[].domains"
+status = "kept"
+
+[[field]]
+path = "upstream.per_domain[].servers"
+status = "kept"
+
+# ---------------------------------------------------------------------------
+# [filtering]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "filtering.enabled"
+status = "kept"
+
+[[field]]
+path = "filtering.refresh_interval_hours"
+status = "kept"
+
+[[field]]
+path = "filtering.blocking_mode"
+status = "kept"
+
+[[field]]
+path = "filtering.blocking_ttl"
+status = "kept"
+
+[[field]]
+path = "filtering.cname_cloaking"
+status = "kept"
+
+[[field]]
+path = "filtering.fail_closed"
+status = "kept"
+
+[[field]]
+path = "filtering.anti_doh_bypass"
+status = "kept"
+
+[[field]]
+path = "filtering.max_rules"
+status = "kept"
+
+[[field]]
+path = "filtering.max_list_bytes"
+status = "kept"
+
+[[field]]
+path = "filtering.allow_empty_list"
+status = "kept"
+
+[[field]]
+path = "filtering.custom_rules"
+status = "kept"
+
+[[field]]
+path = "filtering.regex_compile_budget_ms"
+status = "kept"
+
+[[field]]
+path = "filtering.lists[].name"
+status = "kept"
+
+[[field]]
+path = "filtering.lists[].url"
+status = "kept"
+
+[[field]]
+path = "filtering.lists[].enabled"
+status = "kept"
+
+[[field]]
+path = "filtering.lists[].refresh_hours"
+status = "kept"
+
+# ---------------------------------------------------------------------------
+# [privacy]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "privacy.anonymize_querylog"
+status = "kept"
+
+[[field]]
+path = "privacy.anonymize_client_ip"
+status = "deprecated"
+to = "privacy.anonymize_querylog"
+
+# ---------------------------------------------------------------------------
+# [web]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "web.enabled"
+status = "kept"
+
+[[field]]
+path = "web.bind"
+status = "kept"
+
+[[field]]
+path = "web.port"
+status = "kept"
+
+[[field]]
+path = "web.trusted_proxies"
+status = "kept"
+
+[[field]]
+path = "web.metrics_auth"
+status = "kept"
+
+[[field]]
+path = "web.public_url"
+status = "kept"
+
+[[field]]
+path = "web.tls_terminated_by_proxy"
+status = "kept"
+
+[[field]]
+path = "web.acme_enabled"
+status = "deprecated"
+to = "acme.enabled"
+
+[[field]]
+path = "web.acme_email"
+status = "deprecated"
+to = "acme.email"
+
+[[field]]
+path = "web.acme_domains"
+status = "deprecated"
+to = "acme.domains"
+
+[[field]]
+path = "web.acme_staging"
+status = "deprecated"
+to = "acme.staging"
+
+[[field]]
+path = "web.acme_cache_dir"
+status = "deprecated"
+to = "acme.cache_dir"
+
+# ---------------------------------------------------------------------------
+# [auth]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "auth.session_ttl_hours"
+status = "kept"
+
+[[field]]
+path = "auth.login_rate_limit"
+status = "kept"
+
+[[field]]
+path = "auth.session_persist"
+status = "kept"
+
+[[field]]
+path = "auth.token_default_ttl_days"
+status = "kept"
+
+[[field]]
+path = "auth.admin_password_hash"
+status = "removed"
+
+[[field]]
+path = "auth.tokens"
+status = "removed"
+
+# ---------------------------------------------------------------------------
+# [stats]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "stats.retention_days"
+status = "kept"
+
+[[field]]
+path = "stats.query_log_retention_days"
+status = "deprecated"
+to = "stats.retention_days"
+
+[[field]]
+path = "stats.rollup_retention_days"
+status = "kept"
+
+[[field]]
+path = "stats.rollup_client_names"
+status = "kept"
+
+# ---------------------------------------------------------------------------
+# [clients]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "clients.timezone"
+status = "kept"
+
+[[field]]
+path = "clients.trust_routeros_lease_names"
+status = "kept"
+
+[[field]]
+path = "clients.entries[].name"
+status = "kept"
+
+[[field]]
+path = "clients.entries[].ids"
+status = "kept"
+
+[[field]]
+path = "clients.entries[].group"
+status = "kept"
+
+[[field]]
+path = "clients.entries[].ignore_query_log"
+status = "kept"
+
+[[field]]
+path = "clients.entries[].ignore_stats"
+status = "kept"
+
+[[field]]
+path = "clients.entries[].use_global_upstreams"
+status = "kept"
+
+[[field]]
+path = "clients.entries[].upstreams"
+status = "kept"
+
+[[field]]
+path = "clients.entries[].trusted"
+status = "kept"
+
+[[field]]
+path = "clients.groups.*.description"
+status = "kept"
+
+[[field]]
+path = "clients.groups.*.filtering"
+status = "kept"
+
+[[field]]
+path = "clients.groups.*.lists"
+status = "kept"
+
+[[field]]
+path = "clients.groups.*.custom_rules"
+status = "kept"
+
+[[field]]
+path = "clients.groups.*.safe_search"
+status = "kept"
+
+[[field]]
+path = "clients.groups.*.safe_search_youtube"
+status = "kept"
+
+[[field]]
+path = "clients.groups.*.parental"
+status = "kept"
+
+[[field]]
+path = "clients.groups.*.parental_categories"
+status = "kept"
+
+[[field]]
+path = "clients.groups.*.schedule_enabled"
+status = "kept"
+
+[[field]]
+path = "clients.groups.*.schedule"
+status = "kept"
+
+[[field]]
+path = "clients.groups.*.blocked_services[].service"
+status = "kept"
+
+[[field]]
+path = "clients.groups.*.blocked_services[].schedule"
+status = "kept"
+
+[[field]]
+path = "clients.client_id_secrets.*"
+status = "kept"
+
+# ---------------------------------------------------------------------------
+# [rewrites]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "rewrites.auto_ptr"
+status = "kept"
+
+[[field]]
+path = "rewrites.ttl"
+status = "kept"
+
+[[field]]
+path = "rewrites.entries[].domain"
+status = "kept"
+
+[[field]]
+path = "rewrites.entries[].id"
+status = "kept"
+
+[[field]]
+path = "rewrites.entries[].type"
+status = "kept"
+
+[[field]]
+path = "rewrites.entries[].answer"
+status = "kept"
+
+[[field]]
+path = "rewrites.entries[].exception_clients"
+status = "kept"
+
+# ---------------------------------------------------------------------------
+# [ha]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "ha.replication_port"
+status = "kept"
+
+[[field]]
+path = "ha.listen_addr"
+status = "kept"
+
+[[field]]
+path = "ha.master_url"
+status = "kept"
+
+[[field]]
+path = "ha.master_fingerprint"
+status = "kept"
+
+[[field]]
+path = "ha.master_pubkey"
+status = "kept"
+
+[[field]]
+path = "ha.cert"
+status = "kept"
+
+[[field]]
+path = "ha.key"
+status = "kept"
+
+[[field]]
+path = "ha.ca"
+status = "kept"
+
+[[field]]
+path = "ha.pinned_slave_fingerprints"
+status = "kept"
+
+[[field]]
+path = "ha.slave_token"
+status = "kept"
+
+[[field]]
+path = "ha.allow_unpinned_tls"
+status = "kept"
+
+[[field]]
+path = "ha.allow_insecure_ws"
+status = "kept"
+
+[[field]]
+path = "ha.stats_interval_secs"
+status = "kept"
+
+[[field]]
+path = "ha.ping_interval_secs"
+status = "kept"
+
+# ---------------------------------------------------------------------------
+# [integrations]
+# ---------------------------------------------------------------------------
+[[field]]
+path = "integrations.mikrotik.enabled"
+status = "kept"
+
+[[field]]
+path = "integrations.mikrotik.url"
+status = "kept"
+
+[[field]]
+path = "integrations.mikrotik.token_env"
+status = "kept"
+
+[[field]]
+path = "integrations.mikrotik.username"
+status = "kept"
+
+[[field]]
+path = "integrations.mikrotik.password"
+status = "kept"
+
+[[field]]
+path = "integrations.mikrotik.password_env"
+status = "kept"
+
+[[field]]
+path = "integrations.mikrotik.interval_s"
+status = "kept"
+
+[[field]]
+path = "integrations.mikrotik.allow_invalid_certs"
+status = "kept"
+
+[[field]]
+path = "integrations.mikrotik.token"
+status = "removed"
+
+[[field]]
+path = "integrations.lists.refresh_hours"
+status = "kept"
+
+[[field]]
+path = "integrations.lists.categories.*.url"
+status = "kept"
+
+[[field]]
+path = "integrations.lists.categories.*.refresh_hours"
+status = "kept"
+
+[[field]]
+path = "integrations.lists.categories.*.license"
+status = "kept"

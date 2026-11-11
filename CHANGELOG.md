@@ -24,6 +24,14 @@ as a prerelease. Phase 1 work packages land as separate commits on
   at startup. Removed dead/test-only APIs, unused dependencies and unreachable
   non-Unix fallbacks, and narrowed Tokio features per crate. See
   `docs/2.0-public-api-diff.md`.
+- WP-1.3 (breaking): configuration schema v2. `config_version = 2` is the
+  default and the only accepted version; v1 documents must be migrated with
+  `sito config migrate --from v1 --to v2 --backup`. Unknown keys are errors,
+  `[dns.tls]` and `[web] acme_*` are deprecated aliases for typed
+  `[tls]`/`[acme]`, and the admin UI binds loopback by default. Restart-only
+  admin writes return 409 with `restart_required` and are not persisted;
+  `GET /api/v1/config/restart-required` previews the matrix. See
+  `docs/config-v2.md` and `docs/2.0-public-api-diff.md`.
 
 ## [1.9.5] - 2026-11-10
 

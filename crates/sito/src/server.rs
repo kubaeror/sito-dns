@@ -2396,7 +2396,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sito_cfg_path_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("config.toml");
-        std::fs::write(&file, "config_version = 1\n").unwrap();
+        std::fs::write(&file, "config_version = 2\n").unwrap();
         let resolved = canonical_config_path(&file);
         assert!(resolved.is_absolute());
         assert_eq!(
@@ -2957,7 +2957,12 @@ mod tests {
     /// configuration the wizard actually wrote.
     #[test]
     fn test_exposure_warning_phases_suppress_dns_while_setup_pending() {
-        let default = Config::default();
+        // 2.0 safe default binds the admin UI loopback; explicitly expose it
+        // here so the phase separation is still exercised.
+        let mut default = Config::default();
+        let mut web = default.get_web_config();
+        web.bind = "0.0.0.0".parse().expect("valid wildcard");
+        default.set_web_config(web);
         let startup = exposure_warnings_for_phase(&default, ExposurePhase::Startup);
         assert_eq!(
             startup.len(),

@@ -43,7 +43,7 @@ mod tests {
         let valid_path = temp_dir.join("valid.toml");
         std::fs::write(
             &valid_path,
-            "config_version = 1\n[server]\nrole = \"master\"\n",
+            "config_version = 2\n[server]\nrole = \"master\"\n",
         )
         .unwrap();
         assert!(run_check_config(&valid_path).is_ok());
@@ -51,7 +51,7 @@ mod tests {
         let invalid_path = temp_dir.join("invalid.toml");
         std::fs::write(
             &invalid_path,
-            "config_version = 1\n[server]\nrole = \"unsupported_role\"\n",
+            "config_version = 2\n[server]\nrole = \"unsupported_role\"\n",
         )
         .unwrap();
         assert!(run_check_config(&invalid_path).is_err());

@@ -20,7 +20,7 @@ pub(crate) async fn save_config_document_atomic(
     document: &str,
     config: &Config,
 ) -> Result<(), ProblemDetails> {
-    if let Err(e) = config.validate() {
+    if let Err(e) = config.validate_full() {
         return Err(ProblemDetails::bad_request(format!(
             "Configuration validation failed: {e}"
         )));

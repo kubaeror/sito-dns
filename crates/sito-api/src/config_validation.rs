@@ -14,11 +14,20 @@ use sito_core::config::Config;
 /// Converts every TOML-valued section into its typed form, returning the first
 /// error encountered.
 ///
+/// This is the dependent-crate half of the single validator: it first runs
+/// [`sito_core::config::Config::validate_full`] (so every entry point applies
+/// the same core rules) and then deserializes the sections whose types live
+/// in `sito-clients`, `sito-rewrites` and `sito-ha`.
+///
 /// # Errors
 ///
 /// Returns an error naming the offending section when a section exists but
 /// does not deserialize into its configuration type.
 pub fn validate_typed_sections(config: &Config) -> anyhow::Result<()> {
+    // One validator: startup, check-config, API writes, restore and HA apply
+    // all reach this path, and the core rules are never duplicated.
+    config.validate_full().map_err(|e| anyhow::anyhow!("{e}"))?;
+
     if let Some(value) = config.clients.as_ref() {
         let _: sito_clients::ClientsConfig = value
             .clone()
@@ -39,33 +48,12 @@ pub fn validate_typed_sections(config: &Config) -> anyhow::Result<()> {
         validate_integrations(&integrations, cfg!(feature = "routeros"))?;
     }
     if let Some(value) = config.web.as_ref() {
+        // `public_url` and `tls_terminated_by_proxy` are typed WebConfig
+        // fields; `validate_full` already checks their schemes/types.
         let _: sito_core::config::WebConfig = value
             .clone()
             .try_into()
             .map_err(|e| anyhow::anyhow!("invalid [web] configuration: {e}"))?;
-        // Admin-scheme settings (unknown to the typed WebConfig so they stay
-        // forward-compatible) are validated here.
-        if let Some(public_url) = value.get("public_url") {
-            let url = public_url.as_str().ok_or_else(|| {
-                anyhow::anyhow!("invalid [web] configuration: public_url must be a string")
-            })?;
-            let scheme_ok = url.split_once("://").is_some_and(|(scheme, rest)| {
-                !rest.is_empty()
-                    && (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-            });
-            if !scheme_ok {
-                return Err(anyhow::anyhow!(
-                    "invalid [web] configuration: public_url '{url}' must start with http:// or https://"
-                ));
-            }
-        }
-        if let Some(flag) = value.get("tls_terminated_by_proxy")
-            && !flag.is_bool()
-        {
-            return Err(anyhow::anyhow!(
-                "invalid [web] configuration: tls_terminated_by_proxy must be a boolean"
-            ));
-        }
     }
     if let Some(value) = config.auth.as_ref() {
         let _: sito_core::config::AuthConfig = value
@@ -140,18 +128,19 @@ mod tests {
 
     #[test]
     fn test_rejects_typed_section_errors() {
-        let config = Config::from_toml_str(
-            "config_version = 1\n[clients]\nentries = \"not-an-array\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+        // The single validator now rejects this at parse time, with the same
+        // section-named error the API path used to produce.
+        let err = Config::from_toml_str(
+            "config_version = 2\n[clients]\nentries = \"not-an-array\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
         )
-        .expect("parses as raw TOML");
-        let err = validate_typed_sections(&config).expect_err("must reject bad [clients]");
-        assert!(err.to_string().contains("[clients]"));
+        .expect_err("must reject bad [clients]");
+        assert!(err.to_string().contains("[clients]"), "got: {err}");
     }
 
     #[test]
     fn test_accepts_valid_sections() {
         let config = Config::from_toml_str(
-            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[web]\nport = 8080\n",
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[web]\nport = 8080\n",
         )
         .expect("parses");
         validate_typed_sections(&config).expect("valid sections");
@@ -182,7 +171,7 @@ mod tests {
     #[test]
     fn test_accepts_disabled_mikrotik_without_routeros_feature() {
         let config = Config::from_toml_str(
-            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[integrations.mikrotik]\nenabled = false\n",
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[integrations.mikrotik]\nenabled = false\n",
         )
         .expect("parses");
         validate_typed_sections(&config).expect("a disabled RouterOS section must be accepted");
@@ -212,26 +201,25 @@ mod tests {
     #[test]
     fn test_validates_admin_scheme_settings() {
         let valid = Config::from_toml_str(
-            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[web]\npublic_url = \"https://dns.example.com\"\ntls_terminated_by_proxy = true\n",
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[web]\npublic_url = \"https://dns.example.com\"\ntls_terminated_by_proxy = true\n",
         )
         .expect("parses");
         validate_typed_sections(&valid).expect("valid admin scheme settings");
 
         let bad_url = Config::from_toml_str(
-            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[web]\npublic_url = \"ftp://dns.example.com\"\n",
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[web]\npublic_url = \"ftp://dns.example.com\"\n",
         )
-        .expect("parses");
-        let err = validate_typed_sections(&bad_url).expect_err("ftp scheme rejected");
-        assert!(err.to_string().contains("public_url"), "got: {err}");
+        .expect_err("ftp scheme rejected at parse time by the single validator");
+        assert!(bad_url.to_string().contains("public_url"), "got: {bad_url}");
 
-        let bad_flag = Config::from_toml_str(
-            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[web]\ntls_terminated_by_proxy = \"yes\"\n",
-        )
-        .expect("parses");
+        let bad_flag = Config {
+            web: Some(
+                toml::from_str::<toml::Value>("tls_terminated_by_proxy = \"yes\"\n")
+                    .expect("raw web table"),
+            ),
+            ..Config::default()
+        };
         let err = validate_typed_sections(&bad_flag).expect_err("non-bool rejected");
-        assert!(
-            err.to_string().contains("tls_terminated_by_proxy"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("[web]"), "got: {err}");
     }
 }

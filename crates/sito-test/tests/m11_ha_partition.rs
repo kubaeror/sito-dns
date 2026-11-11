@@ -142,7 +142,7 @@ async fn test_slave_goes_not_ready_when_master_stops_sending_frames() {
     let push = signed_push(
         2,
         0,
-        "config_version = 1\n[server]\nrole = \"slave\"\n",
+        "config_version = 2\n[server]\nrole = \"slave\"\n",
         vec![],
         &key,
     );
@@ -215,7 +215,7 @@ async fn test_restart_with_locally_modified_shared_config_does_not_early_ack_syn
     let watermark_path = dir.join("ha_watermark.toml");
     let key = Ed25519SigningKey::generate().unwrap();
 
-    let applied_doc = r#"config_version = 1
+    let applied_doc = r#"config_version = 2
 [server]
 role = "slave"
 instance_name = "drift-slave"
@@ -325,7 +325,7 @@ async fn test_legacy_watermark_without_digest_forces_full_apply() {
     let watermark_path = dir.join("ha_watermark.toml");
     let key = Ed25519SigningKey::generate().unwrap();
 
-    let applied_doc = r#"config_version = 1
+    let applied_doc = r#"config_version = 2
 [server]
 role = "slave"
 instance_name = "legacy-slave"
@@ -527,7 +527,7 @@ fn bundle(version: u64) -> ConfigBundle {
         version,
         term: 0,
         timestamp: 1,
-        config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+        config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
         custom_rules: vec![],
         rewrites: None,
         clients: None,
@@ -635,15 +635,16 @@ async fn test_file_watcher_rejects_oversized_bundle_and_rolls_back() {
     let dir = temp_dir("watcher-oversize");
     let config_path = dir.join("config.toml");
     // The watcher reads this file, so write a valid baseline first.
-    std::fs::write(&config_path, "config_version = 1\n").unwrap();
+    std::fs::write(&config_path, "config_version = 2\n").unwrap();
     let ctx = publish_context(&dir, &config_path).await;
     let original_ttl = ctx.config.load().dns.cache.min_ttl;
 
-    // A real small shared change plus a large unknown section: Config ignores
-    // the unknown table, but the sanitized source document (and therefore the
-    // signed bundle) keeps it and exceeds the 1 MiB WebSocket limit.
+    // A real small shared change plus a large *valid* custom rule. Unknown
+    // tables are rejected by config v2 (D5), so the oversized payload must be
+    // a real setting that survives HA sanitization and exceeds the 1 MiB
+    // WebSocket limit.
     let oversized_document = format!(
-        "config_version = 1\n[server]\nrole = \"master\"\n[ha]\nreplication_port = 8953\nallow_insecure_ws = true\nslave_token = \"test-token\"\n[dns.cache]\nmin_ttl = {}\n[padding]\nblob = \"{}\"\n",
+        "config_version = 2\n[server]\nrole = \"master\"\n[ha]\nreplication_port = 8953\nallow_insecure_ws = true\nslave_token = \"test-token\"\n[dns.cache]\nmin_ttl = {}\n[filtering]\ncustom_rules = [\"{}\"]\n",
         original_ttl.saturating_add(7),
         "x".repeat(1_100_000)
     );

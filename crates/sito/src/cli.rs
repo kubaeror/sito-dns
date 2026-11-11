@@ -158,6 +158,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: HaCommands,
     },
+    /// Configuration schema management
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
     /// Check for and install software updates
     Update {
         /// Optional path to configuration file (defaults to main --config; the
@@ -214,6 +219,36 @@ pub enum Commands {
         /// keeps its SQLite connections; stop the service when possible.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommands {
+    /// Migrate a v1 configuration document to config v2
+    Migrate {
+        /// Optional path to configuration file (defaults to the main --config)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Source schema version (only `v1` is supported)
+        #[arg(long)]
+        from: String,
+        /// Destination schema version (only `v2` is supported)
+        #[arg(long)]
+        to: String,
+        /// Write a 0600 backup of the original document next to it
+        /// (`<config>.v1.bak`) before replacing the file
+        #[arg(long)]
+        backup: bool,
+        /// Replace the safe 2.0 defaults instead of preserving v1 behavior
+        #[arg(long = "adopt-safe-defaults")]
+        adopt_safe_defaults: bool,
+        /// Drop unknown keys (reported in the migration report) instead of
+        /// failing. Only this explicit flag accepts unknown keys.
+        #[arg(long = "ignore-unknown-keys")]
+        ignore_unknown_keys: bool,
+        /// Print the machine-readable migration report as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -339,6 +374,122 @@ pub fn run_check_config(path: &Path) -> Result<(), anyhow::Error> {
         config.filtering.lists.len()
     );
 
+    Ok(())
+}
+
+/// Options for `sito config migrate`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConfigMigrateOptions {
+    /// Write `<config>.v1.bak` (mode 0600) before replacing the file.
+    pub backup: bool,
+    /// Adopt the documented 2.0 safe defaults.
+    pub adopt_safe_defaults: bool,
+    /// Drop unknown keys (reported) instead of failing.
+    pub ignore_unknown_keys: bool,
+    /// Print the machine-readable report as JSON.
+    pub json: bool,
+}
+
+/// Executes the `config migrate` subcommand (D4).
+///
+/// Behavior-preserving by default: every known v1 value is copied. The
+/// original document is backed up with mode 0600 when `--backup` is passed,
+/// and the migrated document is written atomically (0600, fsync, rename).
+pub fn run_config_migrate(
+    config_path: &Path,
+    from: &str,
+    to: &str,
+    options: ConfigMigrateOptions,
+) -> Result<(), anyhow::Error> {
+    if from != "v1" || to != "v2" {
+        anyhow::bail!(
+            "Unsupported migration '{from}' -> '{to}'; this build supports `sito config migrate --from v1 --to v2 --backup`"
+        );
+    }
+
+    let source = std::fs::read_to_string(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read configuration file '{}': {e}",
+            config_path.display()
+        )
+    })?;
+
+    let migration_options = sito_core::config::MigrationOptions {
+        adopt_safe_defaults: options.adopt_safe_defaults,
+        ignore_unknown_keys: options.ignore_unknown_keys,
+    };
+    let outcome = Config::migrate_v1_to_v2(&source, &migration_options)
+        .map_err(|e| anyhow::anyhow!("Migration of '{}' failed: {e}", config_path.display()))?;
+
+    let backup_path = if options.backup {
+        let mut backup_name = config_path.as_os_str().to_os_string();
+        backup_name.push(".v1.bak");
+        let backup_path = PathBuf::from(backup_name);
+        write_file_atomic_private(&backup_path, source.as_bytes()).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to write the 0600 backup '{}': {e}",
+                backup_path.display()
+            )
+        })?;
+        Some(backup_path)
+    } else {
+        None
+    };
+
+    // Atomic replace: private sibling, fsync, rename, fsync the directory.
+    write_file_atomic_private(config_path, outcome.document.as_bytes()).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to replace '{}' with the migrated document: {e}",
+            config_path.display()
+        )
+    })?;
+
+    if options.json {
+        let rendered = serde_json::to_string_pretty(&outcome.report)
+            .map_err(|e| anyhow::anyhow!("Failed to render the migration report: {e}"))?;
+        println!("{rendered}");
+        return Ok(());
+    }
+
+    println!(
+        "Migrated '{}' from config v{} to v{} ({} moved, {} removed, {} unknown dropped, {} v1 defaults materialized, {} safe defaults adopted).",
+        config_path.display(),
+        outcome.report.from_version,
+        outcome.report.to_version,
+        outcome.report.moved.len(),
+        outcome.report.removed.len(),
+        outcome.report.unknown_dropped.len(),
+        outcome.report.defaults_materialized.len(),
+        outcome.report.safe_defaults_applied.len()
+    );
+    for change in &outcome.report.moved {
+        match &change.to {
+            Some(to) => println!("  moved   {} -> {to}", change.from),
+            None => println!("  moved   {}", change.from),
+        }
+    }
+    for change in &outcome.report.removed {
+        println!("  removed {}", change.from);
+    }
+    for key in &outcome.report.unknown_dropped {
+        println!("  dropped {key} (--ignore-unknown-keys)");
+    }
+    for field in &outcome.report.defaults_materialized {
+        println!("  kept    {field} = v1 default (config v2 default differs)");
+    }
+    for field in &outcome.report.safe_defaults_applied {
+        println!("  default {field} = 2.0 safe default (--adopt-safe-defaults)");
+    }
+    for warning in &outcome.report.warnings {
+        println!("  warning {warning}");
+    }
+    match backup_path {
+        Some(path) => println!(
+            "Backup written to '{}' (mode 0600). Restore it and the binary to roll back.",
+            path.display()
+        ),
+        None => println!("No backup written; pass --backup to keep the v1 document."),
+    }
     Ok(())
 }
 
@@ -664,6 +815,38 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), anyhow::Error>
     }
     file.write_all(contents)?;
     file.sync_all()?;
+    Ok(())
+}
+
+/// Writes `contents` to a unique 0600 sibling, fsyncs it, atomically renames
+/// it over `path`, and fsyncs the parent directory (best effort, matching the
+/// other atomic writers).
+fn write_file_atomic_private(path: &Path, contents: &[u8]) -> Result<(), anyhow::Error> {
+    let file_name = path.file_name().map_or_else(
+        || "config.toml".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let tmp_path = path.with_file_name(format!(
+        "{file_name}.{}.{:016x}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    write_private_file(&tmp_path, contents)?;
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        if let Err(cleanup) = std::fs::remove_file(&tmp_path)
+            && cleanup.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "warning: failed to remove temporary file '{}': {cleanup}",
+                tmp_path.display()
+            );
+        }
+        return Err(anyhow::anyhow!(
+            "Failed to replace '{}': {e}",
+            path.display()
+        ));
+    }
+    fsync_parent_dir(path);
     Ok(())
 }
 
@@ -1338,6 +1521,161 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_config_migrate_flags() {
+        let cli = Cli::try_parse_from([
+            "sito",
+            "config",
+            "migrate",
+            "--from",
+            "v1",
+            "--to",
+            "v2",
+            "--backup",
+            "--adopt-safe-defaults",
+            "--ignore-unknown-keys",
+            "--json",
+        ])
+        .expect("parse config migrate");
+        match cli.command {
+            Some(Commands::Config {
+                command:
+                    ConfigCommands::Migrate {
+                        from,
+                        to,
+                        backup,
+                        adopt_safe_defaults,
+                        ignore_unknown_keys,
+                        json,
+                        ..
+                    },
+            }) => {
+                assert_eq!(from, "v1");
+                assert_eq!(to, "v2");
+                assert!(backup);
+                assert!(adopt_safe_defaults);
+                assert!(ignore_unknown_keys);
+                assert!(json);
+            }
+            other => panic!("expected config migrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_config_uses_the_single_v2_validator() {
+        let dir = temp_config_dir("check_config_v2");
+        let path = dir.join("config.toml");
+
+        std::fs::write(
+            &path,
+            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+        )
+        .unwrap();
+        let err = run_check_config(&path).expect_err("check-config must reject v1");
+        assert!(
+            err.to_string()
+                .contains("sito config migrate --from v1 --to v2 --backup"),
+            "got: {err}"
+        );
+
+        std::fs::write(
+            &path,
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\nbogus = 1\n",
+        )
+        .unwrap();
+        let err = run_check_config(&path).expect_err("check-config must reject unknown keys");
+        assert!(err.to_string().contains("bogus"), "got: {err}");
+
+        std::fs::write(
+            &path,
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+        )
+        .unwrap();
+        run_check_config(&path).expect("a valid v2 document passes check-config");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_config_migrate_writes_v2_and_0600_backup() {
+        let dir = temp_config_dir("migrate");
+        let path = dir.join("config.toml");
+        let v1 = "config_version = 1\n[server]\nrole = \"master\"\n[upstream]\nservers = [\"1.1.1.1\"]\n[web]\nbind = \"0.0.0.0\"\nport = 8080\n";
+        std::fs::write(&path, v1).unwrap();
+
+        run_config_migrate(
+            &path,
+            "v1",
+            "v2",
+            ConfigMigrateOptions {
+                backup: true,
+                ..ConfigMigrateOptions::default()
+            },
+        )
+        .expect("migration succeeds");
+
+        let migrated = std::fs::read_to_string(&path).expect("migrated file exists");
+        let parsed = Config::from_toml_str(&migrated).expect("migrated document is v2");
+        assert_eq!(parsed.config_version, 2);
+        assert_eq!(
+            parsed.get_web_config().bind.to_string(),
+            "0.0.0.0",
+            "migration preserves the v1 effective behavior by default"
+        );
+
+        let backup = PathBuf::from(format!("{}.v1.bak", path.display()));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), v1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the backup must be mode 0600");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_config_migrate_requires_unknown_key_flag() {
+        let dir = temp_config_dir("migrate_unknown");
+        let path = dir.join("config.toml");
+        let v1 = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\nbogus = 1\n";
+        std::fs::write(&path, v1).unwrap();
+
+        let err = run_config_migrate(
+            &path,
+            "v1",
+            "v2",
+            ConfigMigrateOptions {
+                json: true,
+                ..ConfigMigrateOptions::default()
+            },
+        )
+        .expect_err("unknown keys fail closed by default");
+        assert!(err.to_string().contains("bogus"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            v1,
+            "a failed migration must not overwrite the source"
+        );
+
+        run_config_migrate(
+            &path,
+            "v1",
+            "v2",
+            ConfigMigrateOptions {
+                ignore_unknown_keys: true,
+                ..ConfigMigrateOptions::default()
+            },
+        )
+        .expect("--ignore-unknown-keys drops the key");
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(!migrated.contains("bogus"));
+        Config::from_toml_str(&migrated).expect("migrated document is valid");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_cli_update_accepts_config_before_and_after_subcommand() {
         // The documented/error text says `--config <path>`; it must work after
         // the subcommand as well as in the historical global position.
@@ -1389,12 +1727,12 @@ mod tests {
         assert_eq!(resolve_config_path_from(None, &local, &system), local);
 
         // A local config takes precedence over the system path.
-        std::fs::write(&local, "config_version = 1\n").unwrap();
+        std::fs::write(&local, "config_version = 2\n").unwrap();
         assert_eq!(resolve_config_path_from(None, &local, &system), local);
 
         // Without a local config, the system path is used.
         std::fs::remove_file(&local).unwrap();
-        std::fs::write(&system, "config_version = 1\n").unwrap();
+        std::fs::write(&system, "config_version = 2\n").unwrap();
         assert_eq!(resolve_config_path_from(None, &local, &system), system);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1426,7 +1764,7 @@ mod tests {
         assert!(err.contains("--config"), "unexpected error: {err}");
 
         // A local config is used when the system path does not exist.
-        std::fs::write(&local, "config_version = 1\n").unwrap();
+        std::fs::write(&local, "config_version = 2\n").unwrap();
         assert_eq!(
             resolve_update_config_path_from(None, &local, &system).unwrap(),
             local
@@ -1434,7 +1772,7 @@ mod tests {
 
         // The system config wins when both exist, so a stray ./config.toml
         // cannot change the signature policy of a system install.
-        std::fs::write(&system, "config_version = 1\n").unwrap();
+        std::fs::write(&system, "config_version = 2\n").unwrap();
         assert_eq!(
             resolve_update_config_path_from(None, &local, &system).unwrap(),
             system
@@ -1453,7 +1791,7 @@ mod tests {
     fn test_update_preflight_requires_cosign_when_signatures_required() {
         let dir = temp_config_dir("preflight");
         let cfg = dir.join("config.toml");
-        std::fs::write(&cfg, "config_version = 1\n").unwrap();
+        std::fs::write(&cfg, "config_version = 2\n").unwrap();
 
         // Default policy requires signatures; without cosign the update must
         // be refused before downloading anything.
@@ -1468,7 +1806,7 @@ mod tests {
         // Explicit opt-out allows checksum-only verification without cosign.
         std::fs::write(
             &cfg,
-            "config_version = 1\n[server]\nupdate_require_signature = false\n",
+            "config_version = 2\n[server]\nupdate_require_signature = false\n",
         )
         .unwrap();
         assert!(!update_preflight(&cfg, false).unwrap());
@@ -1492,14 +1830,14 @@ mod tests {
 
         // Default config enables the requirement.
         let default_cfg = dir.join("default.toml");
-        std::fs::write(&default_cfg, "config_version = 1\n").unwrap();
+        std::fs::write(&default_cfg, "config_version = 2\n").unwrap();
         assert!(update_signature_policy(&default_cfg).unwrap());
 
         // Explicit opt-out is honored.
         let opt_out = dir.join("opt_out.toml");
         std::fs::write(
             &opt_out,
-            "config_version = 1\n[server]\nupdate_require_signature = false\n",
+            "config_version = 2\n[server]\nupdate_require_signature = false\n",
         )
         .unwrap();
         assert!(!update_signature_policy(&opt_out).unwrap());
@@ -1665,7 +2003,7 @@ mod tests {
         ));
 
         // Existing config: the credential must not be rotated again.
-        std::fs::write(&config_path, "config_version = 1\n").unwrap();
+        std::fs::write(&config_path, "config_version = 2\n").unwrap();
         assert_eq!(
             prepare_no_setup_bootstrap(&config_path, &mut config).unwrap(),
             NoSetupBootstrap::NotNeeded
@@ -1955,7 +2293,7 @@ mod tests {
         let config_path = dir.join("config.toml");
         std::fs::write(
             &config_path,
-            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n",
         )
         .unwrap();
 
@@ -1999,7 +2337,7 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "config_version = 1\n[server]\ndata_dir = \"{}\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+                "config_version = 2\n[server]\ndata_dir = \"{}\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
                 dir.display()
             ),
         )
@@ -2180,7 +2518,7 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "config_version = 1\n[server]\ndata_dir = \"{}\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+                "config_version = 2\n[server]\ndata_dir = \"{}\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
                 dir.display()
             ),
         )

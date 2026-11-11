@@ -419,6 +419,10 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
             get(config::get_config).put(config::update_config),
         )
         .route("/config/reload", post(config::reload_config))
+        .route(
+            "/config/restart-required",
+            get(config::get_restart_required),
+        )
         .route("/config/backup", get(config::download_backup))
         .route("/config/restore", post(config::prepare_restore))
         .route("/config/restore/confirm", post(config::confirm_restore))

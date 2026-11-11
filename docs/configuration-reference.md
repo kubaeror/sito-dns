@@ -2,17 +2,19 @@
 
 This document is the exhaustive configuration reference for **sito v2.0.0-alpha.1**.
 
-> The `2.0.0-alpha.1` development line still accepts `config_version = 1`
-> until the config-v2 migration lands in Phase 1 (WP-1.3). The settings below
-> describe the live schema; the v2 schema and migration guide will replace
-> this note in the same work package.
+> **Config v2 is frozen at WP-1.3.** `config_version = 2` is the default and
+> the only version accepted by startup, `check-config`, API writes, restore and
+> HA apply. A `config_version = 1` document is rejected with a migration hint;
+> run `sito config migrate --from v1 --to v2 --backup`. Unknown keys/tables are
+> errors. See [`docs/config-v2.md`](config-v2.md) for the schema freeze,
+> unknown-key policy, restart-only matrix and migration report.
 
 `sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the `DNSD_SECRET_<name>` environment variable, then a bare `<name>` environment variable; there is no on-disk local secret store, and a placeholder that cannot be resolved rejects the whole pushed configuration.
 
 > [!NOTE]
 > The tables below are validated against the Rust config structs in CI (`scripts/check_config_reference.py`); adding a setting without documenting it fails the build.
 >
-> Configuration persistence round-trips modeled fields via the `Config` schema. Unrecognized or unmodeled keys and comments are omitted when the configuration is saved back to disk by the web console or API.
+> Configuration persistence round-trips modeled fields via the `Config` schema. Unknown keys are rejected at load time (startup, `check-config`, API writes, restore and HA apply); comments are not preserved when the web console or API saves the file.
 
 ---
 
@@ -20,7 +22,7 @@ This document is the exhaustive configuration reference for **sito v2.0.0-alpha.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `config_version` | integer | `1` | Configuration schema version. Only version `1` is accepted; there are **no automatic configuration migrations** in 1.9.x. The 2.0 line adds an explicit migration path. |
+| `config_version` | integer | `2` | Configuration schema version. A file must set `2` explicitly; an omitted key was valid in 1.9 and is treated as v1. Only version `2` is accepted; a v1/unversioned document is rejected with a pointer to `sito config migrate --from v1 --to v2 --backup`. The v2 schema is frozen at WP-1.3: later additions must be optional fields with defaults or a v2.1 migration. |
 
 ---
 
@@ -80,19 +82,19 @@ allow_plaintext_doh = false
 | `doh3_port` | integer | `443` | DNS-over-HTTP/3 (DoH3) UDP port. `0` disables DoH3. |
 | `doh_dedicated_hostname` | string | `""` | When set, DoH/DoH3 requests whose Host/authority does not match are rejected with `421 Misdirected Request`. Empty allows any hostname. |
 | `dot_padding` | boolean | `false` | RFC 7830/8467 padding on DoT responses to mitigate traffic analysis. |
-| `tls` | table | `None` | `[dns.tls]` is the effective TLS table and takes precedence over the top-level `[tls]` alias when both exist (same `cert`, `key`, `sni_certs` fields). Prefer `[dns.tls]` for new configuration; changing either table requires a restart. |
+| `tls` | table | `None` | Top-level `[tls]` is the canonical config v2 table. `[dns.tls]` is a deprecated v1 alias that still takes precedence when both are present (v1 behavior); migration moves it to `[tls]`. Changing either table requires a restart. |
 | `edns_udp_size` | integer | `1232` | Maximum EDNS0 UDP buffer size (1232 bytes prevents IPv6 fragmentation). |
 | `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual source prefix (`0` disables rate limiting; maximum `1000000`). IPv4 budgets are keyed per `/24` and IPv6 per `/64`. |
 | `max_tcp_connections` | integer | `256` | Maximum concurrent TCP, DoT, and DoH client connections. |
 | `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
 > [!WARNING]
-> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 1.9.5 has **no DNS client allow-list**.
+> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 2.0 has **no DNS client allow-list**.
 > `rate_limit_per_ip` only limits rate; it does not authorize clients. A wildcard bind therefore accepts recursive queries from any source
 > that can reach the host. Restrict the DNS ports to your LAN with a host
 > firewall, or bind specific LAN addresses. The server emits a startup warning
 > when a wildcard DNS bind is combined with an enabled DNS port. A
-> default-deny DNS client ACL is planned for 1.10.0.
+> default-deny DNS client ACL is not part of the Phase 1 config work package.
 
 ---
 
@@ -164,7 +166,7 @@ allow_bootstrap_cert = false
 |---|---|---|---|
 | `tls.cert` | string | `None` | Path to PEM-encoded certificate chain for DoT, DoH, DoQ and DoH3. It does **not** secure the admin Web UI, which is plain HTTP behind your reverse proxy/SSH tunnel. |
 | `tls.key` | string | `None` | Path to PEM-encoded unencrypted PKCS#8 or RSA/EC private key. |
-| `tls.sni_certs` | array of tables | `[]` | Additional certificate/key pairs mapped to specific SNI hostnames. |
+| `tls.sni_certs` | array of tables | `[]` | Additional certificate/key pairs mapped to specific SNI hostnames. `sni_certs[].domain` is normalized and must be unique. |
 | `acme.enabled` | boolean | `false` | Enables automated certificate issuance via Let's Encrypt / ACME. |
 | `acme.email` | string | `None` | Contact email address for ACME registration. |
 | `acme.domains` | array of strings | `[]` | Domain names for ACME TLS-ALPN-01 / HTTP-01 certificates. TLS-ALPN-01 is selected only when a DoH listener is actually bound on TCP 443; otherwise HTTP-01 is used when its listener binds. |
@@ -172,6 +174,13 @@ allow_bootstrap_cert = false
 | `acme.cache_dir` | string | `None` | Directory used to persist ACME account keys and certificates (defaults to `<data_dir>/acme`). |
 | `acme.http_port` | integer | `80` | Port for the dedicated ACME HTTP-01 challenge listener. |
 | `acme.allow_bootstrap_cert` | boolean | `false` | Serve a short-lived self-signed certificate on encrypted listeners while the first ACME certificate is being issued. When `false` (default), DoT/DoH/DoQ/DoH3 stay disabled until a trusted certificate exists. |
+
+> [!NOTE]
+> `[dns.tls]` (cert/key/sni_certs) and the legacy `[web] acme_enabled`,
+> `acme_email`, `acme_domains`, `acme_staging`, `acme_cache_dir` keys are
+> accepted as **deprecated aliases** for one 2.0 alpha. They take precedence
+> exactly as they did in 1.9; `sito config migrate` rewrites them to typed
+> `[tls]`/`[acme]`. New configuration must use the typed sections.
 
 ---
 
@@ -333,7 +342,7 @@ exception_clients = ["admin-laptop"]
 [web]
 enabled = true
 port = 8080
-bind = "0.0.0.0"          # single IP address, not an array
+bind = "127.0.0.1"        # single IP address, not an array
 metrics_auth = true
 trusted_proxies = ["10.0.0.1", "192.168.1.10"]   # individual proxy IPs
 
@@ -348,23 +357,29 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 |---|---|---|---|
 | `web.enabled` | boolean | `true` | Enable the web dashboard and REST API. |
 | `web.port` | integer | `8080` | Port for the Web Dashboard and REST API (`/api/v1/`; must be ≥ 1). |
-| `web.bind` | string (IP address) | `"0.0.0.0"` | Bind address for the web server. The admin UI is served over plain HTTP; see the exposure warning below. |
+| `web.bind` | string (IP address) | `"127.0.0.1"` | Bind address for the web server. The admin UI is served over plain HTTP; see the exposure warning below. Migrated v1 documents keep their previous bind unless `--adopt-safe-defaults` is used. |
 | `web.metrics_auth` | boolean | `true` | Require authentication (token or session) for `/metrics`. |
 | `web.trusted_proxies`| array of IP addresses | `[]` | Individual proxy IPs trusted to supply `X-Forwarded-For`/`X-Forwarded-Proto` (CIDR is **not** supported here). |
+| `web.public_url` | string | `None` | Explicit external admin URL. The scheme (`http://` or `https://`) decides Secure cookies/HSTS and whether a declared TLS reverse proxy suppresses the plaintext warning. |
+| `web.tls_terminated_by_proxy` | boolean | `false` | Declare that a trusted reverse proxy terminates TLS in front of the admin UI. Used only for the exposure warning when `public_url` is unset. |
+| `web.acme_enabled` | boolean | `false` | Deprecated v1 alias for `acme.enabled`; migrated to `[acme]`. |
+| `web.acme_email` | string | `None` | Deprecated v1 alias for `acme.email`. |
+| `web.acme_domains` | array of strings | `[]` | Deprecated v1 alias for `acme.domains`. |
+| `web.acme_staging` | boolean | `false` | Deprecated v1 alias for `acme.staging`. |
+| `web.acme_cache_dir` | string | `None` | Deprecated v1 alias for `acme.cache_dir`. |
 | `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required (must be ≥ 1). |
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
 | `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL, but are revalidated against `users.toml` on load and on every request (account exists, role and credential epoch match); entries written before credential epochs existed are rejected once, so users re-login and API tokens are re-issued after upgrading. Corrupt stores are backed up and start empty. Stop the service before `sito reset-sessions`; the reset refuses to run against a live server unless `--force` is given. |
 | `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
 
 > [!WARNING]
-> `web.bind` defaults to `0.0.0.0` and the admin UI is served over plain HTTP
-> by axum (the DNS `[tls]` certificate never protects the admin scheme). Do not
-> expose port `8080` to the internet. The server emits a startup warning when
-> the UI is reachable beyond loopback unless an `https://` `web.public_url` (or
-> `web.tls_terminated_by_proxy = true` with no public URL) declares a TLS
-> reverse proxy. For remote access, bind `web.bind = "127.0.0.1"` and use an SSH
-> tunnel or reverse proxy. The loopback default is planned for 1.10.0; 1.9.5
-> keeps the historical default so existing configurations keep working.
+> `web.bind` defaults to `127.0.0.1` in config v2 and the admin UI is served
+> over plain HTTP by axum (the DNS `[tls]` certificate never protects the admin
+> scheme). Do not expose port `8080` to the internet. The server emits a
+> startup warning when the UI is reachable beyond loopback unless an
+> `https://` `web.public_url` (or `web.tls_terminated_by_proxy = true` with no
+> public URL) declares a TLS reverse proxy. For remote access, use an SSH
+> tunnel or a TLS reverse proxy.
 
 
 The running server holds an exclusive advisory lease on `<data_dir>/sito.pid`
@@ -642,9 +657,11 @@ flag an existing `./config.toml` is preferred, then `/etc/sito/config.toml`
 (the systemd unit and container image pass `/etc/sito/config.toml` explicitly)
 and re-applies the settings below in-process. A
 configuration that cannot be parsed or validated is rejected as a whole: the
-previous settings stay active and the error is logged. The REST API reports
-restart-only changes in the `restart_required` field of `PUT /api/v1/config`
-and `POST /api/v1/config/reload`.
+previous settings stay active and the error is logged. `PUT /api/v1/config`
+returns **409 Conflict** with `restart_required` and persists nothing when a
+restart-only field changes; `GET /api/v1/config/restart-required` previews the
+matrix. `POST /api/v1/config/reload` re-reads an operator-edited file, so it
+applies the hot settings and reports the restart-only fields that remain.
 
 > [!NOTE]
 > The watcher compares the parsed file with the running configuration before
@@ -708,5 +725,6 @@ and `POST /api/v1/config/reload`.
 > UDP) must differ, as must any of them with `dns.port`. `dot_port` and
 > `doq_port` may share a number (different protocols).
 >
-> `config_version` is evaluated whenever the file is loaded; only version `1`
-> is accepted.
+> `config_version` is evaluated whenever the file is loaded; only version `2`
+> is accepted, and unknown keys/tables are rejected before any component is
+> touched. See [`docs/config-v2.md`](config-v2.md).

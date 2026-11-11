@@ -68,7 +68,7 @@ fn routeros_dependency_is_optional() {
 #[test]
 fn startup_rejects_enabled_routeros_without_the_feature() {
     let config = sito_core::config::Config::from_toml_str(
-        "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[integrations.mikrotik]\nenabled = true\n",
+        "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[integrations.mikrotik]\nenabled = true\n",
     )
     .expect("parses");
     let err = sito::server::validate_typed_sections(&config)

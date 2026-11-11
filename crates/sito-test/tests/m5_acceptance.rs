@@ -871,6 +871,7 @@ async fn test_acceptance_m5_metrics_auth() {
             port: 8080,
             trusted_proxies: Vec::new(),
             metrics_auth: false,
+            ..Default::default()
         })
         .unwrap(),
     );

@@ -122,3 +122,33 @@ named by the command.
 | `$client` policy gate (P1-9) | `test_client_name_requires_authenticated_identity`, `test_guessable_sni_label_does_not_grant_identity` | `cargo test -p sito-filter test_client_name_requires_authenticated_identity`; `cargo test -p sito-filter test_guessable_sni_label_does_not_grant_identity` |
 | Rewrite exception policy gate (P1-9) | `test_exception_requires_authenticated_identity`, `test_ip_identified_client_cannot_spoof_exception_with_untrusted_id`, `test_unidentified_client_id_does_not_bypass_exception` | `cargo test -p sito-rewrites test_exception_requires_authenticated_identity`; `cargo test -p sito-rewrites test_ip_identified_client_cannot_spoof_exception_with_untrusted_id` |
 | Serde/backwards compatibility of `ClientContext` | `test_client_context_serde_defaults_are_backwards_compatible` | `cargo test -p sito-core test_client_context_serde_defaults_are_backwards_compatible` |
+
+## WP-1.3 — config v2 schema and one validator
+
+| Finding | Named test / check | Focused command |
+|---|---|---|
+| Config v2 default, v1 rejection with migration command | `test_config_v2_is_the_default_and_only_accepted_version`, `test_v1_document_is_rejected_with_a_clear_migration_command` | `cargo test -p sito-core --test config_v2 test_config_v2_is_the_default_and_only_accepted_version`; `cargo test -p sito-core --test config_v2 test_v1_document_is_rejected` |
+| Unknown keys/tables rejected (D5) | `test_unknown_keys_are_rejected_everywhere` | `cargo test -p sito-core --test config_v2 test_unknown_keys_are_rejected_everywhere` |
+| Duplicate binds and listener port conflicts | `test_duplicate_dns_bind_addresses_are_rejected`, `test_web_listener_port_conflict_is_rejected` | `cargo test -p sito-core --test config_v2 test_duplicate_dns_bind`; `cargo test -p sito-core --test config_v2 test_web_listener_port_conflict` |
+| Empty `data_dir`, bad upstream targets, bad `[integrations.lists]` | `test_empty_data_dir_is_rejected`, `test_bad_upstream_targets_are_rejected_in_every_scope`, `test_bad_integrations_lists_are_rejected` | `cargo test -p sito-core --test config_v2 test_empty_data_dir`; `cargo test -p sito-core --test config_v2 test_bad_upstream`; `cargo test -p sito-core --test config_v2 test_bad_integrations_lists` |
+| Invalid ACME domains | `test_invalid_acme_domains_are_rejected` | `cargo test -p sito-core --test config_v2 test_invalid_acme_domains` |
+| Invalid client CIDR ids | `test_invalid_client_cidr_ids_are_rejected` | `cargo test -p sito-core --test config_v2 test_invalid_client_cidr_ids_are_rejected` |
+| Deprecated aliases accepted for one alpha | `test_legacy_aliases_still_parse_in_v2` | `cargo test -p sito-core --test config_v2 test_legacy_aliases_still_parse_in_v2` |
+| Map/schema drift | `test_map_is_well_formed`, `test_config_map_covers_every_serde_field` | `cargo test -p sito-core config_schema`; `cargo test -p sito-core test_config_map_covers_every_serde_field` |
+| Migration behavior-preserving, aliases moved, removed keys reported | `test_migration_is_behavior_preserving_and_moves_aliases` | `cargo test -p sito-core --test config_v2 test_migration_is_behavior_preserving` |
+| Migration unknown-key policy | `test_migration_rejects_unknown_keys_unless_explicitly_allowed` | `cargo test -p sito-core --test config_v2 test_migration_rejects_unknown_keys` |
+| Migration safe defaults | `test_migration_adopt_safe_defaults_opts_into_v2_defaults` | `cargo test -p sito-core --test config_v2 test_migration_adopt_safe_defaults` |
+| Migration rejects v2/future sources | `test_migration_rejects_a_v2_or_future_document` | `cargo test -p sito-core --test config_v2 test_migration_rejects_a_v2` |
+| Migration alias conflict precedence | `test_migration_alias_conflict_precedence_matches_v1_effective_values` | `cargo test -p sito-core --test config_v2 test_migration_alias_conflict` |
+| Table-level v1 ACME/TLS precedence | `test_migration_partial_acme_section_ignores_every_web_alias`, `test_migration_dns_tls_replaces_the_whole_top_level_tls_table` | `cargo test -p sito-core --test config_v2 test_migration_partial_acme`; `cargo test -p sito-core --test config_v2 test_migration_dns_tls` |
+| v1 admin bind default materialized | `test_migration_materializes_the_v1_web_bind_default` | `cargo test -p sito-core --test config_v2 test_migration_materializes` |
+| Unversioned v1 file rejected | `test_config_v2_is_the_default_and_only_accepted_version` | `cargo test -p sito-core --test config_v2 test_config_v2_is_the_default` |
+| `--ignore-unknown-keys` in table arrays / nested SNI | `test_migration_ignore_unknown_keys_handles_table_arrays_and_nested_sni_fields` | `cargo test -p sito-core --test config_v2 test_migration_ignore_unknown_keys` |
+| Listener overlap: wildcard, ACME, dual-stack | `test_listener_conflicts_cover_wildcards_acme_and_dual_stack` | `cargo test -p sito-core --test config_v2 test_listener_conflicts_cover` |
+| Sanitized HA bundle parses as v2 | `test_migrated_config_reparses_after_ha_sanitization`, `test_persisted_config_preserves_node_local_listener_tls_and_web`, `test_persisted_config_preserves_node_local_web_identity` | `cargo test -p sito-core --test config_v2 test_migrated_config_reparses`; `cargo test -p sito-ha test_persisted_config_preserves_node_local` |
+| CLI migration, 0600 backup, atomic write | `test_cli_config_migrate_flags`, `test_config_migrate_writes_v2_and_0600_backup`, `test_config_migrate_requires_unknown_key_flag` | `cargo test -p sito test_config_migrate` |
+| Restart-only matrix truthful and reachable | `test_restart_matrix_names_are_all_reachable` | `cargo test -p sito-api test_restart_matrix_names_are_all_reachable` |
+| Admin write 409/no-persist | `test_restart_only_write_is_conflict_and_not_persisted`, `test_update_config_restart_only_is_conflict_and_not_persisted` | `cargo test -p sito-api test_restart_only_write_is_conflict_and_not_persisted`; `cargo test -p sito-api test_update_config_restart_only` |
+| HA parity for restart-only rejection | `test_ha_restart_only_push_is_conflict_and_not_persisted` | `cargo test -p sito-api test_ha_restart_only_push` |
+| Restart-only preview endpoint | `test_restart_required_preview_lists_the_matrix` | `cargo test -p sito-api test_restart_required_preview_lists_the_matrix` |
+| Restore/restore-archive uses the single validator | `test_restore_archive_rejects_typed_section_errors` | `cargo test -p sito-api test_restore_archive_rejects_typed_section_errors` |

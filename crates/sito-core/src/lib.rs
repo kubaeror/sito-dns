@@ -5,6 +5,8 @@
 
 pub mod client;
 pub mod config;
+pub mod config_migrate;
+pub mod config_schema;
 pub mod dnssec_fetch;
 pub mod domain;
 pub mod engine;
@@ -19,6 +21,8 @@ pub use config::{
     FilteringConfig, PerDomainUpstream, ServerConfig, SniCertConfig, TlsConfig, UpstreamConfig,
     UpstreamStrategy,
 };
+pub use config_migrate::{MigrationChange, MigrationOptions, MigrationOutcome, MigrationReport};
+pub use config_schema::{FieldStatus, SchemaField};
 pub use dnssec_fetch::DnssecKeyFetcher;
 pub use domain::{DomainError, NormalizedDomain, matches_domain_suffix, matches_strict_subdomain};
 pub use engine::FilterEngine;
